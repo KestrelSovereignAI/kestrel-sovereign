@@ -603,7 +603,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `get_child_result` |  | `agent_management` | `child_name` | 53 | `enabled` |
 | `list_children` |  | `agent_management` |  | 27 | `enabled` |
 | `spawn_agent` |  | `agent_management` | `name`, `purpose`, `budget`, `ttl`, `constraints`, `features` | 369 | `enabled` |
-| `terminate_child` |  | `agent_management` | `child_name` | 53 | `enabled` |
+| `terminate_child` |  | `agent_management` | `child_name`, `offboard_runtime` | 118 | `enabled` |
 
 ### `state_of_mind` (StateOfMindFeature)
 
@@ -632,7 +632,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `strategy_add_pattern` |  | `system` | `pattern`, `source`, `implication` | 110 | `enabled` |
 | `strategy_reconcile_blockers` | `!strategy-reconcile` | `system` | `apply` | 90 | `enabled` |
 | `strategy_resolve_blocker` |  | `system` | `issue`, `resolution` | 114 | `enabled` |
-| `strategy_search` | `!strategy-search` | `memory` | `query`, `kind`, `limit` | 144 | `enabled` |
+| `strategy_search` | `!strategy-search` | `memory` | `query`, `kind`, `limit`, `include_retired` | 182 | `enabled` |
 | `strategy_supersede_pattern` |  | `system` | `pattern_id`, `reason`, `superseded_by` | 140 | `enabled` |
 | `strategy_view` | `!strategy` | `system` | `section` | 82 | `enabled` |
 
@@ -1086,7 +1086,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!sessionlog` | `strategic_memory` | `[session_id] [focus]` | End-of-day session log collector. Scans all repos for today's activity (issues closed, PRs merged, comments, commits) and generates a structured session summary with outcomes and metrics. |
 | `!strategy` | `strategic_memory` | `[section]` | View the current strategic context: vision, milestones, stakeholders, decisions, blockers, and patterns. |
 | `!strategy-reconcile` | `strategic_memory` | `[apply]` | Check each active blocker against live GitHub issue state and report which reference already-closed issues. Pass apply='yes' to resolve the stale rows. |
-| `!strategy-search` | `strategic_memory` | `<query> [kind] [limit]` | Search the strategy ledger (learned patterns and blockers) by keyword. This is the query path that replaced dumping the whole log into the system prompt. |
+| `!strategy-search` | `strategic_memory` | `<query> [kind] [limit] [include_retired]` | Search the strategy ledger (learned patterns and blockers) by keyword. This is the query path that replaced dumping the whole log into the system prompt. |
 | `!a2a attach` | `tasks` | `<task_id> <name> <content> [index] [last_chunk]` | RESPONDER-SIDE artifact attach: the RECIPIENT of an incoming A2A task uses this to attach its own output. To attach payload as the SENDER of an outgoing task, pass ``artifacts``/``references`` to send_a2a_task / send_a2a_question instead. Attach one chunk of long-form output as an Artifact to an incoming A2A task BEFORE calling respond_to_a2a_task. Use this when your reply exceeds the per-tool argument cap (10K chars) — chunk the body into segments of <=9000 chars each, call this tool once per segment with monotonically-increasing index (0, 1, 2, ...) and last_chunk=False on every segment except the final one. The sender's get_peer_task_result returns the artifacts in order so the resumed turn can reassemble the full body. After all segments are attached, call respond_to_a2a_task with a SHORT content like 'See attached artifacts (N segments).' so the sender knows where to look. |
 | `!a2a respond` | `tasks` | `<task_id> <content> [state]` | Respond to an incoming A2A task in your inbox by transitioning it to a terminal state with your reply text. Use this when another agent sent you a task via send_a2a_question (fire-and-resume — sender's turn ended, they wake on the a2a.question_answered signal when you transition), send_a2a_message (FYI, brief receipt), or send_a2a_task (delegated work, full result). The sender's subscription supervisor on the SSE stream picks up your terminal frame and fires their resumption signal. Without this tool the sender's send_a2a_question lineage never resumes until the hourly expiry sweep fires a state='expired' signal. |
 | `!cancel-task` | `tasks` | `<task_id> [reason]` | Cancel a pending or running task. |
@@ -1111,6 +1111,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 

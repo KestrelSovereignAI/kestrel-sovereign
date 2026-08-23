@@ -787,6 +787,32 @@ nav {
     text-align: center;
 }
 
+/* Paging affordance for the conversation list (#2960). Sits at the end of the
+   rows, full width, and only exists when the server reported another page —
+   so its absence is the end of the list rather than a disabled control. */
+.conversations-load-more {
+    display: block;
+    width: calc(100% - 1rem);
+    margin: 0.5rem;
+    padding: 0.5rem;
+    background: transparent;
+    border: 1px solid var(--border, #334155);
+    border-radius: 6px;
+    color: var(--text-secondary, #94a3b8);
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.conversations-load-more:hover:not(:disabled) {
+    background: var(--bg-hover, rgba(148, 163, 184, 0.1));
+    color: var(--text, #e2e8f0);
+}
+
+.conversations-load-more:disabled {
+    cursor: default;
+    opacity: 0.6;
+}
+
 /* Trash sub-view (#765). Same shell as conversations but uses
    a softer affordance set: permanent-delete sits next to a
    Restore button, both visible by default (the user is

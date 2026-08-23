@@ -883,7 +883,14 @@ export function createApiClient({
         importSovereignty: (cid) => client.request('/api/sovereignty/import', { method: 'POST', body: JSON.stringify({ cid }) }),
         getSovereigntyFiles: () => client.request('/api/sovereignty/files'),
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
-        getConversations: (decrypt = true, view = 'active') => client.request(`/api/conversations?decrypt=${decrypt}&view=${encodeURIComponent(view)}`),
+        // `cursor` continues a previous page; the response's `next_cursor` is
+        // the token for the one after it, and null at the end of the list
+        // (#2960). Opaque — it encodes the server's ordering keys, which is not
+        // a shape a caller may build or parse.
+        getConversations: (decrypt = true, view = 'active', cursor = null) => client.request(
+            `/api/conversations?decrypt=${decrypt}&view=${encodeURIComponent(view)}`
+            + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''),
+        ),
         // Full-text search over conversation content + titles. Same endpoint
         // as the list — `q` flips it into search mode and each returned
         // session carries match_count / match_role / match_snippet.

@@ -56,6 +56,7 @@ from kestrel_sovereign.storage.session_grouping import (
     group_messages_into_sessions,
     timestamp_query_param,
 )
+from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 from kestrel_sovereign.storage.session_id_column import (
     SESSION_ID_MAX_LENGTH,
     column_session_id,
@@ -301,16 +302,21 @@ async def _assert_the_projection_agrees_with_the_grouper(
     }
     stored = {row["session_id"]: row for row in await projection.list()}
 
-    # Every session the grouper finds *whose id the column may hold*. A row
-    # filed under nothing gets a synthetic key from the grouper — a bare row id
-    # — which `session_id` cannot store, so the projection is legitimately
-    # silent about it (Phase A's invariant: silent where it must be, never
-    # wrong). Asserted through `is_stampable_session_id` rather than by listing
-    # the shapes, which is the same rule the unit differential applies; stating
-    # it twice is how the two drifted apart until round 6.
+    # Every session the grouper finds *whose id a reader can open*, which is
+    # two things and not one: a value the column may hold, or the bare row id
+    # the grouper invents for a cluster filed under nothing (#2012), which the
+    # row-id resolver opens even though the column can never store it.
+    #
+    # This was `is_stampable_session_id` alone until #2960 — Phase B could
+    # afford to be silent about the second kind because nothing read the table.
+    # #2960 makes it the conversation list, so a silent session is a
+    # conversation that has vanished. Asserted through the same two functions
+    # the derivation asks rather than by listing the shapes; stating the rule
+    # twice is how the two drifted apart until round 6.
     assert set(stored) == {
         session_id for session_id in reference
         if is_stampable_session_id(session_id)
+        or coerce_persistent_message_id(session_id) is not None
     }
     for session_id, row in stored.items():
         expected = reference[session_id]

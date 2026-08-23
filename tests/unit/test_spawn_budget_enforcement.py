@@ -12,7 +12,7 @@ paths, so a `budget` was a no-op (later an interim rejection). These tests cover
 import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -566,6 +566,91 @@ async def test_direct_remove_agent_releases_budget():
 
     await mgr.remove_agent("Kid")
     assert parent.wallet.get_balance() == Decimal("100")   # hold released on delete
+
+
+@pytest.mark.asyncio
+async def test_budget_allocation_failure_preserves_retained_offboarding_outcome():
+    """Budget rollback must not mask a child tree retained after unpublication."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import (
+        AgentManager,
+        RuntimeOffboardingRetainedError,
+    )
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    parent = SimpleNamespace(
+        agent_id="did:test:budget-parent",
+        wallet=FakeWallet(initial_balance=Decimal("100")),
+    )
+    child = SimpleNamespace(agent_id="did:test:budget-child")
+    mandate = SpawnMandate(
+        parent_did=parent.agent_id,
+        purpose="rollback",
+        budget_allocation=Decimal("30"),
+        ttl_seconds=60,
+    )
+    retained = RuntimeOffboardingRetainedError(
+        agent_name="Child",
+        agent_id=child.agent_id,
+        runtime_path=None,
+        cause=RuntimeError("synthetic retained tree"),
+    )
+    manager.remove_agent = AsyncMock(side_effect=retained)
+
+    with patch(
+        "kestrel_sovereign.multi_agent.agent_manager.create_delegated_wallet",
+        new=AsyncMock(side_effect=RuntimeError("allocation failed")),
+    ):
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await manager._apply_delegated_budget(
+                "Child", parent, child, mandate
+            )
+
+    assert any("allocation failed" in str(error) for error in raised.value.exceptions)
+    assert any(error is retained for error in raised.value.exceptions)
+    manager.remove_agent.assert_awaited_once_with(
+        "Child", offboard_runtime=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_budget_allocation_failure_accepts_real_non_hosted_child_rollback():
+    """Storage-backed rollback shutdown is complete despite its typed no-op."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    parent = SimpleNamespace(
+        agent_id="did:test:budget-parent-non-hosted",
+        wallet=FakeWallet(initial_balance=Decimal("100")),
+    )
+    child = SimpleNamespace(
+        agent_id="did:test:budget-child-non-hosted",
+        shutdown=AsyncMock(),
+    )
+    manager._agents["Child"] = child
+    manager._agent_names[child.agent_id] = "Child"
+    mandate = SpawnMandate(
+        parent_did=parent.agent_id,
+        purpose="rollback",
+        budget_allocation=Decimal("30"),
+        ttl_seconds=60,
+    )
+    allocation_failure = RuntimeError("allocation failed")
+
+    with patch(
+        "kestrel_sovereign.multi_agent.agent_manager.create_delegated_wallet",
+        new=AsyncMock(side_effect=allocation_failure),
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            await manager._apply_delegated_budget("Child", parent, child, mandate)
+
+    assert raised.value is allocation_failure
+    child.shutdown.assert_awaited_once_with()
+    assert manager.get_agent("Child") is None
+    assert child.agent_id not in manager._agent_names
 
 
 @pytest.mark.asyncio

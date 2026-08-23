@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import inspect
 import math
+import sys
 import time
 from dataclasses import dataclass, replace as _replace_dataclass
 from datetime import datetime
@@ -578,6 +579,10 @@ class KestrelAgent(
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
         isolated_feature_data_dir: Optional[Path] = None,
+        isolated_runtime_root: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_namespace: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_legacy_root: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_hosted: bool = False,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
@@ -636,10 +641,23 @@ class KestrelAgent(
                        This is injected by the embedding runtime, never derived
                        from a tool caller or user-id field.
             isolated_feature_data_dir: Optional host-owned per-agent directory
-                       for isolated feature venvs and provisioning manifests.
-                       This lets a PostgreSQL-backed multi-tenant embedding
-                       isolate feature runtimes without pretending it owns a
-                       SQLite storage path.
+                       retained for standalone embedding compatibility. Hosted
+                       and multi-tenant factories must use the explicit root /
+                       namespace contract below instead.
+            isolated_runtime_root: Host-owned root for isolated-feature mutable
+                       runtime state. Hosted factories must pair this with
+                       ``isolated_runtime_namespace``.
+            isolated_runtime_namespace: Canonical relative tenant/agent
+                       namespace below ``isolated_runtime_root``. The runtime
+                       validates it and securely binds it to this agent DID.
+            isolated_runtime_legacy_root: Explicit, agent-scoped location of
+                       the released hosted feature runtime layout. Managed
+                       factories may supply this only to adopt existing
+                       ``feature_venvs/<ClassName>`` state into the new
+                       namespace; it is never a runtime fallback.
+            isolated_runtime_hosted: Declares that this agent shares a host
+                       runtime. Discovery of an isolated feature fails closed
+                       unless an explicit root and namespace were supplied.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -670,6 +688,69 @@ class KestrelAgent(
         self.did = did
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
+        effective_db_backend = db_backend or os.environ.get(
+            "KESTREL_DB_BACKEND", "sqlite"
+        )
+        if type(isolated_runtime_hosted) is not bool:
+            raise TypeError("isolated_runtime_hosted must be a bool")
+        if isolated_feature_data_dir is not None and (
+            isolated_runtime_root is not None
+            or isolated_runtime_namespace is not None
+        ):
+            raise ValueError(
+                "isolated_feature_data_dir cannot be combined with the hosted "
+                "isolated runtime root/namespace contract"
+            )
+        # PostgreSQL hosts commonly have no agent-local filesystem database.
+        # Treat that construction shape as hosted even if its factory predates
+        # the explicit runtime-scope arguments.  An isolated feature then fails
+        # before startup instead of silently collapsing into agent_data/default.
+        # A factory which knows its host-owned root and namespace can (and must)
+        # supply them below to make the feature usable.
+        self.isolated_runtime_hosted = bool(
+            isolated_runtime_hosted
+            or isolated_runtime_root is not None
+            or isolated_runtime_namespace is not None
+            or (
+                storage_path is None
+                and effective_db_backend.lower() == "postgres"
+            )
+        )
+        self.isolated_runtime_root: Optional[Path] = None
+        self.isolated_runtime_namespace: Optional[Path] = None
+        self.isolated_runtime_path: Optional[Path] = None
+        self.isolated_runtime_legacy_root: Optional[Path] = None
+        self.isolated_runtime_scope = None
+        if isolated_runtime_root is not None or isolated_runtime_namespace is not None:
+            # Keep the hosted runtime boundary owned by the isolated-runtime
+            # module. This validates path traversal once at construction and
+            # the proxy reuses the same canonical scope when it launches a
+            # feature, rather than deriving mutable placement from database
+            # storage (which PostgreSQL-backed hosted agents deliberately lack).
+            from kestrel_sovereign.features.isolated_runtime import (
+                resolve_legacy_isolated_runtime_root,
+                resolve_isolated_runtime_namespace,
+            )
+
+            runtime_scope = resolve_isolated_runtime_namespace(
+                isolated_runtime_root, isolated_runtime_namespace
+            )
+            self.isolated_runtime_root = runtime_scope.root
+            self.isolated_runtime_namespace = runtime_scope.namespace
+            self.isolated_runtime_path = runtime_scope.path
+            self.isolated_runtime_scope = runtime_scope
+            if isolated_runtime_legacy_root is not None:
+                self.isolated_runtime_legacy_root = (
+                    resolve_legacy_isolated_runtime_root(
+                        isolated_runtime_legacy_root,
+                        runtime_scope,
+                    )
+                )
+        elif isolated_runtime_legacy_root is not None:
+            raise ValueError(
+                "isolated_runtime_legacy_root requires the hosted isolated "
+                "runtime root/namespace contract"
+            )
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
         # attribute from birth — no construction path (fleet load, spawn /
@@ -1140,7 +1221,7 @@ class KestrelAgent(
                     raise IdentityReadinessError.from_load_error(exc) from None
 
         # Determine database backend
-        self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+        self._db_backend = effective_db_backend
         # Birth-record capability the runtime database could not be given and
         # no retry can supply (#2871). Surfaced by the ``birth_record`` health
         # check; empty on every healthy agent.
@@ -1267,6 +1348,7 @@ class KestrelAgent(
 
         # Features will be initialized after storage
         self.features: Dict[str, Feature] = {}
+        self.rejected_feature_contributions = ()
 
         # Hooks manager for security and middleware
         self.hooks_manager = HooksManager()
@@ -2870,7 +2952,7 @@ class KestrelAgent(
         for feature, prepared_item in prepared_contributions.activatable(
             enabled_discovered_features
         ):
-            await self._register_feature(
+            await self._register_startup_feature(
                 feature,
                 prepared_contributions=prepared_item,
             )
@@ -4198,7 +4280,15 @@ class KestrelAgent(
         indistinguishable from one that loaded and had nothing to do. This is
         what ``/health/detailed`` reports (issue #2951).
         """
-        self.rejected_feature_contributions = tuple(transition.rejected)
+        existing = tuple(self.rejected_feature_contributions)
+        self.rejected_feature_contributions = existing + tuple(
+            rejection
+            for rejection in transition.rejected
+            if not any(
+                prior.feature_name == rejection.feature_name
+                for prior in existing
+            )
+        )
         for rejection in transition.rejected:
             logging.error(
                 "Feature '%s' did not load — %s. The agent is running WITHOUT "
@@ -4206,6 +4296,33 @@ class KestrelAgent(
                 rejection.feature_name,
                 rejection.reason,
             )
+
+    def record_feature_unavailable(
+        self,
+        *,
+        feature: object,
+        feature_name: str,
+        reason: str,
+    ) -> None:
+        """Retain one safely described optional-feature quarantine for health."""
+
+        from kestrel_sovereign.features.contribution_runtime import (
+            ContributionRejection,
+        )
+
+        if any(
+            rejection.feature_name == feature_name
+            for rejection in self.rejected_feature_contributions
+        ):
+            return
+        self.rejected_feature_contributions = (
+            *self.rejected_feature_contributions,
+            ContributionRejection(
+                feature=feature,
+                feature_name=feature_name,
+                reason=reason,
+            ),
+        )
 
     def _prepare_feature_contribution_transition(self, features):
         """Collect and prevalidate one complete feature activation transition."""
@@ -4383,6 +4500,121 @@ class KestrelAgent(
             return None
         declared = entry.get("config")
         return declared if isinstance(declared, dict) else None
+
+    async def _register_startup_feature(
+        self,
+        feature: Feature,
+        *,
+        prepared_contributions=None,
+    ) -> bool:
+        """Register one discovered feature, quarantining safe prep failures.
+
+        A transient OS failure, an ambiguous legacy/stable custody migration,
+        or unsafe process-wide feature configuration makes an optional isolated
+        feature unavailable, but does not weaken the rest of the agent.  True
+        namespace/ownership violations use the separate
+        ``IsolatedRuntimeNamespaceError`` hierarchy and continue to fail the
+        hosted agent closed.
+        """
+
+        try:
+            await self._register_feature(
+                feature,
+                prepared_contributions=prepared_contributions,
+            )
+        except Exception as exc:
+            # Do not import the optional isolated runtime while registering
+            # ordinary core features. An actual ProxyFeature proves the module
+            # is already loaded, so classify its narrow quarantine outcomes
+            # from that exact module and let every other exception propagate.
+            isolated_runtime = sys.modules.get(
+                "kestrel_sovereign.features.isolated_runtime"
+            )
+            proxy_type = getattr(isolated_runtime, "ProxyFeature", None)
+            configuration_error = getattr(
+                isolated_runtime,
+                "IsolatedRuntimeConfigurationError",
+                None,
+            )
+            preparation_error = getattr(
+                isolated_runtime,
+                "IsolatedRuntimePreparationError",
+                None,
+            )
+            is_isolated_feature = isinstance(proxy_type, type) and isinstance(
+                feature, proxy_type
+            )
+            if not is_isolated_feature:
+                raise
+            if isinstance(configuration_error, type) and isinstance(
+                exc, configuration_error
+            ):
+                # Derive text through the exception type's closed diagnostic
+                # map. Third-party code can raise this public type with an
+                # arbitrary base message, so logging ``exc`` could disclose
+                # values.
+                diagnostic = configuration_error.safe_diagnostic(exc)
+                logging.error(
+                    "Optional isolated feature '%s' is unavailable because %s; "
+                    "other agent features will continue.",
+                    getattr(feature, "name", type(feature).__name__),
+                    diagnostic,
+                )
+                self.record_feature_unavailable(
+                    feature=feature,
+                    feature_name=getattr(
+                        feature,
+                        "name",
+                        type(feature).__name__,
+                    ),
+                    reason=diagnostic,
+                )
+                return False
+            if isinstance(preparation_error, type) and isinstance(
+                exc, preparation_error
+            ):
+                diagnostic_factory = getattr(
+                    isolated_runtime,
+                    "safe_isolated_runtime_preparation_diagnostic",
+                    None,
+                )
+                exc_info_factory = getattr(
+                    isolated_runtime,
+                    "sanitized_isolated_runtime_preparation_exc_info",
+                    None,
+                )
+                diagnostic = (
+                    diagnostic_factory(exc)
+                    if callable(diagnostic_factory)
+                    else (
+                        "the agent-scoped runtime could not be prepared; inspect "
+                        "host filesystem health"
+                    )
+                )
+                safe_exc_info = (
+                    exc_info_factory(exc)
+                    if callable(exc_info_factory)
+                    else None
+                )
+                logging.error(
+                    "Optional isolated feature '%s' is unavailable because %s; "
+                    "other agent features will continue.",
+                    getattr(feature, "name", type(feature).__name__),
+                    diagnostic,
+                    exc_info=safe_exc_info,
+                )
+                self.record_feature_unavailable(
+                    feature=feature,
+                    feature_name=getattr(
+                        feature,
+                        "name",
+                        type(feature).__name__,
+                    ),
+                    reason=diagnostic,
+                )
+                return False
+            raise
+        return True
 
     async def _register_feature(
         self,

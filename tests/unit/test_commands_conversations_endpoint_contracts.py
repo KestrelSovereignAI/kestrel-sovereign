@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.session_id_column import column_session_id
 
 
 def _prepare_app(agent):
@@ -121,37 +122,74 @@ def test_sessions_endpoint_returns_message_totals_from_history():
         _restore_app(app, original)
 
 
-def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview():
-    now = datetime(2026, 3, 17, 9, 0, 0)
-    rows = [
-        (4, "user", "plain text", "{}", now + timedelta(minutes=3)),
-        (3, "system", "[New conversation started]", '{"new_session": true, "type": "session_marker"}', now + timedelta(minutes=2)),
-        (2, "assistant", "hello", "{}", now + timedelta(minutes=1)),
-        (1, "user", "ciphertext", '{"enc": true}', now),
-    ]
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=True)
-    storage.query_conversations = AsyncMock(return_value=rows)
-    agent = MagicMock(storage=storage)
+LIST_AGENT = "did:test:conversation-list"
 
-    app, original = _prepare_app(agent)
+
+async def _seeded_list_storage(tmp_path, name, rows):
+    """A real store + privacy wrapper holding ``rows``, for the list endpoint.
+
+    The list reads the #2959 projection through the privacy layer (#2960), so a
+    fixture that mocks the storage call proves nothing about where sessions come
+    from. These go through the real derivation.
+
+    The ``session_id`` COLUMN is derived from each row's metadata with
+    ``column_session_id`` — the same function the write paths use — rather than
+    left NULL for convenience. Leaving it NULL beside a stampable metadata id is
+    a state no writer produces, and the projection refuses it on purpose; a
+    fixture that manufactured it would be testing the refusal. Rows carrying no
+    stampable id still land NULL, which is what legacy history looks like.
+
+    ``rows`` are ``(role, content, metadata_json, created_at)``, oldest first.
+    """
+    storage = AsyncStorage(str(tmp_path / name))
+    storage.agent_id = LIST_AGENT
+    await storage.initialize()
+    await storage.db.execute_many(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, session_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (LIST_AGENT, role, content, metadata,
+             column_session_id(metadata), created_at)
+            for role, content, metadata, created_at in rows
+        ],
+    )
+    return storage, PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+
+def _listed(app, query=""):
+    with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+        with TestClient(app) as client:
+            return client.get(f"/api/conversations{query}", headers=_api_headers())
+
+
+@pytest.mark.asyncio
+async def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview(tmp_path):
+    """Two clusters an hour apart list as two sessions, newest first, and an
+    undecryptable preview is reported as encrypted rather than shown."""
+    now = datetime(2026, 3, 17, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "encrypted.db", [
+        ("user", "ciphertext", '{"enc": true}', now),
+        ("assistant", "hello", "{}", now + timedelta(minutes=1)),
+        ("user", "plain text", "{}", now + timedelta(hours=2)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
         with patch("kestrel_sovereign.endpoints.conversations.get_agent_fernet", return_value=object()):
             with patch("kestrel_sovereign.endpoints.conversations.decrypt_string", side_effect=ValueError("bad key")):
-                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                    with TestClient(app) as client:
-                        response = client.get("/api/conversations?limit=10", headers=_api_headers())
+                response = _listed(app, "?limit=10")
         assert response.status_code == 200
         payload = response.json()
         assert payload["total"] == 2
-        latest_session = payload["conversations"][0]
-        older_session = payload["conversations"][1]
+        latest_session, older_session = payload["conversations"]
         assert latest_session["preview"] == "plain text"
         assert older_session["preview"] == "ciphertext"
         assert older_session["preview_encrypted"] is True
-        assert payload["encrypted_at_rest"] is True
-        storage.query_conversations.assert_awaited_once_with("did:agent", limit=200, view="active")
+        # Nothing follows a page that held every session.
+        assert payload["next_cursor"] is None
     finally:
         _restore_app(app, original)
+        await storage.close()
 
 
 def _wake_meta(session_id, source="talon.job_complete"):
@@ -161,52 +199,43 @@ def _wake_meta(session_id, source="talon.job_complete"):
     })
 
 
-def test_conversations_endpoint_skips_signal_wake_for_card_preview():
+@pytest.mark.asyncio
+async def test_conversations_endpoint_skips_signal_wake_for_card_preview(tmp_path):
     """#2947: a COGNITION signal wake persists as role="user" so it replays in
     history, but it must not become the conversation card's title — the first
     real user turn does."""
     now = datetime(2026, 8, 10, 21, 0, 0)
-    rows = [
-        (3, "assistant", "sunny", json.dumps({"session_id": "s1"}), now + timedelta(minutes=2)),
-        (2, "user", "what's the weather", json.dumps({"session_id": "s1"}), now + timedelta(minutes=1)),
-        (1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", _wake_meta("s1"), now),
-    ]
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversations = AsyncMock(return_value=rows)
-    agent = MagicMock(storage=storage)
-
-    app, original = _prepare_app(agent)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "wake-skip.db", [
+        ("user", "[TALON_JOB_COMPLETE] Background Talon job ...", _wake_meta("s1"), now),
+        ("user", "what's the weather", json.dumps({"session_id": "s1"}), now + timedelta(minutes=1)),
+        ("assistant", "sunny", json.dumps({"session_id": "s1"}), now + timedelta(minutes=2)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.get("/api/conversations?limit=10", headers=_api_headers())
+        response = _listed(app, "?limit=10")
         assert response.status_code == 200
         sessions = response.json()["conversations"]
         assert len(sessions) == 1
         assert sessions[0]["preview"] == "what's the weather"
     finally:
         _restore_app(app, original)
+        await storage.close()
 
 
-def test_conversations_endpoint_labels_a_wake_only_session_autonomous():
+@pytest.mark.asyncio
+async def test_conversations_endpoint_labels_a_wake_only_session_autonomous(tmp_path):
     """#2947: unattended dispatch and heartbeat-born sessions have a wake as
     their only user row. Skipping it must not leave an empty preview — the UI
     would render that as 'New conversation', a lie about a session that ran
     autonomous work."""
     now = datetime(2026, 8, 10, 21, 20, 0)
-    rows = [
-        (2, "assistant", "reviewed the PR", json.dumps({"session_id": "s1"}), now + timedelta(minutes=1)),
-        (1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", _wake_meta("s1"), now),
-    ]
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversations = AsyncMock(return_value=rows)
-    agent = MagicMock(storage=storage)
-
-    app, original = _prepare_app(agent)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "wake-only.db", [
+        ("user", "[TALON_JOB_COMPLETE] Background Talon job ...", _wake_meta("s1"), now),
+        ("assistant", "reviewed the PR", json.dumps({"session_id": "s1"}), now + timedelta(minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.get("/api/conversations?limit=10", headers=_api_headers())
+        response = _listed(app, "?limit=10")
         assert response.status_code == 200
         sessions = response.json()["conversations"]
         assert len(sessions) == 1
@@ -216,136 +245,239 @@ def test_conversations_endpoint_labels_a_wake_only_session_autonomous():
         assert "preview_content" not in sessions[0]
     finally:
         _restore_app(app, original)
+        await storage.close()
 
 
-def test_conversations_endpoint_exposes_marker_uuid_as_session_id():
+@pytest.mark.asyncio
+async def test_conversations_endpoint_exposes_marker_uuid_as_session_id(tmp_path):
     """#2012: the list identifier must be the session's canonical UUID
     (metadata.session_id on the new_session marker), NOT the message
     row-id — so the value the UI round-trips matches where messages are
     filed and the pane doesn't load empty on a hard refresh."""
     now = datetime(2026, 6, 28, 9, 0, 0)
     uuid = "e1fd6fe5-885e-4d8b-9aaa-000000000099"
-    # DESC order (newest first) — the endpoint reverses internally.
-    rows = [
-        (44, "assistant", "hello", json.dumps({"session_id": uuid}), now + timedelta(minutes=2)),
-        (43, "user", "hi", json.dumps({"session_id": uuid}), now + timedelta(minutes=1)),
-        (42, "system", "[New conversation started]",
+    storage, wrapped = await _seeded_list_storage(tmp_path, "marker-uuid.db", [
+        ("system", "[New conversation started]",
          json.dumps({"new_session": True, "type": "session_marker", "session_id": uuid}), now),
-    ]
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversations = AsyncMock(return_value=rows)
-    agent = MagicMock(storage=storage)
-
-    app, original = _prepare_app(agent)
+        ("user", "hi", json.dumps({"session_id": uuid}), now + timedelta(minutes=1)),
+        ("assistant", "hello", json.dumps({"session_id": uuid}), now + timedelta(minutes=2)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.get("/api/conversations?limit=10", headers=_api_headers())
+        response = _listed(app, "?limit=10")
         assert response.status_code == 200
         sessions = response.json()["conversations"]
         assert len(sessions) == 1
-        # Identity is the UUID, not "42" (the marker's row-id).
+        # Identity is the UUID, not the marker's row-id.
         assert sessions[0]["session_id"] == uuid
     finally:
         _restore_app(app, original)
-
-
-def test_conversations_endpoint_falls_back_to_rowid_for_legacy_cluster():
-    """A genuinely legacy cluster with no session_id anywhere still keys
-    by the first message's row-id (the resolver handles those via the
-    row-id time-gap path)."""
-    now = datetime(2026, 6, 28, 11, 0, 0)
-    rows = [
-        (8, "assistant", "reply", "{}", now + timedelta(minutes=1)),
-        (7, "user", "first", "{}", now),
-    ]
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversations = AsyncMock(return_value=rows)
-    agent = MagicMock(storage=storage)
-
-    app, original = _prepare_app(agent)
-    try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.get("/api/conversations?limit=10", headers=_api_headers())
-        assert response.status_code == 200
-        sessions = response.json()["conversations"]
-        assert sessions[0]["session_id"] == "7"
-    finally:
-        _restore_app(app, original)
+        await storage.close()
 
 
 @pytest.mark.asyncio
-async def test_conversations_endpoint_limits_sql_scan_for_large_history(tmp_path):
-    agent_id = "did:test:large-conversation-list"
-    storage = AsyncStorage(str(tmp_path / "large-history.db"))
-    storage.agent_id = agent_id
-    await storage.initialize()
-    wrapped_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+async def test_conversations_endpoint_falls_back_to_rowid_for_legacy_cluster(tmp_path):
+    """A genuinely legacy cluster with no session_id anywhere still keys by the
+    first message's row-id, and is REACHABLE — #2960's projection could not hold
+    such a key when Phase B shipped, and a list served from a table that drops
+    them would have made those conversations vanish instead of merely rank low.
 
+    Measured on Emma's live database: 473 of 1,522 live rows carry no session
+    id, so this is the ordinary shape of old history, not an edge case.
+    """
+    now = datetime(2026, 6, 28, 11, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "legacy-rowid.db", [
+        ("user", "first", "{}", now),
+        ("assistant", "reply", "{}", now + timedelta(minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        response = _listed(app, "?limit=10")
+        assert response.status_code == 200
+        sessions = response.json()["conversations"]
+        assert [s["session_id"] for s in sessions] == ["1"]
+        assert sessions[0]["preview"] == "first"
+        # ...and the key opens. A listed session nobody can open would be a
+        # different way of losing the conversation.
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                detail = client.get("/api/conversations/1", headers=_api_headers())
+        assert detail.status_code == 200
+        assert [m["content"] for m in detail.json()["messages"]] == ["first", "reply"]
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_session_id_the_indexed_column_cannot_hold_is_still_listed(tmp_path):
+    """``rasa_shim`` files every SMS turn under ``sms:{sender}`` — core code,
+    not a hypothetical — and a colon is outside Phase A's column charset, so the
+    column stays NULL for those rows.
+
+    The column is not what opens a session. ``_get_session_messages`` resolves a
+    row id or matches ``metadata LIKE '%"session_id": "<value>"%'``, and an
+    ``sms:`` session is found by the second. A list built on "could the column
+    hold this key" therefore dropped a whole channel's conversations — the exact
+    disappearance this ticket exists to end, reached by another route.
+    """
+    now = datetime(2026, 5, 1, 9, 0, 0)
+    sms = json.dumps({"session_id": "sms:+15551234567"})
+    storage, wrapped = await _seeded_list_storage(tmp_path, "sms.db", [
+        ("user", "text me the forecast", sms, now),
+        ("assistant", "clear all week", sms, now + timedelta(minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        response = _listed(app, "?limit=10")
+        assert response.status_code == 200
+        sessions = response.json()["conversations"]
+        assert [s["session_id"] for s in sessions] == ["sms:+15551234567"]
+        assert sessions[0]["preview"] == "text me the forecast"
+        assert sessions[0]["message_count"] == 2
+        # The column really is NULL — the fixture stamps it the way a writer
+        # does, so this is the state production is in, not one the test built.
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history "
+            "WHERE agent_id = ? AND session_id IS NULL",
+            (LIST_AGENT,),
+        ) == 2
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_every_session_is_reachable_by_paging_a_history_past_the_old_window(
+    tmp_path,
+):
+    """#2960's acceptance: a corpus larger than the retired 1,000-row window,
+    and every session reachable by asking again.
+
+    The path this replaces fetched ``min(limit * 20, 1000)`` rows of history and
+    grouped whatever fell inside. 2,500 sessions of two rows each is 5,000 rows,
+    so the old read could see at most 500 of them and no ``limit`` could reach
+    the rest — measured on Emma at 34% unreachable. Paging must find all 2,500,
+    each exactly once, and stop by saying so rather than by repeating itself.
+    """
     start = datetime(2026, 6, 9, 8, 0, 0)
     rows = []
-    for session_idx in range(2500):
-        session_start = start + timedelta(minutes=session_idx * 40)
-        rows.append((
-            agent_id,
-            "user",
-            f"preview {session_idx}",
-            "{}",
-            session_start,
-        ))
-        rows.append((
-            agent_id,
-            "assistant",
-            f"reply {session_idx}",
-            "{}",
-            session_start + timedelta(minutes=1),
-        ))
+    for index in range(2500):
+        session_start = start + timedelta(minutes=index * 40)
+        rows.append(("user", f"preview {index}", "{}", session_start))
+        rows.append(("assistant", f"reply {index}", "{}", session_start + timedelta(minutes=1)))
+    storage, wrapped = await _seeded_list_storage(tmp_path, "deep-history.db", rows)
+    assert len(rows) > 1000, "the corpus must exceed the window this ticket removed"
 
-    await storage.db.execute_many(
-        """
-        INSERT INTO conversation_history (agent_id, role, content, metadata, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-
-    plan_rows = await storage.db.fetchall(
-        """
-        EXPLAIN QUERY PLAN
-        SELECT id, role, content, metadata, created_at
-        FROM conversation_history
-        WHERE agent_id = ? AND deleted_at IS NULL
-        ORDER BY created_at DESC
-        LIMIT ?
-        """,
-        (agent_id, 100),
-    )
-    plan_text = " ".join(str(row) for row in plan_rows).upper()
-    assert "IDX_CONVERSATION_AGENT_CREATED_AT" in plan_text, plan_text
-    assert "USE TEMP B-TREE" not in plan_text, plan_text
-    assert len(await wrapped_storage.query_conversations(agent_id, limit=100)) == 100
-
-    agent = MagicMock(storage=wrapped_storage)
-    app, original = _prepare_app(agent)
+    app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
+        seen = []
+        query = "?limit=500"
+        pages = 0
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            transport = httpx.ASGITransport(app=app)
-            started = time.perf_counter()
-            async with httpx.AsyncClient(
-                transport=transport,
-                base_url="http://testserver",
-            ) as client:
-                response = await client.get(
-                    "/api/conversations?limit=5&decrypt=false",
-                    headers=_api_headers(),
-                )
-            elapsed = time.perf_counter() - started
+            with TestClient(app) as client:
+                while True:
+                    response = client.get(f"/api/conversations{query}", headers=_api_headers())
+                    assert response.status_code == 200
+                    payload = response.json()
+                    seen.extend(s["session_id"] for s in payload["conversations"])
+                    pages += 1
+                    assert pages <= 20, "paging did not terminate"
+                    if not payload["next_cursor"]:
+                        break
+                    query = f"?limit=500&cursor={payload['next_cursor']}"
 
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["total"] == 5
-        assert elapsed < 0.5
+        assert len(seen) == len(set(seen)), "a session was served on two pages"
+        assert len(seen) == 2500, f"{2500 - len(seen)} sessions were unreachable"
+        # Newest-first, all the way down, across the page seams.
+        assert seen[0] == "4999" and seen[-1] == "1"
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_half_built_index_is_a_503_not_a_truncated_list(tmp_path):
+    """A partial projection is missing the FRONT of the list, not the tail.
+
+    The walk goes forward by row id, so what a budget-exhausted repair has
+    written is the OLDEST sessions — while the list is ordered by most recent
+    activity. Serving it hands the user their oldest conversations, omits every
+    recent one, and ends with ``next_cursor: null``, which reads as the end of
+    a list that is missing its beginning.
+
+    503 says the index is not ready. It clears itself: the next request
+    continues the walk.
+    """
+    now = datetime(2026, 5, 1, 9, 0, 0)
+    # Two sessions, so a page of one has a second page to continue to.
+    storage, wrapped = await _seeded_list_storage(tmp_path, "half-built.db", [
+        ("user", "hello", "{}", now),
+        ("assistant", "hi", "{}", now + timedelta(minutes=1)),
+        ("user", "later", "{}", now + timedelta(hours=3)),
+        ("assistant", "and again", "{}", now + timedelta(hours=3, minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        # A walk that can never land: every repair leaves the watermark short.
+        from kestrel_sovereign.storage.conversation_sessions import SessionWatermark
+
+        async def never_complete():
+            return SessionWatermark("gen", True, 1, 1, 0, 999)
+
+        with patch(
+            "kestrel_sovereign.storage.conversation_sessions"
+            ".ConversationSessionProjection.accounted",
+            side_effect=never_complete,
+        ):
+            response = _listed(app, "?limit=10")
+        assert response.status_code == 503
+        assert "still being built" in response.json()["detail"]
+        assert response.headers.get("Retry-After") == "5"
+
+        # ...and an index that IS complete serves normally, so the refusal is
+        # not simply refusing everything.
+        first = _listed(app, "?limit=1")
+        assert first.status_code == 200
+
+        # A CONTINUATION is refused too. It does not repair — moving the ground
+        # under a cursor is how a keyset page starts skipping rows — but a page
+        # read while the projection is being rewalked ends early and says
+        # `next_cursor: null`, which reads as the end of the list.
+        token = first.json()["next_cursor"]
+        assert token, "the fixture needs a second page for this to mean anything"
+        with patch(
+            "kestrel_sovereign.storage.conversation_sessions"
+            ".ConversationSessionProjection.accounted",
+            side_effect=never_complete,
+        ):
+            assert _listed(app, f"?limit=1&cursor={token}").status_code == 503
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cursor_this_build_cannot_read_is_a_client_error(tmp_path):
+    """A cursor is client-supplied text. Restarting at page one for an
+    unreadable one answers a request for page nine with page one and looks like
+    a list that forgot where it was; raising past the handler reports a typo as
+    a server fault. It is a 400."""
+    storage, wrapped = await _seeded_list_storage(tmp_path, "bad-cursor.db", [
+        ("user", "hello", "{}", datetime(2026, 6, 28, 11, 0, 0)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        assert _listed(app, "?cursor=not-a-cursor").status_code == 400
+        # ...and one minted for another view, which is served by other
+        # machinery and ordered by keys this view never produced.
+        first = _listed(app, "?limit=1")
+        assert first.status_code == 200
+        token = first.json()["next_cursor"]
+        assert token is None or _listed(
+            app, f"?limit=1&view=archived&cursor={token}"
+        ).status_code == 400
     finally:
         _restore_app(app, original)
         await storage.close()
@@ -614,44 +746,25 @@ def test_rename_conversation_non_string_name_400():
         _restore_app(app, original)
 
 
-def test_list_conversations_includes_user_assigned_names():
+@pytest.mark.asyncio
+async def test_list_conversations_includes_user_assigned_names(tmp_path):
     """List endpoint decorates sessions with their user-assigned ``name``
     when one is set; sessions without a rename don't get the key so the
-    UI's ``conv.name || conv.preview`` fallback resolves to preview.
-
-    Fixture matches the row-order contract the endpoint expects:
-    ``query_conversations`` returns newest-first, and the endpoint reverses
-    internally (see ``test_conversations_endpoint_groups_rows_and_marks_
-    encrypted_preview`` for the canonical fixture shape).
-    """
+    UI's ``conv.name || conv.preview`` fallback resolves to preview."""
     now = datetime(2026, 3, 17, 9, 0, 0)
-    rows = [
-        # Newest-first.  Explicit new_session marker splits the two
-        # clusters; session_ids emitted by the endpoint are the first
-        # message id in each cluster (str-coerced).
-        (4, "user", "second thread", "{}", now + timedelta(hours=2, minutes=1)),
-        (3, "system", "[New conversation started]",
-         '{"new_session": true, "type": "session_marker"}',
-         now + timedelta(hours=2)),
-        (2, "assistant", "hi there", "{}", now + timedelta(minutes=1)),
-        (1, "user", "first thread", "{}", now),
-    ]
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversations = AsyncMock(return_value=rows)
-    # Only the older session (first row id = "1") has a custom name.
-    storage.get_conversation_names = AsyncMock(
-        return_value={"1": "Custom Title"}
-    )
-    agent = MagicMock(storage=storage)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "names.db", [
+        ("user", "first thread", "{}", now),
+        ("assistant", "hi there", "{}", now + timedelta(minutes=1)),
+        ("system", "[New conversation started]",
+         '{"new_session": true, "type": "session_marker"}', now + timedelta(hours=2)),
+        ("user", "second thread", "{}", now + timedelta(hours=2, minutes=1)),
+    ])
+    # Only the older session (keyed by its first row id) has a custom name.
+    await storage.set_conversation_name("1", "Custom Title")
 
-    app, original = _prepare_app(agent)
+    app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.get(
-                    "/api/conversations",
-                    headers=_api_headers(),
-                )
+        response = _listed(app)
         assert response.status_code == 200
         payload = response.json()
         assert payload["total"] == 2
@@ -660,13 +773,63 @@ def test_list_conversations_includes_user_assigned_names():
         assert len(named) == 1, (
             f"expected exactly one renamed session; got {conversations}"
         )
-        # Un-renamed sessions must not have the key so the client's
-        # ``conv.name || conv.preview`` fallback resolves to preview.
-        un_renamed = [c for c in conversations if "name" not in c]
-        assert un_renamed, "at least one un-named session expected"
-        storage.get_conversation_names.assert_awaited_once()
+        assert named[0]["session_id"] == "1"
+        assert all("name" not in c for c in conversations if c["session_id"] != "1")
     finally:
         _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_serves_the_archived_view_uncapped(tmp_path):
+    """``view=archived`` (#2149) lists the sessions the user tidied away.
+
+    Its membership — ``deleted_at IS NULL AND archived_at IS NOT NULL`` — is
+    disjoint from the one the #2959 projection describes, so these are still
+    derived by grouping. They are read WITHOUT a row cap: capping them is what
+    put 34% of the active list out of reach, and the same cap behind the archive
+    tab would leave the same defect standing there.
+    """
+    now = datetime(2026, 3, 17, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "archived.db", [
+        ("user", "live thread", "{}", now),
+        ("assistant", "live reply", "{}", now + timedelta(minutes=1)),
+    ])
+    # A corpus of archived rows larger than the retired 1,000-row window.
+    archived = []
+    for index in range(600):
+        started = now + timedelta(days=1, minutes=index * 40)
+        archived.append((LIST_AGENT, "user", f"archived {index}", "{}", started, started))
+        archived.append((LIST_AGENT, "assistant", f"reply {index}", "{}",
+                         started + timedelta(minutes=1), started))
+    await storage.db.execute_many(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at, archived_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        archived,
+    )
+
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        seen = []
+        query = "?view=archived&limit=200"
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                for _ in range(10):
+                    response = client.get(f"/api/conversations{query}", headers=_api_headers())
+                    assert response.status_code == 200
+                    payload = response.json()
+                    seen.extend(s["session_id"] for s in payload["conversations"])
+                    if not payload["next_cursor"]:
+                        break
+                    query = f"?view=archived&limit=200&cursor={payload['next_cursor']}"
+        assert len(seen) == len(set(seen))
+        assert len(seen) == 600, f"{600 - len(seen)} archived sessions were unreachable"
+        # ...and the archived view never shows the live one.
+        assert "1" not in seen
+    finally:
+        _restore_app(app, original)
+        await storage.close()
 
 
 def test_new_conversation_delete_message_and_transcript_contracts():
@@ -774,27 +937,6 @@ def test_archive_endpoint_404s_on_zero_rows():
                     "/api/conversations/ghost/archive", headers=_api_headers()
                 )
         assert response.status_code == 404
-    finally:
-        _restore_app(app, original)
-
-
-def test_list_conversations_passes_archived_view():
-    """view=archived is validated and forwarded to query_conversations."""
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversations = AsyncMock(return_value=[])
-    agent = MagicMock(storage=storage)
-
-    app, original = _prepare_app(agent)
-    try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.get(
-                    "/api/conversations?view=archived", headers=_api_headers()
-                )
-        assert response.status_code == 200
-        storage.query_conversations.assert_awaited_once_with(
-            "did:agent", limit=1000, view="archived"
-        )
     finally:
         _restore_app(app, original)
 

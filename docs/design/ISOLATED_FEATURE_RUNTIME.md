@@ -69,8 +69,10 @@ one-off would be a fourth snowflake.
   dependency conflict and pay no IPC cost).
 - A remote/distributed feature mesh — this is **localhost, same-host**
   isolation. (Cross-host is A2A's job; see §6.)
-- Sandboxing/security isolation as a primary aim (that's a bonus, not the
-  driver — the driver is *dependency* isolation).
+- OS sandboxing/security isolation. The runtime provides dependency, lifecycle,
+  namespace-ownership, and accidental-path containment; it does not make
+  mutually hostile same-UID feature code safe (the driver is *dependency*
+  isolation).
 
 ## 3. Proposed design
 
@@ -85,13 +87,58 @@ its `pyproject.toml` (read from installed metadata, no import required):
 ```toml
 [tool.kestrel.feature]
 runtime = "isolated-venv"          # default: "in-process"
-service = "kestrel_whatsapp_web.service:main"   # entry point of the service
-venv = "service"                   # path (relative to package) of the service's own venv/project
+service = "kestrel_whatsapp_web.service:main" # Python module:callable
+# A bare [project.scripts] name such as "kestrel-whatsapp-service" is also valid.
+# Optional standalone-only mutable selection. Hosted declarations must use an
+# absolute, already-built immutable operator venv.
+venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
 ```
 
 - `runtime = "in-process"` (default, omitted) → today's behavior, unchanged.
 - `runtime = "isolated-venv"` → the loader does **not** import the heavy
   package; it launches/connects the declared service in its own venv.
+
+`service` accepts two deliberately separate forms:
+
+- A bare portable console executable starts with an ASCII letter or digit and
+  may then contain ASCII letters, digits, `.`, `_`, and `-`. Separators, drive
+  syntax, leading punctuation, trailing dots, and Windows device names are
+  rejected. Core verifies and launches the same exact file below the venv's
+  `bin/` (or `Scripts/` on Windows), so metadata cannot make verification
+  inspect one wrapper while execution selects another.
+- A Python callable uses exactly `module:callable`. Every dotted module
+  component and the callable must be a non-keyword ASCII Python identifier;
+  separators, traversal, drive syntax, extra colons, and dotted or
+  expression-like callable targets are rejected. Core launches this form
+  through the current venv's interpreter with Python safe-path mode (`-P`) and
+  bytecode writes disabled (`-B`). The installed Kestrel SDK requires Python
+  3.11 or newer; an incompatible operator-prebuilt interpreter is quarantined
+  with a bounded configuration diagnostic. `-P` keeps the mutable child
+  working directory out of the import boundary without implying `-E`, so the
+  hosted `PYTHONUTF8` and `PYTHONIOENCODING` settings retain the same stdio
+  semantics as console-script services. Core separately strips `PYTHONPATH`,
+  `PYTHONHOME`, `PYTHONSTARTUP`, and inherited `VIRTUAL_ENV`. Before any Core
+  provisioning manifest is stamped, Core uses that same safe-path interpreter
+  to import the module, resolve the attribute, and prove it is callable. The
+  verification subprocess has a finite ten-second timeout, runs off the host
+  event loop, discards untrusted output, and distinguishes missing targets from
+  host execution failures. A callable has no console wrapper, so
+  console-wrapper relocation repair is not applicable.
+
+Core's child distribution and SDK freshness probes use the same `-P -B` boundary.
+Neither service verification nor a freshness decision can import a same-named
+module from the host process working directory.
+
+The operator-level `KESTREL_FEATURE_<NAME>_BIN` setting is a complete executable
+override and preserves the historical ability to omit `service`. When BIN is
+present, Core validates the hosted prebuilt executable but does not parse or
+forward unused service metadata. Operator symlinks (including Homebrew, Nix,
+`update-alternatives`, and `uv tool` layouts) are supported: Core resolves the
+chain once, requires the resolved target to be a regular executable with safe
+POSIX owner/mode custody, and launches that exact pinned target. A later link
+replacement cannot redirect the already-resolved proxy. If BIN is absent when
+launch paths are resolved, `service` is required and the appropriate grammar
+above is enforced before any venv preparation or child start.
 
 FeatureFeature's design/scaffold stage emits this table (and the `service/`
 sub-project layout) when a proposed feature declares conflicting deps.
@@ -111,7 +158,9 @@ feature, instead of importing the class it instantiates a **proxy `Feature`**:
 
 **venv resolution / provisioning** (Talon's discovery order, generalized):
 1. `KESTREL_FEATURE_<NAME>_VENV` / `..._BIN` env override.
-2. Configured path (host config).
+2. Configured path (host config). In hosted mode, metadata `venv` must be an
+   absolute, already-existing immutable prebuilt venv; relative paths are
+   rejected because they otherwise resolve through the shared Core CWD.
 3. Convention: `<package>/<venv>/.venv` (e.g. `service/.venv`) or sibling repo.
 4. On-demand provision: `uv venv` + `uv pip install` of the service project
    (opt-in; gives true "feature brings its own venv" UX).
@@ -139,6 +188,292 @@ while an old replica may still write it, and never perform this cleanup against
 another tenant's invisible rows.  New proxies continue to converge on legacy
 for as long as that row is visible.
 
+#### Hosted runtime namespace contract
+
+A standalone filesystem agent continues to place isolated runtime data beside
+its storage database. This includes AgentManager's existing per-agent SQLite
+layout: upgrading Core does not move its feature state or WhatsApp credentials.
+A pathless/shared-database hosted factory must instead construct `KestrelAgent`
+with all three of:
+
+```python
+from kestrel_sovereign.features.isolated_runtime import (
+    derive_isolated_runtime_namespace,
+)
+
+KestrelAgent(
+    ...,
+    isolated_runtime_root=operator_runtime_root,
+    isolated_runtime_namespace=derive_isolated_runtime_namespace(
+        authenticated_user_id,
+        companion_did,
+    ),
+    # Managed upgrade input only: the released hosted layout below this
+    # exact agent data directory. It is never used as a runtime fallback.
+    isolated_runtime_legacy_root=agent_data_dir / "feature_venvs",
+    isolated_runtime_hosted=True,
+)
+```
+
+The root is operator-owned; the namespace is a canonical relative path. The
+root's parent must already exist, so an absent volume mount cannot be replaced
+silently with ephemeral directories. Core may create the root leaf at `0700`.
+If the root already exists, Core verifies service-account ownership and rejects
+group/world-writable mode, but does not chmod operator state (a safe `0755`
+root remains `0755`).
+
+Core rejects traversal, aliases, reserved/case-colliding path components, and
+binds the namespace to the agent DID with a private ownership marker. Marker
+publication writes and fsyncs a same-directory temporary file, then installs it
+with exclusive link semantics and fsyncs the directory; a crash cannot expose
+a partial marker. An interrupted link/unlink tail is recovered only when the
+temporary name is a hard link to the complete marker. A missing, short, or
+otherwise corrupt visible marker is never guessed or automatically replaced:
+the operator must verify custody and remove the corrupt marker before retrying.
+Secure cleanup retains the valid ownership marker throughout its recursive
+sweep and removes it only as the final entry immediately before removing the
+namespace leaf. A partial filesystem failure therefore retains custody proof
+and can be retried after the operator corrects the underlying error.
+POSIX directory creation is descriptor-relative and no-follow, with inode/path
+binding checks before child launch. Multi-component namespaces are supported,
+but allocated namespace leaves must be prefix-free: secure cleanup refuses a
+tree containing any descendant ownership marker before deleting its contents.
+
+A namespace already bound to a different DID, an unsafe operator root, a
+symlink/path swap, or a corrupt marker is a containment/ownership violation and
+fails hosted agent discovery closed. Ordinary OS preparation failures such as
+ENOSPC or a transient descriptor limit instead make that optional isolated
+feature unavailable; they do not suppress the agent's mandatory features.
+
+`isolated_feature_data_dir` remains only a standalone compatibility input. It
+is not an adequate hosted containment boundary because it does not identify a
+trusted root separately from tenant-controlled namespace material. PostgreSQL
+agents constructed without a filesystem storage path are treated as hosted,
+so an old factory cannot silently recover the shared `agent_data/default`
+fallback.
+
+The default standalone/SQLite WhatsApp venv remains under
+`<agent>/feature_venvs/WhatsAppFeature/.venv`. Standalone launches preserve the
+historical child environment and cwd: `KESTREL_FEATURE_DATA_DIR` still takes
+precedence over `KESTREL_DATA_DIR`, which still takes precedence over the
+prebuilt/default venv's `sys.prefix.parent/whatsapp_service` fallback. Core does
+not inject its hosted canonical data-dir variable into a standalone child, so
+an upgrade neither relocates credentials nor changes Telegram/general feature
+HOME, TMPDIR, XDG, or relative-path behavior. Operators remain responsible for
+ensuring any process-wide standalone data-directory override is not shared by
+agents that require distinct mutable state.
+
+Released managed PostgreSQL agents also used that class-named layout under
+their resolved per-agent data directory. The managed factory supplies that
+exact old `feature_venvs` root as migration input. On first isolated-feature
+startup, Core validates the old root and class directory without following
+symlinks, verifies service-account custody, and atomically renames the complete
+class directory (venv plus service state/credentials) into the DID-owned stable
+namespace. A cross-device move, unsafe owner/mode, path race, or both-old-and-
+new collision retains the old tree (and both trees for a collision) and
+quarantines the optional feature for operator reconciliation; Core never
+copies, merges, overwrites, or deletes ambiguous credentials.
+Explicit agent offboarding checks this released per-agent root independently
+of feature discovery, so state for a feature that was never loaded/adopted is
+not orphaned while the new namespace is reported removed. A service-owned,
+non-writable released tree is securely swept without following symlinks;
+ambiguous custody or a nested namespace marker retains it and makes the whole
+offboarding outcome visibly retained.
+
+Moving a venv changes the absolute interpreter path embedded in console-script
+shebangs. Core therefore records the canonical absolute venv path in its
+private provisioning manifest. A directory rename observed in the current
+startup, a mismatched non-empty path stamp, or a console wrapper containing a
+foreign absolute interpreter is relocation evidence. When that evidence finds
+a stale wrapper, Core performs one full package reinstall at the adopted
+destination before child launch; an ordinary `--upgrade` is not accepted as
+repair because already-satisfied packages may retain stale scripts. If repair
+cannot complete, Core quarantines the optional feature rather than launch the
+unusable wrapper. Import, configuration, and preparation quarantines are also
+retained in the agent's rejected-contribution inventory, so detailed health is
+degraded and names the unavailable feature instead of reporting a silent
+healthy boot. A missing path stamp alone is not relocation evidence:
+unchanged pre-upgrade venvs are positively probed and their path is atomically
+backfilled without contacting an index. A migrated module-callable runtime (or
+an already-repaired console wrapper) is similarly verified and adopted without
+an unnecessary reinstall. The manifest is replaced atomically only after
+install/adoption and distribution verification succeed, so a crash retries a
+still-demonstrably-stale repair on restart. Service credentials and state beside
+`.venv` are preserved, and a valid same-path stamp remains idempotent.
+
+Every hosted feature receives a private mutable directory below that namespace
+for its working directory, home, temp, XDG config/data/cache, channel artifacts,
+provisioning manifest, and default venv. Hosted children inherit only a narrow
+execution/locale/CA/proxy environment (`HTTP_PROXY`, `HTTPS_PROXY`, and
+`NO_PROXY`, including lowercase spellings); feature configuration and secrets
+travel in the per-agent initialize handshake. Process-wide legacy Telegram,
+Twilio, WhatsApp, or `KESTREL_FEATURE_<NAME>_*` configuration is not silently
+dropped or forwarded across tenants: hosted discovery names the offending keys
+and refuses that optional feature until the values are moved into the agent's
+persisted feature configuration. `..._BIN` and `..._VENV` remain host-side
+artifact-selection inputs and are never exposed to the child. In hosted mode
+these process-wide overrides are accepted only when the executable or complete
+venv already exists; a venv carrying Core's provisioning manifest is refused.
+On POSIX, Core also requires the resolved venv root, `pyvenv.cfg`, bin
+directory, resolved interpreter target, and exact console wrapper target to be
+owned by root or the service account and not group/world writable. Interpreter
+and console targets must be regular executables. Secure operator-facing venv,
+configuration, interpreter, and console-wrapper symlinks remain supported and
+resolve to canonical artifacts before use. A resolved console target must stay
+within the already validated venv bin directory; executables outside that
+boundary require the explicit `..._BIN` contract. Core launches the pinned
+in-bin console target it validated, so replacing the public wrapper symlink
+cannot redirect a prepared feature.
+Core never creates, upgrades, or stamps a process-wide override. The validated
+operator-selected artifact may be shared, but every child process and mutable
+workspace/cache/state path remains namespace-distinct.
+
+Installed `[tool.kestrel.feature] venv = ...` metadata follows the same hosted
+immutable-prebuilt contract as `..._VENV`: the value must be absolute, the venv
+and executable interpreter must already exist, and the directory must not carry
+a Core provisioning manifest. Core revalidates it immediately before the
+mutation boundary and refuses a release-link or override-selection change when
+the revalidated canonical root differs from the path resolved for that enable
+attempt. No stale-tree launch-artifact, distribution, or SDK probe runs after
+that mismatch. Core never creates, upgrades, or stamps the immutable venv.
+Standalone agents retain their historical mutable and relative metadata
+behavior.
+
+The per-feature directory identity is a digest of the normalized distribution
+name and declared feature class. Entry-point module paths and service runner
+spellings are deployment details: refactoring either does not move tenant state
+or credentials. On the first startup with this stable identity, Core atomically
+renames a directory produced by the earlier distribution/class/entry-point/
+service digest before creating the stable workspace. If both old and stable
+trees exist, Core never merges or guesses between credential stores; it retains
+both and marks that optional feature unavailable pending operator custody
+reconciliation.
+
+Hosted venv SDK/distribution probes use the same narrow execution/locale/CA/
+proxy allowlist and receive no package credentials. Each probe has a finite
+ten-second subprocess timeout; a timeout remains fail-closed as an
+unverifiable distribution or unknown SDK rather than wedging agent startup.
+`uv` provisioning and feature build backends additionally receive only
+explicit `PIP_INDEX_*`, `UV_*INDEX*`, and named
+`UV_INDEX_<NAME>_{USERNAME,PASSWORD}` package-index settings. They do not
+inherit API/channel/tenant secrets, config-file or keyring paths, SSH-agent
+authority, or the host process environment. Private VCS dependencies that
+require those broader capabilities must be materialized as an operator-owned
+prebuilt venv rather than widening the hosted subprocess boundary. Core
+resolves `uv` to a trusted absolute host executable after excluding the mutable
+feature venv from the search path, and provisioning uses an explicit private
+per-agent/per-feature `UV_CACHE_DIR` in a dedicated `provisioning_cache`
+directory. That cache is distinct from the child's `XDG_CACHE_HOME`, is not
+exported to the child, and never relies on `HOME`, passwd-database discovery,
+or an operator uv cache.
+
+Namespace creation and ownership binding happen only during isolated-feature
+startup. QR GETs resolve the cached path read-only and perform their filesystem
+stat off the event loop; QR events use the already-prepared cached directory and
+offload atomic file replacement/unlink work. A read or event therefore never
+materializes a missing tenant namespace.
+
+Explicit tenant offboarding is the runtime-state deletion boundary. Normal host
+shutdown, restart, lifespan teardown, ordinary `DELETE /api/agents/{name}`, and
+ordinary child termination stop/unpublish agents but retain every hosted
+namespace. The DELETE compatibility default also leaves `multi_agent.toml`
+registration intact, so a later host restart may start the agent again.
+`DELETE /api/agents/{name}?offboard_runtime=true` is the explicit destructive
+contract. It is available only to config-driven deployments. Core first resolves
+the registered local DID without mutating configuration, refuses an absent or
+ambiguous identity, then removes the persisted registration before runtime
+deletion. A stopped/never-loaded registered agent follows the same DID-scoped
+offboarding admission without being constructed. This prevents credential-less
+autostart resurrection and avoids guessing a namespace from a routing name;
+auto-discovery deployments are refused because safely deprovisioning them would
+also require an explicit primary-storage policy.
+Approved `terminate_child(..., offboard_runtime=true)` calls and rollback of an
+uncommitted spawn carry the same separate destructive intent. After durable
+shutdown, AgentManager verifies the ownership
+marker against the removed DID and deletes the namespace with
+descriptor-relative, no-follow recursion. A foreign/corrupt or nested marker,
+unsafe path, or unsupported secure-deletion platform retains the tree and makes
+offboarding fail visibly. Filesystem deletion is admitted while removal is
+serialized but awaited only after manager, A2A, and scheduler lifecycle locks
+are released. The administrative wait is bounded by
+`KESTREL_RUNTIME_OFFBOARD_TIMEOUT_S`, whose default is 30 seconds independently
+of the ordinary five-second agent-shutdown bound. Timeout/cancellation
+unpublishes the stopped agent, retains the exact cleanup worker for terminal
+draining, and returns sanitized metadata with `runtime_cleanup_state=pending`:
+the cleanup may still finish, so this is not a claim of permanent retention.
+A completed cleanup failure instead reports `runtime_cleanup_state=retained`.
+Neither response exposes the host path. If shutdown is quarantined, its retained
+reaper deletes only when the original caller carried that explicit intent and
+durable shutdown later succeeds. The initiating DELETE/tool call immediately
+receives a typed pending-custody outcome rather than claiming deletion; the
+reaper remains the sole owner of eventual deletion. The `terminate_child` tool
+defaults to state retention and is permission-gated `ALWAYS_ASK` because its
+explicit `offboard_runtime=true` variant is irreversible and ordinary ASK can
+be promoted by auto/demo policy. For that destructive variant,
+the tool reports pending/retained cleanup as partial success: the named child is
+stopped and must not be retried, while any named child or descendant with
+pending/retained runtime custody is identified separately for operator
+reconciliation.
+Storage-derived standalone/SQLite trees are outside hosted namespace cleanup
+and retain their existing storage lifecycle policy. A destructive request for
+such an agent therefore reports `runtime_cleanup_state=not_hosted`; it never
+claims the storage-backed tree was removed. If the exact owned hosted namespace
+is already absent, Core reports `runtime_cleanup_state=already_absent`. Both are
+typed no-op custody outcomes (`runtime_offboarded=false`) rather than a false
+deprovisioning success. When a concurrent lifecycle operation leaves only
+routing and parent-edge absence as evidence, Core instead reports
+`runtime_cleanup_state=custody_unknown`: neither runtime deletion nor retention
+was observed, so positive runtime-retention fields are omitted unless another
+typed outcome independently proves retention. These three custody states keep
+routing withdrawal and persisted-registration removal truthful and separate
+from filesystem custody.
+
+Tool results and spawn-history records finalized from routing absence carry
+`finalized_from_absence=true` so the operator-facing evidence remains durable.
+
+For cascade results, `runtime_already_absent` and
+`hosted_runtime_configured` describe the named child when its no-op state is
+known. Descendant-only no-op outcomes never populate those named-child fields;
+Core omits both when the named child has no independently scoped no-op state.
+For a removed named child, `runtime_cleanup_state` likewise uses only its own
+no-op outcome and otherwise reports `removed`, regardless of descendant state.
+For retained cascades it uses the named child's own `pending` or `retained`
+outcome; aggregate descendant work remains visible through
+`runtime_cleanup_pending` and `retained_agents`. The additive `pending_agents`
+and `retained_only_agents` fields preserve each retained agent's state so only
+pending cleanup is described as potentially completing.
+Descendant `termination_not_performed` outcomes remain visible through
+`surviving_subtree_agents`, retry fields, and `runtime_custody_known=false`; the
+named child's `runtime_cleanup_state` changes to `termination_not_performed`
+only when termination was not performed for that named child itself.
+When retained and no-op outcomes coexist, the backward-compatible
+`runtime_custody_code` names the stronger retained outcome and
+`runtime_custody_codes` lists both facts for operator reconciliation.
+
+Core-created standalone feature, workspace, and channel-artifact directories
+are private `0700`; a pre-existing storage parent (including process CWD) is
+operator-owned and its mode is never changed.
+
+#### Same-service-account trust boundary
+
+The hosted namespace contract is not an operating-system sandbox. Isolated
+feature subprocesses normally run as the same service account as Core and each
+other. POSIX `0700` prevents access by other UIDs; it cannot prevent a malicious
+same-UID child from traversing a sibling namespace once it learns or guesses a
+path. Absolute paths for only the child's own workspace are unavoidable launch
+inputs (`cwd`, HOME/XDG/temp, and the feature data directory), and Core does not
+publish the operator root, sibling paths, or retained host paths through its
+HTTP error metadata. Those paths are locations, not capabilities.
+
+Feature packages installed into one Core service must therefore be trusted at
+the service-account boundary. A hosted operator that runs mutually distrustful
+or tenant-supplied feature code must put each trust domain behind a real OS
+boundary—separate UID, container, VM, or an equivalent mandatory sandbox—and
+give it only its own mounted namespace. Namespace validation, no-follow file
+operations, ownership markers, and private modes remain defense in depth
+against traversal bugs, symlink swaps, accidental collision, and other Unix
+accounts; they are not claimed to isolate hostile peers sharing a UID.
+
 ### 3.3 IPC + lifecycle contract (SDK)
 
 A shared contract in `kestrel-sovereign-sdk` so every isolated feature (and,
@@ -161,7 +496,8 @@ over time, Talon/MCP) uses one substrate:
   WhatsApp message) are JSON-RPC notifications service → host, which the proxy
   routes into the normal path (`ChannelFeature.handle_inbound`, signals, etc.).
 - **State/secret ownership**: the service owns its own data dir / session DB
-  (e.g. WhatsApp linked-device credentials) under the agent data dir.
+  (e.g. WhatsApp linked-device credentials) under the standalone agent data
+  directory or the explicit hosted runtime namespace described above.
 
 #### External-ingress transition fence
 
@@ -250,9 +586,10 @@ send + receive via neonize):
   same-host. **Resolved.**
 - **venv provisioning** → **resolved: per-agent, auto-provisioned**. Each agent
   gets its **own copy** of the feature venv, created on demand (`uv venv` +
-  `uv pip install` of the service project) under the agent data dir
-  (`<agent_data>/feature_venvs/<feature>/`). An explicit path override stays as
-  a dev convenience, but production provisions per agent. **Resolved.**
+  `uv pip install` of the service project) under its standalone data root or
+  explicit hosted namespace (`<runtime>/feature_venvs/<feature>/`). An explicit
+  path override stays as a dev convenience and is never mutated when it is an
+  operator-prebuilt environment. **Resolved.**
 - **Service scope** → **resolved: per-agent**. One service instance per agent
   (each owns its venv copy and its session DB, e.g. its own WhatsApp link).
   Per-host sharing is explicitly out for now. **Resolved.**

@@ -88,8 +88,8 @@ class SponsorKeyStorage:
         await self._db.execute(
             """
             INSERT OR IGNORE INTO service_providers
-            (id, name, supports_sub_accounts)
-            VALUES (?, ?, ?)
+            (id, name, supports_sub_accounts, created_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 provider_id,

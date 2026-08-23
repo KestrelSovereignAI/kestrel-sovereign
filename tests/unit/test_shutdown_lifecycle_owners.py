@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from starlette.routing import Mount, Route
 
 from kestrel_sovereign import cli, main, server
@@ -22,7 +22,11 @@ from kestrel_sovereign.kestrel_agent import (
     await_lifecycle_task_completion,
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
-from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.agent_manager import (
+    AgentManager,
+    InflightRuntimeOffboarding,
+    RuntimeOffboardingRetainedError,
+)
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
@@ -359,6 +363,84 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
     assert str(failure) == "host failure"
+
+
+@pytest.mark.asyncio
+async def test_lifespan_consumer_preserves_grouped_cancellation_and_failure(
+    monkeypatch,
+) -> None:
+    """Grouped fleet cancellation remains cancellation through teardown."""
+
+    class _GroupedManager:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        async def shutdown_all(self) -> None:
+            self.shutdown_calls += 1
+            raise BaseExceptionGroup(
+                "cancelled fleet failure",
+                [
+                    asyncio.CancelledError(),
+                    RuntimeError("agent cleanup failed"),
+                ],
+            )
+
+    async def noop(_app) -> None:
+        return None
+
+    manager = _GroupedManager()
+    app = FastAPI()
+    app.state.agent_manager = manager
+    app.state.startup_cleanup_agent_manager = None
+    app.state.agent = None
+    monkeypatch.setattr(server, "_shutdown_host_scheduler", noop)
+    monkeypatch.setattr(server, "_shutdown_host_features", noop)
+    monkeypatch.setattr(server, "_shutdown_phoenix", noop)
+
+    cancelled, failure = await server._shutdown_server_resources(app)
+
+    assert cancelled is True
+    assert isinstance(failure, ExceptionGroup)
+    assert len(failure.exceptions) == 1
+    assert isinstance(failure.exceptions[0], RuntimeError)
+    assert str(failure.exceptions[0]) == "agent cleanup failed"
+
+    with pytest.raises(asyncio.CancelledError):
+        async with server._lifespan_teardown_owner(app):
+            pass
+    assert manager.shutdown_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_startup_rollback_consumer_preserves_grouped_cancellation_and_failure(
+    caplog,
+) -> None:
+    """Startup rollback reports cancellation without dropping its failure leaf."""
+
+    class _GroupedManager:
+        async def shutdown_all(self) -> None:
+            raise BaseExceptionGroup(
+                "cancelled startup rollback",
+                [
+                    asyncio.CancelledError(),
+                    OSError("rollback cleanup failed"),
+                ],
+            )
+
+    cancelled = await server._rollback_startup_agent_manager(_GroupedManager())
+
+    assert cancelled is True
+    warning = next(
+        record
+        for record in caplog.records
+        if "startup rollback did not fully shut down" in record.getMessage()
+    )
+    assert warning.exc_info is not None
+    logged_failure = warning.exc_info[1]
+    assert isinstance(logged_failure, ExceptionGroup)
+    assert len(logged_failure.exceptions) == 1
+    assert isinstance(logged_failure.exceptions[0], OSError)
+    assert str(logged_failure.exceptions[0]) == "rollback cleanup failed"
 
 
 @pytest.mark.asyncio
@@ -1442,6 +1524,157 @@ async def test_terminal_quarantine_drain_seals_late_bounded_removal_handoffs() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_kind", ("authorized", "registered"))
+async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
+    monkeypatch,
+    tmp_path,
+    identity_kind,
+) -> None:
+    """No identity cleanup task can appear after a drain's empty seal point."""
+
+    from kestrel_sovereign.features import isolated_runtime
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+    manager = AgentManager(base_data_dir=tmp_path)
+    did = f"did:test:sealed-{identity_kind}-offboarding"
+    name = "Cold"
+    if identity_kind == "authorized":
+        manager._seed_scheduler_authority(
+            {
+                did: (
+                    name,
+                    LocalAgentConfig(
+                        data_dir=f"agent_data/{identity_kind}",
+                        port=8801,
+                        autostart=False,
+                    ),
+                )
+            }
+        )
+    cleanup = MagicMock(side_effect=AssertionError("post-seal cleanup started"))
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_isolated_runtime_namespace",
+        cleanup,
+    )
+    seal_visible = asyncio.Event()
+    allow_drain_scan = asyncio.Event()
+    real_set_seal = manager._set_quarantined_shutdown_handoffs_sealed
+
+    async def expose_empty_seal(sealed: bool) -> bool:
+        cancelled = await real_set_seal(sealed)
+        if sealed:
+            seal_visible.set()
+            await allow_drain_scan.wait()
+        return cancelled
+
+    monkeypatch.setattr(
+        manager,
+        "_set_quarantined_shutdown_handoffs_sealed",
+        expose_empty_seal,
+    )
+    drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
+    try:
+        await asyncio.wait_for(seal_visible.wait(), timeout=1.0)
+        if identity_kind == "registered":
+            registered_config = LocalAgentConfig(
+                data_dir=f"agent_data/{identity_kind}",
+                port=8801,
+                autostart=False,
+            )
+            registered_config.resolve_data_dir(tmp_path).mkdir(parents=True)
+            kwargs = {
+                "known_agent_id": did,
+                "known_agent_config": registered_config,
+            }
+        else:
+            kwargs = {}
+        assert await asyncio.wait_for(
+            manager.remove_agent(name, offboard_runtime=True, **kwargs),
+            timeout=1.0,
+        ) is False
+        assert manager._inflight_runtime_offboardings == {}
+        cleanup.assert_not_called()
+        assert did not in manager._scheduler_revoked_dids
+        assert name not in manager._scheduler_revoked_names
+        if identity_kind == "authorized":
+            assert manager.is_scheduler_agent_authorized(did)
+            assert manager.scheduler_authority_for(did)[0] == name
+        else:
+            assert manager.scheduler_authority_for(did) is None
+        assert not drain.done()
+    finally:
+        allow_drain_scan.set()
+
+    assert await asyncio.wait_for(drain, timeout=1.0) is False
+    assert manager._quarantined_shutdown_handoffs_sealed is False
+    assert manager._inflight_runtime_offboardings == {}
+    cleanup.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_type"),
+    (
+        ("not_hosted", "RuntimeOffboardingNotPerformedError"),
+        ("invalid", "TypeError"),
+    ),
+)
+async def test_terminal_drain_validates_inflight_runtime_cleanup_outcome(
+    monkeypatch,
+    outcome,
+    expected_type,
+) -> None:
+    """Joining an inflight worker cannot bless a non-removal or invalid return."""
+
+    from kestrel_sovereign.features import isolated_runtime
+
+    manager = AgentManager()
+    agent = SimpleNamespace(agent_id="did:test:terminal-inflight-outcome")
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_cleanup(_agent):
+        started.set()
+        release.wait(timeout=5)
+        if outcome == "not_hosted":
+            return isolated_runtime.RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+        return None
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_agent_runtime_namespace",
+        delayed_cleanup,
+    )
+    record = manager._start_agent_runtime_offboarding(
+        name="Hosted",
+        agent=agent,
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
+        for _ in range(100):
+            if manager._quarantined_shutdown_handoffs_sealed:
+                break
+            await asyncio.sleep(0)
+        assert manager._quarantined_shutdown_handoffs_sealed
+        release.set()
+        with pytest.raises(ExceptionGroup) as raised:
+            await drain
+    finally:
+        release.set()
+
+    assert record.task.done()
+    assert any(
+        type(error).__name__ == expected_type
+        for error in raised.value.exceptions
+    )
+    assert manager._inflight_runtime_offboardings == {}
+    assert manager._quarantined_shutdown_handoffs_sealed is False
+
+
+@pytest.mark.asyncio
 async def test_terminal_quarantine_drain_reports_precompleted_reaper_failure() -> None:
     """Unsafe metadata from a precompleted reaper remains terminal evidence."""
 
@@ -1461,7 +1694,11 @@ async def test_terminal_quarantine_drain_reports_precompleted_reaper_failure() -
     with pytest.raises(ExceptionGroup, match="quarantined shutdown reapers") as exc_info:
         await manager.drain_quarantined_shutdowns()
 
-    assert reaper_id in str(exc_info.value.exceptions[0])
+    rendered = str(exc_info.value.exceptions[0])
+    assert reaper_id in rendered
+    assert "unacknowledged cleanup failure" in rendered
+    assert "(RuntimeError)" not in rendered
+    assert "late durable release failed" not in rendered
     assert reaper_id in manager._unsafe_quarantined_shutdown_failures
 
 
@@ -1493,7 +1730,7 @@ async def test_quarantined_shutdown_drain_finishes_cleanup_after_cancellation() 
 
 @pytest.mark.asyncio
 async def test_quarantine_drain_preserves_cancellation_after_reaper_failure() -> None:
-    """Caller cancellation wins only after the failing reaper has settled."""
+    """Caller cancellation and the settled failure are both preserved."""
 
     manager = AgentManager()
     cleanup_entered = asyncio.Event()
@@ -1514,10 +1751,99 @@ async def test_quarantine_drain_preserves_cancellation_after_reaper_failure() ->
     drain.cancel()
     allow_failure.set()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(BaseExceptionGroup) as exc_info:
         await asyncio.wait_for(drain, timeout=1.0)
+    leaves: list[BaseException] = []
+
+    def collect(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup):
+            for nested in error.exceptions:
+                collect(nested)
+        else:
+            leaves.append(error)
+
+    collect(exc_info.value)
+    assert any(isinstance(error, asyncio.CancelledError) for error in leaves)
+    assert any(isinstance(error, RuntimeError) for error in leaves)
     assert manager._quarantined_shutdown_reapers == {}
     assert reaper_id in manager._unsafe_quarantined_shutdown_failures
+
+
+@pytest.mark.asyncio
+async def test_terminal_drain_sanitizes_cancelled_worker_with_prior_failure(
+    monkeypatch,
+) -> None:
+    """A cancellation race cannot discard failures or reflect host paths."""
+
+    manager = AgentManager()
+    private_path = "/private/tenant/runtime/credential"
+
+    async def fail_with_private_path() -> None:
+        raise OSError(private_path)
+
+    failed_task = asyncio.create_task(fail_with_private_path())
+    manager._retain_quarantined_cleanup(
+        name="unsafe",
+        agent_id="did:test:unsafe",
+        task=failed_task,
+    )
+    with pytest.raises(OSError):
+        await failed_task
+    await asyncio.sleep(0)
+
+    cleanup_task = asyncio.create_task(asyncio.Event().wait())
+    record_key = id(cleanup_task)
+    manager._inflight_runtime_offboardings[record_key] = (
+        InflightRuntimeOffboarding(
+            agent_name="Hosted",
+            agent_id="did:test:hosted",
+            runtime_path=Path(private_path),
+            task=cleanup_task,
+        )
+    )
+    cleanup_task.add_done_callback(
+        lambda _task: manager._inflight_runtime_offboardings.pop(record_key, None)
+    )
+
+    from kestrel_sovereign.multi_agent import agent_manager as manager_module
+
+    real_join = manager_module.await_lifecycle_task_completion
+    cleanup_join_started = asyncio.Event()
+
+    async def observe_join(task):
+        if task is cleanup_task:
+            cleanup_join_started.set()
+        return await real_join(task)
+
+    monkeypatch.setattr(
+        manager_module,
+        "await_lifecycle_task_completion",
+        observe_join,
+    )
+    drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
+    await asyncio.wait_for(cleanup_join_started.wait(), timeout=1.0)
+    cleanup_task.cancel()
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await asyncio.wait_for(drain, timeout=1.0)
+
+    leaves: list[BaseException] = []
+
+    def collect(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup):
+            for nested in error.exceptions:
+                collect(nested)
+        else:
+            leaves.append(error)
+
+    collect(exc_info.value)
+    assert len(leaves) == 2
+    assert all(isinstance(error, Exception) for error in leaves)
+    assert any("CancelledError" in str(error) for error in leaves)
+    rendered = " | ".join(str(error) for error in leaves)
+    assert private_path not in rendered
+    assert "Cannot nest BaseExceptions" not in rendered
+    assert manager._inflight_runtime_offboardings == {}
 
 
 @pytest.mark.asyncio
@@ -1623,6 +1949,9 @@ async def test_manager_shutdown_all_drains_quarantined_reaper_before_returning(
     agent = ObservableHostileShutdownAgent()
     manager._agents["hostile"] = agent
     manager._agent_names[agent.agent_id] = "hostile"
+    manager._offboard_agent_runtime_namespace = AsyncMock(
+        return_value=(False, None)
+    )
     removal_completed = asyncio.Event()
 
     async def release_budget(name: str) -> None:
@@ -1654,6 +1983,275 @@ async def test_manager_shutdown_all_drains_quarantined_reaper_before_returning(
     assert all(
         not item["pending"] for item in manager.quarantined_shutdowns().values()
     )
+    manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_offboarding_intent_survives_quarantined_reaper_handoff(
+    monkeypatch,
+) -> None:
+    """A bounded deprovision carries deletion intent into its retained reaper."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
+    )
+
+    class ObservableHostileShutdownAgent(_CancellationHostileShutdownAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reaper_handed_off = asyncio.Event()
+
+        def handoff_shutdown_to_reaper(self, shutdown_task):
+            reaper = super().handoff_shutdown_to_reaper(shutdown_task)
+            self.reaper_handed_off.set()
+            return reaper
+
+    manager = AgentManager()
+    agent = ObservableHostileShutdownAgent()
+    manager._agents["hostile"] = agent
+    manager._agent_names[agent.agent_id] = "hostile"
+    manager._offboard_agent_runtime_namespace = AsyncMock(
+        return_value=(False, None)
+    )
+
+    removal = asyncio.create_task(
+        manager.remove_agent("hostile", offboard_runtime=True)
+    )
+    try:
+        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=1.0)
+        with pytest.raises(RuntimeOffboardingRetainedError) as raised:
+            await asyncio.wait_for(removal, timeout=1.0)
+        assert raised.value.metadata["agent_removed"] is True
+        assert raised.value.metadata["runtime_cleanup_pending"] is True
+        assert raised.value.metadata["runtime_cleanup_state"] == "pending"
+        assert manager.get_agent("hostile") is None
+        manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+        agent.allow_shutdown_finish.set()
+        assert await manager.drain_quarantined_shutdowns() is False
+    finally:
+        agent.allow_shutdown_finish.set()
+        if not removal.done():
+            await asyncio.wait_for(removal, timeout=1.0)
+
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+
+
+@pytest.mark.asyncio
+async def test_handed_off_offboarding_failure_is_owned_once_and_remains_visible(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
+    )
+
+    class ObservableHostileShutdownAgent(_CancellationHostileShutdownAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reaper_handed_off = asyncio.Event()
+
+        def handoff_shutdown_to_reaper(self, shutdown_task):
+            reaper = super().handoff_shutdown_to_reaper(shutdown_task)
+            self.reaper_handed_off.set()
+            return reaper
+
+    manager = AgentManager()
+    agent = ObservableHostileShutdownAgent()
+    manager._agents["hostile"] = agent
+    manager._agent_names[agent.agent_id] = "hostile"
+    retained_failure = OSError("private retained runtime path")
+    manager._offboard_agent_runtime_namespace = AsyncMock(
+        return_value=(False, retained_failure)
+    )
+
+    removal = asyncio.create_task(
+        manager.remove_agent("hostile", offboard_runtime=True)
+    )
+    try:
+        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=1.0)
+        with pytest.raises(RuntimeOffboardingRetainedError) as pending:
+            await asyncio.wait_for(removal, timeout=1.0)
+        assert pending.value.metadata["runtime_cleanup_state"] == "pending"
+        assert manager._inflight_runtime_offboardings == {}
+
+        agent.allow_shutdown_finish.set()
+        with pytest.raises(ExceptionGroup, match="quarantined shutdown reapers"):
+            await manager.drain_quarantined_shutdowns()
+    finally:
+        agent.allow_shutdown_finish.set()
+        if not removal.done():
+            with pytest.raises(RuntimeOffboardingRetainedError):
+                await asyncio.wait_for(removal, timeout=1.0)
+
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    assert manager.get_agent("hostile") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ("removed", "not_hosted"))
+async def test_quarantined_offboard_preserves_cancellation_on_every_custody_outcome(
+    monkeypatch,
+    outcome,
+) -> None:
+    """A successful/no-op worker cannot erase cancellation of its joiner."""
+
+    from kestrel_sovereign.features import isolated_runtime
+    from kestrel_sovereign.multi_agent.agent_manager import (
+        RuntimeOffboardingNotPerformedError,
+    )
+
+    manager = AgentManager()
+    agent = SimpleNamespace(agent_id=f"did:test:cancelled-{outcome}")
+    manager._agent_names[agent.agent_id] = "Hosted"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def finish_after_cancellation(_agent):
+        entered.set()
+        release.wait(timeout=5)
+        return (
+            isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+            if outcome == "removed"
+            else isolated_runtime.RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+        )
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_agent_runtime_namespace",
+        finish_after_cancellation,
+    )
+    operation = asyncio.create_task(
+        manager._offboard_agent_runtime_namespace(agent)
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        operation.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        cancelled, failure = await operation
+    finally:
+        release.set()
+
+    assert cancelled is True
+    if outcome == "removed":
+        assert failure is None
+    else:
+        assert isinstance(failure, RuntimeOffboardingNotPerformedError)
+        assert failure.cleanup_state == "not_hosted"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_successful_quarantined_offboard_is_terminally_accounted(
+    monkeypatch,
+) -> None:
+    """Terminal drain sees cancellation even when the deletion itself succeeds."""
+
+    from kestrel_sovereign.features import isolated_runtime
+
+    manager = AgentManager()
+    agent = SimpleNamespace(agent_id="did:test:cancelled-successful-offboard")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def finish_after_cancellation(_agent):
+        entered.set()
+        release.wait(timeout=5)
+        return isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_agent_runtime_namespace",
+        finish_after_cancellation,
+    )
+
+    async def retained_owner() -> None:
+        cancelled, failure = await manager._offboard_agent_runtime_namespace(agent)
+        if failure is not None:
+            raise failure
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    owner = asyncio.create_task(retained_owner())
+    manager._retain_quarantined_cleanup(
+        name="Hosted",
+        agent_id=agent.agent_id,
+        task=owner,
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        owner.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(ExceptionGroup, match="quarantined shutdown reapers"):
+            await manager.drain_quarantined_shutdowns()
+    finally:
+        release.set()
+
+    retained = manager.quarantined_shutdowns()
+    assert len(retained) == 1
+    assert next(iter(retained.values()))["failure"] == (
+        "shutdown reaper was cancelled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_endpoint_maps_real_shutdown_handoff_to_pending_custody(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from kestrel_sovereign.endpoints.models import delete_agent
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    agent = _CancellationHostileShutdownAgent()
+    manager._agents["hostile"] = agent
+    manager._agent_names[agent.agent_id] = "hostile"
+    manager._offboard_agent_runtime_namespace = AsyncMock(return_value=(False, None))
+    config_path = tmp_path / "multi_agent.toml"
+    config = MultiAgentConfig(
+        agents={
+            "hostile": LocalAgentConfig(
+                data_dir="agent_data/hostile",
+                port=8801,
+            )
+        }
+    )
+    config.save(config_path)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                agent_manager=manager,
+                multi_agent_config_path=config_path,
+                multi_agent_config=config,
+            )
+        )
+    )
+
+    try:
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "hostile",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        assert raised.value.detail["agent_removed"] is True
+        assert raised.value.detail["runtime_cleanup_state"] == "pending"
+        assert manager.get_agent("hostile") is None
+        assert MultiAgentConfig.from_file(config_path).agents == {}
+        manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+        agent.allow_shutdown_finish.set()
+        assert await manager.drain_quarantined_shutdowns() is False
+    finally:
+        agent.allow_shutdown_finish.set()
+
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
 
 
 @pytest.mark.asyncio
@@ -1796,8 +2394,12 @@ async def test_terminal_drain_retains_prelinearization_ordinary_release_failure(
 
     with pytest.raises(ExceptionGroup, match="ordinary budget releases") as first:
         await asyncio.wait_for(drain, timeout=1.0)
-    assert "ordinary refund failed before drain linearization" in str(
-        first.value.exceptions[0]
+    rendered_failure = str(first.value.exceptions[0])
+    assert "ordinary-budget-release:1" in rendered_failure
+    assert "unacknowledged cleanup failure" in rendered_failure
+    assert "(RuntimeError)" not in rendered_failure
+    assert "ordinary refund failed before drain linearization" not in (
+        rendered_failure
     )
 
     failures = manager.unsafe_removal_budget_release_failures()
@@ -2146,12 +2748,19 @@ async def test_shutdown_all_accepts_false_after_concurrent_removal_fully_removed
     shutdown_waiting_to_remove_b = asyncio.Event()
     allow_shutdown_to_remove_b = asyncio.Event()
 
-    async def gated_remove_agent(name: str) -> bool:
+    async def gated_remove_agent(
+        name: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
         current = asyncio.current_task()
         if name == "B" and current is not None and current.get_name() == "fleet-shutdown":
             shutdown_waiting_to_remove_b.set()
             await allow_shutdown_to_remove_b.wait()
-        return await original_remove_agent(name)
+        return await original_remove_agent(
+            name,
+            offboard_runtime=offboard_runtime,
+        )
 
     manager.remove_agent = gated_remove_agent
     direct_removal = asyncio.create_task(
@@ -2393,7 +3002,12 @@ async def test_manager_shutdown_all_retains_tracking_for_false_removal(
     manager._child_mandates = {"stuck": mandate}
     attempted: list[str] = []
 
-    async def return_false(name: str) -> bool:
+    async def return_false(
+        name: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
+        assert offboard_runtime is False
         attempted.append(name)
         return False
 
@@ -2727,7 +3341,12 @@ async def test_shutdown_all_preserves_tracking_when_quarantined_refund_restores_
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
 
-    async def hand_off_then_restore(name: str) -> bool:
+    async def hand_off_then_restore(
+        name: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
+        assert offboard_runtime is False
         assert name == child_name
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
@@ -2772,7 +3391,12 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
     refund_started = asyncio.Event()
     allow_refund = asyncio.Event()
 
-    async def hand_off_pending_refund(name: str) -> bool:
+    async def hand_off_pending_refund(
+        name: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
+        assert offboard_runtime is False
         assert name == child_name
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
@@ -2819,7 +3443,12 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
     refund_started = asyncio.Event()
     allow_failure = asyncio.Event()
 
-    async def hand_off_then_restore(name: str) -> bool:
+    async def hand_off_then_restore(
+        name: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
+        assert offboard_runtime is False
         assert name == child_name
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name

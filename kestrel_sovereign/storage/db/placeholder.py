@@ -194,9 +194,20 @@ def normalize_schema(schema: str, backend: str) -> str:
         schema = re.sub(r'\bTIMESTAMP WITH TIME ZONE\b', 'TEXT', schema, flags=re.IGNORECASE)
         schema = re.sub(r'\bTIMESTAMPTZ\b', 'TEXT', schema, flags=re.IGNORECASE)
         schema = re.sub(r'\bJSONB?\b', 'TEXT', schema, flags=re.IGNORECASE)
-        # Remove PostgreSQL-specific clauses
-        schema = re.sub(r'\s+DEFAULT\s+NOW\(\)', '', schema, flags=re.IGNORECASE)
-        schema = re.sub(r'\s+DEFAULT\s+CURRENT_TIMESTAMP', '', schema, flags=re.IGNORECASE)
+        # `NOW()` is the PostgreSQL spelling of a clause SQLite HAS. Translate
+        # it rather than dropping it: dropping leaves the column with no default
+        # at all, so an INSERT that omits it stores NULL on SQLite and a real
+        # timestamp on PostgreSQL — a silent divergence in a column readers
+        # date (#3048).
+        schema = re.sub(
+            r'\bDEFAULT\s+NOW\(\)', 'DEFAULT CURRENT_TIMESTAMP', schema,
+            flags=re.IGNORECASE,
+        )
+        # `CURRENT_TIMESTAMP` is not PostgreSQL-specific at all — it is standard
+        # SQL and SQLite supports it natively. Stripping it was the same defect
+        # with nothing to translate: measured on a live agent database, 55 of 70
+        # TIMESTAMP columns had no default where the authored schema gives 28 of
+        # them one.
         return schema
     
     elif backend == 'postgres':

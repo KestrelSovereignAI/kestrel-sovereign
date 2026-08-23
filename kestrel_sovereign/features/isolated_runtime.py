@@ -4,34 +4,43 @@ A feature distribution opts into out-of-venv execution via its pyproject:
 
     [tool.kestrel.feature]
     runtime = "isolated-venv"
-    service = "kestrel-whatsapp-web"   # runnable: a console-script name, or "module:func"
+    service = "kestrel_whatsapp.service:main" # console name or module:callable
     project = "service"                # install target for the venv (path/dist); defaults to the distribution
     # venv  = "/abs/path/.venv"        # optional explicit venv-path override
 
-`service` is the thing to RUN (resolved from the per-agent venv's bin/ as a
-console script, or executed as a "module:func" callable). `project` is the
-thing to INSTALL. They are deliberately distinct so the runnable is never
-mistaken for a pip target or a `python -m` module.
+`service` is the thing to RUN: either a bare portable console-script name
+resolved from the per-agent venv's bin/, or a validated Python
+``module:callable`` target launched through that venv's interpreter. `project`
+is the thing to INSTALL. They are deliberately distinct so the runnable is
+never mistaken for a pip target or a ``python -m`` module. Console artifacts
+are verified at the exact path later launched; callables do not use a wrapper.
 """
 
 import asyncio
+import base64
+import errno
 import hashlib
+import hmac
 import inspect
 import json
+import keyword
 import logging
 import math
 import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
 from uuid import uuid4
 
@@ -59,6 +68,7 @@ from kestrel_sovereign.features.channels.route_ownership import (
 )
 
 logger = logging.getLogger(__name__)
+_CORE_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def canonical_telegram_bot_id(value: object) -> str:
@@ -1968,6 +1978,34 @@ _CHILD_SDK_PROBE = (
     "    return 'unknown'\n"
     "print(v())\n"
 )
+_ISOLATED_PYTHON_SAFE_PATH_FLAG = "-P"
+_NO_BYTECODE_FLAG = "-B"
+_CALLABLE_TARGET_VERIFICATION_TIMEOUT_S = 10.0
+_FRESHNESS_PROBE_TIMEOUT_S = 10.0
+_CALLABLE_TARGET_MISSING_MODULE_EXIT = 40
+_CALLABLE_TARGET_MISSING_ATTRIBUTE_EXIT = 41
+_CALLABLE_TARGET_NOT_CALLABLE_EXIT = 42
+_CALLABLE_TARGET_UNVERIFIABLE_EXIT = 43
+_CALLABLE_TARGET_UNSUPPORTED_INTERPRETER_EXIT = 44
+
+
+def _isolated_python_command(python_path: Path, source: str) -> list[str]:
+    """Run supported feature Python without cwd injection or bytecode writes.
+
+    The installed SDK requires Python 3.11+, where ``-P`` provides safe-path
+    behavior without implying ``-E``. Hosted ``PYTHONUTF8`` and
+    ``PYTHONIOENCODING`` therefore retain their documented stdio semantics.
+    The caller supplies an environment with ``PYTHONPATH`` and the other
+    interpreter-shadowing variables removed.
+    """
+
+    return [
+        str(python_path),
+        _ISOLATED_PYTHON_SAFE_PATH_FLAG,
+        _NO_BYTECODE_FLAG,
+        "-c",
+        source,
+    ]
 
 
 @dataclass(frozen=True)
@@ -2005,7 +2043,10 @@ class _FeatureDistributionProbe:
 
 
 def _venv_feature_distribution_probe(
-    python_path: Path, distribution: str
+    python_path: Path,
+    distribution: str,
+    *,
+    hosted: bool = False,
 ) -> _FeatureDistributionProbe:
     """Classify this runtime distribution inside the isolated child.
 
@@ -2040,11 +2081,16 @@ def _venv_feature_distribution_probe(
     )
     try:
         result = subprocess.run(
-            [str(python_path), "-c", probe],
+            _isolated_python_command(python_path, probe),
             check=True,
             capture_output=True,
             text=True,
-            env=_isolated_child_env(venv_path),
+            env=(
+                _isolated_provisioning_env(venv_path)
+                if hosted
+                else _isolated_child_env(venv_path)
+            ),
+            timeout=_FRESHNESS_PROBE_TIMEOUT_S,
         )
         decoded = json.loads(result.stdout)
         if type(decoded) is not dict:
@@ -2059,11 +2105,13 @@ def _venv_feature_distribution_probe(
         if state == "probe-failed":
             return _FeatureDistributionProbe.failed()
         return _FeatureDistributionProbe.failed()
+    except subprocess.TimeoutExpired:
+        return _FeatureDistributionProbe.failed()
     except Exception:  # noqa: BLE001 - the caller applies the safe stale policy
         return _FeatureDistributionProbe.failed()
 
 
-def _venv_sdk_version(python_path: Path) -> str:
+def _venv_sdk_version(python_path: Path, *, hosted: bool = False) -> str:
     """The kestrel-sdk version resolved *inside* the feature venv (may differ
     from the host when the feature pins the dependency)."""
     # Reuse the exact child-launch environment.  A bare version probe that
@@ -2077,13 +2125,20 @@ def _venv_sdk_version(python_path: Path) -> str:
     )
     try:
         res = subprocess.run(
-            [str(python_path), "-c", _CHILD_SDK_PROBE],
+            _isolated_python_command(python_path, _CHILD_SDK_PROBE),
             check=True,
             capture_output=True,
             text=True,
-            env=_isolated_child_env(venv_path),
+            env=(
+                _isolated_provisioning_env(venv_path)
+                if hosted
+                else _isolated_child_env(venv_path)
+            ),
+            timeout=_FRESHNESS_PROBE_TIMEOUT_S,
         )
         return res.stdout.strip() or "unknown"
+    except subprocess.TimeoutExpired:
+        return "unknown"
     except Exception:  # noqa: BLE001
         return "unknown"
 
@@ -2093,18 +2148,2566 @@ def _env_key(feature_name: str, suffix: str) -> str:
     return f"KESTREL_FEATURE_{normalized}_{suffix}"
 
 
-def _agent_data_dir(agent: Any) -> Path:
-    # A PostgreSQL-backed multi-tenant host has no SQLite ``storage_path`` to
-    # derive from, yet each agent still needs a private isolated-feature venv.
-    # The embedding host supplies this path before feature discovery; it never
-    # comes from feature configuration or a tool request.
-    isolated_feature_data_dir = getattr(agent, "isolated_feature_data_dir", None)
-    if isinstance(isolated_feature_data_dir, (str, os.PathLike)):
+class IsolatedRuntimeNamespaceError(ValueError):
+    """A hosted runtime scope violates containment or ownership policy."""
+
+
+class IsolatedRuntimePreparationError(RuntimeError):
+    """A safe runtime scope could not be prepared because the OS failed.
+
+    Unlike :class:`IsolatedRuntimeNamespaceError`, this does not indicate a
+    tenant-boundary violation.  Discovery may therefore mark the optional
+    isolated feature unavailable without taking down the rest of the agent.
+    """
+
+
+class _IsolatedRuntimeLaunchTargetPreparationError(
+    IsolatedRuntimePreparationError
+):
+    """Core verified that the selected child target cannot be resolved."""
+
+
+class _IsolatedRuntimeLaunchTargetMissingModuleError(
+    _IsolatedRuntimeLaunchTargetPreparationError
+):
+    """The declared callable module is absent from the selected venv."""
+
+
+class _IsolatedRuntimeLaunchTargetMissingAttributeError(
+    _IsolatedRuntimeLaunchTargetPreparationError
+):
+    """The declared callable attribute is absent from its module."""
+
+
+class _IsolatedRuntimeLaunchTargetNotCallableError(
+    _IsolatedRuntimeLaunchTargetPreparationError
+):
+    """The declared callable attribute resolves to a non-callable object."""
+
+
+class _IsolatedRuntimeLaunchVerificationTimeoutError(
+    IsolatedRuntimePreparationError
+):
+    """Callable verification exceeded Core's bounded startup budget."""
+
+
+class _IsolatedRuntimeLaunchVerificationInfrastructureError(
+    IsolatedRuntimePreparationError
+):
+    """The host could not obtain a trustworthy callable verification result."""
+
+
+_CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT = "unsafe-process-environment"
+_CONFIGURATION_HOSTED_CLIENT_FACTORY = "hosted-client-factory"
+_CONFIGURATION_HOSTED_PREBUILT_OVERRIDE = "hosted-prebuilt-override"
+_CONFIGURATION_FEATURE_IDENTITY = "feature-identity"
+_CONFIGURATION_SERVICE_EXECUTABLE = "service-executable"
+_CONFIGURATION_FEATURE_INTERPRETER = "feature-interpreter"
+_HOSTED_RUNTIME_VENV_SETTING = "runtime.venv"
+_SAFE_ENVIRONMENT_KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}")
+
+
+class IsolatedRuntimeConfigurationError(RuntimeError):
+    """Hosted feature configuration cannot be forwarded without leaking scope.
+
+    ``safe_diagnostic`` deliberately derives public/log text from a closed
+    reason set and sanitized environment-key names. Startup must not log the
+    arbitrary exception message: a third-party feature can raise this public
+    exception type, and its message may contain credential values.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        reason: str | None = None,
+        environment_keys: tuple[str, ...] = (),
+    ) -> None:
+        self.reason = reason
+        self.environment_keys = tuple(environment_keys)
+        super().__init__(
+            message
+            if message is not None
+            else IsolatedRuntimeConfigurationError.safe_diagnostic(self)
+        )
+
+    def safe_diagnostic(self) -> str:
+        """Return a bounded diagnostic containing names, never env values."""
+
+        try:
+            state = object.__getattribute__(self, "__dict__")
+        except BaseException:  # pragma: no cover - hostile object seam
+            state = {}
+        reason = state.get("reason") if type(state) is dict else None
+        if type(reason) is not str:
+            reason = None
+        environment_keys = (
+            state.get("environment_keys", ()) if type(state) is dict else ()
+        )
+        if type(environment_keys) is not tuple:
+            environment_keys = ()
+
+        if reason == _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT:
+            safe_names = []
+            invalid_name_seen = False
+            for key in environment_keys:
+                if type(key) is str and _SAFE_ENVIRONMENT_KEY_NAME.fullmatch(key):
+                    safe_names.append(key)
+                else:
+                    invalid_name_seen = True
+            if invalid_name_seen:
+                safe_names.append("<invalid-environment-key>")
+            names = ", ".join(sorted(set(safe_names))) or "<unknown>"
+            return (
+                "unsafe process-wide environment keys were found "
+                f"({names}); move these keys into persisted per-agent feature "
+                "configuration"
+            )
+        if reason == _CONFIGURATION_HOSTED_CLIENT_FACTORY:
+            return (
+                "the isolated client factory cannot guarantee tenant-scoped "
+                "env and cwd delivery; update it to accept both hosted launch "
+                "arguments"
+            )
+        if reason == _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE:
+            safe_names = [
+                key
+                for key in environment_keys
+                if type(key) is str
+                and (
+                    _SAFE_ENVIRONMENT_KEY_NAME.fullmatch(key)
+                    or key == _HOSTED_RUNTIME_VENV_SETTING
+                )
+            ]
+            name = safe_names[0] if len(safe_names) == 1 else "<unknown>"
+            return (
+                f"hosted process-wide prebuilt override {name} must name an "
+                "existing operator-owned executable or venv with no Core "
+                "provisioning manifest"
+            )
+        if reason == _CONFIGURATION_FEATURE_IDENTITY:
+            return "isolated feature class name is not a safe canonical identifier"
+        if reason == _CONFIGURATION_SERVICE_EXECUTABLE:
+            return (
+                "isolated feature service must be a bare portable console-script "
+                "executable name or a safe Python module:callable target"
+            )
+        if reason == _CONFIGURATION_FEATURE_INTERPRETER:
+            return (
+                "isolated Python callable services require a feature interpreter "
+                "that supports the SDK's Python 3.11 safe-path contract"
+            )
+        return "the hosted isolated feature configuration is unsafe"
+
+
+def safe_isolated_runtime_preparation_diagnostic(
+    error: BaseException,
+) -> str:
+    """Classify a preparation failure without reflecting arbitrary text.
+
+    Optional feature packages can raise the public preparation exception or
+    attach an ``OSError`` containing paths and credentials.  Only Core-chosen
+    errno categories cross the startup log boundary; all messages and path
+    attributes on the original exception remain private.
+    """
+
+    if type(error) is _IsolatedRuntimeLaunchTargetMissingModuleError:
+        return (
+            "the isolated feature Python callable module is absent from its "
+            "selected venv; verify the installed feature package"
+        )
+    if type(error) is _IsolatedRuntimeLaunchTargetMissingAttributeError:
+        return (
+            "the isolated feature Python callable attribute is absent from its "
+            "module; verify the service metadata and installed feature package"
+        )
+    if type(error) is _IsolatedRuntimeLaunchTargetNotCallableError:
+        return (
+            "the isolated feature Python callable target resolves to a "
+            "non-callable object; verify the service metadata"
+        )
+    if type(error) is _IsolatedRuntimeLaunchVerificationTimeoutError:
+        return (
+            "isolated feature callable verification exceeded the bounded "
+            "startup timeout; inspect feature import side effects and host health"
+        )
+    if type(error) is _IsolatedRuntimeLaunchVerificationInfrastructureError:
+        return (
+            "the host could not complete isolated feature callable verification; "
+            "inspect the sanitized traceback and host process health"
+        )
+
+    current: BaseException | None = error
+    visited: set[int] = set()
+    error_number: int | None = None
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, OSError) and type(current.errno) is int:
+            error_number = current.errno
+            break
+        current = current.__cause__ or current.__context__
+
+    if error_number == errno.EXDEV:
+        return (
+            "released runtime state cannot be adopted across filesystems; "
+            "move it onto the hosted runtime filesystem and retry"
+        )
+    if error_number in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+        return (
+            "the runtime filesystem has insufficient free space or quota; "
+            "restore capacity and retry"
+        )
+    if error_number in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        return (
+            "the host filesystem denied runtime preparation; verify the "
+            "configured mount ownership and write policy"
+        )
+    if error_number in {errno.EMFILE, errno.ENFILE}:
+        return (
+            "the host exhausted its file-descriptor capacity during runtime "
+            "preparation; restore capacity and retry"
+        )
+    return (
+        "the agent-scoped runtime could not be prepared; inspect the sanitized "
+        "traceback and host filesystem health"
+    )
+
+
+def sanitized_isolated_runtime_preparation_exc_info(
+    error: BaseException,
+) -> tuple[type[BaseException], BaseException, TracebackType | None]:
+    """Return traceback evidence whose exception text and cause are sanitized."""
+
+    core_frames = []
+    current = error.__traceback__
+    while current is not None:
+        try:
+            frame_path = Path(current.tb_frame.f_code.co_filename).resolve(
+                strict=False
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            frame_path = None
+        if frame_path is not None and (
+            frame_path == _CORE_PACKAGE_ROOT
+            or _CORE_PACKAGE_ROOT in frame_path.parents
+        ):
+            core_frames.append(current)
+        current = current.tb_next
+    safe_traceback: TracebackType | None = None
+    for frame in reversed(core_frames):
+        safe_traceback = TracebackType(
+            safe_traceback,
+            frame.tb_frame,
+            frame.tb_lasti,
+            frame.tb_lineno,
+        )
+    safe_error = IsolatedRuntimePreparationError(
+        safe_isolated_runtime_preparation_diagnostic(error)
+    )
+    safe_error.__traceback__ = safe_traceback
+    safe_error.__cause__ = None
+    safe_error.__context__ = None
+    safe_error.__suppress_context__ = True
+    return type(safe_error), safe_error, safe_traceback
+
+
+class _RuntimeOwnerMarkerMissing(IsolatedRuntimeNamespaceError):
+    """Internal signal: creation is allowed, but cleanup must still refuse."""
+
+
+@dataclass(frozen=True)
+class IsolatedRuntimeNamespace:
+    """Canonical, agent-owned location for mutable isolated-feature runtime data.
+
+    A hosted factory supplies a host-owned root plus a tenant/agent namespace.
+    Resolving both together here keeps the containment rule in one place rather
+    than trusting every feature caller to join and sanitize path fragments.
+    """
+
+    root: Path
+    namespace: Path
+    path: Path
+
+
+class RuntimeNamespaceCleanupOutcome(str, Enum):
+    """Exact custody result from a secure runtime deletion primitive."""
+
+    REMOVED = "removed"
+    ALREADY_ABSENT = "already_absent"
+    NOT_HOSTED = "not_hosted"
+
+
+_RUNTIME_NAMESPACE_COMPONENT = re.compile(
+    r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$"
+)
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }
+)
+_RUNTIME_OWNER_MARKER = ".kestrel-runtime-owner"
+_RUNTIME_OWNER_TEMP_PREFIX = ".kestrel-runtime-owner.tmp-"
+_VENV_RELOCATION_REPAIR_MARKER = ".kestrel-venv-relocation-pending"
+_VENV_RELOCATION_REPAIR_TEMP_PREFIX = ".kestrel-venv-relocation-pending.tmp-"
+_VENV_RELOCATION_REPAIR_PAYLOAD = b"kestrel-venv-relocation-v1\n"
+_PRIVATE_DIRECTORY_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+_ISOLATED_FEATURE_CLASS_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+_ISOLATED_SERVICE_EXECUTABLE_NAME = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
+_ISOLATED_SERVICE_PYTHON_IDENTIFIER = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+)
+_ISOLATED_SERVICE_CALLABLE_MAX_LENGTH = 512
+_HOSTED_FEATURE_RUNTIME_COMPONENT = re.compile(r"^feature-[0-9a-f]{64}$")
+_DERIVED_NAMESPACE_DIGEST_HEX_CHARS = 58
+
+
+def _is_windows_reserved_runtime_component(component: str) -> bool:
+    return component.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_COMPONENTS
+
+
+def _validated_isolated_service_executable(service: object) -> str:
+    """Return one portable basename used identically for verify and launch."""
+
+    if (
+        type(service) is not str
+        or not service
+        or service != service.strip()
+        or _ISOLATED_SERVICE_EXECUTABLE_NAME.fullmatch(service) is None
+        or service.endswith(".")
+        or _is_windows_reserved_runtime_component(service)
+    ):
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    return service
+
+
+@dataclass(frozen=True)
+class _IsolatedServiceTarget:
+    """One validated console executable or Python callable launch target."""
+
+    raw: str
+    console_executable: str | None = None
+    module: str | None = None
+    callable_name: str | None = None
+
+    @property
+    def is_callable(self) -> bool:
+        return self.module is not None
+
+
+def _is_safe_service_python_identifier(value: str) -> bool:
+    return (
+        _ISOLATED_SERVICE_PYTHON_IDENTIFIER.fullmatch(value) is not None
+        and not keyword.iskeyword(value)
+    )
+
+
+def _validated_isolated_service_target(service: object) -> _IsolatedServiceTarget:
+    """Classify one non-reflective, code-injection-safe service declaration."""
+
+    if type(service) is not str or not service or service != service.strip():
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    if ":" not in service:
+        return _IsolatedServiceTarget(
+            raw=service,
+            console_executable=_validated_isolated_service_executable(service),
+        )
+    if (
+        len(service) > _ISOLATED_SERVICE_CALLABLE_MAX_LENGTH
+        or service.count(":") != 1
+    ):
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    module, callable_name = service.split(":", 1)
+    module_components = module.split(".")
+    if (
+        not module_components
+        or (len(module) == 1 and module.isascii() and module.isalpha())
+        or any(
+            not _is_safe_service_python_identifier(component)
+            for component in module_components
+        )
+        or not _is_safe_service_python_identifier(callable_name)
+    ):
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    return _IsolatedServiceTarget(
+        raw=service,
+        module=module,
+        callable_name=callable_name,
+    )
+
+
+def safe_isolated_runtime_exception_type_name(error: BaseException) -> str:
+    """Return a bounded identifier for sanitized server-side diagnostics."""
+
+    name = type(error).__name__
+    if _ISOLATED_FEATURE_CLASS_NAME.fullmatch(name) is not None:
+        return name
+    return "RuntimeError"
+
+
+def derive_isolated_runtime_namespace(*identifiers: str) -> str:
+    """Derive one portable, collision-resistant namespace from host identities.
+
+    The host decides which authenticated identities define ownership (for
+    example ``user_id, companion_id``). Length-prefixing keeps tuples such as
+    ``("ab", "c")`` and ``("a", "bc")`` distinct without putting private or
+    path-active identifier text on disk.
+    """
+
+    if not identifiers:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime namespace requires an identity."
+        )
+    digest = hashlib.sha256()
+    for identifier in identifiers:
+        if type(identifier) is not str or not identifier:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime identities must be non-empty strings."
+            )
+        encoded = identifier.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    # Keep the opaque component within the same grammar accepted from hosted
+    # factories. Fifty-eight hex digits retain a 232-bit digest (a roughly
+    # 2^116 birthday bound) while making the complete value exactly 64
+    # characters.
+    value = f"agent-{digest.hexdigest()[:_DERIVED_NAMESPACE_DIGEST_HEX_CHARS]}"
+    if (
+        _RUNTIME_NAMESPACE_COMPONENT.fullmatch(value) is None
+        or _is_windows_reserved_runtime_component(value)
+    ):
+        raise AssertionError(
+            "derived isolated-runtime namespace no longer satisfies its grammar"
+        )
+    return value
+
+
+def _hosted_feature_runtime_component(runtime: InstalledFeatureRuntime) -> str:
+    """Return the durable, path-inert identity of one hosted feature.
+
+    Entry-point module paths and service runner spellings are packaging
+    details, not feature identity.  Moving either must not relocate mutable
+    tenant state or credentials.  Distribution names use their PEP 503
+    comparison form so punctuation/case-only metadata changes are inert too.
+    Distinct classes in one distribution remain independently scoped.
+    """
+
+    digest = hashlib.sha256()
+    distribution = re.sub(r"[-_.]+", "-", runtime.distribution.strip()).lower()
+    for value in (distribution, runtime.class_name):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"feature-{digest.hexdigest()}"
+
+
+def _legacy_hosted_feature_runtime_component(
+    runtime: InstalledFeatureRuntime,
+) -> str:
+    """Return the issue-2716 pre-stable hosted directory identity.
+
+    This exists only to migrate a tree created by the earlier implementation.
+    New runtime paths must always use :func:`_hosted_feature_runtime_component`.
+    """
+
+    digest = hashlib.sha256()
+    for value in (
+        runtime.distribution,
+        runtime.class_name,
+        runtime.entry_point,
+        runtime.service or "",
+    ):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"feature-{digest.hexdigest()}"
+
+
+def resolve_isolated_runtime_namespace(
+    root: str | os.PathLike[str],
+    namespace: str | os.PathLike[str],
+) -> IsolatedRuntimeNamespace:
+    """Validate and canonicalize a hosted agent's runtime namespace.
+
+    ``namespace`` is deliberately relative to the configured host root.  Reject
+    traversal components even when normalization would remain inside that root:
+    accepting them makes a tenant identifier's meaning depend on path parsing
+    and invites future callers to join it unsafely.
+    """
+    if not isinstance(root, (str, os.PathLike)):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated features require an explicit runtime root."
+        )
+    if not isinstance(namespace, (str, os.PathLike)):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated features require an explicit runtime namespace."
+        )
+
+    try:
+        root_text = os.fspath(root)
+        namespace_text = os.fspath(namespace)
+    except TypeError as exc:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime paths must be filesystem paths."
+        ) from exc
+    if type(root_text) is not str or not root_text or "\x00" in root_text:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must be a non-empty path."
+        )
+    if (
+        type(namespace_text) is not str
+        or not namespace_text
+        or namespace_text != namespace_text.strip()
+        or "\x00" in namespace_text
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime namespace must not be empty."
+        )
+    if "\\" in namespace_text or namespace_text.startswith("/"):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime namespace must be a canonical "
+            "relative path."
+        )
+    components = namespace_text.split("/")
+    if (
+        "/".join(components) != namespace_text
+        or any(
+            component in {"", ".", ".."}
+            or _RUNTIME_NAMESPACE_COMPONENT.fullmatch(component) is None
+            or _is_windows_reserved_runtime_component(component)
+            for component in components
+        )
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime namespace must contain only "
+            "canonical lowercase path components."
+        )
+    relative_namespace = Path(*components)
+
+    try:
+        canonical_root = Path(root_text).expanduser().resolve()
+    except OSError as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature runtime root could not be resolved."
+        ) from exc
+    if canonical_root == Path(canonical_root.anchor):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must not be a filesystem root."
+        )
+    if canonical_root.exists() and not canonical_root.is_dir():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must be a directory."
+        )
+    if not canonical_root.parent.is_dir():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root parent must already exist; "
+            "refusing to materialize a missing operator volume path."
+        )
+    canonical_path = canonical_root.joinpath(*components)
+
+    return IsolatedRuntimeNamespace(
+        root=canonical_root,
+        namespace=relative_namespace,
+        path=canonical_path,
+    )
+
+
+def resolve_legacy_isolated_runtime_root(
+    root: str | os.PathLike[str],
+    scope: IsolatedRuntimeNamespace,
+) -> Path:
+    """Validate the factory-owned source of the released hosted layout.
+
+    This path is migration input only.  It must name the exact historical
+    ``feature_venvs`` directory below an already-existing per-agent data
+    directory, and it must be disjoint from the new runtime root.  Filesystem
+    identity and ownership are checked again descriptor-relatively when a
+    feature is adopted; construction deliberately performs no creation.
+    """
+
+    if not isinstance(root, (str, os.PathLike)):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be a path."
+        )
+    try:
+        root_text = os.fspath(root)
+    except TypeError as exc:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be a path."
+        ) from exc
+    if type(root_text) is not str or not root_text or "\x00" in root_text:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be a non-empty path."
+        )
+    expanded = os.path.expanduser(root_text)
+    if not os.path.isabs(expanded):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be absolute."
+        )
+    canonical = Path(os.path.abspath(expanded))
+    if canonical.name != "feature_venvs":
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must name feature_venvs."
+        )
+    if not canonical.parent.is_dir():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime parent must already exist."
+        )
+    try:
+        resolved_parent = canonical.parent.resolve(strict=True)
+    except OSError as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature legacy runtime parent could not be resolved."
+        ) from exc
+    if resolved_parent != canonical.parent:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime parent must not contain "
+            "path aliases or symlinks."
+        )
+    if canonical.is_symlink():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must not be a symlink."
+        )
+    try:
+        canonical.relative_to(scope.root)
+    except ValueError:
+        pass
+    else:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy and current runtime roots must be disjoint."
+        )
+    try:
+        scope.root.relative_to(canonical)
+    except ValueError:
+        pass
+    else:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy and current runtime roots must be disjoint."
+        )
+    return canonical
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _rename_directory_noreplace_at(
+    source_parent_fd: int,
+    source_component: str,
+    target_parent_fd: int,
+    target_component: str,
+) -> None:
+    """Atomically rename a directory while refusing any existing target.
+
+    Plain POSIX ``rename`` may replace an empty directory created after a
+    collision pre-check, destroying the competing custody claim. Linux and
+    Darwin both expose an exclusive descriptor-relative variant. Other POSIX
+    platforms fail closed rather than weakening migration semantics.
+    """
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(source_component)
+    target = os.fsencode(target_component)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_parent_fd,
+            source,
+            target_parent_fd,
+            target,
+            1,  # RENAME_NOREPLACE
+        )
+    else:
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace directory rename is unavailable",
+            )
+        renameatx_np.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            source_parent_fd,
+            source,
+            target_parent_fd,
+            target,
+            0x00000004,  # RENAME_EXCL
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _secure_dirfd_supported() -> bool:
+    required = (os.open, os.mkdir, os.stat)
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and all(function in os.supports_dir_fd for function in required)
+    )
+
+
+def _validate_operator_root_metadata(metadata: os.stat_result) -> None:
+    if os.name == "posix" and metadata.st_uid != os.geteuid():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must be owned by the service "
+            "account."
+        )
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must not be group- or "
+            "world-writable."
+        )
+
+
+def _open_or_create_directory_at(
+    parent_fd: int,
+    component: str,
+    *,
+    enforce_private: bool = True,
+    operator_root: bool = False,
+) -> int:
+    created = False
+    try:
+        descriptor = os.open(component, _directory_open_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(component, mode=_PRIVATE_DIRECTORY_MODE, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+        descriptor = os.open(component, _directory_open_flags(), dir_fd=parent_fd)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime path contains a non-directory entry."
+        )
+    try:
+        if created or enforce_private:
+            os.fchmod(descriptor, _PRIVATE_DIRECTORY_MODE)
+        elif operator_root:
+            _validate_operator_root_metadata(metadata)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_secure_absolute_directory(path: Path) -> int:
+    # The root's parent is operator custody.  It must already exist (validated
+    # by ``resolve_isolated_runtime_namespace``); Core may create only the root
+    # leaf itself, never a plausible-looking replacement for a missing mount.
+    parent_fd = os.open(path.parent, _directory_open_flags())
+    try:
+        parent_lexical = os.stat(path.parent, follow_symlinks=False)
+        if not stat.S_ISDIR(parent_lexical.st_mode) or not _same_file_identity(
+            parent_lexical, os.fstat(parent_fd)
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime root parent changed during "
+                "validation."
+            )
+        descriptor = _open_or_create_directory_at(
+            parent_fd,
+            path.name,
+            enforce_private=False,
+            operator_root=True,
+        )
+    except BaseException:
+        os.close(parent_fd)
+        raise
+    try:
+        lexical = os.stat(path, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(lexical.st_mode) or not _same_file_identity(
+            lexical, opened
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime root changed during validation."
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _runtime_owner_bytes(owner: str) -> bytes:
+    return (hashlib.sha256(owner.encode("utf-8")).hexdigest() + "\n").encode()
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("runtime ownership marker write made no progress")
+        view = view[written:]
+
+
+def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
+    """Validate a durable relocation marker without following path entries."""
+
+    marker_fd: Optional[int] = None
+    try:
+        try:
+            metadata = os.stat(
+                _VENV_RELOCATION_REPAIR_MARKER,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (os.name == "posix" and metadata.st_uid != os.geteuid())
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker is unsafe."
+            )
+        if metadata.st_nlink != 1:
+            for name in os.listdir(directory_fd):
+                if not name.startswith(_VENV_RELOCATION_REPAIR_TEMP_PREFIX):
+                    continue
+                try:
+                    candidate = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(candidate.st_mode) and _same_file_identity(
+                    candidate, metadata
+                ):
+                    try:
+                        os.unlink(name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+            try:
+                metadata = os.stat(
+                    _VENV_RELOCATION_REPAIR_MARKER,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (os.name == "posix" and metadata.st_uid != os.geteuid())
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature relocation repair marker has an "
+                    "unsafe external hard link."
+                )
+        marker_fd = os.open(
+            _VENV_RELOCATION_REPAIR_MARKER,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        if not _same_file_identity(metadata, os.fstat(marker_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker changed during "
+                "validation."
+            )
+        payload = os.read(marker_fd, len(_VENV_RELOCATION_REPAIR_PAYLOAD) + 1)
+        if payload != _VENV_RELOCATION_REPAIR_PAYLOAD:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state is corrupt; "
+                "tenant state was retained."
+            )
+        return True
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker is unsafe."
+            ) from exc
+        raise
+    finally:
+        if marker_fd is not None:
+            os.close(marker_fd)
+
+
+def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
+    """Publish repair intent before a feature-directory rename can commit."""
+
+    if _read_venv_relocation_repair_marker_at(directory_fd):
+        return
+    temporary = (
+        f"{_VENV_RELOCATION_REPAIR_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
+    )
+    temporary_fd: Optional[int] = None
+    try:
+        temporary_fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            _PRIVATE_FILE_MODE,
+            dir_fd=directory_fd,
+        )
+        _write_all(temporary_fd, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        try:
+            os.link(
+                temporary,
+                _VENV_RELOCATION_REPAIR_MARKER,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            pass
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(directory_fd)
+        if not _read_venv_relocation_repair_marker_at(directory_fd):
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be "
+                "recorded."
+            )
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
+    """Portable fallback for validating relocation repair intent."""
+
+    marker = directory / _VENV_RELOCATION_REPAIR_MARKER
+    try:
+        metadata = marker.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or (
+            os.name == "posix"
+            and (
+                metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            )
+        )
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature relocation repair marker is unsafe."
+        )
+    if metadata.st_nlink != 1:
+        for candidate in directory.iterdir():
+            if not candidate.name.startswith(_VENV_RELOCATION_REPAIR_TEMP_PREFIX):
+                continue
+            try:
+                candidate_metadata = candidate.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(candidate_metadata.st_mode) and _same_file_identity(
+                candidate_metadata, metadata
+            ):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+        try:
+            metadata = marker.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (
+                os.name == "posix"
+                and (
+                    metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                )
+            )
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker has an unsafe "
+                "external hard link."
+            )
+    if marker.read_bytes() != _VENV_RELOCATION_REPAIR_PAYLOAD:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature relocation repair state is corrupt; tenant "
+            "state was retained."
+        )
+    return True
+
+
+def _ensure_venv_relocation_repair_marker_portable(directory: Path) -> None:
+    """Portable fallback for publishing relocation repair intent."""
+
+    if _read_venv_relocation_repair_marker_portable(directory):
+        return
+    marker = directory / _VENV_RELOCATION_REPAIR_MARKER
+    temporary = directory / (
+        f"{_VENV_RELOCATION_REPAIR_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
+    )
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            _PRIVATE_FILE_MODE,
+        )
+        _write_all(descriptor, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            os.link(temporary, marker, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        if not _read_venv_relocation_repair_marker_portable(directory):
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be "
+                "recorded."
+            )
+        if os.name == "posix":
+            directory_fd = os.open(directory, _directory_open_flags())
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _recover_runtime_owner_install_link(
+    directory_fd: int,
+    marker_fd: int,
+) -> os.stat_result:
+    """Finish the unlink half of an interrupted temp+link marker install."""
+
+    metadata = os.fstat(marker_fd)
+    if metadata.st_nlink == 1:
+        return metadata
+    for name in os.listdir(directory_fd):
+        if not name.startswith(_RUNTIME_OWNER_TEMP_PREFIX):
+            continue
+        try:
+            candidate = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            # Another preparer/cleaner may have completed recovery after this
+            # directory snapshot was taken.
+            continue
+        if stat.S_ISREG(candidate.st_mode) and _same_file_identity(candidate, metadata):
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                # The hard-link name is recovery debris, not authoritative
+                # state. Concurrent disappearance is the desired outcome.
+                pass
+    metadata = os.fstat(marker_fd)
+    if metadata.st_nlink != 1:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime ownership marker has an unsafe "
+            "external hard link."
+        )
+    os.fsync(directory_fd)
+    return metadata
+
+
+def _read_existing_runtime_owner(directory_fd: int, owner: str) -> None:
+    owner_bytes = _runtime_owner_bytes(owner)
+    try:
+        marker_fd = os.open(
+            _RUNTIME_OWNER_MARKER,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError as exc:
+        raise _RuntimeOwnerMarkerMissing(
+            "Hosted isolated feature runtime ownership marker is missing; "
+            "refusing to assume tenant ownership."
+        ) from exc
+    try:
+        metadata = os.fstat(marker_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime ownership marker is unsafe."
+            )
+        metadata = _recover_runtime_owner_install_link(directory_fd, marker_fd)
+        existing = os.read(marker_fd, len(owner_bytes) + 1)
+        if metadata.st_size != len(owner_bytes) or len(existing) != len(owner_bytes):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime ownership marker is corrupt; "
+                "operator verification is required before recovery."
+            )
+        if not hmac.compare_digest(existing, owner_bytes):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime namespace is already owned by "
+                "a different agent."
+            )
+        os.fchmod(marker_fd, _PRIVATE_FILE_MODE)
+    finally:
+        os.close(marker_fd)
+
+
+def _read_or_create_runtime_owner(directory_fd: int, owner: str) -> None:
+    """Atomically publish a complete, durable tenant ownership marker."""
+
+    try:
+        _read_existing_runtime_owner(directory_fd, owner)
+        return
+    except _RuntimeOwnerMarkerMissing:
+        pass
+
+    owner_bytes = _runtime_owner_bytes(owner)
+    temporary = f"{_RUNTIME_OWNER_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
+    temporary_fd = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        _PRIVATE_FILE_MODE,
+        dir_fd=directory_fd,
+    )
+    try:
+        try:
+            _write_all(temporary_fd, owner_bytes)
+            os.fchmod(temporary_fd, _PRIVATE_FILE_MODE)
+            os.fsync(temporary_fd)
+        finally:
+            os.close(temporary_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+    published = False
+    try:
+        try:
+            os.link(
+                temporary,
+                _RUNTIME_OWNER_MARKER,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            published = True
+        except FileExistsError:
+            pass
+    finally:
+        # A concurrent preparer can recover the just-published hard link and
+        # remove this temporary name before the creator reaches its cleanup
+        # tail.  The marker is already durable; a missing install temp is the
+        # expected result of that recovery, not a preparation failure.
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+    if published:
+        os.fsync(directory_fd)
+    # A concurrent creator may have won.  Re-read the published marker in all
+    # cases so collision and corrupt-marker policy has one authoritative path.
+    _read_existing_runtime_owner(directory_fd, owner)
+
+
+def _migrate_runtime_directory_at(
+    parent_fd: int,
+    legacy_component: str,
+    stable_component: str,
+) -> bool:
+    """Atomically adopt one legacy feature directory under an open parent.
+
+    Both names are opaque Core-derived components.  A target collision is not
+    guessed at or merged: either tree can contain credentials, so retaining
+    both and making the optional feature unavailable is the only safe policy.
+    """
+
+    if legacy_component == stable_component:
+        return False
+    if (
+        _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(legacy_component) is None
+        or _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(stable_component) is None
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime migration names are not canonical."
+        )
+    try:
+        legacy_metadata = os.stat(
+            legacy_component,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(legacy_metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime path is unsafe."
+        )
+    legacy_fd = os.open(
+        legacy_component,
+        _directory_open_flags(),
+        dir_fd=parent_fd,
+    )
+    try:
+        if not _same_file_identity(legacy_metadata, os.fstat(legacy_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature legacy runtime changed during migration."
+            )
+    finally:
+        os.close(legacy_fd)
+
+    try:
+        stable_metadata = os.stat(
+            stable_component,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        stable_metadata = None
+    if stable_metadata is not None:
+        if not stat.S_ISDIR(stable_metadata.st_mode):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature stable runtime path is unsafe."
+            )
+        _log_runtime_migration_collision(legacy_component, stable_component)
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature has both legacy and stable runtime state; "
+            "operator custody reconciliation is required."
+        )
+
+    legacy_fd = os.open(
+        legacy_component,
+        _directory_open_flags(),
+        dir_fd=parent_fd,
+    )
+    try:
+        if not _same_file_identity(legacy_metadata, os.fstat(legacy_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature legacy runtime changed during migration."
+            )
+        _ensure_venv_relocation_repair_marker_at(legacy_fd)
+    finally:
+        os.close(legacy_fd)
+
+    try:
+        _rename_directory_noreplace_at(
+            parent_fd,
+            legacy_component,
+            parent_fd,
+            stable_component,
+        )
+    except FileNotFoundError:
+        # A concurrent preparer may have completed the same atomic rename.
+        # Accept only that exact terminal shape; every other disappearance is
+        # retained as an ambiguous preparation failure.
+        try:
+            post_legacy = os.stat(
+                legacy_component,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            post_legacy = None
+        try:
+            post_stable = os.stat(
+                stable_component,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            post_stable = None
+        if post_legacy is not None or post_stable is None:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature legacy runtime migration did not "
+                "complete; tenant state was retained."
+            ) from None
+        if not stat.S_ISDIR(post_stable.st_mode):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature stable runtime path is unsafe."
+            )
+    except OSError as exc:
+        if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise
+        _log_runtime_migration_collision(legacy_component, stable_component)
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature has both legacy and stable runtime state; "
+            "operator custody reconciliation is required."
+        ) from exc
+    os.fsync(parent_fd)
+    return True
+
+
+def _log_runtime_migration_collision(
+    legacy_component: str,
+    stable_component: str,
+    *,
+    legacy_parent: str = "feature_venvs",
+) -> None:
+    """Log opaque namespace-relative custody locations for the operator.
+
+    The exception crossing feature/API boundaries deliberately contains no
+    filesystem names.  Operators still need enough server-side evidence to
+    reconcile the two retained credential trees, so log only Core-derived
+    relative components -- never the configured root or tenant namespace.
+    """
+
+    logger.error(
+        "Hosted isolated feature runtime migration collision; both trees were "
+        "retained and the feature is unavailable pending custody reconciliation "
+        "(legacy=%s, stable=%s)",
+        f"{legacy_parent}/{legacy_component}",
+        f"feature_venvs/{stable_component}",
+    )
+
+
+def _validate_released_legacy_directory_metadata(
+    metadata: os.stat_result,
+) -> None:
+    """Require custody properties Core can prove without mutating old state."""
+
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime path is unsafe."
+        )
+    if os.name == "posix" and metadata.st_uid != os.geteuid():
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released legacy runtime custody could not "
+            "be proven; tenant state was retained."
+        )
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released legacy runtime custody could not "
+            "be proven; tenant state was retained."
+        )
+
+
+def _validate_released_legacy_root_custody(metadata: os.stat_result) -> None:
+    """Quarantine populated released state whose custody cannot be proven.
+
+    The released ``feature_venvs`` parent predates Core's private-directory
+    contract and may legitimately remain permissive after every class-named
+    child has already been migrated.  Its mode is therefore relevant only
+    when the requested legacy component still exists.  A non-directory is a
+    path-substitution violation; ownership or write-access ambiguity for a
+    populated directory is an operational custody problem and quarantines only
+    the optional feature without moving either tree.
+    """
+
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root is unsafe."
+        )
+    if (
+        os.name == "posix"
+        and (
+            metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        )
+    ):
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released runtime custody could not be "
+            "proven; tenant state was retained."
+        )
+
+
+def _revalidate_portable_released_root(
+    legacy_root: Path,
+    expected: os.stat_result,
+) -> None:
+    """Detect a portable-path root substitution before any rename."""
+
+    try:
+        current = legacy_root.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root changed "
+            "during validation."
+        ) from exc
+    if not stat.S_ISDIR(current.st_mode) or not _same_file_identity(expected, current):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root changed "
+            "during validation."
+        )
+
+
+def _migrate_released_runtime_directory_portable(
+    legacy_root: Path,
+    scope: IsolatedRuntimeNamespace,
+    legacy_component: str,
+    stable_component: str,
+) -> bool:
+    """Best-effort non-dirfd adoption with fail-closed custody checks."""
+
+    try:
+        root_metadata = legacy_root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root is unsafe."
+        )
+    legacy = legacy_root / legacy_component
+    stable = scope.path / "feature_venvs" / stable_component
+    try:
+        legacy_metadata = legacy.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        _revalidate_portable_released_root(legacy_root, root_metadata)
+        return False
+    _revalidate_portable_released_root(legacy_root, root_metadata)
+    _validate_released_legacy_root_custody(root_metadata)
+    if stat.S_ISLNK(legacy_metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime path is unsafe."
+        )
+    _validate_released_legacy_directory_metadata(legacy_metadata)
+    if stable.exists() or stable.is_symlink():
+        if stable.is_symlink() or not stable.is_dir():
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature stable runtime path is unsafe."
+            )
+        _log_runtime_migration_collision(
+            legacy_component,
+            stable_component,
+            legacy_parent="released_feature_venvs",
+        )
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature has both released legacy and stable runtime "
+            "state; operator custody reconciliation is required."
+        )
+    _revalidate_portable_released_root(legacy_root, root_metadata)
+    _ensure_venv_relocation_repair_marker_portable(legacy)
+    try:
+        legacy.rename(stable)
+    except OSError as exc:
+        if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise
+        _log_runtime_migration_collision(
+            legacy_component,
+            stable_component,
+            legacy_parent="released_feature_venvs",
+        )
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature has both released legacy and stable runtime "
+            "state; operator custody reconciliation is required."
+        ) from exc
+    try:
+        migrated = stable.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released legacy runtime migration did not "
+            "complete; tenant state was retained."
+        ) from exc
+    if not _same_file_identity(legacy_metadata, migrated):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime changed during migration."
+        )
+    return True
+
+
+def migrate_released_hosted_feature_runtime(
+    legacy_root: Path,
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+    legacy_component: str,
+    stable_component: str,
+) -> bool:
+    """Adopt the shipped class-named hosted tree into its tenant namespace.
+
+    The managed factory, rather than feature metadata or process environment,
+    supplies ``legacy_root``.  Adoption renames the complete feature directory
+    so venv contents and service data (including channel credentials) move as
+    one filesystem object.  Cross-device moves fail with both custody trees
+    untouched; collisions are never merged or overwritten.
+    """
+
+    if (
+        not isinstance(legacy_root, Path)
+        or _ISOLATED_FEATURE_CLASS_NAME.fullmatch(legacy_component) is None
+        or _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(stable_component) is None
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released runtime migration is not canonical."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - Windows fallback
+        try:
+            migrated = _migrate_released_runtime_directory_portable(
+                legacy_root,
+                scope,
+                legacy_component,
+                stable_component,
+            )
+        except IsolatedRuntimeNamespaceError:
+            raise
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature released runtime could not be migrated; "
+                "tenant state was retained."
+            ) from exc
+        return migrated
+
+    source_parent_fd: Optional[int] = None
+    target_root_fd: Optional[int] = None
+    namespace_fd: Optional[int] = None
+    target_parent_fd: Optional[int] = None
+    try:
+        try:
+            source_parent_fd = os.open(
+                legacy_root.parent,
+                _directory_open_flags(),
+            )
+            lexical_parent = os.stat(
+                legacy_root.parent,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(lexical_parent.st_mode) or not _same_file_identity(
+                lexical_parent,
+                os.fstat(source_parent_fd),
+            ):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature released legacy runtime parent "
+                    "changed during validation."
+                )
+            try:
+                source_root_metadata = os.stat(
+                    legacy_root.name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            source_root_fd = os.open(
+                legacy_root.name,
+                _directory_open_flags(),
+                dir_fd=source_parent_fd,
+            )
+        except IsolatedRuntimeNamespaceError:
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature released legacy runtime contains "
+                    "an unsafe path entry."
+                ) from exc
+            raise
+
+        try:
+            if not _same_file_identity(source_root_metadata, os.fstat(source_root_fd)):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature released legacy runtime root changed "
+                    "during validation."
+                )
+
+            try:
+                legacy_metadata = os.stat(
+                    legacy_component,
+                    dir_fd=source_root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            _validate_released_legacy_root_custody(source_root_metadata)
+            _validate_released_legacy_directory_metadata(legacy_metadata)
+            legacy_fd = os.open(
+                legacy_component,
+                _directory_open_flags(),
+                dir_fd=source_root_fd,
+            )
+            try:
+                if not _same_file_identity(legacy_metadata, os.fstat(legacy_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature released legacy runtime changed "
+                        "during migration."
+                    )
+            finally:
+                os.close(legacy_fd)
+
+            target_root_fd = _open_secure_absolute_directory(scope.root)
+            namespace_fd = os.dup(target_root_fd)
+            for component in scope.namespace.parts:
+                child = os.open(
+                    component,
+                    _directory_open_flags(),
+                    dir_fd=namespace_fd,
+                )
+                os.close(namespace_fd)
+                namespace_fd = child
+            _read_existing_runtime_owner(namespace_fd, owner)
+            target_parent_fd = os.open(
+                "feature_venvs",
+                _directory_open_flags(),
+                dir_fd=namespace_fd,
+            )
+
+            try:
+                stable_metadata = os.stat(
+                    stable_component,
+                    dir_fd=target_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                stable_metadata = None
+            if stable_metadata is not None:
+                if not stat.S_ISDIR(stable_metadata.st_mode):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature stable runtime path is unsafe."
+                    )
+                _log_runtime_migration_collision(
+                    legacy_component,
+                    stable_component,
+                    legacy_parent="released_feature_venvs",
+                )
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature has both released legacy and stable "
+                    "runtime state; operator custody reconciliation is required."
+                )
+
+            legacy_fd = os.open(
+                legacy_component,
+                _directory_open_flags(),
+                dir_fd=source_root_fd,
+            )
+            try:
+                if not _same_file_identity(legacy_metadata, os.fstat(legacy_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature released legacy runtime changed "
+                        "during migration."
+                    )
+                _ensure_venv_relocation_repair_marker_at(legacy_fd)
+            finally:
+                os.close(legacy_fd)
+
+            try:
+                _rename_directory_noreplace_at(
+                    source_root_fd,
+                    legacy_component,
+                    target_parent_fd,
+                    stable_component,
+                )
+            except FileNotFoundError:
+                try:
+                    post_legacy = os.stat(
+                        legacy_component,
+                        dir_fd=source_root_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    post_legacy = None
+                try:
+                    post_stable = os.stat(
+                        stable_component,
+                        dir_fd=target_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    post_stable = None
+                if (
+                    post_legacy is not None
+                    or post_stable is None
+                    or not _same_file_identity(legacy_metadata, post_stable)
+                ):
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature released legacy runtime migration "
+                        "did not complete; tenant state was retained."
+                    ) from None
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                _log_runtime_migration_collision(
+                    legacy_component,
+                    stable_component,
+                    legacy_parent="released_feature_venvs",
+                )
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature has both released legacy and stable "
+                    "runtime state; operator custody reconciliation is required."
+                ) from exc
+            migrated_fd = os.open(
+                stable_component,
+                _directory_open_flags(),
+                dir_fd=target_parent_fd,
+            )
+            try:
+                if not _same_file_identity(legacy_metadata, os.fstat(migrated_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature released legacy runtime changed "
+                        "during migration."
+                    )
+            finally:
+                os.close(migrated_fd)
+            os.fsync(source_root_fd)
+            os.fsync(target_parent_fd)
+            return True
+        finally:
+            os.close(source_root_fd)
+    except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature released runtime migration encountered "
+                "an unsafe path entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released runtime could not be migrated; "
+            "tenant state was retained."
+        ) from exc
+    finally:
+        if target_parent_fd is not None:
+            os.close(target_parent_fd)
+        if namespace_fd is not None:
+            os.close(namespace_fd)
+        if target_root_fd is not None:
+            os.close(target_root_fd)
+        if source_parent_fd is not None:
+            os.close(source_parent_fd)
+
+
+def _prepare_runtime_tree_portable(
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+    relative_directories: tuple[tuple[str, ...], ...],
+    directory_migrations: tuple[tuple[tuple[str, ...], str, str], ...],
+    migration_results: Optional[set[tuple[tuple[str, ...], str, str]]],
+) -> None:
+    """Best-effort non-POSIX fallback where dirfd no-follow is unavailable."""
+
+    created_root = False
+    try:
+        scope.root.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
+        created_root = True
+    except FileExistsError:
+        pass
+    if scope.root.is_symlink():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must not be a symlink."
+        )
+    root_metadata = scope.root.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must be a directory."
+        )
+    if created_root:
+        scope.root.chmod(_PRIVATE_DIRECTORY_MODE)
+    else:
+        _validate_operator_root_metadata(root_metadata)
+    cursor = scope.root
+    for component in scope.namespace.parts:
+        cursor = cursor / component
+        if cursor.is_symlink():
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime namespace must not contain symlinks."
+            )
+        cursor.mkdir(exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
+        cursor.chmod(_PRIVATE_DIRECTORY_MODE)
+    marker = cursor / _RUNTIME_OWNER_MARKER
+    owner_bytes = _runtime_owner_bytes(owner)
+
+    def validate_existing_marker() -> None:
+        if marker.is_symlink():
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime ownership marker is unsafe."
+            )
+        try:
+            metadata = marker.stat(follow_symlinks=False)
+            existing = marker.read_bytes()
+        except FileNotFoundError as exc:
+            raise _RuntimeOwnerMarkerMissing(
+                "Hosted isolated feature runtime ownership marker is missing; "
+                "refusing to assume tenant ownership."
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime ownership marker is unsafe."
+            )
+        if metadata.st_nlink != 1:
+            for candidate in cursor.iterdir():
+                if not candidate.name.startswith(_RUNTIME_OWNER_TEMP_PREFIX):
+                    continue
+                try:
+                    candidate_metadata = candidate.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(candidate_metadata.st_mode) and _same_file_identity(
+                    candidate_metadata, metadata
+                ):
+                    try:
+                        candidate.unlink()
+                    except FileNotFoundError:
+                        pass
+            if marker.stat(follow_symlinks=False).st_nlink != 1:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime ownership marker has an "
+                    "unsafe external hard link."
+                )
+        if len(existing) != len(owner_bytes):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime ownership marker is corrupt; "
+                "operator verification is required before recovery."
+            )
+        if not hmac.compare_digest(existing, owner_bytes):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime namespace is already owned by "
+                "a different agent."
+            )
+        marker.chmod(_PRIVATE_FILE_MODE)
+
+    try:
+        validate_existing_marker()
+    except _RuntimeOwnerMarkerMissing:
+        temporary = cursor / f"{_RUNTIME_OWNER_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
+        temporary_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            _PRIVATE_FILE_MODE,
+        )
+        try:
+            try:
+                _write_all(temporary_fd, owner_bytes)
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
+            temporary.chmod(_PRIVATE_FILE_MODE)
+            try:
+                os.link(temporary, marker, follow_symlinks=False)
+            except FileExistsError:
+                pass
+        finally:
+            temporary.unlink(missing_ok=True)
+        validate_existing_marker()
+    for parent, legacy_component, stable_component in directory_migrations:
+        migration_parent = cursor.joinpath(*parent)
+        migration_parent.mkdir(
+            parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE
+        )
+        if migration_parent.is_symlink():
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime migration parent must not "
+                "contain symlinks."
+            )
+        legacy = migration_parent / legacy_component
+        stable = migration_parent / stable_component
+        if not legacy.exists() and not legacy.is_symlink():
+            continue
+        if legacy.is_symlink() or not legacy.is_dir():
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature legacy runtime path is unsafe."
+            )
+        if stable.exists() or stable.is_symlink():
+            if stable.is_symlink() or not stable.is_dir():
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature stable runtime path is unsafe."
+                )
+            _log_runtime_migration_collision(legacy_component, stable_component)
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature has both legacy and stable runtime "
+                "state; operator custody reconciliation is required."
+            )
+        _ensure_venv_relocation_repair_marker_portable(legacy)
+        legacy.rename(stable)
+        if migration_results is not None:
+            migration_results.add((parent, legacy_component, stable_component))
+    for relative in relative_directories:
+        cursor = scope.path
+        for component in relative:
+            cursor = cursor / component
+            if cursor.is_symlink():
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime workspace must not contain "
+                    "symlinks."
+                )
+            cursor.mkdir(exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
+            cursor.chmod(_PRIVATE_DIRECTORY_MODE)
+
+
+def prepare_isolated_runtime_namespace(
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+    *,
+    relative_directories: tuple[tuple[str, ...], ...] = (),
+    directory_migrations: tuple[tuple[tuple[str, ...], str, str], ...] = (),
+    migration_results: Optional[set[tuple[tuple[str, ...], str, str]]] = None,
+) -> Path:
+    """Securely bind and prepare one hosted agent's mutable runtime tree.
+
+    On POSIX, every creation/open is descriptor-relative and no-follow. The
+    final inode/path bindings are rechecked before the descriptors are released,
+    closing the validation-to-create symlink race for tenant-controlled path
+    entries. The configured root's parent remains an operator custody boundary.
+    """
+
+    if type(owner) is not str or not owner:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime requires a concrete agent identity."
+        )
+    if any(
+        not relative
+        or any(
+            type(component) is not str
+            or not component
+            or component in {".", ".."}
+            or "/" in component
+            or "\\" in component
+            for component in relative
+        )
+        for relative in relative_directories
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime workspace paths must be canonical "
+            "relative components."
+        )
+    if any(
+        not parent
+        or any(
+            type(component) is not str
+            or not component
+            or component in {".", ".."}
+            or "/" in component
+            or "\\" in component
+            for component in parent
+        )
+        or _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(legacy_component) is None
+        or _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(stable_component) is None
+        for parent, legacy_component, stable_component in directory_migrations
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime migrations must use canonical "
+            "relative components."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - Windows fallback
+        try:
+            _prepare_runtime_tree_portable(
+                scope,
+                owner,
+                relative_directories,
+                directory_migrations,
+                migration_results,
+            )
+        except IsolatedRuntimeNamespaceError:
+            raise
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature runtime path could not be prepared."
+            ) from exc
+        return scope.path
+
+    try:
+        root_fd = _open_secure_absolute_directory(scope.root)
+    except IsolatedRuntimeNamespaceError:
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime root contains an unsafe path "
+                "entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature runtime root could not be prepared."
+        ) from exc
+    namespace_fd = root_fd
+    owns_namespace_fd = False
+    try:
+        for component in scope.namespace.parts:
+            child = _open_or_create_directory_at(namespace_fd, component)
+            if owns_namespace_fd:
+                os.close(namespace_fd)
+            namespace_fd = child
+            owns_namespace_fd = True
+        try:
+            current = os.stat(scope.path, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime namespace changed during "
+                "validation."
+            ) from exc
+        if not stat.S_ISDIR(current.st_mode) or not _same_file_identity(
+            current, os.fstat(namespace_fd)
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime namespace changed during validation."
+            )
+        _read_or_create_runtime_owner(namespace_fd, owner)
+        for parent, legacy_component, stable_component in directory_migrations:
+            descriptor = os.dup(namespace_fd)
+            try:
+                for component in parent:
+                    child = _open_or_create_directory_at(descriptor, component)
+                    os.close(descriptor)
+                    descriptor = child
+                migrated = _migrate_runtime_directory_at(
+                    descriptor,
+                    legacy_component,
+                    stable_component,
+                )
+                if migrated and migration_results is not None:
+                    migration_results.add((parent, legacy_component, stable_component))
+            finally:
+                os.close(descriptor)
+        for relative in relative_directories:
+            descriptor = os.dup(namespace_fd)
+            try:
+                for component in relative:
+                    child = _open_or_create_directory_at(descriptor, component)
+                    os.close(descriptor)
+                    descriptor = child
+                path = scope.path.joinpath(*relative)
+                try:
+                    current = os.stat(path, follow_symlinks=False)
+                except FileNotFoundError as exc:
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime workspace changed during "
+                        "validation."
+                    ) from exc
+                if not stat.S_ISDIR(current.st_mode) or not _same_file_identity(
+                    current, os.fstat(descriptor)
+                ):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime workspace changed during "
+                        "validation."
+                    )
+            finally:
+                os.close(descriptor)
+        return scope.path
+    except IsolatedRuntimeNamespaceError:
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime path contains an unsafe entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature runtime path could not be prepared."
+        ) from exc
+    finally:
+        if owns_namespace_fd:
+            os.close(namespace_fd)
+        os.close(root_fd)
+
+
+def _assert_no_nested_runtime_owners_at(
+    directory_fd: int,
+    *,
+    allow_owner_marker: bool,
+) -> None:
+    """Refuse cleanup when another runtime namespace is nested below this one.
+
+    Multi-component namespaces are valid, but allocated namespace leaves must
+    remain prefix-free. This descriptor-relative preflight prevents deleting
+    any sibling content before discovering that a descendant is independently
+    bound to an agent. The deletion walk repeats the check to fail closed if a
+    marker appears between preflight and mutation.
+    """
+
+    with os.scandir(directory_fd) as entries:
+        names = [entry.name for entry in entries]
+    if not allow_owner_marker and _RUNTIME_OWNER_MARKER in names:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup found a nested ownership "
+            "marker; allocated namespaces must not contain one another."
+        )
+    for name in names:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            continue
+        child_fd = os.open(name, _directory_open_flags(), dir_fd=directory_fd)
+        try:
+            if not _same_file_identity(metadata, os.fstat(child_fd)):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime cleanup target changed "
+                    "during nested-owner validation."
+                )
+            _assert_no_nested_runtime_owners_at(
+                child_fd,
+                allow_owner_marker=False,
+            )
+        finally:
+            os.close(child_fd)
+
+
+def _remove_directory_contents_at(
+    directory_fd: int,
+    *,
+    allow_owner_marker: bool,
+) -> None:
+    """Delete one already-open tree without following any directory symlink."""
+
+    with os.scandir(directory_fd) as entries:
+        names = [entry.name for entry in entries]
+    if not allow_owner_marker and _RUNTIME_OWNER_MARKER in names:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup found a nested ownership "
+            "marker; allocated namespaces must not contain one another."
+        )
+    for name in names:
+        # The top-level marker is the custody proof needed to retry a partial
+        # cleanup. Preserve it throughout the sweep regardless of filesystem
+        # enumeration order. Nested markers remain a hard failure above.
+        if allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
+            continue
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = os.open(name, _directory_open_flags(), dir_fd=directory_fd)
+            try:
+                if not _same_file_identity(metadata, os.fstat(child_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime cleanup target changed "
+                        "during validation."
+                    )
+                _remove_directory_contents_at(
+                    child_fd,
+                    allow_owner_marker=False,
+                )
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            # Symlinks and special files are removed as directory entries; they
+            # are never opened or traversed.
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def remove_isolated_runtime_namespace(
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+) -> RuntimeNamespaceCleanupOutcome:
+    """Securely offboard one tenant runtime tree after its agent has stopped.
+
+    Cleanup is deliberately POSIX-dirfd-only.  On a platform without the
+    no-follow primitives required to bind every deletion to the verified
+    namespace inode, Core retains the tree and reports the unsupported secure
+    cleanup instead of falling back to a traversal-prone recursive delete.
+    """
+
+    if type(owner) is not str or not owner:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup requires an agent identity."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - non-POSIX policy
+        if scope.path.exists():
+            raise IsolatedRuntimePreparationError(
+                "Secure isolated-runtime offboarding is unavailable on this "
+                "platform; tenant state was retained."
+            )
+        return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+
+    try:
+        root_fd = os.open(scope.root, _directory_open_flags())
+    except FileNotFoundError:
+        return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup root is unsafe."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature runtime cleanup root could not be opened."
+        ) from exc
+
+    current_fd = root_fd
+    owns_current_fd = False
+    parent_fd: Optional[int] = None
+    namespace_fd: Optional[int] = None
+    leaf = scope.namespace.parts[-1]
+    try:
+        root_metadata = os.fstat(root_fd)
+        lexical_root = os.stat(scope.root, follow_symlinks=False)
+        if not _same_file_identity(root_metadata, lexical_root):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup root changed during "
+                "validation."
+            )
+        _validate_operator_root_metadata(root_metadata)
+
+        for index, component in enumerate(scope.namespace.parts):
+            try:
+                child_fd = os.open(
+                    component, _directory_open_flags(), dir_fd=current_fd
+                )
+            except FileNotFoundError:
+                return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+            if index == len(scope.namespace.parts) - 1:
+                parent_fd = current_fd
+                namespace_fd = child_fd
+                break
+            if owns_current_fd:
+                os.close(current_fd)
+            current_fd = child_fd
+            owns_current_fd = True
+
+        assert parent_fd is not None and namespace_fd is not None
+        try:
+            lexical_namespace = os.stat(scope.path, follow_symlinks=False)
+        except FileNotFoundError:
+            return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+        if not stat.S_ISDIR(lexical_namespace.st_mode) or not _same_file_identity(
+            lexical_namespace, os.fstat(namespace_fd)
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup namespace changed during "
+                "validation."
+            )
+        _read_existing_runtime_owner(namespace_fd, owner)
+        _assert_no_nested_runtime_owners_at(
+            namespace_fd,
+            allow_owner_marker=True,
+        )
+        _remove_directory_contents_at(
+            namespace_fd,
+            allow_owner_marker=True,
+        )
+        # Revalidate custody after the mutable sweep, then remove its marker as
+        # the final directory entry immediately before rmdir.  If the final
+        # rmdir itself loses a race, recreate the same atomic marker through
+        # the still-open directory descriptor so a later retry is not wedged.
+        _read_existing_runtime_owner(namespace_fd, owner)
+        try:
+            os.unlink(_RUNTIME_OWNER_MARKER, dir_fd=namespace_fd)
+        except FileNotFoundError as exc:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime ownership marker changed "
+                "during cleanup."
+            ) from exc
+        try:
+            os.rmdir(leaf, dir_fd=parent_fd)
+        except FileNotFoundError:
+            # A concurrent cleanup holding the same verified custody evidence
+            # may have completed the final removal first.  The still-open
+            # descriptor refers to the now-unlinked inode; attempting to
+            # recreate a marker there would manufacture an unreachable file
+            # and turn a successful deletion into a false retained outcome.
+            pass
+        except OSError as remove_exc:
+            try:
+                _read_or_create_runtime_owner(namespace_fd, owner)
+            except Exception as restore_exc:
+                # Do not replace the original deletion diagnosis with the
+                # compensation failure.  Both are required for an operator to
+                # understand a retained tree whose marker could not be restored.
+                causes = ExceptionGroup(
+                    "isolated runtime removal and ownership recovery failed",
+                    [remove_exc, restore_exc],
+                )
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature runtime cleanup failed and its "
+                    "ownership marker could not be restored; operator custody "
+                    "reconciliation is required."
+                ) from causes
+            raise
+        os.fsync(parent_fd)
+        os.close(namespace_fd)
+        namespace_fd = None
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+    except IsolatedRuntimeNamespaceError:
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup encountered an unsafe "
+                "path entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature runtime cleanup could not complete; tenant "
+            "state was retained."
+        ) from exc
+    finally:
+        if namespace_fd is not None:
+            os.close(namespace_fd)
+        if owns_current_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _runtime_scope_value(agent: Any, attribute: str) -> Optional[str | Path]:
+    """Read one normalized agent path attribute without mistaking a Mock for one.
+
+    ``KestrelAgent`` canonicalizes general ``os.PathLike`` constructor inputs to
+    ``Path`` before exposing them. Restricting this duck-typed compatibility
+    boundary to concrete strings/pathlib paths also prevents a MagicMock's
+    synthetic ``__fspath__`` from declaring a hosted scope in endpoint tests.
+    """
+    value = getattr(agent, attribute, None)
+    if type(value) is str or isinstance(value, Path):
+        return value
+    return None
+
+
+def _agent_runtime_scope(agent: Any) -> Optional[IsolatedRuntimeNamespace]:
+    declared = getattr(agent, "isolated_runtime_scope", None)
+    if isinstance(declared, IsolatedRuntimeNamespace):
+        return declared
+    runtime_root = _runtime_scope_value(agent, "isolated_runtime_root")
+    runtime_namespace = _runtime_scope_value(agent, "isolated_runtime_namespace")
+    if runtime_root is not None or runtime_namespace is not None:
+        return resolve_isolated_runtime_namespace(runtime_root, runtime_namespace)
+    return None
+
+
+def _agent_released_legacy_runtime_root(agent: Any) -> Optional[Path]:
+    """Return only a factory-validated released-layout migration source."""
+
+    value = _runtime_scope_value(agent, "isolated_runtime_legacy_root")
+    return value if isinstance(value, Path) else None
+
+
+def _agent_runtime_owner(agent: Any) -> str:
+    for attribute in ("did", "agent_id"):
+        value = getattr(agent, attribute, None)
+        if type(value) is str and value:
+            return value
+    raise IsolatedRuntimeNamespaceError(
+        "Hosted isolated feature runtime requires a concrete agent DID."
+    )
+
+
+def resolve_agent_runtime_dir(agent: Any) -> Path:
+    """Resolve an agent runtime path without creating or changing the filesystem.
+
+    Standalone agents keep the existing storage-derived layout.  Hosted agents
+    must opt into an explicit root plus relative namespace; they never fall back
+    to the process CWD because that would collapse tenants onto one directory.
+    """
+    runtime_scope = _agent_runtime_scope(agent)
+    if runtime_scope is not None:
+        return runtime_scope.path
+
+    hosted = getattr(agent, "isolated_runtime_hosted", False)
+    if isinstance(hosted, bool) and hosted:
+        legacy_data_dir = _runtime_scope_value(agent, "isolated_feature_data_dir")
+        migration = (
+            " The legacy isolated_feature_data_dir value is not a containment "
+            "boundary; pass isolated_runtime_root and "
+            "isolated_runtime_namespace instead."
+            if legacy_data_dir is not None
+            else ""
+        )
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted agent has an isolated feature but no explicit runtime "
+            f"root and namespace.{migration}"
+        )
+
+    isolated_feature_data_dir = _runtime_scope_value(
+        agent, "isolated_feature_data_dir"
+    )
+    if isolated_feature_data_dir is not None:
         return Path(isolated_feature_data_dir).expanduser().resolve()
     storage_path = getattr(agent, "storage_path", None)
-    if storage_path:
+    if isinstance(storage_path, (str, os.PathLike)) and storage_path:
         return Path(storage_path).expanduser().resolve().parent
     return (Path.cwd() / "agent_data" / "default").resolve()
+
+
+def agent_runtime_dir(agent: Any) -> Path:
+    """Prepare and return the agent-owned mutable isolated-feature root."""
+
+    runtime_scope = _agent_runtime_scope(agent)
+    if runtime_scope is not None:
+        return prepare_isolated_runtime_namespace(
+            runtime_scope, _agent_runtime_owner(agent)
+        )
+    return resolve_agent_runtime_dir(agent)
+
+
+def remove_released_legacy_runtime_root(
+    legacy_root: Path,
+) -> RuntimeNamespaceCleanupOutcome:
+    """Securely remove the released per-agent ``feature_venvs`` tree.
+
+    The released layout has no ownership marker, so custody is intentionally
+    narrower than migration: the factory-provided path must be the canonical
+    ``feature_venvs`` leaf, its parent and leaf must remain descriptor-bound,
+    and the populated leaf must be service-owned and non-writable by group or
+    world.  Ambiguous custody is retained and reported; it is never mistaken
+    for successful deprovisioning of the new namespace.
+    """
+
+    if (
+        not isinstance(legacy_root, Path)
+        or not legacy_root.is_absolute()
+        or legacy_root.name != "feature_venvs"
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted released runtime cleanup path is not canonical."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - non-POSIX policy
+        if legacy_root.exists() or legacy_root.is_symlink():
+            raise IsolatedRuntimePreparationError(
+                "Secure released-runtime offboarding is unavailable on this "
+                "platform; tenant state was retained."
+            )
+        return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+
+    parent_fd: Optional[int] = None
+    legacy_fd: Optional[int] = None
+    try:
+        parent_fd = os.open(legacy_root.parent, _directory_open_flags())
+        lexical_parent = os.stat(legacy_root.parent, follow_symlinks=False)
+        if not stat.S_ISDIR(lexical_parent.st_mode) or not _same_file_identity(
+            lexical_parent,
+            os.fstat(parent_fd),
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup parent changed during validation."
+            )
+        try:
+            lexical_root = os.stat(
+                legacy_root.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+        legacy_fd = os.open(
+            legacy_root.name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        opened_root = os.fstat(legacy_fd)
+        if not stat.S_ISDIR(lexical_root.st_mode) or not _same_file_identity(
+            lexical_root,
+            opened_root,
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup root changed during validation."
+            )
+        _validate_released_legacy_root_custody(opened_root)
+        _assert_no_nested_runtime_owners_at(
+            legacy_fd,
+            allow_owner_marker=False,
+        )
+        _remove_directory_contents_at(
+            legacy_fd,
+            allow_owner_marker=False,
+        )
+        if not _same_file_identity(opened_root, os.fstat(legacy_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup root changed during removal."
+            )
+        try:
+            os.rmdir(legacy_root.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(parent_fd)
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+    except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup encountered an unsafe path entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted released runtime cleanup could not complete; tenant state "
+            "was retained."
+        ) from exc
+    finally:
+        if legacy_fd is not None:
+            os.close(legacy_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def remove_runtime_namespace(
+    scope: Optional[IsolatedRuntimeNamespace],
+    owner: Optional[str],
+    released_legacy_root: Optional[Path] = None,
+) -> RuntimeNamespaceCleanupOutcome:
+    """Delete all known hosted runtime layouts with exact custody semantics."""
+
+    if scope is None:
+        return RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+    if type(owner) is not str or not owner:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup requires an agent identity."
+        )
+    current_outcome = remove_isolated_runtime_namespace(scope, owner)
+    if released_legacy_root is None:
+        return current_outcome
+    legacy_outcome = remove_released_legacy_runtime_root(released_legacy_root)
+    if RuntimeNamespaceCleanupOutcome.REMOVED in {
+        current_outcome,
+        legacy_outcome,
+    }:
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+    return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+
+
+def remove_agent_runtime_namespace(agent: Any) -> RuntimeNamespaceCleanupOutcome:
+    """Remove current and released hosted state, or report storage custody."""
+
+    runtime_scope = _agent_runtime_scope(agent)
+    owner = _agent_runtime_owner(agent) if runtime_scope is not None else None
+    legacy_root = (
+        _agent_released_legacy_runtime_root(agent)
+        if runtime_scope is not None
+        else None
+    )
+    return remove_runtime_namespace(runtime_scope, owner, legacy_root)
 
 
 def _venv_bin_dir(venv_path: Path) -> Path:
@@ -2117,34 +4720,720 @@ def _venv_python(venv_path: Path) -> Path:
     return venv_path / "bin" / "python"
 
 
+def _console_script_path(venv_path: Path, service: str) -> Path:
+    """Return the exact executable path used for a console entry point."""
+
+    executable = _validated_isolated_service_executable(service)
+    if os.name == "nt" and not executable.casefold().endswith(".exe"):
+        executable = f"{executable}.exe"
+    return _venv_bin_dir(venv_path) / executable
+
+
 # Interpreter-behavior env vars that would let the HOST Python installation
 # shadow the isolated venv's packages, defeating the isolation the runtime
-# exists for (F023). Feature config/secrets ride through the general environment
-# intentionally (KESTREL_FEATURE_* is the documented config channel), so we STRIP
-# these specific interpreter vars rather than allowlisting the whole environment.
+# exists for (F023). Standalone feature config/secrets ride through the general
+# environment for backwards compatibility, so only these interpreter variables
+# are stripped there; hosted mode uses the restrictive allowlist below.
 _SHADOWING_ENV_VARS = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV")
 
+# Hosted services must not inherit a co-hosted agent's process-wide credentials
+# or feature configuration. These are the only host variables a child needs to
+# execute; agent-specific configuration (including secrets) travels through the
+# isolated-feature initialize handshake instead.
+_HOSTED_CHILD_ENV_BASE_KEYS = (
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
-def _isolated_child_env(venv_path: Optional[Path]) -> Dict[str, str]:
+# Package resolution is the only provisioning-specific authority inherited by
+# hosted uv/build subprocesses.  URLs may carry private-index credentials, and
+# named uv indexes conventionally use UV_INDEX_<NAME>_{USERNAME,PASSWORD};
+# those values are intentionally available only during provisioning, never to
+# the long-lived feature service or read-only venv probes.  Config-file,
+# keyring, SSH-agent, cloud, API, channel, and tenant variables are excluded.
+_HOSTED_PROVISIONING_PACKAGE_ENV_KEYS = (
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_TRUSTED_HOST",
+    "UV_DEFAULT_INDEX",
+    "UV_INDEX",
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+    "UV_INDEX_STRATEGY",
+    "UV_INSECURE_HOST",
+    "UV_NATIVE_TLS",
+)
+_HOSTED_PROVISIONING_NAMED_INDEX_CREDENTIAL = re.compile(
+    r"^UV_INDEX_[A-Z0-9_]+_(?:USERNAME|PASSWORD)$"
+)
+
+
+def _isolated_provisioning_env(
+    venv_path: Optional[Path],
+    *,
+    include_package_index: bool = False,
+    uv_cache_dir: Optional[Path] = None,
+) -> Dict[str, str]:
+    """Build a narrow environment for hosted probes and provisioning.
+
+    A feature venv can execute ``sitecustomize`` during a probe and arbitrary
+    build-backend code during installation.  Both therefore start from the
+    same host execution/locale/CA/proxy allowlist.  Only the installation path
+    opts into explicitly documented package-index settings and credentials.
+    """
+
+    source = os.environ
+    env = {key: source[key] for key in _HOSTED_CHILD_ENV_BASE_KEYS if key in source}
+    if include_package_index:
+        if uv_cache_dir is None:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature provisioning requires an explicit "
+                "private uv cache."
+            )
+        env.update(
+            {
+                key: source[key]
+                for key in _HOSTED_PROVISIONING_PACKAGE_ENV_KEYS
+                if key in source
+            }
+        )
+        env.update(
+            {
+                key: value
+                for key, value in source.items()
+                if _HOSTED_PROVISIONING_NAMED_INDEX_CREDENTIAL.fullmatch(key)
+            }
+        )
+        # Do not let uv discover an operator/home/cwd config file that was not
+        # explicitly admitted above.
+        env["UV_NO_CONFIG"] = "1"
+        env["UV_CACHE_DIR"] = str(uv_cache_dir)
+    elif uv_cache_dir is not None:
+        raise ValueError("uv_cache_dir is only valid for package provisioning")
+    if venv_path is not None:
+        env["VIRTUAL_ENV"] = str(venv_path)
+        bin_dir = str(_venv_bin_dir(venv_path))
+        env["PATH"] = os.pathsep.join([bin_dir, env.get("PATH", "")]).rstrip(os.pathsep)
+    return env
+
+
+def _trusted_host_executable(
+    executable: str,
+    *,
+    excluded_venv: Path,
+) -> tuple[str, str]:
+    """Resolve an operator executable without consulting feature-owned bins.
+
+    Package-index credentials are visible to the provisioning process and its
+    build backend.  The command which receives them must therefore be resolved
+    from the host PATH after removing every entry inside the mutable feature
+    venv.  Both PATH directories and the selected executable are resolved to
+    defeat symlink aliases back into that venv.
+
+    Returns the trusted absolute executable and the filtered absolute PATH used
+    for selection.  The latter is also given to the subprocess so a child
+    cannot resolve a helper through the excluded feature bin.
+    """
+
+    if (
+        type(executable) is not str
+        or not executable
+        or Path(executable).name != executable
+    ):
+        raise RuntimeError("Hosted provisioning executable must be a bare name")
+
+    excluded = excluded_venv.expanduser().resolve(strict=False)
+    trusted_entries: list[str] = []
+    for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
+        # An empty PATH entry means the process cwd.  It is mutable application
+        # state, not an operator executable directory, so never admit it here.
+        if not raw_entry:
+            continue
+        unresolved_entry = Path(raw_entry).expanduser()
+        if not unresolved_entry.is_absolute():
+            continue
+        try:
+            resolved_entry = unresolved_entry.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_entry == excluded or excluded in resolved_entry.parents:
+            continue
+        trusted_entries.append(str(resolved_entry))
+
+    if not trusted_entries:
+        raise RuntimeError(f"Required executable not found: {executable}")
+    trusted_path = os.pathsep.join(trusted_entries)
+    selected = shutil.which(executable, path=trusted_path)
+    if selected is None:
+        raise RuntimeError(f"Required executable not found: {executable}")
+    try:
+        selected_path = Path(selected).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"Required executable could not be resolved safely: {executable}"
+        ) from exc
+    if selected_path == excluded or excluded in selected_path.parents:
+        raise RuntimeError(
+            "Hosted provisioning executable resolved inside the feature venv"
+        )
+    return str(selected_path), trusted_path
+
+
+def _unsafe_hosted_feature_env_keys(
+    feature_name: Optional[str],
+    feature_distribution: Optional[str],
+) -> tuple[str, ...]:
+    """Return legacy process-wide config that cannot be assigned to a tenant."""
+
+    identity = f"{feature_name or ''} {feature_distribution or ''}".casefold()
+    relevant_legacy_keys: set[str] = set()
+    if "telegram" in identity:
+        relevant_legacy_keys.update(
+            {"KESTREL_TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN"}
+        )
+    if "whatsapp" in identity or "twilio" in identity:
+        relevant_legacy_keys.update(
+            {
+                "KESTREL_WHATSAPP_PROVIDER",
+                "KESTREL_WHATSAPP_SESSION_DB",
+                "TWILIO_ACCOUNT_SID",
+                "TWILIO_AUTH_TOKEN",
+                "TWILIO_WHATSAPP_FROM",
+            }
+        )
+    unsafe = {key for key in relevant_legacy_keys if key in os.environ}
+    if feature_name:
+        prefix = _env_key(feature_name, "")
+        host_only = {_env_key(feature_name, "BIN"), _env_key(feature_name, "VENV")}
+        unsafe.update(
+            key for key in os.environ if key.startswith(prefix) and key not in host_only
+        )
+    return tuple(sorted(unsafe))
+
+
+def _assert_hosted_feature_env_is_scoped(
+    feature_name: Optional[str],
+    feature_distribution: Optional[str],
+) -> None:
+    unsafe_keys = _unsafe_hosted_feature_env_keys(feature_name, feature_distribution)
+    if not unsafe_keys:
+        return
+    raise IsolatedRuntimeConfigurationError(
+        reason=_CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT,
+        environment_keys=unsafe_keys,
+    )
+
+
+def _hosted_prebuilt_override_error(key: str) -> IsolatedRuntimeConfigurationError:
+    return IsolatedRuntimeConfigurationError(
+        reason=_CONFIGURATION_HOSTED_PREBUILT_OVERRIDE,
+        environment_keys=(key,),
+    )
+
+
+def _hosted_immutable_metadata_is_unsafe(metadata: os.stat_result) -> bool:
+    """Return whether an immutable artifact has unsafe POSIX custody/mode."""
+
+    return os.name == "posix" and (
+        metadata.st_uid not in {0, os.geteuid()}
+        or bool(stat.S_IMODE(metadata.st_mode) & 0o022)
+    )
+
+
+@dataclass(frozen=True)
+class _ValidatedHostedPrebuiltVenv:
+    """Canonical root and bin directory proven safe for immutable use."""
+
+    root_path: Path
+    bin_path: Path
+
+
+def _validate_hosted_prebuilt_venv(
+    value: str,
+    *,
+    setting: str,
+    require_absolute: bool,
+) -> _ValidatedHostedPrebuiltVenv:
+    """Resolve and validate one immutable hosted venv selection.
+
+    ``runtime.venv`` comes from installed package metadata.  Unlike a
+    standalone declaration, a relative value would resolve against Core's
+    process CWD and become one shared mutable location for every tenant, so it
+    is never a valid hosted selection.  Environment overrides retain their
+    established absolute-normalization behavior but are subject to the same
+    immutable artifact checks. Operator-facing venv and interpreter symlinks
+    remain supported: every chain is resolved once and the canonical venv root,
+    configuration target, bin directory, and interpreter target are validated.
+    """
+
+    try:
+        candidate = Path(value).expanduser()
+        if require_absolute and not candidate.is_absolute():
+            raise ValueError("hosted runtime venv must be absolute")
+        venv_path = Path(os.path.abspath(candidate)).resolve(strict=True)
+        venv_metadata = venv_path.stat(follow_symlinks=False)
+        manifest = venv_path / ".kestrel_provision.json"
+        try:
+            manifest.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            manifest_present = False
+        else:
+            manifest_present = True
+        config_path = (venv_path / "pyvenv.cfg").resolve(strict=True)
+        config_metadata = config_path.stat(follow_symlinks=False)
+        bin_path = _venv_bin_dir(venv_path).resolve(strict=True)
+        bin_metadata = bin_path.stat(follow_symlinks=False)
+        python_path = _venv_python(venv_path).resolve(strict=True)
+        python_metadata = python_path.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise _hosted_prebuilt_override_error(setting) from None
+    if (
+        not stat.S_ISDIR(venv_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(venv_metadata)
+        or manifest_present
+        or not stat.S_ISREG(config_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(config_metadata)
+        or not stat.S_ISDIR(bin_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(bin_metadata)
+        or not stat.S_ISREG(python_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(python_metadata)
+        or (os.name == "posix" and not os.access(python_path, os.X_OK))
+    ):
+        raise _hosted_prebuilt_override_error(setting)
+    return _ValidatedHostedPrebuiltVenv(
+        root_path=venv_path,
+        bin_path=bin_path,
+    )
+
+
+def _validate_hosted_prebuilt_executable(
+    value: str,
+    *,
+    setting: str,
+    containment_root: Optional[Path] = None,
+) -> Path:
+    """Pin one executable after optional canonical containment validation.
+
+    The returned canonical target is the only path the caller may publish or
+    launch. A later replacement of the operator-facing symlink therefore
+    cannot redirect an already-resolved feature to a file Core did not inspect.
+    Root-owned system artifacts and service-uid-owned artifacts are accepted;
+    mutable group/world-writable targets are not.
+    """
+
+    try:
+        candidate = Path(value).expanduser()
+        absolute = Path(os.path.abspath(candidate))
+        resolved = absolute.resolve(strict=True)
+        if (
+            containment_root is not None
+            and containment_root not in resolved.parents
+        ):
+            raise ValueError("hosted prebuilt executable escaped containment")
+        metadata = resolved.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise _hosted_prebuilt_override_error(setting) from None
+    unsafe_posix_custody = _hosted_immutable_metadata_is_unsafe(metadata) or (
+        os.name == "posix" and not os.access(resolved, os.X_OK)
+    )
+    if not stat.S_ISREG(metadata.st_mode) or unsafe_posix_custody:
+        raise _hosted_prebuilt_override_error(setting)
+    return resolved
+
+
+def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
+    """Pin one hosted BIN symlink chain to its immutable executable target."""
+
+    return _validate_hosted_prebuilt_executable(value, setting=setting)
+
+
+def _validate_hosted_prebuilt_console(
+    venv_path: Path,
+    venv_bin_path: Path,
+    service: str,
+    *,
+    setting: str,
+) -> Path:
+    """Pin one immutable console target contained by its validated venv bin."""
+
+    script_name = _console_script_path(venv_path, service).name
+    return _validate_hosted_prebuilt_executable(
+        str(venv_bin_path / script_name),
+        setting=setting,
+        containment_root=venv_bin_path,
+    )
+
+
+@dataclass(frozen=True)
+class _ValidatedHostedPrebuiltOverrides:
+    """Canonical immutable artifacts selected by hosted operator settings."""
+
+    venv_path: Optional[Path]
+    venv_bin_path: Optional[Path]
+    bin_path: Optional[Path]
+
+
+def _validate_hosted_process_prebuilt_overrides(
+    feature_name: str,
+    *,
+    runtime_venv: Optional[str] = None,
+) -> _ValidatedHostedPrebuiltOverrides:
+    """Accept only existing immutable-shape hosted launch overrides.
+
+    Process variables and installed ``runtime.venv`` metadata are host
+    configuration rather than tenant config, so they may be shared only as
+    prebuilt artifacts. Core must never create, upgrade, or stamp either path:
+    doing so lets concurrent hosted agents race over mutable provisioning
+    state.
+    """
+
+    venv_key = _env_key(feature_name, "VENV")
+    venv_value = os.environ.get(venv_key)
+    validated_process_venv: Optional[_ValidatedHostedPrebuiltVenv] = None
+    if venv_value:
+        validated_process_venv = _validate_hosted_prebuilt_venv(
+            venv_value,
+            setting=venv_key,
+            require_absolute=False,
+        )
+
+    validated_runtime_venv: Optional[_ValidatedHostedPrebuiltVenv] = None
+    if runtime_venv is not None:
+        if type(runtime_venv) is not str or not runtime_venv:
+            raise _hosted_prebuilt_override_error(_HOSTED_RUNTIME_VENV_SETTING)
+        validated_runtime_venv = _validate_hosted_prebuilt_venv(
+            runtime_venv,
+            setting=_HOSTED_RUNTIME_VENV_SETTING,
+            require_absolute=True,
+        )
+    selected_venv = validated_process_venv or validated_runtime_venv
+    selected_venv_path = (
+        selected_venv.root_path if selected_venv is not None else None
+    )
+    selected_venv_bin_path = (
+        selected_venv.bin_path if selected_venv is not None else None
+    )
+
+    bin_key = _env_key(feature_name, "BIN")
+    bin_value = os.environ.get(bin_key)
+    if bin_value:
+        return _ValidatedHostedPrebuiltOverrides(
+            venv_path=selected_venv_path,
+            venv_bin_path=selected_venv_bin_path,
+            bin_path=_validate_hosted_prebuilt_bin(bin_value, setting=bin_key),
+        )
+    return _ValidatedHostedPrebuiltOverrides(
+        venv_path=selected_venv_path,
+        venv_bin_path=selected_venv_bin_path,
+        bin_path=None,
+    )
+
+
+def _isolated_child_env(
+    venv_path: Optional[Path],
+    *,
+    runtime_dir: Optional[Path] = None,
+    hosted: bool = False,
+    feature_name: Optional[str] = None,
+    feature_distribution: Optional[str] = None,
+) -> Dict[str, str]:
     """Build the launch environment for the isolated service subprocess.
 
-    Inherits the host environment (so feature config/secrets pass through) but
-    strips the interpreter-behavior vars in ``_SHADOWING_ENV_VARS`` so a stray
-    host ``PYTHONPATH``/``VIRTUAL_ENV`` can't resolve the service's imports
-    against host site-packages. When a venv is used, re-point ``VIRTUAL_ENV`` at
-    it and prepend its bin dir to ``PATH`` so child processes bind to the
-    isolated venv.
+    Standalone services inherit feature variables for backwards compatibility.
+    Hosted services deliberately drop those process-wide variables and receive
+    agent-scoped configuration through their initialize handshake. In both
+    modes interpreter-behavior vars in ``_SHADOWING_ENV_VARS`` are stripped so
+    a stray host ``PYTHONPATH``/``VIRTUAL_ENV`` cannot defeat venv isolation.
+    Hosted runtime workspaces also own child homes, cache, data, and temp
+    paths. Standalone launches preserve their historical process environment;
+    their feature packages may already rely on HOME, TMPDIR, XDG, or legacy
+    Kestrel data-directory precedence.
     """
     env = dict(os.environ)
     for var in _SHADOWING_ENV_VARS:
         env.pop(var, None)
+    if hosted:
+        _assert_hosted_feature_env_is_scoped(feature_name, feature_distribution)
+        # A process environment is host scoped, so inherited variables cannot
+        # safely represent a tenant's configuration or credentials. Keep only
+        # execution/locale/CA variables; feature config and secrets arrive in
+        # the per-agent initialize handshake.
+        env = {key: env[key] for key in _HOSTED_CHILD_ENV_BASE_KEYS if key in env}
     if venv_path is not None:
         env["VIRTUAL_ENV"] = str(venv_path)
         bin_dir = str(_venv_bin_dir(venv_path))
-        env["PATH"] = os.pathsep.join(
-            [bin_dir, env.get("PATH", "")]
-        ).rstrip(os.pathsep)
+        env["PATH"] = os.pathsep.join([bin_dir, env.get("PATH", "")]).rstrip(os.pathsep)
+    if hosted and runtime_dir is not None:
+        # These are location contracts, not capabilities. Hosted feature code
+        # runs under Core's service UID unless the operator supplies a real
+        # container/UID sandbox; POSIX 0700 cannot isolate hostile same-UID
+        # siblings. Expose only this child's required workspace paths, never
+        # the configured operator root or a sibling namespace.
+        # Child libraries commonly write relative files, XDG state, or temp
+        # files. Point all of those at the feature's agent-owned workspace.
+        # ``KESTREL_ISOLATED_RUNTIME_DIR`` is Kestrel's generic canonical
+        # variable. ``KESTREL_ISOLATED_FEATURE_DATA_DIR`` is the established
+        # isolated-service contract (including kestrel-channel-whatsapp), so
+        # export both while feature packages migrate to the canonical spelling.
+        env["KESTREL_ISOLATED_RUNTIME_DIR"] = str(runtime_dir)
+        env["KESTREL_ISOLATED_FEATURE_DATA_DIR"] = str(runtime_dir)
+        env["HOME"] = str(runtime_dir / "home")
+        env["TMPDIR"] = str(runtime_dir / "tmp")
+        env["TMP"] = str(runtime_dir / "tmp")
+        env["TEMP"] = str(runtime_dir / "tmp")
+        env["USERPROFILE"] = str(runtime_dir / "home")
+        env["APPDATA"] = str(runtime_dir / "config")
+        env["LOCALAPPDATA"] = str(runtime_dir / "data")
+        env["XDG_CONFIG_HOME"] = str(runtime_dir / "config")
+        env["XDG_DATA_HOME"] = str(runtime_dir / "data")
+        env["XDG_CACHE_HOME"] = str(runtime_dir / "cache")
     return env
+
+
+_MAX_PRIVATE_ARTIFACT_BYTES = 4 * 1024 * 1024
+_ASCII_BASE64_WHITESPACE = b" \t\n\r\v\f"
+
+
+def _write_private_artifact(path: Path, payload: bytes) -> None:
+    """Atomically replace one file in an existing, no-follow runtime directory."""
+
+    if len(payload) > _MAX_PRIVATE_ARTIFACT_BYTES:
+        raise IsolatedRuntimeNamespaceError(
+            "Agent runtime artifact exceeds the safe write limit."
+        )
+
+    if not _secure_dirfd_supported():  # pragma: no cover - Windows fallback
+        if path.parent.is_symlink() or not path.parent.is_dir():
+            raise IsolatedRuntimeNamespaceError(
+                "Agent runtime artifact directory is unavailable or unsafe."
+            )
+        temporary_path = path.parent / (f".{path.name}.tmp-{os.getpid()}-{uuid4().hex}")
+        descriptor = os.open(
+            temporary_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            _PRIVATE_FILE_MODE,
+        )
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        temporary_path.chmod(_PRIVATE_FILE_MODE)
+        try:
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return
+
+    directory_fd = os.open(path.parent, _directory_open_flags())
+    temporary = f".{path.name}.tmp-{os.getpid()}-{uuid4().hex}"
+    temporary_fd: Optional[int] = None
+    try:
+        lexical = os.stat(path.parent, follow_symlinks=False)
+        if not stat.S_ISDIR(lexical.st_mode) or not _same_file_identity(
+            lexical, os.fstat(directory_fd)
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Agent runtime artifact directory changed during validation."
+            )
+        temporary_fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            _PRIVATE_FILE_MODE,
+            dir_fd=directory_fd,
+        )
+        _write_all(temporary_fd, payload)
+        os.fchmod(temporary_fd, _PRIVATE_FILE_MODE)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        finally:
+            # Cleanup failure must never strand the directory descriptor.
+            os.close(directory_fd)
+
+
+def _read_bounded_descriptor(descriptor: int, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            raise IsolatedRuntimeNamespaceError(
+                "Agent runtime artifact exceeds the safe read limit."
+            )
+
+
+def _validate_private_artifact_metadata(
+    metadata: os.stat_result, *, max_bytes: int
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise IsolatedRuntimeNamespaceError(
+            "Agent runtime artifact is not a private regular file."
+        )
+    if metadata.st_size < 0 or metadata.st_size > max_bytes:
+        raise IsolatedRuntimeNamespaceError(
+            "Agent runtime artifact exceeds the safe read limit."
+        )
+
+
+def read_private_artifact(
+    path: Path, *, max_bytes: int = _MAX_PRIVATE_ARTIFACT_BYTES
+) -> Optional[bytes]:
+    """Read one bounded artifact without following a tenant-controlled link.
+
+    This function is intentionally synchronous: HTTP/event callers must run
+    the entire descriptor-relative open and read in a worker thread. ``None``
+    means the artifact or its parent is absent. Unsafe path entries and file
+    types fail closed with :class:`IsolatedRuntimeNamespaceError`.
+    """
+
+    path = Path(path)
+    if max_bytes < 0 or path.name in {"", ".", ".."}:
+        raise IsolatedRuntimeNamespaceError(
+            "Agent runtime artifact path is invalid."
+        )
+
+    if not _secure_dirfd_supported():  # pragma: no cover - Windows fallback
+        try:
+            parent_metadata = path.parent.stat(follow_symlinks=False)
+            entry_metadata = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(parent_metadata.st_mode):
+            raise IsolatedRuntimeNamespaceError(
+                "Agent runtime artifact directory is unavailable or unsafe."
+            )
+        _validate_private_artifact_metadata(entry_metadata, max_bytes=max_bytes)
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            opened = os.fstat(descriptor)
+            _validate_private_artifact_metadata(opened, max_bytes=max_bytes)
+            if not _same_file_identity(entry_metadata, opened):
+                raise IsolatedRuntimeNamespaceError(
+                    "Agent runtime artifact changed during validation."
+                )
+            return _read_bounded_descriptor(descriptor, max_bytes)
+        finally:
+            os.close(descriptor)
+
+    try:
+        directory_fd = os.open(path.parent, _directory_open_flags())
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Agent runtime artifact directory is unavailable or unsafe."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Agent runtime artifact directory could not be opened."
+        ) from exc
+    try:
+        try:
+            lexical_parent = os.stat(path.parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(lexical_parent.st_mode) or not _same_file_identity(
+            lexical_parent, os.fstat(directory_fd)
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Agent runtime artifact directory changed during validation."
+            )
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise IsolatedRuntimeNamespaceError(
+                    "Agent runtime artifact is unavailable or unsafe."
+                ) from exc
+            raise IsolatedRuntimePreparationError(
+                "Agent runtime artifact could not be opened."
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            _validate_private_artifact_metadata(metadata, max_bytes=max_bytes)
+            return _read_bounded_descriptor(descriptor, max_bytes)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory_fd)
+
+
+def _unlink_private_artifact(path: Path) -> None:
+    """Unlink one artifact relative to its existing no-follow directory."""
+
+    if not _secure_dirfd_supported():  # pragma: no cover - Windows fallback
+        if path.parent.is_symlink() or not path.parent.is_dir():
+            raise IsolatedRuntimeNamespaceError(
+                "Agent runtime artifact directory is unavailable or unsafe."
+            )
+        path.unlink(missing_ok=True)
+        return
+
+    directory_fd = os.open(path.parent, _directory_open_flags())
+    try:
+        os.unlink(path.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(directory_fd)
 
 
 def _coerce_category(value: Any) -> ToolCategory:
@@ -2257,6 +5546,40 @@ class ProxyFeature(Feature):
         super().__init__(agent)
         self.runtime = runtime
         self.name = runtime.class_name
+        # Resolve hosted containment before classifying optional feature
+        # metadata.  A malformed third-party class may be quarantined, but it
+        # must never mask a real missing/invalid hosted namespace.
+        self._isolated_runtime_scope = _agent_runtime_scope(agent)
+        if (
+            self._isolated_runtime_scope is None
+            and getattr(agent, "isolated_runtime_hosted", False) is True
+        ):
+            # This read-only resolver owns the explicit missing-scope error;
+            # it cannot create a standalone fallback for a declared host.
+            resolve_agent_runtime_dir(agent)
+        if _ISOLATED_FEATURE_CLASS_NAME.fullmatch(self.name) is None:
+            raise IsolatedRuntimeConfigurationError(
+                reason=_CONFIGURATION_FEATURE_IDENTITY,
+            )
+        # An explicit BIN override is the complete runnable and historically
+        # does not require service metadata. Defer target validation until the
+        # constructor has validated any hosted process-wide override below.
+        self._service_target: _IsolatedServiceTarget | None = None
+        self._runtime_directory_name = (
+            _hosted_feature_runtime_component(runtime)
+            if self._isolated_runtime_scope is not None
+            else self.name
+        )
+        self._legacy_runtime_directory_name = (
+            _legacy_hosted_feature_runtime_component(runtime)
+            if self._isolated_runtime_scope is not None
+            else None
+        )
+        self._released_legacy_runtime_root = (
+            _agent_released_legacy_runtime_root(agent)
+            if self._isolated_runtime_scope is not None
+            else None
+        )
         self._client_factory = client_factory
         self._client: Any = None
         self._tools: List[AgentTool] = []
@@ -2337,6 +5660,22 @@ class ProxyFeature(Feature):
         self._reloading = False
         self._reload_lock = asyncio.Lock()
         self._reload_gen = 0
+        # Resolve at construction, before feature startup/discovery can turn a
+        # missing hosted scope into an optional-feature warning and continue.
+        self._agent_runtime_dir = agent_runtime_dir(agent)
+        if (
+            self._isolated_runtime_scope is not None
+            or getattr(agent, "isolated_runtime_hosted", False) is True
+        ):
+            _assert_hosted_feature_env_is_scoped(self.name, self.runtime.distribution)
+            _validate_hosted_process_prebuilt_overrides(
+                self.name,
+                runtime_venv=self.runtime.venv,
+            )
+        if not os.environ.get(_env_key(self.name, "BIN")):
+            self._service_target = _validated_isolated_service_target(
+                self.runtime.service
+            )
         self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
         # Event acknowledgement requests are intentionally detached from the
         # SDK read loop (which cannot await a response it must itself read).
@@ -2360,6 +5699,16 @@ class ProxyFeature(Feature):
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
+        # Hosted immutable console wrappers may themselves be operator-facing
+        # symlinks. Preparation resolves and validates one exact regular target;
+        # child construction must execute that target rather than re-following
+        # the public link after the custody check.
+        self._validated_hosted_console_path: Optional[Path] = None
+        # Set only when Core observes a custody-preserving directory rename in
+        # the current enable attempt. A missing manifest stamp is not evidence
+        # of relocation; older, unmoved venvs use this distinction to start
+        # offline and atomically backfill their canonical path.
+        self._venv_relocated_this_startup = False
         self._host_config: Dict[str, Any] = {}
         self._hosted_telegram_startup_attested = False
         self._hosted_telegram_route_identity: Optional[str] = None
@@ -2931,9 +6280,10 @@ class ProxyFeature(Feature):
             # let that in-memory state stand in for the durable read below.
             self._host_config = {}
             self._host_config_loaded = False
+            self._prepare_runtime_workspace()
             self._venv_path, self._bin_path = self.resolve_runtime_paths()
             if self._bin_path is None:
-                self.ensure_venv()
+                await self._ensure_venv_without_blocking_event_loop()
             # Resolve persisted/UI host config BEFORE building the client so it can be
             # forwarded to the isolated service through the initialize handshake (the
             # service is otherwise launched bare, with only env vars).
@@ -2948,6 +6298,22 @@ class ProxyFeature(Feature):
             await self._reset_traffic_gate_after_initialize()
             self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
+
+    async def _ensure_venv_without_blocking_event_loop(self) -> None:
+        """Own synchronous preparation in a worker without orphaning it.
+
+        Fresh callable verification executes feature import code with a finite
+        subprocess timeout. Running the surrounding synchronous preparation in
+        a worker keeps that budget from blocking every agent on the host loop.
+        A cancellation is observed only after the shielded worker settles, so
+        venv mutation cannot continue after lifecycle ownership is released.
+        """
+
+        task = asyncio.create_task(
+            asyncio.to_thread(self.ensure_venv),
+            name=f"isolated-venv-prepare:{self.name}",
+        )
+        await _await_task_until_complete(task, preserve_cancellation=False)
 
     def _latch_terminal_lifecycle(self) -> int:
         """Record one terminal intent and revoke queued initialization permits.
@@ -3082,7 +6448,7 @@ class ProxyFeature(Feature):
         )
         try:
             await self._register_event_handler(client)
-        except BaseException:
+        except BaseException as exc:
             # A client whose event registration failed must not remain
             # reachable through host tools while its caller unwinds.  Shutdown
             # may already have unpublished and retired this exact client while
@@ -3091,6 +6457,25 @@ class ProxyFeature(Feature):
             unpublished_client = self._unpublish_client(client)
             if unpublished_client is client:
                 await self._retire_detached_client(unpublished_client)
+            if isinstance(
+                exc,
+                (
+                    IsolatedRuntimeNamespaceError,
+                    IsolatedRuntimeConfigurationError,
+                    IsolatedRuntimePreparationError,
+                    _TerminalLifecyclePermitRevoked,
+                    asyncio.CancelledError,
+                ),
+            ):
+                raise
+            if isinstance(
+                exc,
+                (OSError, subprocess.SubprocessError, RuntimeError, ProtocolError),
+            ):
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature child event registration could not be "
+                    "prepared."
+                ) from exc
             raise
         # Registration is an awaited post-publication operation.  Shutdown may
         # have latched while it was in flight and be waiting for this lifecycle
@@ -3130,12 +6515,43 @@ class ProxyFeature(Feature):
         """
 
         child_config = self._host_config if config is None else config
-        client = self._build_client(config=child_config)
+        try:
+            client = self._build_client(config=child_config)
+        except (
+            IsolatedRuntimeNamespaceError,
+            IsolatedRuntimeConfigurationError,
+            IsolatedRuntimePreparationError,
+            _TerminalLifecyclePermitRevoked,
+        ):
+            raise
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature child process could not be prepared."
+            ) from exc
         try:
             await _maybe_await(client.start())
             advertised_tools = await _maybe_await(client.list_tools())
-        except BaseException:
+        except BaseException as exc:
             await self._retire_detached_client(client)
+            if isinstance(
+                exc,
+                (
+                    IsolatedRuntimeNamespaceError,
+                    IsolatedRuntimeConfigurationError,
+                    IsolatedRuntimePreparationError,
+                    _TerminalLifecyclePermitRevoked,
+                    asyncio.CancelledError,
+                ),
+            ):
+                raise
+            if isinstance(
+                exc,
+                (OSError, subprocess.SubprocessError, RuntimeError, ProtocolError),
+            ):
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature child process could not start or advertise "
+                    "its runtime contract."
+                ) from exc
             raise
         return client, [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
 
@@ -6000,7 +9416,7 @@ class ProxyFeature(Feature):
             result = None
             call = None
             request = None
-            self = None
+            self = None  # noqa: F841 - explicitly detach the bound proxy reference
 
     async def _run_host_ingress(
         self,
@@ -6171,6 +9587,7 @@ class ProxyFeature(Feature):
         onto the forwarding adapter.
         """
         from kestrel_sdk.channels import ChannelConfig
+
         from kestrel_sovereign.features.channels.feature import (
             canonical_telegram_allowed_senders,
         )
@@ -6370,18 +9787,98 @@ class ProxyFeature(Feature):
             logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
+        # A new resolution invalidates any prior enable cycle's console pin.
+        self._validated_hosted_console_path = None
+        validated_hosted_overrides: Optional[
+            _ValidatedHostedPrebuiltOverrides
+        ] = None
+        if self._runtime_is_hosted():
+            # Revalidate here as well as at construction: tests, embedders, and
+            # long-lived hosts can mutate ``os.environ`` between discovery and
+            # enable.  A late process-wide path must never acquire provisioning
+            # authority merely because the ProxyFeature already exists.
+            validated_hosted_overrides = _validate_hosted_process_prebuilt_overrides(
+                self.name,
+                runtime_venv=self.runtime.venv,
+            )
         bin_override = os.environ.get(_env_key(self.name, "BIN"))
         if bin_override:
-            return self._default_venv_path(), Path(bin_override).expanduser().resolve()
+            # BIN is authoritative for this launch attempt. Do not reflect or
+            # forward unused service metadata to the child factory.
+            self._service_target = None
+            if (
+                validated_hosted_overrides is not None
+                and validated_hosted_overrides.bin_path is not None
+            ):
+                return (
+                    self._default_venv_path(),
+                    validated_hosted_overrides.bin_path,
+                )
+            return (
+                self._default_venv_path(),
+                Path(bin_override).expanduser().resolve(),
+            )
+
+        # Revalidate at the launch-path mutation boundary. In particular, a
+        # BIN override removed after discovery must not expose missing or
+        # malformed service metadata to `_service_command`.
+        self._service_target = _validated_isolated_service_target(
+            self.runtime.service
+        )
 
         venv_override = os.environ.get(_env_key(self.name, "VENV"))
         if venv_override:
+            if (
+                validated_hosted_overrides is not None
+                and validated_hosted_overrides.venv_path is not None
+            ):
+                return validated_hosted_overrides.venv_path, None
             return Path(venv_override).expanduser().resolve(), None
 
         if self.runtime.venv:
+            if (
+                validated_hosted_overrides is not None
+                and validated_hosted_overrides.venv_path is not None
+            ):
+                return validated_hosted_overrides.venv_path, None
             return Path(self.runtime.venv).expanduser().resolve(), None
 
         return self._default_venv_path(), None
+
+    def _runtime_is_hosted(self) -> bool:
+        return (
+            self._isolated_runtime_scope is not None
+            or getattr(self.agent, "isolated_runtime_hosted", False) is True
+        )
+
+    def _required_service_target(self) -> _IsolatedServiceTarget:
+        """Return service metadata only on a launch path without BIN."""
+
+        if self._service_target is None:
+            self._service_target = _validated_isolated_service_target(
+                self.runtime.service
+            )
+        return self._service_target
+
+    def _probe_feature_distribution(
+        self,
+        python_path: Path,
+    ) -> _FeatureDistributionProbe:
+        if self._runtime_is_hosted():
+            return _venv_feature_distribution_probe(
+                python_path,
+                self.runtime.distribution,
+                hosted=True,
+            )
+        return _venv_feature_distribution_probe(
+            python_path,
+            self.runtime.distribution,
+        )
+
+    def _probe_sdk_version(self, python_path: Path) -> str:
+        if self._runtime_is_hosted():
+            return _venv_sdk_version(python_path, hosted=True)
+        return _venv_sdk_version(python_path)
 
     def _venv_is_overridden(self) -> bool:
         """True when the venv path was supplied by the operator (KESTREL_FEATURE_
@@ -6393,8 +9890,169 @@ class ProxyFeature(Feature):
             or self.runtime.venv
         )
 
+    def _process_venv_is_overridden(self) -> bool:
+        """Whether this host selected a process-wide immutable venv artifact."""
+
+        return bool(os.environ.get(_env_key(self.name, "VENV")))
+
+    def _hosted_immutable_venv_setting(self) -> Optional[str]:
+        """Return the safe setting name selecting an immutable hosted venv."""
+
+        if self._process_venv_is_overridden():
+            return _env_key(self.name, "VENV")
+        if self.runtime.venv is not None:
+            return _HOSTED_RUNTIME_VENV_SETTING
+        return None
+
     def _default_venv_path(self) -> Path:
-        return _agent_data_dir(self.agent) / "feature_venvs" / self.name / ".venv"
+        return self._feature_runtime_dir() / ".venv"
+
+    def _feature_runtime_dir(self) -> Path:
+        """Return this feature's mutable, agent-scoped runtime directory."""
+        return (
+            self._agent_runtime_dir
+            / "feature_venvs"
+            / self._runtime_directory_name
+        )
+
+    def _prepare_runtime_workspace(self) -> Path:
+        """Create the per-feature child-process workspace without touching its venv.
+
+        This intentionally lives beside, rather than inside, ``.venv`` so an
+        operator-provided prebuilt environment remains immutable while service
+        state, temp files, and user-home/XDG writes stay agent scoped.
+        """
+        runtime_dir = self._feature_runtime_dir()
+        self._venv_relocated_this_startup = False
+        if self._isolated_runtime_scope is not None:
+            prefix = ("feature_venvs", self._runtime_directory_name)
+            legacy_component = self._legacy_runtime_directory_name
+            migrations = (
+                ((("feature_venvs",), legacy_component, self._runtime_directory_name),)
+                if (
+                    legacy_component is not None
+                    and legacy_component != self._runtime_directory_name
+                )
+                else ()
+            )
+            migration_results: set[tuple[tuple[str, ...], str, str]] = set()
+            prepare_isolated_runtime_namespace(
+                self._isolated_runtime_scope,
+                _agent_runtime_owner(self.agent),
+                relative_directories=(("feature_venvs",),),
+                directory_migrations=migrations,
+                migration_results=migration_results,
+            )
+            self._venv_relocated_this_startup = bool(migration_results)
+            if self._released_legacy_runtime_root is not None:
+                self._venv_relocated_this_startup = (
+                    migrate_released_hosted_feature_runtime(
+                        self._released_legacy_runtime_root,
+                        self._isolated_runtime_scope,
+                        _agent_runtime_owner(self.agent),
+                        self.name,
+                        self._runtime_directory_name,
+                    )
+                    or self._venv_relocated_this_startup
+                )
+            prepare_isolated_runtime_namespace(
+                self._isolated_runtime_scope,
+                _agent_runtime_owner(self.agent),
+                relative_directories=(
+                    ("channel_link_artifacts",),
+                    prefix,
+                    prefix + ("work",),
+                    prefix + ("home",),
+                    prefix + ("tmp",),
+                    prefix + ("config",),
+                    prefix + ("data",),
+                    prefix + ("cache",),
+                    prefix + ("provisioning_cache",),
+                ),
+            )
+            return runtime_dir
+        # The storage parent belongs to the standalone operator and may be the
+        # process CWD. Never chmod it when it already exists. Core's dedicated
+        # child directories below are its private ownership boundary and are
+        # created/normalized explicitly so mutable feature state and channel
+        # credentials remain inaccessible through a permissive parent.
+        if self._agent_runtime_dir.is_symlink():
+            raise IsolatedRuntimeNamespaceError(
+                "Standalone isolated feature runtime root must not be a symlink."
+            )
+        try:
+            self._agent_runtime_dir.mkdir(
+                parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE
+            )
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Standalone isolated feature runtime root could not be prepared."
+            ) from exc
+        for directory in (
+            self._agent_runtime_dir / "feature_venvs",
+            runtime_dir,
+            runtime_dir / "work",
+            runtime_dir / "home",
+            runtime_dir / "tmp",
+            runtime_dir / "config",
+            runtime_dir / "data",
+            runtime_dir / "cache",
+            self._agent_runtime_dir / "channel_link_artifacts",
+        ):
+            if directory.is_symlink():
+                raise IsolatedRuntimeNamespaceError(
+                    "Standalone isolated feature runtime workspace must not "
+                    "contain symlinks."
+                )
+            try:
+                directory.mkdir(exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
+                directory.chmod(_PRIVATE_DIRECTORY_MODE)
+            except OSError as exc:
+                raise IsolatedRuntimePreparationError(
+                    "Standalone isolated feature runtime workspace could not be "
+                    "prepared."
+                ) from exc
+        return runtime_dir
+
+    def _hosted_provisioning_cache_dir(self) -> Path:
+        """Return the already-prepared private cache used by hosted uv.
+
+        Workspace creation is descriptor-relative and precedes venv
+        provisioning in ``initialize``.  Revalidate the resulting lexical
+        path here so a missing mount/workspace becomes a preparation failure,
+        while a symlink, foreign owner, or permissive replacement remains a
+        containment failure that aborts hosted startup.
+        """
+
+        if self._isolated_runtime_scope is None:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature provisioning has no runtime scope."
+            )
+        cache_dir = self._feature_runtime_dir() / "provisioning_cache"
+        try:
+            metadata = cache_dir.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature provisioning cache was not prepared."
+            ) from exc
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature provisioning cache could not be inspected."
+            ) from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature provisioning cache is unsafe."
+            )
+        if os.name == "posix":
+            if metadata.st_uid != os.geteuid():
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature provisioning cache has a foreign owner."
+                )
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature provisioning cache is not private."
+                )
+        return cache_dir
 
     def _provision_manifest_path(self) -> Path:
         # Inside the venv dir, not its parent: explicit venv overrides can share
@@ -6403,11 +10061,106 @@ class ProxyFeature(Feature):
         assert self._venv_path is not None
         return self._venv_path / ".kestrel_provision.json"
 
+    def _venv_relocation_repair_pending(self) -> bool:
+        """Read durable migration intent from the feature directory."""
+
+        if self._isolated_runtime_scope is None:
+            return False
+        runtime_dir = self._feature_runtime_dir()
+        if not _secure_dirfd_supported():  # pragma: no cover - portable policy
+            try:
+                return _read_venv_relocation_repair_marker_portable(runtime_dir)
+            except IsolatedRuntimeNamespaceError:
+                raise
+            except OSError as exc:
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature relocation repair state could not "
+                    "be read."
+                ) from exc
+        directory_fd: Optional[int] = None
+        try:
+            directory_fd = os.open(runtime_dir, _directory_open_flags())
+            lexical = os.stat(runtime_dir, follow_symlinks=False)
+            if not _same_file_identity(lexical, os.fstat(directory_fd)):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime changed while reading "
+                    "relocation repair state."
+                )
+            return _read_venv_relocation_repair_marker_at(directory_fd)
+        except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature relocation repair path is unsafe."
+                ) from exc
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be read."
+            ) from exc
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    def _clear_venv_relocation_repair_marker(self) -> None:
+        """Clear migration intent only after launch verification and stamping."""
+
+        if self._isolated_runtime_scope is None:
+            return
+        runtime_dir = self._feature_runtime_dir()
+        if not _secure_dirfd_supported():  # pragma: no cover - portable policy
+            marker = runtime_dir / _VENV_RELOCATION_REPAIR_MARKER
+            try:
+                if not _read_venv_relocation_repair_marker_portable(runtime_dir):
+                    return
+                marker.unlink()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature relocation repair state could not "
+                    "be finalized."
+                ) from exc
+            return
+        directory_fd: Optional[int] = None
+        try:
+            directory_fd = os.open(runtime_dir, _directory_open_flags())
+            lexical = os.stat(runtime_dir, follow_symlinks=False)
+            if not _same_file_identity(lexical, os.fstat(directory_fd)):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime changed while finalizing "
+                    "relocation repair."
+                )
+            if not _read_venv_relocation_repair_marker_at(directory_fd):
+                return
+            try:
+                os.unlink(
+                    _VENV_RELOCATION_REPAIR_MARKER,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return
+            os.fsync(directory_fd)
+        except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature relocation repair path is unsafe."
+                ) from exc
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be "
+                "finalized."
+            ) from exc
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
     def _read_provision_manifest(self) -> Dict[str, Any]:
         try:
-            return json.loads(self._provision_manifest_path().read_text())
+            manifest = json.loads(self._provision_manifest_path().read_text())
         except Exception:  # noqa: BLE001 — missing/corrupt manifest ⇒ reprovision
             return {}
+        return manifest if isinstance(manifest, dict) else {}
 
     def _write_provision_manifest(
         self,
@@ -6417,49 +10170,421 @@ class ProxyFeature(Feature):
         feature_distribution_version: str,
         child_feature_distribution: _FeatureDistributionProbe,
     ) -> None:
-        path = self._provision_manifest_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "install_target": install_target,
-                    # The host SDK we provisioned AGAINST — staleness keys on a
-                    # change here, so a genuinely SDK-pinned feature reinstalls
-                    # once per host bump, not on every startup.
-                    "provisioned_against_host_sdk": host_sdk,
-                    # The SDK version that actually landed in the venv (may lag
-                    # host_sdk if the feature pins it); recorded for diagnosis.
-                    "child_sdk_version": child_sdk,
-                    # ``project`` is commonly an unversioned pip target. Keep
-                    # the host-visible distribution release separately so an
-                    # upgraded isolated feature cannot keep running an older
-                    # child merely because its target string did not change.
-                    "feature_distribution_version": feature_distribution_version,
-                    # The feature release actually resolved inside the child
-                    # venv.  It must equal the host-visible desired release
-                    # whenever that release is known; retaining it makes the
-                    # successful verification auditable and invalidates old
-                    # manifests that predate this check once.
-                    "child_feature_distribution_state": (
-                        child_feature_distribution.state
-                    ),
-                    "child_feature_distribution_version": (
-                        child_feature_distribution.version
-                    ),
-                },
-                indent=2,
-            )
+        self._write_provision_manifest_payload(
+            {
+                "install_target": install_target,
+                # Console-script shebangs embed the venv's absolute interpreter
+                # path. A directory adoption therefore makes an otherwise
+                # version-current venv stale. Stamp the canonical location so
+                # both released-layout and pre-stable moves force exactly one
+                # reinstall at their destination.
+                "venv_path": str(self._venv_path.resolve()),
+                # The host SDK we provisioned AGAINST — staleness keys on a
+                # change here, so a genuinely SDK-pinned feature reinstalls
+                # once per host bump, not on every startup.
+                "provisioned_against_host_sdk": host_sdk,
+                # The SDK version that actually landed in the venv (may lag
+                # host_sdk if the feature pins it); recorded for diagnosis.
+                "child_sdk_version": child_sdk,
+                # ``project`` is commonly an unversioned pip target. Keep
+                # the host-visible distribution release separately so an
+                # upgraded isolated feature cannot keep running an older
+                # child merely because its target string did not change.
+                "feature_distribution_version": feature_distribution_version,
+                # The feature release actually resolved inside the child
+                # venv.  It must equal the host-visible desired release
+                # whenever that release is known; retaining it makes the
+                # successful verification auditable and invalidates old
+                # manifests that predate this check once.
+                "child_feature_distribution_state": child_feature_distribution.state,
+                "child_feature_distribution_version": (
+                    child_feature_distribution.version
+                ),
+            }
         )
 
-    def _provision_is_stale(self, install_target: str) -> bool:
-        """Return whether this host-owned venv must be reprovisioned.
+    def _write_provision_manifest_payload(self, manifest: Dict[str, Any]) -> None:
+        """Atomically publish one private Core provisioning manifest."""
 
-        The stamp covers the exact project target, the host SDK wire contract,
-        and the feature distribution release.  An unavailable distribution
-        version does not become a moving stale marker: it is stamped as
-        ``unknown`` and remains fresh until a concrete version is observable.
+        path = self._provision_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(manifest, indent=2).encode("utf-8")
+        temporary = path.with_name(
+            f"{path.name}.tmp-{os.getpid()}-{uuid4().hex}"
+        )
+        descriptor: Optional[int] = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                _PRIVATE_FILE_MODE,
+            )
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            os.replace(temporary, path)
+            path.chmod(_PRIVATE_FILE_MODE)
+            if os.name == "posix":
+                parent_fd = os.open(path.parent, _directory_open_flags())
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature provisioning state could not be recorded."
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _console_script_location_state(
+        self,
+        *,
+        validated_script_path: Optional[Path] = None,
+    ) -> str:
+        """Return ``current``, ``relocated``, ``missing``, or ``not-applicable``.
+
+        A configured console entry point normally embeds the venv's absolute
+        path. Python callables launch through the current venv interpreter and
+        have no wrapper to verify. Only a positively observed foreign absolute
+        shebang proves console relocation when no Core path stamp exists. A
+        hosted immutable wrapper symlink is inspected through the already
+        resolved and custody-validated target that will be launched.
         """
-        manifest = self._read_provision_manifest()
+
+        if self._bin_path is not None:
+            return "not-applicable"
+        service_target = self._required_service_target()
+        if service_target.console_executable is None:
+            return "not-applicable"
+        service = service_target.console_executable
+        assert self._venv_path is not None
+        script = validated_script_path or _console_script_path(
+            self._venv_path,
+            service,
+        )
+        executable_name = script.name
+        if _secure_dirfd_supported():
+            bin_fd: Optional[int] = None
+            script_fd: Optional[int] = None
+            try:
+                bin_fd = os.open(
+                    script.parent,
+                    _directory_open_flags(),
+                )
+                metadata = os.stat(
+                    executable_name,
+                    dir_fd=bin_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISREG(metadata.st_mode):
+                    return "missing"
+                script_fd = os.open(
+                    executable_name,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=bin_fd,
+                )
+                if not _same_file_identity(metadata, os.fstat(script_fd)):
+                    return "missing"
+                prefix = os.read(script_fd, 8192)
+            except OSError:
+                return "missing"
+            finally:
+                if script_fd is not None:
+                    os.close(script_fd)
+                if bin_fd is not None:
+                    os.close(bin_fd)
+        else:  # pragma: no cover - portable fallback
+            try:
+                metadata = script.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    return "missing"
+                with script.open("rb") as stream:
+                    prefix = stream.read(8192)
+            except OSError:
+                return "missing"
+        if os.name == "nt":  # pragma: no cover - exercised by platform seam tests
+            # distlib's Windows console launcher is binary and does not expose
+            # a reliably parseable interpreter path. Presence of the exact
+            # regular ``.exe`` launch artifact is verifiable; durable rename
+            # evidence still forces its reinstall before this check.
+            return "current"
+        # Console generators embed the lexical venv interpreter path even when
+        # ``bin/python`` is itself a symlink to a base interpreter. Resolving
+        # that final symlink would falsely classify every repaired uv venv as
+        # stale on the next boot.
+        current_python = os.fsencode(str(_venv_python(self._venv_path)))
+        if current_python in prefix:
+            return "current"
+        first_line = prefix.splitlines()[0] if prefix else b""
+        if first_line.startswith(b"#!"):
+            interpreter_parts = first_line[2:].strip().split(maxsplit=1)
+            if interpreter_parts:
+                interpreter = interpreter_parts[0]
+                if interpreter == b"/usr/bin/env":
+                    return "current"
+                if interpreter.startswith(b"/"):
+                    return "relocated"
+        # Windows launchers and nonstandard wrappers cannot be safely inferred
+        # from an absent text path. A rename observed by Core below remains
+        # sufficient evidence to repair them conservatively.
+        return "missing"
+
+    def _location_requires_forced_reinstall(
+        self,
+        manifest: Dict[str, Any],
+    ) -> bool:
+        assert self._venv_path is not None
+        current_path = str(self._venv_path.resolve())
+        stamped_path = manifest.get("venv_path")
+        stamped_relocation = (
+            type(stamped_path) is str
+            and bool(stamped_path)
+            and stamped_path != current_path
+        )
+        location_state = self._console_script_location_state()
+        relocation_proven = (
+            self._venv_relocated_this_startup
+            or self._venv_relocation_repair_pending()
+            or stamped_relocation
+            or location_state == "relocated"
+        )
+        # A missing or unclassifiable console wrapper is never fresh, even when
+        # every manifest field is current. Only ``--reinstall`` is sufficient
+        # to recreate an already-satisfied distribution's generated script.
+        if location_state == "missing":
+            return True
+        return relocation_proven and location_state != "not-applicable"
+
+    def _provision_status(
+        self,
+        install_target: str,
+        manifest: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, bool]:
+        """Return ``(stale, force_reinstall)`` for a Core-owned venv.
+
+        A location mismatch or an observed foreign shebang proves that an
+        entry-point script may still contain the source venv's interpreter.
+        A missing stamp alone is legacy metadata, not relocation evidence. If
+        a repair crashes before the atomic manifest replacement, either the old
+        stamp or the stale wrapper itself causes the repair to be retried.
+        """
+
+        if manifest is None:
+            manifest = self._read_provision_manifest()
+        assert self._venv_path is not None
+        if self._location_requires_forced_reinstall(manifest):
+            return True, True
+        location_stamp_stale = manifest.get("venv_path") != str(
+            self._venv_path.resolve()
+        )
+        return (
+            self._provision_is_stale_from_manifest(install_target, manifest)
+            or location_stamp_stale,
+            False,
+        )
+
+    def _adopt_verified_unstamped_venv(
+        self,
+        install_target: str,
+        manifest: Dict[str, Any],
+    ) -> bool:
+        """Stamp an already-usable Core venv without contacting an index.
+
+        This path applies only when the location stamp is absent or obsolete
+        and no stale console wrapper requires repair. Positive child probes
+        replace the missing historical stamp; a changed recorded install target
+        still takes the ordinary provisioning path.
+        """
+
+        assert self._venv_path is not None
+        current_path = str(self._venv_path.resolve())
+        if manifest.get("venv_path") == current_path:
+            return False
+        recorded_target = manifest.get("install_target")
+        if recorded_target != install_target:
+            return False
+        if manifest.get("provisioned_against_host_sdk") != _host_sdk_version():
+            return False
+        # Location metadata is the only field this path may repair. A host SDK,
+        # install target, feature release, or child-probe transition must take
+        # the ordinary provisioning path rather than being blessed by a fresh
+        # manifest assembled from post-hoc probes.
+        if self._provision_is_stale_from_manifest(install_target, manifest):
+            return False
+        if self._console_script_location_state() in {"relocated", "missing"}:
+            return False
+        desired = _feature_distribution_version(
+            self.runtime.distribution,
+            install_target,
+        )
+        child = self._probe_feature_distribution(_venv_python(self._venv_path))
+        if not child.is_present:
+            return False
+        if desired != "unknown" and (
+            child.state != "versioned" or child.version != desired
+        ):
+            return False
+        host_sdk = _host_sdk_version()
+        child_sdk = self._probe_sdk_version(_venv_python(self._venv_path))
+        self._warn_on_sdk_mismatch(
+            _venv_python(self._venv_path),
+            host_sdk=host_sdk,
+            child_sdk=child_sdk,
+        )
+        # Adoption is still a freshness stamp. Prove that the configured
+        # launch target resolves in this exact venv before publishing it.
+        self._verify_launch_artifact()
+        self._write_provision_manifest(
+            install_target,
+            host_sdk,
+            child_sdk,
+            desired,
+            child,
+        )
+        return True
+
+    def _verify_launch_artifact(
+        self,
+        *,
+        validated_console_path: Optional[Path] = None,
+    ) -> None:
+        """Require the configured launch target to resolve inside this venv."""
+
+        target = self._required_service_target()
+        if target.is_callable:
+            self._verify_python_callable_target(target)
+            return
+
+        state = self._console_script_location_state(
+            validated_script_path=validated_console_path,
+        )
+        if state in {"relocated", "missing"}:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature launch artifact could not be verified after "
+                "runtime provisioning."
+            )
+
+    def _verify_python_callable_target(
+        self,
+        target: _IsolatedServiceTarget,
+    ) -> None:
+        """Resolve a callable with the same isolated interpreter used to launch.
+
+        Closed exit codes distinguish an absent module, absent attribute, and
+        non-callable object from timeout/spawn/import infrastructure failures.
+        Child stdout, stderr, and exception text are deliberately discarded
+        because feature import hooks are untrusted and may reflect credentials
+        or paths.
+        """
+
+        assert target.module is not None
+        assert target.callable_name is not None
+        assert self._venv_path is not None
+        source = (
+            "import importlib, os, sys\n"
+            "finish = os._exit\n"
+            f"module_name = {target.module!r}\n"
+            "if sys.version_info < (3, 11) or not sys.flags.safe_path:\n"
+            f"    finish({_CALLABLE_TARGET_UNSUPPORTED_INTERPRETER_EXIT})\n"
+            "try:\n"
+            "    module = importlib.import_module(module_name)\n"
+            "except ModuleNotFoundError as error:\n"
+            "    missing_name = error.name if type(error) is ModuleNotFoundError "
+            "and type(error.name) is str else None\n"
+            "    target_missing = missing_name is not None and "
+            "(module_name == missing_name or "
+            "module_name.startswith(missing_name + '.'))\n"
+            f"    finish({_CALLABLE_TARGET_MISSING_MODULE_EXIT} if target_missing "
+            f"else {_CALLABLE_TARGET_UNVERIFIABLE_EXIT})\n"
+            "except BaseException:\n"
+            f"    finish({_CALLABLE_TARGET_UNVERIFIABLE_EXIT})\n"
+            "try:\n"
+            f"    resolved = getattr(module, {target.callable_name!r})\n"
+            "except AttributeError:\n"
+            f"    finish({_CALLABLE_TARGET_MISSING_ATTRIBUTE_EXIT})\n"
+            "except BaseException:\n"
+            f"    finish({_CALLABLE_TARGET_UNVERIFIABLE_EXIT})\n"
+            f"finish(0 if callable(resolved) else "
+            f"{_CALLABLE_TARGET_NOT_CALLABLE_EXIT})\n"
+        )
+        runtime_dir = self._feature_runtime_dir()
+        hosted = self._runtime_is_hosted()
+        try:
+            completed = subprocess.run(
+                _isolated_python_command(
+                    _venv_python(self._venv_path),
+                    source,
+                ),
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_isolated_child_env(
+                    self._venv_path,
+                    runtime_dir=runtime_dir if hosted else None,
+                    hosted=hosted,
+                    feature_name=self.name,
+                    feature_distribution=self.runtime.distribution,
+                ),
+                cwd=str(runtime_dir / "work") if hosted else None,
+                timeout=_CALLABLE_TARGET_VERIFICATION_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            raise _IsolatedRuntimeLaunchVerificationTimeoutError(
+                "Isolated feature Python callable verification timed out."
+            ) from None
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature Python callable verification could not start."
+            ) from exc
+        except subprocess.SubprocessError:
+            raise _IsolatedRuntimeLaunchVerificationInfrastructureError(
+                "Isolated feature Python callable verification failed."
+            ) from None
+
+        target_failures: dict[int, type[_IsolatedRuntimeLaunchTargetPreparationError]] = {
+            _CALLABLE_TARGET_MISSING_MODULE_EXIT: (
+                _IsolatedRuntimeLaunchTargetMissingModuleError
+            ),
+            _CALLABLE_TARGET_MISSING_ATTRIBUTE_EXIT: (
+                _IsolatedRuntimeLaunchTargetMissingAttributeError
+            ),
+            _CALLABLE_TARGET_NOT_CALLABLE_EXIT: (
+                _IsolatedRuntimeLaunchTargetNotCallableError
+            ),
+        }
+        failure_type = target_failures.get(completed.returncode)
+        if failure_type is not None:
+            raise failure_type(
+                "Isolated feature Python callable target is unavailable."
+            )
+        if completed.returncode in {
+            2,
+            _CALLABLE_TARGET_UNSUPPORTED_INTERPRETER_EXIT,
+        }:
+            raise IsolatedRuntimeConfigurationError(
+                reason=_CONFIGURATION_FEATURE_INTERPRETER,
+            )
+        if completed.returncode != 0:
+            raise _IsolatedRuntimeLaunchVerificationInfrastructureError(
+                "Isolated feature Python callable verification was inconclusive."
+            )
+
+    def _provision_is_stale_from_manifest(
+        self,
+        install_target: str,
+        manifest: Dict[str, Any],
+    ) -> bool:
+        """Apply version/probe staleness checks to one location-valid stamp."""
+
         if manifest.get("install_target") != install_target:
             return True
         if manifest.get("provisioned_against_host_sdk") != _host_sdk_version():
@@ -6483,9 +10608,7 @@ class ProxyFeature(Feature):
         # unchanged-environment check must probe the child interpreter again:
         # an index repair, manual downgrade, or stale editable metadata can
         # otherwise leave the host running an older service indefinitely.
-        child = _venv_feature_distribution_probe(
-            _venv_python(self._venv_path), self.runtime.distribution
-        )
+        child = self._probe_feature_distribution(_venv_python(self._venv_path))
         if not child.is_present:
             return True
         if installed_version != "unknown" and (
@@ -6515,12 +10638,10 @@ class ProxyFeature(Feature):
         desired = _feature_distribution_version(
             self.runtime.distribution, install_target
         )
-        child = _venv_feature_distribution_probe(
-            python_path, self.runtime.distribution
-        )
+        child = self._probe_feature_distribution(python_path)
         if not child.is_present:
             observed = "missing" if child.state == "missing" else "unverifiable"
-            raise RuntimeError(
+            raise IsolatedRuntimePreparationError(
                 f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
                 f"version {observed}, but host requires {desired!r}; refusing to run "
                 "an unverifiable override venv"
@@ -6533,7 +10654,7 @@ class ProxyFeature(Feature):
                 if child.state == "present-unversioned"
                 else repr(child.version)
             )
-            raise RuntimeError(
+            raise IsolatedRuntimePreparationError(
                 f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
                 f"version {observed}, but host requires {desired!r}; refusing to run "
                 "an unverifiable override venv"
@@ -6544,12 +10665,69 @@ class ProxyFeature(Feature):
         python_path = _venv_python(self._venv_path)
 
         # Install the PROJECT (path/dist), never the `service` runnable — the
-        # latter is a console-script name or "module:func", not a pip target.
+        # latter is a console-script name or module:callable, not a pip target.
         install_target = self.runtime.project or self.runtime.distribution
         if not install_target:
-            raise RuntimeError(
-                f"Isolated feature {self.name} has no project/distribution to install"
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature provisioning metadata has no install target."
             )
+
+        hosted_immutable_setting = (
+            self._hosted_immutable_venv_setting()
+            if self._runtime_is_hosted()
+            else None
+        )
+        if hosted_immutable_setting is not None:
+            self._validated_hosted_console_path = None
+            # Revalidate at the mutation boundary, not only at discovery/path
+            # resolution. A concurrent host/metadata change or late Core
+            # manifest must never make this shared path fall through to uv
+            # creation, upgrade, or manifest stamping.
+            validated_overrides = _validate_hosted_process_prebuilt_overrides(
+                self.name,
+                runtime_venv=self.runtime.venv,
+            )
+            if validated_overrides.venv_path != self._venv_path:
+                raise _hosted_prebuilt_override_error(hosted_immutable_setting)
+            target = self._required_service_target()
+            validated_console_path: Optional[Path] = None
+            if target.is_callable:
+                # Callable target and infrastructure classifications must stay
+                # distinct from selecting-setting custody diagnostics. Verify
+                # before the override wrapper and before distribution probing
+                # can collapse an unsupported interpreter into a missing
+                # package outcome.
+                self._verify_launch_artifact()
+            try:
+                if not target.is_callable:
+                    # A console wrapper is part of the selected immutable venv.
+                    # Resolve and custody-check the exact launch target first;
+                    # missing, mutable, foreign, or relocated artifacts must
+                    # name the VENV setting that the operator needs to repair.
+                    assert target.console_executable is not None
+                    assert validated_overrides.venv_bin_path is not None
+                    validated_console_path = _validate_hosted_prebuilt_console(
+                        self._venv_path,
+                        validated_overrides.venv_bin_path,
+                        target.console_executable,
+                        setting=hosted_immutable_setting,
+                    )
+                    self._verify_launch_artifact(
+                        validated_console_path=validated_console_path,
+                    )
+                self._verify_prebuilt_feature_distribution(
+                    python_path,
+                    install_target,
+                )
+                self._warn_on_sdk_mismatch(python_path)
+            except IsolatedRuntimeConfigurationError:
+                raise
+            except Exception as exc:
+                raise _hosted_prebuilt_override_error(
+                    hosted_immutable_setting
+                ) from exc
+            self._validated_hosted_console_path = validated_console_path
+            return
 
         exists = python_path.exists()
 
@@ -6568,6 +10746,7 @@ class ProxyFeature(Feature):
             and self._venv_is_overridden()
             and not self._provision_manifest_path().exists()
         ):
+            self._verify_launch_artifact()
             self._verify_prebuilt_feature_distribution(python_path, install_target)
             self._warn_on_sdk_mismatch(python_path)
             return
@@ -6580,20 +10759,38 @@ class ProxyFeature(Feature):
         # Something), but leave the venv untouched and do not stamp a manifest we
         # don't own. Host-owned default venvs (and a not-yet-created override
         # path we bootstrap below) keep the full reprovision lifecycle.
+        force_reinstall = False
         if not exists:
-            self._run(["uv", "venv", str(self._venv_path)])
-        elif not self._provision_is_stale(install_target):
-            return
+            self._run_provisioning_command(
+                ["uv", "venv", str(self._venv_path)]
+            )
+        else:
+            manifest = self._read_provision_manifest()
+            stale, force_reinstall = self._provision_status(
+                install_target,
+                manifest,
+            )
+            if not stale:
+                self._verify_launch_artifact()
+                self._clear_venv_relocation_repair_marker()
+                return
+            if not force_reinstall and self._adopt_verified_unstamped_venv(
+                install_target,
+                manifest,
+            ):
+                self._clear_venv_relocation_repair_marker()
+                return
 
         # Fresh venv, changed install target, or host SDK upgraded since the
-        # venv was provisioned. On an existing venv, upgrade in place so a stale
-        # kestrel-sdk is replaced; then stamp the manifest so the next startup
-        # can tell whether another reprovision is due.
+        # venv was provisioned. A moved/unstamped venv requires ``--reinstall``
+        # so console scripts are rewritten even when package versions are
+        # already satisfied; other stale existing venvs upgrade in place.
+        # Stamp only after install and verification both succeed.
         cmd = ["uv", "pip", "install", "--python", str(python_path)]
         if exists:
-            cmd.append("--upgrade")
+            cmd.append("--reinstall" if force_reinstall else "--upgrade")
         cmd.append(install_target)
-        self._run(cmd)
+        self._run_provisioning_command(cmd)
 
         # Verify what actually landed: a feature that pins an older SDK can
         # install "successfully" while keeping the stale wire contract. Surface
@@ -6601,33 +10798,29 @@ class ProxyFeature(Feature):
         # Say Something) — staleness still keys on the host transition so we
         # don't thrash reinstalling a genuinely pinned feature every startup.
         host_sdk = _host_sdk_version()
-        child_sdk = _venv_sdk_version(python_path)
+        child_sdk = self._probe_sdk_version(python_path)
         desired_feature_version = _feature_distribution_version(
             self.runtime.distribution, install_target
         )
-        child_feature_distribution = _venv_feature_distribution_probe(
-            python_path, self.runtime.distribution
-        )
-        if (
-            desired_feature_version != "unknown"
-            and (
-                child_feature_distribution.state != "versioned"
-                or child_feature_distribution.version != desired_feature_version
-            )
+        child_feature_distribution = self._probe_feature_distribution(python_path)
+        if desired_feature_version != "unknown" and (
+            child_feature_distribution.state != "versioned"
+            or child_feature_distribution.version != desired_feature_version
         ):
-            raise RuntimeError(
-                f"Isolated feature {self.name} installed "
-                f"{self.runtime.distribution!r} version "
-                f"{child_feature_distribution.version!r}, "
-                f"but host requires {desired_feature_version!r}; refusing to "
-                "stamp the venv fresh"
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature child distribution did not match the host "
+                "release after provisioning; the venv was not stamped fresh."
             )
         if not child_feature_distribution.is_present:
-            raise RuntimeError(
-                f"Isolated feature {self.name} installed "
-                f"{self.runtime.distribution!r} but its child distribution probe "
-                "was not positively present; refusing to stamp the venv fresh"
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature child distribution could not be verified after "
+                "provisioning; the venv was not stamped fresh."
             )
+        # Every install or upgrade must prove the configured launch artifact,
+        # not only relocation repairs. Otherwise a resolver can succeed without
+        # installing the declared console entry point and Core would stamp that
+        # permanently unlaunchable venv as fresh.
+        self._verify_launch_artifact()
         self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
         self._write_provision_manifest(
             install_target,
@@ -6636,12 +10829,15 @@ class ProxyFeature(Feature):
             desired_feature_version,
             child_feature_distribution,
         )
+        self._clear_venv_relocation_repair_marker()
 
     def _warn_on_sdk_mismatch(
         self, python_path: Path, *, host_sdk: str = None, child_sdk: str = None
     ) -> None:
         host_sdk = host_sdk if host_sdk is not None else _host_sdk_version()
-        child_sdk = child_sdk if child_sdk is not None else _venv_sdk_version(python_path)
+        child_sdk = (
+            child_sdk if child_sdk is not None else self._probe_sdk_version(python_path)
+        )
         if child_sdk != host_sdk and "unknown" not in (child_sdk, host_sdk):
             logger.warning(
                 "Isolated feature %s venv resolved kestrel-sdk %s but host is %s — "
@@ -6651,10 +10847,37 @@ class ProxyFeature(Feature):
                 host_sdk,
             )
 
+    def _run_provisioning_command(self, cmd: List[str]) -> None:
+        """Map expected host provisioning failures to optional quarantine."""
+
+        try:
+            self._run(cmd)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature venv provisioning could not be completed."
+            ) from exc
+
     def _run(self, cmd: List[str]) -> None:
-        if shutil.which(cmd[0]) is None:
-            raise RuntimeError(f"Required executable not found: {cmd[0]}")
-        subprocess.run(cmd, check=True)
+        if not cmd:
+            raise ValueError("Provisioning command must not be empty")
+        if not self._runtime_is_hosted():
+            if shutil.which(cmd[0]) is None:
+                raise RuntimeError(f"Required executable not found: {cmd[0]}")
+            subprocess.run(cmd, check=True)
+            return
+
+        assert self._venv_path is not None
+        executable, trusted_path = _trusted_host_executable(
+            cmd[0],
+            excluded_venv=self._venv_path,
+        )
+        env = _isolated_provisioning_env(
+            None,
+            include_package_index=True,
+            uv_cache_dir=self._hosted_provisioning_cache_dir(),
+        )
+        env["PATH"] = trusted_path
+        subprocess.run([executable, *cmd[1:]], check=True, env=env)
 
     def _build_client(self, config: Optional[Dict[str, Any]] = None) -> Any:
         factory = self._client_factory
@@ -6663,6 +10886,8 @@ class ProxyFeature(Feature):
 
             factory = SubprocessIsolatedFeatureClient
 
+        runtime_dir = self._feature_runtime_dir()
+        hosted = self._runtime_is_hosted()
         child_config = self._host_config if config is None else config
         # SDK 0.35.1's subprocess wrapper does not yet expose a reverse
         # host-capability field in ``clientInfo``.  Its initialize ``config``
@@ -6680,13 +10905,19 @@ class ProxyFeature(Feature):
             if self._hosted_telegram_startup_attested:
                 capabilities.append(_HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY)
             child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = capabilities
-
         kwargs = {
             "feature_name": self.name,
-            "service": self.runtime.service,
+            "service": (
+                self._service_target.raw
+                if self._service_target is not None
+                else None
+            ),
             "venv_path": str(self._venv_path) if self._venv_path else None,
             "python": str(_venv_python(self._venv_path)) if self._venv_path else None,
             "executable": str(self._bin_path) if self._bin_path else None,
+            # Hosted execution is deliberately rooted in its tenant workspace.
+            # Standalone execution retains the SDK's historical inherited cwd.
+            "cwd": str(runtime_dir / "work") if hosted else None,
             "event_handler": self._handle_event,
             "notification_handler": self._handle_event,
             # An empty object is an explicit effective config: the SDK sends
@@ -6696,67 +10927,123 @@ class ProxyFeature(Feature):
             "config": child_config,
             # Launch env with interpreter-shadowing vars stripped (F023) so the
             # host PYTHONPATH/VIRTUAL_ENV can't defeat the venv isolation.
-            "env": _isolated_child_env(self._venv_path),
+            "env": _isolated_child_env(
+                self._venv_path,
+                runtime_dir=runtime_dir if hosted else None,
+                hosted=hosted,
+                feature_name=self.name,
+                feature_distribution=self.runtime.distribution,
+            ),
         }
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
         try:
             signature = inspect.signature(factory)
             params = signature.parameters
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            if hosted:
+                raise IsolatedRuntimeConfigurationError(
+                    reason=_CONFIGURATION_HOSTED_CLIENT_FACTORY,
+                ) from exc
             params = {}
 
-        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            return factory(**kwargs)
+        accepts_var_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in params.values()
+        )
+        if hosted and not accepts_var_kwargs:
+            keyword_kinds = {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+            if any(
+                name not in params or params[name].kind not in keyword_kinds
+                for name in ("env", "cwd")
+            ):
+                raise IsolatedRuntimeConfigurationError(
+                    reason=_CONFIGURATION_HOSTED_CLIENT_FACTORY,
+                )
 
-        accepted = {key: value for key, value in kwargs.items() if key in params}
+        accepted = (
+            dict(kwargs)
+            if accepts_var_kwargs
+            else {key: value for key, value in kwargs.items() if key in params}
+        )
 
         # Keyword-only factory (named params, no positional `command`): deliver the
         # accepted keyword args directly (config/event handlers/etc.).
         if "command" not in params:
-            if accepted:
-                return factory(**accepted)
-            return factory()
+            try:
+                if accepted:
+                    return factory(**accepted)
+                return factory()
+            except (TypeError, ValueError) as exc:
+                if hosted:
+                    raise IsolatedRuntimeConfigurationError(
+                        reason=_CONFIGURATION_HOSTED_CLIENT_FACTORY,
+                    ) from exc
+                raise
 
         # Positional-command constructor (SubprocessIsolatedFeatureClient): pass the
         # launch argv plus whatever keyword extras the factory accepts (notably
         # `config`, so host config reaches the service via the initialize handshake).
         accepted.pop("command", None)
+        command = self._service_command()
         try:
-            return factory(self._service_command(), **accepted)
-        except (TypeError, ValueError):
-            return factory(self._service_command())
+            return factory(command, **accepted)
+        except (TypeError, ValueError) as exc:
+            if hosted:
+                raise IsolatedRuntimeConfigurationError(
+                    reason=_CONFIGURATION_HOSTED_CLIENT_FACTORY,
+                ) from exc
+            return factory(command)
 
     def _service_command(self) -> List[str]:
         """Build the argv to launch the isolated service.
 
         Resolution order:
           1. explicit BIN override (``self._bin_path``);
-          2. ``service`` of the form ``module:func`` -> ``<venv-python> -c ...``;
-          3. ``service`` as a console-script name -> ``<venv>/bin/<script>``.
-        The ``service`` runnable is NEVER treated as a ``python -m`` module
-        (it may be a path/dist), which is what previously broke startup.
+          2. a validated ``module:callable`` through the venv interpreter;
+          3. the validated bare console-script name in the venv bin directory.
+        Console runnables are never treated as paths or install targets.
         """
         if self._bin_path is not None:
             return [str(self._bin_path)]
 
-        service = self.runtime.service
-        if not service:
-            raise RuntimeError(
-                f"Isolated feature {self.name} has no `service` runnable configured"
-            )
-
-        if ":" in service:  # module:func callable
-            module, _, func = service.partition(":")
+        service = self._required_service_target()
+        if service.is_callable:
+            assert service.module is not None
+            assert service.callable_name is not None
             python = (
-                str(_venv_python(self._venv_path)) if self._venv_path else "python"
+                str(_venv_python(self._venv_path))
+                if self._venv_path is not None
+                else "python"
             )
-            return [python, "-c", f"from {module} import {func}; {func}()"]
+            # The installed SDK requires Python 3.11+, so ``-P`` is the
+            # compatible safe-path boundary. Unlike ``-I``, it preserves the
+            # hosted stdio encoding variables required by the JSON-RPC pipe;
+            # the child environment separately removes Python path injection.
+            return _isolated_python_command(
+                Path(python),
+                (
+                    f"from {service.module} import {service.callable_name}; "
+                    f"{service.callable_name}()"
+                ),
+            )
 
-        # console-script installed into the venv's bin/Scripts dir
+        assert service.console_executable is not None
+        if self._validated_hosted_console_path is not None:
+            return [str(self._validated_hosted_console_path)]
         if self._venv_path is not None:
-            return [str(_venv_bin_dir(self._venv_path) / service)]
-        return [service]
+            return [
+                str(
+                    _console_script_path(
+                        self._venv_path,
+                        service.console_executable,
+                    )
+                )
+            ]
+        return [service.console_executable]
 
     async def _register_event_handler(self, client: Any = None) -> None:
         """Attach the host event handler to a published client.
@@ -8174,14 +12461,22 @@ class ProxyFeature(Feature):
         if not channel_type or not re.fullmatch(r"[a-z0-9_]{1,32}", channel_type):
             return
         png = (
-            _agent_data_dir(self.agent)
+            self._agent_runtime_dir
             / "channel_link_artifacts"
             / f"{channel_type}_link_qr.png"
         )
         try:
-            png.unlink(missing_ok=True)
-        except OSError:
-            pass
+            await asyncio.to_thread(_unlink_private_artifact, png)
+        except (
+            IsolatedRuntimeNamespaceError,
+            IsolatedRuntimePreparationError,
+            OSError,
+        ) as exc:
+            logger.warning(
+                "Failed to clear channel-link artifact for %s: %s",
+                self.name,
+                exc,
+            )
 
     async def _route_link_qr(self, payload: Any) -> None:
         """Persist the latest channel pairing-QR PNG under the agent data dir.
@@ -8196,8 +12491,6 @@ class ProxyFeature(Feature):
         """
         if not isinstance(payload, dict):
             return
-        import base64
-
         channel_type = str(payload.get("channel_type") or "").strip().lower()
         png_b64 = payload.get("png_b64") or payload.get("png")
         if (
@@ -8207,22 +12500,63 @@ class ProxyFeature(Feature):
         ):
             logger.warning("Dropping malformed channel.link_qr from %s", self.name)
             return
+        if type(png_b64) is not str:
+            logger.warning("Dropping malformed channel.link_qr from %s", self.name)
+            return
+        max_encoded_bytes = ((_MAX_PRIVATE_ARTIFACT_BYTES + 2) // 3) * 4
+        # Accept ordinary MIME wrapping without making whitespace an unbounded
+        # child-controlled input.  A 6.25% allowance covers CRLF every 76
+        # columns, while the normalized alphabet and decoded payload retain
+        # their independent exact bounds below.
+        max_wrapping_bytes = max(16, max_encoded_bytes // 16)
+        if len(png_b64) > max_encoded_bytes + max_wrapping_bytes:
+            logger.warning("Dropping oversized channel.link_qr PNG from %s", self.name)
+            return
         try:
-            png_bytes = base64.b64decode(png_b64)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("channel.link_qr from %s had undecodable PNG: %s", self.name, exc)
+            encoded_png = png_b64.encode("ascii")
+        except (UnicodeEncodeError, ValueError) as exc:
+            logger.warning(
+                "channel.link_qr from %s had undecodable PNG: %s", self.name, exc
+            )
+            return
+        normalized_png = encoded_png.translate(None, _ASCII_BASE64_WHITESPACE)
+        if not normalized_png:
+            logger.warning("Dropping malformed channel.link_qr from %s", self.name)
+            return
+        if len(encoded_png) - len(normalized_png) > max(
+            16, len(normalized_png) // 16
+        ):
+            logger.warning("Dropping oversized channel.link_qr PNG from %s", self.name)
+            return
+        if len(normalized_png) > max_encoded_bytes:
+            logger.warning("Dropping oversized channel.link_qr PNG from %s", self.name)
+            return
+        try:
+            png_bytes = base64.b64decode(normalized_png, validate=True)
+        except ValueError as exc:
+            logger.warning(
+                "channel.link_qr from %s had undecodable PNG: %s", self.name, exc
+            )
+            return
+        if len(png_bytes) > _MAX_PRIVATE_ARTIFACT_BYTES:
+            logger.warning("Dropping oversized channel.link_qr PNG from %s", self.name)
             return
 
         out = (
-            _agent_data_dir(self.agent)
+            self._agent_runtime_dir
             / "channel_link_artifacts"
             / f"{channel_type}_link_qr.png"
         )
         try:
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(png_bytes)
-        except OSError as exc:
-            logger.warning("Failed to persist channel.link_qr PNG for %s: %s", self.name, exc)
+            await asyncio.to_thread(_write_private_artifact, out, png_bytes)
+        except (
+            IsolatedRuntimeNamespaceError,
+            IsolatedRuntimePreparationError,
+            OSError,
+        ) as exc:
+            logger.warning(
+                "Failed to persist channel.link_qr PNG for %s: %s", self.name, exc
+            )
             return
 
     def _telegram_terminal_disposition(

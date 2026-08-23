@@ -28,6 +28,12 @@ from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
+from kestrel_sovereign.multi_agent.agent_manager import (
+    RuntimeOffboardingAdmission,
+    RuntimeOffboardingNotPerformedError,
+    RuntimeOffboardingRetainedError,
+    public_exception_type_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +68,112 @@ def _get_service_key_db_or_none(agent):
 
 class CreateAgentRequest(BaseModel):
     """Request body for creating a new agent."""
-    name: str = Field(..., description="Agent name (alphanumeric, hyphens, underscores)", min_length=1, max_length=64)
+
+    name: str = Field(
+        ...,
+        description="Agent name (alphanumeric, hyphens, underscores)",
+        min_length=1,
+        max_length=64,
+    )
+
+
+def _grouped_runtime_retained_detail(
+    error: BaseExceptionGroup,
+) -> Optional[Dict[str, object]]:
+    """Extract a retained-runtime outcome without exposing exception text.
+
+    Agent removal can legitimately report secure-cleanup retention together
+    with a delegated-budget refund or cancellation outcome.  Flatten nested
+    groups, retain the machine-readable 409 contract, and summarize only
+    exception types/counts; messages can contain absolute host paths or
+    credentials and stay server-side.
+    """
+
+    leaves: List[BaseException] = []
+
+    def collect(candidate: BaseException) -> None:
+        if isinstance(candidate, BaseExceptionGroup):
+            for nested in candidate.exceptions:
+                collect(nested)
+            return
+        leaves.append(candidate)
+
+    collect(error)
+    retained = [
+        candidate
+        for candidate in leaves
+        if isinstance(candidate, RuntimeOffboardingRetainedError)
+    ]
+    not_performed = [
+        candidate
+        for candidate in leaves
+        if isinstance(candidate, RuntimeOffboardingNotPerformedError)
+    ]
+    custody_outcomes = [*retained, *not_performed]
+    if not custody_outcomes:
+        return None
+    # Never turn process-control exceptions into an HTTP response. A grouped
+    # CancelledError is an expected manager terminal outcome, but an actively
+    # cancelling request is handled by the caller before this helper is used.
+    if any(
+        not isinstance(candidate, (Exception, asyncio.CancelledError))
+        for candidate in leaves
+    ):
+        return None
+
+    detail: Dict[str, object] = dict(custody_outcomes[0].metadata)
+    retained_agents = sorted(
+        {
+            str(candidate.metadata["agent"])
+            for candidate in retained
+            if type(candidate.metadata.get("agent")) is str
+        },
+        key=str.casefold,
+    )
+    not_performed_agents = sorted(
+        {
+            str(candidate.metadata["agent"])
+            for candidate in not_performed
+            if type(candidate.metadata.get("agent")) is str
+        },
+        key=str.casefold,
+    )
+    cleanup_states = {
+        str(candidate.metadata.get("runtime_cleanup_state", "retained"))
+        for candidate in custody_outcomes
+    }
+    cleanup_pending = "pending" in cleanup_states
+    if cleanup_pending and cleanup_states != {"pending"}:
+        cleanup_state = "mixed"
+    elif cleanup_pending:
+        cleanup_state = "pending"
+    elif len(cleanup_states) == 1:
+        cleanup_state = next(iter(cleanup_states))
+    else:
+        cleanup_state = "mixed"
+    custody_identities = {id(candidate) for candidate in custody_outcomes}
+    additional = [
+        candidate for candidate in leaves if id(candidate) not in custody_identities
+    ]
+    detail.update(
+        {
+            "compound_outcome": True,
+            "retained_outcome_count": len(retained),
+            "not_performed_outcome_count": len(not_performed),
+            "retained_agents": retained_agents,
+            "not_performed_agents": not_performed_agents,
+            "runtime_cleanup_pending": cleanup_pending,
+            "runtime_cleanup_state": cleanup_state,
+            "additional_outcome_count": len(additional),
+            "additional_outcome_types": sorted(
+                {
+                    public_exception_type_name(candidate)
+                    for candidate in additional
+                }
+            ),
+        }
+    )
+    return detail
 
 
 @router.get("/api/agents")
@@ -270,13 +381,232 @@ async def create_agent(request: Request, body: CreateAgentRequest):
         raise HTTPException(status_code=500, detail="Error creating agent.")
 
 
+def _read_persisted_agent_registration_for_offboarding(
+    request: Request,
+    agent_name: str,
+):
+    """Return one exact local registration without mutating persisted config.
+
+    Identity resolution must succeed from this snapshot before the registration
+    is removed. A config-less auto-discovery deployment cannot safely promise
+    deprovisioning without also deleting its primary storage tree, so it must
+    refuse this runtime-only operation.
+    """
+
+    config_path = getattr(request.app.state, "multi_agent_config_path", None)
+    if config_path is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Destructive runtime offboarding requires a config-driven "
+                "multi-agent deployment so the agent cannot be auto-discovered "
+                "again on restart."
+            ),
+        )
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    try:
+        current = MultiAgentConfig.from_file(config_path)
+    except Exception as exc:
+        logger.error(
+            "Could not load multi-agent config before offboarding %r",
+            agent_name,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Destructive runtime offboarding requires a readable persisted "
+                "multi-agent registration."
+            ),
+        ) from exc
+
+    matching = [
+        name for name in current.agents if name.casefold() == agent_name.casefold()
+    ]
+    if len(matching) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Persisted agent registration is ambiguous; offboarding refused.",
+        )
+    if not matching:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Destructive runtime offboarding requires a known persisted "
+                "local agent registration."
+            ),
+        )
+    persisted_name = matching[0]
+    registered_config = current.agents[persisted_name]
+    from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+
+    if not isinstance(registered_config, LocalAgentConfig):
+        raise HTTPException(
+            status_code=409,
+            detail="Only a registered local hosted agent can be offboarded.",
+        )
+    return config_path, persisted_name, registered_config
+
+
+def _remove_persisted_agent_registration_for_offboarding(
+    request: Request,
+    registration: tuple[object, str, object],
+):
+    """Remove the previously witnessed registration with a narrow CAS check."""
+
+    config_path, persisted_name, expected_config = registration
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    try:
+        current = MultiAgentConfig.from_file(config_path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Persisted agent registration changed before offboarding; runtime "
+                "offboarding was not started."
+            ),
+        ) from exc
+    current_config = current.agents.get(persisted_name)
+    if current_config != expected_config:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Persisted agent registration changed before offboarding; runtime "
+                "offboarding was not started."
+            ),
+        )
+    removed_config = current.agents.pop(persisted_name)
+    try:
+        type(current).model_validate(current.model_dump())
+        current.save(config_path)
+    except Exception as exc:
+        logger.error(
+            "Could not remove persisted registration before offboarding %r",
+            persisted_name,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Persisted agent registration could not be removed; runtime "
+                "offboarding was not started."
+            ),
+        ) from exc
+    request.app.state.multi_agent_config = current
+    return config_path, persisted_name, removed_config
+
+
+def _restore_persisted_agent_registration(
+    request: Request,
+    rollback: tuple[object, str, object],
+) -> None:
+    """Restore a registration only after manager proves removal did not start."""
+
+    config_path, persisted_name, removed_config = rollback
+    if removed_config is None:
+        return
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    current = MultiAgentConfig.from_file(config_path)
+    if any(name.casefold() == persisted_name.casefold() for name in current.agents):
+        raise RuntimeError(
+            "agent registration changed concurrently; refusing rollback overwrite"
+        )
+    current.agents[persisted_name] = removed_config
+    type(current).model_validate(current.model_dump())
+    current.save(config_path)
+    request.app.state.multi_agent_config = current
+
+
+def _restore_registration_if_offboarding_not_admitted(
+    request: Request,
+    admission: Optional[RuntimeOffboardingAdmission],
+    rollback: Optional[tuple[object, str, object]],
+) -> None:
+    """Compensate desired state only when no destructive worker was started."""
+
+    if rollback is None:
+        return
+    if admission is None or not admission.started:
+        _restore_persisted_agent_registration(request, rollback)
+
+
+def _restore_registration_for_custody_response(
+    request: Request,
+    admission: Optional[RuntimeOffboardingAdmission],
+    rollback: Optional[tuple[object, str, object]],
+    *,
+    agent_name: str,
+) -> bool:
+    """Best-effort config compensation without replacing a custody response.
+
+    Once the manager has produced a typed runtime-custody outcome, that 409 is
+    the authoritative lifecycle result. A concurrent persisted-config writer
+    can still make the narrow CAS restore unsafe. Preserve the custody result
+    in that case, log the compensation failure for the operator, and mark the
+    response as requiring desired-state reconciliation.
+
+    Only ordinary ``Exception`` failures are converted. Cancellation and
+    other process-control ``BaseException`` outcomes retain their existing
+    propagation semantics.
+    """
+
+    try:
+        _restore_registration_if_offboarding_not_admitted(
+            request,
+            admission,
+            rollback,
+        )
+    except Exception:
+        logger.error(
+            "Could not restore persisted registration after runtime-custody "
+            "outcome for agent %r; operator reconciliation is required",
+            agent_name,
+            exc_info=True,
+        )
+        return True
+    return False
+
+
+def _annotate_custody_registration_detail(
+    detail: Dict[str, object],
+    *,
+    admission: Optional[RuntimeOffboardingAdmission],
+    rollback: Optional[tuple[object, str, object]],
+    requires_reconciliation: bool,
+) -> Dict[str, object]:
+    """Add truthful persisted-registration state to a custody response."""
+
+    if requires_reconciliation:
+        detail["persisted_registration_requires_reconciliation"] = True
+    if rollback is not None:
+        detail["persisted_registration_removed"] = bool(
+            rollback[2] is not None
+            and (
+                requires_reconciliation
+                or (admission is not None and admission.started)
+            )
+        )
+    return detail
+
+
 @router.delete("/api/agents/{agent_name}")
 @limiter.limit("10/minute")
-async def delete_agent(request: Request, agent_name: str):
-    """Remove an agent from the multi-agent manager.
+async def delete_agent(
+    request: Request,
+    agent_name: str,
+    offboard_runtime: bool = False,
+):
+    """Stop a live agent, retaining its runtime unless explicitly offboarded.
 
-    Shuts down the agent but does NOT delete its data directory.
-    The agent can be re-loaded by restarting the server.
+    The compatibility default withdraws routing and stops the process while
+    preserving runtime state and the persisted registration for a later host
+    restart. ``offboard_runtime=true`` is destructive: it first resolves the
+    persisted local identity without mutation, then removes the registration
+    and securely removes the hosted isolated-feature namespace. The primary
+    agent storage directory is not deleted.
 
     Only available in multi-agent mode.
     """
@@ -287,20 +617,229 @@ async def delete_agent(request: Request, agent_name: str):
             detail="Agent management is only available in multi-agent mode.",
         )
 
+    if type(offboard_runtime) is not bool:
+        raise HTTPException(status_code=400, detail="offboard_runtime must be a bool")
+
+    registration_rollback = None
+    known_agent_id = None
+    offboarding_admission = None
+    manager_agent_name = agent_name
+    if offboard_runtime:
+        registration = _read_persisted_agent_registration_for_offboarding(
+            request,
+            agent_name,
+        )
+        manager_agent_name = registration[1]
+        try:
+            known_agent_id = await agent_manager.resolve_registered_agent_id(
+                manager_agent_name,
+                registration[2],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if type(known_agent_id) is not str or not known_agent_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Registered agent identity is unavailable; offboarding was "
+                    "refused."
+                ),
+            )
+        registration_rollback = _remove_persisted_agent_registration_for_offboarding(
+            request,
+            registration,
+        )
+        offboarding_admission = RuntimeOffboardingAdmission()
+
     try:
-        removed = await agent_manager.remove_agent(agent_name)
+        if offboard_runtime:
+            removed = await agent_manager.remove_agent(
+                manager_agent_name,
+                offboard_runtime=True,
+                known_agent_id=known_agent_id,
+                known_agent_config=registration[2],
+                offboarding_admission=offboarding_admission,
+            )
+        else:
+            removed = await agent_manager.remove_agent(
+                agent_name,
+                offboard_runtime=False,
+            )
+    except RuntimeOffboardingRetainedError as exc:
+        # Shutdown/unpublication succeeded, so this is neither a missing agent
+        # nor a generic server failure. Return an explicit custody outcome
+        # (pending or retained) without inviting a retry against a dead route.
+        registration_requires_reconciliation = (
+            _restore_registration_for_custody_response(
+                request,
+                offboarding_admission,
+                registration_rollback,
+                agent_name=manager_agent_name,
+            )
+        )
+        detail = _annotate_custody_registration_detail(
+            dict(exc.metadata),
+            admission=offboarding_admission,
+            rollback=registration_rollback,
+            requires_reconciliation=registration_requires_reconciliation,
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    except RuntimeOffboardingNotPerformedError as exc:
+        # The agent is gone, but destructive intent did not remove a tree.
+        # Preserve the precise no-op state instead of returning a false 200.
+        registration_requires_reconciliation = (
+            _restore_registration_for_custody_response(
+                request,
+                offboarding_admission,
+                registration_rollback,
+                agent_name=manager_agent_name,
+            )
+        )
+        detail = _annotate_custody_registration_detail(
+            dict(exc.metadata),
+            admission=offboarding_admission,
+            rollback=registration_rollback,
+            requires_reconciliation=registration_requires_reconciliation,
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    except BaseExceptionGroup as exc:
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            try:
+                _restore_registration_if_offboarding_not_admitted(
+                    request,
+                    offboarding_admission,
+                    registration_rollback,
+                )
+            except Exception as rollback_error:
+                raise BaseExceptionGroup(
+                    "Agent deletion cancellation and registration compensation "
+                    "failed",
+                    [exc, rollback_error],
+                )
+            raise
+        detail = _grouped_runtime_retained_detail(exc)
+        if detail is None:
+            try:
+                _restore_registration_if_offboarding_not_admitted(
+                    request,
+                    offboarding_admission,
+                    registration_rollback,
+                )
+            except Exception as rollback_error:
+                raise BaseExceptionGroup(
+                    "Agent deletion failure and registration compensation failed",
+                    [exc, rollback_error],
+                )
+            raise
+        registration_requires_reconciliation = (
+            _restore_registration_for_custody_response(
+                request,
+                offboarding_admission,
+                registration_rollback,
+                agent_name=manager_agent_name,
+            )
+        )
+        detail = _annotate_custody_registration_detail(
+            detail,
+            admission=offboarding_admission,
+            rollback=registration_rollback,
+            requires_reconciliation=registration_requires_reconciliation,
+        )
+        logger.error(
+            "Agent '%s' was removed with retained runtime and additional "
+            "terminal outcomes",
+            manager_agent_name,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=409, detail=detail)
     except ValueError as e:
         # remove_agent refuses to delete an agent that still has budgeted child
         # agents (#2113) — that teardown must go through terminate_child. Surface
         # it as a controlled 409, not a 500.
+        if registration_rollback is not None and (
+            offboarding_admission is None or not offboarding_admission.started
+        ):
+            try:
+                _restore_persisted_agent_registration(request, registration_rollback)
+            except Exception as rollback_error:
+                logger.error(
+                    "Could not restore persisted registration after refused "
+                    "offboarding of %r",
+                    manager_agent_name,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Agent offboarding was refused and its persisted "
+                        "registration requires operator reconciliation."
+                    ),
+                ) from rollback_error
         raise HTTPException(status_code=409, detail=str(e))
+    except asyncio.CancelledError as exc:
+        try:
+            _restore_registration_if_offboarding_not_admitted(
+                request,
+                offboarding_admission,
+                registration_rollback,
+            )
+        except Exception as rollback_error:
+            raise BaseExceptionGroup(
+                "Agent deletion cancellation and registration compensation failed",
+                [exc, rollback_error],
+            )
+        raise
+    except Exception as exc:
+        try:
+            _restore_registration_if_offboarding_not_admitted(
+                request,
+                offboarding_admission,
+                registration_rollback,
+            )
+        except Exception as rollback_error:
+            raise BaseExceptionGroup(
+                "Agent deletion failure and registration compensation failed",
+                [exc, rollback_error],
+            )
+        raise
     if not removed:
+        if registration_rollback is not None and (
+            offboarding_admission is None or not offboarding_admission.started
+        ):
+            try:
+                _restore_persisted_agent_registration(request, registration_rollback)
+            except Exception as rollback_error:
+                logger.error(
+                    "Could not restore persisted registration after agent %r "
+                    "was not found",
+                    manager_agent_name,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Agent was not removed and its persisted registration "
+                        "requires operator reconciliation."
+                    ),
+                ) from rollback_error
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found.")
 
     return {
         "success": True,
         "name": agent_name,
-        "message": f"Agent '{agent_name}' shut down and removed.",
+        "runtime_offboarded": offboard_runtime,
+        "runtime_retained_for_restart": not offboard_runtime,
+        "persisted_registration_removed": bool(
+            offboard_runtime
+            and registration_rollback is not None
+            and registration_rollback[2] is not None
+        ),
+        "message": (
+            f"Agent '{agent_name}' shut down and deprovisioned."
+            if offboard_runtime
+            else f"Agent '{agent_name}' shut down; runtime retained for restart."
+        ),
     }
 
 

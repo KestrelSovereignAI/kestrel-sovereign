@@ -18,15 +18,508 @@ Architecture:
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
+
+_SAFE_AGENT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+def _flatten_terminal_outcomes(error: BaseException) -> list[BaseException]:
+    """Flatten a lifecycle exception group without inspecting error text."""
+
+    if isinstance(error, BaseExceptionGroup):
+        leaves: list[BaseException] = []
+        for nested in error.exceptions:
+            leaves.extend(_flatten_terminal_outcomes(nested))
+        return leaves
+    return [error]
+
+
+def _safe_retained_agent_name(error: object) -> str | None:
+    """Return only a canonical public agent name from retained metadata."""
+
+    metadata = getattr(error, "metadata", None)
+    candidate = metadata.get("agent") if isinstance(metadata, dict) else None
+    if type(candidate) is str and _SAFE_AGENT_NAME_RE.fullmatch(candidate):
+        return candidate
+    return None
+
+
+def _safe_termination_agent_name(error: object) -> str | None:
+    """Return only a canonical child name from a termination outcome."""
+
+    candidate = getattr(error, "child_name", None)
+    if type(candidate) is str and _SAFE_AGENT_NAME_RE.fullmatch(candidate):
+        return candidate
+    return None
+
+
+def _absence_finalization_partial_result(
+    *,
+    child_name: str,
+    offboard_runtime: bool,
+) -> ToolResult:
+    """Report routing finalization without inventing runtime-tree custody.
+
+    A concurrent lifecycle operation may remove manager routing and the parent
+    edge before this request receives an authoritative termination result.
+    That is enough to finalize local tracking, but proves neither that runtime
+    state was retained nor that a destructive request removed it.
+    """
+
+    return ToolResult.partial(
+        f"Terminated child '{child_name}'.",
+        (
+            "The child was already absent from manager routing when this "
+            "request reconciled local lifecycle tracking. Runtime retention "
+            "and offboarding are unknown; reconcile runtime custody before "
+            "restart or deprovisioning. Do not retry termination."
+        ),
+        data={
+            "terminated": True,
+            "child_name": child_name,
+            "agent_removed": True,
+            "finalized_from_absence": True,
+            "runtime_offboard_requested": offboard_runtime,
+            "runtime_offboarded": False,
+            "runtime_cleanup_pending": False,
+            "runtime_cleanup_state": "custody_unknown",
+            "runtime_already_absent": False,
+            "runtime_custody_known": False,
+            "runtime_retention_unknown": True,
+            "operator_action_required": True,
+            "retry_termination": False,
+        },
+    )
+
+
+def _termination_partial_result(
+    *,
+    child_name: str,
+    offboard_runtime: bool,
+    manager: object,
+    error: BaseException,
+    retained_error_type: type[BaseException],
+    not_performed_error_type: type[BaseException],
+    reconciliation_error_type: type[BaseException],
+    termination_not_performed_error_type: type[BaseException],
+    public_exception_type_name: Callable[[BaseException], str],
+) -> ToolResult | None:
+    """Build a safe terminal tool outcome, or decline unsupported failures.
+
+    Only manager-typed custody/reconciliation outcomes and cancellation may be
+    summarized. Arbitrary exceptions are re-raised by the caller because they
+    do not prove that shutdown/unpublication completed and may represent a
+    programmer or security-boundary failure.
+    """
+
+    leaves = _flatten_terminal_outcomes(error)
+    retained = [item for item in leaves if isinstance(item, retained_error_type)]
+    not_performed = [
+        item for item in leaves if isinstance(item, not_performed_error_type)
+    ]
+    reconciliation = [
+        item for item in leaves if isinstance(item, reconciliation_error_type)
+    ]
+    termination_not_performed = [
+        item
+        for item in leaves
+        if isinstance(item, termination_not_performed_error_type)
+    ]
+    supported = (
+        retained_error_type,
+        not_performed_error_type,
+        reconciliation_error_type,
+        termination_not_performed_error_type,
+        asyncio.CancelledError,
+    )
+    if any(not isinstance(item, supported) for item in leaves):
+        return None
+    current_task = asyncio.current_task()
+    if any(isinstance(item, asyncio.CancelledError) for item in leaves) and (
+        current_task is not None and current_task.cancelling()
+    ):
+        return None
+    # Cancellation alone must retain normal task-cancellation semantics. A
+    # typed reconciliation error is independently sufficient proof of removal;
+    # otherwise this helper is specifically the retained-custody contract.
+    if not retained and not not_performed and not termination_not_performed and (
+        not reconciliation or len(reconciliation) != len(leaves)
+    ):
+        return None
+    if termination_not_performed and len(termination_not_performed) == len(leaves):
+        return None
+
+    get_agent = getattr(manager, "get_agent", None)
+    if not callable(get_agent):
+        return None
+    named_termination_not_performed = any(
+        getattr(item, "child_name", None).casefold() == child_name.casefold()
+        for item in termination_not_performed
+        if isinstance(getattr(item, "child_name", None), str)
+    )
+    try:
+        named_child_removed = (
+            not named_termination_not_performed and get_agent(child_name) is None
+        )
+    except Exception:
+        return None
+    if not named_child_removed and not named_termination_not_performed:
+        return None
+
+    surviving_subtree_agents: list[str] = []
+    for item in termination_not_performed:
+        agent_name = _safe_termination_agent_name(item)
+        if agent_name is None:
+            return None
+        if agent_name.casefold() == child_name.casefold():
+            continue
+        if agent_name not in surviving_subtree_agents:
+            surviving_subtree_agents.append(agent_name)
+    surviving_subtree_agents.sort(key=str.casefold)
+
+    retained_agents: list[str] = []
+    retained_states_by_agent: dict[str, set[str]] = {}
+    for item in retained:
+        agent_name = _safe_retained_agent_name(item)
+        if agent_name is None:
+            return None
+        if agent_name not in retained_agents:
+            retained_agents.append(agent_name)
+        metadata = getattr(item, "metadata", None)
+        retained_state = (
+            str(metadata.get("runtime_cleanup_state", "retained"))
+            if isinstance(metadata, dict)
+            else "retained"
+        )
+        retained_states_by_agent.setdefault(agent_name, set()).add(retained_state)
+    retained_agents.sort(key=str.casefold)
+    pending_agents = sorted(
+        (
+            agent_name
+            for agent_name, states in retained_states_by_agent.items()
+            if states == {"pending"}
+        ),
+        key=str.casefold,
+    )
+    retained_only_agents = sorted(
+        (
+            agent_name
+            for agent_name, states in retained_states_by_agent.items()
+            if states != {"pending"}
+        ),
+        key=str.casefold,
+    )
+    named_child_retained = any(
+        name.casefold() == child_name.casefold() for name in retained_agents
+    )
+
+    not_performed_agents: list[str] = []
+    for item in not_performed:
+        agent_name = _safe_retained_agent_name(item)
+        if agent_name is None:
+            return None
+        if agent_name not in not_performed_agents:
+            not_performed_agents.append(agent_name)
+    not_performed_agents.sort(key=str.casefold)
+    named_child_not_performed = any(
+        name.casefold() == child_name.casefold() for name in not_performed_agents
+    )
+
+    no_op_states = {
+        str(item.metadata.get("runtime_cleanup_state"))
+        for item in not_performed
+        if isinstance(getattr(item, "metadata", None), dict)
+    }
+    named_child_no_op_states = {
+        str(item.metadata.get("runtime_cleanup_state"))
+        for item in not_performed
+        if isinstance(getattr(item, "metadata", None), dict)
+        and isinstance(getattr(item, "agent_name", None), str)
+        and item.agent_name.casefold() == child_name.casefold()
+    }
+    if len(named_child_no_op_states) == 1:
+        scoped_no_op_state = next(iter(named_child_no_op_states))
+    else:
+        scoped_no_op_state = None
+    custody_unknown = any(
+        item.metadata.get("runtime_custody_known") is False
+        for item in not_performed
+        if isinstance(getattr(item, "metadata", None), dict)
+    )
+    named_child_not_hosted = "not_hosted" in named_child_no_op_states
+
+    additional = [
+        item
+        for item in leaves
+        if not isinstance(item, (retained_error_type, not_performed_error_type))
+    ]
+    additional_types = sorted(
+        {public_exception_type_name(item) for item in additional}
+    )
+    cause_types = sorted(
+        {
+            str(item.metadata["cause_type"])
+            for item in retained
+            if isinstance(getattr(item, "metadata", None), dict)
+            and type(item.metadata.get("cause_type")) is str
+        }
+    )
+    cleanup_pending = any(
+        item.metadata.get("runtime_cleanup_state") == "pending"
+        for item in retained
+        if isinstance(getattr(item, "metadata", None), dict)
+    )
+    named_child_retained_states = {
+        str(item.metadata.get("runtime_cleanup_state", "retained"))
+        for item in retained
+        if isinstance(getattr(item, "metadata", None), dict)
+        and isinstance(getattr(item, "agent_name", None), str)
+        and item.agent_name.casefold() == child_name.casefold()
+    }
+    if len(named_child_retained_states) == 1:
+        named_child_retained_state = next(iter(named_child_retained_states))
+    elif named_child_retained_states:
+        named_child_retained_state = "mixed"
+    elif named_child_retained:
+        named_child_retained_state = "retained"
+    else:
+        named_child_retained_state = None
+
+    retention_witness = False
+    named_retention_witness = False
+    if offboard_runtime:
+        # Only a retained cleanup, a subtree which was never stopped, or an
+        # explicitly storage-backed agent is a positive retention witness.
+        # Routing absence alone is not evidence for either retention or
+        # deletion and therefore cannot produce a retention field.
+        retention_witness = (
+            bool(retained)
+            or bool(termination_not_performed)
+            or "not_hosted" in no_op_states
+        )
+        named_retention_witness = (
+            named_child_retained
+            or named_termination_not_performed
+            or named_child_not_hosted
+        )
+        runtime_retained = retention_witness
+        named_runtime_retained = named_retention_witness
+        named_runtime_removed = named_child_removed and (
+            not named_child_retained and not named_child_not_performed
+        )
+        reported_cleanup_state = (
+            "termination_not_performed"
+            if named_termination_not_performed
+            else "not_performed"
+            if not named_child_removed
+            else named_child_retained_state
+            if named_child_retained
+            else scoped_no_op_state or "removed"
+        )
+    else:
+        # This is the compatibility stop contract: no runtime cleanup was
+        # admitted, so every named/descendant tree remains available for a
+        # later restart regardless of the independent tracking failure that
+        # made the overall lifecycle outcome partial.
+        runtime_retained = True
+        named_runtime_retained = True
+        named_runtime_removed = False
+        cleanup_pending = False
+        reported_cleanup_state = "not_requested"
+
+    data: Dict[str, Any] = {
+        "terminated": named_child_removed,
+        "child_name": child_name,
+        "agent_removed": named_child_removed,
+        "runtime_offboard_requested": offboard_runtime,
+        "runtime_offboarded": (
+            offboard_runtime
+            and named_child_removed
+            and not retained
+            and not not_performed
+            and not termination_not_performed
+        ),
+        "runtime_retained": runtime_retained,
+        "runtime_retained_for_restart": not offboard_runtime,
+        "named_child_runtime_retained": named_runtime_retained,
+        "named_child_runtime_removed": named_runtime_removed,
+        "runtime_cleanup_pending": cleanup_pending,
+        "runtime_cleanup_state": reported_cleanup_state,
+        "operator_action_required": True,
+        "retry_termination": not named_child_removed,
+        "retained_outcome_count": len(retained),
+        "retained_agents": retained_agents,
+        "additional_outcome_count": len(additional),
+        "additional_outcome_types": additional_types,
+    }
+    if custody_unknown and not retention_witness:
+        data.pop("runtime_retained")
+    if custody_unknown and not named_retention_witness:
+        data.pop("named_child_runtime_retained")
+    if len(retained_agents) == 1:
+        data["retained_agent"] = retained_agents[0]
+    if retained:
+        data["runtime_custody_code"] = "runtime_offboarding_retained"
+        data["pending_agents"] = pending_agents
+        data["retained_only_agents"] = retained_only_agents
+        data["retained_cause_types"] = cause_types
+        if len(cause_types) == 1:
+            data["retained_cause_type"] = cause_types[0]
+    if reconciliation:
+        data["tracking_reconciled"] = False
+    retained_custody_messages: list[str] = []
+    if pending_agents:
+        retained_custody_messages.append(
+            "Secure runtime cleanup is still pending for "
+            f"{', '.join(pending_agents)} and may complete in manager-owned "
+            "cleanup."
+        )
+    if retained_only_agents:
+        retained_custody_messages.append(
+            "Secure runtime custody was retained for "
+            f"{', '.join(retained_only_agents)}."
+        )
+
+    if termination_not_performed:
+        data["termination_not_performed_outcome_count"] = len(
+            termination_not_performed
+        )
+        data["surviving_subtree_agents"] = surviving_subtree_agents
+        data["named_child_termination_not_performed"] = (
+            named_termination_not_performed
+        )
+        data["retry_named_child_termination"] = named_termination_not_performed
+        data["retry_descendant_termination"] = bool(surviving_subtree_agents)
+        data["retry_descendant_agents"] = surviving_subtree_agents
+        if offboard_runtime:
+            data["runtime_custody_known"] = False
+    if not_performed:
+        data["not_performed_outcome_count"] = len(not_performed)
+        data["not_performed_agents"] = not_performed_agents
+        not_performed_code = "runtime_offboarding_not_performed"
+        if retained:
+            data["runtime_custody_codes"] = [
+                "runtime_offboarding_retained",
+                not_performed_code,
+            ]
+        else:
+            data["runtime_custody_code"] = not_performed_code
+        if scoped_no_op_state is not None:
+            data["runtime_already_absent"] = (
+                scoped_no_op_state == "already_absent"
+            )
+            if scoped_no_op_state != "custody_unknown":
+                data["hosted_runtime_configured"] = (
+                    scoped_no_op_state != "not_hosted"
+                )
+        if custody_unknown:
+            data["runtime_custody_known"] = False
+            data["runtime_retention_unknown"] = True
+            data["finalized_from_absence"] = True
+
+    if termination_not_performed:
+        survivors = ", ".join(surviving_subtree_agents)
+        if named_termination_not_performed and surviving_subtree_agents:
+            custody_message = (
+                f"Termination was not performed for the named child and surviving "
+                f"descendants {survivors}. Runtime custody is incomplete. Retry "
+                "the named child termination after operator reconciliation."
+            )
+        elif named_termination_not_performed:
+            custody_message = (
+                "Termination was not performed for the named child. Its runtime "
+                "state was retained. Retry the named child termination after "
+                "operator reconciliation."
+            )
+        elif offboard_runtime:
+            custody_message = (
+                f"Termination was not performed for surviving subtree {survivors}. "
+                "Its runtime state remains retained and complete custody is "
+                "unknown. Retry termination for the named descendant subtree "
+                "after operator reconciliation."
+            )
+        else:
+            custody_message = (
+                f"Termination was not performed for surviving subtree {survivors}; "
+                "runtime offboarding was not requested. Retry termination for the "
+                "named descendant subtree after operator reconciliation."
+            )
+        if retained_custody_messages:
+            custody_message = (
+                f"{custody_message} {' '.join(retained_custody_messages)} "
+                "An operator must also reconcile each retained tree and pending "
+                "cleanup."
+            )
+    elif not named_child_removed:
+        custody_message = (
+            "Descendant cleanup had terminal outcomes, but the named child was "
+            "not removed. Retry termination after operator reconciliation."
+        )
+    elif not offboard_runtime:
+        custody_message = (
+            "The child was stopped and its runtime state was retained for "
+            "restart, but lifecycle bookkeeping requires operator "
+            "reconciliation. Do not retry termination."
+        )
+    elif custody_unknown:
+        custody_message = (
+            "The child was already stopped and unpublished, but this request "
+            "performed no secure runtime offboarding. Runtime retention and "
+            "deletion are unknown until operator reconciliation confirms "
+            "custody. Do not retry termination."
+        )
+    elif retained and not_performed:
+        custody_message = (
+            f"{' '.join(retained_custody_messages)} Runtime cleanup was not "
+            f"performed for {', '.join(not_performed_agents)}. Do not retry "
+            "termination; an operator must reconcile each retained tree, "
+            "pending cleanup, and the remaining no-op custody outcomes."
+        )
+    elif not_performed and scoped_no_op_state == "already_absent":
+        custody_message = (
+            "The child was stopped, but its hosted runtime namespace was already "
+            "absent and no tree was deleted. Do not retry termination."
+        )
+    elif not_performed and scoped_no_op_state == "not_hosted":
+        custody_message = (
+            "The child was stopped, but it has no hosted runtime namespace that "
+            "Core can securely offboard. Its storage-backed state was not deleted. "
+            "Do not retry termination."
+        )
+    elif not_performed:
+        custody_message = (
+            "The child was stopped, but the cascade produced mixed runtime "
+            "custody outcomes. Do not retry termination; an operator must "
+            "reconcile the named child and descendant custody states."
+        )
+    elif retained:
+        custody_message = (
+            f"{' '.join(retained_custody_messages)} Do not retry termination; "
+            "an operator must reconcile each retained tree and pending cleanup."
+        )
+    else:
+        custody_message = (
+            "The child was removed, but lifecycle bookkeeping requires "
+            "operator reconciliation. Do not retry termination."
+        )
+    return ToolResult.partial(
+        (
+            f"Terminated child '{child_name}'."
+            if named_child_removed
+            else f"Child '{child_name}' was not terminated."
+        ),
+        custody_message,
+        data=data,
+    )
 
 
 def _coerce_constraint_value(value: str):
@@ -353,6 +846,7 @@ class SpawnFeature(Feature):
 
         parent_did = self.agent.agent_id
         child_names = manager.get_children(parent_did)
+        lifecycle = self._get_lifecycle(manager)
 
         children = []
         for child_name in child_names:
@@ -365,12 +859,18 @@ class SpawnFeature(Feature):
                 and not self._child_tasks[child_name].done()
             )
 
-            children.append({
+            child_record = {
                 "name": child_name,
                 "status": status,
                 "has_result": has_result,
                 "has_pending_task": has_pending_task,
-            })
+            }
+            if lifecycle is not None:
+                refusal = lifecycle.get_termination_refusal(child_name)
+                if refusal is not None:
+                    child_record["termination_refusal"] = refusal
+                    child_record["operator_action_required"] = True
+            children.append(child_record)
 
         if not children:
             return ToolResult.ok(
@@ -535,18 +1035,33 @@ class SpawnFeature(Feature):
 
     @tool(
         name="terminate_child",
-        description="Terminate a child agent, stopping it and releasing its resources.",
+        description=(
+            "Stop a child agent. By default its runtime state is retained for "
+            "restart; offboard_runtime=true irreversibly deletes the child and "
+            "descendant hosted runtime trees after shutdown."
+        ),
         category=ToolCategory.AGENT_MANAGEMENT,
     )
-    async def terminate_child(self, child_name: str) -> ToolResult:
+    async def terminate_child(
+        self,
+        child_name: str,
+        offboard_runtime: bool = False,
+    ) -> ToolResult:
         """
         Terminate a child agent early.
 
         Args:
             child_name: Name of the child agent to terminate
+            offboard_runtime: Explicitly and irreversibly delete hosted
+                runtime state after stopping the child and descendants.
 
         Returns:
             ToolResult.ok when the child was actually terminated.
+            ToolResult.partial when the child was stopped/unpublished but its
+            isolated runtime cleanup is pending/retained or its manager
+            bookkeeping needs operator reconciliation. It is also partial for
+            either offboard value when local finalization observes only routing
+            absence, because that proves neither runtime deletion nor retention.
             ERROR when there's no AgentManager, the named agent is
             not a child of this parent, or the underlying terminate
             call returned False.
@@ -554,6 +1069,8 @@ class SpawnFeature(Feature):
         manager = self._get_agent_manager()
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
+        if type(offboard_runtime) is not bool:
+            return ToolResult.failed(error="offboard_runtime must be a bool")
 
         # Verify this is our child
         parent_did = self.agent.agent_id
@@ -571,19 +1088,77 @@ class SpawnFeature(Feature):
         self._child_results.pop(child_name, None)
 
         # Remove from manager (handles shutdown + cascading child termination)
+        from kestrel_sovereign.multi_agent.agent_manager import (
+            ChildTerminationNotPerformedError,
+            ChildTerminationReconciliationError,
+            RuntimeOffboardingNotPerformedError,
+            RuntimeOffboardingRetainedError,
+            public_exception_type_name,
+        )
+
         lifecycle = self._get_lifecycle(manager)
-        if lifecycle is not None:
-            result = await lifecycle.terminate(
+        try:
+            if lifecycle is not None:
+                if offboard_runtime:
+                    result = await lifecycle.terminate(
+                        child_name=child_name,
+                        reason="explicit termination",
+                        offboard_runtime=True,
+                    )
+                else:
+                    result = await lifecycle.terminate(
+                        child_name=child_name,
+                        reason="explicit termination",
+                    )
+                removed = result is not None
+            else:
+                if offboard_runtime:
+                    removed = await manager.terminate_child(
+                        parent_did,
+                        child_name,
+                        offboard_runtime=True,
+                    )
+                else:
+                    removed = await manager.terminate_child(parent_did, child_name)
+        except BaseException as exc:
+            # Manager-typed terminal outcomes prove that routing withdrawal
+            # succeeded even when custody/reconciliation did not. Flatten
+            # those groups into one truthful, path-free PARTIAL. Anything else
+            # remains exceptional: converting an arbitrary programming or
+            # namespace-security failure into a tool ERROR would mask it.
+            partial = _termination_partial_result(
                 child_name=child_name,
-                reason="explicit termination",
+                offboard_runtime=offboard_runtime,
+                manager=manager,
+                error=exc,
+                retained_error_type=RuntimeOffboardingRetainedError,
+                not_performed_error_type=RuntimeOffboardingNotPerformedError,
+                reconciliation_error_type=ChildTerminationReconciliationError,
+                termination_not_performed_error_type=(
+                    ChildTerminationNotPerformedError
+                ),
+                public_exception_type_name=public_exception_type_name,
             )
-            removed = result is not None
-        else:
-            removed = await manager.terminate_child(parent_did, child_name)
+            if partial is None:
+                raise
+            return partial
         if removed:
+            if (
+                lifecycle is not None
+                and getattr(result, "finalized_from_absence", False) is True
+            ):
+                return _absence_finalization_partial_result(
+                    child_name=child_name,
+                    offboard_runtime=offboard_runtime,
+                )
             return ToolResult.ok(
                 f"Terminated child '{child_name}'.",
-                data={"terminated": True, "child_name": child_name},
+                data={
+                    "terminated": True,
+                    "child_name": child_name,
+                    "runtime_offboarded": offboard_runtime,
+                    "runtime_retained_for_restart": not offboard_runtime,
+                },
             )
 
         return ToolResult.failed(error=f"Failed to terminate '{child_name}'")
@@ -595,18 +1170,3 @@ class SpawnFeature(Feature):
                 task.cancel()
         self._child_tasks.clear()
         self._child_results.clear()
-
-    @property
-    def default_permissions(self) -> Dict[str, str]:
-        """Default permission levels for spawn tools.
-
-        spawn_agent requires explicit approval (ASK) since it creates new agents.
-        Other tools default to ALLOW since they operate on already-approved children.
-        """
-        return {
-            "spawn_agent": "ask",
-            "list_children": "allow",
-            "delegate_task": "allow",
-            "get_child_result": "allow",
-            "terminate_child": "allow",
-        }

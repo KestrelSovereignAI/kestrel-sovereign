@@ -39,6 +39,7 @@ from kestrel_sovereign.features.strategic_memory.ledger import (
 )
 from kestrel_sovereign.features.strategic_memory.ledger_index import (
     BLOCKER_NODE_TYPE,
+    MEMBERSHIP_READ_CAP,
     PATTERN_NODE_TYPE,
     ledger_node_id,
     project_ledger,
@@ -73,6 +74,20 @@ class _FakeGraph:
 
     async def get_nodes_by_type(self, node_type):
         return [n for n in self.nodes.values() if n.node_type == node_type]
+
+    async def add_node(self, node):
+        """Whole-row upsert, label included -- what AsyncGraphStore does.
+
+        Absent from this double until #3064, which is why a projection change
+        that called it looked like it worked: the call raised AttributeError,
+        the projection's ``except Exception`` counted it as a failed write,
+        and the assertions still passed. A double cannot test what it does
+        not implement.
+        """
+        if self._fail_on and self._fail_on in node.node_id:
+            raise RuntimeError("graph write refused")
+        self.writes += 1
+        self.nodes[node.node_id] = node
 
     async def delete_node(self, node_id):
         self.deleted.append(node_id)
@@ -579,16 +594,44 @@ class TestProjection:
         assert props["status"] == "superseded"
 
     @pytest.mark.asyncio
-    async def test_graph_supersession_survives_where_the_ledger_is_silent(self):
+    async def test_clearing_supersession_in_the_file_takes_effect(self):
+        """The ledger owns a ledger row's retirement, alone.
+
+        This projection used to carry superseded_* across from the existing
+        node wherever the file was silent, so that a value a PREVIOUS
+        projection had written from YAML survived the field being cleared --
+        the outcome the module docstring said the carry-over existed to
+        avoid. The recall then reported the resulting empty active page as
+        healthy (#3064).
+
+        The theory was that the graph might own a retirement the file cannot
+        express. Nothing can write one: memory_supersede_claim refuses every
+        node type outside CLAIM_SHAPED_NODE_TYPES, update_action_item
+        type-guards, and no module outside strategic_memory names these node
+        types at all. So the mechanism had no reachable legitimate case and
+        one reachable harmful one, and the test that pinned it hand-wrote a
+        world production cannot produce.
+        """
         node_id = ledger_node_id(PATTERN_NODE_TYPE, AGENT, "pat_1")
         graph = _FakeGraph()
-        rows = {PATTERNS_KEY: [{"id": "pat_1", "pattern": "x"}]}
-        await project_ledger(graph, AGENT, rows)
-        graph.nodes[node_id].properties["superseded_by"] = "pat_newer"
+        await project_ledger(
+            graph,
+            AGENT,
+            {PATTERNS_KEY: [{"id": "pat_1", "pattern": "x",
+                             "superseded_by": "pat_older",
+                             "superseded_at": "2026-08-01"}]},
+        )
+        assert graph.nodes[node_id].properties["status"] == "superseded"
 
-        await project_ledger(graph, AGENT, rows)
+        # Reactivated by hand: the fields are gone from the canonical file.
+        await project_ledger(
+            graph, AGENT, {PATTERNS_KEY: [{"id": "pat_1", "pattern": "x"}]}
+        )
 
-        assert graph.nodes[node_id].properties["superseded_by"] == "pat_newer"
+        props = graph.nodes[node_id].properties
+        assert props["superseded_by"] == ""
+        assert props["superseded_at"] == ""
+        assert props["status"] == "active"
 
     @pytest.mark.asyncio
     async def test_missing_graph_store_is_not_an_error(self):
@@ -992,6 +1035,11 @@ class TestTheIndexHasAConsumer:
         result = await feature.recall_patterns()
         assert result.data["count"] == 1
         assert result.data["patterns"][0]["text"] == "a durable observation"
+        # The row still comes back -- that is the claim here. It is also now
+        # reported as a divergence, because an in-memory ledger holding none
+        # of it and an index holding one of it do disagree.
+        assert result.status.value == "partial"
+        assert result.data["orphaned_count"] == 1
         # Count the pattern nodes specifically. ``len(graph.nodes)`` would also
         # count decision and blocker nodes, which is a different claim than the
         # one this test is making.
@@ -1015,6 +1063,31 @@ class TestTheIndexHasAConsumer:
         assert row["issue"] == "owner/repo#42"
         assert row["severity"] == "high"
         assert row["node_id"].startswith(f"{BLOCKER_NODE_TYPE}:{AGENT}:")
+
+    @pytest.mark.asyncio
+    async def test_a_recalled_blocker_carries_its_repository(self, tmp_path):
+        """#3064: the projection dropped ``repo``.
+
+        ``#42`` names an issue only relative to a repository, and the ledger
+        records the field for exactly that reason. Losing it in the index
+        hands every consumer an ambiguous reference -- in the same change
+        that added repository-identity guards elsewhere.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_blocker(
+            issue="#42",
+            title="CI runner is wedged",
+            severity="high",
+            repo="owner/repo",
+        )
+
+        result = await feature.recall_blockers()
+
+        row = result.data["blockers"][0]
+        assert row["issue"] == "#42"
+        assert row["repo"] == "owner/repo", (
+            "a bare issue number without its repo is not a reference"
+        )
 
     @pytest.mark.asyncio
     async def test_superseded_patterns_are_excluded_by_default(self, tmp_path):
@@ -1077,9 +1150,805 @@ class TestTheIndexHasAConsumer:
 
         assert result.status.value == "partial"
         assert result.data["count"] == 0
-        assert result.data["canonical_active"] == 1
+        assert result.data["canonical_expected"] == 1
+        assert result.data["missing_count"] == 1
         assert result.data["index_stale"] is True
         assert "stale or was never built" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_partial_index_is_not_a_clean_answer(self, tmp_path):
+        """#3064: non-emptiness was taken as proof the index was complete.
+
+        One projected row standing in for two canonical ones returned a short
+        list with an ok status -- a check answering "is there anything?" while
+        the caller asked "is this all of it?".
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first observation")
+        await feature.strategy_add_pattern(pattern="the second observation")
+        graph = feature.agent.storage.graph
+        # Drop exactly one projected node. The ledger still holds both.
+        victim = next(
+            node_id
+            for node_id, node in graph.nodes.items()
+            if node.node_type == PATTERN_NODE_TYPE
+        )
+        del graph.nodes[victim]
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "partial", (
+            "a list missing a canonical row is not a clean answer"
+        )
+        assert result.data["index_stale"] is True
+        assert result.data["missing_count"] == 1
+        assert result.data["canonical_expected"] == 2
+
+    @pytest.mark.asyncio
+    async def test_membership_not_count_decides_staleness(self, tmp_path):
+        """An index of the right size and the wrong contents is still stale.
+
+        Comparing counts would pass here: one node in, one node out.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the canonical observation")
+        graph = feature.agent.storage.graph
+        victim, node = next(
+            (nid, n)
+            for nid, n in graph.nodes.items()
+            if n.node_type == PATTERN_NODE_TYPE
+        )
+        del graph.nodes[victim]
+        # A node of the same type and agent, but not a row the ledger holds.
+        node.node_id = f"{PATTERN_NODE_TYPE}:{AGENT}:pat_stranger"
+        node.properties = {**node.properties, "row_id": "pat_stranger"}
+        graph.nodes[node.node_id] = node
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "partial"
+        assert result.data["missing_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_retired_row_still_answering_as_current_is_a_divergence(
+        self, tmp_path
+    ):
+        """One-directional membership certified retired guidance as current.
+
+        Projection is best-effort, so a write that fails after a supersession
+        leaves the old node marked active while the canonical active set no
+        longer holds it. Nothing is *missing*, so a check that only asks
+        "did I get everything?" returns ok with completeness_checked True --
+        confidently wrong rather than merely short.
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="old guidance")
+        graph = feature.agent.storage.graph
+        # The projection of the supersession fails. The canonical file records
+        # it; the index still answers with the active row.
+        graph._fail_on = PATTERN_NODE_TYPE
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="retired"
+        )
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1, "the stale node is still returned"
+        assert result.data["canonical_expected"] == 0
+        assert result.status.value == "partial", (
+            "an index answering with a row the ledger retired is not ok"
+        )
+        assert result.data["index_stale"] is True
+        assert result.data["misfiled_count"] == 1, (
+            "the ledger retired it and the index still marks it current"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_row_reactivated_in_the_file_comes_back(self, tmp_path):
+        """The recall reflects the canonical file, including a clearing.
+
+        This was the case that made the carry-over untenable: the node kept
+        superseded_* a previous YAML projection had written, reprojection
+        preserved them, and recall_patterns returned a certified-clean empty
+        page over a pattern the operator had reactivated (#3064).
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="briefly retired")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="thought it was done"
+        )
+        assert (await feature.recall_patterns()).data["count"] == 0
+
+        # Reactivated by hand in the canonical file.
+        for row in feature._ledger.data[PATTERNS_KEY]:
+            row.pop("superseded_at", None)
+            row.pop("superseded_by", None)
+            row.pop("superseded_reason", None)
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "ok"
+        assert result.data["completeness_checked"] is True
+
+        assert result.data["completeness_checked"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_divergence_behind_the_page_is_still_reported(self, tmp_path):
+        """The check reads the whole scoped projection, not the caller's page.
+
+        An orphan that sorts behind every canonical row is invisible to a
+        LIMIT and present in the database, so a page-derived check certifies a
+        clean index while a larger limit returns deleted guidance.
+        """
+        feature = await _feature(tmp_path)
+        for n in range(3):
+            await feature.strategy_add_pattern(pattern=f"observation {n}")
+        graph = feature.agent.storage.graph
+        node = next(
+            n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
+        )
+        node.properties = {**node.properties, "row_id": "pat_stranger"}
+
+        result = await feature.recall_patterns(limit=2)
+
+        assert result.data["count"] == 2, "the page itself is still bounded"
+        assert result.status.value == "partial"
+        assert result.data["index_stale"] is True
+        assert result.data["completeness_checked"] is True, (
+            "the limit no longer defeats the check"
+        )
+        assert result.data["orphaned_count"] == 1
+        assert result.data["missing_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_stale_retired_recall_names_a_fallback_that_can_answer(
+        self, tmp_path
+    ):
+        """strategy_search excludes retired rows unless told otherwise.
+
+        Recommending it bare for a retired-mode recall promises a fallback
+        that structurally cannot return the rows the error is about.
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="a retired observation")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="no longer holds"
+        )
+        feature.agent.storage.graph.nodes.clear()
+
+        result = await feature.recall_patterns(include_superseded=True)
+
+        assert result.status.value == "partial"
+        assert "include_retired=True" in (result.error or "")
+
+        # And the named path actually returns it.
+        found = await feature.strategy_search(
+            query="retired observation", include_retired=True
+        )
+        assert found.data["count"] == 1
+        assert (await feature.strategy_search(query="retired observation")).data[
+            "count"
+        ] == 0
+
+    @pytest.mark.asyncio
+    async def test_superseded_recall_is_measured_against_superseded_rows(
+        self, tmp_path
+    ):
+        """#3064: include_superseded=True still compared against ACTIVE rows.
+
+        A ledger holding only retired rows against an empty index therefore
+        returned a clean zero -- the baseline answered a different question
+        than the query did.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a since-retired observation")
+        for row in feature._ledger.patterns:
+            row["superseded_at"] = "2026-01-01"
+            row["superseded_reason"] = "no longer holds"
+        feature._ledger.save()
+        feature.agent.storage.graph.nodes.clear()
+
+        active = await feature.recall_patterns()
+        assert active.data["canonical_expected"] == 0, (
+            "no ACTIVE rows are expected, so the empty page is the right answer"
+        )
+        assert active.status.value == "partial", (
+            "but membership is status-agnostic: the index is missing a row the "
+            "ledger holds, and that is true whichever page was asked for"
+        )
+        assert active.data["missing_count"] == 1
+
+        everything = await feature.recall_patterns(include_superseded=True)
+
+        assert everything.data["count"] == 0
+        assert everything.status.value == "partial", (
+            "the ledger holds a superseded row the index does not"
+        )
+        assert everything.data["canonical_expected"] == 1
+        assert everything.data["index_stale"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_bounded_page_over_a_healthy_index_is_clean(self, tmp_path):
+        """The limit bounds the answer without weakening the claim about it.
+
+        Reading membership from the whole scoped projection means a short page
+        is just a short page -- neither a false alarm nor an unrun check.
+        """
+        feature = await _feature(tmp_path)
+        for n in range(4):
+            await feature.strategy_add_pattern(pattern=f"observation {n}")
+
+        result = await feature.recall_patterns(limit=2)
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 2
+        assert result.data["completeness_checked"] is True
+        assert "index_stale" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_an_id_stable_edit_that_never_projected_is_reported(
+        self, tmp_path
+    ):
+        """Membership is weaker than agreement.
+
+        Changing a blocker's repo or severity leaves its id and its status
+        untouched, so a membership-only check certified the index clean while
+        the recalled row still carried the OLD repository -- the very
+        ambiguity the repo field was added to remove.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_blocker(
+            issue="#42", title="wedged", severity="high", repo="owner/repo"
+        )
+        feature.agent.storage.graph._fail_on = BLOCKER_NODE_TYPE
+        for row in feature._ledger.data[BLOCKERS_KEY]:
+            row["repo"] = "someone-else/other"
+            row["severity"] = "critical"
+        feature._ledger.save()
+
+        result = await feature.recall_blockers()
+
+        assert result.data["blockers"][0]["repo"] == "owner/repo", (
+            "the index really is handing back the stale repository"
+        )
+        assert result.status.value == "partial"
+        assert result.data["drifted_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hand_edited_id_with_whitespace_is_not_a_false_alarm(
+        self, tmp_path
+    ):
+        """One rule for the row id, computed once.
+
+        The properties function read row["id"] verbatim while _row_id stripped
+        it, so a freshly and healthily rebuilt node advertised one spelling and
+        was addressed by another -- reported missing AND orphaned, forever,
+        with no restart able to clear it.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a hand-edited row")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        rows[0]["id"] = "  " + rows[0]["id"] + "  "
+        feature._ledger.save()
+        feature.agent.storage.graph.nodes.clear()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "ok", (
+            "a healthy rebuild is not a divergence"
+        )
+        assert "index_stale" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_an_edit_to_a_canonical_supersession_reason_is_content(
+        self, tmp_path
+    ):
+        """Graph-ownership is per key, and only where the ledger is silent.
+
+        When the canonical file sets superseded_reason itself, that value
+        wins, so an edit to it is an ordinary content change. Excusing the
+        supersession fields wholesale hid exactly that edit.
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="retired in the file")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="original reason"
+        )
+        feature.agent.storage.graph._fail_on = PATTERN_NODE_TYPE
+        for row in feature._ledger.data[PATTERNS_KEY]:
+            row["superseded_reason"] = "a corrected reason"
+        feature._ledger.save()
+
+        result = await feature.recall_patterns(include_superseded=True)
+
+        assert result.status.value == "partial"
+        assert result.data["drifted_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_node_retired_without_evidence_is_not_excused(self, tmp_path):
+        """The excuse needs the carry-over that produces it, not a status.
+
+        A legacy or mangled node carrying no graph-owned supersession at all
+        was still read as intentionally retired, so recall returned zero rows
+        over an active pattern and called the check complete.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an active row")
+        node = next(
+            n
+            for n in feature.agent.storage.graph.nodes.values()
+            if n.node_type == PATTERN_NODE_TYPE
+        )
+        node.properties["status"] = "mangled"
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 0
+        assert result.status.value == "partial"
+        assert result.data["misfiled_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_collision_only_divergence_does_not_advise_a_restart(
+        self, tmp_path
+    ):
+        """Advice that contradicts itself is worse than none.
+
+        The message says reprojection cannot fix a collision, so it must not
+        then tell the operator to restart and reproject.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        duplicate = dict(rows[0])
+        duplicate["pattern"] = "a different observation"
+        rows.append(duplicate)
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.data["colliding_count"] == 1
+        assert "restart" not in (result.error or "").lower()
+        assert "Resolve the duplicate ids" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_repairable_divergence_still_advises_a_restart(self, tmp_path):
+        """And the advice must not disappear for the case a restart fixes."""
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="canonical but unindexed")
+        feature.agent.storage.graph.nodes.clear()
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert "restart the agent to reproject" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_superseded_row_is_clean_when_the_index_agrees(self, tmp_path):
+        """The retired page is checked the same way the active one is.
+
+        Supersession recorded in the file and projected to the index is
+        agreement, not drift -- the comparison must not manufacture a
+        divergence out of a row's retirement.
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="retired and indexed")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="superseded properly"
+        )
+
+        result = await feature.recall_patterns(include_superseded=True)
+
+        assert result.data["count"] == 1
+        assert result.status.value == "ok"
+        assert "drifted_count" not in result.data
+        assert "misfiled_count" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_a_blocker_reopened_by_hand_is_not_a_clean_zero(self, tmp_path):
+        """Whether the INDEX may retire a row is a property of the section.
+
+        A pattern node may carry a graph-owned supersession the ledger is
+        silent about. A blocker's status is a pure function of the ledger's
+        resolved_at, so the same shape there is a projection that has not
+        landed -- and an operator reopening a blocker by editing YAML would
+        otherwise get a certified-clean empty list over an active blocker.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_blocker(
+            issue="owner/repo#42", title="CI runner is wedged", severity="high"
+        )
+        row_id = feature._ledger.data[BLOCKERS_KEY][0]["id"]
+        await feature.strategy_resolve_blocker(issue=row_id, resolution="fixed")
+        # Reopened by hand, and the reprojection cannot land.
+        feature.agent.storage.graph._fail_on = BLOCKER_NODE_TYPE
+        for row in feature._ledger.data[BLOCKERS_KEY]:
+            row.pop("resolved_at", None)
+            row.pop("resolution", None)
+        feature._ledger.save()
+
+        result = await feature.recall_blockers()
+
+        assert result.data["count"] == 0
+        assert result.data["canonical_expected"] == 1
+        assert result.status.value == "partial", (
+            "an empty list over an active blocker is the original bug shape"
+        )
+        assert result.data["misfiled_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_two_canonical_rows_on_one_id_are_reported(self, tmp_path):
+        """A set of ids hides multiplicity; the ledger is hand-editable.
+
+        Both rows project to the same node, the second overwrites the first,
+        and one canonical row is unreachable however healthy the projection
+        is. Reprojecting cannot fix it, so the message must not tell the
+        caller to restart and expect a different result.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        duplicate = dict(rows[0])
+        duplicate["pattern"] = "a genuinely different observation"
+        rows.append(duplicate)
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.data["canonical_expected"] == 2, (
+            "two rows are two rows, whatever ids they carry"
+        )
+        assert result.data["count"] == 1
+        assert result.status.value == "partial"
+        assert result.data["colliding_count"] == 1
+        assert "duplicate ids" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_reprojection_mid_read_is_a_check_that_did_not_run(
+        self, tmp_path
+    ):
+        """The page and the membership are two queries.
+
+        A reprojection landing between them leaves the page describing the old
+        index and the membership the new one -- and in that interleaving every
+        divergence set comes out empty, so a just-resolved blocker is returned
+        and certified current. The fence makes the two one observation.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first observation")
+        graph = feature.agent.storage.graph
+        original = graph.query_nodes_by_type_and_property
+        state = {"reads": 0}
+
+        async def _mutate_between(node_type, filters=None, **kwargs):
+            result = await original(node_type, filters=filters, **kwargs)
+            if kwargs.get("limit") == MEMBERSHIP_READ_CAP:
+                state["reads"] += 1
+                if state["reads"] == 1:
+                    # A scheduled mutation reprojects while the page is read.
+                    await feature.strategy_add_pattern(pattern="landed midway")
+            return result
+
+        graph.query_nodes_by_type_and_property = _mutate_between
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == (
+            "index_changed_during_read"
+        )
+        assert "index_stale" not in result.data, (
+            "a reprojection is not a divergence, and must not be accused as one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_edited_text_updates_the_stored_label_too(self, tmp_path):
+        """Every reader of the node, not just this one.
+
+        compare_and_swap_node is deliberately properties-only, so editing a
+        pattern's text under an id the row carries explicitly used to leave
+        GraphNode.label holding the old wording forever. /api/memories reads
+        ``label`` directly, so a second consumer served text the ledger no
+        longer contained. Deriving a fresh label in recall_nodes alone would
+        have made ONE surface honest and left the other lying -- so the
+        projection updates the stored label, and the recall's derived value
+        agrees with it rather than covering for it.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the original wording")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        rows[0]["pattern"] = "the corrected wording"
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        node = next(
+            n
+            for n in feature.agent.storage.graph.nodes.values()
+            if n.node_type == PATTERN_NODE_TYPE
+        )
+        assert node.label == "the corrected wording", (
+            "the stored label is what /api/memories serves"
+        )
+
+        result = await feature.recall_patterns()
+        row = result.data["patterns"][0]
+        assert row["text"] == "the corrected wording"
+        assert row["label"] == "the corrected wording"
+        assert result.status.value == "ok"
+
+        assert result.status.value == "ok"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_label_repair_stays_visible(self, tmp_path):
+        """The repair can fail, and then the stale label is still out there.
+
+        /api/memories serves GraphNode.label directly, so a repair that did
+        not land leaves that consumer on obsolete text. Comparing only the
+        properties would certify the index clean over it. This is reportable
+        precisely because the projection can now fix it -- a reproject clears
+        it, so it is a divergence rather than a permanent alarm.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the original wording")
+        graph = feature.agent.storage.graph
+        node = next(
+            n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
+        )
+        # A pre-patch projection: properties moved on, the label did not.
+        node.properties["text"] = "the corrected wording"
+        rows = feature._ledger.data[PATTERNS_KEY]
+        rows[0]["pattern"] = "the corrected wording"
+        feature._ledger.save()
+        # ...and the repair cannot land.
+        graph._fail_on = PATTERN_NODE_TYPE
+        await feature._reindex_ledger()
+        assert graph.nodes[node.node_id].label == "the original wording"
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial", (
+            "a consumer is still being served the old wording"
+        )
+        assert result.data["drifted_count"] == 1
+
+        # And a successful reprojection clears it -- not a permanent alarm.
+        graph._fail_on = None
+        await feature._reindex_ledger()
+        assert (await feature.recall_patterns()).status.value == "ok"
+
+    @pytest.mark.asyncio
+    async def test_the_common_path_still_refuses_to_clobber(self, tmp_path):
+        """The label refresh must not become the ordinary write.
+
+        add_node is a whole-row upsert, so routing every projection through it
+        would silently retire the compare-and-swap that stops a concurrent
+        write being overwritten by the snapshot the projection read a moment
+        earlier. It is for the rare edit that moves the label, and nothing
+        else -- which needs pinning, because nothing pinned the CAS path
+        before this branch existed.
+        """
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="unchanged wording")
+        graph = feature.agent.storage.graph
+        node = next(
+            n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
+        )
+        original_get = graph.get_node
+
+        async def _stale_snapshot(node_id):
+            got = await original_get(node_id)
+            if got is None:
+                return got
+            # What the projection reads. A concurrent writer then moves the
+            # stored row on, so this snapshot is out of date by the time the
+            # write lands -- exactly what CAS exists to catch.
+            stale = GraphNode(
+                node_id=got.node_id,
+                node_type=got.node_type,
+                label=got.label,
+                properties=dict(got.properties or {}),
+            )
+            got.properties["origin"] = "a concurrent writer"
+            return stale
+
+        graph.get_node = _stale_snapshot
+
+        await feature._reindex_ledger()
+
+        # Read the STORE, not the reference captured above: add_node replaces
+        # the row with a new object, so a stale handle would still show the
+        # concurrent value and the assertion would pass either way.
+        stored = graph.nodes[node.node_id]
+        assert stored.properties.get("origin") == "a concurrent writer", (
+            "the concurrent value survived, so the write was conditional"
+        )
+        assert stored.properties["text"] == "unchanged wording"
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_fence_read_failing_names_that_cause(
+        self, tmp_path
+    ):
+        """A first-read failure is not a reprojection.
+
+        Reporting index_changed_during_read for a query that simply failed
+        sends an operator looking for a concurrent write that never happened.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an indexed observation")
+        graph = feature.agent.storage.graph
+        original = graph.query_nodes_by_type_and_property
+        state = {"membership_reads": 0}
+
+        async def _fail_first_membership(node_type, filters=None, **kwargs):
+            if kwargs.get("limit") == MEMBERSHIP_READ_CAP:
+                state["membership_reads"] += 1
+                if state["membership_reads"] == 1:
+                    raise RuntimeError("graph query refused")
+            return await original(node_type, filters=filters, **kwargs)
+
+        graph.query_nodes_by_type_and_property = _fail_first_membership
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert result.data["completeness_unchecked_reason"] == (
+            "index_membership_unavailable"
+        ), "the first read failed; nothing observed a reprojection"
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_membership_read_is_not_a_complete_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A capped read cannot be told apart from a whole one.
+
+        query_nodes_by_type_and_property clamps its limit, so a projection
+        larger than the cap comes back looking exactly like a small complete
+        one -- and every row past the cap would read as missing.
+        """
+        from kestrel_sovereign.features.strategic_memory import ledger_index
+
+        feature = await _feature(tmp_path)
+        for n in range(2):
+            await feature.strategy_add_pattern(pattern=f"observation {n}")
+        monkeypatch.setattr(ledger_index, "MEMBERSHIP_READ_CAP", 1)
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial", (
+            "the rows are a real answer, but the caveat belongs in status and "
+            "error -- parked in data it is narrated as a clean confirmation"
+        )
+        assert "was not checked" in (result.error or "")
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == (
+            "index_exceeds_membership_cap"
+        )
+        assert "index_stale" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_a_hand_written_node_is_not_this_projections_orphan(
+        self, tmp_path
+    ):
+        """Membership describes what THIS projection wrote, nothing else.
+
+        recall_nodes already filters on source so a hand-written node of the
+        same type stays out of an answer claiming to describe the ledger. The
+        membership read has to apply the same boundary, or someone else's node
+        becomes a permanent orphan this feature reports and cannot fix.
+        """
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a real observation")
+        graph = feature.agent.storage.graph
+        node_id = f"{PATTERN_NODE_TYPE}:{AGENT}:hand_written"
+        graph.nodes[node_id] = GraphNode(
+            node_id=node_id,
+            node_type=PATTERN_NODE_TYPE,
+            label="not ours",
+            properties={
+                "agent_id": AGENT,
+                "row_id": "hand_written",
+                "status": "active",
+                "source": "some_other_writer",
+            },
+        )
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 1, "and it is not in the answer either"
+        assert "orphaned_count" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_membership_query_names_the_unrun_check(
+        self, tmp_path
+    ):
+        """A failed membership read is not agreement, and not a failed recall.
+
+        The rows already returned are a real answer; only the check could not
+        run, and it says which.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an indexed observation")
+        graph = feature.agent.storage.graph
+        original = graph.query_nodes_by_type_and_property
+
+        async def _refuse_membership(node_type, filters=None, **kwargs):
+            # Discriminate on the cap, not on the absence of a status filter:
+            # include_superseded=True also omits status, so that reading would
+            # make the double refuse the page read as well.
+            if kwargs.get("limit") == MEMBERSHIP_READ_CAP:
+                raise RuntimeError("graph query refused")
+            return await original(node_type, filters=filters, **kwargs)
+
+        graph.query_nodes_by_type_and_property = _refuse_membership
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert "was not checked" in (result.error or "")
+        assert result.data["count"] == 1
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == (
+            "index_membership_unavailable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_ledger_names_the_unrun_check(self, tmp_path):
+        """No trustworthy baseline means the check cannot run -- and says so."""
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an indexed observation")
+        # The real path: the index is already projected, then the canonical
+        # file is corrupted underneath it and reloaded. Setting the flag by
+        # hand would test the flag.
+        (tmp_path / LEDGER_FILENAME).write_text(
+            "patterns_learned: [unclosed\n", encoding="utf-8"
+        )
+        feature._ledger.load()
+        assert not feature._ledger.readable
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert "was not checked" in (result.error or "")
+        assert result.data["count"] == 1
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == "ledger_unreadable"
+
+    @pytest.mark.asyncio
+    async def test_a_text_less_row_is_not_reported_missing_forever(self, tmp_path):
+        """The projection skips rows with no text; the check must skip them too.
+
+        Otherwise every recall reports a permanent staleness no reprojection
+        can clear.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a real observation")
+        # ``patterns`` is a property that builds a fresh list, so appending to
+        # it changes nothing. Write through ``data``, which is the ledger.
+        feature._ledger.data[PATTERNS_KEY].append(
+            {"id": "pat_blank", "pattern": "   "}
+        )
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 1
+        assert result.data["completeness_checked"] is True
 
     @pytest.mark.asyncio
     async def test_a_genuinely_empty_ledger_recalls_cleanly(self, tmp_path):
@@ -1519,6 +2388,44 @@ class TestRecallLimitIsNotUnderReported:
             assert all(
                 r["text"].startswith("still true") for r in result.data["patterns"]
             )
+        finally:
+            await database.close()
+
+    @pytest.mark.asyncio
+    async def test_the_label_really_is_updated_by_the_real_store(self, tmp_path):
+        """The double was missing add_node entirely until #3064.
+
+        Its absence made a projection change that called it look like it
+        worked: the call raised AttributeError, the projection's broad except
+        counted a failed write, and the assertions still passed. So this one
+        runs against AsyncGraphStore, where the whole-row upsert is the real
+        one and the label column is really rewritten.
+        """
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
+        try:
+            feature = await _feature(
+                tmp_path, graph=AsyncGraphStore(database)
+            )
+            await feature.strategy_add_pattern(pattern="the original wording")
+            rows = feature._ledger.data[PATTERNS_KEY]
+            row_id = rows[0]["id"]
+            rows[0]["pattern"] = "the corrected wording"
+            feature._ledger.save()
+            await feature._reindex_ledger()
+
+            node = await feature.agent.storage.graph.get_node(
+                ledger_node_id(PATTERN_NODE_TYPE, AGENT, row_id)
+            )
+            assert node is not None
+            assert node.label == "the corrected wording"
+            assert node.properties["text"] == "the corrected wording"
+
+            result = await feature.recall_patterns()
+            assert result.data["patterns"][0]["text"] == "the corrected wording"
+            assert result.status.value == "ok"
         finally:
             await database.close()
 
