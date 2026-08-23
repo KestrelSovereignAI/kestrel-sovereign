@@ -1302,6 +1302,8 @@ def test_a_repair_whose_last_pass_failed_is_still_judged_by_where_core_is(
     assert "RESTORE FAILED" not in err
     assert len(venv.commands) == 2  # both passes ran...
     assert venv.editable.get(CORE) is None  # ...and core is the declared wheel
+    assert venv.installed[CORE] == "0.52.0"
+    assert guard.verify() == 0  # nothing left to report on a second look
 
 
 def test_a_repair_whose_dependency_resolve_refused_is_not_reported_as_clean(
@@ -1320,7 +1322,7 @@ def test_a_repair_whose_dependency_resolve_refused_is_not_reported_as_clean(
     it before the conflict is fixed changes nothing.
     """
     venv, guard = _pypi_core_guard(
-        monkeypatch, repair_resolve_refused=True, core_version="0.51.0",
+        monkeypatch, core_resolve_refused=True, core_version="0.51.0",
     )
     monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
 
@@ -1362,8 +1364,102 @@ def test_a_repair_killed_by_its_bound_is_still_judged_by_where_core_is(
     assert venv.editable.get(CORE) is None  # the write landed before the kill
     assert outcome.repaired is True
     assert outcome.unresolved is False
-    assert venv.installed[CORE] == "0.52.0"
-    assert guard.verify() == 0  # nothing left to report on a second look
+
+
+def test_a_core_switch_whose_dependencies_do_not_resolve_is_not_continuable(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A DELIBERATE core move can hit the same wall, and must not be waved through.
+
+    `install_core` is the operator moving core's source on purpose, so the guard
+    refreshes to whatever core became and `conforms_now()` is True — core IS the
+    declared install. That answers where core is and says nothing about whether
+    the host can load it. Left as the generic package `1`, `kestrel update
+    --continue-on-error` ignores it by contract and restarts every agent onto a
+    core whose dependencies were just found unsatisfiable (#3047).
+
+    The remaining manifest entries are skipped for the same reason a failed
+    source transition skips them: installing features against a core that cannot
+    load is what produces a venv no single step reports as broken.
+    """
+    from kestrel_sovereign.cli_features import CORE_UNRESOLVED, core_state_refusal
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    venv = FakeUv(core_resolve_refused=True, feature_requires=">=0.52")
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    # Core did move to its declared source — this is not a drift.
+    assert venv.editable.get(CORE) is None
+    assert rc == CORE_UNRESOLVED
+    # Non-continuable, and it says which of the three core states it is.
+    assert core_state_refusal(rc) is not None
+    assert "dependencies do not resolve" in out
+    # The rest of the batch did not run against it.
+    assert "kestrel-feature-voice" not in venv.installed
+
+
+def test_only_the_closing_pass_of_a_multi_pass_install_is_a_refused_resolve():
+    """Position, not argv shape — asserted on every axis it turns on.
+
+    The closing pass of a pip source switch and the only pass of an ordinary
+    install are the SAME command, so reading the argv called every failed
+    install a refused resolve. What separates them is that one ran after two
+    passes had already changed the environment.
+    """
+    import subprocess as sp
+
+    from kestrel_sovereign.cli_features import InstallSequenceResult
+
+    def result(returncode, index, total):
+        return InstallSequenceResult(
+            sp.CompletedProcess(["pip", "install", "pkg"], returncode),
+            index=index,
+            total=total,
+        )
+
+    # The pip switch's third pass: the artifact is already written, and this is
+    # the pass that resolves what it declares.
+    assert result(1, 2, 3).resolve_refused is True
+    # The `--no-deps` pass: it resolves nothing, so its failure says nothing.
+    assert result(1, 1, 3).resolve_refused is False
+    # The opening resolve: it failed before anything moved — an ordinary
+    # failure over an environment still intact.
+    assert result(1, 0, 3).resolve_refused is False
+    # A single-command install (uv's scoped switch, or any ordinary install).
+    assert result(1, 0, 1).resolve_refused is False
+    # Success is not a refusal.
+    assert result(0, 2, 3).resolve_refused is False
+
+
+def test_an_ordinary_failed_feature_install_stays_continuable(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A feature that would not build is what `--continue-on-error` is FOR.
+
+    The core states added for #3047 must not widen that flag's contract by
+    catching ordinary package failures on their way past.
+    """
+    from kestrel_sovereign.cli_features import core_state_refusal
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = FakeUv(feature_install_fails=True, feature_requires=">=0.52")
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 1                              # an ordinary package failure...
+    assert core_state_refusal(rc) is None       # ...and continuable as one
+    assert venv.editable[CORE] == CHECKOUT      # core untouched throughout
 
 
 def test_repair_displaces_a_non_editable_direct_url_core_at_a_satisfying_version(

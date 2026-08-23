@@ -79,7 +79,7 @@ class FakeUv:
     core was already home, so its exit status describes the installer and not
     the venv. ``repair_last_pass_fails=True``: pip's scoped repair is two
     passes and the first one restores core, so a failure in the second is a
-    nonzero exit over a conforming core. ``repair_resolve_refused=True`` is its
+    nonzero exit over a conforming core. ``core_resolve_refused=True`` is its
     opposite number: pip's LAST pass resolves the dependencies of the artifact
     the ``--no-deps`` pass installed, so a refusal there is also a nonzero exit
     over a conforming core — but this one means the host cannot load what it
@@ -106,7 +106,7 @@ class FakeUv:
         repair_noops=False,
         repair_hangs=False,
         repair_last_pass_fails=False,
-        repair_resolve_refused=False,
+        core_resolve_refused=False,
         repair_hangs_after_restore=False,
         feature_install_fails=False,
         feature_install_times_out=False,
@@ -141,7 +141,7 @@ class FakeUv:
         self.repair_noops = repair_noops
         self.repair_hangs = repair_hangs
         self.repair_last_pass_fails = repair_last_pass_fails
-        self.repair_resolve_refused = repair_resolve_refused
+        self.core_resolve_refused = core_resolve_refused
         self.repair_hangs_after_restore = repair_hangs_after_restore
         self.feature_install_fails = feature_install_fails
         self.feature_install_times_out = feature_install_times_out
@@ -411,7 +411,7 @@ class FakeUv:
             # left core exactly where it was.
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if (
-            self.repair_resolve_refused
+            self.core_resolve_refused
             and "--no-deps" not in cmd
             and "--upgrade" not in cmd
             and "--reinstall-package" not in cmd
