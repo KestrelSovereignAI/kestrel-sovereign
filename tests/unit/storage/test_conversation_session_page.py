@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+from uuid import uuid4
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -52,6 +54,39 @@ from kestrel_sovereign.storage.session_grouping import (
 )
 
 AGENT = "did:test:session-page"
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+async def sqlite_or_postgres(request, tmp_path):
+    """``(db, agent)`` on both engines, because this claim is engine-dependent.
+
+    The watermark epoch is written by a statement whose INSERT path runs on one
+    backend and whose conflict path runs on the other, so a single-engine
+    fixture proves it for whichever engine happens to work.
+
+    The agent id is unique per run, and that is not tidiness. A PostgreSQL
+    database is reused between runs, so a fixed id inherits the previous run's
+    watermark — the repair then finds nothing stale, writes nothing, and the
+    test reads back an epoch some earlier build wrote. Measured: a mutant that
+    disabled the epoch entirely still passed here, on state it had not created.
+    """
+    agent = f"{AGENT}-{uuid4()}"
+    if request.param == "postgres":
+        url = os.environ.get("TEST_POSTGRES_URL")
+        if not url:
+            pytest.skip("TEST_POSTGRES_URL is not set")
+        db = await AsyncDatabase.postgres(url)
+    else:
+        db = await AsyncDatabase.sqlite(str(tmp_path / "either.db"))
+    try:
+        yield db, agent
+    finally:
+        try:
+            await db.execute(
+                "DELETE FROM conversation_history WHERE agent_id = ?", (agent,)
+            )
+        finally:
+            await db.close()
 START = datetime(2026, 5, 1, 9, 0, 0)
 
 
@@ -682,6 +717,100 @@ def test_a_cursor_key_the_store_cannot_hold_is_refused(session_id):
     ).decode().rstrip("=")
     with pytest.raises(SessionCursorError):
         decode_session_cursor(token, "active")
+
+
+@pytest.mark.asyncio
+async def test_the_watermark_epoch_is_set_on_every_backend(tmp_path, sqlite_or_postgres):
+    """The epoch has to be written where the ROW is actually created.
+
+    On PostgreSQL it is not this statement that creates it: ``_claim()`` inserts
+    the row first, as a thing to lock, so ``_record``'s INSERT always takes the
+    conflict path. An insert-only epoch was therefore empty for every agent on
+    PostgreSQL — the fence degenerated to the revision alone on the backend that
+    matters most — while a SQLite check said it worked, because ``_claim()`` is
+    a no-op there.
+    """
+    db, agent = sqlite_or_postgres
+    await db.execute(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at) "
+        "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+        (agent,),
+    )
+    projection = ConversationSessionProjection(db, agent)
+    await projection.repair()
+
+    first = await projection.accounted()
+    assert first.epoch, "the watermark was written with no epoch at all"
+
+    # Set ONCE: a later write must not move it, or it would be a second
+    # revision counter answering the question the first one answers.
+    await projection.repair()
+    await db.execute(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at) "
+        "VALUES (?, 'user', 'again', '{}', '2026-05-01 11:00:00')",
+        (agent,),
+    )
+    await projection.repair()
+    later = await projection.accounted()
+    assert later.epoch == first.epoch, "the epoch moved while its row lived"
+    assert later.revision > first.revision, "...and the counter did not move"
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_cache_is_invalidated_even_with_no_ledger_row(tmp_path):
+    """Rotating the generation can match no rows, and then it claims nothing.
+
+    An agent whose projection was built before the triggers existed, or restored
+    with one table and not the other, has a watermark and no slot-0 ledger row.
+    Its generation is ``''`` and its stamp is 0 — exactly what a MISSING ledger
+    reads back as — so the numbers agree, ``is_stale()`` answers false, and a
+    freshly emptied cache is served for ever beside intact history.
+    """
+    path = str(tmp_path / "no-ledger.db")
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+            (AGENT,),
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        # The state this is about, built exactly: a watermark recorded when
+        # there was no ledger to compare against — generation '' and stamp 0,
+        # which is precisely what a MISSING ledger row reads back as. That
+        # coincidence is the bug; a watermark with a non-zero stamp would be
+        # detected as stale by ordinary arithmetic and prove nothing here.
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+        await db.execute(
+            "UPDATE conversation_session_watermarks "
+            "SET accounted_generation = '', accounted_stamp = 0, "
+            "accounted_appends = 0 WHERE agent_id = ?",
+            (AGENT,),
+        )
+        assert not await projection.is_stale(), (
+            "the case only means something while the projection reports itself "
+            "CURRENT — that is the coincidence being defended against"
+        )
+        await db.execute("DROP TABLE conversation_sessions")
+    finally:
+        await db.close()
+
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        projection = ConversationSessionProjection(db, AGENT)
+        assert await projection.is_stale(), (
+            "an emptied cache reported itself current with no ledger to rotate"
+        )
+        await projection.repair()
+        assert [r["session_id"] for r in await projection.list()] == ["1"]
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

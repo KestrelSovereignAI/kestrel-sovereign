@@ -2047,6 +2047,7 @@ class AsyncDatabase:
             mutation_trigger_functions,
             mutation_triggers,
             NON_NULL_PROJECTION_COLUMNS,
+            emptied_cache_invalidation,
             WATERMARK_EPOCH_COLUMN,
             WATERMARK_REVISION_COLUMN,
             projection_tables,
@@ -2141,14 +2142,23 @@ class AsyncDatabase:
                         if table == "conversation_sessions":
                             emptied_the_cache = True
                 if emptied_the_cache:
+                    # Two statements, because one of them can match no rows.
+                    #
                     # Rotating the generation is the mechanism already written
                     # for "the shape moved": both `is_stale` and `_plan` read a
                     # changed generation as counters belonging to a different
                     # incarnation, and answer REBUILD — including for a repair
-                    # already in flight, whose publish fence re-reads it.
+                    # already in flight, whose publish fence re-reads it. But it
+                    # updates the LEDGER, and an agent can have a watermark with
+                    # no ledger row at all (a projection built before the
+                    # triggers existed, a restore that carried one table and not
+                    # the other). Its generation is '' and its stamp is 0, which
+                    # is precisely what a missing ledger reads back as, so the
+                    # rotation touches nothing and the numbers go on agreeing.
                     await self._backend.execute(
                         shape_change_invalidation(self.backend_type)
                     )
+                    await self._backend.execute(emptied_cache_invalidation())
                     logger.info(
                         "conversation_sessions is empty; every agent's "
                         "projection will be derived again (#2960)"
