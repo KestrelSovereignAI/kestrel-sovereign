@@ -3371,14 +3371,10 @@ def test_hosted_prebuilt_missing_console_names_selecting_venv_setting(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX console custody contract")
-@pytest.mark.parametrize(
-    ("mode", "case"),
-    ((0o720, "group-writable"), (0o600, "non-executable")),
-)
-def test_hosted_prebuilt_console_rejects_unsafe_target_mode(
+@pytest.mark.parametrize("case", ("group-writable", "non-executable", "escape"))
+def test_hosted_prebuilt_console_rejects_unsafe_or_escaping_target(
     monkeypatch,
     tmp_path,
-    mode,
     case,
 ):
     prebuilt = tmp_path / f"operator-console-{case}"
@@ -3390,19 +3386,40 @@ def test_hosted_prebuilt_console_rejects_unsafe_target_mode(
         prebuilt,
         _isolated_runtime().service,
     )
-    wrapper.chmod(mode)
+    outside_target = None
+    if case == "group-writable":
+        wrapper.chmod(0o720)
+    elif case == "non-executable":
+        wrapper.chmod(0o600)
+    else:
+        outside_parent = tmp_path / "world-writable-shared-bin"
+        outside_parent.mkdir(mode=0o700)
+        outside_parent.chmod(0o777)
+        outside_target = outside_parent / "secure-looking-service"
+        outside_target.write_bytes(wrapper.read_bytes())
+        outside_target.chmod(0o700)
+        wrapper.unlink()
+        wrapper.symlink_to(outside_target)
     key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
     monkeypatch.setenv(key, str(prebuilt))
+    client_factory = Mock(side_effect=AssertionError("unsafe child was launched"))
     feature = ProxyFeature(
         _hosted_postgres_agent(tmp_path / "runtime", f"console-{case}"),
         _isolated_runtime(),
-        client_factory=FakeIsolatedClient,
+        client_factory=client_factory,
     )
     feature._prepare_runtime_workspace()
     feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._verify_launch_artifact = Mock(
+        side_effect=AssertionError("unsafe console reached artifact probe")
+    )
     feature._verify_prebuilt_feature_distribution = Mock(
         side_effect=AssertionError("unsafe console reached distribution probe")
     )
+    feature._warn_on_sdk_mismatch = Mock(
+        side_effect=AssertionError("unsafe console reached SDK probe")
+    )
+    feature._run = Mock(side_effect=AssertionError("unsafe console was provisioned"))
 
     with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
         feature.ensure_venv()
@@ -3410,8 +3427,15 @@ def test_hosted_prebuilt_console_rejects_unsafe_target_mode(
     diagnostic = raised.value.safe_diagnostic()
     assert key in diagnostic
     assert str(prebuilt) not in diagnostic
+    assert "world-writable-shared-bin" not in diagnostic
+    feature._verify_launch_artifact.assert_not_called()
     feature._verify_prebuilt_feature_distribution.assert_not_called()
+    feature._warn_on_sdk_mismatch.assert_not_called()
+    feature._run.assert_not_called()
+    client_factory.assert_not_called()
     assert feature._validated_hosted_console_path is None
+    if outside_target is not None:
+        assert outside_target.read_bytes().startswith(b"#!")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX console custody contract")

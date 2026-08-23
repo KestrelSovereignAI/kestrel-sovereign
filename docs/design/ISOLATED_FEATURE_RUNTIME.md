@@ -319,9 +319,11 @@ directory, resolved interpreter target, and exact console wrapper target to be
 owned by root or the service account and not group/world writable. Interpreter
 and console targets must be regular executables. Secure operator-facing venv,
 configuration, interpreter, and console-wrapper symlinks remain supported and
-resolve to canonical artifacts before use. Core launches the pinned console
-target it validated, so replacing the public wrapper symlink cannot redirect a
-prepared feature.
+resolve to canonical artifacts before use. A resolved console target must stay
+within the already validated venv bin directory; executables outside that
+boundary require the explicit `..._BIN` contract. Core launches the pinned
+in-bin console target it validated, so replacing the public wrapper symlink
+cannot redirect a prepared feature.
 Core never creates, upgrades, or stamps a process-wide override. The validated
 operator-selected artifact may be shared, but every child process and mutable
 workspace/cache/state path remains namespace-distinct.

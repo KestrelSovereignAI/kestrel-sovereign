@@ -4959,12 +4959,20 @@ def _hosted_immutable_metadata_is_unsafe(metadata: os.stat_result) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _ValidatedHostedPrebuiltVenv:
+    """Canonical root and bin directory proven safe for immutable use."""
+
+    root_path: Path
+    bin_path: Path
+
+
 def _validate_hosted_prebuilt_venv(
     value: str,
     *,
     setting: str,
     require_absolute: bool,
-) -> Path:
+) -> _ValidatedHostedPrebuiltVenv:
     """Resolve and validate one immutable hosted venv selection.
 
     ``runtime.venv`` comes from installed package metadata.  Unlike a
@@ -5011,11 +5019,19 @@ def _validate_hosted_prebuilt_venv(
         or (os.name == "posix" and not os.access(python_path, os.X_OK))
     ):
         raise _hosted_prebuilt_override_error(setting)
-    return venv_path
+    return _ValidatedHostedPrebuiltVenv(
+        root_path=venv_path,
+        bin_path=bin_path,
+    )
 
 
-def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
-    """Pin one hosted BIN symlink chain to its validated immutable target.
+def _validate_hosted_prebuilt_executable(
+    value: str,
+    *,
+    setting: str,
+    containment_root: Optional[Path] = None,
+) -> Path:
+    """Pin one executable after optional canonical containment validation.
 
     The returned canonical target is the only path the caller may publish or
     launch. A later replacement of the operator-facing symlink therefore
@@ -5028,6 +5044,11 @@ def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
         candidate = Path(value).expanduser()
         absolute = Path(os.path.abspath(candidate))
         resolved = absolute.resolve(strict=True)
+        if (
+            containment_root is not None
+            and containment_root not in resolved.parents
+        ):
+            raise ValueError("hosted prebuilt executable escaped containment")
         metadata = resolved.stat(follow_symlinks=False)
     except (OSError, RuntimeError, TypeError, ValueError):
         raise _hosted_prebuilt_override_error(setting) from None
@@ -5039,17 +5060,26 @@ def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
     return resolved
 
 
+def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
+    """Pin one hosted BIN symlink chain to its immutable executable target."""
+
+    return _validate_hosted_prebuilt_executable(value, setting=setting)
+
+
 def _validate_hosted_prebuilt_console(
     venv_path: Path,
+    venv_bin_path: Path,
     service: str,
     *,
     setting: str,
 ) -> Path:
-    """Pin the exact immutable console target selected inside a hosted venv."""
+    """Pin one immutable console target contained by its validated venv bin."""
 
-    return _validate_hosted_prebuilt_bin(
-        str(_console_script_path(venv_path, service)),
+    script_name = _console_script_path(venv_path, service).name
+    return _validate_hosted_prebuilt_executable(
+        str(venv_bin_path / script_name),
         setting=setting,
+        containment_root=venv_bin_path,
     )
 
 
@@ -5058,6 +5088,7 @@ class _ValidatedHostedPrebuiltOverrides:
     """Canonical immutable artifacts selected by hosted operator settings."""
 
     venv_path: Optional[Path]
+    venv_bin_path: Optional[Path]
     bin_path: Optional[Path]
 
 
@@ -5077,7 +5108,7 @@ def _validate_hosted_process_prebuilt_overrides(
 
     venv_key = _env_key(feature_name, "VENV")
     venv_value = os.environ.get(venv_key)
-    validated_process_venv: Optional[Path] = None
+    validated_process_venv: Optional[_ValidatedHostedPrebuiltVenv] = None
     if venv_value:
         validated_process_venv = _validate_hosted_prebuilt_venv(
             venv_value,
@@ -5085,7 +5116,7 @@ def _validate_hosted_process_prebuilt_overrides(
             require_absolute=False,
         )
 
-    validated_runtime_venv: Optional[Path] = None
+    validated_runtime_venv: Optional[_ValidatedHostedPrebuiltVenv] = None
     if runtime_venv is not None:
         if type(runtime_venv) is not str or not runtime_venv:
             raise _hosted_prebuilt_override_error(_HOSTED_RUNTIME_VENV_SETTING)
@@ -5095,16 +5126,24 @@ def _validate_hosted_process_prebuilt_overrides(
             require_absolute=True,
         )
     selected_venv = validated_process_venv or validated_runtime_venv
+    selected_venv_path = (
+        selected_venv.root_path if selected_venv is not None else None
+    )
+    selected_venv_bin_path = (
+        selected_venv.bin_path if selected_venv is not None else None
+    )
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
     if bin_value:
         return _ValidatedHostedPrebuiltOverrides(
-            venv_path=selected_venv,
+            venv_path=selected_venv_path,
+            venv_bin_path=selected_venv_bin_path,
             bin_path=_validate_hosted_prebuilt_bin(bin_value, setting=bin_key),
         )
     return _ValidatedHostedPrebuiltOverrides(
-        venv_path=selected_venv,
+        venv_path=selected_venv_path,
+        venv_bin_path=selected_venv_bin_path,
         bin_path=None,
     )
 
@@ -10666,8 +10705,10 @@ class ProxyFeature(Feature):
                     # missing, mutable, foreign, or relocated artifacts must
                     # name the VENV setting that the operator needs to repair.
                     assert target.console_executable is not None
+                    assert validated_overrides.venv_bin_path is not None
                     validated_console_path = _validate_hosted_prebuilt_console(
                         self._venv_path,
+                        validated_overrides.venv_bin_path,
                         target.console_executable,
                         setting=hosted_immutable_setting,
                     )
