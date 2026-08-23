@@ -1349,6 +1349,66 @@ class TestTheIndexHasAConsumer:
         assert "index_stale" not in result.data
 
     @pytest.mark.asyncio
+    async def test_a_blocker_reopened_by_hand_is_not_a_clean_zero(self, tmp_path):
+        """Whether the INDEX may retire a row is a property of the section.
+
+        A pattern node may carry a graph-owned supersession the ledger is
+        silent about. A blocker's status is a pure function of the ledger's
+        resolved_at, so the same shape there is a projection that has not
+        landed -- and an operator reopening a blocker by editing YAML would
+        otherwise get a certified-clean empty list over an active blocker.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_blocker(
+            issue="owner/repo#42", title="CI runner is wedged", severity="high"
+        )
+        row_id = feature._ledger.data[BLOCKERS_KEY][0]["id"]
+        await feature.strategy_resolve_blocker(issue=row_id, resolution="fixed")
+        # Reopened by hand, and the reprojection cannot land.
+        feature.agent.storage.graph._fail_on = BLOCKER_NODE_TYPE
+        for row in feature._ledger.data[BLOCKERS_KEY]:
+            row.pop("resolved_at", None)
+            row.pop("resolution", None)
+        feature._ledger.save()
+
+        result = await feature.recall_blockers()
+
+        assert result.data["count"] == 0
+        assert result.data["canonical_expected"] == 1
+        assert result.status.value == "partial", (
+            "an empty list over an active blocker is the original bug shape"
+        )
+        assert result.data["misfiled_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_two_canonical_rows_on_one_id_are_reported(self, tmp_path):
+        """A set of ids hides multiplicity; the ledger is hand-editable.
+
+        Both rows project to the same node, the second overwrites the first,
+        and one canonical row is unreachable however healthy the projection
+        is. Reprojecting cannot fix it, so the message must not tell the
+        caller to restart and expect a different result.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        duplicate = dict(rows[0])
+        duplicate["pattern"] = "a genuinely different observation"
+        rows.append(duplicate)
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.data["canonical_expected"] == 2, (
+            "two rows are two rows, whatever ids they carry"
+        )
+        assert result.data["count"] == 1
+        assert result.status.value == "partial"
+        assert result.data["colliding_count"] == 1
+        assert "duplicate ids" in (result.error or "")
+
+    @pytest.mark.asyncio
     async def test_a_saturated_membership_read_is_not_a_complete_one(
         self, tmp_path, monkeypatch
     ):

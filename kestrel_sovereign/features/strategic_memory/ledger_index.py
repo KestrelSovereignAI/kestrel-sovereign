@@ -146,6 +146,16 @@ class LedgerSection:
     minter: Callable[[Dict[str, Any]], str]
     is_active: Callable[[Dict[str, Any]], bool]
     properties: Callable[[str, Dict[str, Any]], Dict[str, Any]]
+    #: Whether the INDEX may hold a retirement the ledger does not.
+    #:
+    #: True for patterns: :data:`_GRAPH_OWNED_PROPERTIES` is carried across for
+    #: rows the ledger is silent about, so a node marked superseded beside an
+    #: unsuperseded YAML row is the documented design and reprojection keeps it
+    #: that way. False for blockers, whose ``status`` is a pure function of the
+    #: ledger's ``resolved_at`` -- there, the same shape is a projection that
+    #: has not landed, and an operator reopening a blocker by hand would
+    #: otherwise get a certified-clean empty recall (#3064).
+    graph_may_retire: bool
 
     def rows(self, ledger_data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return _dict_rows(ledger_data, self.ledger_key)
@@ -181,12 +191,29 @@ class LedgerSection:
     def expected_row_ids(
         self, ledger_data: Optional[Dict[str, Any]], *, include_retired: bool
     ) -> Set[str]:
-        return {
+        return set(
+            self.expected_row_id_list(
+                ledger_data, include_retired=include_retired
+            )
+        )
+
+    def expected_row_id_list(
+        self, ledger_data: Optional[Dict[str, Any]], *, include_retired: bool
+    ) -> List[str]:
+        """The ids as a LIST, so a caller can see multiplicity.
+
+        The ledger is hand-editable and ``normalize`` only disambiguates ids it
+        mints, so two rows can end up sharing one. Both then project to the
+        same node and the second overwrites the first -- a set of ids hides
+        that entirely, and the index reports itself complete while one
+        canonical row is unreachable (#3064).
+        """
+        return [
             self.row_id(row)
             for row in self.expected_rows(
                 ledger_data, include_retired=include_retired
             )
-        }
+        ]
 
 
 PATTERN_SECTION = LedgerSection(
@@ -198,6 +225,7 @@ PATTERN_SECTION = LedgerSection(
     minter=pattern_row_id,
     is_active=is_active_pattern,
     properties=_pattern_properties,
+    graph_may_retire=True,
 )
 
 BLOCKER_SECTION = LedgerSection(
@@ -209,6 +237,7 @@ BLOCKER_SECTION = LedgerSection(
     minter=blocker_row_id,
     is_active=is_active_blocker,
     properties=_blocker_properties,
+    graph_may_retire=False,
 )
 
 

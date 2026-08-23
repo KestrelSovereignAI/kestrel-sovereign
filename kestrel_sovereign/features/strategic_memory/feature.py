@@ -1152,30 +1152,39 @@ class StrategicMemoryFeature(Feature):
         ledger_data = self._ledger.data
         # Membership is status-agnostic: whether a row is retired decides which
         # PAGE it belongs on, not whether the index should hold a node for it.
-        ledger_all = section.expected_row_ids(ledger_data, include_retired=True)
+        all_ids = section.expected_row_id_list(ledger_data, include_retired=True)
+        ledger_all = set(all_ids)
         ledger_active = section.expected_row_ids(ledger_data, include_retired=False)
         indexed = set(membership)
+        # Rows, not ids: two canonical rows sharing an id are two rows, and
+        # counting the set would under-report the ledger to the caller.
         data["canonical_expected"] = len(
-            section.expected_row_ids(ledger_data, include_retired=include_retired)
+            section.expected_rows(ledger_data, include_retired=include_retired)
         )
         data["completeness_checked"] = True
 
         missing = ledger_all - indexed
         orphaned = indexed - ledger_all
-        # Active in the index while the canonical file has retired it. The
-        # REVERSE -- retired in the index while the ledger is silent -- is the
-        # projection's documented graph-owned supersession, which reprojection
-        # deliberately preserves. Calling that a divergence would report a
-        # permanent staleness no restart could ever clear.
-        misfiled = {
-            row_id
-            for row_id, status in membership.items()
-            if status == ACTIVE_STATUS
-            and row_id in ledger_all
-            and row_id not in ledger_active
-        }
+        # Two canonical rows on one id project to one node, so the second
+        # overwrites the first and one row is unreachable however healthy the
+        # projection is. Counted separately because reprojecting cannot fix it.
+        colliding = len(all_ids) - len(ledger_all)
+        misfiled = set()
+        for row_id, status in membership.items():
+            if row_id not in ledger_all:
+                continue  # an orphan, already counted
+            indexed_current = status == ACTIVE_STATUS
+            ledger_current = row_id in ledger_active
+            if indexed_current == ledger_current:
+                continue
+            if not indexed_current and ledger_current and section.graph_may_retire:
+                # The projection's documented graph-owned supersession, which
+                # reprojection deliberately preserves. Calling it a divergence
+                # would report a staleness no restart could ever clear.
+                continue
+            misfiled.add(row_id)
 
-        if not (missing or orphaned or misfiled):
+        if not (missing or orphaned or misfiled or colliding):
             return ToolResult.ok(confirmation=confirmation, data=data)
 
         data["index_stale"] = True
@@ -1195,8 +1204,15 @@ class StrategicMemoryFeature(Feature):
         if misfiled:
             data["misfiled_count"] = len(misfiled)
             divergences.append(
-                f"{len(misfiled)} row(s) it still marks current were retired "
-                f"in {LEDGER_FILENAME}"
+                f"{len(misfiled)} row(s) whose current/retired state it "
+                f"disagrees with {LEDGER_FILENAME} on"
+            )
+        if colliding:
+            data["colliding_count"] = colliding
+            divergences.append(
+                f"{colliding} canonical row(s) share an id with another, so "
+                "the index can hold only one of each -- reprojecting cannot "
+                f"fix that, {LEDGER_FILENAME} needs the duplicate ids resolved"
             )
         fallback = "strategy_search"
         if include_retired:
