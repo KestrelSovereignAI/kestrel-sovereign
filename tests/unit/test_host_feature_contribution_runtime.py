@@ -455,3 +455,37 @@ def test_a_healthy_payload_keeps_its_boolean():
     )
 
     assert payload["overall_healthy"] is True
+
+
+def test_a_non_string_backend_error_is_not_an_outage():
+    """`str()` of any object is truthy, so coercion would invent a failure.
+
+    Found by the suite, not by this file: `app.state` is a module singleton
+    and an earlier test leaves a stand-in host context on it, whose every
+    attribute answers. Coercing that attribute reported a host backend outage
+    naming the stand-in's repr — a surface built to stop health lying, lying.
+    """
+    from unittest.mock import MagicMock
+
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    class _State:
+        host_context = MagicMock()
+
+    payload = _with_host_feature_rejections(
+        _State(), {"status": "healthy", "overall_healthy": True}
+    )
+
+    assert payload == {"status": "healthy", "overall_healthy": True}
+
+
+def test_a_whitespace_backend_error_is_not_an_outage():
+    """Nor is a field that exists and says nothing."""
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    class _State:
+        host_context = SovereignHostContext(backend_error="   ")
+
+    payload = _with_host_feature_rejections(_State(), {"status": "healthy"})
+
+    assert payload == {"status": "healthy"}
