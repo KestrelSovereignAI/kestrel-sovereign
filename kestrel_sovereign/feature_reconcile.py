@@ -532,6 +532,86 @@ def version_is_valid(version: Optional[str]) -> bool:
         return False
 
 
+def requested_extras(package_spec: str) -> Tuple[str, ...]:
+    """The extras named in a spec like ``pkg[voice,web]>=1.2``."""
+    if "[" not in package_spec or "]" not in package_spec:
+        return ()
+    inside = package_spec.split("[", 1)[1].split("]", 1)[0]
+    return tuple(part.strip() for part in inside.split(",") if part.strip())
+
+
+def requirement_applies(req, extras: Tuple[str, ...]) -> bool:
+    """Whether *req* is active for this interpreter and these extras.
+
+    An unmarked requirement always applies. A marked one applies if it
+    evaluates true in the base environment or under any extra the caller
+    requested — `packaging` evaluates ``extra == "x"`` to False when no extra is
+    supplied, so the base environment alone would silently drop every
+    extra-gated requirement.
+    """
+    if req.marker is None:
+        return True
+    for env in ({}, *({"extra": extra} for extra in extras)):
+        try:
+            if req.marker.evaluate(env):
+                return True
+        except Exception:  # noqa: BLE001
+            # An undefined marker name tells us nothing either way; a later
+            # environment may still resolve it.
+            continue
+    return False
+
+
+def unsatisfied_requirements(
+    dist_name: str, extras: Tuple[str, ...], requires, installed_version,
+) -> Tuple[str, ...]:
+    """Every ACTIVE requirement of *dist_name* this venv does not satisfy.
+
+    The other half of the question ``present`` has to answer. "Is it the
+    declared version from the declared source" says where a distribution came
+    from; this says whether the venv can actually load it. A package can be
+    exactly what the manifest asked for and still be unusable because something
+    it declares is missing or too old (issue #3080).
+
+    Read from the INSTALLED metadata, because the requirement that matters is
+    the one the artifact on disk declares — not the one the install command
+    asked for, and not the index's idea of that version.
+
+    Scoped deliberately to ONE distribution's own requirements rather than to
+    the environment. ``feature sync``'s claim is that the venv matches the
+    manifest, so it has no authority over a conflict between packages the
+    manifest never names — and measured on a live host, an environment-wide
+    check reports seven such conflicts among observability transitives and
+    would refuse every update on a host that is working perfectly well.
+
+    *requires* and *installed_version* are the venv readers, passed in so this
+    stays a pure function of what they report.
+    """
+    from packaging.requirements import Requirement
+
+    unmet: List[str] = []
+    for raw in requires(dist_name) or ():
+        try:
+            req = Requirement(raw)
+        except Exception:  # noqa: BLE001 - unparseable metadata tells us nothing
+            continue
+        if not requirement_applies(req, extras):
+            continue
+        have = installed_version(req.name)
+        if have is None:
+            unmet.append(
+                f"{dist_name} requires {req.name}{req.specifier}, which is "
+                "not installed"
+            )
+            continue
+        spec = str(req.specifier)
+        if spec and not version_satisfies(have, spec):
+            unmet.append(
+                f"{dist_name} requires {req.name}{spec}, but {have} is installed"
+            )
+    return tuple(unmet)
+
+
 def spec_is_valid(spec: Optional[str]) -> bool:
     """Is *spec* a USABLE PEP 440 specifier? Empty counts as valid ("any").
 

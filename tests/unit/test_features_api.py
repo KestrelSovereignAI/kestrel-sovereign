@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign import cli
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
@@ -600,19 +601,36 @@ class TestInstallFeature:
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_install_reports_and_restores_a_replaced_core(self, mock_registry, monkeypatch):
-        """An install that bypassed the pin cannot return a clean 'installed'."""
+        """An install that bypassed the pin cannot return a clean 'installed'.
+
+        This feature requires core `>=0.53`, so the very act of installing it
+        pulled 0.53 in and the repair put 0.52 back — which leaves the freshly
+        installed package unable to load. The endpoint has a branch for exactly
+        that, and until the requirement reading was shared (#3080) it could not
+        fire here: it read the metadata of a package that only exists in the
+        double, got nothing, and reported the completed install over an
+        environment that cannot load it. The check was blind in the one
+        scenario it was written for.
+
+        There is no companion test for "drift, but the restored core satisfies
+        the package", because that state cannot occur on this path: the swap
+        happens precisely BECAUSE the installed core does not satisfy the
+        requirement, so restoring it always leaves the requirement unmet. The
+        "no drift" arm is
+        `test_install_succeeds_when_the_checkout_satisfies_the_feature`.
+        """
         mock_registry.return_value = dict(FAKE_REGISTRY)
         venv = self._venv(monkeypatch, honours_constraints=False)
 
-        with TestClient(_make_app(_make_agent())) as client:
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
             resp = client.post("/api/features/test-pkg/install")
 
-        body = resp.json()
-        assert resp.status_code == 200  # the package really did install...
-        assert body["status"] == "installed_with_core_drift"  # ...but say so
-        assert body["core_restored"] is True
-        assert "expected: editable → /src/core" in body["core_drift"]
-        assert venv.editable[CORE] == "/src/core"  # actually re-linked
+        detail = resp.json()["detail"]
+        assert resp.status_code == 500
+        assert "installed and then moved core" in detail
+        assert "present but cannot load" in detail
+        assert f"{CORE}>=0.53" in detail  # names the requirement that cannot be met
+        assert venv.editable[CORE] == "/src/core"  # core was actually re-linked
         assert venv.installed[CORE] == "0.52.0"
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
@@ -1548,8 +1566,6 @@ class TestPostRepairRevalidation:
         and cannot load. Returning 200 "installed, restart the agent" there is a
         completed-install report over an environment that cannot run it.
         """
-        import importlib.metadata as md
-
         mock_registry.return_value = dict(FAKE_REGISTRY)
         # Core moved and was restored to 0.52.0, which the package rejects.
         venv = FakeUv(
@@ -1557,13 +1573,10 @@ class TestPostRepairRevalidation:
             honours_constraints=False,
         )
         use_fake_uv(monkeypatch, venv)
-        class _Meta(dict):
-            def get_all(self, key):
-                return self.get(key, [])
-
+        # Stated on the seam the code reads requirements through, so the double
+        # and the test agree about what the artifact on disk declares.
         monkeypatch.setattr(
-            md, "metadata",
-            lambda name: _Meta({"Requires-Dist": ["kestrel-sovereign>=0.53"]}),
+            cli, "_installed_requirements", lambda name: ("kestrel-sovereign>=0.53",),
         )
 
         with TestClient(
@@ -1587,28 +1600,18 @@ class TestPostRepairRevalidation:
         healthy install into a 500 — the guard inventing the very failure it
         exists to report.
         """
-        import importlib.metadata as md
-
         mock_registry.return_value = dict(FAKE_REGISTRY)
         venv = FakeUv(
             feature="kestrel-feature-test", core_checkout="/src/core",
             honours_constraints=False,
         )
         use_fake_uv(monkeypatch, venv)
-
-        class _Meta(dict):
-            def get_all(self, key):
-                return self.get(key, [])
-
         # The SAME specifier the test above proves is reported when it applies —
         # only the marker differs, so the marker is what this test isolates.
         monkeypatch.setattr(
-            md, "metadata",
-            lambda name: _Meta({
-                "Requires-Dist": [
-                    'kestrel-sovereign>=0.53; python_version < "3.10"',
-                ],
-            }),
+            cli,
+            "_installed_requirements",
+            lambda name: ('kestrel-sovereign>=0.53; python_version < "3.10"',),
         )
 
         with TestClient(

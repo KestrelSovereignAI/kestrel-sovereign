@@ -61,6 +61,12 @@ def _versions(monkeypatch, mapping):
         raise md.PackageNotFoundError(name)
 
     monkeypatch.setattr(md, "version", fake_version)
+    # A stubbed venv has to answer every question the code asks of a venv, and
+    # `present` now asks whether a package's own requirements are satisfied
+    # (#3080). Left unstubbed, this reads the REAL metadata of the interpreter
+    # running the tests and checks it against `mapping`, so every package looks
+    # unsatisfiable. A mapping that declares no requirements declares none.
+    monkeypatch.setattr(cli, "_installed_requirements", lambda name: ())
 
 
 def _fake_host(monkeypatch, tmp_path, agents=("Emma", "Claw"), port=8888):
