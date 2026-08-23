@@ -209,13 +209,22 @@ class TestCheckDatabase:
             "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
             0.1,
         )
+        # Every duration here is a HANG bound, not a coordination window: the
+        # test waits for an EVENT and these numbers only exist so a genuine
+        # hang fails instead of blocking for ever. They were tight enough
+        # (0.5s, and a 2.0s watchdog inside them) that a loaded machine crossed
+        # them while the code was working, and the watchdog releasing the
+        # worker mid-test changed the behaviour under assertion (#3077).
+        #
+        # The one duration that is NOT a bound is the patched drain timeout
+        # above: this test asserts THAT the deadline fires, so it stays short.
         backend = SQLiteBackend(str(tmp_path / "expired-cleanup.db"))
         await backend.connect()
         db = AsyncDatabase(backend)
         conn = backend._ensure_connected()
         entered_worker = threading.Event()
         release_worker = threading.Event()
-        watchdog = threading.Timer(2.0, release_worker.set)
+        watchdog = threading.Timer(60.0, release_worker.set)
 
         def block_in_worker() -> int:
             entered_worker.set()
@@ -228,7 +237,7 @@ class TestCheckDatabase:
         )
         try:
             watchdog.start()
-            async with asyncio.timeout(0.5):
+            async with asyncio.timeout(10):
                 while not entered_worker.is_set():
                     await asyncio.sleep(0.005)
 
@@ -240,7 +249,7 @@ class TestCheckDatabase:
             assert initial["status"] == "warn"
             assert "cleanup is still pending" in initial["message"]
 
-            async with asyncio.timeout(0.5):
+            async with asyncio.timeout(10):
                 while not backend.write_connection_cleanup_deadline_exceeded:
                     await asyncio.sleep(0.005)
 
@@ -271,7 +280,7 @@ class TestCheckDatabase:
         conn = backend._ensure_connected()
         entered_worker = threading.Event()
         release_worker = threading.Event()
-        watchdog = threading.Timer(2.0, release_worker.set)
+        watchdog = threading.Timer(60.0, release_worker.set)
         first_probe = True
         real_fetchone = db.fetchone
 
@@ -322,7 +331,7 @@ class TestCheckDatabase:
                 release_handle = asyncio.get_running_loop().call_later(
                     0.08, release_worker.set
                 )
-                async with asyncio.timeout(0.5):
+                async with asyncio.timeout(10):
                     await db.execute(
                         "CREATE TABLE after_probe (id INTEGER PRIMARY KEY)"
                     )

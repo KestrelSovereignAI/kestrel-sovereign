@@ -16261,12 +16261,25 @@ async def test_owned_facade_lifecycle_cancellation_keeps_pending_future_and_task
 
 @pytest.mark.asyncio
 async def test_owned_facade_lifecycle_timeout_retains_task_returned_by_facade(monkeypatch):
-    """A cancellation-resistant Task return remains attached to its host owner."""
+    """A cancellation-resistant Task return remains attached to its host owner.
 
+    The two short budgets below are patched because this asserts THAT the
+    timeout fires. Everything the timeout causes is awaited as an event, not
+    assumed to have happened inside those windows (#3077).
+
+    ``started`` is the load-sensitive part: a task cancelled before its first
+    step is cancelled outright, its body never runs, and then nothing observes
+    the cancellation and nothing is handed over — the runtime is right to
+    record no late task for a settled one, and the test was asserting a
+    scheduling race rather than the behaviour.
+    """
+
+    started = asyncio.Event()
     cancellation_observed = asyncio.Event()
     release = asyncio.Event()
 
     async def pending_task():
+        started.set()
         while not release.is_set():
             try:
                 await release.wait()
@@ -16274,6 +16287,9 @@ async def test_owned_facade_lifecycle_timeout_retains_task_returned_by_facade(mo
                 cancellation_observed.set()
 
     operation = asyncio.create_task(pending_task(), name="facade-hostile-stop-task")
+    # RUNNING before the settlement budget starts, so the cancellation lands in
+    # the body rather than on a task that never began.
+    await asyncio.wait_for(started.wait(), timeout=5)
 
     class TaskReturningFacade:
         def stop(self):
@@ -16289,12 +16305,15 @@ async def test_owned_facade_lifecycle_timeout_retains_task_returned_by_facade(mo
                 name="test-hostile-facade-stop-task",
                 on_late_task=late_tasks.append,
             )
-        assert cancellation_observed.is_set()
         assert len(late_tasks) == 1
         assert late_tasks[0].get_name() == "test-hostile-facade-stop-task"
+        # The cancellation was DELIVERED before the timeout raised; the task
+        # observing it is its own next scheduling, which is not the grace
+        # window's to contain. The bound here only fails a genuine hang.
+        await asyncio.wait_for(cancellation_observed.wait(), timeout=5)
     finally:
         release.set()
-        await asyncio.wait_for(late_tasks[0] if late_tasks else operation, timeout=1)
+        await asyncio.wait_for(late_tasks[0] if late_tasks else operation, timeout=5)
 
 
 @pytest.mark.asyncio
