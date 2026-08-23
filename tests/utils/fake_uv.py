@@ -77,9 +77,15 @@ class FakeUv:
 
     The last two model the mirror image — an installer that ended badly *after*
     core was already home, so its exit status describes the installer and not
-    the venv. ``repair_last_pass_fails=True``: pip's scoped repair is two
-    passes and the first one restores core, so a failure in the second is a
-    nonzero exit over a conforming core. ``repair_hangs_after_restore=True``:
+    the venv. ``core_write_pass_fails=True``: pip's scoped core install
+    is a sequence and the first pass can already have landed core, so a failure
+    in the WRITE pass is a nonzero exit over a conforming core — and one that
+    stops the sequence before the pass which validates dependencies. ``core_resolve_refused=True`` is its
+    opposite number: pip's LAST pass resolves the dependencies of the artifact
+    the ``--no-deps`` pass installed, so a refusal there is also a nonzero exit
+    over a conforming core — but this one means the host cannot load what it
+    just installed, which re-reading core cannot see (issue #3047).
+    ``repair_hangs_after_restore=True``:
     the write lands and the process is killed afterwards — a bound stops a hung
     installer, it does not undo what that installer had already done.
     """
@@ -94,12 +100,15 @@ class FakeUv:
         feature="kestrel-feature-voice",
         feature_version="0.4.0",
         feature_requires=">=0.53",
+        feature_installed_requires=None,
         core_index=("0.52.0", "0.53.0"),
         honours_constraints=True,
         repair_fails=False,
         repair_noops=False,
         repair_hangs=False,
-        repair_last_pass_fails=False,
+        core_write_pass_fails=False,
+        core_write_pass_hangs=False,
+        core_resolve_refused=False,
         repair_hangs_after_restore=False,
         feature_install_fails=False,
         feature_install_times_out=False,
@@ -120,13 +129,22 @@ class FakeUv:
             self.checkouts.setdefault(core_checkout, core_version)
         self.feature = feature
         self.feature_version = feature_version
+        #: What the INDEX artifact declares, and what a resolve reads whenever
+        #: it builds its candidate from the index.
         self.feature_requires = feature_requires
+        #: What the artifact currently ON DISK declares. Defaults to the index's
+        #: own requirement — they differ only where a test says they do, which
+        #: is the case in issue #3047: a checkout build and the wheel published
+        #: at the same version are not obliged to declare the same dependencies.
+        self.feature_installed_requires = feature_installed_requires or feature_requires
         self.core_index = list(core_index)
         self.honours_constraints = honours_constraints
         self.repair_fails = repair_fails
         self.repair_noops = repair_noops
         self.repair_hangs = repair_hangs
-        self.repair_last_pass_fails = repair_last_pass_fails
+        self.core_write_pass_fails = core_write_pass_fails
+        self.core_write_pass_hangs = core_write_pass_hangs
+        self.core_resolve_refused = core_resolve_refused
         self.repair_hangs_after_restore = repair_hangs_after_restore
         self.feature_install_fails = feature_install_fails
         self.feature_install_times_out = feature_install_times_out
@@ -201,7 +219,7 @@ class FakeUv:
             # A killed install is not a no-op: whatever pip had already written
             # stays written. Model the worst honest case — the dependency swap
             # landed before the timeout.
-            self._swap_core_for_index_wheel(pin)
+            self._swap_core_for_index_wheel(pin, self._resolved_feature_requires(cmd))
             raise subprocess.TimeoutExpired(cmd, timeout or 0)
 
         if self.feature_install_interrupted:
@@ -210,7 +228,7 @@ class FakeUv:
             # arrives as a BaseException that unwinds the caller instead of a
             # value it can inspect, which is how the post-check came to be
             # skipped (issue #2962).
-            self._swap_core_for_index_wheel(pin)
+            self._swap_core_for_index_wheel(pin, self._resolved_feature_requires(cmd))
             raise KeyboardInterrupt()
 
         if self._reinstalls_dependencies(cmd):
@@ -227,7 +245,7 @@ class FakeUv:
                 return self._failed(cmd, f"x Failed to build `{self.feature}`")
             return self._install_feature(cmd)
 
-        wanted = SpecifierSet(self.feature_requires)
+        wanted = SpecifierSet(self._resolved_feature_requires(cmd))
         if Version(self.installed[CORE]) in wanted:
             # Core already satisfies the feature; a satisfied dependency is
             # left alone. Nothing to swap.
@@ -241,7 +259,7 @@ class FakeUv:
                 cmd,
                 "x No solution found when resolving dependencies: "
                 f"{self.feature}=={self.feature_version} depends on "
-                f"{CORE}{self.feature_requires}, but you require "
+                f"{CORE}{self._resolved_feature_requires(cmd)}, but you require "
                 f"{CORE}=={self.installed[CORE]}.",
             )
 
@@ -279,10 +297,40 @@ class FakeUv:
         source switch, and the reason a scoped reinstall must still reach the
         requested package.
         """
+        landed = (
+            self._reinstalls_package(cmd, self.feature)
+            or self.installed.get(self.feature) != self.feature_version
+        )
         self.installed[self.feature] = self.feature_version
         if self._reinstalls_package(cmd, self.feature):
             self.editable.pop(self.feature, None)
+        if landed:
+            # The index artifact is the one on disk now, so what the venv
+            # declares as a dependency changed with the file that declared it.
+            self.feature_installed_requires = self.feature_requires
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def _resolved_feature_requires(self, cmd) -> str:
+        """The feature requirement THIS command's resolve actually reads.
+
+        pip builds its candidate for a name requirement from the installed
+        distribution whenever that distribution already satisfies the request —
+        modelled here as "the index would return the version already on disk".
+        The candidate carries the INSTALLED artifact's metadata, so that is the
+        dependency set the resolve enforces, not the index artifact's.
+
+        A command that forces the package's own reinstall has no installed
+        candidate to choose and reads the index artifact instead. That is the
+        whole of issue #3047: pip's ``--force-reinstall --no-deps`` pass is the
+        only one that reaches the index artifact, and it is the one pass that
+        resolves nothing.
+        """
+        if (
+            self.installed.get(self.feature) == self.feature_version
+            and not self._reinstalls_package(cmd, self.feature)
+        ):
+            return self.feature_installed_requires
+        return self.feature_requires
 
     def _reinstalls_package(self, cmd, package) -> bool:
         """Is *package* itself in this command's reinstall set?
@@ -338,11 +386,11 @@ class FakeUv:
         """
         self.editable.pop(SDK, None)
 
-    def _swap_core_for_index_wheel(self, pin):
+    def _swap_core_for_index_wheel(self, pin, requires):
         from packaging.specifiers import SpecifierSet
         from packaging.version import Version
 
-        wanted = SpecifierSet(self.feature_requires)
+        wanted = SpecifierSet(requires)
         candidates = [v for v in self._core_candidates(pin) if Version(v) in wanted]
         if candidates:
             self.installed[CORE] = max(candidates, key=Version)
@@ -365,7 +413,28 @@ class FakeUv:
             # Exit 0, venv unchanged — an installer that reported success and
             # left core exactly where it was.
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if self.repair_last_pass_fails and "--no-deps" in cmd:
+        if (
+            self.core_resolve_refused
+            and "--no-deps" not in cmd
+            and "--upgrade" not in cmd
+            and "--reinstall-package" not in cmd
+        ):
+            # pip's third pass: no force, no exclusion — it resolves the
+            # dependencies of what the `--no-deps` pass installed, and core is
+            # already home by the time it runs. Its refusal is a fact about the
+            # dependency closure and about nothing else (issue #3047).
+            return self._failed(
+                cmd,
+                "x No solution found when resolving dependencies: "
+                f"{CORE}=={self.installed[CORE]} depends on "
+                f"{SDK}>=0.99, but you require {SDK}==0.36.0.",
+            )
+        if self.core_write_pass_hangs and "--no-deps" in cmd:
+            # Killed IN the write pass, after pass 1 has already landed core.
+            # The exit code is a kill, not a refusal — but the sequence still
+            # stopped before the pass that validates dependencies (#3047).
+            self._never_returns(cmd, target, timeout)
+        if self.core_write_pass_fails and "--no-deps" in cmd:
             # pip's destructive pass fails — but the resolve pass before it has
             # already put core back (it ran this same branch and wrote), so this
             # exit code describes the command, not the venv.

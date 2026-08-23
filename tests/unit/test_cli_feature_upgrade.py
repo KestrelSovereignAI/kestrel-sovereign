@@ -14,6 +14,7 @@ import types
 import pytest
 
 from kestrel_sovereign import cli
+from kestrel_sovereign import cli_features
 
 
 def _dist(name, version, editable_path=None, entries=None):
@@ -186,6 +187,32 @@ def test_upgrade_skips_editable_and_pip_upgrades_others(monkeypatch, fake_regist
     assert "upgraded -> 0.2.0" in out
     assert "1 package(s) upgraded" in out
     assert "kestrel-feature-voice" in out and "skip (editable" in out
+
+
+@pytest.mark.parametrize("core_rc", sorted(cli_features.NON_CONTINUABLE_CORE))
+def test_upgrade_returns_every_core_state_verbatim(
+    monkeypatch, fake_registry, capsys, core_rc
+):
+    """A gate that hand-compares one code is a hole the next code falls through.
+
+    Driven with EVERY non-continuable code rather than the one this gate was
+    written for, so adding a code and adding a gate are caught by the same
+    check. `feature sync`'s gate has the same test in test_cli_feature_sync.py.
+    """
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [_dist("kestrel-feature-github", "0.1.0")],
+    )
+    _installed_versions(monkeypatch, {"kestrel-feature-github": "0.2.0"})
+    monkeypatch.setattr(cli.subprocess, "run", _PipSpy())
+    monkeypatch.setattr(
+        cli_features.CoreInstallGuard, "verify", lambda self: core_rc,
+    )
+
+    rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
+
+    assert rc == core_rc
 
 
 # --- what an upgrade did is a fact about the venv (#2949) -------------------

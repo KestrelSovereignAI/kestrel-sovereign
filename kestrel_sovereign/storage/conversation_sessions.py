@@ -979,16 +979,36 @@ def _own_rows_through(backend_type: str) -> str:
     )
 
 
-def _live_rows_through(backend_type: str) -> str:
-    """Every live row of this agent's up to one frontier, for the transcript
-    pass — the same columns, in the order a reader would see them, so unstamped
-    rows are attributed the way the grouper attributes them."""
+def live_transcript_sql(backend_type: str, *, through: bool = False) -> str:
+    """Every live row of one agent's history, in the order a reader sees it.
+
+    The columns a derivation reads and the canonical order it reads them in, so
+    unstamped rows are attributed the way the grouper attributes them.
+
+    ``through`` adds a frontier — ``id <= ?`` — which the projection's own
+    transcript pass needs and a search does not. A snapshot the projection
+    publishes must describe one frontier or the next repair folds a row twice
+    (see :meth:`ConversationSessionProjection._rebuild_from_transcript`);
+    :func:`transcript_membership` publishes nothing, so it takes history as it
+    stands and a row arriving under it is simply one more row it did not see.
+
+    One statement rather than two that agree today, because the membership map
+    and the projection have to be derived from the SAME rows in the SAME order:
+    they are two halves of one grouping, and a second spelling of "the live
+    transcript" is where they would drift apart.
+    """
+    frontier = "AND id <= ? " if through else ""
     return (
         f"SELECT {_derived_from(backend_type)} FROM conversation_history "
         f"WHERE agent_id = ? AND {_LIVE} "
-        "AND id <= ? "
+        f"{frontier}"
         f"{canonical_order(backend_type)}"
     )
+
+
+def _live_rows_through(backend_type: str) -> str:
+    """:func:`live_transcript_sql`, bounded by the frontier a snapshot names."""
+    return live_transcript_sql(backend_type, through=True)
 
 #: :meth:`ConversationSessionProjection.repair` did nothing: the projection had
 #: accounted for every row and the change stamp had not moved.
@@ -1926,6 +1946,25 @@ def _caused_by(exc: BaseException, wanted: type) -> bool:
     return False
 
 
+def only_appends_above(delta: int, appended: int, rows_above: int) -> bool:
+    """Is a stamp movement explained entirely by rows appended above the target?
+
+    Authored once because two callers need it and they must not drift:
+    :meth:`ConversationSessionProjection._plan` decides whether the walk may
+    CONTINUE, and :meth:`ConversationSessionProjection.unchanged_below` answers
+    a reader asking whether the rows a projection describes are still the rows
+    standing now (#2961). Those are the same question — "did anything at or
+    below the frontier move" — reached from two directions.
+
+    Three numbers rather than two, because two cannot tell a row ARRIVING above
+    the target from an existing row RENUMBERED above it: both are one change and
+    one row up there, and treating the second as an append counts a row the
+    projection has already counted (#3001). Only the first is also an append,
+    which is what the third number sees.
+    """
+    return delta > 0 and delta == appended and delta == rows_above
+
+
 @dataclass(frozen=True, slots=True)
 class _Plan:
     """What one step decided to do, computed inside that step's transaction.
@@ -1966,6 +2005,99 @@ class SessionProjection:
     wake_source: Optional[str]
 
 
+def _transcript_messages(
+    rows: Sequence[Sequence[Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[Any, Any]]:
+    """``rows`` as the grouper reads them, plus what each row's column says.
+
+    Returns ``(messages, stamped)`` — the message dicts in the order given, and
+    ``{row id: session_id column}`` for the checks that have to ask whether the
+    indexed duplicate agrees with the derivation.
+    """
+    messages: List[Dict[str, Any]] = []
+    stamped: Dict[Any, Any] = {}
+    # Trailing columns are ignored here: the derivation also selects the key
+    # its ORDER BY sorted on (see :func:`_derived_from`), which the fold
+    # reads and the grouper has no use for.
+    for row_id, role, metadata, created_at, column in (row[:5] for row in rows):
+        stamped[row_id] = column
+        messages.append(
+            {
+                "id": row_id,
+                "role": role,
+                # The row's identity standing in for its text, so the preview
+                # picker answers WHICH row rather than what it said. See the
+                # module docstring for why that is faithful.
+                "content": str(row_id),
+                "metadata": parse_message_metadata(metadata),
+                "created_at": created_at,
+            }
+        )
+    return messages, stamped
+
+
+def _grouped_transcript(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The sessions a reader shows for ``messages``, each carrying its rows.
+
+    One call, so the projection and the membership map below cannot be built
+    from two spellings of "group this transcript" — the defect this codebase
+    has hit repeatedly is two call sites answering one question differently.
+
+    ``keep_empty_markers`` so a conversation that exists only as its
+    ``new_session`` marker is still a session (#2222) — the UI prepends a tile
+    for it the moment the user starts typing, and a projection that dropped it
+    could not serve that reader. A reader wanting only sessions with traffic
+    filters on ``message_count``.
+
+    ``now`` is deliberately NOT passed. The deterministic substitute for an
+    undatable row is the grouper's own rule now, so the read path and this
+    projection cannot disagree about a legacy row with a malformed
+    ``created_at`` — which they did while this computed the fallback itself
+    and `/api/conversations` let the grouper reach for the wall clock (round-7
+    review). A projection that has to be reproducible from the rows cannot own
+    half of a rule the reader owns the other half of.
+    """
+    return coalesce_sessions_by_session_id(
+        group_messages_into_sessions(
+            messages,
+            keep_empty_markers=True,
+            collect_messages=True,
+        )
+    )
+
+
+def transcript_membership(rows: Sequence[Sequence[Any]]) -> Dict[str, List[Any]]:
+    """``{session_id: [row id, ...]}`` — which rows each session is made of.
+
+    :func:`project_transcript`'s other half. That one keeps the *summary* of
+    each session and discards the attribution; this keeps the attribution and
+    discards the summary, from the same grouping call — so a row is in the
+    session here that the projection describes there, by construction rather
+    than by two functions agreeing.
+
+    Search (#2961) is the caller. It has to decide whether a session matches a
+    query, which means knowing which rows are its own, and 473 of Emma's 1,522
+    live rows carry no ``session_id`` at all — the column cannot answer for
+    them. Their session is the one the gap arithmetic puts them in, and gap
+    arithmetic needs every row before them, so this takes the whole transcript
+    or nothing. ``rows`` must therefore be the complete membership in canonical
+    order, exactly as :meth:`ConversationSessionProjection._rebuild_from_transcript`
+    reads it; a windowed read here would attribute the rows at its edge to
+    sessions that only look like theirs.
+
+    Structural ``new_session`` marker rows are excluded from the lists, because
+    ``collect_messages`` excludes them: they carry no content to match and are
+    not rows a reader shows.
+    """
+    messages, _ = _transcript_messages(rows)
+    return {
+        str(session["session_id"]): [
+            message["id"] for message in session.get("messages", ())
+        ]
+        for session in _grouped_transcript(messages)
+    }
+
+
 def project_transcript(
     rows: Sequence[Sequence[Any]], expect: Optional[str] = None
 ) -> List[SessionProjection]:
@@ -2000,45 +2132,8 @@ def project_transcript(
     rows a reader querying that column would find. Refuse the whole thing rather
     than store a count nobody else would compute.
     """
-    messages: List[Dict[str, Any]] = []
-    stamped: Dict[Any, Any] = {}
-    # Trailing columns are ignored here: the derivation also selects the key
-    # its ORDER BY sorted on (see :func:`_derived_from`), which the fold
-    # reads and the grouper has no use for.
-    for row_id, role, metadata, created_at, column in (row[:5] for row in rows):
-        stamped[row_id] = column
-        messages.append(
-            {
-                "id": row_id,
-                "role": role,
-                # The row's identity standing in for its text, so the preview
-                # picker answers WHICH row rather than what it said. See the
-                # module docstring for why that is faithful.
-                "content": str(row_id),
-                "metadata": parse_message_metadata(metadata),
-                "created_at": created_at,
-            }
-        )
-
-    # ``keep_empty_markers`` so a conversation that exists only as its
-    # ``new_session`` marker is still a session (#2222) — the UI prepends a tile
-    # for it the moment the user starts typing, and a projection that dropped it
-    # could not serve that reader. A reader wanting only sessions with traffic
-    # filters on ``message_count``.
-    # ``now`` is deliberately NOT passed. The deterministic substitute for an
-    # undatable row is the grouper's own rule now, so the read path and this
-    # projection cannot disagree about a legacy row with a malformed
-    # ``created_at`` — which they did while this computed the fallback itself
-    # and `/api/conversations` let the grouper reach for the wall clock (round-7
-    # review). A projection that has to be reproducible from the rows cannot own
-    # half of a rule the reader owns the other half of.
-    grouped = coalesce_sessions_by_session_id(
-        group_messages_into_sessions(
-            messages,
-            keep_empty_markers=True,
-            collect_messages=True,
-        )
-    )
+    messages, stamped = _transcript_messages(rows)
+    grouped = _grouped_transcript(messages)
     if (
         expect is not None
         and messages
@@ -2301,6 +2396,79 @@ class ConversationSessionProjection:
             str(row[0]), bool(row[1]), int(row[2]), int(row[3]), int(row[4]),
             int(row[5]), int(row[6]), str(row[7] or ""),
         )
+
+    async def unchanged_below(self, accounted: SessionWatermark) -> bool:
+        """Has nothing at or below ``accounted.target`` moved since it was written?
+
+        For a reader that takes SUMMARIES from this projection and then reads
+        the ROWS those summaries describe — search does, because matching needs
+        content this table deliberately does not hold. Its two reads have to
+        describe one history, and ``is_stale`` is the wrong question: it is
+        false for an append above the frontier, which changes nothing the
+        summaries claim and happens on every turn of every conversation.
+
+        Measured what the gap costs when it is not asked: a row below the
+        frontier restored from Trash between the two reads came back as
+        ``message_count: 1`` beside ``match_count: 2`` — a pairing the data
+        cannot produce, which is worse than a stale number because nothing
+        about it looks stale (codex R3 P2).
+
+        ``False`` for an invalid or foreign-generation watermark: those describe
+        a projection that is not the one standing, so "unchanged" is not a claim
+        that can be made about them.
+        """
+        if not accounted.valid:
+            return False
+        observed, appends, generation, above = await self._counters(accounted.target)
+        if accounted.generation != generation:
+            return False
+        if observed == accounted.stamp:
+            return True
+        return only_appends_above(
+            observed - accounted.stamp, appends - accounted.appends, above
+        )
+
+    async def _counters(self, target: int) -> Tuple[int, int, str, int]:
+        """The four numbers a consistency test compares, from ONE snapshot.
+
+        ``(changes, appends, generation, rows above target)``.
+
+        Four awaits would be four snapshots. PostgreSQL's default isolation
+        gives each STATEMENT its own, so reads inside one transaction are not
+        one instant either — and :func:`only_appends_above` is exact only about
+        numbers that describe one. Measured interleaving: a mutation BELOW the
+        frontier commits and is counted by ``changes``; an ordinary append then
+        commits before ``appends`` and the row count are read, so all three
+        arrive as 1 and the movement below the frontier is certified as an
+        append above it (codex R4 P2, reproduced: ``message_count: 1`` beside
+        ``match_count: 2``).
+
+        One statement is what fixes it, rather than an isolation level: a single
+        SELECT is a snapshot under READ COMMITTED and inside SQLite's implicit
+        transaction alike, so the scalar subqueries below say "at the same
+        instant" without either engine being asked for something it does not
+        use here.
+
+        :meth:`_plan` and :meth:`_rebuild_from_transcript` read the same
+        counters one at a time and have the same exposure on PostgreSQL —
+        pre-existing, in the repair path rather than this read, and filed as
+        #3081 rather than restructured from here.
+        """
+        row = await self.db.fetchone(
+            "SELECT "
+            "(SELECT COALESCE(SUM(changes), 0) FROM conversation_history_changes "
+            "WHERE agent_id = ?), "
+            "(SELECT COALESCE(SUM(appends), 0) FROM conversation_history_changes "
+            "WHERE agent_id = ?), "
+            "(SELECT generation FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot = 0), "
+            "(SELECT COUNT(*) FROM conversation_history "
+            "WHERE agent_id = ? AND id > ?)",
+            (self.agent_id, self.agent_id, self.agent_id, self.agent_id, target),
+        )
+        if row is None:
+            return 0, 0, "", 0
+        return int(row[0] or 0), int(row[1] or 0), str(row[2] or ""), int(row[3] or 0)
 
     async def is_stale(self) -> bool:
         """Whether the projection disagrees with the rows it describes.
@@ -2734,10 +2902,8 @@ class ConversationSessionProjection:
         # existing row RENUMBERED above it: both are one change and one row up
         # there, and folding the second one counts a row this projection has
         # already counted (#3001). Only the first is also an append.
-        if (
-            delta > 0
-            and delta == appended
-            and delta == await self._rows_above(accounted.target)
+        if only_appends_above(
+            delta, appended, await self._rows_above(accounted.target)
         ):
             return _Plan(
                 INCREMENTAL,

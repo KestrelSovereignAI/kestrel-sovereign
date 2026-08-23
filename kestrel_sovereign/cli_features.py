@@ -48,10 +48,53 @@ CORE_UNSAFE = 2
 # while reporting success is not that (issue #2949).
 CORE_STALE = 3
 
+# Return code for "core is the declared install, at the declared version, and
+# its dependencies do not resolve". A THIRD core state, because the operator
+# instruction differs from both above: nothing needs restoring (CORE_UNSAFE)
+# and nothing needs pulling (CORE_STALE) — a version conflict has to be fixed
+# before this core can load. Reusing either code would print a sentence that is
+# false in front of the operator. Not continuable, for the reason all three are
+# not: `--continue-on-error` covers an optional package that would not install
+# (issue #3047).
+CORE_UNRESOLVED = 4
+
 # Exit-code severity, worst first. `max()` on the raw ints is WRONG (CORE_STALE
 # is 3 and CORE_UNSAFE is 2), which is exactly why ranking these by hand at each
-# assignment site kept losing the stronger code.
-_RC_SEVERITY = (CORE_UNSAFE, CORE_STALE, 1, 0)
+# assignment site kept losing the stronger code. An undeclared core outranks an
+# unloadable one, which outranks one merely running old code.
+_RC_SEVERITY = (CORE_UNSAFE, CORE_UNRESOLVED, CORE_STALE, 1, 0)
+
+
+#: Every core state no caller may continue past, and the sentence each one
+#: means. ONE table, because the gates that ask are in three different
+#: functions and a code added without all three learning it is silently
+#: continuable — which is the failure `--continue-on-error` keeps producing.
+#: The text is the operator's INSTRUCTION, and it differs per state: restore,
+#: pull, or fix a conflict. That is why they are not one code.
+NON_CONTINUABLE_CORE = {
+    CORE_UNSAFE: (
+        "core is not the declared install and could not be repaired. "
+        "Refusing to continue onto an undeclared core"
+    ),
+    CORE_STALE: (
+        "the declared core checkout could not be updated, so a restart would "
+        "run stale code. Resolve the checkout (or pass --allow-dirty)"
+    ),
+    CORE_UNRESOLVED: (
+        "core is the declared install, but the pass that validates its "
+        "dependencies did not complete, so a restart could bring agents up on "
+        "a core they cannot load. Resolve what failed and re-run"
+    ),
+}
+
+
+def core_state_refusal(rc: int):
+    """The operator sentence for a non-continuable core state, else ``None``.
+
+    The one question a gate asks about an exit code, so "is this continuable"
+    has exactly one answer everywhere it is asked.
+    """
+    return NON_CONTINUABLE_CORE.get(rc)
 
 
 def _worst_rc(*codes: int) -> int:
@@ -671,11 +714,12 @@ def cmd_feature_upgrade(args) -> int:
         if upgraded:
             print("  Restart the host/agents to load the upgraded code.")
         # Detection half: an upgrade that bypassed the pin can't leave the
-        # command reporting success over a replaced core. CORE_UNSAFE is
-        # returned verbatim rather than folded into rc — see verify().
+        # command reporting success over a replaced core. A core state is
+        # returned verbatim rather than folded into rc — see verify() — and the
+        # set of them lives in `core_state_refusal`, not in a comparison here.
         core_rc = guard.verify()
-        if core_rc == CORE_UNSAFE:
-            return CORE_UNSAFE
+        if core_state_refusal(core_rc):
+            return core_rc
         if core_rc:
             rc = 1
     return rc
@@ -875,14 +919,37 @@ def _install_commands(pip_args: list, extra_args=(), reinstall=None) -> list:
          one that was working. Non-forcing, so a satisfying editable core keeps
          its link.
       2. ``--force-reinstall --no-deps`` replaces the package itself and only
-         it. This is the destructive pass, and it runs last: after the resolve
-         it depends on has already succeeded. It is needed because pass 1 is a
+         it. This is the destructive pass, and it runs after the resolve it
+         depends on has already succeeded. It is needed because pass 1 is a
          no-op when the index publishes the same version the checkout builds —
          the case that motivated all of this.
+      3. A plain install — the very command a non-switch install runs — so the
+         environment is resolved around the artifact that ACTUALLY landed.
 
-      Running those two the other way round is a bug, not a style choice: the
+      Running 1 and 2 the other way round is a bug, not a style choice: the
       wheel lands, the dependency resolve then fails, and the caller reports a
       failure over an environment it has already changed.
+
+    Pass 3 is there because pass 1 does not resolve the artifact pass 2
+    installs. pip builds its candidate for a *name* requirement from the
+    installed distribution whenever that distribution already satisfies the
+    spec, so in the no-op case pass 1 reads the metadata of the copy on disk —
+    the checkout build — and pass 2 then writes the index artifact with
+    ``--no-deps``. Two artifacts at one version are not obliged to declare the
+    same dependencies (an extra, a raised floor, a dependency added after the
+    tag), so without pass 3 the environment is left holding a distribution
+    whose dependency set was validated by NEITHER pass (issue #3047).
+
+    Pass 3 resolves because by then the index artifact IS the installed one, so
+    the candidate pip builds carries its metadata. It can only run after pass 2,
+    and that is the honest cost: a requirement only the new artifact declares is
+    refused with the switch already made. Moving that check ahead of pass 2
+    would mean resolving the index artifact without installing it — which needs
+    the resolver to ignore what is installed, and then core has to come from the
+    index too. An editable core builds a version the index may never have
+    published, so that resolve would refuse every install on a dev host. A late
+    honest failure beats an early false one; the earlier check is still there in
+    pass 1 for every case where pip can make it.
     """
     extra = list(extra_args)
     if not reinstall:
@@ -894,6 +961,7 @@ def _install_commands(pip_args: list, extra_args=(), reinstall=None) -> list:
     return [
         _install_backend_argv(pip_args, [*extra, "--upgrade"]),
         _install_backend_argv(pip_args, [*extra, "--force-reinstall", "--no-deps"]),
+        _install_backend_argv(pip_args, extra),
     ]
 
 
@@ -961,9 +1029,9 @@ def _render_commands(argvs: list) -> str:
     """Render a whole install SEQUENCE as one line the operator's shell runs.
 
     A single command renders exactly as :func:`_render_command` — the common
-    case, and the only one on a uv host. A pip source switch is two passes
-    (see :func:`_install_commands`) and both have to reach the operator:
-    printing only the first advertises a repair that does half the job.
+    case, and the only one on a uv host. A pip source switch is three passes
+    (see :func:`_install_commands`) and every one has to reach the operator:
+    printing a prefix of them advertises a repair that does part of the job.
 
     The ORDER is the protection (:func:`_install_commands`), so the rendered
     line has to carry it: pass 2 replaces the package with ``--no-deps`` and is
@@ -1067,8 +1135,22 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
 
     try:
         result = None
-        for cmd in _install_commands(pip_args, extra_args, reinstall):
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        commands = _install_commands(pip_args, extra_args, reinstall)
+        for index, cmd in enumerate(commands):
+            try:
+                completed = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as expired:
+                # A bound raises before the result exists, so the position
+                # would be lost — and with it the only way to know that a kill
+                # in the WRITE pass left an artifact nothing has validated.
+                raise InstallSequenceTimeout(
+                    expired, index=index, total=len(commands),
+                ) from expired
+            result = InstallSequenceResult(
+                completed, index=index, total=len(commands),
+            )
             if result.returncode != 0:
                 break
         return result
@@ -1080,6 +1162,74 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
                 pass
 
 
+class InstallSequenceTimeout(subprocess.TimeoutExpired):
+    """A timed-out install that still knows WHICH pass it was in.
+
+    A subclass so every existing ``except subprocess.TimeoutExpired`` keeps
+    catching it, and so :func:`_killed_process` can rebuild the position the
+    raise would otherwise have thrown away.
+    """
+
+    def __init__(self, expired: subprocess.TimeoutExpired, *, index: int, total: int):
+        super().__init__(
+            expired.cmd, expired.timeout, output=expired.output, stderr=expired.stderr,
+        )
+        self.index = index
+        self.total = total
+
+
+class InstallSequenceResult(subprocess.CompletedProcess):
+    """A finished install sequence, plus WHICH of its passes ended it.
+
+    The exit code alone cannot say what a late failure means. A pip source
+    switch is three passes and only the LAST resolves the dependencies of what
+    landed (:func:`_install_commands`), so a caller has to tell "the resolve
+    refused after the artifact was written" from "the destructive pass failed
+    over an artifact already in place" — the second is the case re-reading core
+    was always the right answer for.
+
+    Position, not argv shape: the closing pass of a switch and the only pass of
+    an ordinary install are the SAME command, and reading the argv called an
+    ordinary failed install a refused resolve. What distinguishes them is that
+    one ran after two passes had already changed the environment.
+    """
+
+    def __init__(self, completed, *, index: int, total: int):
+        super().__init__(
+            completed.args, completed.returncode, completed.stdout, completed.stderr,
+        )
+        self.index = index
+        self.total = total
+
+    @property
+    def resolve_incomplete(self) -> bool:
+        """Did a multi-pass sequence end without its closing resolve succeeding?
+
+        Not "did the last pass refuse". The environment is in the SAME state
+        whether the closing resolve refused or an earlier pass stopped the
+        sequence before it ran: the ``--no-deps`` pass has written an artifact
+        and nothing has validated what it declares. Asking only about the last
+        pass missed the second case entirely.
+
+        Pass 1 is exempt — it fails before anything is written, so that is an
+        ordinary failed install over an environment still intact — and so is a
+        single-command sequence, which is pass 1 and nothing else.
+
+        Deliberately conservative where it cannot tell: a ``--no-deps`` pass
+        that fails after a pass 1 which really did resolve leaves a fine
+        environment, and this reports it anyway, because the exit code cannot
+        distinguish that from a pass 1 that no-oped. The costs are not
+        symmetric — a false positive costs a re-run, a false negative restarts
+        a fleet onto a core it cannot load.
+
+        A killed process never reaches this class at all — the timeout path
+        builds a plain :class:`~subprocess.CompletedProcess`
+        (:func:`_killed_process`) — which is how "a bound ended it" stays
+        distinct from "the sequence did not finish".
+        """
+        return self.returncode != 0 and self.total > 1 and self.index > 0
+
+
 def _killed_process(expired: subprocess.TimeoutExpired) -> subprocess.CompletedProcess:
     """A timed-out install, shaped like the result its callers already read.
 
@@ -1088,18 +1238,30 @@ def _killed_process(expired: subprocess.TimeoutExpired) -> subprocess.CompletedP
     before the kill, and the only extra fact is WHY that output stops where it
     does. Folding it into a failed :class:`~subprocess.CompletedProcess` with
     that fact in ``stderr`` keeps one shape flowing to the operator.
+
+    The pass POSITION survives when the raise carried it
+    (:class:`InstallSequenceTimeout`), so a kill in the write pass is still
+    read as an artifact nothing has validated. A kill in the FIRST pass keeps
+    the documented answer — judge by where core is — because that pass is the
+    resolve, and this is the one place a killed installer and a refused one
+    differ: the bound ended a process, it did not make a resolver say no.
     """
     def text(stream) -> str:
         if stream is None:
             return ""
         return stream if isinstance(stream, str) else stream.decode(errors="replace")
 
-    return subprocess.CompletedProcess(
+    killed = subprocess.CompletedProcess(
         expired.cmd,
         returncode=1,
         stdout=text(expired.stdout),
         stderr=f"timed out after {expired.timeout}s\n{text(expired.stderr)}".strip(),
     )
+    if isinstance(expired, InstallSequenceTimeout):
+        return InstallSequenceResult(
+            killed, index=expired.index, total=expired.total,
+        )
+    return killed
 
 
 def _core_install_shape():
@@ -1140,6 +1302,12 @@ class CoreGuardOutcome:
     # and "we did not try" are different facts and must not print the same
     # sentence (issue #2962).
     attempted: bool = True
+    # Core IS back from its declared source, but the pass that resolves its
+    # dependencies refused. Not a failed restore — saying so would send the
+    # operator to redo an install that happened — and not a success either: the
+    # host cannot load what it just installed. A third sentence, because it is
+    # a third fact (issue #3047).
+    unresolved: bool = False
     command: Optional[str] = None
     # Which shell ``command`` is quoted for, captured with it (see
     # :func:`_render_shell`). ``None`` where the platform has only one answer.
@@ -1186,6 +1354,16 @@ class CoreGuardOutcome:
                 "no command that could put it back. See the detail above."
             )
         where = f" in {self.shell}" if self.shell else ""
+        if self.unresolved:
+            # The restore worked. What failed is the resolve after it, so the
+            # operator has to fix the conflict FIRST — re-running the command
+            # before that changes nothing and reads as the command being wrong.
+            return (
+                f"RESTORED, DEPENDENCIES UNRESOLVED — {CORE_DISTRIBUTION} is "
+                "back from its declared source, but the pass that validates "
+                "its dependencies did not complete. Resolve what failed below, "
+                f"then run `{self.command}`{where} by hand."
+            )
         if not self.attempted:
             # Nothing was tried, so nothing failed. Saying RESTORE FAILED here
             # would report an attempt that never happened, and an operator who
@@ -1584,12 +1762,20 @@ class CoreInstallGuard:
             )
         except subprocess.TimeoutExpired as expired:
             result = _killed_process(expired)
-        ok = self._check() is None
-        if ok:
+        restored = self._check() is None
+        # Two independent facts, so two variables: WHERE core is, and whether
+        # the dependencies of what landed have a solution. Re-reading core
+        # answers the first and cannot answer the second, and a repair whose
+        # final resolving pass refused leaves a host that is off neither its
+        # declared source nor able to load — reporting it by core's location
+        # alone downgrades the stronger fact to the weaker one.
+        unresolved = restored and getattr(result, "resolve_incomplete", False)
+        ok = restored and not unresolved
+        if restored:
             # Core is where the policy wants it: that is the state this batch
             # now measures later drift against.
             self.refresh()
-        return ok, rendered, shell, result
+        return ok, rendered, shell, result, unresolved
 
     def resolve(self, *, timeout=None) -> CoreGuardOutcome:
         """Check core against the policy, and repair it if it drifted.
@@ -1630,11 +1816,12 @@ class CoreInstallGuard:
         if not self.policy.source_is_verifiable:
             return self._unrestorable(drift, replaced)
 
-        repaired, rendered, shell, result = self._repair(timeout=timeout)
+        repaired, rendered, shell, result, unresolved = self._repair(timeout=timeout)
         return CoreGuardOutcome(
             drift=drift,
             replaced=replaced,
             repaired=repaired,
+            unresolved=unresolved,
             command=rendered,
             shell=shell,
             output="" if repaired else (result.stderr or result.stdout or "").strip(),
@@ -1651,6 +1838,9 @@ class CoreInstallGuard:
           again, so a caller told to tolerate failures may go on.
         * :data:`CORE_UNSAFE` — core moved and the repair **failed**. The venv is
           left running a core the manifest does not declare.
+        * :data:`CORE_UNRESOLVED` — core was put back, and the pass that
+          resolves its dependencies refused. Nothing to restore; a conflict to
+          fix (#3047).
 
         The last one is a safety assertion, not a package-level failure, and
         must not be reachable through ``--continue-on-error`` — a flag whose
@@ -1671,7 +1861,7 @@ class CoreInstallGuard:
         print(f"    {outcome.restore_instruction}", file=sys.stderr)
         for line in outcome.output.splitlines()[-3:]:
             print(f"      {line}", file=sys.stderr)
-        return CORE_UNSAFE
+        return CORE_UNRESOLVED if outcome.unresolved else CORE_UNSAFE
 
 
 def _capture_host_manifest(path: Path) -> int:
@@ -2030,6 +2220,26 @@ def cmd_feature_sync(args) -> int:
             # optional extra says nothing about core's source — treating it as a
             # failed transition skipped every remaining manifest entry, so
             # `--continue-on-error` restarted with packages still pruned.
+            if (
+                is_core
+                and guard.conforms_now()
+                and getattr(result, "resolve_incomplete", False)
+            ):
+                # Core reached its declared source and version — so
+                # `conforms_now()` is True and says nothing about whether the
+                # host can LOAD it. The sequence ended without the pass that
+                # validates core's dependencies succeeding, which is a core
+                # state a restart must not proceed over; leaving it as the
+                # generic package `1` let `--continue-on-error` restart the
+                # fleet onto it (#3047).
+                core_state = _worst_rc(core_state, CORE_UNRESOLVED)
+                print(
+                    "      note: core is the declared install, but the pass "
+                    "that validates its dependencies did not complete — the "
+                    "rest of this batch is skipped and a restart must not "
+                    "proceed. Resolve what failed above, then re-run."
+                )
+                break
             if is_core and not guard.conforms_now():
                 # `install_core` has
                 # already refreshed the guard from whatever core is NOW — the
@@ -2061,16 +2271,17 @@ def cmd_feature_sync(args) -> int:
         # Constraints prevent the common swap; this catches every other path
         # (a feature's own build step, a direct pip call) so sync can never
         # report success over a core that was replaced (issue #2949).
-        # CORE_UNSAFE is returned verbatim — `kestrel update` gates its restart
-        # on this rc under --continue-on-error exactly as reconcile does, so
-        # collapsing it into 1 would reopen the same hole one step earlier.
-        #
         # `verify()` is a second reading of CORE state, so it is RANKED against
         # the first rather than assigned over it — a repaired-core `1` must not
         # erase a CORE_STALE recorded by the pull above.
         core_state = _worst_rc(core_state, guard.verify())
-        if core_state == CORE_UNSAFE:
-            return CORE_UNSAFE
+    # No gate here, deliberately: `_RC_SEVERITY` already ranks every core state
+    # above a package failure, so the fold below returns the core state
+    # verbatim and `kestrel update` gates its restart on it exactly as
+    # reconcile does. An `if core_state == ...: return core_state` in front of
+    # this is dead — it was, and a mutation test that could not kill it is what
+    # said so. The ranking is the mechanism; a comparison beside it is a second
+    # place to forget a code.
     return _worst_rc(core_state, package_rc)
 
 
