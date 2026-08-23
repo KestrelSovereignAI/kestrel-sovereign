@@ -678,8 +678,28 @@ def unsatisfied_requirements(
         # version string that is not PEP 440, so demanding a parseable version
         # first rejects the case the operator was added for — and then reports
         # permanent uncertain drift over an environment that is satisfied.
-        arbitrary = all(item.operator == "===" for item in req.specifier)
-        evaluable = spec_is_valid(spec) and (arbitrary or version_is_valid(have))
+        #
+        # It also has to be COMPARED differently. `version_satisfies` fails open
+        # on an unparseable version, so routing arbitrary equality through it
+        # turns every mismatch into a pass — the exemption handing back the same
+        # blindness it was added to remove. `SpecifierSet` compares the raw
+        # string, which is the whole point of the operator.
+        arbitrary = bool(spec) and all(
+            item.operator == "===" for item in req.specifier
+        )
+        if arbitrary and not version_is_valid(have):
+            if not req.specifier.contains(have):
+                unmet.append(UnmetRequirement(
+                    name,
+                    f"{dist_name} requires {req.name}{spec}, but {have} is "
+                    "installed",
+                ))
+            elif req.extras:
+                unmet.extend(unsatisfied_requirements(
+                    name, tuple(req.extras), requires, installed_version, seen,
+                ))
+            continue
+        evaluable = spec_is_valid(spec) and version_is_valid(have)
         if not evaluable:
             unmet.append(UnmetRequirement(
                 name,

@@ -2990,3 +2990,23 @@ def test_arbitrary_equality_is_honoured_rather_than_called_uncomparable(
     use_fake_uv(monkeypatch, venv)
 
     assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
+
+
+def test_arbitrary_equality_that_does_not_match_is_unmet(monkeypatch):
+    """The exemption must not hand back the blindness it removed.
+
+    `version_satisfies` fails open on an unparseable version, so routing
+    arbitrary equality through it turns every mismatch into a pass. The
+    specifier compares the raw string, which is the whole point of `===`.
+    """
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["legacypkg===vendor-2"]
+    venv.installed["legacypkg"] = "vendor-1"   # a DIFFERENT legacy version
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+
+    assert [r.name for r in unmet] == ["legacypkg"]
+    assert unmet[0].certain is True
+    assert "vendor-1 is installed" in unmet[0].detail
