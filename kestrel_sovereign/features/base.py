@@ -466,10 +466,15 @@ class Feature(_SdkFeature):
             self._owned_signal_source_names = []
             return
         try:
-            # Release what this feature HOLDS. The registry removes each source
-            # only when its last holder lets go, so a source another feature is
-            # still dispatching against survives this teardown (#3053).
-            registry.release_all(self)
+            # ONLY the sources this feature registered itself. Its declared
+            # contributions are released by the contribution runtime, which is a
+            # different teardown that can fail on its own — and
+            # `_unregister_feature_runtime` deliberately continues to here after
+            # a rejected `deactivate()`. Releasing both roles together dropped a
+            # still-active contribution's claim (#3053).
+            from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+
+            registry.release_all(self, CLAIM_IMPERATIVE)
         except Exception as exc:  # noqa: BLE001 - best-effort teardown
             logger.warning(
                 "feature '%s': could not release its signal sources: %s",

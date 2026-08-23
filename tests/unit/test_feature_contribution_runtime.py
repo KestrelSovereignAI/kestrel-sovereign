@@ -931,8 +931,9 @@ def test_the_registry_is_the_only_ownership_ledger(tmp_path):
     assert set(runtime.source_registry.owners_of(name)) == {first, second}
 
     # Tear `first` down through BOTH paths, in the order a real disable uses.
-    runtime.deactivate(first)
-    runtime.source_registry.release_all(first)   # what shutdown() does
+    runtime.deactivate(first)                    # the declarative teardown
+    from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+    runtime.source_registry.release_all(first, CLAIM_IMPERATIVE)  # shutdown()
 
     # `second` is still active, so the source is still there for it.
     assert runtime.is_active(second)
@@ -942,3 +943,35 @@ def test_the_registry_is_the_only_ownership_ledger(tmp_path):
     # And when the last holder goes, so does the source.
     runtime.deactivate(second)
     assert runtime.source_registry.get(name) is None
+
+
+def test_a_failed_declarative_teardown_keeps_its_source(tmp_path):
+    """`shutdown()` runs even after `deactivate()` was rejected.
+
+    `_unregister_feature_runtime` deliberately continues to `shutdown()` when
+    the declarative teardown raises, so releasing BOTH roles there dropped a
+    still-active contribution's claim and could take its source with it. The
+    contribution keeps its claim until its own teardown succeeds.
+    """
+    from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    agent.signal_registry = runtime.source_registry
+
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    name = feature.source.name
+    assert runtime.source_registry.get(name) is feature.source
+
+    # Break an unrelated inverse so the declarative teardown is rejected.
+    runtime.wait_registry.unregister(feature.wait_provider.kind)
+    with pytest.raises(FeatureContributionRuntimeError, match="wait-provider"):
+        runtime.deactivate(feature)
+
+    # shutdown() still runs, and releases only what the feature registered itself.
+    runtime.source_registry.release_all(feature, CLAIM_IMPERATIVE)
+
+    # The contribution is still active, so its source is still there.
+    assert runtime.is_active(feature)
+    assert runtime.source_registry.get(name) is feature.source

@@ -89,6 +89,12 @@ class RegistrationError(ValueError):
     """
 
 
+#: A feature holds sources in two independent roles: ones it registered itself,
+#: and ones its declared contributions activated. They tear down by different
+#: paths and either can fail alone, so they are separate claims (issue #3053).
+CLAIM_IMPERATIVE = "imperative"
+CLAIM_CONTRIBUTION = "contribution"
+
 #: Marks the host as a holder of a source (issue #3053). The host outlives every
 #: feature, so this claim is never released — only `unregister` clears it.
 _HOST_CLAIM = "host"
@@ -220,9 +226,11 @@ class SourceRegistry:
         finally:
             self._acquisition_logs.pop()
 
-    def release_acquired(self, acquired, owner) -> None:
+    def release_acquired(
+        self, acquired, owner, role: str = CLAIM_CONTRIBUTION
+    ) -> None:
         """Release exactly the claims recorded by :meth:`claims_acquired`."""
-        key = _HOST_CLAIM if owner is None else id(owner)
+        key = _HOST_CLAIM if owner is None else (id(owner), role)
         for name in acquired:
             holders = self._claims.get(name)
             if not holders or key not in holders:
@@ -241,7 +249,7 @@ class SourceRegistry:
         for log in self._acquisition_logs:
             log.append(name)
 
-    def _claim(self, name: str, owner) -> None:
+    def _claim(self, name: str, owner, role: str = CLAIM_CONTRIBUTION) -> None:
         """Record *owner* as a holder of *name*. ``None`` means the host.
 
         The host IS a holder — it just never lets go. Recording nothing for it
@@ -256,7 +264,7 @@ class SourceRegistry:
                 holders.append(_HOST_CLAIM)
                 self._record_acquisition(name)
             return
-        key = id(owner)
+        key = (id(owner), role)
         if key not in holders:
             holders.append(key)
             self._claim_owners[key] = owner
@@ -276,13 +284,16 @@ class SourceRegistry:
 
     def owners_of(self, name: str) -> tuple:
         """The objects currently holding *name*, in the order they claimed it."""
-        return tuple(
-            self._claim_owners[key]
-            for key in self._claims.get(name, ())
-            if key is not _HOST_CLAIM and key in self._claim_owners
-        )
+        seen: list = []
+        for key in self._claims.get(name, ()):
+            if key is _HOST_CLAIM or key not in self._claim_owners:
+                continue
+            owner = self._claim_owners[key]
+            if not any(owner is existing for existing in seen):
+                seen.append(owner)
+        return tuple(seen)
 
-    def release(self, name: str, owner) -> bool:
+    def release(self, name: str, owner, role: str = CLAIM_CONTRIBUTION) -> bool:
         """Drop *owner*'s claim on *name*; remove the source with the last one.
 
         Returns True when the source itself was removed. This is what replaces
@@ -291,7 +302,7 @@ class SourceRegistry:
         reference count kept somewhere else, no second list to agree with.
         """
         holders = self._claims.get(name)
-        key = id(owner)
+        key = (id(owner), role)
         if not holders or key not in holders:
             return False
         holders.remove(key)
@@ -301,7 +312,9 @@ class SourceRegistry:
         self._claims.pop(name, None)
         return self._sources.pop(name, None) is not None
 
-    def adopt(self, name: str, owner, *, created: bool) -> None:
+    def adopt(
+        self, name: str, owner, *, created: bool, role: str = CLAIM_IMPERATIVE
+    ) -> None:
         """Record *owner* as a holder AFTER the fact.
 
         For call sites that cannot pass ``owner=`` at registration — the
@@ -319,13 +332,23 @@ class SourceRegistry:
             holders = self._claims.setdefault(name, [])
             if _HOST_CLAIM in holders:
                 holders.remove(_HOST_CLAIM)
-        self._claim(name, owner)
+        self._claim(name, owner, role)
 
-    def release_all(self, owner) -> tuple:
-        """Release every claim *owner* holds. Returns the names actually removed."""
+    def release_all(self, owner, role: str = CLAIM_CONTRIBUTION) -> tuple:
+        """Release every claim *owner* holds IN THIS ROLE.
+
+        A feature is two independent dependents: what it registered itself
+        (``CLAIM_IMPERATIVE``) and what its declared contributions activated
+        (``CLAIM_CONTRIBUTION``). They are torn down by different code paths and
+        either can fail on its own — `_unregister_feature_runtime` deliberately
+        continues to `shutdown()` after a rejected `deactivate()` — so releasing
+        both together dropped a still-active contribution's claim and could take
+        its source with it (issue #3053).
+        """
         removed = []
-        for name in [n for n, h in self._claims.items() if id(owner) in h]:
-            if self.release(name, owner):
+        key = (id(owner), role)
+        for name in [n for n, h in self._claims.items() if key in h]:
+            if self.release(name, owner, role):
                 removed.append(name)
         return tuple(removed)
 
