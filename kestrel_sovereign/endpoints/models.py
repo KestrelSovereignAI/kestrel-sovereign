@@ -570,6 +570,28 @@ def _restore_registration_for_custody_response(
     return False
 
 
+def _annotate_custody_registration_detail(
+    detail: Dict[str, object],
+    *,
+    admission: Optional[RuntimeOffboardingAdmission],
+    rollback: Optional[tuple[object, str, object]],
+    requires_reconciliation: bool,
+) -> Dict[str, object]:
+    """Add truthful persisted-registration state to a custody response."""
+
+    if requires_reconciliation:
+        detail["persisted_registration_requires_reconciliation"] = True
+    if rollback is not None:
+        detail["persisted_registration_removed"] = bool(
+            rollback[2] is not None
+            and (
+                requires_reconciliation
+                or (admission is not None and admission.started)
+            )
+        )
+    return detail
+
+
 @router.delete("/api/agents/{agent_name}")
 @limiter.limit("10/minute")
 async def delete_agent(
@@ -652,18 +674,15 @@ async def delete_agent(
                 request,
                 offboarding_admission,
                 registration_rollback,
-                agent_name=agent_name,
+                agent_name=manager_agent_name,
             )
         )
-        detail = dict(exc.metadata)
-        if registration_requires_reconciliation:
-            detail["persisted_registration_requires_reconciliation"] = True
-        if registration_rollback is not None:
-            detail["persisted_registration_removed"] = bool(
-                registration_rollback[2] is not None
-                and offboarding_admission is not None
-                and offboarding_admission.started
-            )
+        detail = _annotate_custody_registration_detail(
+            dict(exc.metadata),
+            admission=offboarding_admission,
+            rollback=registration_rollback,
+            requires_reconciliation=registration_requires_reconciliation,
+        )
         raise HTTPException(status_code=409, detail=detail)
     except RuntimeOffboardingNotPerformedError as exc:
         # The agent is gone, but destructive intent did not remove a tree.
@@ -673,18 +692,15 @@ async def delete_agent(
                 request,
                 offboarding_admission,
                 registration_rollback,
-                agent_name=agent_name,
+                agent_name=manager_agent_name,
             )
         )
-        detail = dict(exc.metadata)
-        if registration_requires_reconciliation:
-            detail["persisted_registration_requires_reconciliation"] = True
-        if registration_rollback is not None:
-            detail["persisted_registration_removed"] = bool(
-                registration_rollback[2] is not None
-                and offboarding_admission is not None
-                and offboarding_admission.started
-            )
+        detail = _annotate_custody_registration_detail(
+            dict(exc.metadata),
+            admission=offboarding_admission,
+            rollback=registration_rollback,
+            requires_reconciliation=registration_requires_reconciliation,
+        )
         raise HTTPException(status_code=409, detail=detail)
     except BaseExceptionGroup as exc:
         current_task = asyncio.current_task()
@@ -704,32 +720,36 @@ async def delete_agent(
             raise
         detail = _grouped_runtime_retained_detail(exc)
         if detail is None:
-            _restore_registration_if_offboarding_not_admitted(
-                request,
-                offboarding_admission,
-                registration_rollback,
-            )
+            try:
+                _restore_registration_if_offboarding_not_admitted(
+                    request,
+                    offboarding_admission,
+                    registration_rollback,
+                )
+            except Exception as rollback_error:
+                raise BaseExceptionGroup(
+                    "Agent deletion failure and registration compensation failed",
+                    [exc, rollback_error],
+                )
             raise
         registration_requires_reconciliation = (
             _restore_registration_for_custody_response(
                 request,
                 offboarding_admission,
                 registration_rollback,
-                agent_name=agent_name,
+                agent_name=manager_agent_name,
             )
         )
-        if registration_requires_reconciliation:
-            detail["persisted_registration_requires_reconciliation"] = True
-        if registration_rollback is not None:
-            detail["persisted_registration_removed"] = bool(
-                registration_rollback[2] is not None
-                and offboarding_admission is not None
-                and offboarding_admission.started
-            )
+        detail = _annotate_custody_registration_detail(
+            detail,
+            admission=offboarding_admission,
+            rollback=registration_rollback,
+            requires_reconciliation=registration_requires_reconciliation,
+        )
         logger.error(
             "Agent '%s' was removed with retained runtime and additional "
             "terminal outcomes",
-            agent_name,
+            manager_agent_name,
             exc_info=True,
         )
         raise HTTPException(status_code=409, detail=detail)
@@ -746,7 +766,7 @@ async def delete_agent(
                 logger.error(
                     "Could not restore persisted registration after refused "
                     "offboarding of %r",
-                    agent_name,
+                    manager_agent_name,
                     exc_info=True,
                 )
                 raise HTTPException(
@@ -770,12 +790,18 @@ async def delete_agent(
                 [exc, rollback_error],
             )
         raise
-    except Exception:
-        _restore_registration_if_offboarding_not_admitted(
-            request,
-            offboarding_admission,
-            registration_rollback,
-        )
+    except Exception as exc:
+        try:
+            _restore_registration_if_offboarding_not_admitted(
+                request,
+                offboarding_admission,
+                registration_rollback,
+            )
+        except Exception as rollback_error:
+            raise BaseExceptionGroup(
+                "Agent deletion failure and registration compensation failed",
+                [exc, rollback_error],
+            )
         raise
     if not removed:
         if registration_rollback is not None and (
@@ -787,7 +813,7 @@ async def delete_agent(
                 logger.error(
                     "Could not restore persisted registration after agent %r "
                     "was not found",
-                    agent_name,
+                    manager_agent_name,
                     exc_info=True,
                 )
                 raise HTTPException(

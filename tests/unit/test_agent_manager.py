@@ -131,6 +131,38 @@ def _admitted_offboarding_success() -> AsyncMock:
     return AsyncMock(side_effect=succeed)
 
 
+def _endpoint_custody_outcome(
+    outcome_kind: str,
+    *,
+    private_path: Path,
+) -> BaseException:
+    """Build one sanitized public custody shape with private internal causes."""
+
+    retained = RuntimeOffboardingRetainedError(
+        agent_name="Hosted",
+        agent_id="did:test:restore-conflict",
+        runtime_path=private_path.parent,
+        cause=OSError(f"private cleanup failure at {private_path}"),
+    )
+    if outcome_kind == "retained":
+        return retained
+    if outcome_kind == "not-performed":
+        return RuntimeOffboardingNotPerformedError(
+            agent_name="Hosted",
+            agent_id="did:test:restore-conflict",
+            cleanup_state="already_absent",
+        )
+    if outcome_kind == "grouped-retained":
+        return ExceptionGroup(
+            "compound offboarding result",
+            [
+                retained,
+                RuntimeError(f"private refund failure at {private_path}"),
+            ],
+        )
+    raise AssertionError(f"unsupported test outcome kind: {outcome_kind}")
+
+
 @pytest.mark.parametrize("value", ["30s", "nan", "inf", "0", "-1"])
 def test_runtime_offboard_timeout_rejects_invalid_values_actionably(value):
     with pytest.raises(
@@ -1828,28 +1860,10 @@ class TestAgentManagerBasics:
         config = MultiAgentConfig(agents={"Hosted": original})
         config.save(config_path)
         private_path = tmp_path / "private-runtime" / "credential.json"
-        retained = RuntimeOffboardingRetainedError(
-            agent_name="Hosted",
-            agent_id="did:test:restore-conflict",
-            runtime_path=private_path.parent,
-            cause=OSError(f"private cleanup failure at {private_path}"),
+        outcome = _endpoint_custody_outcome(
+            outcome_kind,
+            private_path=private_path,
         )
-        if outcome_kind == "retained":
-            outcome: BaseException = retained
-        elif outcome_kind == "not-performed":
-            outcome = RuntimeOffboardingNotPerformedError(
-                agent_name="Hosted",
-                agent_id="did:test:restore-conflict",
-                cleanup_state="already_absent",
-            )
-        else:
-            outcome = ExceptionGroup(
-                "compound offboarding result",
-                [
-                    retained,
-                    RuntimeError(f"private refund failure at {private_path}"),
-                ],
-            )
 
         async def conflict_then_fail(_name, **kwargs):
             admission = kwargs["offboarding_admission"]
@@ -1891,7 +1905,7 @@ class TestAgentManagerBasics:
         detail = raised.value.detail
         assert detail["code"] == expected_code
         assert detail["runtime_cleanup_state"] == expected_cleanup_state
-        assert detail["persisted_registration_removed"] is False
+        assert detail["persisted_registration_removed"] is True
         assert detail["persisted_registration_requires_reconciliation"] is True
         assert str(private_path) not in str(detail)
         assert "private cleanup failure" not in str(detail)
@@ -1901,6 +1915,258 @@ class TestAgentManagerBasics:
             == replacement
         )
         assert "operator reconciliation is required" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome_kind",
+        ("retained", "not-performed", "grouped-retained"),
+    )
+    async def test_delete_endpoint_custody_409_reports_registration_restored(
+        self,
+        tmp_path,
+        outcome_kind,
+    ):
+        """A successful pre-admission compensation retains the original row."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/original"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        outcome = _endpoint_custody_outcome(
+            outcome_kind,
+            private_path=tmp_path / "private-runtime" / "credential.json",
+        )
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
+            remove_agent=AsyncMock(side_effect=outcome),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        detail = raised.value.detail
+        assert detail["persisted_registration_removed"] is False
+        assert "persisted_registration_requires_reconciliation" not in detail
+        assert MultiAgentConfig.from_file(config_path).agents["Hosted"] == original
+        assert request.app.state.multi_agent_config.agents["Hosted"] == original
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome_kind", "expected_code", "expected_cleanup_state"),
+        (
+            (
+                "retained",
+                "runtime_offboarding_retained",
+                "retained",
+            ),
+            (
+                "not-performed",
+                "runtime_offboarding_not_performed",
+                "already_absent",
+            ),
+            (
+                "grouped-retained",
+                "runtime_offboarding_retained",
+                "retained",
+            ),
+        ),
+    )
+    @pytest.mark.parametrize(
+        "restore_failure",
+        ("missing", "invalid", "write-failure"),
+    )
+    async def test_delete_endpoint_marks_removed_when_config_restore_fails(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+        outcome_kind,
+        expected_code,
+        expected_cleanup_state,
+        restore_failure,
+    ):
+        """Unreadable or unwritable desired state retains truthful custody."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/original"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        private_path = tmp_path / "private-runtime" / "credential.json"
+        outcome = _endpoint_custody_outcome(
+            outcome_kind,
+            private_path=private_path,
+        )
+
+        if restore_failure == "write-failure":
+            real_save = MultiAgentConfig.save
+            save_calls = 0
+
+            def fail_restore_save(candidate, path=None):
+                nonlocal save_calls
+                save_calls += 1
+                if save_calls == 2:
+                    raise PermissionError(
+                        f"private config volume at {tmp_path / 'operator.toml'}"
+                    )
+                return real_save(candidate, path)
+
+            monkeypatch.setattr(MultiAgentConfig, "save", fail_restore_save)
+
+        async def damage_config_then_fail(name, **kwargs):
+            assert name == "Hosted"
+            admission = kwargs["offboarding_admission"]
+            assert isinstance(admission, RuntimeOffboardingAdmission)
+            assert admission.started is False
+            if restore_failure == "missing":
+                config_path.unlink()
+            elif restore_failure == "invalid":
+                config_path.write_text("[agents.invalid", encoding="utf-8")
+            raise outcome
+
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(
+                return_value="did:test:restore-conflict"
+            ),
+            remove_agent=AsyncMock(side_effect=damage_config_then_fail),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+        caplog.set_level(
+            "ERROR",
+            logger="kestrel_sovereign.endpoints.models",
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "hOsTeD",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        detail = raised.value.detail
+        assert detail["code"] == expected_code
+        assert detail["runtime_cleanup_state"] == expected_cleanup_state
+        assert detail["persisted_registration_removed"] is True
+        assert detail["persisted_registration_requires_reconciliation"] is True
+        assert str(private_path) not in str(detail)
+        assert "private cleanup failure" not in str(detail)
+        assert "private refund failure" not in str(detail)
+        assert "operator.toml" not in str(detail)
+        assert "operator reconciliation is required" in caplog.text
+        assert "agent 'Hosted'" in caplog.text
+        assert "hOsTeD" not in caplog.text
+        if restore_failure == "missing":
+            assert not config_path.exists()
+        elif restore_failure == "invalid":
+            with pytest.raises(ValueError, match="Invalid TOML"):
+                MultiAgentConfig.from_file(config_path)
+        else:
+            assert MultiAgentConfig.from_file(config_path).agents == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("manager_outcome", "expected_log"),
+        (
+            ("value-error", "refused offboarding of 'Hosted'"),
+            ("not-found", "after agent 'Hosted' was not found"),
+        ),
+    )
+    async def test_delete_endpoint_reconciliation_logs_use_persisted_key(
+        self,
+        tmp_path,
+        caplog,
+        manager_outcome,
+        expected_log,
+    ):
+        """All post-resolution reconciliation alerts use the TOML key."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/original"),
+            port=8801,
+            autostart=True,
+        )
+        replacement = LocalAgentConfig(
+            data_dir=Path("agent_data/concurrent"),
+            port=8899,
+            autostart=False,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+
+        async def conflict_after_removal(name, **_kwargs):
+            assert name == "Hosted"
+            MultiAgentConfig(agents={"Hosted": replacement}).save(config_path)
+            if manager_outcome == "value-error":
+                raise ValueError(f"private refusal at {tmp_path}")
+            return False
+
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
+            remove_agent=AsyncMock(side_effect=conflict_after_removal),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+        caplog.set_level(
+            "ERROR",
+            logger="kestrel_sovereign.endpoints.models",
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "hOsTeD",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 500
+        assert str(tmp_path) not in str(raised.value.detail)
+        assert expected_log in caplog.text
+        assert "hOsTeD" not in caplog.text
+        assert MultiAgentConfig.from_file(config_path).agents["Hosted"] == replacement
 
     @pytest.mark.asyncio
     async def test_delete_endpoint_restores_registration_when_removal_is_refused(
@@ -2043,6 +2309,176 @@ class TestAgentManagerBasics:
         restored = MultiAgentConfig.from_file(config_path)
         assert restored.agents["Hosted"] == original
         assert request.app.state.multi_agent_config.agents["Hosted"] == original
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "process_failure",
+        (KeyboardInterrupt(), SystemExit(17)),
+        ids=("keyboard-interrupt", "system-exit"),
+    )
+    async def test_delete_endpoint_preserves_grouped_process_control_when_restore_fails(
+        self,
+        tmp_path,
+        process_failure,
+    ):
+        """Compensation failure cannot replace a process-control group."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/hosted"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        retained = RuntimeOffboardingRetainedError(
+            agent_name="Hosted",
+            agent_id="did:test:process-control",
+            runtime_path=tmp_path / "private-runtime",
+            cause=OSError(f"private cleanup failure at {tmp_path}"),
+        )
+        terminal = BaseExceptionGroup(
+            "manager process-control outcome",
+            [retained, process_failure],
+        )
+
+        async def remove_config_then_fail(_name, **_kwargs):
+            config_path.unlink()
+            raise terminal
+
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(
+                return_value="did:test:process-control"
+            ),
+            remove_agent=AsyncMock(side_effect=remove_config_then_fail),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.exceptions[0] is terminal
+        assert isinstance(raised.value.exceptions[1], FileNotFoundError)
+        leaves = _exception_leaves(raised.value)
+        assert retained in leaves
+        assert process_failure in leaves
+        assert str(tmp_path) not in str(raised.value)
+        assert not config_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_preserves_ordinary_failure_when_restore_fails(
+        self,
+        tmp_path,
+    ):
+        """The generic failure tail aggregates rather than masks either error."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/hosted"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        failure = RuntimeError(f"private manager failure at {tmp_path}")
+
+        async def remove_config_then_fail(_name, **_kwargs):
+            config_path.unlink()
+            raise failure
+
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(
+                return_value="did:test:ordinary-failure"
+            ),
+            remove_agent=AsyncMock(side_effect=remove_config_then_fail),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.exceptions[0] is failure
+        assert isinstance(raised.value.exceptions[1], FileNotFoundError)
+        assert str(tmp_path) not in str(raised.value)
+        assert not config_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_preserves_cancellation_when_restore_fails(
+        self,
+        tmp_path,
+    ):
+        """Bare request cancellation retains precedence and compensation detail."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/hosted"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        cancelled = asyncio.CancelledError()
+
+        async def remove_config_then_cancel(_name, **_kwargs):
+            config_path.unlink()
+            raise cancelled
+
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(
+                return_value="did:test:cancelled-failure"
+            ),
+            remove_agent=AsyncMock(side_effect=remove_config_then_cancel),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.exceptions[0] is cancelled
+        assert isinstance(raised.value.exceptions[1], FileNotFoundError)
+        assert not config_path.exists()
 
     @pytest.mark.asyncio
     async def test_delete_endpoint_reports_unpublished_agent_with_retained_runtime(
