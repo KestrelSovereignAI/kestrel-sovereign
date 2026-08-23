@@ -1179,6 +1179,143 @@ def test_health_rejects_fleet_when_one_loaded_agent_is_in_safe_mode():
     assert detailed.json()["constitution_safe_mode"][0]["agent"] == "restricted"
 
 
+def test_safe_mode_still_names_the_feature_a_fleet_agent_refused():
+    """The two conditions that co-occur when a host is already degraded.
+
+    The safe-mode branch returns before the fleet walk that carries
+    `features_not_loaded`, and it used to ask the SINGLETON agent — which is
+    `None` on every multi-agent host, so the helper read through `getattr` and
+    no-oped. The operator saw "restricted" and no reason to suspect a missing
+    capability, in the one response whose whole job is to carry them (#3079).
+    """
+    from types import SimpleNamespace
+
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    restricted = MagicMock()
+    restricted._safe_mode = True
+    restricted._safe_mode_entered_at = None
+    restricted._constitution_state_load_error = None
+    restricted.rejected_feature_contributions = (
+        SimpleNamespace(
+            feature_name="TalonCoordinatorFeature",
+            reason=(
+                "signal source already registered with a different contract: "
+                "fleet_stalled_sweep"
+            ),
+        ),
+    )
+    manager = MagicMock()
+    manager.list_agents.return_value = {"kite": restricted}
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None  # every multi-agent host
+        app.state.agent_manager = manager
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                detailed = client.get(
+                    "/health/detailed",
+                    headers={"Authorization": "Bearer test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    body = detailed.json()
+    assert detailed.status_code == 503
+    assert body["status"] == "restricted"
+    # The safe mode is still reported...
+    assert body["constitution_safe_mode"][0]["agent"] == "kite"
+    # ...and so is the capability the host is missing, naming WHICH agent lost
+    # it: a host-level list is not scoped to one agent.
+    assert body["features_not_loaded"] == [
+        {
+            "agent": "kite",
+            "feature": "TalonCoordinatorFeature",
+            "reason": (
+                "signal source already registered with a different contract: "
+                "fleet_stalled_sweep"
+            ),
+        }
+    ]
+
+
+def test_safe_mode_manufactures_no_key_when_nothing_was_refused():
+    """No rejections must not invent an empty list in the response."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    restricted = MagicMock()
+    restricted._safe_mode = True
+    restricted._safe_mode_entered_at = None
+    restricted._constitution_state_load_error = None
+    restricted.rejected_feature_contributions = ()
+    manager = MagicMock()
+    manager.list_agents.return_value = {"kite": restricted}
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                detailed = client.get(
+                    "/health/detailed",
+                    headers={"Authorization": "Bearer test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    assert "features_not_loaded" not in detailed.json()
+
+
 def test_health_reports_startup_audit_pending_as_restricted():
     from kestrel_sovereign.server import _constitution_safe_mode_record
 

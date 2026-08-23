@@ -3410,6 +3410,11 @@ def _with_contribution_rejections(agent, result: dict) -> dict:
     Never reports ``healthy`` over a refused contribution — the host is running
     without something it was configured to have, which is the definition of
     degraded.
+
+    Takes ONE agent, and its entries do not name it, because every response
+    that uses it is already scoped to that agent. A host-level response is not:
+    see :func:`_contribution_rejection_records`, which walks the fleet and
+    names each one.
     """
     rejections = tuple(getattr(agent, "rejected_feature_contributions", ()) or ())
     if not rejections:
@@ -3422,6 +3427,43 @@ def _with_contribution_rejections(agent, result: dict) -> dict:
     if merged.get("status") == "healthy":
         merged["status"] = "degraded"
     return merged
+
+
+def _contribution_rejection_records(agent, manager) -> list[dict]:
+    """Refused feature contributions across the whole host, each naming its agent.
+
+    The same singleton-then-fleet walk as
+    :func:`_constitution_safe_mode_records`, and for the same reason: on a
+    multi-agent host ``app.state.agent`` is ``None``, so anything that asks only
+    the singleton reports nothing while the fleet is degraded. That is exactly
+    what happened to the safe-mode branch of ``/health/detailed`` — it called
+    the single-agent helper, which read through ``getattr`` and no-oped, and
+    the fleet walk that carries these was never reached (#3079).
+
+    Entries name their agent because a host-level list is not scoped to one:
+    "some feature somewhere did not load" is not a diagnostic.
+    """
+    records: list[dict] = []
+    seen: set[int] = set()
+
+    def collect(name, candidate) -> None:
+        if candidate is None or id(candidate) in seen:
+            return
+        seen.add(id(candidate))
+        for rejection in getattr(candidate, "rejected_feature_contributions", ()) or ():
+            records.append(
+                {
+                    "agent": name,
+                    "feature": rejection.feature_name,
+                    "reason": rejection.reason,
+                }
+            )
+
+    collect(getattr(agent, "_agent_name", None) or "default", agent)
+    if manager is not None:
+        for name, managed_agent in manager.list_agents().items():
+            collect(name, managed_agent)
+    return records
 
 
 async def _agent_detailed_health(agent) -> dict:
@@ -3536,22 +3578,23 @@ async def health_detailed(request: Request):
         # the agent entirely. A diagnostic response that drops the diagnostics is
         # the one place it is least affordable (#2951).
         #
-        # `_with_contribution_rejections` reads through `getattr`, so a None
-        # agent is a no-op rather than a branch.
+        # Asked of the FLEET, not of the singleton. This branch used to call the
+        # single-agent helper, which reads through `getattr` and no-ops on the
+        # `None` that every multi-agent host has — and it returns before the
+        # fleet walk below, so the diagnostic was dropped in exactly the two
+        # conditions that co-occur when a host is already degraded (#3079).
+        content = {
+            "status": "restricted",
+            "constitution_safe_mode": safe_mode_records,
+            "checks": [],
+            "tracing": tracing,
+        }
+        rejections = _contribution_rejection_records(agent, manager)
+        if rejections:
+            content["features_not_loaded"] = rejections
         return JSONResponse(
             status_code=503,
-            content=_with_host_feature_rejections(
-                request.app.state,
-                _with_contribution_rejections(
-                    agent,
-                    {
-                        "status": "restricted",
-                        "constitution_safe_mode": safe_mode_records,
-                        "checks": [],
-                        "tracing": tracing,
-                    },
-                ),
-            ),
+            content=_with_host_feature_rejections(request.app.state, content),
         )
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
