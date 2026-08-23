@@ -1455,6 +1455,8 @@ async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
 
     from kestrel_sovereign.features import isolated_runtime
 
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
     manager = AgentManager(base_data_dir=tmp_path)
     did = f"did:test:sealed-{identity_kind}-offboarding"
     name = "Cold"
@@ -1844,6 +1846,113 @@ async def test_handed_off_offboarding_failure_is_owned_once_and_remains_visible(
 
     manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
     assert manager.get_agent("hostile") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ("removed", "not_hosted"))
+async def test_quarantined_offboard_preserves_cancellation_on_every_custody_outcome(
+    monkeypatch,
+    outcome,
+) -> None:
+    """A successful/no-op worker cannot erase cancellation of its joiner."""
+
+    from kestrel_sovereign.features import isolated_runtime
+    from kestrel_sovereign.multi_agent.agent_manager import (
+        RuntimeOffboardingNotPerformedError,
+    )
+
+    manager = AgentManager()
+    agent = SimpleNamespace(agent_id=f"did:test:cancelled-{outcome}")
+    manager._agent_names[agent.agent_id] = "Hosted"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def finish_after_cancellation(_agent):
+        entered.set()
+        release.wait(timeout=5)
+        return (
+            isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+            if outcome == "removed"
+            else isolated_runtime.RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+        )
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_agent_runtime_namespace",
+        finish_after_cancellation,
+    )
+    operation = asyncio.create_task(
+        manager._offboard_agent_runtime_namespace(agent)
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        operation.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        cancelled, failure = await operation
+    finally:
+        release.set()
+
+    assert cancelled is True
+    if outcome == "removed":
+        assert failure is None
+    else:
+        assert isinstance(failure, RuntimeOffboardingNotPerformedError)
+        assert failure.cleanup_state == "not_hosted"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_successful_quarantined_offboard_is_terminally_accounted(
+    monkeypatch,
+) -> None:
+    """Terminal drain sees cancellation even when the deletion itself succeeds."""
+
+    from kestrel_sovereign.features import isolated_runtime
+
+    manager = AgentManager()
+    agent = SimpleNamespace(agent_id="did:test:cancelled-successful-offboard")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def finish_after_cancellation(_agent):
+        entered.set()
+        release.wait(timeout=5)
+        return isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_agent_runtime_namespace",
+        finish_after_cancellation,
+    )
+
+    async def retained_owner() -> None:
+        cancelled, failure = await manager._offboard_agent_runtime_namespace(agent)
+        if failure is not None:
+            raise failure
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    owner = asyncio.create_task(retained_owner())
+    manager._retain_quarantined_cleanup(
+        name="Hosted",
+        agent_id=agent.agent_id,
+        task=owner,
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        owner.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(ExceptionGroup, match="quarantined shutdown reapers"):
+            await manager.drain_quarantined_shutdowns()
+    finally:
+        release.set()
+
+    retained = manager.quarantined_shutdowns()
+    assert len(retained) == 1
+    assert next(iter(retained.values()))["failure"] == (
+        "shutdown reaper was cancelled"
+    )
 
 
 @pytest.mark.asyncio

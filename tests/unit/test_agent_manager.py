@@ -1783,8 +1783,11 @@ class TestAgentManagerBasics:
     @pytest.mark.asyncio
     async def test_explicit_offboard_removes_authorized_cold_agent_runtime(
         self,
+        monkeypatch,
         tmp_path,
     ):
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
         manager = AgentManager(base_data_dir=tmp_path)
         did = "did:pkh:cold-offboarding"
         scope = resolve_isolated_runtime_namespace(
@@ -1827,6 +1830,8 @@ class TestAgentManagerBasics:
 
         from kestrel_sovereign.features import isolated_runtime
 
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
         manager = AgentManager(base_data_dir=tmp_path)
         did = "did:pkh:registered-cold-offboarding"
         scope = resolve_isolated_runtime_namespace(
@@ -1866,6 +1871,111 @@ class TestAgentManagerBasics:
         assert not manager.is_scheduler_agent_authorized(did)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("hosted", "expected_state"),
+        ((False, "not_hosted"), (True, "already_absent")),
+        ids=("cold-storage-backed", "cold-hosted-already-absent"),
+    )
+    async def test_cold_identity_offboarding_preserves_typed_custody_outcome(
+        self,
+        monkeypatch,
+        tmp_path,
+        hosted,
+        expected_state,
+    ):
+        """Cold cleanup reports the factory contract, never a synthesized path."""
+
+        if hosted:
+            monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+            monkeypatch.setenv(
+                "KESTREL_DATABASE_URL", "postgresql://host/kestrel"
+            )
+        else:
+            monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+            monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = f"did:pkh:cold-custody-{expected_state}"
+        # A stale tree at the DID-derived location is not authority to delete it
+        # when this manager's factory is storage-backed.
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        if not hosted:
+            prepare_isolated_runtime_namespace(scope, did)
+            retained = scope.path / "credential"
+            retained.write_text("storage-backed-custody")
+
+        with pytest.raises(RuntimeOffboardingNotPerformedError) as raised:
+            await manager.remove_agent(
+                "Cold",
+                offboard_runtime=True,
+                known_agent_id=did,
+            )
+
+        assert raised.value.metadata["runtime_cleanup_state"] == expected_state
+        assert raised.value.metadata["hosted_runtime_configured"] is hosted
+        assert raised.value.metadata["runtime_already_absent"] is hosted
+        if not hosted:
+            assert retained.read_text() == "storage-backed-custody"
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_cold_storage_agent_reports_not_hosted_custody(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+        monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:cold-storage-endpoint"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(scope, did)
+        retained = scope.path / "credential"
+        retained.write_text("must-not-be-inferred-from-path")
+        local = LocalAgentConfig(
+            data_dir=Path("agent_data/cold-storage"),
+            port=8801,
+            autostart=False,
+        )
+        config = MultiAgentConfig(agents={"Cold": local})
+        config_path = tmp_path / "multi_agent.toml"
+        config.save(config_path)
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+            AsyncMock(return_value=did),
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Cold",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        assert raised.value.detail["runtime_cleanup_state"] == "not_hosted"
+        assert raised.value.detail["hosted_runtime_configured"] is False
+        assert raised.value.detail["runtime_offboarded"] is False
+        assert raised.value.detail["persisted_registration_removed"] is True
+        assert retained.read_text() == "must-not-be-inferred-from-path"
+        assert MultiAgentConfig.from_file(config_path).agents == {}
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("cleanup_outcome", ("success", "failure", "pending"))
     async def test_delete_endpoint_offboards_registered_unloaded_agent_truthfully(
         self,
@@ -1876,6 +1986,8 @@ class TestAgentManagerBasics:
         from kestrel_sovereign.endpoints.models import delete_agent
         from kestrel_sovereign.features import isolated_runtime
 
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
         manager = AgentManager(base_data_dir=tmp_path)
         did = f"did:pkh:cold-endpoint-{cleanup_outcome}"
         scope = resolve_isolated_runtime_namespace(

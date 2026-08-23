@@ -296,7 +296,33 @@ class InflightRuntimeOffboarding:
     agent_name: str
     agent_id: str
     runtime_path: Optional[Path]
-    task: "asyncio.Task[bool]"
+    task: "asyncio.Task[object]"
+
+
+def _runtime_offboarding_outcome_error(
+    *,
+    agent_name: str,
+    agent_id: str,
+    result: object,
+) -> Optional[BaseException]:
+    """Translate one typed filesystem custody result without path inference."""
+
+    from kestrel_sovereign.features.isolated_runtime import (
+        RuntimeNamespaceCleanupOutcome,
+    )
+
+    if result is RuntimeNamespaceCleanupOutcome.REMOVED:
+        return None
+    if (
+        result is RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+        or result is RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+    ):
+        return RuntimeOffboardingNotPerformedError(
+            agent_name=agent_name,
+            agent_id=agent_id,
+            cleanup_state=result.value,
+        )
+    return TypeError("secure runtime offboarding returned an invalid outcome")
 
 
 def _bounded_shutdown_metadata(value: object) -> str:
@@ -715,6 +741,15 @@ class AgentManager:
             self._isolated_runtime_root,
             derive_isolated_runtime_namespace(agent_did),
         )
+
+    @staticmethod
+    def _hosted_agent_runtime_factory_configured(
+        db_backend: str,
+        database_url: Optional[str],
+    ) -> bool:
+        """Mirror the factory condition that supplies an explicit PG scope."""
+
+        return db_backend.lower() == "postgres" and bool(database_url)
 
     def set_agent_registration_hook(
         self,
@@ -1322,7 +1357,10 @@ class AgentManager:
                     ),
                 )
             )
-            if db_backend.lower() == "postgres" and database_url:
+            if self._hosted_agent_runtime_factory_configured(
+                db_backend,
+                database_url,
+            ):
                 runtime_root, runtime_namespace = self._isolated_runtime_scope(
                     agent_did
                 )
@@ -2897,24 +2935,14 @@ class AgentManager:
         if failure is not None:
             return cancelled, failure
         result = cleanup_task.result()
-        if type(result) is not bool:
-            return False, RuntimeError(
-                "secure runtime offboarding returned an invalid outcome"
-            )
-        if result:
-            return False, None
         agent_id = _loaded_agent_did(agent) or "<unknown>"
         agent_name = self._agent_names.get(agent_id)
         if type(agent_name) is not str or not agent_name:
             agent_name = agent_id
-        return False, RuntimeOffboardingNotPerformedError(
+        return cancelled, _runtime_offboarding_outcome_error(
             agent_name=agent_name,
             agent_id=agent_id,
-            cleanup_state=(
-                "already_absent"
-                if _agent_runtime_path(agent) is not None
-                else "not_hosted"
-            ),
+            result=result,
         )
 
     def _start_agent_runtime_offboarding(
@@ -3010,15 +3038,20 @@ class AgentManager:
         """Register deletion for a cold agent while the caller owns ``_lock``."""
 
         from kestrel_sovereign.features.isolated_runtime import (
-            remove_isolated_runtime_namespace,
+            remove_runtime_namespace,
             resolve_isolated_runtime_namespace,
         )
 
-        root, namespace = self._isolated_runtime_scope(agent_id)
-        scope = resolve_isolated_runtime_namespace(root, namespace)
+        scope = None
+        if self._hosted_agent_runtime_factory_configured(
+            os.environ.get("KESTREL_DB_BACKEND", "sqlite"),
+            os.environ.get("KESTREL_DATABASE_URL"),
+        ):
+            root, namespace = self._isolated_runtime_scope(agent_id)
+            scope = resolve_isolated_runtime_namespace(root, namespace)
         cleanup_task = asyncio.create_task(
             asyncio.to_thread(
-                remove_isolated_runtime_namespace,
+                remove_runtime_namespace,
                 scope,
                 agent_id,
             ),
@@ -3027,7 +3060,7 @@ class AgentManager:
         record = InflightRuntimeOffboarding(
             agent_name=name,
             agent_id=agent_id,
-            runtime_path=scope.path,
+            runtime_path=scope.path if scope is not None else None,
             task=cleanup_task,
         )
         record_key = id(cleanup_task)
@@ -3103,30 +3136,25 @@ class AgentManager:
                 cleanup_pending=True,
             )
         if record.task.cancelled():
-            return False, retained(
+            return cancellation_already_observed, retained(
                 RuntimeError("secure runtime offboarding task was cancelled")
             )
         failure = record.task.exception()
         if failure is None:
             result = record.task.result()
-            if type(result) is not bool:
-                return False, retained(
-                    TypeError("secure runtime offboarding returned an invalid outcome")
-                )
-            if result:
-                return False, None
-            return False, RuntimeOffboardingNotPerformedError(
+            outcome_error = _runtime_offboarding_outcome_error(
                 agent_name=record.agent_name,
                 agent_id=record.agent_id,
-                cleanup_state=(
-                    "already_absent"
-                    if record.runtime_path is not None
-                    else "not_hosted"
-                ),
+                result=result,
             )
+            if outcome_error is None:
+                return cancellation_already_observed, None
+            if isinstance(outcome_error, RuntimeOffboardingNotPerformedError):
+                return cancellation_already_observed, outcome_error
+            return cancellation_already_observed, retained(outcome_error)
         if not isinstance(failure, Exception):
             raise failure
-        return False, retained(failure)
+        return cancellation_already_observed, retained(failure)
 
     def _retain_quarantined_cleanup(
         self,

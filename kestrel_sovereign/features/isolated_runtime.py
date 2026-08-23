@@ -34,6 +34,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import TracebackType
@@ -2273,6 +2274,14 @@ class IsolatedRuntimeNamespace:
     path: Path
 
 
+class RuntimeNamespaceCleanupOutcome(str, Enum):
+    """Exact custody result from a secure runtime deletion primitive."""
+
+    REMOVED = "removed"
+    ALREADY_ABSENT = "already_absent"
+    NOT_HOSTED = "not_hosted"
+
+
 _RUNTIME_NAMESPACE_COMPONENT = re.compile(
     r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$"
 )
@@ -2288,6 +2297,9 @@ _WINDOWS_RESERVED_COMPONENTS = frozenset(
 )
 _RUNTIME_OWNER_MARKER = ".kestrel-runtime-owner"
 _RUNTIME_OWNER_TEMP_PREFIX = ".kestrel-runtime-owner.tmp-"
+_VENV_RELOCATION_REPAIR_MARKER = ".kestrel-venv-relocation-pending"
+_VENV_RELOCATION_REPAIR_TEMP_PREFIX = ".kestrel-venv-relocation-pending.tmp-"
+_VENV_RELOCATION_REPAIR_PAYLOAD = b"kestrel-venv-relocation-v1\n"
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _ISOLATED_FEATURE_CLASS_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
@@ -2727,6 +2739,240 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
+    """Validate a durable relocation marker without following path entries."""
+
+    marker_fd: Optional[int] = None
+    try:
+        try:
+            metadata = os.stat(
+                _VENV_RELOCATION_REPAIR_MARKER,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (os.name == "posix" and metadata.st_uid != os.geteuid())
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker is unsafe."
+            )
+        if metadata.st_nlink != 1:
+            for name in os.listdir(directory_fd):
+                if not name.startswith(_VENV_RELOCATION_REPAIR_TEMP_PREFIX):
+                    continue
+                try:
+                    candidate = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(candidate.st_mode) and _same_file_identity(
+                    candidate, metadata
+                ):
+                    try:
+                        os.unlink(name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+            try:
+                metadata = os.stat(
+                    _VENV_RELOCATION_REPAIR_MARKER,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (os.name == "posix" and metadata.st_uid != os.geteuid())
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature relocation repair marker has an "
+                    "unsafe external hard link."
+                )
+        marker_fd = os.open(
+            _VENV_RELOCATION_REPAIR_MARKER,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        if not _same_file_identity(metadata, os.fstat(marker_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker changed during "
+                "validation."
+            )
+        payload = os.read(marker_fd, len(_VENV_RELOCATION_REPAIR_PAYLOAD) + 1)
+        if payload != _VENV_RELOCATION_REPAIR_PAYLOAD:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state is corrupt; "
+                "tenant state was retained."
+            )
+        return True
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker is unsafe."
+            ) from exc
+        raise
+    finally:
+        if marker_fd is not None:
+            os.close(marker_fd)
+
+
+def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
+    """Publish repair intent before a feature-directory rename can commit."""
+
+    if _read_venv_relocation_repair_marker_at(directory_fd):
+        return
+    temporary = (
+        f"{_VENV_RELOCATION_REPAIR_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
+    )
+    temporary_fd: Optional[int] = None
+    try:
+        temporary_fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            _PRIVATE_FILE_MODE,
+            dir_fd=directory_fd,
+        )
+        _write_all(temporary_fd, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        try:
+            os.link(
+                temporary,
+                _VENV_RELOCATION_REPAIR_MARKER,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            pass
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(directory_fd)
+        _read_venv_relocation_repair_marker_at(directory_fd)
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
+    """Portable fallback for validating relocation repair intent."""
+
+    marker = directory / _VENV_RELOCATION_REPAIR_MARKER
+    try:
+        metadata = marker.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or (os.name == "posix" and metadata.st_uid != os.geteuid())
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature relocation repair marker is unsafe."
+        )
+    if metadata.st_nlink != 1:
+        for candidate in directory.iterdir():
+            if not candidate.name.startswith(_VENV_RELOCATION_REPAIR_TEMP_PREFIX):
+                continue
+            try:
+                candidate_metadata = candidate.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(candidate_metadata.st_mode) and _same_file_identity(
+                candidate_metadata, metadata
+            ):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+        try:
+            metadata = marker.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (os.name == "posix" and metadata.st_uid != os.geteuid())
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature relocation repair marker has an unsafe "
+                "external hard link."
+            )
+    if marker.read_bytes() != _VENV_RELOCATION_REPAIR_PAYLOAD:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature relocation repair state is corrupt; tenant "
+            "state was retained."
+        )
+    return True
+
+
+def _ensure_venv_relocation_repair_marker_portable(directory: Path) -> None:
+    """Portable fallback for publishing relocation repair intent."""
+
+    if _read_venv_relocation_repair_marker_portable(directory):
+        return
+    marker = directory / _VENV_RELOCATION_REPAIR_MARKER
+    temporary = directory / (
+        f"{_VENV_RELOCATION_REPAIR_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
+    )
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            _PRIVATE_FILE_MODE,
+        )
+        _write_all(descriptor, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            os.link(temporary, marker, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        if not _read_venv_relocation_repair_marker_portable(directory):
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be "
+                "recorded."
+            )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _recover_runtime_owner_install_link(
     directory_fd: int,
     marker_fd: int,
@@ -2927,6 +3173,20 @@ def _migrate_runtime_directory_at(
             "operator custody reconciliation is required."
         )
 
+    legacy_fd = os.open(
+        legacy_component,
+        _directory_open_flags(),
+        dir_fd=parent_fd,
+    )
+    try:
+        if not _same_file_identity(legacy_metadata, os.fstat(legacy_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature legacy runtime changed during migration."
+            )
+        _ensure_venv_relocation_repair_marker_at(legacy_fd)
+    finally:
+        os.close(legacy_fd)
+
     try:
         _rename_directory_noreplace_at(
             parent_fd,
@@ -3113,6 +3373,7 @@ def _migrate_released_runtime_directory_portable(
             "state; operator custody reconciliation is required."
         )
     _revalidate_portable_released_root(legacy_root, root_metadata)
+    _ensure_venv_relocation_repair_marker_portable(legacy)
     try:
         legacy.rename(stable)
     except OSError as exc:
@@ -3297,6 +3558,21 @@ def migrate_released_hosted_feature_runtime(
                     "Hosted isolated feature has both released legacy and stable "
                     "runtime state; operator custody reconciliation is required."
                 )
+
+            legacy_fd = os.open(
+                legacy_component,
+                _directory_open_flags(),
+                dir_fd=source_root_fd,
+            )
+            try:
+                if not _same_file_identity(legacy_metadata, os.fstat(legacy_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature released legacy runtime changed "
+                        "during migration."
+                    )
+                _ensure_venv_relocation_repair_marker_at(legacy_fd)
+            finally:
+                os.close(legacy_fd)
 
             try:
                 _rename_directory_noreplace_at(
@@ -3524,6 +3800,7 @@ def _prepare_runtime_tree_portable(
                 "Hosted isolated feature has both legacy and stable runtime "
                 "state; operator custody reconciliation is required."
             )
+        _ensure_venv_relocation_repair_marker_portable(legacy)
         legacy.rename(stable)
         if migration_results is not None:
             migration_results.add((parent, legacy_component, stable_component))
@@ -3789,7 +4066,7 @@ def _remove_directory_contents_at(
 def remove_isolated_runtime_namespace(
     scope: IsolatedRuntimeNamespace,
     owner: str,
-) -> bool:
+) -> RuntimeNamespaceCleanupOutcome:
     """Securely offboard one tenant runtime tree after its agent has stopped.
 
     Cleanup is deliberately POSIX-dirfd-only.  On a platform without the
@@ -3808,12 +4085,12 @@ def remove_isolated_runtime_namespace(
                 "Secure isolated-runtime offboarding is unavailable on this "
                 "platform; tenant state was retained."
             )
-        return False
+        return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
 
     try:
         root_fd = os.open(scope.root, _directory_open_flags())
     except FileNotFoundError:
-        return False
+        return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -3844,7 +4121,7 @@ def remove_isolated_runtime_namespace(
                     component, _directory_open_flags(), dir_fd=current_fd
                 )
             except FileNotFoundError:
-                return False
+                return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
             if index == len(scope.namespace.parts) - 1:
                 parent_fd = current_fd
                 namespace_fd = child_fd
@@ -3858,7 +4135,7 @@ def remove_isolated_runtime_namespace(
         try:
             lexical_namespace = os.stat(scope.path, follow_symlinks=False)
         except FileNotFoundError:
-            return False
+            return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
         if not stat.S_ISDIR(lexical_namespace.st_mode) or not _same_file_identity(
             lexical_namespace, os.fstat(namespace_fd)
         ):
@@ -3916,7 +4193,7 @@ def remove_isolated_runtime_namespace(
         os.fsync(parent_fd)
         os.close(namespace_fd)
         namespace_fd = None
-        return True
+        return RuntimeNamespaceCleanupOutcome.REMOVED
     except IsolatedRuntimeNamespaceError:
         raise
     except OSError as exc:
@@ -4027,15 +4304,27 @@ def agent_runtime_dir(agent: Any) -> Path:
     return resolve_agent_runtime_dir(agent)
 
 
-def remove_agent_runtime_namespace(agent: Any) -> bool:
-    """Remove an explicit hosted scope, or no-op for storage-backed agents."""
+def remove_runtime_namespace(
+    scope: Optional[IsolatedRuntimeNamespace],
+    owner: Optional[str],
+) -> RuntimeNamespaceCleanupOutcome:
+    """Delete an explicit hosted scope while preserving exact custody state."""
+
+    if scope is None:
+        return RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+    if type(owner) is not str or not owner:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup requires an agent identity."
+        )
+    return remove_isolated_runtime_namespace(scope, owner)
+
+
+def remove_agent_runtime_namespace(agent: Any) -> RuntimeNamespaceCleanupOutcome:
+    """Remove an explicit hosted scope, or report storage-backed custody."""
 
     runtime_scope = _agent_runtime_scope(agent)
-    if runtime_scope is None:
-        return False
-    return remove_isolated_runtime_namespace(
-        runtime_scope, _agent_runtime_owner(agent)
-    )
+    owner = _agent_runtime_owner(agent) if runtime_scope is not None else None
+    return remove_runtime_namespace(runtime_scope, owner)
 
 
 def _venv_bin_dir(venv_path: Path) -> Path:
@@ -9149,6 +9438,100 @@ class ProxyFeature(Feature):
         assert self._venv_path is not None
         return self._venv_path / ".kestrel_provision.json"
 
+    def _venv_relocation_repair_pending(self) -> bool:
+        """Read durable migration intent from the feature directory."""
+
+        if self._isolated_runtime_scope is None:
+            return False
+        runtime_dir = self._feature_runtime_dir()
+        if not _secure_dirfd_supported():  # pragma: no cover - portable policy
+            try:
+                return _read_venv_relocation_repair_marker_portable(runtime_dir)
+            except IsolatedRuntimeNamespaceError:
+                raise
+            except OSError as exc:
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature relocation repair state could not "
+                    "be read."
+                ) from exc
+        directory_fd: Optional[int] = None
+        try:
+            directory_fd = os.open(runtime_dir, _directory_open_flags())
+            lexical = os.stat(runtime_dir, follow_symlinks=False)
+            if not _same_file_identity(lexical, os.fstat(directory_fd)):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime changed while reading "
+                    "relocation repair state."
+                )
+            return _read_venv_relocation_repair_marker_at(directory_fd)
+        except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature relocation repair path is unsafe."
+                ) from exc
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be read."
+            ) from exc
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    def _clear_venv_relocation_repair_marker(self) -> None:
+        """Clear migration intent only after launch verification and stamping."""
+
+        if self._isolated_runtime_scope is None:
+            return
+        runtime_dir = self._feature_runtime_dir()
+        if not _secure_dirfd_supported():  # pragma: no cover - portable policy
+            marker = runtime_dir / _VENV_RELOCATION_REPAIR_MARKER
+            try:
+                if not _read_venv_relocation_repair_marker_portable(runtime_dir):
+                    return
+                marker.unlink()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature relocation repair state could not "
+                    "be finalized."
+                ) from exc
+            return
+        directory_fd: Optional[int] = None
+        try:
+            directory_fd = os.open(runtime_dir, _directory_open_flags())
+            lexical = os.stat(runtime_dir, follow_symlinks=False)
+            if not _same_file_identity(lexical, os.fstat(directory_fd)):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime changed while finalizing "
+                    "relocation repair."
+                )
+            if not _read_venv_relocation_repair_marker_at(directory_fd):
+                return
+            try:
+                os.unlink(
+                    _VENV_RELOCATION_REPAIR_MARKER,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return
+            os.fsync(directory_fd)
+        except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature relocation repair path is unsafe."
+                ) from exc
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be "
+                "finalized."
+            ) from exc
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
     def _read_provision_manifest(self) -> Dict[str, Any]:
         try:
             manifest = json.loads(self._provision_manifest_path().read_text())
@@ -9325,10 +9708,22 @@ class ProxyFeature(Feature):
         location_state = self._console_script_location_state()
         relocation_proven = (
             self._venv_relocated_this_startup
+            or self._venv_relocation_repair_pending()
             or stamped_relocation
             or location_state == "relocated"
         )
-        return relocation_proven and location_state in {"relocated", "missing"}
+        # A hosted console wrapper that is absent or cannot be classified is
+        # not a launchable artifact.  Legacy issue-2716 attempts may have
+        # completed their rename before durable repair evidence existed, so an
+        # unstamped missing wrapper must also take the conservative repair path.
+        unstamped_hosted_console = (
+            self._isolated_runtime_scope is not None
+            and location_state == "missing"
+            and not (type(stamped_path) is str and bool(stamped_path))
+        )
+        return (
+            relocation_proven and location_state in {"relocated", "missing"}
+        ) or unstamped_hosted_console
 
     def _provision_status(
         self,
@@ -9349,7 +9744,14 @@ class ProxyFeature(Feature):
         assert self._venv_path is not None
         if self._location_requires_forced_reinstall(manifest):
             return True, True
-        return self._provision_is_stale_from_manifest(install_target, manifest), False
+        location_stamp_stale = manifest.get("venv_path") != str(
+            self._venv_path.resolve()
+        )
+        return (
+            self._provision_is_stale_from_manifest(install_target, manifest)
+            or location_stamp_stale,
+            False,
+        )
 
     def _adopt_verified_unstamped_venv(
         self,
@@ -9369,7 +9771,15 @@ class ProxyFeature(Feature):
         if manifest.get("venv_path") == current_path:
             return False
         recorded_target = manifest.get("install_target")
-        if recorded_target is not None and recorded_target != install_target:
+        if recorded_target != install_target:
+            return False
+        if manifest.get("provisioned_against_host_sdk") != _host_sdk_version():
+            return False
+        # Location metadata is the only field this path may repair. A host SDK,
+        # install target, feature release, or child-probe transition must take
+        # the ordinary provisioning path rather than being blessed by a fresh
+        # manifest assembled from post-hoc probes.
+        if self._provision_is_stale_from_manifest(install_target, manifest):
             return False
         if self._console_script_location_state() in {"relocated", "missing"}:
             return False
@@ -9399,6 +9809,16 @@ class ProxyFeature(Feature):
             child,
         )
         return True
+
+    def _verify_launch_artifact(self) -> None:
+        """Require the actual configured console wrapper to target this venv."""
+
+        state = self._console_script_location_state()
+        if state in {"relocated", "missing"}:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature launch artifact could not be verified after "
+                "runtime provisioning."
+            )
 
     def _provision_is_stale(self, install_target: str) -> bool:
         """Return whether this host-owned venv must be reprovisioned.
@@ -9573,15 +9993,20 @@ class ProxyFeature(Feature):
                 manifest,
             )
             if not stale:
+                if self._venv_relocation_repair_pending():
+                    self._verify_launch_artifact()
                 if manifest.get("venv_path") != str(self._venv_path.resolve()):
                     updated = dict(manifest)
                     updated["venv_path"] = str(self._venv_path.resolve())
                     self._write_provision_manifest_payload(updated)
+                self._clear_venv_relocation_repair_marker()
                 return
             if not force_reinstall and self._adopt_verified_unstamped_venv(
                 install_target,
                 manifest,
             ):
+                self._verify_launch_artifact()
+                self._clear_venv_relocation_repair_marker()
                 return
 
         # Fresh venv, changed install target, or host SDK upgraded since the
@@ -9623,6 +10048,8 @@ class ProxyFeature(Feature):
                 f"{self.runtime.distribution!r} but its child distribution probe "
                 "was not positively present; refusing to stamp the venv fresh"
             )
+        if force_reinstall or self._venv_relocation_repair_pending():
+            self._verify_launch_artifact()
         self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
         self._write_provision_manifest(
             install_target,
@@ -9631,6 +10058,7 @@ class ProxyFeature(Feature):
             desired_feature_version,
             child_feature_distribution,
         )
+        self._clear_venv_relocation_repair_marker()
 
     def _warn_on_sdk_mismatch(
         self, python_path: Path, *, host_sdk: str = None, child_sdk: str = None

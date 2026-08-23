@@ -2086,6 +2086,81 @@ def test_unmoved_legacy_manifest_backfills_venv_path_without_index_access(
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize("staleness", ("host-sdk", "target", "feature-version"))
+def test_locationless_manifest_adoption_refuses_non_location_staleness(
+    monkeypatch,
+    tmp_path,
+    staleness,
+):
+    """A missing path stamp cannot bless unrelated stale child contents."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="WhatsAppFeature",
+        entry_point="wa.feature:WhatsAppFeature",
+        distribution="offline-feature",
+        runtime="isolated-venv",
+        service="offline-service",
+        project="offline-feature",
+    )
+    feature = ProxyFeature(
+        _hosted_postgres_agent(
+            tmp_path / "runtime",
+            f"agent-locationless-{staleness}",
+            did=f"did:test:locationless-{staleness}",
+        ),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    python = isolated_runtime._venv_python(feature._venv_path)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o700)
+    console = isolated_runtime._venv_bin_dir(feature._venv_path) / runtime.service
+    console.write_text(f"#!{python}\nprint('usable')\n")
+    console.chmod(0o700)
+    manifest = {
+        "install_target": runtime.project,
+        "provisioned_against_host_sdk": "2.0.0",
+        "child_sdk_version": "2.0.0",
+        "feature_distribution_version": "4.5.6",
+        "child_feature_distribution_state": "versioned",
+        "child_feature_distribution_version": "4.5.6",
+    }
+    if staleness == "host-sdk":
+        manifest["provisioned_against_host_sdk"] = "1.0.0"
+    elif staleness == "target":
+        manifest["install_target"] = "different-feature"
+    else:
+        manifest["feature_distribution_version"] = "4.5.5"
+    manifest_path = feature._provision_manifest_path()
+    manifest_path.write_text(json.dumps(manifest))
+    commands = []
+    feature._run = lambda command: commands.append(command)
+    feature._probe_sdk_version = Mock(return_value="2.0.0")
+    feature._probe_feature_distribution = Mock(
+        return_value=_child_distribution_probe("4.5.6")
+    )
+    monkeypatch.setattr(isolated_runtime, "_host_sdk_version", lambda: "2.0.0")
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "4.5.6",
+    )
+
+    feature.ensure_venv()
+
+    installs = [command for command in commands if "install" in command]
+    assert len(installs) == 1
+    assert "--upgrade" in installs[0]
+    assert "--reinstall" not in installs[0]
+    refreshed = json.loads(manifest_path.read_text())
+    assert refreshed["install_target"] == runtime.project
+    assert refreshed["provisioned_against_host_sdk"] == "2.0.0"
+    assert refreshed["feature_distribution_version"] == "4.5.6"
+
+
 def test_migrated_module_runtime_is_adopted_offline_without_reinstall(
     monkeypatch,
     tmp_path,
@@ -2123,6 +2198,18 @@ def test_migrated_module_runtime_is_adopted_offline_without_reinstall(
     python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text("#!/bin/sh\nexit 0\n")
     python.chmod(0o700)
+    (source_venv / ".kestrel_provision.json").write_text(
+        json.dumps(
+            {
+                "install_target": runtime.project,
+                "provisioned_against_host_sdk": "1.2.3",
+                "child_sdk_version": "1.2.3",
+                "feature_distribution_version": "7.8.9",
+                "child_feature_distribution_state": "versioned",
+                "child_feature_distribution_version": "7.8.9",
+            }
+        )
+    )
 
     feature._prepare_runtime_workspace()
     assert feature._venv_relocated_this_startup is True
@@ -2145,6 +2232,148 @@ def test_migrated_module_runtime_is_adopted_offline_without_reinstall(
     manifest = json.loads(feature._provision_manifest_path().read_text())
     assert manifest["venv_path"] == str(feature._venv_path.resolve())
     assert manifest["feature_distribution_version"] == "7.8.9"
+    assert not (
+        feature._feature_runtime_dir()
+        / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
+    ).exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="console shebangs are POSIX paths")
+@pytest.mark.parametrize("migration_kind", ("released", "pre-stable"))
+def test_relocation_repair_intent_survives_failed_boot_and_forces_restart_repair(
+    tmp_path,
+    migration_kind,
+):
+    """A failed first repair cannot lose the evidence required by boot two."""
+
+    wheel = _write_console_script_fixture_wheel(tmp_path)
+    runtime = InstalledFeatureRuntime(
+        class_name="WhatsAppFeature",
+        entry_point="wa.feature:WhatsAppFeature",
+        distribution="kestrel-console-migration-fixture",
+        runtime="isolated-venv",
+        service="kestrel-whatsapp-service",
+        project=str(wheel),
+    )
+    runtime_root = tmp_path / "hosted-runtime"
+    if migration_kind == "released":
+        agent_dir = tmp_path / "agent_data" / "Hosted"
+        legacy_root = agent_dir / "feature_venvs"
+        source_feature = legacy_root / "WhatsAppFeature"
+        source_feature.mkdir(parents=True, mode=0o700)
+        legacy_root.chmod(0o700)
+        agent = KestrelAgent(
+            did="did:test:repair-restart-released",
+            storage_path=str(agent_dir / "kestrel_prime.db"),
+            llm_service=Mock(providers=[]),
+            database_url="postgresql://hosted.example/kestrel",
+            db_backend="postgres",
+            isolated_runtime_root=runtime_root,
+            isolated_runtime_namespace="agent-repair-restart-released",
+            isolated_runtime_legacy_root=legacy_root,
+            isolated_runtime_hosted=True,
+        )
+        first = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    else:
+        agent = _hosted_postgres_agent(
+            runtime_root,
+            "agent-repair-restart-pre-stable",
+            did="did:test:repair-restart-pre-stable",
+        )
+        first = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+        legacy_component = first._legacy_runtime_directory_name
+        assert legacy_component is not None
+        isolated_runtime.prepare_isolated_runtime_namespace(
+            first._isolated_runtime_scope,
+            agent.did,
+            relative_directories=(("feature_venvs", legacy_component),),
+        )
+        source_feature = (
+            first._agent_runtime_dir / "feature_venvs" / legacy_component
+        )
+
+    source_venv = source_feature / ".venv"
+    subprocess.run(
+        ["uv", "venv", "--python", sys.executable, str(source_venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(isolated_runtime._venv_python(source_venv)),
+            str(wheel),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    old_python = str(isolated_runtime._venv_python(source_venv))
+    first._prepare_runtime_workspace()
+    first._venv_path, first._bin_path = first.resolve_runtime_paths()
+    marker = (
+        first._feature_runtime_dir()
+        / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
+    )
+    assert marker.read_bytes() == isolated_runtime._VENV_RELOCATION_REPAIR_PAYLOAD
+    failed_commands = []
+
+    def fail_install(command):
+        failed_commands.append(command)
+        raise subprocess.CalledProcessError(1, command)
+
+    first._run = fail_install
+    with pytest.raises(IsolatedRuntimePreparationError):
+        first.ensure_venv()
+    assert "--reinstall" in failed_commands[-1]
+    assert marker.is_file()
+    assert old_python in (
+        first._venv_path / "bin" / "kestrel-whatsapp-service"
+    ).read_text()
+
+    unverified = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    unverified._prepare_runtime_workspace()
+    unverified._venv_path, unverified._bin_path = unverified.resolve_runtime_paths()
+    unverified._run = Mock(return_value=None)
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="launch artifact could not be verified",
+    ):
+        unverified.ensure_venv()
+    unverified._run.assert_called_once()
+    assert "--reinstall" in unverified._run.call_args.args[0]
+    assert marker.is_file()
+    assert not unverified._provision_manifest_path().exists()
+
+    restarted = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    restarted._prepare_runtime_workspace()
+    assert restarted._venv_relocated_this_startup is False
+    restarted._venv_path, restarted._bin_path = restarted.resolve_runtime_paths()
+    restarted.ensure_venv()
+
+    console = restarted._venv_path / "bin" / "kestrel-whatsapp-service"
+    assert str(isolated_runtime._venv_python(restarted._venv_path)) in console.read_text()
+    assert old_python not in console.read_text()
+    assert subprocess.run(
+        [str(console)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "console-path-ok"
+    assert not marker.exists()
+
+    final_restart = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    final_restart._prepare_runtime_workspace()
+    final_restart._venv_path, final_restart._bin_path = (
+        final_restart.resolve_runtime_paths()
+    )
+    final_restart._run = Mock(side_effect=AssertionError("repair repeated"))
+    final_restart.ensure_venv()
+    final_restart._run.assert_not_called()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="console shebangs are POSIX paths")
@@ -2267,7 +2496,20 @@ def test_relocated_venv_failed_repair_retains_stale_stamp_for_retry(
     assert stale_manifest.read_text() == stale_payload
 
     successful_runs = []
-    feature._run = lambda command: successful_runs.append(command)
+
+    def complete_repair(command):
+        successful_runs.append(command)
+        console = (
+            isolated_runtime._venv_bin_dir(feature._venv_path)
+            / feature.runtime.service
+        )
+        console.write_text(
+            f"#!{isolated_runtime._venv_python(feature._venv_path)}\n"
+            "print('repaired')\n"
+        )
+        console.chmod(0o700)
+
+    feature._run = complete_repair
     with monkeypatch.context() as manifest_failure:
         manifest_failure.setattr(
             isolated_runtime.os,
@@ -2282,7 +2524,8 @@ def test_relocated_venv_failed_repair_retains_stale_stamp_for_retry(
 
     successful_runs.clear()
     feature.ensure_venv()
-    assert "--reinstall" in successful_runs[-1]
+    assert "--upgrade" in successful_runs[-1]
+    assert "--reinstall" not in successful_runs[-1]
     repaired = json.loads(stale_manifest.read_text())
     assert repaired["venv_path"] == str(feature._venv_path.resolve())
 
@@ -3296,11 +3539,57 @@ def test_cleanup_refuses_nested_owned_namespace_without_deleting_either(tmp_path
     assert isolated_runtime.remove_isolated_runtime_namespace(
         inner,
         "did:test:inner",
-    )
+    ) is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
     assert isolated_runtime.remove_isolated_runtime_namespace(
         outer,
         "did:test:outer",
+    ) is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+
+
+def test_runtime_cleanup_primitive_reports_exact_absent_and_unhosted_custody(
+    tmp_path,
+):
+    scope = resolve_isolated_runtime_namespace(tmp_path / "runtime", "tenant")
+
+    assert (
+        isolated_runtime.remove_isolated_runtime_namespace(scope, "did:test:absent")
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
     )
+    assert (
+        isolated_runtime.remove_agent_runtime_namespace(
+            SimpleNamespace(
+                did="did:test:storage-backed",
+                storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+            )
+        )
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="repair marker uses POSIX dirfds")
+def test_relocation_repair_marker_recovers_only_its_interrupted_temp_link(tmp_path):
+    runtime_dir = tmp_path / "feature-runtime"
+    runtime_dir.mkdir(mode=0o700)
+    directory_fd = os.open(runtime_dir, isolated_runtime._directory_open_flags())
+    try:
+        isolated_runtime._ensure_venv_relocation_repair_marker_at(directory_fd)
+        marker = runtime_dir / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
+        interrupted = runtime_dir / (
+            f"{isolated_runtime._VENV_RELOCATION_REPAIR_TEMP_PREFIX}interrupted"
+        )
+        os.link(marker, interrupted)
+
+        assert isolated_runtime._read_venv_relocation_repair_marker_at(directory_fd)
+        assert not interrupted.exists()
+        assert marker.stat().st_nlink == 1
+
+        external = tmp_path / "unrelated-hard-link"
+        os.link(marker, external)
+        with pytest.raises(IsolatedRuntimeNamespaceError, match="external hard link"):
+            isolated_runtime._read_venv_relocation_repair_marker_at(directory_fd)
+        assert external.is_file()
+    finally:
+        os.close(directory_fd)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="secure cleanup is POSIX-only")
@@ -3330,7 +3619,10 @@ def test_partial_cleanup_preserves_owner_marker_and_retry_succeeds(
     assert (scope.path / ".kestrel-runtime-owner").is_file()
     assert blocked.read_text() == "retain-until-retry"
     monkeypatch.setattr(isolated_runtime.os, "unlink", original_unlink)
-    assert isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+    assert (
+        isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+    )
     assert not scope.path.exists()
 
 
@@ -3354,7 +3646,10 @@ def test_final_rmdir_failure_restores_marker_for_retry(monkeypatch, tmp_path):
         isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
 
     assert (scope.path / ".kestrel-runtime-owner").is_file()
-    assert isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+    assert (
+        isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="secure cleanup is POSIX-only")
@@ -3372,7 +3667,10 @@ def test_final_rmdir_concurrent_disappearance_is_success(monkeypatch, tmp_path):
 
     monkeypatch.setattr(isolated_runtime.os, "rmdir", remove_then_report_missing)
 
-    assert isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+    assert (
+        isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+    )
     assert not scope.path.exists()
 
 
@@ -3636,7 +3934,10 @@ def test_owner_marker_cleanup_tolerates_temp_disappearing_before_unlink(
     monkeypatch.setattr(isolated_runtime.os, "stat", stat_then_remove)
     monkeypatch.setattr(isolated_runtime, "_secure_dirfd_supported", lambda: True)
 
-    assert isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+    assert (
+        isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+    )
     assert raced
     assert not path.exists()
 
