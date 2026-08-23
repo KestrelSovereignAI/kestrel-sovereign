@@ -1933,8 +1933,13 @@ class AsyncConversationStore:
         meta: Optional[Dict],
         content: str,
         rendered_raw: Optional[str],
+        migrate: bool = True,
     ) -> tuple[str, Optional[str]]:
         """Apply the canonical/transport split (#1402) for a single row.
+
+        ``migrate=False`` withholds the opportunistic backfill below without
+        changing what is returned. Search passes it — see
+        :meth:`_normalized_search_row` for why a scan must not write.
 
         Returns ``(canonical_content, rendered_content)`` where
         ``canonical_content`` is the raw user turn (or original content for
@@ -1972,7 +1977,7 @@ class AsyncConversationStore:
             # form. Move it into rendered_content and strip wrappers.
             rendered_content = content
             content = extract_raw_user_content(content)
-            if self._migrate_on_read:
+            if migrate and self._migrate_on_read:
                 try:
                     await self._migrate_split_sent_form(
                         row_id, content, rendered_content, meta
@@ -3032,23 +3037,35 @@ class AsyncConversationStore:
         rendered_content)``. Both search paths normalize through here, so the
         text a query is compared against is the same text whichever path found
         the row.
+
+        **This one does not migrate**, and the other read paths still do. They
+        read what a user asked to see; this reads whatever it has to in order to
+        answer whether a word appears, which since #2961 is bounded by the query
+        rather than by 5,000 rows. Opportunistically rewriting every row it
+        touched would make one search of a legacy history a bulk UPDATE of it —
+        tens of thousands of serialized writes on the corpus #3075 was filed
+        against — inside a request the user made by typing in a box.
+
+        It would also be a write inside this walk's own consistency fence. A
+        rewritten row whose metadata is malformed compares unequal on the raw
+        text (measured: valid JSON is unchanged, ``not json at all`` bumps the
+        stamp), so the scan would move the change stamp it is about to check and
+        restart itself. A read that invalidates its own snapshot is not a
+        contract worth keeping.
+
+        The rows still migrate: the one-shot backfill in
+        ``security/encryption_backfill.py`` does it deliberately, and every path
+        that shows a message to someone does it on the way past.
         """
         row_id, role = row[0], row[1]
         meta = parse_message_metadata(row[3])
-        content, needs_migration = self._decrypt_with_fallback(row[2], meta)
-
-        # Opportunistic per-agent key migration, as in search_history.
-        if needs_migration and self._migrate_on_read:
-            try:
-                await self._migrate_message(row_id, content, meta)
-            except Exception as e:
-                logger.warning(
-                    f"Migration failed for message {row_id} in search_sessions: {e}"
-                )
+        content, _needs_migration = self._decrypt_with_fallback(row[2], meta)
 
         # Canonical/transport split (#1402): match and snippet against the
         # raw user turn, never the rendered transport bytes.
-        content, _ = await self._resolve_canonical(row_id, role, meta, content, row[5])
+        content, _ = await self._resolve_canonical(
+            row_id, role, meta, content, row[5], migrate=False
+        )
 
         cleaned_meta = remove_enc_flag(meta)
         if cleaned_meta:

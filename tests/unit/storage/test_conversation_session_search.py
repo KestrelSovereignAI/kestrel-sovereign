@@ -1001,3 +1001,69 @@ class TestTheWalkIsOneProjection:
             "a row that moved below the frontier was certified as an append "
             "above it"
         )
+
+
+class TestASearchDoesNotWriteHistory:
+    @pytest.mark.asyncio
+    async def test_a_scan_does_not_rewrite_the_rows_it_reads(self, store):
+        """The other read paths migrate opportunistically; this one must not.
+
+        They read what a user asked to see. A search reads whatever it has to in
+        order to answer whether a word appears, which since #2961 is bounded by
+        the query rather than by 5,000 rows — so rewriting every row it touched
+        would make one search of a legacy history a bulk UPDATE of it, tens of
+        thousands of serialized writes inside a request the user made by typing
+        in a box.
+
+        It would also be a write inside the walk's own consistency fence: a
+        rewritten row with malformed metadata compares unequal on the raw text
+        and moves the change stamp the walk is about to check, so the scan would
+        restart itself.
+
+        The row below is the legacy ``sent_form`` shape — rendered bytes in
+        ``content``, ``rendered_content`` still NULL — which is the split the
+        canonical resolver backfills on its way past (#1402).
+        """
+        import re
+
+        await store.db.execute_commit(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at, session_id) "
+            "VALUES (?, 'user', ?, ?, ?, 's1')",
+            (
+                store.agent_id,
+                "<user_input>the launch codes are in the penguin folder</user_input>",
+                json.dumps({"session_id": "s1", "sent_form": True}),
+                _stamp(0),
+            ),
+        )
+        assert store._migrate_on_read, "the fixture must have migration enabled"
+
+        touched: List[str] = []
+        real = store.db.execute_commit
+
+        async def watching(sql, *args, **kwargs):
+            if re.search(r"\bconversation_history\b", sql) and sql.lstrip()[:6].upper() in (
+                "UPDATE", "INSERT", "DELETE"
+            ):
+                touched.append(" ".join(sql.split())[:80])
+            return await real(sql, *args, **kwargs)
+
+        store.db.execute_commit = watching
+        try:
+            found = await store.search_sessions("penguin folder")
+        finally:
+            store.db.execute_commit = real
+
+        assert [s["session_id"] for s in found] == ["s1"]
+        assert touched == [], f"the search rewrote history: {touched}"
+        # ...and the row is untouched on disk, not merely unwritten by that path.
+        stored = await store.db.fetchone(
+            "SELECT content, rendered_content FROM conversation_history "
+            "WHERE agent_id = ?",
+            (store.agent_id,),
+        )
+        assert stored[0] == (
+            "<user_input>the launch codes are in the penguin folder</user_input>"
+        )
+        assert stored[1] is None
