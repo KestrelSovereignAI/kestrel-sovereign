@@ -1527,6 +1527,15 @@ class CoreInstallGuard:
         return list(self._constraints)
 
     @property
+    def manifest_bounds(self) -> list:
+        """The manifest's declared windows for everything EXCEPT core.
+
+        Read by the failure reports, which have to name the right thing: a
+        conflict against one of these is not a reason to move core.
+        """
+        return list(self._manifest_bounds)
+
+    @property
     def install_constraints(self) -> list:
         """Every line a guarded install carries: core's pin, then the manifest's.
 
@@ -2309,6 +2318,20 @@ def cmd_feature_sync(args) -> int:
                     "this install so a feature cannot silently replace it. If "
                     "this is a version conflict, move core to a version the "
                     "feature accepts — do not remove the pin."
+                )
+            if not is_core and guard.manifest_bounds:
+                # Named separately, because a conflict against one of these is
+                # NOT a reason to move core: the resolver was refused by a
+                # window the operator declared for another package. Printing
+                # only the core note sent them to change something unrelated
+                # to the conflict the line above just showed them (#3106).
+                windows = ", ".join(guard.manifest_bounds)
+                print(
+                    "      note: the manifest also bounds "
+                    f"{windows} for this install, so satisfying one entry "
+                    "cannot move another out of its declared window. If the "
+                    "conflict names one of these, that entry is the one to "
+                    "change."
                 )
             # A failed core action stops the batch only when core is ACTUALLY
             # off its declared source. `_resolve_manifest_action` returns

@@ -3158,6 +3158,11 @@ def test_an_install_cannot_move_another_entry_out_of_its_declared_window(
     assert "No solution found" in out
     # ...and the entry it would have moved is exactly where the manifest says.
     assert venv.installed["kestrel-feature-workflows"] == "0.5.2"
+    # The guidance names the window that refused it. A conflict against one of
+    # these is NOT a reason to move core, and saying only "move core" sends the
+    # operator to change something the conflict never mentioned.
+    assert "the manifest also bounds kestrel-feature-workflows>=0.5.1,<0.6" in out
+    assert "that entry is the one to change" in out
 
 
 def test_the_manifest_bound_travels_on_the_install_itself(
