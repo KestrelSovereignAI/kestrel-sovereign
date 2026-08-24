@@ -72,11 +72,14 @@ Before a wake, Core recreates the private workspace, resolves runtime paths, and
 reprovisions a missing Core-managed venv. It also invalidates the prior child's
 memoized config and reads the current durable generation, so a change committed
 by another replica while this process was idle reaches the new child.
-`cleanup_eligible` therefore means the
-exact child is stopped and the embedding host may reclaim that feature's owned
-mutable workspace, Core-managed venv, and provisioning cache. It does not grant
-permission to remove the agent namespace, sibling feature directories, or an
-external immutable venv.
+`cleanup_eligible` therefore means the exact child is stopped and the embedding
+host may ask Core to reclaim that feature's owned mutable workspace,
+Core-managed venv, and provisioning cache through
+`ProxyFeature.reclaim_idle_workspace()`. It is not permission for the host to
+delete a path itself: Core's seam rechecks eligibility and performs secure
+feature-scoped deletion under the same reload lock that serializes a racing
+cold wake. It never removes the agent namespace, sibling feature directories,
+or an external immutable venv.
 
 `IsolatedRuntimeTelemetrySnapshot` is immutable and deliberately excludes DIDs,
 tenant identifiers, paths, commands, environment variables, configuration, and
@@ -88,17 +91,21 @@ process. Health restart count is separate from planned idle-wake count, and
 cold child startup timing is separate from warm admission latency. Core measures
 its owned venv, mutable workspace, and provisioning-cache bytes off the event
 loop with root no-follow descriptor traversal plus entry/time budgets;
-all components in one refresh share the same total time deadline. Externally
-supplied immutable environments remain `None`. `cache_hit` means Core performed
-no venv mutation, and venv size is cached across wakes unless Core actually
-provisions, upgrades, or reinstalls it. An embedding host may merge its own
-owner-scoped accounting after receiving the snapshot. A failed or uncertain
-retirement reports `state="retirement-uncertain"`, remains active for capacity
-accounting, and is never cleanup-eligible.
+all components in one refresh share the same total time deadline. The
+`disk_telemetry_status` field distinguishes a complete sample, a budget-exceeded
+sample, and an unavailable safe traversal; the first budget exhaustion is also
+logged once per feature. Externally supplied immutable environments remain
+`None` without making an otherwise complete sample ambiguous. `cache_hit` means
+Core performed no venv mutation, and venv size is cached across wakes unless
+Core actually provisions, upgrades, or reinstalls it. An embedding host may
+merge its own owner-scoped accounting after receiving the snapshot. A failed or
+uncertain retirement reports `state="retirement-uncertain"`, remains active for
+capacity accounting, and is never cleanup-eligible.
 
 The observer is stored on the exact agent instance. There is no process-global
 registry and no lookup API that can select another agent's telemetry. Observer
-delivery is advisory: failures are logged, OS sampling runs in a worker, hot-path
+delivery is advisory: failures are logged, OS sampling and synchronous host
+observers run in workers, hot-path
 emissions are rate-limited and scheduled through the agent background-task
 registry after traffic admission is released, and an asynchronous observer is
 bounded then detached and observed if it refuses to finish. A state transition
@@ -111,3 +118,5 @@ Telemetry cannot acquire ownership of child traffic or lifecycle progress.
 The isolated child supervisor, idle monitor, and telemetry delivery tasks are
 registered as infrastructure daemons, so their intentional residency does not itself block an
 `idle_agents_only` restart.
+While retired, the supervisor waits on the child-publication event rather than
+polling once per second; a cold wake or terminal shutdown releases that wait.
