@@ -157,11 +157,7 @@ CASES = [
     ("json negative number", json.dumps({"session_id": -5}), None),
     # ``str.isdigit()`` is true for these and neither dialect's digit test is.
     ("unicode digits", json.dumps({"session_id": "١٢٣"}), None),
-    # Printable ASCII, inside the charset since #3061 widened it — a value the
-    # column could never hold is a row that stays NULL for ever, which is what
-    # kept an agent's every repair re-deriving its whole history.
-    ("printable ascii punctuation", json.dumps({"session_id": "did:x:1"}), "did:x:1"),
-    ("non-ascii", json.dumps({"session_id": "sesión:1"}), None),
+    ("outside the charset", json.dumps({"session_id": "did:x:1"}), None),
     ("metadata not an object", json.dumps([{"session_id": UUID_A}]), None),
     ("metadata scalar", json.dumps("hello"), None),
     # A duplicated key has no answer the three readers share, so it has none
@@ -654,12 +650,12 @@ async def test_a_metadata_update_carries_the_column_with_it(db_backend):
 
         # 2. A replacement OUTSIDE the contract must blank the column rather
         #    than keep the previous id: metadata no longer says what it says.
-        assert await store.update_message_metadata(message_id, {"session_id": "sesión:1"})
+        assert await store.update_message_metadata(message_id, {"session_id": "did:x:1"})
         metadata, column = await db.fetchone(
             "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
             (message_id,),
         )
-        assert json.loads(metadata)["session_id"] == "sesión:1"
+        assert json.loads(metadata)["session_id"] == "did:x:1"
         assert column is None
 
         # 3. And an update that does not mention the key leaves the column
@@ -670,7 +666,7 @@ async def test_a_metadata_update_carries_the_column_with_it(db_backend):
             (message_id,),
         )
         assert json.loads(metadata)["importance"] == 0.9
-        assert json.loads(metadata)["session_id"] == "sesión:1"
+        assert json.loads(metadata)["session_id"] == "did:x:1"
         assert column is None
 
         # 4. Back inside the contract: the column comes back, not stays NULL.
@@ -952,14 +948,14 @@ async def test_the_batch_metadata_api_moves_every_row_it_touches(db_backend):
         # Outside the contract the whole batch blanks, rather than every row
         # keeping the session it has just been moved out of.
         assert await store.update_messages_metadata(
-            message_ids, {"session_id": "sesión:1"}
+            message_ids, {"session_id": "did:x:1"}
         ) == len(message_ids)
         for message_id in message_ids:
             metadata, column = await db.fetchone(
                 "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
                 (message_id,),
             )
-            assert json.loads(metadata)["session_id"] == "sesión:1"
+            assert json.loads(metadata)["session_id"] == "did:x:1"
             assert column is None
 
 

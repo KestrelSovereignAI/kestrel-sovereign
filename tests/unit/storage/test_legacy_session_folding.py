@@ -11,19 +11,21 @@ history. That is a global answer to a local hazard, and legacy rows are not a
 transient upgrade state: they are what old history looks like for ever, so one
 of them made every repair pay for all of it, on the read path #2960 put it on.
 
-The guard is now a frontier. A session cannot hold a row standing after its own
-last message, so a session that STARTS after every unstamped row provably holds
-none and folds soundly. Everything else escalates, exactly as before.
+The guard is now the chunk. A chunk holding a row it cannot file refuses to fold
+at all, so a walk that reaches its frontier without escalating has accounted for
+every live row at or below it — and a fold only ever ADDS a chunk's rows to what
+is already stored. An append lands in a chunk of its own and folds; the legacy
+rows below keep the answer the transcript already gave them.
 
 Measured, SQLite, one session in three legacy, ``list_session_page(50)`` timed
 straight after one appended row:
 
-=========  =========  ==========  ==========
-live rows  stamped    legacy old  legacy new
-=========  =========  ==========  ==========
-1,500      3.7 ms     18.0 ms     3.4 ms
-15,000     4.9 ms     133.0 ms    6.3 ms
-=========  =========  ==========  ==========
+=========  ==========  ==========
+live rows  before      after
+=========  ==========  ==========
+1,500      18.0 ms     3.4 ms
+15,000     133.0 ms    6.3 ms
+=========  ==========  ==========
 
 The tests below are about the two ways a local guard can be wrong: trusting a
 fold that should not be trusted, and — the one that actually happened while
@@ -240,40 +242,37 @@ class TestWhatTheInvariantBuys:
             await db.close()
 
 
-class TestTheWidenedColumn:
-    @pytest.mark.asyncio
-    async def test_an_sms_conversation_folds_like_any_other(
-        self, tmp_path, monkeypatch
-    ):
-        """``rasa_shim`` files every SMS turn under ``sms:{sender}``.
+@pytest.mark.asyncio
+async def test_a_stamped_row_absorbed_into_a_legacy_cluster_still_lists(tmp_path):
+    """#3098, pinned here because #3061 is what would have widened its reach.
 
-        A colon was outside the column's charset, so those rows were unstamped
-        for ever — and with a per-agent guard that meant an SMS agent re-derived
-        its whole history on every turn. The charset is printable ASCII now, so
-        the rows stamp on write and the fold reads them like any other session.
-        """
-        path = tmp_path / "sms.db"
-        _seed(path, [("sms:+15551234567", 0), ("sms:+15551234567", 1)])
+    ``group_messages_into_sessions`` deliberately does not split a row carrying
+    an explicit id out of a legacy numeric cluster (#2019): the resolver walks
+    that cluster forward in time and does not stop on id changes, so a split
+    list would let deleting the legacy session destroy the other one too. The
+    column, derived per row from that row's own metadata, files it under the
+    explicit id anyway — and ``project_transcript`` then drops the session as
+    the Phase A violation it is.
 
-        passes = _counting_transcript_passes(monkeypatch)
-        db = await AsyncDatabase.sqlite(str(path))
-        try:
-            columns = await db.fetchall(
-                "SELECT session_id FROM conversation_history WHERE agent_id = ?",
-                (AGENT,),
-            )
-            assert [row[0] for row in columns] == ["sms:+15551234567"] * 2, (
-                "the backfill left the SMS rows unstamped, so this agent is "
-                "still on the transcript derivation"
-            )
-            projection = ConversationSessionProjection(db, AGENT)
-            await projection.repair()
-            settled = len(passes)
-            await _append(db, "sms:+15551234567", 2)
-            await projection.repair()
-            await _append(db, "sms:+15551234567", 3)
-            await projection.repair()
-            assert len(passes) == settled
-            assert [r["message_count"] for r in await projection.list()] == [4]
-        finally:
-            await db.close()
+    Reproduced on main: two live rows five minutes apart, one stamped, and the
+    conversation list is EMPTY.
+
+    This is xfail rather than absent because #3061 wanted the column's charset
+    widened — `rasa_shim` files every SMS turn under `sms:{sender}`, which the
+    column cannot hold, so those rows are unstamped for ever — and that widening
+    turns this from unreachable into reachable for any agent with legacy history
+    that starts receiving SMS. The test says which order the two must land in.
+    """
+    path = tmp_path / "absorbed.db"
+    _seed(path, [(None, 0), ("8f1d1c62-9b0e-4b2c-9a1d-000000000001", 5)])
+
+    db = await AsyncDatabase.sqlite(str(path))
+    try:
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        listed = {r["session_id"]: r["message_count"] for r in await projection.list()}
+        if not listed:
+            pytest.xfail("#3098: the absorbed row's column contradicts grouping")
+        assert listed == {"1": 2}
+    finally:
+        await db.close()

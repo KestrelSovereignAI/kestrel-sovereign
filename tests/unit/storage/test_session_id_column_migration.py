@@ -88,12 +88,7 @@ LEGACY_ROWS = [
     ("json negative number", json.dumps({"session_id": -5}), None),
     # str.isdigit() calls this digits and neither SQL dialect does.
     ("unicode digits", json.dumps({"session_id": "١٢٣"}), None),
-    # Printable ASCII outside the ORIGINAL charset, and inside it since #3061
-    # widened the rule: a value the column can never hold is a row that stays
-    # NULL for ever, and one such row keeps every repair on the whole-transcript
-    # path. ``rasa_shim``'s ``sms:{sender}`` is the id that made that concrete.
-    ("printable ascii with punctuation", json.dumps({"session_id": "did:x:1"}), "did:x:1"),
-    ("sms sender", json.dumps({"session_id": "sms:+15551234567"}), "sms:+15551234567"),
+    ("outside the charset", json.dumps({"session_id": "did:x:1"}), None),
     # Metadata that is valid JSON but not an object has no session_id at all.
     ("metadata not an object", json.dumps([{"session_id": UUID_A}]), None),
 ]
@@ -348,22 +343,18 @@ async def test_an_unstampable_caller_id_is_stored_but_not_indexed(tmp_path):
     outside the charset still reaches metadata verbatim, still groups exactly
     as it did before, and simply leaves the column NULL — the state legacy rows
     are already in and the one Phase C has to tolerate anyway.
-
-    The id is non-ASCII since #3061 widened the charset to printable ASCII.
-    That widening is about which ids the column can INDEX; it is not an ingress
-    rule either, and the claim under test is the same one.
     """
     db = await AsyncDatabase.sqlite(str(tmp_path / "ingress.db"))
     try:
         store = AsyncConversationStore(db, agent_id=AGENT)
-        await store.add_conversation("user", "hello", session_id="sesión:1")
+        await store.add_conversation("user", "hello", session_id="did:x:1")
 
         _content, metadata, session_id = (await _rows(db))[0]
-        assert json.loads(metadata)["session_id"] == "sesión:1"
+        assert json.loads(metadata)["session_id"] == "did:x:1"
         assert session_id is None
 
         # ...and grouping still files it under the id it always did.
-        assert _grouped_session_id(json.loads(metadata)) == "sesión:1"
+        assert _grouped_session_id(json.loads(metadata)) == "did:x:1"
     finally:
         await db.close()
 

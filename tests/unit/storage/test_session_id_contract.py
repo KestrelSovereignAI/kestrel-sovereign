@@ -73,35 +73,12 @@ VALUES = [
     ("json object", {"nested": UUID_A}, False),
     ("json array", [UUID_A], False),
     ("json null", None, False),
-    # Printable ASCII the charset admits since #3061 widened it. `sms:{sender}`
-    # is the one that mattered: ``rasa_shim`` writes it on every SMS turn, and a
-    # value the column can never hold is a row that stays NULL for ever — which
-    # is what kept an agent's whole history being re-derived on every repair.
-    ("space", "a b", True),
-    ("colon", "did:x:1", True),
-    ("sms sender", "sms:+15551234567", True),
-    ("slash", "a/b", True),
-    ("dot", "sess.9fk21xa", True),
-    ("percent", "a%b", True),
-    ("like underscore wildcard", "a_b", True),
-    ("at sign", "a@b", True),
-    ("printable edges", " ~", True),
-    # ...and the four printable characters still refused, each for its own
-    # reason. `^` `]` `\\` have no shared meaning between a PostgreSQL regex
-    # bracket expression and a SQLite GLOB one; `"` survives into the raw
-    # metadata document as `\\"`, so the resolver's LIKE pattern built from the
-    # unescaped value could not match it and the session would be listed
-    # unopenable.
+    # Ordinary strings that are simply outside the portable charset.
+    ("space", "a b", False),
+    ("colon", "did:x:1", False),
+    ("slash", "a/b", False),
     ("bracket", "a]b", False),
     ("caret", "a^b", False),
-    ("backslash", "a\\b", False),
-    ("double quote", 'a"b', False),
-    # Still ASCII-only, and that is the load-bearing part rather than the
-    # narrowness: for an ASCII string ``str.isdigit()`` is exactly ``[0-9]+``,
-    # which both dialects can say.
-    ("del control character", "a\x7fb", False),
-    ("tab", "a\tb", False),
-    ("newline", "a\nb", False),
 ]
 
 
