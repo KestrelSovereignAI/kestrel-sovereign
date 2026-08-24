@@ -301,25 +301,20 @@ class TestWhatTheInvariantBuys:
 
 
 @pytest.mark.asyncio
-async def test_a_stamped_row_absorbed_into_a_legacy_cluster_still_lists(tmp_path):
-    """#3098, pinned here because #3061 is what would have widened its reach.
+async def test_a_stamped_row_beside_a_legacy_cluster_still_lists(tmp_path):
+    """#3098, which this ticket's frontier hands over to.
 
-    ``group_messages_into_sessions`` deliberately does not split a row carrying
-    an explicit id out of a legacy numeric cluster (#2019): the resolver walks
-    that cluster forward in time and does not stop on id changes, so a split
-    list would let deleting the legacy session destroy the other one too. The
-    column, derived per row from that row's own metadata, files it under the
-    explicit id anyway — and ``project_transcript`` then drops the session as
-    the Phase A violation it is.
+    Two live rows five minutes apart, one stamped. ``project_transcript`` used
+    to find the stamped row grouped under the legacy cluster's numeric anchor
+    while its own column said otherwise, refuse to guess, and drop BOTH — the
+    conversation list came back empty, reproduced on main.
 
-    Reproduced on main: two live rows five minutes apart, one stamped, and the
-    conversation list is EMPTY.
-
-    This is xfail rather than absent because #3061 wanted the column's charset
-    widened — `rasa_shim` files every SMS turn under `sms:{sender}`, which the
-    column cannot hold, so those rows are unstamped for ever — and that widening
-    turns this from unreachable into reachable for any agent with legacy history
-    that starts receiving SMS. The test says which order the two must land in.
+    The disagreement was the grouper's, and the grouper's reason was the
+    resolver's: a legacy cluster absorbed the stamped row because
+    ``_filter_session_rows`` walked straight through it, so splitting the list
+    would have let deleting the legacy session destroy the stamped one too
+    (#2019). #3098 stopped the walk; both sessions are now listed as
+    themselves. See ``test_session_id_boundary.py`` for the pair of them.
     """
     path = tmp_path / "absorbed.db"
     _seed(path, [(None, 0), ("8f1d1c62-9b0e-4b2c-9a1d-000000000001", 5)])
@@ -329,31 +324,39 @@ async def test_a_stamped_row_absorbed_into_a_legacy_cluster_still_lists(tmp_path
         projection = ConversationSessionProjection(db, AGENT)
         await projection.repair()
         listed = {r["session_id"]: r["message_count"] for r in await projection.list()}
-        if not listed:
-            pytest.xfail("#3098: the absorbed row's column contradicts grouping")
-        assert listed == {"1": 2}
+        assert listed == {"1": 1, "8f1d1c62-9b0e-4b2c-9a1d-000000000001": 1}
     finally:
         await db.close()
 
 
-class TestTheFrontiersEdges:
+class TestTheFrontierIsExact:
+    """The frontier is one stamp, and #3098 is why it can be.
+
+    It used to run a grouping gap past the newest unstamped row and then
+    further still, along a walk of the cluster that row sat in, because a
+    legacy cluster ABSORBED following stamped rows and so extended
+    transitively. That absorption is gone. Every live row above the newest
+    unstamped one carries a column, a column is a canonical id, and a canonical
+    id now starts its own session — so the cluster ends AT that row and the
+    walk could only ever have handed it back.
+
+    What remains is the claim itself: a chunk landing after the newest
+    unstamped row is one the column can answer alone. The grouper is a
+    left-to-right fold, so an unstamped row's session is decided by what
+    precedes it and a later row cannot move it; the one thing a later row can
+    do is resume a session by naming it, and coalescing only ADDS, which is
+    what a fold does.
+    """
+
     @pytest.mark.asyncio
-    async def test_a_chunk_inside_the_gap_window_escalates(self, tmp_path, monkeypatch):
-        """The frontier carries the grouping gap, and that is not padding.
+    async def test_a_chunk_after_the_newest_unstamped_row_folds(
+        self, tmp_path, monkeypatch
+    ):
+        """The tightening, stated as the case that used to escalate.
 
-        A stamped row arriving within ``SESSION_GAP_MINUTES`` of the newest
-        unstamped one is absorbed into that row's cluster by the grouper —
-        deliberately (#2019), because the resolver walks a legacy numeric
-        cluster forward in time and does not stop on id changes. A fold files it
-        under its own column id instead. Measured without the extension: the
-        reader saw one session of two rows and the projection stored two
-        sessions of one, calling itself current.
-
-        What the escalation hands over to is #3098: the transcript pass then
-        drops that cluster, because the absorbed row's column contradicts the
-        grouping. That is pre-existing and identical on main — asserted here as
-        "the fold did not invent a different answer", which is this ticket's
-        part of it.
+        A stamped row five minutes after the legacy one no longer needs the
+        transcript — and the answer it folds to is the reader's, which is the
+        half that makes the fold legitimate rather than merely cheap.
         """
         path = tmp_path / "gap.db"
         _seed(path, [(None, 0)])
@@ -367,36 +370,61 @@ class TestTheFrontiersEdges:
             await projection.repair()
             settled = len(passes)
 
-            await _append(db, "sess-b", 5)  # above the frontier, inside the gap
+            await _append(db, "sess-b", 5)  # inside the old gap window
             await projection.repair()
-            assert len(passes) > settled, "a chunk inside the gap window folded"
-            listed = {r["session_id"] for r in await projection.list()}
-            assert "sess-b" not in listed, (
-                f"{listed}: the fold listed a session the reader absorbs into "
-                "the legacy cluster beside it"
-            )
+            assert len(passes) == settled, "this step escalated, so it folded nothing"
+            listed = {
+                r["session_id"]: r["message_count"] for r in await projection.list()
+            }
+            assert listed == {"1": 1, "sess-b": 1, "sess-z": 1}, listed
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_chunk_sharing_the_frontier_stamp_escalates(
+        self, tmp_path, monkeypatch
+    ):
+        """``<=``, not ``<``, and the tie is the reason.
+
+        ``created_at`` is stored to the second, so a row landing in the same
+        second as the newest unstamped one is ordinary rather than exotic — and
+        canonical order breaks that tie by id, which an import or an
+        overlapping PostgreSQL writer may set either way. A row that sorts
+        BEFORE the unstamped one takes it, and no column read can see that, so
+        the boundary stamp itself is inside the fence.
+        """
+        path = tmp_path / "tie.db"
+        _seed(path, [("sess-a", 0), (None, 2)])
+
+        passes = _counting_transcript_passes(monkeypatch)
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            projection = ConversationSessionProjection(db, AGENT)
+            await projection.repair()
+            await _append(db, "sess-z", 2000)
+            await projection.repair()
+            settled = len(passes)
+
+            await _append(db, "sess-b", 2)  # the same second as the unstamped row
+            await projection.repair()
+            assert len(passes) > settled, "the chunk folded on the frontier itself"
         finally:
             await db.close()
 
 
 @pytest.mark.asyncio
-async def test_a_legacy_cluster_reaching_past_the_gap_is_fenced(tmp_path):
-    """A legacy cluster extends transitively, and the fence follows it.
+async def test_a_stamped_chain_no_longer_extends_the_fence(tmp_path):
+    """Unstamped at 0, stamped at 20, stamped at 40 is three sessions, not one.
 
-    Unstamped at minute 0, stamped at 20, stamped at 40 is ONE cluster to the
-    reader: each adjacent gap is under thirty minutes, and a legacy cluster
-    absorbs stamped rows (#2019). A frontier of "newest unstamped row plus one
-    gap" stops at minute 30 and would fold minute 40 under its own id.
+    This was the case the reach walk existed for: each adjacent gap is under
+    thirty minutes, and a legacy cluster used to absorb stamped rows, so the
+    reader called all three one conversation and a frontier of "newest
+    unstamped plus one gap" would have folded minute 40 under its own id.
 
-    The reach is walked over history rather than read from the projection —
-    which is where a cluster's end is written down, and is exactly what #3098
-    makes unreadable, since the absorbed row at minute 20 causes the cluster to
-    be refused and never stored.
-
-    So the assertion is in two parts. The fold's part holds now: it invents no
-    session the reader does not show. Full agreement is still #3098's, and the
-    xfail below is that ticket's, not this one's — this branch and main produce
-    the identical (wrong) answer for it.
+    #3098 made each stamped row its own session, so there is no chain to
+    follow. The assertion is the whole listing rather than an absence: the
+    projection and the reader now agree outright, where this test previously
+    could only say the fold had not invented a session and xfail the rest.
     """
     path = tmp_path / "chain.db"
     _seed(path, [(None, 0)])
@@ -412,50 +440,7 @@ async def test_a_legacy_cluster_reaching_past_the_gap_is_fenced(tmp_path):
         await _append(db, "sess-y", 40)
         await projection.repair()
 
-        listed = {r["session_id"] for r in await projection.list()}
-        assert "sess-y" not in listed, (
-            f"{listed}: the fold listed a session the reader absorbs into the "
-            "legacy cluster reaching past it"
-        )
-        if listed != {"1", "sess-z"}:
-            pytest.xfail(f"#3098: the reader groups these as 1 + sess-z, not {listed}")
-    finally:
-        await db.close()
-
-
-@pytest.mark.asyncio
-async def test_a_chain_longer_than_the_walk_refuses_rather_than_guesses(
-    tmp_path, monkeypatch
-):
-    """The reach walk is bounded, and running out is an answer.
-
-    A legacy cluster extends for as long as consecutive rows stay within the
-    grouping gap, which nothing in the data bounds — so the walk does, and a
-    chain it cannot see the end of returns a frontier nothing can be after
-    rather than the last row it happened to reach. Guessing there would fold a
-    row the reader puts inside the cluster.
-    """
-    monkeypatch.setattr(
-        "kestrel_sovereign.storage.conversation_sessions.CLUSTER_REACH_ROWS", 2
-    )
-    path = tmp_path / "long-chain.db"
-    _seed(path, [(None, 0)] + [(f"sess-{n}", n * 10) for n in range(1, 6)])
-
-    passes = _counting_transcript_passes(monkeypatch)
-    db = await AsyncDatabase.sqlite(str(path))
-    try:
-        projection = ConversationSessionProjection(db, AGENT)
-        await projection.repair()
-        await _append(db, "sess-far", 43200)
-        await projection.repair()
-        settled = len(passes)
-
-        # Far past any real cluster, but the walk cannot prove where the chain
-        # ends within two rows, so nothing may be folded.
-        await _append(db, "sess-later", 43300)
-        await projection.repair()
-        assert len(passes) > settled, (
-            "a chunk folded while the walk had not reached the end of the chain"
-        )
+        listed = {r["session_id"]: r["message_count"] for r in await projection.list()}
+        assert listed == {"1": 1, "sess-x": 1, "sess-y": 1, "sess-z": 1}, listed
     finally:
         await db.close()

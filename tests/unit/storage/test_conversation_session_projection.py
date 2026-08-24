@@ -1258,9 +1258,25 @@ def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
         PROJECTION_METADATA_KEYS,
     )
 
+    def _key(node):
+        """The string a lookup's argument names, whether spelled or named.
+
+        A key given as a module constant — ``metadata.get(SESSION_ID_KEY)`` —
+        is the same literal lookup as a quoted one, and resolving it here is
+        what keeps this scan from silently going blind the moment a key is
+        given a name. Anything else (a variable, an expression) is not a
+        literal key and is deliberately not counted.
+        """
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, str) else None
+        if isinstance(node, ast.Name):
+            resolved = getattr(session_grouping, node.id, None)
+            return resolved if isinstance(resolved, str) else None
+        return None
+
     tree = ast.parse(inspect.getsource(session_grouping))
     consulted = {
-        node.args[0].value
+        key
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1269,8 +1285,8 @@ def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id in {"meta", "metadata"}
         and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
+        for key in [_key(node.args[0])]
+        if key is not None
     }
     assert consulted, "found no metadata lookups at all — the scan is broken"
     assert consulted == set(PROJECTION_METADATA_KEYS), (

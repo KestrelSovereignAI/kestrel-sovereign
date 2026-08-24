@@ -26,6 +26,7 @@ from .conversation_ids import coerce_persistent_message_id
 from .conversation_created_at import UNDATED_TABLE
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
+    canonical_session_id,
     canonical_timestamp_sql,
     iso_session_timestamp,
     parse_message_metadata,
@@ -2224,12 +2225,41 @@ class AsyncConversationStore:
         session_rows = []
         last_timestamp: Optional[datetime] = None
         is_first = True
+        # Whether the requested session's implicit run is still taking rows.
+        #
+        # A row filed under a DIFFERENT canonical id ends it, and ending it is
+        # not the same as skipping the row: an unlabeled row after it inherits
+        # THAT session under ``group_messages_into_sessions``, so it must not
+        # be able to rejoin this one by merely falling inside the gap. Only a
+        # row carrying the requested id re-opens the run — that is a resumption,
+        # and the grouper coalesces those back together by id.
+        #
+        # Until #3098 this walk did not stop, so a legacy numeric cluster
+        # absorbed a following stamped row. The grouper had to absorb it too,
+        # or deleting the cluster the list showed would have destroyed the
+        # stamped session beside it — and that absorption is what made Phase
+        # A's per-row column disagree with the grouping and drop the whole
+        # conversation from the list.
+        run_open = True
 
         for timestamp, _row_id, row, meta in candidates:
             is_resumed_message = meta.get("session_id") == session_id_str
 
             if not is_first and not is_resumed_message and meta.get("new_session"):
                 break
+
+            if is_resumed_message:
+                run_open = True
+            elif not is_first and canonical_session_id(meta) not in (
+                None,
+                session_id_str,
+            ):
+                run_open = False
+            if not run_open:
+                # Deliberately WITHOUT advancing ``last_timestamp``: nothing
+                # else can join this session until a resumption re-opens it,
+                # and a resumption is admitted regardless of the gap.
+                continue
 
             if last_timestamp and not is_resumed_message:
                 gap_minutes = (

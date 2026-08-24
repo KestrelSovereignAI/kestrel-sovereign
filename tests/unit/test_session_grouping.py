@@ -98,20 +98,21 @@ def test_session_id_change_splits_even_within_gap():
     assert all(s["message_count"] == 1 for s in sessions)
 
 
-def test_legacy_then_uuid_stays_merged_to_match_resolver():
-    # A legacy row (no session_id) followed within the gap by a UUID row must
-    # stay ONE session: _get_session_messages(<legacy row id>) time-walks
-    # through the UUID row, so splitting the list there would let a legacy
-    # delete also destroy the UUID session (#2019). Two distinct UUIDs still
-    # split — see test_session_id_change_splits_even_within_gap.
+def test_legacy_then_uuid_splits_because_the_resolver_stops_there():
+    # A legacy row (no session_id) followed within the gap by a stamped row is
+    # TWO sessions. It used to be one: the resolver's time-walk from a legacy
+    # row-id did not stop on id changes, so a split list would have let a
+    # legacy delete destroy the stamped session too (#2019). The walk stops
+    # now (`_filter_session_rows`), and merging them was what made Phase A's
+    # per-row column contradict the grouping and drop the conversation from
+    # the list entirely (#3098).
     msgs = [
         _msg(1, "user", "legacy", minutes=0),               # no session_id
         _msg(2, "user", "stamped", minutes=1, session_id="u-1234"),
     ]
     sessions = group_messages_into_sessions(msgs)
-    assert len(sessions) == 1
-    assert sessions[0]["session_id"] == "1"  # legacy anchor wins
-    assert sessions[0]["message_count"] == 2
+    assert [s["session_id"] for s in sessions] == ["1", "u-1234"]
+    assert [s["message_count"] for s in sessions] == [1, 1]
 
 
 def test_unlabeled_turn_stays_with_current_session():

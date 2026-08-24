@@ -319,14 +319,12 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
 from .session_grouping import (
-    timestamp_predicate,
     SESSION_ORDER,
     SESSION_ORDER_TEXT_COLUMNS,
     canonical_timestamp_sql,
@@ -583,15 +581,6 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: probes below count these rows; two spellings of one membership rule is the
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
-
-#: How far a cluster-reach walk will follow a chain of turns before refusing.
-#:
-#: A legacy cluster extends for as long as consecutive rows stay within
-#: ``SESSION_GAP_MINUTES``, which has no bound in the data — so the walk has one,
-#: and running out is answered by a frontier nothing can be after rather than by
-#: a guess. 512 turns without a half-hour break is well past any real
-#: conversation and is one indexed read.
-CLUSTER_REACH_ROWS = 512
 
 #: "Something is unstamped and nothing can be ordered against it."
 #:
@@ -3453,13 +3442,13 @@ class ConversationSessionProjection:
         )
 
     async def _unstamped_frontier(self) -> Optional[datetime]:
-        """How recently an unstamped live row stands, or ``None`` for none at all.
+        """Where the newest unstamped live row stands, or ``None`` for none.
 
-        A row filed under no ``session_id`` belongs to whichever cluster it falls
-        next to, so a row arriving BESIDE it can take it — and a fold reading
-        sessions by their column would never see that happen. Ordinary appends
-        land after everything and cannot; a row whose id is higher but whose
-        stamp is earlier can, and that is not hypothetical: PostgreSQL's
+        A row filed under no ``session_id`` belongs to whichever cluster it
+        falls next to, so a row arriving BEFORE it can take it — and a fold
+        reading sessions by their column would never see that happen. Ordinary
+        appends land after everything and cannot; a row whose id is higher but
+        whose stamp is earlier can, and that is not hypothetical: PostgreSQL's
         ``NOW()`` is transaction-start time, so an overlapping writer commits a
         later id carrying an earlier timestamp, and an import or restore can
         write anything.
@@ -3469,15 +3458,25 @@ class ConversationSessionProjection:
         09:01 with a higher id stored ``sess-a=2, sess-b=1`` under a watermark
         reporting itself current, where the reader says ``sess-a=1, sess-b=2``.
 
-**Extended by the grouping gap, and by the reach of the
-        cluster the newest unstamped row sits in.** A stamped row
-        arriving within ``SESSION_GAP_MINUTES`` of the newest unstamped one is
-        absorbed into that row's cluster by the grouper — deliberately, because
-        the resolver walks a legacy numeric cluster forward in time and does not
-        stop on id changes (#2019) — while a fold would file it under its own
-        column id. Measured without the extension: the reader says one session
-        of two rows, the projection stored two sessions of one, and called
-        itself current.
+        **The newest unstamped row's own stamp is the whole frontier**, and
+        that is a claim worth stating rather than a bound chosen for comfort.
+        ``group_messages_into_sessions`` is a left-to-right fold, so which
+        session an unstamped row lands in is decided entirely by the rows
+        BEFORE it; a row arriving after it cannot move it. What a later row can
+        do is resume a session by naming it, and coalescing only ever ADDS —
+        which is exactly what a fold does. So a chunk landing after this stamp
+        is one the column can answer alone, and a chunk landing at or before it
+        is one only the transcript can.
+
+        Until #3098 the frontier ran a grouping gap further out, and further
+        still along a walk of the cluster the newest unstamped row sat in,
+        because a legacy cluster ABSORBED following stamped rows and so
+        extended transitively — unstamped at 0, stamped at 20, stamped at 40
+        was one conversation. That absorption is gone: a row filed under its
+        own canonical id now starts its own session, and every live row above
+        this one carries a column, so every one of them is such a row. The
+        cluster therefore ends AT the newest unstamped row, and the walk that
+        looked for its end could only ever have returned that row back.
 
         ``None`` means nothing is unstamped and every chunk lands clear.
 
@@ -3498,81 +3497,7 @@ class ConversationSessionProjection:
         newest = coerce_session_timestamp(row[0])
         if newest is None:
             return _UNDATABLE_FRONTIER
-
-        # ...and out to the END of the cluster that row sits in, because a
-        # legacy cluster ABSORBS stamped rows (#2019) and so extends
-        # transitively: unstamped at 0, stamped at 20, stamped at 40 is one
-        # conversation, each adjacent gap being under the limit. Fencing one gap
-        # past the unstamped row would leave minute 40 outside it and the reader
-        # still puts it inside.
-        #
-        # Walked over history rather than read from the projection, which is
-        # where a cluster's end is written down and is exactly what #3098 makes
-        # unreadable: the absorbed row's column contradicts the grouping, so
-        # `project_transcript` refuses the cluster and never stores the row that
-        # would say where it stops.
-        newest = await self._cluster_reach(row[0], newest)
-        # ``datetime.max`` is a legal stored stamp — the #3009 CHECK admits year
-        # 9999 — and adding to it raises rather than returning a large number.
-        # A frontier nothing can be after is what the sentinel already means.
-        if newest > datetime.max - timedelta(minutes=SESSION_GAP_MINUTES):
-            return _UNDATABLE_FRONTIER
-        # One gap past where the cluster stops, because the grouper splits on
-        # ``gap > gap_minutes`` — strictly greater — so a row landing exactly
-        # that far after the last one is still absorbed.
-        #
-        # NOT SEPARATELY COVERED, and it is worth saying why rather than leaving
-        # a mutant survivor unexplained: reaching the boundary needs a chunk row
-        # between the chain's end and one gap past it, and a projection settled
-        # enough to fold at all needs an earlier fold BEYOND that point — so the
-        # only constructions that touch this comparison are inversions, which
-        # `_folded`'s own monotonicity check escalates first. Both spellings
-        # behave identically on every input a test can build. The rule is the
-        # grouper's, stated the same way it states it.
-        return newest + timedelta(minutes=SESSION_GAP_MINUTES)
-
-    async def _cluster_reach(
-        self, frontier_stamp: Any, newest: datetime
-    ) -> datetime:
-        """Where the cluster containing the newest unstamped row stops.
-
-        Walks forward from it while each step is within ``SESSION_GAP_MINUTES``
-        of the last — the grouper's own rule for staying in a session — and
-        returns the last row it reached. That row plus one gap is the first
-        point at which a new session provably begins.
-
-        **Bounded, and it says so by refusing rather than by stopping early.**
-        The walk reads at most :data:`CLUSTER_REACH_ROWS`; a chain longer than
-        that is an agent talking without a half-hour break for that many turns,
-        and guessing its end would be worse than not folding. Running out
-        returns ``datetime.max``, which every caller already reads as "nothing
-        can be proved to land clear of this".
-        """
-        rows = await self.db.fetchall(
-            f"SELECT {_canonical_key(self.db.backend_type, 'created_at')}, created_at "
-            "FROM conversation_history "
-            f"WHERE agent_id = ? AND {_LIVE} "
-            f"AND {timestamp_predicate(self.db.backend_type, 'created_at', '>=')} "
-            f"{canonical_order(self.db.backend_type)} LIMIT ?",
-            (
-                self.agent_id,
-                timestamp_query_param(self.db.backend_type, frontier_stamp),
-                CLUSTER_REACH_ROWS + 1,
-            ),
-        )
-        reached = newest
-        for index, row in enumerate(rows):
-            stamp = coerce_session_timestamp(row[1])
-            if stamp is None:
-                return datetime.max
-            if stamp <= reached:
-                continue
-            if (stamp - reached) > timedelta(minutes=SESSION_GAP_MINUTES):
-                return reached
-            reached = stamp
-        if len(rows) > CLUSTER_REACH_ROWS:
-            return datetime.max
-        return reached
+        return newest
 
     async def _fold(
         self, rows: Sequence[Sequence[Any]], through: int,
