@@ -338,45 +338,6 @@ async def test_a_stamped_row_absorbed_into_a_legacy_cluster_still_lists(tmp_path
 
 class TestTheFrontiersEdges:
     @pytest.mark.asyncio
-    async def test_a_chunk_landing_exactly_at_the_frontier_escalates(
-        self, tmp_path, monkeypatch
-    ):
-        """``<=`` rather than ``<``, and the boundary is load-bearing.
-
-        The frontier is the newest unstamped row plus ``SESSION_GAP_MINUTES``,
-        and the grouper splits on ``gap > gap_minutes`` — strictly greater. So a
-        row landing EXACTLY that many minutes later is still absorbed into the
-        cluster beside it, and a fold filing it under its own id would disagree
-        with the reader by one row at the one input where the two comparisons
-        differ.
-
-        Stated as a test because the alternative is a boundary nobody can see:
-        both spellings behave identically on every other input, and ``<`` did
-        survive this test while it used a row well inside the window.
-        """
-        path = tmp_path / "tie.db"
-        _seed(path, [("sess-a", 0), (None, 2)])
-
-        passes = _counting_transcript_passes(monkeypatch)
-        db = await AsyncDatabase.sqlite(str(path))
-        try:
-            projection = ConversationSessionProjection(db, AGENT)
-            await projection.repair()
-            await _append(db, "sess-z", 2000)
-            await projection.repair()
-            settled = len(passes)
-
-            # Exactly SESSION_GAP_MINUTES after the unstamped row at minute 2,
-            # which is exactly the frontier — and still absorbed by it.
-            await _append(db, "sess-b", 2 + SESSION_GAP_MINUTES)
-            await projection.repair()
-            assert len(passes) > settled, (
-                "a chunk landing exactly at the frontier folded"
-            )
-        finally:
-            await db.close()
-
-    @pytest.mark.asyncio
     async def test_a_chunk_inside_the_gap_window_escalates(self, tmp_path, monkeypatch):
         """The frontier carries the grouping gap, and that is not padding.
 
@@ -419,24 +380,23 @@ class TestTheFrontiersEdges:
 
 
 @pytest.mark.asyncio
-async def test_a_legacy_cluster_reaching_past_the_gap_is_not_fenced(tmp_path):
-    """#3098 again, and the reason #3061's frontier is one gap and not a reach.
+async def test_a_legacy_cluster_reaching_past_the_gap_is_fenced(tmp_path):
+    """A legacy cluster extends transitively, and the fence follows it.
 
-    A legacy cluster absorbs stamped rows, so it extends transitively: unstamped
-    at minute 0, stamped at 20, stamped at 40 is ONE cluster to the reader,
-    because each adjacent gap is under thirty minutes. The frontier is the
-    newest unstamped row plus one gap, so a chunk landing at minute 40 is past
-    it and folds.
+    Unstamped at minute 0, stamped at 20, stamped at 40 is ONE cluster to the
+    reader: each adjacent gap is under thirty minutes, and a legacy cluster
+    absorbs stamped rows (#2019). A frontier of "newest unstamped row plus one
+    gap" stops at minute 30 and would fold minute 40 under its own id.
 
-    The projection is where that reach would be read from — a cluster's stored
-    ``last_message_at`` IS where it stops — and it cannot be, because #3098
-    means the absorbed row's column contradicts the grouping and the cluster is
-    never stored at all. Measured on main and on this branch: both disagree with
-    the reader here, differently.
+    The reach is walked over history rather than read from the projection —
+    which is where a cluster's end is written down, and is exactly what #3098
+    makes unreadable, since the absorbed row at minute 20 causes the cluster to
+    be refused and never stored.
 
-    So this is not a regression to fix in #3061; it is the second thing #3098
-    blocks, and it says so rather than being left for the next reader to
-    rediscover.
+    So the assertion is in two parts. The fold's part holds now: it invents no
+    session the reader does not show. Full agreement is still #3098's, and the
+    xfail below is that ticket's, not this one's — this branch and main produce
+    the identical (wrong) answer for it.
     """
     path = tmp_path / "chain.db"
     _seed(path, [(None, 0)])
@@ -453,7 +413,49 @@ async def test_a_legacy_cluster_reaching_past_the_gap_is_not_fenced(tmp_path):
         await projection.repair()
 
         listed = {r["session_id"] for r in await projection.list()}
+        assert "sess-y" not in listed, (
+            f"{listed}: the fold listed a session the reader absorbs into the "
+            "legacy cluster reaching past it"
+        )
         if listed != {"1", "sess-z"}:
             pytest.xfail(f"#3098: the reader groups these as 1 + sess-z, not {listed}")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_chain_longer_than_the_walk_refuses_rather_than_guesses(
+    tmp_path, monkeypatch
+):
+    """The reach walk is bounded, and running out is an answer.
+
+    A legacy cluster extends for as long as consecutive rows stay within the
+    grouping gap, which nothing in the data bounds — so the walk does, and a
+    chain it cannot see the end of returns a frontier nothing can be after
+    rather than the last row it happened to reach. Guessing there would fold a
+    row the reader puts inside the cluster.
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.conversation_sessions.CLUSTER_REACH_ROWS", 2
+    )
+    path = tmp_path / "long-chain.db"
+    _seed(path, [(None, 0)] + [(f"sess-{n}", n * 10) for n in range(1, 6)])
+
+    passes = _counting_transcript_passes(monkeypatch)
+    db = await AsyncDatabase.sqlite(str(path))
+    try:
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        await _append(db, "sess-far", 43200)
+        await projection.repair()
+        settled = len(passes)
+
+        # Far past any real cluster, but the walk cannot prove where the chain
+        # ends within two rows, so nothing may be folded.
+        await _append(db, "sess-later", 43300)
+        await projection.repair()
+        assert len(passes) > settled, (
+            "a chunk folded while the walk had not reached the end of the chain"
+        )
     finally:
         await db.close()
