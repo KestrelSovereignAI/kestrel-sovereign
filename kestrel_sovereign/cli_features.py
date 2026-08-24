@@ -304,6 +304,9 @@ def cmd_feature_install(args) -> int:
                 "version conflict, move core to a version the feature accepts "
                 "— do not remove the pin."
             )
+        bound_note = guard.manifest_bound_note()
+        if bound_note:
+            print(f"  note: {bound_note}")
         # A failed install can be the very thing that broke the link. An
         # unrepaired core outranks the install failure: the caller must be able
         # to tell "this package did not install" from "the venv's core is not
@@ -734,6 +737,9 @@ def cmd_feature_upgrade(args) -> int:
                     f"      note: core is pinned to {guard.constraints[0]}; a "
                     "version conflict here is a real skew, not the pin's fault."
                 )
+            bound_note = guard.manifest_bound_note()
+            if bound_note:
+                print(f"      note: {bound_note}")
             continue
 
         new_version = _installed_version(name)
@@ -1463,6 +1469,13 @@ class CoreInstallGuard:
         self.before = before
         self._baseline = before
         self._constraints = self._derive(before)
+        # A SECOND set of lines, kept apart from core's on purpose: core's pin
+        # encodes a source policy and is re-derived whenever core moves, while
+        # these are the operator's declared windows for everything else and do
+        # not change during a batch. Folding them together would re-derive the
+        # manifest's bounds from core's shape, which is not where they come
+        # from (issue #3106).
+        self._manifest_bounds: list = []
 
     @classmethod
     def snapshot(cls, source_index=None):
@@ -1483,7 +1496,13 @@ class CoreInstallGuard:
         # them apart. Passing the narrowed value let a damaged venv run entirely
         # unguarded — no constraint, no verification (issue #2949).
         policy = fr.resolve_core_policy(source_index or {}, before)
-        return cls(policy, before)
+        guard = cls(policy, before)
+        # Every install this guard performs is bounded by the WHOLE manifest,
+        # not only by core's pin. Without it, remediating one entry moves
+        # another outside its declared window and the run reports success over
+        # the violation (issue #3106).
+        guard._manifest_bounds = fr.manifest_version_constraints(source_index or {})
+        return guard
 
     @classmethod
     def unguarded(cls):
@@ -1503,8 +1522,56 @@ class CoreInstallGuard:
 
     @property
     def constraints(self) -> list:
-        """The constraint lines applied to each guarded install (may be empty)."""
+        """CORE's constraint lines, and only core's (may be empty).
+
+        Every caller reads this to say "core is pinned to ``constraints[0]``",
+        so it stays what that sentence claims. Folding the manifest's other
+        windows in here made that message name a FEATURE's window on a host
+        with no core pin — two facts in one list, and the caller reading it
+        positionally could not tell.
+        """
         return list(self._constraints)
+
+    @property
+    def manifest_bounds(self) -> list:
+        """The manifest's declared windows for everything EXCEPT core.
+
+        Read by the failure reports, which have to name the right thing: a
+        conflict against one of these is not a reason to move core.
+        """
+        return list(self._manifest_bounds)
+
+    def manifest_bound_note(self) -> Optional[str]:
+        """The sentence naming the windows in force for everything but core.
+
+        Owned by the guard because EVERY surface that reports a guarded
+        install's failure has to say it: a note added at one of them is a note
+        the other three do not have, and an operator on the wrong surface is
+        told to move core over a conflict core is not in (#3106).
+
+        ``None`` when the manifest declares no windows, so a caller can ask
+        without knowing whether there is anything to say.
+        """
+        if not self._manifest_bounds:
+            return None
+        windows = ", ".join(self._manifest_bounds)
+        return (
+            f"the manifest also bounds {windows} for this install, so "
+            "satisfying one entry cannot move another out of its declared "
+            "window. If the conflict names one of these, that entry is the "
+            "one to change."
+        )
+
+    @property
+    def install_constraints(self) -> list:
+        """Every line a guarded install carries: core's pin, then the manifest's.
+
+        The other fact, under its own name. Core's pin bounds core's source and
+        version; the manifest's windows bound everything else it declares, and
+        an install that has to satisfy one entry must not move another out of
+        its own (issue #3106).
+        """
+        return list(self._constraints) + list(self._manifest_bounds)
 
     def run(self, pip_args: list, *, reinstall=None, timeout=None):
         """Install a FEATURE package with core held inside the policy.
@@ -1517,7 +1584,7 @@ class CoreInstallGuard:
         """
         return self._install(
             pip_args,
-            constraints=self._constraints or None,
+            constraints=self.install_constraints or None,
             reinstall=reinstall,
             timeout=timeout,
         )
@@ -1535,7 +1602,13 @@ class CoreInstallGuard:
         own dependency tree, and a blanket flag would.
         """
         result = self._install(
-            pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+            pip_args,
+            # Never core's own pin — this IS the operator moving core — but the
+            # rest of the manifest still binds: a core install must not drag a
+            # declared feature outside its window either (issue #3106).
+            constraints=self._manifest_bounds or None,
+            reinstall=reinstall,
+            timeout=timeout,
         )
         self.refresh()
         return result
@@ -1792,7 +1865,15 @@ class CoreInstallGuard:
         pip_args, reinstall, rendered, shell = self._restore_plan()
         try:
             result = self._install(
-                pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+                pip_args,
+                # Core is never constrained against itself, here least of all —
+                # this install exists to put core back. The rest of the manifest
+                # still binds: a repair that resolves a dependency outside
+                # another entry's declared window has moved it, and this rechecks
+                # only core (issue #3106).
+                constraints=self._manifest_bounds or None,
+                reinstall=reinstall,
+                timeout=timeout,
                 repairing=True,
             )
         except subprocess.TimeoutExpired as expired:
@@ -2265,6 +2346,11 @@ def cmd_feature_sync(args) -> int:
                     "this is a version conflict, move core to a version the "
                     "feature accepts — do not remove the pin."
                 )
+            # Not gated on `is_core`: a core install carries these bounds too,
+            # and a conflict against one of them is not a reason to move core.
+            bound_note = guard.manifest_bound_note()
+            if bound_note:
+                print(f"      note: {bound_note}")
             # A failed core action stops the batch only when core is ACTUALLY
             # off its declared source. `_resolve_manifest_action` returns
             # `ensure` for a conforming core that declares extras, and a failed

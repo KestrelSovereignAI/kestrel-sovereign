@@ -3112,3 +3112,200 @@ def test_a_closure_the_failed_install_repaired_does_not_block_the_restart(
     # Still an error — the install failed — but a CONTINUABLE one, because the
     # thing this check exists to refuse is no longer true.
     assert rc == 1
+
+
+# --- the manifest bounds EVERY install, not just core's (#3106) --------------
+#
+# Observed on the live host: remediating one manifest entry upgraded another
+# past its declared window, reconcile put it back 12 seconds later, and the
+# update reported success over a package that still could not load.
+
+
+def _two_entries_that_cannot_both_hold(tmp_path):
+    """`voice` needs a `workflows` its own manifest entry forbids."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-feature-workflows"\npypi = ">=0.5.1,<0.6"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52")   # core itself is satisfied
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    venv.installed_requires["kestrel-feature-voice"] = [
+        "kestrel-feature-workflows>=0.6.0,<0.7",
+    ]
+    venv.package_index["kestrel-feature-workflows"] = ["0.5.2", "0.6.0"]
+    return manifest, venv
+
+
+def test_an_install_cannot_move_another_entry_out_of_its_declared_window(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The conflict is the answer, not something to oscillate over.
+
+    Bounded by core's pin alone, this install has a solution — upgrade
+    `workflows` past the `<0.6` its own entry declares — so it "succeeds",
+    reconcile reverts it, and nothing reports that the operator has two entries
+    that cannot both hold.
+    """
+    manifest, venv = _two_entries_that_cannot_both_hold(tmp_path)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc == 1                                        # reported, not hidden
+    assert "No solution found" in out
+    # ...and the entry it would have moved is exactly where the manifest says.
+    assert venv.installed["kestrel-feature-workflows"] == "0.5.2"
+    # The guidance names the window that refused it. A conflict against one of
+    # these is NOT a reason to move core, and saying only "move core" sends the
+    # operator to change something the conflict never mentioned.
+    assert "the manifest also bounds kestrel-feature-workflows>=0.5.1,<0.6" in out
+    assert "that entry is the one to change" in out
+
+
+def test_the_manifest_bound_travels_on_the_install_itself(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The window has to reach the RESOLVER, not just the classification.
+
+    A check that demotes the entry and then hands the installer only core's pin
+    is the shape that produced the live churn: the resolver is free to satisfy
+    the requirement the one way the manifest forbids.
+    """
+    manifest, venv = _two_entries_that_cannot_both_hold(tmp_path)
+    use_fake_uv(monkeypatch, venv)
+
+    cli.cmd_feature_sync(_args(manifest))
+
+    # The file is deleted on return, so read what the double captured as it ran.
+    assert venv.constraint_files, venv.commands
+    lines = venv.constraint_files[-1].split()
+    assert "kestrel-feature-workflows>=0.5.1,<0.6" in lines
+    # Core's pin is still there, and still first — every message that quotes
+    # `constraints[0]` is about core.
+    assert lines[0].startswith(CORE)
+
+
+def test_a_manifest_without_a_conflict_installs_exactly_as_before(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Fidelity: the bounds must not manufacture failures.
+
+    Same two entries, with a requirement the declared window satisfies.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-feature-workflows"\npypi = ">=0.5.1,<0.6"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    venv.installed_requires["kestrel-feature-voice"] = [
+        "kestrel-feature-workflows>=0.5,<0.6",
+    ]
+    venv.package_index["kestrel-feature-workflows"] = ["0.5.2", "0.6.0"]
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert "present" in capsys.readouterr().out
+    assert venv.installed["kestrel-feature-workflows"] == "0.5.2"
+
+
+def test_a_core_install_is_bounded_by_the_manifest_too(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Core is never constrained against ITSELF — that is not a waiver of the rest.
+
+    `install_core` is the operator deliberately moving core, so core's own pin
+    is dropped. Dropping the whole file with it lets a core install move a
+    declared feature out of the window the same manifest declares for it.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+        '[[feature]]\nname = "kestrel-feature-workflows"\npypi = ">=0.5.1,<0.6"\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    venv.installed_requires[CORE] = ["kestrel-feature-workflows>=0.6.0,<0.7"]
+    venv.package_index["kestrel-feature-workflows"] = ["0.5.2", "0.6.0"]
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "No solution found" in out
+    assert venv.installed["kestrel-feature-workflows"] == "0.5.2"
+    # Core's OWN pin is still absent from that install — this is the operator
+    # moving core, and it must not be constrained against itself.
+    assert not any(line.startswith(CORE) for line in venv.constraint_files[-1].split())
+
+
+def test_the_core_pin_message_never_names_another_entrys_window(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """"core is pinned to X" has to be true, and on some hosts there is no X.
+
+    A host whose core is a plain index install with no declared pin has an
+    EMPTY core constraint list while the manifest still bounds its features.
+    Reading `constraints[0]` off a combined list then names a feature's window
+    in a sentence about core — two facts in one list, and the caller reading it
+    positionally cannot tell.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-feature-workflows"\npypi = ">=0.5.1,<0.6"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    # Core is an ordinary index install the manifest says nothing about, so
+    # there is no core pin to quote.
+    venv = FakeUv(core_checkout=None, feature_requires=">=0.53", feature_install_fails=True)
+    use_fake_uv(monkeypatch, venv)
+
+    cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert "core is pinned to kestrel-feature-workflows" not in out
+    assert "FAILED" in out          # the failure itself is still reported
+
+
+def test_the_repair_is_bounded_by_the_manifest_too(monkeypatch, capsys):
+    """A repair that moves a declared package has moved it, and rechecks core.
+
+    `_repair` drops core's own pin for the same reason `install_core` does —
+    it exists to put core back. Dropping the whole file with it lets the
+    restore resolve a dependency outside another entry's declared window, and
+    then report success because it only re-reads core.
+    """
+    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.feature_reconcile import SourceEntry
+
+    venv = FakeUv()
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    venv.installed_requires[CORE] = ["kestrel-feature-workflows>=0.6.0,<0.7"]
+    venv.package_index["kestrel-feature-workflows"] = ["0.5.2", "0.6.0"]
+    use_fake_uv(monkeypatch, venv)
+    index = {
+        CORE: SourceEntry(package=CORE, pypi=">=0.52,<0.53"),
+        "kestrel-feature-workflows": SourceEntry(
+            package="kestrel-feature-workflows", pypi=">=0.5.1,<0.6",
+        ),
+    }
+    guard = CoreInstallGuard.snapshot(index)
+
+    outcome = guard.resolve()
+
+    # The repair could not run without violating the workflows window, so it
+    # is reported as a failed repair rather than a success over a moved entry.
+    assert outcome.repaired is False
+    assert venv.installed["kestrel-feature-workflows"] == "0.5.2"
+    # Core's own pin is absent from the repair; the rest of the manifest is not.
+    lines = venv.constraint_files[-1].split()
+    assert "kestrel-feature-workflows>=0.5.1,<0.6" in lines
+    assert not any(line.startswith(CORE) for line in lines)

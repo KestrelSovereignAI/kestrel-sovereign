@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -576,3 +577,45 @@ def test_reconcile_reports_core_drift_when_the_install_is_interrupted(
     assert "INTERRUPTED" in err
     assert "/src/core" in err          # the declared source to restore to
     assert venv.editable.get(CORE) != "/src/core"   # left moved: no repair ran
+
+
+def test_reconcile_names_the_manifest_window_that_refused_an_install(
+    patched, monkeypatch, capsys
+):
+    """The bound note has to reach EVERY surface that reports a failure.
+
+    `kestrel update` reports a failed install from here, not from
+    `feature sync` — so a note added only there is a note this path does not
+    have, and the operator is told to move core over a conflict core is not in
+    (#3106).
+    """
+    manifest = patched / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-feature-workflows"\npypi = ">=0.5.1,<0.6"\n'
+        '[[feature]]\nname = "kestrel-feature-voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    monkeypatch.setattr(cli, "_host_manifest_path", lambda ns: manifest)
+
+    def failing_install(pip_args, *, constraints=None, reinstall=None, timeout=None):
+        return subprocess.CompletedProcess(
+            ["uv", "pip", "install", *pip_args], 1, stdout="",
+            stderr=(
+                "x No solution found when resolving dependencies: "
+                "kestrel-feature-voice depends on "
+                "kestrel-feature-workflows>=0.6.0, but you require "
+                "kestrel-feature-workflows>=0.5.1,<0.6."
+            ),
+        )
+
+    md = __import__("importlib.metadata", fromlist=["PackageNotFoundError"])
+    with patch("importlib.metadata.version", side_effect=md.PackageNotFoundError), \
+         patch.object(cli, "_editable_install_path", lambda p: None), \
+         patch.object(cli, "_extension_install_run", failing_install):
+        cli_lifecycle._run_feature_reconcile(
+            patched, manifest_override=None, dry_run=False,
+            allow_dirty=False, continue_on_error=True, prefer=None,
+        )
+
+    out = capsys.readouterr().out
+    assert "the manifest also bounds" in out
+    assert "kestrel-feature-workflows>=0.5.1,<0.6" in out
