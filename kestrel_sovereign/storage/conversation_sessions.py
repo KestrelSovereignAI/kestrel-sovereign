@@ -581,6 +581,14 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
 
+#: "Something is unstamped and nothing can be ordered against it."
+#:
+#: An unstamped row whose ``created_at`` will not parse cannot be placed before
+#: or after anything, so no session can be proved clear of it. ``datetime.max``
+#: says exactly that through the same comparison every other frontier uses,
+#: rather than adding a second branch that would then need its own test.
+_UNDATABLE_FRONTIER = datetime.max
+
 
 def active_history_predicate() -> str:
     """What the conversation list's DEFAULT view selects — live, not archived.
@@ -2289,175 +2297,6 @@ def transcript_membership(rows: Sequence[Sequence[Any]]) -> Dict[str, List[Any]]
     }
 
 
-#: The prefix a re-keyed legacy cluster is given (#3061).
-#:
-#: A cluster carrying no usable session id anywhere is keyed by the grouper as
-#: ``str(first row id)`` — all digits, which is precisely what
-#: :func:`~kestrel_sovereign.storage.session_id_column.is_stampable_session_id`
-#: refuses, because bare integers are the mis-filed legacy keys of #2012 that
-#: the grouper itself ignores. So that key can never reach the column, the rows
-#: stay NULL for ever, and one such row makes every repair of that agent
-#: re-derive its whole live history.
-#:
-#: The prefix turns the same identity into one the column can hold. It is
-#: derived from the old key rather than minted fresh so the migration is
-#: deterministic and re-runnable, and so ``conversation_titles`` — keyed on the
-#: old string — can be carried across by name.
-LEGACY_SESSION_PREFIX = "legacy-"
-
-
-def legacy_session_assignments(
-    rows: Sequence[Sequence[Any]],
-) -> Tuple[Dict[Any, str], Dict[Any, str], Dict[str, str], List[str]]:
-    """What every live row's ``session_id`` column should hold, for a transcript.
-
-    ``rows`` is the agent's whole live history in canonical order — the same
-    read :func:`transcript_membership` takes, and for the same reason: a row
-    carrying no session id belongs to whichever cluster it falls next to, and
-    that is decided by the rows before it.
-
-    Returns ``(stamp, rekey, titles, left_alone)``:
-
-    * ``stamp`` — ``{row id: session id}`` for rows whose METADATA already holds
-      that id. Only the column needs writing, and it cannot disagree with the
-      document because it is being copied out of it.
-    * ``rekey`` — ``{row id: session id}`` for rows whose cluster had no usable
-      id at all. Both the metadata and the column have to be written, together.
-    * ``titles`` — ``{old key: new key}`` so a user-assigned name follows the
-      conversation it named.
-    * ``left_alone`` — cluster keys this pass will not touch, each because it
-      cannot be touched WHOLLY. Two reasons: the key is a real metadata id the
-      column still cannot hold (nothing in this codebase writes one since the
-      charset was widened to printable ASCII), or one of the cluster's rows
-      holds metadata that is not a JSON object, so its document cannot gain a
-      key without destroying whatever it does hold. They are returned rather
-      than assumed absent, because the rows stay NULL and the caller has to be
-      able to say so.
-
-    **A cluster is re-keyed whole or not at all.** Re-keying half of one does
-    not converge: the rewritten rows group under the new id on the next pass
-    while the rest group by time gap under another, so the conversation stays
-    split for ever. That is why an unwritable row disqualifies its cluster
-    rather than just itself — measured against a transcript of five rows where
-    only the third held a parseable document.
-
-    **This writes down the answer the reader already gives.** The identity a
-    re-keyed cluster gets is the grouper's own, spelled so the column can hold
-    it — not a new opinion about where the boundaries are. A row whose metadata
-    holds a bare integer loses that value, and that is the point: every reader
-    already ignores it (#2012), so what is lost is a string nothing consults.
-    """
-    messages, _ = _transcript_messages(rows)
-    grouped = _grouped_transcript(messages)
-    metadata_of = {message["id"]: message["metadata"] for message in messages}
-    # Which rows can be given a key at all. ``parse_message_metadata`` answers
-    # ``{}`` for a document it cannot read, which is the right answer for a
-    # READER and the wrong one for a writer: re-serializing ``{}`` over
-    # ``{not json`` would destroy the only copy of whatever that row holds.
-    rewritable = set()
-    for row in rows:
-        try:
-            document = json.loads(row[2] or "{}")
-        except (TypeError, ValueError):
-            continue
-        if isinstance(document, dict):
-            rewritable.add(row[0])
-
-    # Every value this transcript FILES a row under, by the grouper's own
-    # acceptance rule. A cluster key absent from this set was invented from a
-    # row id, which is the only case that may be re-keyed: a key that IS in it
-    # is an identity a writer chose and a reader resolves.
-    filed_under = set()
-    for message in messages:
-        candidate = message["metadata"].get(SESSION_ID_KEY)
-        if candidate and not str(candidate).isdigit():
-            filed_under.add(str(candidate))
-
-    stamp: Dict[Any, str] = {}
-    rekey: Dict[Any, str] = {}
-    titles: Dict[str, str] = {}
-    left_alone: List[str] = []
-    taken = set(filed_under)
-
-    for session in grouped:
-        key = str(session["session_id"])
-        members = [message["id"] for message in session.get("messages", ())]
-        minting = not is_stampable_session_id(key)
-        if minting and key in filed_under:
-            # A key a writer chose and a reader resolves. It is not this pass's
-            # to replace; the column simply stays silent about it.
-            left_alone.append(key)
-            continue
-
-        # Decided for the whole cluster before anything is written, because a
-        # cluster is touched whole or not at all.
-        plan: Dict[Any, bool] = {}
-        for row_id in members:
-            held = metadata_of.get(row_id, {}).get(SESSION_ID_KEY)
-            if isinstance(held, str) and held == (key if not minting else None):
-                plan[row_id] = False          # already says it; stamp only
-            elif _ignored_by_grouping(held) and row_id in rewritable:
-                plan[row_id] = True           # says nothing a reader uses
-            else:
-                plan = {}
-                break
-        if not plan:
-            left_alone.append(key)
-            continue
-
-        if minting:
-            target = _minted_key(key, taken)
-            taken.add(target)
-            titles[key] = target
-        else:
-            target = key
-        for row_id, rewriting in plan.items():
-            (rekey if rewriting else stamp)[row_id] = target
-
-    # Structural ``new_session`` markers are excluded from a session's messages
-    # (they are not rows a reader shows), so the loop above never reaches them —
-    # but they are live rows with a NULL column, and one is enough to keep every
-    # repair on the transcript pass. Each carries its own id, which is how a
-    # marker establishes a session at all.
-    for message in messages:
-        row_id = message["id"]
-        if row_id in stamp or row_id in rekey:
-            continue
-        own = message["metadata"].get(SESSION_ID_KEY)
-        if isinstance(own, str) and is_stampable_session_id(own):
-            stamp[row_id] = own
-
-    return stamp, rekey, titles, left_alone
-
-
-def _ignored_by_grouping(value: Any) -> bool:
-    """Whether session grouping files a row under this ``metadata.session_id``.
-
-    ``True`` means it does NOT — the value is absent, empty, or a bare integer
-    (#2012's mis-filed legacy keys) — which is the only case a migration may
-    overwrite. Anything else is an identity a writer chose and a reader
-    resolves, and this pass does not get to rename it.
-
-    The rule is the grouper's own, inverted, rather than a restatement: it files
-    a row under ``metadata.session_id`` when that value is truthy and not
-    ``str(...).isdigit()``.
-    """
-    return not value or str(value).isdigit()
-
-
-def _minted_key(key: str, taken: set) -> str:
-    """``legacy-<key>``, or the first suffix that nothing else in the transcript
-    already answers to. A collision needs a writer to have chosen a literal
-    ``legacy-197``; it costs one set lookup to be sure rather than to hope."""
-    candidate = f"{LEGACY_SESSION_PREFIX}{key}"
-    if candidate not in taken:
-        return candidate
-    attempt = 2
-    while f"{candidate}-{attempt}" in taken:
-        attempt += 1
-    return f"{candidate}-{attempt}"
-
-
 def project_transcript(
     rows: Sequence[Sequence[Any]], expect: Optional[str] = None
 ) -> List[SessionProjection]:
@@ -3083,8 +2922,7 @@ class ConversationSessionProjection:
                 plan = await self._plan(accounted, observed)
                 if plan is None:
                     return _Step(CURRENT, 0, True)
-                if not await self._has_unstamped_rows():
-                    return await self._chunk(plan)
+                return await self._chunk(plan)
         except Exception as exc:
             # The signal is raised inside the step's transaction so that the
             # rollback is the abort: nothing the chunk wrote stands, and the
@@ -3318,7 +3156,7 @@ class ConversationSessionProjection:
         through = (
             plan.target if len(rows) < self.chunk_rows else int(rows[-1][0])
         )
-        written = await self._fold(rows, through)
+        written = await self._fold(rows, through, await self._unstamped_frontier())
         await self._record(
             SessionWatermark(
                 plan.generation, True, plan.stamp, plan.appends, through,
@@ -3595,37 +3433,79 @@ class ConversationSessionProjection:
             or 0
         )
 
-    async def _has_unstamped_rows(self) -> bool:
-        """Whether any live row of this agent's is filed under no session id.
+    async def _unstamped_frontier(self) -> Optional[datetime]:
+        """How recently an unstamped live row stands, or ``None`` for none at all.
 
-        Seeded by Phase A's ``(agent_id, session_id)`` index and stopped at the
-        first hit, so the ordinary answer costs one seek. It is not free in the
-        pathological case — an agent holding many unstamped rows that are all
-        soft-deleted or archived pays a heap visit per candidate — but that is an
-        agent already on the transcript derivation, whose repair reads its whole
-        live history anyway.
+        A row filed under no ``session_id`` belongs to whichever cluster it falls
+        next to, and only the transcript says which — so a fold, which reads a
+        session's rows BY that column, cannot be trusted about a session holding
+        one. This is the cheap half of that question, asked once per step.
 
-        This chooses between the two derivations: with no unstamped rows a
-        session's own rows are the whole of its story, and with any of them
-        attribution has to be read off the transcript (see the module docstring).
+        **A frontier rather than a flag, and that is the fix for #3061.** The
+        guard used to be :meth:`_has_unstamped_rows`, which asked whether ANY
+        live row of the agent's was unstamped and sent the whole step to the
+        transcript if so. That is a global answer to a local hazard: legacy rows
+        are not a transient upgrade state, they are what old history looks like
+        for ever, so one of them made EVERY repair re-derive the agent's entire
+        live history — and #2960 put that repair on the conversation list's read
+        path. Measured, SQLite, one session in three legacy,
+        ``list_session_page(50)`` straight after an appended row: 18.0 ms at
+        1,500 live rows against 3.7 ms with none, and 133.0 ms against 4.9 ms at
+        15,000. Flat against linear, on a path a user waits for.
+
+        A session cannot hold a row that stands after its own last message, and
+        it cannot hold one that stands before its first. So a session starting
+        after every unstamped row provably has none, and its fold is sound —
+        which is the ordinary case for every conversation begun since the agent
+        started stamping. :meth:`_provably_whole` applies it.
+
+        ``None`` means nothing is unstamped and every fold is sound.
+        :data:`_UNDATABLE_FRONTIER` means something is unstamped and cannot be
+        placed in time at all, so no session can be proved clear of it.
         """
         row = await self.db.fetchone(
-            "SELECT 1 FROM conversation_history "
-            f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE} "
-            "LIMIT 1",
+            "SELECT COUNT(*), MAX(created_at) FROM conversation_history "
+            f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE}",
             (self.agent_id,),
         )
-        return row is not None
+        if not row or not row[0]:
+            return None
+        newest = coerce_session_timestamp(row[1])
+        return _UNDATABLE_FRONTIER if newest is None else newest
+
+    @staticmethod
+    def _provably_whole(
+        projection: SessionProjection, frontier: Optional[datetime]
+    ) -> bool:
+        """Whether this session can be trusted to be all of itself.
+
+        The fold read it by ``session_id`` column, so it is complete exactly
+        when no unstamped row belongs to it — and a row that stands after the
+        newest unstamped row cannot be one. Conservative in the direction that
+        costs correctness nothing: a session STARTING at or before the frontier
+        merely *may* hold one, and is sent to the transcript rather than stored
+        on a guess.
+
+        A session whose own ``started_at`` cannot be read back is not provable
+        either, and says so here rather than comparing ``None``.
+        """
+        if frontier is None:
+            return True
+        started = coerce_session_timestamp(projection.started_at)
+        return started is not None and started > frontier
 
     async def _fold(
-        self, rows: Sequence[Sequence[Any]], through: int
+        self, rows: Sequence[Sequence[Any]], through: int,
+        frontier: Optional[datetime],
     ) -> int:
         """Fold one chunk's rows into the sessions they belong to.
 
-        Only ever reached with no unstamped live rows in play (see
-        :meth:`_step`), which is what makes a row's column the whole story of
-        where it belongs — so the chunk can be partitioned by that column without
-        consulting anything else, and each partition grouped on its own.
+        A row's column is the whole story of where it belongs for every session
+        this may store — so the chunk is partitioned by that column and each
+        partition grouped on its own. ``frontier`` is what makes that true per
+        session rather than per agent: see :meth:`_unstamped_frontier` for why
+        the guard used to be a flag and why a flag cost every repair the agent's
+        whole history.
 
         The rows handed here are the rows the chunk read. Nothing re-reads a
         session's history: that is the difference between a walk costing one pass
@@ -3642,7 +3522,14 @@ class ConversationSessionProjection:
         for row in rows:
             session_id = row[4]
             if session_id is None:
-                continue
+                # **The chunk cannot file this row, so it cannot fold at all.**
+                # Skipping it was the shape before #3061 and it was only safe
+                # because `_step` had already refused to reach here with any
+                # unstamped row anywhere. With the guard now per session, a
+                # skipped row is a session that exists in history and in NO
+                # projection — measured, six legacy rows and an empty list.
+                # Absence is not the permitted direction for a conversation.
+                raise _NeedsTranscript(row[0])
             by_session.setdefault(str(session_id), []).append(row)
 
         written = 0
@@ -3653,9 +3540,16 @@ class ConversationSessionProjection:
             # and the branch that handled it (forgetting the session) outlived
             # the case by several rounds, looking like live handling of a
             # Phase A violation that in fact reached the transcript pass.
-            written += await self._store(
-                await self._folded(session_id, by_session[session_id], through)
+            projection = await self._folded(
+                session_id, by_session[session_id], through
             )
+            if not self._provably_whole(projection, frontier):
+                # An unstamped row may belong here, and only the transcript can
+                # say. Escalating the STEP rather than this session is the same
+                # reasoning `_folded`'s own escalations use: a session's
+                # boundaries are not a property of its own rows.
+                raise _NeedsTranscript(session_id)
+            written += await self._store(projection)
         return written
 
     async def _folded(
