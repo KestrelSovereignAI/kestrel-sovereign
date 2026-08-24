@@ -486,6 +486,40 @@ async def test_idle_monitor_emits_retirement_without_clock_polling(monkeypatch, 
     await feature.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_async_telemetry_observer_cannot_hang_child_lifecycle(
+    monkeypatch, tmp_path
+):
+    observer_cancelled = asyncio.Event()
+
+    async def observe(_snapshot):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            observer_cancelled.set()
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    configure_hosted_isolated_runtime_lifecycle(
+        agent,
+        idle_timeout_seconds=3600,
+        telemetry_observer=observe,
+    )
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = FakeIsolatedClient()
+    feature = ProxyFeature(
+        agent, _idle_test_runtime(), client_factory=lambda **_kwargs: client
+    )
+
+    await asyncio.wait_for(feature.initialize(), timeout=1)
+
+    assert observer_cancelled.is_set()
+    assert client.started is True
+    await asyncio.wait_for(feature.shutdown(), timeout=1)
+
+
 def test_hosted_lifecycle_policy_requires_and_binds_explicit_agent_scope(tmp_path):
     observer = Mock()
 

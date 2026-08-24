@@ -183,6 +183,9 @@ def set_hosted_telegram_route_attestation_resolver(
 # answers health() must not silently kill supervision forever (F013) — treat a
 # probe that exceeds this as unhealthy and fall through to the restart path.
 _HEALTH_PROBE_TIMEOUT = 5.0
+# Host telemetry is advisory. An async observer that wedges must never acquire
+# ownership of child startup, retirement, reload, or shutdown progress.
+_TELEMETRY_OBSERVER_TIMEOUT = 1.0
 
 # ``ToolExecutionTrigger`` validates identifiers by UTF-8 byte length, not
 # Python character count.  Schedule IDs normally fit unchanged, but legacy
@@ -5921,7 +5924,12 @@ class ProxyFeature(Feature):
             return
         snapshot = self.runtime_telemetry_snapshot()
         try:
-            await _maybe_await(observer(snapshot))
+            result = observer(snapshot)
+            if inspect.isawaitable(result):
+                await asyncio.wait_for(
+                    result,
+                    timeout=_TELEMETRY_OBSERVER_TIMEOUT,
+                )
         except Exception:  # noqa: BLE001 - host observer cannot own child lifecycle
             logger.warning(
                 "Hosted isolated runtime telemetry observer failed for %s", self.name

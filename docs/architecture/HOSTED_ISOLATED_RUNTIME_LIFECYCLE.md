@@ -59,4 +59,7 @@ itself knows them; an embedding host may merge its own owner-scoped workspace
 accounting after receiving the snapshot.
 
 The observer is stored on the exact agent instance. There is no process-global
-registry and no lookup API that can select another agent's telemetry.
+registry and no lookup API that can select another agent's telemetry. Observer
+delivery is advisory: failures are logged, and an asynchronous observer is
+bounded and cancelled so it cannot acquire ownership of child lifecycle
+progress.
