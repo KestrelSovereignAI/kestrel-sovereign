@@ -1326,6 +1326,39 @@ async def test_blocked_tick_fails_closed_and_recovers_after_completion(
                 return
             await asyncio.sleep(0.01)
 
+    async def wait_for_recovered_live_view():
+        """Wait for one instant where the live view is coherently recovered.
+
+        ``tick_stalled`` is derived from the clock on every read: it re-arms at
+        the top of each tick and reads True again whenever the tick in flight
+        outlives ``_tick_in_progress_limit_seconds`` — squeezed to 50ms above so
+        the stall under test is detectable quickly. Every later tick still makes
+        two ``scheduler_database_clock`` round trips, so on a loaded runner an
+        ordinary healthy tick crosses that 50ms and the property legitimately
+        reads True again *after* the durable row has already reported
+        "running". Sampling it once, at an instant this test does not control,
+        asserted a scheduling race rather than recovery: measured True in 33/60
+        samples with 80ms round trips and 0/60 when they are fast, which is why
+        it passed everywhere except one contended CI runner (#3099).
+
+        So wait for the event. Recovery is "the runner returns to a coherent
+        healthy view", and a regression that never clears the stall never
+        presents one — the bound below is a hang bound, not a coordination
+        window.
+        """
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            # Read both halves at one instant: the pair is the claim, and
+            # reading them apart re-opens the same race in miniature.
+            if not runner.tick_stalled and runner.worker_available:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(
+            "runner never presented a recovered live view after the blocked "
+            f"tick completed (tick_stalled={runner.tick_stalled}, "
+            f"worker_available={runner.worker_available})"
+        )
+
     monkeypatch.setattr(runner, "_tick", blocked_once)
     monkeypatch.setattr(
         "kestrel_sovereign.features.scheduler.runner."
@@ -1350,8 +1383,7 @@ async def test_blocked_tick_fails_closed_and_recovers_after_completion(
 
         release_tick.set()
         await asyncio.wait_for(wait_for_worker_state("running"), timeout=2)
-        assert runner.tick_stalled is False
-        assert runner.worker_available is True
+        await wait_for_recovered_live_view()
     finally:
         release_tick.set()
         await runner.stop()
