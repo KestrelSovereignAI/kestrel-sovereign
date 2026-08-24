@@ -353,3 +353,36 @@ class TestTheNameFollowsTheConversation:
         _stamped, rekey, titles, _left = legacy_session_assignments(rows)
         assert rekey == {1: "legacy-1-2"}
         assert titles == {"1": "legacy-1-2"}
+
+    @pytest.mark.asyncio
+    async def test_an_id_the_column_still_cannot_hold_is_not_renamed_either(
+        self, tmp_path
+    ):
+        """The guard that matters, on the only case that can reach it.
+
+        ``sms:{sender}`` is stampable since the charset widened, so it never
+        tests the "was this id chosen by a writer" branch at all — a mutant that
+        deleted that branch survived the SMS test. A non-ASCII id is what still
+        reaches it: grouping files rows under it, a reader resolves it, and the
+        column cannot hold it. Leaving it NULL is the honest answer; renaming it
+        would rename a conversation to make a cache convenient.
+        """
+        path = tmp_path / "non-ascii.db"
+        _seed(path, [
+            ("user", "a", json.dumps({"session_id": "sesión:1"}), _stamp(0)),
+            ("user", "b", json.dumps({"session_id": "sesión:1"}), _stamp(1)),
+        ])
+
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            rows = await _rows(db)
+            assert [json.loads(row[1])["session_id"] for row in rows] == [
+                "sesión:1",
+                "sesión:1",
+            ]
+            assert [row[2] for row in rows] == [None, None]
+            projection = ConversationSessionProjection(db, AGENT)
+            await projection.repair()
+            assert [r["session_id"] for r in await projection.list()] == ["sesión:1"]
+        finally:
+            await db.close()
