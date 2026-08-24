@@ -209,7 +209,9 @@ _DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
 _DISK_TELEMETRY_DEPTH_BUDGET = 64
 
 
-def _directory_tree_bytes(path: Path) -> int | None:
+def _directory_tree_bytes(
+    path: Path, *, deadline: float | None = None
+) -> int | None:
     """Measure one no-follow tree within explicit entry and time budgets."""
 
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -225,7 +227,8 @@ def _directory_tree_bytes(path: Path) -> int | None:
     stack: list[tuple[int, Any]] = []
     total = 0
     entries_seen = 0
-    deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
     try:
         root_fd = os.open(path, flags)
         try:
@@ -5969,28 +5972,75 @@ class ProxyFeature(Feature):
             return self.runtime.description
         return f"Isolated feature service for {self.name}"
 
-    def runtime_telemetry_snapshot(self) -> IsolatedRuntimeTelemetrySnapshot:
-        """Return a path-free snapshot for this exact proxy's host."""
+    def _runtime_telemetry_snapshot_inputs(
+        self,
+    ) -> tuple[dict[str, Any], Any, tuple[int, float] | None]:
+        """Freeze event-loop-owned lifecycle state before process sampling."""
+
+        retirement_clients = tuple(self._terminal_retirement_clients)
+        terminal_health_probe = self._terminal_health_probe_task
+        uncertain_retirement = bool(
+            retirement_clients
+            or tuple(self._terminal_lifecycle_tasks)
+            or self._terminal_cleanup_uncertain
+            or (
+                terminal_health_probe is not None
+                and not terminal_health_probe.done()
+            )
+        )
+        client = self._client
+        if client is None and retirement_clients:
+            client = retirement_clients[0]
+        idle = self._idle_retired and client is None
+        if uncertain_retirement:
+            state = "retirement-uncertain"
+        elif self._terminal_lifecycle_latched or self._stopping:
+            state = "stopping" if client is not None else "stopped"
+        elif idle:
+            state = "idle"
+        elif client is not None:
+            state = "running"
+        else:
+            state = "starting"
+        values = {
+            "feature": self.name,
+            "distribution": self.runtime.distribution,
+            "state": state,
+            "lifecycle_generation": self._reload_gen,
+            "active_processes": int(client is not None or uncertain_retirement),
+            "idle_processes": int(idle and not uncertain_retirement),
+            "restart_count": self._health_restart_count,
+            "idle_wake_count": self._idle_wake_count,
+            "last_used_at": self._last_used_at,
+            "cold_start_seconds": self._last_cold_start_seconds,
+            "warm_start_seconds": self._last_warm_start_seconds,
+            "environment_bytes": self._environment_bytes,
+            "private_writable_bytes": self._private_writable_bytes,
+            "downloaded_bytes": self._downloaded_bytes,
+            "provision_seconds": self._last_provision_seconds,
+            "cache_hit": self._last_cache_hit,
+            "cleanup_eligible": idle and not uncertain_retirement,
+        }
+        return values, client, self._process_identity
+
+    @staticmethod
+    def _build_runtime_telemetry_snapshot(
+        values: dict[str, Any],
+        client: Any,
+        process_identity: tuple[int, float] | None,
+    ) -> IsolatedRuntimeTelemetrySnapshot:
+        """Perform only OS process sampling after lifecycle state is frozen."""
 
         rss_bytes: int | None = None
         cpu_seconds: float | None = None
         open_fds: int | None = None
         process_count: int | None = None
-        uncertain_retirement = bool(
-            self._terminal_retirement_clients
-            or self._terminal_lifecycle_tasks
-            or self._terminal_cleanup_uncertain
-            or self._has_running_terminal_health_probe_task()
-        )
-        client = self._client
-        if client is None and self._terminal_retirement_clients:
-            client = self._terminal_retirement_clients[0]
         process = getattr(client, "process", None) if client is not None else None
         pid = getattr(process, "pid", None)
         if type(pid) is int and getattr(process, "returncode", None) is None:
             try:
                 observed = psutil.Process(pid)
-                if self._process_identity != (pid, observed.create_time()):
+                if process_identity != (pid, observed.create_time()):
                     raise psutil.NoSuchProcess(pid)
                 children = observed.children(recursive=True)
                 memory = observed.memory_info().rss
@@ -6007,38 +6057,19 @@ class ProxyFeature(Feature):
                 process_count = 1 + len(children)
             except (OSError, RuntimeError, psutil.Error):
                 pass
-        if uncertain_retirement:
-            state = "retirement-uncertain"
-        elif self._terminal_lifecycle_latched or self._stopping:
-            state = "stopping" if client is not None else "stopped"
-        elif self._idle_retired:
-            state = "idle"
-        elif client is not None:
-            state = "running"
-        else:
-            state = "starting"
         return IsolatedRuntimeTelemetrySnapshot(
-            feature=self.name,
-            distribution=self.runtime.distribution,
-            state=state,
-            lifecycle_generation=self._reload_gen,
-            active_processes=int(client is not None or uncertain_retirement),
-            idle_processes=int(self._idle_retired and not uncertain_retirement),
-            restart_count=self._health_restart_count,
-            idle_wake_count=self._idle_wake_count,
-            last_used_at=self._last_used_at,
-            cold_start_seconds=self._last_cold_start_seconds,
-            warm_start_seconds=self._last_warm_start_seconds,
+            **values,
             rss_bytes=rss_bytes,
             cpu_seconds=cpu_seconds,
             open_fds=open_fds,
             process_count=process_count,
-            environment_bytes=self._environment_bytes,
-            private_writable_bytes=self._private_writable_bytes,
-            downloaded_bytes=self._downloaded_bytes,
-            provision_seconds=self._last_provision_seconds,
-            cache_hit=self._last_cache_hit,
-            cleanup_eligible=self._idle_retired and not uncertain_retirement,
+        )
+
+    def runtime_telemetry_snapshot(self) -> IsolatedRuntimeTelemetrySnapshot:
+        """Return a path-free, non-mutating snapshot for this exact proxy."""
+
+        return self._build_runtime_telemetry_snapshot(
+            *self._runtime_telemetry_snapshot_inputs()
         )
 
     async def _refresh_disk_telemetry(
@@ -6053,8 +6084,9 @@ class ProxyFeature(Feature):
         venv = self._venv_path
 
         def measure() -> tuple[int | None, int | None, int | None]:
+            deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
             environment = (
-                _directory_tree_bytes(venv)
+                _directory_tree_bytes(venv, deadline=deadline)
                 if (
                     refresh_environment
                     and venv is not None
@@ -6063,7 +6095,10 @@ class ProxyFeature(Feature):
                 else self._environment_bytes
             )
             private_sizes = [
-                _directory_tree_bytes(runtime_dir / component)
+                _directory_tree_bytes(
+                    runtime_dir / component,
+                    deadline=deadline,
+                )
                 for component in ("work", "home", "tmp", "config", "data", "cache")
             ]
             private = (
@@ -6071,7 +6106,10 @@ class ProxyFeature(Feature):
                 if all(size is not None for size in private_sizes)
                 else None
             )
-            downloaded = _directory_tree_bytes(runtime_dir / "provisioning_cache")
+            downloaded = _directory_tree_bytes(
+                runtime_dir / "provisioning_cache",
+                deadline=deadline,
+            )
             return environment, private, downloaded
 
         (
@@ -6097,8 +6135,14 @@ class ProxyFeature(Feature):
         ):
             return
         self._last_telemetry_emit_monotonic = loop.time()
-        snapshot = await asyncio.to_thread(self.runtime_telemetry_snapshot)
         try:
+            # Snapshot loop-owned lifecycle references before crossing into the
+            # worker.  The synchronous builder is deliberately non-mutating,
+            # so telemetry can never consume or clear lifecycle task state.
+            inputs = self._runtime_telemetry_snapshot_inputs()
+            snapshot = await asyncio.to_thread(
+                self._build_runtime_telemetry_snapshot, *inputs
+            )
             result = observer(snapshot)
             if inspect.isawaitable(result):
                 task = asyncio.ensure_future(result)
@@ -6719,8 +6763,9 @@ class ProxyFeature(Feature):
             self._supervision_task = self._start_supervision()
             self._last_used_monotonic = asyncio.get_running_loop().time()
             self._start_idle_monitor()
-            await self._refresh_disk_telemetry(refresh_environment=True)
-            await self._emit_runtime_telemetry()
+        # Advisory disk/process telemetry never extends lifecycle-lock custody.
+        await self._refresh_disk_telemetry(refresh_environment=True)
+        await self._emit_runtime_telemetry()
 
     async def _ensure_venv_without_blocking_event_loop(self) -> None:
         """Own synchronous preparation in a worker without orphaning it.
@@ -6733,14 +6778,15 @@ class ProxyFeature(Feature):
         """
 
         started = asyncio.get_running_loop().time()
-        cache_hit = bool(self._venv_path and self._venv_path.exists())
         task = asyncio.create_task(
             asyncio.to_thread(self.ensure_venv),
             name=f"isolated-venv-prepare:{self.name}",
         )
-        await _await_task_until_complete(task, preserve_cancellation=False)
+        environment_mutated = await _await_task_until_complete(
+            task, preserve_cancellation=False
+        )
         self._last_provision_seconds = asyncio.get_running_loop().time() - started
-        self._last_cache_hit = cache_hit
+        self._last_cache_hit = not environment_mutated
 
     def _latch_terminal_lifecycle(self) -> int:
         """Record one terminal intent and revoke queued initialization permits.
@@ -6768,6 +6814,7 @@ class ProxyFeature(Feature):
         idle_monitor = self._idle_monitor_task
         if idle_monitor is not None and idle_monitor is not asyncio.current_task():
             idle_monitor.cancel()
+        self._idle_monitor_task = None
         return self._terminal_lifecycle_generation
 
     async def _run_traffic_gate_operation(
@@ -9868,6 +9915,7 @@ class ProxyFeature(Feature):
         try:
             while True:
                 wake_idle = False
+                completed_call = False
                 async with self._traffic_gate.admit():
                     client = self._client
                     if client is None and self._idle_retired:
@@ -9925,8 +9973,10 @@ class ProxyFeature(Feature):
                             )
                         finally:
                             self._record_runtime_activity()
-                            self._schedule_runtime_telemetry()
-                        return
+                        completed_call = True
+                if completed_call:
+                    self._schedule_runtime_telemetry()
+                    return
                 if wake_idle:
                     await self._wake_idle_runtime()
         except _TrafficGateTerminalError:
@@ -10105,8 +10155,11 @@ class ProxyFeature(Feature):
                             )
                         finally:
                             self._record_runtime_activity()
-                            self._schedule_runtime_telemetry()
-                        return result
+                if not wake_idle:
+                    # Admission has been released before this background task
+                    # can begin any observer or disk work.
+                    self._schedule_runtime_telemetry()
+                    return result
                 if wake_idle:
                     experienced_wake = True
                     await self._wake_idle_runtime()
@@ -11155,7 +11208,8 @@ class ProxyFeature(Feature):
                 "an unverifiable override venv"
             )
 
-    def ensure_venv(self) -> None:
+    def ensure_venv(self) -> bool:
+        """Ensure the runtime environment and report whether Core mutated it."""
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
 
@@ -11222,7 +11276,7 @@ class ProxyFeature(Feature):
                     hosted_immutable_setting
                 ) from exc
             self._validated_hosted_console_path = validated_console_path
-            return
+            return False
 
         exists = python_path.exists()
 
@@ -11244,7 +11298,7 @@ class ProxyFeature(Feature):
             self._verify_launch_artifact()
             self._verify_prebuilt_feature_distribution(python_path, install_target)
             self._warn_on_sdk_mismatch(python_path)
-            return
+            return False
 
         # An operator-supplied (override) venv that already exists is NOT ours to
         # mutate: running `uv pip install --upgrade` into it would rewrite a
@@ -11268,13 +11322,13 @@ class ProxyFeature(Feature):
             if not stale:
                 self._verify_launch_artifact()
                 self._clear_venv_relocation_repair_marker()
-                return
+                return False
             if not force_reinstall and self._adopt_verified_unstamped_venv(
                 install_target,
                 manifest,
             ):
                 self._clear_venv_relocation_repair_marker()
-                return
+                return False
 
         # Fresh venv, changed install target, or host SDK upgraded since the
         # venv was provisioned. A moved/unstamped venv requires ``--reinstall``
@@ -11325,6 +11379,7 @@ class ProxyFeature(Feature):
             child_feature_distribution,
         )
         self._clear_venv_relocation_repair_marker()
+        return True
 
     def _warn_on_sdk_mismatch(
         self, python_path: Path, *, host_sdk: str = None, child_sdk: str = None
@@ -11641,6 +11696,7 @@ class ProxyFeature(Feature):
             while not self._stopping:
                 try:
                     baseline = self._last_used_monotonic
+                    baseline_generation = self._activity_generation
                     if baseline is None or self._idle_retired:
                         await asyncio.sleep(self._idle_timeout_seconds)
                         continue
@@ -11653,7 +11709,7 @@ class ProxyFeature(Feature):
                         await asyncio.sleep(remaining)
                         continue
                     retired = await self._retire_idle_generation(
-                        expected_activity_generation=self._activity_generation,
+                        expected_activity_generation=baseline_generation,
                         expected_last_used=baseline,
                     )
                     if not retired:
@@ -11712,6 +11768,14 @@ class ProxyFeature(Feature):
                 if not retired:
                     self._latch_terminal_lifecycle()
                     await self._seal_traffic_gate()
+                    # The first stop completed by raising; unlike a timed-out
+                    # lifecycle operation, there is no concurrent facade task
+                    # that makes a fresh bounded retry unsafe.
+                    self._terminal_cleanup_uncertain = False
+                    await self._complete_terminal_cleanup(
+                        best_effort=True,
+                        lifecycle_lock_held=True,
+                    )
                     return False
                 self._idle_retired = True
                 self._reload_gen += 1
@@ -11736,7 +11800,14 @@ class ProxyFeature(Feature):
             self._wake_idle_runtime_uninterrupted(),
             name=f"isolated-idle-wake:{self.name}",
         )
-        await _await_task_until_complete(task, preserve_cancellation=False)
+        try:
+            await _await_task_until_complete(task, preserve_cancellation=False)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature could not be prepared after idle retirement."
+            ) from exc
 
     async def _wake_idle_runtime_uninterrupted(self) -> None:
         """Finish one wake transaction even if its initiating caller cancels."""
@@ -11781,8 +11852,16 @@ class ProxyFeature(Feature):
                 if uncertain:
                     self._latch_terminal_lifecycle()
                     await self._seal_traffic_gate()
-                else:
+                elif self._client is None:
                     self._idle_retired = True
+                    if self._traffic_gate.closed:
+                        await self._reopen_traffic_gate()
+                        reopened = True
+                else:
+                    # The child was published before ancillary telemetry failed.
+                    # Keep it running and supervised; never advertise a live
+                    # process as idle or safe for workspace reclamation.
+                    self._idle_retired = False
                     if self._traffic_gate.closed:
                         await self._reopen_traffic_gate()
                         reopened = True

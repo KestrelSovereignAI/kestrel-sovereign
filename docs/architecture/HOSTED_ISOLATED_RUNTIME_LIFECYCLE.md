@@ -65,6 +65,9 @@ one new generation. Failed or cancellation-resistant stops seal the proxy and
 retain the exact client for terminal cleanup; they are never reported as idle
 success. A transient cold-start failure instead restores the idle/retryable
 state, and caller cancellation cannot interrupt a wake transaction midway.
+Wake preparation failures retain the existing secret-free tool error envelope;
+an ancillary telemetry failure after publication leaves the live child running
+and supervised rather than misclassifying it as idle.
 Before a wake, Core recreates the private workspace, resolves runtime paths, and
 reprovisions a missing Core-managed venv. `cleanup_eligible` therefore means the
 exact child is stopped and the embedding host may reclaim that feature's owned
@@ -82,8 +85,10 @@ process. Health restart count is separate from planned idle-wake count, and
 cold child startup timing is separate from warm admission latency. Core measures
 its owned venv, mutable workspace, and provisioning-cache bytes off the event
 loop with root no-follow descriptor traversal plus entry/time budgets;
-externally supplied immutable environments remain `None`. Venv size is cached
-across wakes unless Core reprovisions it. An embedding host may merge its own
+all components in one refresh share the same total time deadline. Externally
+supplied immutable environments remain `None`. `cache_hit` means Core performed
+no venv mutation, and venv size is cached across wakes unless Core actually
+provisions, upgrades, or reinstalls it. An embedding host may merge its own
 owner-scoped accounting after receiving the snapshot. A failed or uncertain
 retirement reports `state="retirement-uncertain"`, remains active for capacity
 accounting, and is never cleanup-eligible.
@@ -96,3 +101,6 @@ registry after traffic admission is released, and an asynchronous observer is
 bounded then detached and observed if it refuses to finish. Terminal lifecycle
 cancels Core-owned telemetry tasks and does not create a post-cleanup delivery.
 Telemetry cannot acquire ownership of child traffic or lifecycle progress.
+The isolated child supervisor and idle monitor are registered as infrastructure
+daemons, so their intentional residency does not itself block an
+`idle_agents_only` restart.

@@ -21,7 +21,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, Mapping, Optional
+from typing import Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.identity.local_anchor import (

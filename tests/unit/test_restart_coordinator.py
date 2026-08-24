@@ -2461,6 +2461,33 @@ async def test_idle_ignores_a2a_question_supervisor_tasks(tmp_path):
         work_task.cancel()
 
 
+@pytest.mark.asyncio
+async def test_idle_ignores_isolated_runtime_lifecycle_daemons(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+
+    async def _never():
+        await asyncio.Event().wait()
+
+    supervisor = asyncio.create_task(_never(), name="isolated-feature:Search")
+    idle_monitor = asyncio.create_task(
+        _never(), name="isolated-feature-idle:Search"
+    )
+    work_task = asyncio.create_task(_never(), name="isolated-call:Search")
+    try:
+        feat.agent._background_tasks = {supervisor, idle_monitor}
+        assert feat._agent_appears_idle()["idle"] is True
+
+        feat.agent._background_tasks = {supervisor, idle_monitor, work_task}
+        busy = feat._agent_appears_idle()
+        assert busy["idle"] is False
+        assert "isolated-call:Search" in busy["reason"]
+        assert "isolated-feature" not in busy["reason"]
+    finally:
+        supervisor.cancel()
+        idle_monitor.cancel()
+        work_task.cancel()
+
+
 # ---------------------------------------------------------------------------
 # #1809: prompt wake (on_agent_ready) + same-session routing
 # ---------------------------------------------------------------------------

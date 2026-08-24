@@ -221,6 +221,8 @@ _INFRA_TASK_PREFIXES = (
     "durable_signal_log",
     "a2a_question_expiry_sweep",
     "a2a_question_supervisor:",
+    "isolated-feature:",
+    "isolated-feature-idle:",
 )
 
 
