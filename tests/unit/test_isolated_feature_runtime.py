@@ -1524,6 +1524,14 @@ async def test_idle_workspace_reclaim_serializes_racing_wake(monkeypatch, tmp_pa
         expected_activity_generation=feature._activity_generation,
         expected_last_used=feature._last_used_monotonic,
     )
+    feature._idle_ui_contributions = {
+        "modules": ["panel.mjs"],
+        "static_dir": str(runtime_dir / ".venv" / "feature_pkg" / "static"),
+    }
+    feature._environment_bytes = 100
+    feature._private_writable_bytes = 20
+    feature._downloaded_bytes = 5
+    feature._disk_telemetry_status = "complete"
 
     delete_started = threading.Event()
     release_delete = threading.Event()
@@ -1537,6 +1545,12 @@ async def test_idle_workspace_reclaim_serializes_racing_wake(monkeypatch, tmp_pa
     monkeypatch.setattr(isolated_runtime, "_remove_isolated_feature_runtime", slow_remove)
     reclaim = asyncio.create_task(feature.reclaim_idle_workspace())
     assert await asyncio.to_thread(delete_started.wait, 1)
+    assert feature.get_ui_contributions() is None
+    deleting_snapshot = feature.runtime_telemetry_snapshot()
+    assert deleting_snapshot.environment_bytes is None
+    assert deleting_snapshot.private_writable_bytes is None
+    assert deleting_snapshot.downloaded_bytes is None
+    assert deleting_snapshot.disk_telemetry_status == "unavailable"
     wake = asyncio.create_task(
         feature.call_isolated_tool("ping", {"message": "after reclaim"})
     )

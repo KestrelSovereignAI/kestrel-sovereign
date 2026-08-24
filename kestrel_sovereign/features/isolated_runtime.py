@@ -12259,6 +12259,17 @@ class ProxyFeature(Feature):
                     raise IsolatedRuntimePreparationError(
                         "Hosted isolated feature workspace is not idle and reclaimable."
                     )
+                # Stop advertising assets and completed byte counts before the
+                # no-follow deletion begins. The event loop remains available
+                # while the worker removes a potentially large venv, so
+                # lock-free manifest and telemetry readers must observe the
+                # conservative state throughout that window. Keep this state
+                # on failure too: removal may have partially changed the tree.
+                self._idle_ui_contributions = None
+                self._environment_bytes = None
+                self._private_writable_bytes = None
+                self._downloaded_bytes = None
+                self._disk_telemetry_status = "unavailable"
                 outcome = await asyncio.to_thread(
                     _remove_isolated_feature_runtime,
                     self._isolated_runtime_scope,
@@ -12268,7 +12279,6 @@ class ProxyFeature(Feature):
                 self._workspace_reclaim_generation += 1
                 self._telemetry_disk_refresh_pending = False
                 self._telemetry_environment_refresh_pending = False
-                self._idle_ui_contributions = None
                 self._environment_bytes = (
                     0
                     if self._bin_path is None and not self._venv_is_overridden()
