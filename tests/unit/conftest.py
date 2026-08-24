@@ -11,10 +11,24 @@ effect of ``pytest``, and the real host features named by the project's
 against it. CI never notices: the runner's ``HOME`` is fresh, so the same
 code writes a throwaway file.
 
-The autouse fixture below moves every one of those roots into the test's own
-``tmp_path``, so a unit test cannot name the operator's data at all. Anything
-narrower would leave the next test that boots a real lifespan free to do it
-again.
+The autouse fixture below moves those roots into the test's own ``tmp_path``.
+
+Scope, precisely: this isolates *function-based* path resolution --
+``paths.host_data_dir()``, ``paths.project_dir()``, ``host_database_path()``
+and anything else that reads the environment when called. It does **not**
+isolate module-scope constants that build an absolute path at **import**
+time, because collection imports them before any fixture runs. Five such
+constants still name the operator's real home:
+``cli_serve.STATE_DIR`` / ``STATE_FILE`` / ``LOG_DIR``,
+``destructive_policy.DEFAULT_TRASH_DIR``, and
+``local_mps_adapter.DEFAULT_WORKING_DIR``. Those are tracked in #3104; the
+fix there is resolve-on-call in the modules, not a longer patch list here --
+a fixture that enumerates names is a set that grows, and the sixth constant
+would silently reopen the hole.
+
+Note for anyone verifying this: a probe that imports inside a test body sees
+everything clean, because the fixture has already run. Only a module-level
+import reproduces what a real session does.
 
 Tests that deliberately exercise path resolution opt out with
 ``@pytest.mark.owns_host_paths`` and set the same variables themselves —
@@ -76,6 +90,11 @@ def _isolate_host_runtime_paths(request, tmp_path, monkeypatch):
     # discovery run rewrites) the operator's real
     # ``~/.kestrel/discovered_context_limits.json``. Reset the one-time read
     # too, so the redirect is what the next lookup sees.
+    #
+    # This is a point fix for the one import-time constant this suite was
+    # observed to write, NOT a general solution: five more are frozen the
+    # same way and are deliberately left alone here (see the module
+    # docstring and #3104). Do not grow this into a patch list.
     monkeypatch.setattr(
         token_counter, "CACHE_FILE", root / "discovered_context_limits.json"
     )
