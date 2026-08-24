@@ -36,6 +36,11 @@ agent = KestrelAgent(
 )
 ```
 
+Hosts that load agents through `AgentManager` provide the same per-agent policy
+through `hosted_isolated_runtime_lifecycle_policy_factory`; the factory returns
+a `HostedIsolatedRuntimeLifecyclePolicy` selected from the manager-owned agent
+name, DID, and local configuration before that agent is constructed.
+
 Lifecycle policy is accepted only with an explicit hosted root and namespace.
 The default timeout applies per isolated feature; the immutable override map can
 set a different positive timeout or disable retirement for an ingress producer.
@@ -47,6 +52,9 @@ also refuses idle retirement whenever the child owns a channel bridge, hosted
 Telegram route attestation, or negotiated external-ingress lifecycle: an inbound
 producer with no independent wake source must remain resident even if a host
 accidentally assigns it a timeout.
+The idle monitor is not started for a child that already advertises an inbound
+producer, and it stops if a later reload adds one. Other non-retirement outcomes
+use a bounded retry interval rather than a zero-yield loop.
 
 Core owns retirement. At the deadline it atomically closes the existing traffic
 gate only when no work is admitted, rechecks the activity generation and
@@ -57,6 +65,12 @@ one new generation. Failed or cancellation-resistant stops seal the proxy and
 retain the exact client for terminal cleanup; they are never reported as idle
 success. A transient cold-start failure instead restores the idle/retryable
 state, and caller cancellation cannot interrupt a wake transaction midway.
+Before a wake, Core recreates the private workspace, resolves runtime paths, and
+reprovisions a missing Core-managed venv. `cleanup_eligible` therefore means the
+exact child is stopped and the embedding host may reclaim that feature's owned
+mutable workspace, Core-managed venv, and provisioning cache. It does not grant
+permission to remove the agent namespace, sibling feature directories, or an
+external immutable venv.
 
 `IsolatedRuntimeTelemetrySnapshot` is immutable and deliberately excludes DIDs,
 tenant identifiers, paths, commands, environment variables, configuration, and
@@ -67,12 +81,18 @@ PID is pinned to its observed creation time so PID reuse cannot expose another
 process. Health restart count is separate from planned idle-wake count, and
 cold child startup timing is separate from warm admission latency. Core measures
 its owned venv, mutable workspace, and provisioning-cache bytes off the event
-loop; externally supplied immutable environments remain `None`. An embedding
-host may merge its own owner-scoped accounting after receiving the snapshot.
+loop with root no-follow descriptor traversal plus entry/time budgets;
+externally supplied immutable environments remain `None`. Venv size is cached
+across wakes unless Core reprovisions it. An embedding host may merge its own
+owner-scoped accounting after receiving the snapshot. A failed or uncertain
+retirement reports `state="retirement-uncertain"`, remains active for capacity
+accounting, and is never cleanup-eligible.
 
 The observer is stored on the exact agent instance. There is no process-global
 registry and no lookup API that can select another agent's telemetry. Observer
 delivery is advisory: failures are logged, OS sampling runs in a worker, hot-path
-emissions are rate-limited, and an asynchronous observer is bounded then
-detached and observed if it refuses to finish. It cannot acquire ownership of
-child lifecycle progress.
+emissions are rate-limited and scheduled through the agent background-task
+registry after traffic admission is released, and an asynchronous observer is
+bounded then detached and observed if it refuses to finish. Terminal lifecycle
+cancels Core-owned telemetry tasks and does not create a post-cleanup delivery.
+Telemetry cannot acquire ownership of child traffic or lifecycle progress.

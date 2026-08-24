@@ -32,6 +32,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import time
 import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -203,26 +204,74 @@ _HEALTH_PROBE_TIMEOUT = 5.0
 # ownership of child startup, retirement, reload, or shutdown progress.
 _TELEMETRY_OBSERVER_TIMEOUT = 1.0
 _TELEMETRY_EMIT_MIN_INTERVAL = 5.0
+_DISK_TELEMETRY_ENTRY_BUDGET = 250_000
+_DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
+_DISK_TELEMETRY_DEPTH_BUDGET = 64
 
 
 def _directory_tree_bytes(path: Path) -> int | None:
-    """Measure regular files below one owned directory without following links."""
+    """Measure one no-follow tree within explicit entry and time budgets."""
 
-    total = 0
-    pending = [path]
-    try:
-        while pending:
-            current = pending.pop()
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    metadata = entry.stat(follow_symlinks=False)
-                    if stat.S_ISDIR(metadata.st_mode):
-                        pending.append(Path(entry.path))
-                    elif stat.S_ISREG(metadata.st_mode):
-                        total += int(metadata.st_size)
-        return total
-    except (FileNotFoundError, NotADirectoryError, OSError):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if (
+        nofollow is None
+        or directory is None
+        or os.open not in os.supports_dir_fd
+        or os.scandir not in os.supports_fd
+    ):
         return None
+    flags = os.O_RDONLY | nofollow | directory
+    stack: list[tuple[int, Any]] = []
+    total = 0
+    entries_seen = 0
+    deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
+    try:
+        root_fd = os.open(path, flags)
+        try:
+            root_entries = os.scandir(root_fd)
+        except BaseException:
+            os.close(root_fd)
+            raise
+        stack.append((root_fd, root_entries))
+        while stack:
+            current_fd, entries = stack[-1]
+            try:
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                os.close(current_fd)
+                stack.pop()
+                continue
+            entries_seen += 1
+            if (
+                entries_seen > _DISK_TELEMETRY_ENTRY_BUDGET
+                or time.monotonic() >= deadline
+            ):
+                return None
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                if len(stack) >= _DISK_TELEMETRY_DEPTH_BUDGET:
+                    return None
+                child_fd = os.open(entry.name, flags, dir_fd=current_fd)
+                try:
+                    child_entries = os.scandir(child_fd)
+                except BaseException:
+                    os.close(child_fd)
+                    raise
+                stack.append((child_fd, child_entries))
+            elif stat.S_ISREG(metadata.st_mode):
+                total += int(metadata.st_size)
+        return total
+    except OSError:
+        return None
+    finally:
+        for descriptor, entries in reversed(stack):
+            entries.close()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 # ``ToolExecutionTrigger`` validates identifiers by UTF-8 byte length, not
 # Python character count.  Schedule IDs normally fit unchanged, but legacy
@@ -5827,6 +5876,7 @@ class ProxyFeature(Feature):
         self._downloaded_bytes: int | None = None
         self._last_telemetry_emit_monotonic: float | None = None
         self._telemetry_observer_tasks: set[asyncio.Future[Any]] = set()
+        self._telemetry_emit_tasks: set[asyncio.Task[None]] = set()
         # Event acknowledgement requests are intentionally detached from the
         # SDK read loop (which cannot await a response it must itself read).
         # Keep exact task ownership so terminal cleanup can cancel them rather
@@ -5926,7 +5976,15 @@ class ProxyFeature(Feature):
         cpu_seconds: float | None = None
         open_fds: int | None = None
         process_count: int | None = None
+        uncertain_retirement = bool(
+            self._terminal_retirement_clients
+            or self._terminal_lifecycle_tasks
+            or self._terminal_cleanup_uncertain
+            or self._has_running_terminal_health_probe_task()
+        )
         client = self._client
+        if client is None and self._terminal_retirement_clients:
+            client = self._terminal_retirement_clients[0]
         process = getattr(client, "process", None) if client is not None else None
         pid = getattr(process, "pid", None)
         if type(pid) is int and getattr(process, "returncode", None) is None:
@@ -5949,7 +6007,9 @@ class ProxyFeature(Feature):
                 process_count = 1 + len(children)
             except (OSError, RuntimeError, psutil.Error):
                 pass
-        if self._terminal_lifecycle_latched or self._stopping:
+        if uncertain_retirement:
+            state = "retirement-uncertain"
+        elif self._terminal_lifecycle_latched or self._stopping:
             state = "stopping" if client is not None else "stopped"
         elif self._idle_retired:
             state = "idle"
@@ -5962,8 +6022,8 @@ class ProxyFeature(Feature):
             distribution=self.runtime.distribution,
             state=state,
             lifecycle_generation=self._reload_gen,
-            active_processes=int(client is not None),
-            idle_processes=int(self._idle_retired),
+            active_processes=int(client is not None or uncertain_retirement),
+            idle_processes=int(self._idle_retired and not uncertain_retirement),
             restart_count=self._health_restart_count,
             idle_wake_count=self._idle_wake_count,
             last_used_at=self._last_used_at,
@@ -5978,11 +6038,16 @@ class ProxyFeature(Feature):
             downloaded_bytes=self._downloaded_bytes,
             provision_seconds=self._last_provision_seconds,
             cache_hit=self._last_cache_hit,
-            cleanup_eligible=self._idle_retired,
+            cleanup_eligible=self._idle_retired and not uncertain_retirement,
         )
 
-    async def _refresh_disk_telemetry(self) -> None:
+    async def _refresh_disk_telemetry(
+        self, *, refresh_environment: bool = False
+    ) -> None:
         """Refresh owned workspace byte counters outside the event loop."""
+
+        if self._telemetry_observer is None:
+            return
 
         runtime_dir = self._feature_runtime_dir()
         venv = self._venv_path
@@ -5990,8 +6055,12 @@ class ProxyFeature(Feature):
         def measure() -> tuple[int | None, int | None, int | None]:
             environment = (
                 _directory_tree_bytes(venv)
-                if venv is not None and venv == runtime_dir / ".venv"
-                else None
+                if (
+                    refresh_environment
+                    and venv is not None
+                    and venv == runtime_dir / ".venv"
+                )
+                else self._environment_bytes
             )
             private_sizes = [
                 _directory_tree_bytes(runtime_dir / component)
@@ -5999,7 +6068,7 @@ class ProxyFeature(Feature):
             ]
             private = (
                 sum(size for size in private_sizes if size is not None)
-                if any(size is not None for size in private_sizes)
+                if all(size is not None for size in private_sizes)
                 else None
             )
             downloaded = _directory_tree_bytes(runtime_dir / "provisioning_cache")
@@ -6062,6 +6131,42 @@ class ProxyFeature(Feature):
             logger.warning(
                 "Hosted isolated runtime telemetry observer failed for %s", self.name
             )
+
+    def _schedule_runtime_telemetry(self) -> None:
+        """Emit hot-path telemetry without retaining traffic admission."""
+
+        if (
+            self._telemetry_observer is None
+            or self._terminal_lifecycle_latched
+            or self._stopping
+            or any(
+                not task.done() for task in self._telemetry_emit_tasks
+            )
+        ):
+            return
+        coro = self._emit_runtime_telemetry(rate_limited=True)
+        name = f"isolated-runtime-telemetry:{self.name}"
+        tracker = getattr(self.agent, "_track_background_task", None)
+        task = None
+        if callable(tracker):
+            try:
+                tracked = tracker(coro, name=name)
+                if isinstance(tracked, asyncio.Task):
+                    task = tracked
+            except Exception:  # noqa: BLE001 - test doubles may reject tracking
+                task = None
+        if task is None:
+            task = asyncio.create_task(coro, name=name)
+        self._telemetry_emit_tasks.add(task)
+
+        def consume(completed: asyncio.Task[None]) -> None:
+            self._telemetry_emit_tasks.discard(completed)
+            try:
+                completed.result()
+            except BaseException:
+                return
+
+        task.add_done_callback(consume)
 
     def _record_runtime_activity(self) -> None:
         self._activity_generation += 1
@@ -6614,7 +6719,7 @@ class ProxyFeature(Feature):
             self._supervision_task = self._start_supervision()
             self._last_used_monotonic = asyncio.get_running_loop().time()
             self._start_idle_monitor()
-            await self._refresh_disk_telemetry()
+            await self._refresh_disk_telemetry(refresh_environment=True)
             await self._emit_runtime_telemetry()
 
     async def _ensure_venv_without_blocking_event_loop(self) -> None:
@@ -6655,6 +6760,10 @@ class ProxyFeature(Feature):
         for task in tuple(self._event_ingress_tasks):
             task.cancel()
         for task in tuple(self._deferred_acknowledged_event_tasks):
+            task.cancel()
+        for task in tuple(self._telemetry_emit_tasks):
+            task.cancel()
+        for task in tuple(self._telemetry_observer_tasks):
             task.cancel()
         idle_monitor = self._idle_monitor_task
         if idle_monitor is not None and idle_monitor is not asyncio.current_task():
@@ -7468,7 +7577,6 @@ class ProxyFeature(Feature):
         # cannot decide to restart the child in the tiny interval before seal.
         self._latch_terminal_lifecycle()
         await self._complete_terminal_cleanup()
-        await self._emit_runtime_telemetry()
 
     def prepare_shutdown_with_agent_deadline(self) -> None:
         """Synchronously establish terminal ownership for agent shutdown.
@@ -9817,7 +9925,7 @@ class ProxyFeature(Feature):
                             )
                         finally:
                             self._record_runtime_activity()
-                            await self._emit_runtime_telemetry(rate_limited=True)
+                            self._schedule_runtime_telemetry()
                         return
                 if wake_idle:
                     await self._wake_idle_runtime()
@@ -9997,7 +10105,7 @@ class ProxyFeature(Feature):
                             )
                         finally:
                             self._record_runtime_activity()
-                            await self._emit_runtime_telemetry(rate_limited=True)
+                            self._schedule_runtime_telemetry()
                         return result
                 if wake_idle:
                     experienced_wake = True
@@ -11488,6 +11596,13 @@ class ProxyFeature(Feature):
     def _start_idle_monitor(self) -> None:
         if self._idle_timeout_seconds is None:
             return
+        if self._owns_inbound_producer():
+            logger.warning(
+                "Hosted isolated runtime %s remains resident because it owns "
+                "an inbound producer",
+                self.name,
+            )
+            return
         task = self._idle_monitor_task
         if task is not None and not task.done():
             return
@@ -11508,12 +11623,12 @@ class ProxyFeature(Feature):
     def _owns_inbound_producer(self) -> bool:
         """Return whether retiring this child would remove its only wake source."""
 
-        if (
-            self._channel_adapter is not None
-            or self._hosted_telegram_startup_attested
-        ):
+        if self._hosted_telegram_startup_attested:
             return True
         try:
+            capabilities = self._client_capabilities()
+            if "channel" in capabilities:
+                return True
             return self._new_external_ingress_quiesce() is not None
         except BaseException:  # noqa: BLE001 - ambiguous producer state fails resident
             return True
@@ -11537,10 +11652,19 @@ class ProxyFeature(Feature):
                     if remaining > 0:
                         await asyncio.sleep(remaining)
                         continue
-                    await self._retire_idle_generation(
+                    retired = await self._retire_idle_generation(
                         expected_activity_generation=self._activity_generation,
                         expected_last_used=baseline,
                     )
+                    if not retired:
+                        if self._owns_inbound_producer():
+                            logger.warning(
+                                "Hosted isolated runtime %s stopped idle monitoring "
+                                "because it now owns an inbound producer",
+                                self.name,
+                            )
+                            return
+                        await asyncio.sleep(min(self._idle_timeout_seconds, 1.0))
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - monitor must remain observable/alive
@@ -11565,11 +11689,6 @@ class ProxyFeature(Feature):
             if self._stopping or self._idle_retired or self._client is None:
                 return False
             if self._owns_inbound_producer():
-                logger.warning(
-                    "Hosted isolated runtime %s remains resident because it owns "
-                    "an inbound producer",
-                    self.name,
-                )
                 return False
             self._reloading = True
             reopened = False
@@ -11634,6 +11753,10 @@ class ProxyFeature(Feature):
             try:
                 await self._close_traffic_gate()
                 if self._client is None:
+                    self._prepare_runtime_workspace()
+                    self._venv_path, self._bin_path = self.resolve_runtime_paths()
+                    if self._bin_path is None:
+                        await self._ensure_venv_without_blocking_event_loop()
                     if self._is_telegram_runtime():
                         await self._resolve_hosted_telegram_startup_attestation()
                     await self._connect_client()
@@ -11642,7 +11765,12 @@ class ProxyFeature(Feature):
                     self._last_used_monotonic = asyncio.get_running_loop().time()
                 await self._reopen_traffic_gate()
                 reopened = True
-                await self._refresh_disk_telemetry()
+                await self._refresh_disk_telemetry(
+                    refresh_environment=(
+                        not self._last_cache_hit
+                        or self._environment_bytes is None
+                    )
+                )
                 await self._emit_runtime_telemetry()
             except BaseException:
                 uncertain = bool(
@@ -12177,7 +12305,7 @@ class ProxyFeature(Feature):
                         self._schedule_event_ingress_acknowledgement(
                             source_client, acknowledgement
                         )
-                        await self._emit_runtime_telemetry(rate_limited=True)
+                        self._schedule_runtime_telemetry()
                 elif retry is not None:
                     self._schedule_event_ingress_retry(source_client, retry)
             except asyncio.CancelledError:
@@ -12399,7 +12527,7 @@ class ProxyFeature(Feature):
                     source_client,
                     acknowledgement,
                 )
-                await self._emit_runtime_telemetry(rate_limited=True)
+                self._schedule_runtime_telemetry()
             elif retry is not None and source_client is not None:
                 self._schedule_event_ingress_retry(source_client, retry)
         elif event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
@@ -12760,7 +12888,7 @@ class ProxyFeature(Feature):
                             deferred.source_client,
                             deferred.acknowledgement,
                         )
-                        await self._emit_runtime_telemetry(rate_limited=True)
+                        self._schedule_runtime_telemetry()
                     elif deferred.retry is not None:
                         self._schedule_event_ingress_retry(
                             deferred.source_client, deferred.retry

@@ -261,9 +261,14 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
         assert idle.cleanup_eligible is True
         assert idle.rss_bytes is None
 
+        work_dir = feature._feature_runtime_dir() / "work"
+        work_dir.rmdir()
+        assert work_dir.exists() is False
+
         assert await feature.call_host_ingress("poke", {"generation": 2}) == {
             "generation": 2
         }
+        assert work_dir.is_dir()
         second_process = feature._client.process
         restarted = feature.runtime_telemetry_snapshot()
         assert second_process is not None

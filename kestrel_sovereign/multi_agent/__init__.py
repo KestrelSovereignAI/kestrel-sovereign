@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 # demand and caches the resolved object back into module globals.
 _LAZY_EXPORTS = {
     "AgentManager": ".agent_manager",
+    "HostedIsolatedRuntimeLifecyclePolicy": ".agent_manager",
     "MultiAgentConfig": ".config",
     "HostConfig": ".config",
     "LocalAgentConfig": ".config",
@@ -52,7 +53,7 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:  # eager names for type checkers / IDEs only — no runtime cost
-    from .agent_manager import AgentManager
+    from .agent_manager import AgentManager, HostedIsolatedRuntimeLifecyclePolicy
     from .config import (
         HostConfig,
         LocalAgentConfig,
@@ -69,6 +70,7 @@ if TYPE_CHECKING:  # eager names for type checkers / IDEs only — no runtime co
 
 __all__ = [
     "AgentManager",
+    "HostedIsolatedRuntimeLifecyclePolicy",
     "MultiAgentConfig",
     "HostConfig",
     "LocalAgentConfig",
