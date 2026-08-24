@@ -221,6 +221,8 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
         features={},
     )
     agent.storage = _Storage()
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
     configure_hosted_isolated_runtime_lifecycle(
         agent,
         idle_timeout_seconds=3600,
@@ -268,7 +270,8 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
         assert second_process.pid != first_process.pid
         assert restarted.state == "running"
         assert restarted.lifecycle_generation == 2
-        assert restarted.restart_count == 1
+        assert restarted.restart_count == 0
+        assert restarted.idle_wake_count == 1
         assert restarted.process_count == 1
         assert {snapshot.feature for snapshot in snapshots} == {
             "IdleLifecycleFeature"

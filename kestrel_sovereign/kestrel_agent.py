@@ -2884,6 +2884,22 @@ class KestrelAgent(
                 "birth_record", cause_type="BirthRecordIdentityMissing"
             )
 
+    def _warn_unmatched_isolated_runtime_idle_timeouts(
+        self, discovered_features: tuple[Any, ...] | list[Any]
+    ) -> None:
+        """Make typoed pre-discovery lifecycle overrides operator-visible."""
+
+        idle_timeouts = self.__dict__.get("isolated_runtime_idle_timeouts", {})
+        if not isinstance(idle_timeouts, Mapping):
+            return
+        discovered_names = {feature.name for feature in discovered_features}
+        for unmatched_name in sorted(set(idle_timeouts) - discovered_names):
+            logging.warning(
+                "Ignoring isolated runtime idle timeout override for undiscovered "
+                "feature %s",
+                unmatched_name,
+            )
+
     async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
         """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""
         # Resolve agent name BEFORE features so features can use it
@@ -2963,6 +2979,7 @@ class KestrelAgent(
         discovered_features = discover_features(
             self, allowed_features=effective_features
         )
+        self._warn_unmatched_isolated_runtime_idle_timeouts(discovered_features)
         # Register the feature teardown BEFORE the loop so a failure partway
         # through registration (or in post_all_features_loaded below) rolls back
         # every feature already initialized — each feature.initialize() may have

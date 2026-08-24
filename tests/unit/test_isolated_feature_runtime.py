@@ -280,6 +280,16 @@ def _idle_test_runtime() -> InstalledFeatureRuntime:
     )
 
 
+def _configure_idle_lifecycle(agent, tmp_path, **kwargs) -> None:
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    agent.isolated_runtime_scope = resolve_isolated_runtime_namespace(
+        agent.isolated_runtime_root,
+        agent.isolated_runtime_namespace,
+    )
+    configure_hosted_isolated_runtime_lifecycle(agent, **kwargs)
+
+
 @pytest.mark.asyncio
 async def test_idle_retirement_cold_starts_exactly_one_new_generation(
     monkeypatch, tmp_path
@@ -288,8 +298,9 @@ async def test_idle_retirement_cold_starts_exactly_one_new_generation(
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
     snapshots: list[IsolatedRuntimeTelemetrySnapshot] = []
-    configure_hosted_isolated_runtime_lifecycle(
+    _configure_idle_lifecycle(
         agent,
+        tmp_path,
         idle_timeout_seconds=3600,
         telemetry_observer=snapshots.append,
     )
@@ -325,7 +336,8 @@ async def test_idle_retirement_cold_starts_exactly_one_new_generation(
     assert all(result["success"] is True for result in results)
     snapshot = feature.runtime_telemetry_snapshot()
     assert snapshot.state == "running"
-    assert snapshot.restart_count == 1
+    assert snapshot.restart_count == 0
+    assert snapshot.idle_wake_count == 1
     assert snapshot.lifecycle_generation == 2
     assert snapshot.last_used_at is not None
     assert not hasattr(snapshot, "command")
@@ -348,9 +360,7 @@ async def test_idle_deadline_loses_to_already_admitted_tool(monkeypatch, tmp_pat
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
-    configure_hosted_isolated_runtime_lifecycle(
-        agent, idle_timeout_seconds=3600
-    )
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=BlockingClient)
     await feature.initialize()
@@ -396,9 +406,7 @@ async def test_idle_stop_failure_seals_and_retains_exact_client_for_retry(
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
-    configure_hosted_isolated_runtime_lifecycle(
-        agent, idle_timeout_seconds=3600
-    )
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     client = RetryStopClient()
     feature = ProxyFeature(
@@ -428,9 +436,7 @@ async def test_shutdown_latch_beats_queued_idle_retirement(monkeypatch, tmp_path
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
-    configure_hosted_isolated_runtime_lifecycle(
-        agent, idle_timeout_seconds=3600
-    )
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     client = FakeIsolatedClient()
     feature = ProxyFeature(
@@ -469,8 +475,8 @@ async def test_idle_monitor_emits_retirement_without_clock_polling(monkeypatch, 
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
-    configure_hosted_isolated_runtime_lifecycle(
-        agent, idle_timeout_seconds=0.01, telemetry_observer=observe
+    _configure_idle_lifecycle(
+        agent, tmp_path, idle_timeout_seconds=0.01, telemetry_observer=observe
     )
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     client = FakeIsolatedClient()
@@ -490,19 +496,24 @@ async def test_idle_monitor_emits_retirement_without_clock_polling(monkeypatch, 
 async def test_async_telemetry_observer_cannot_hang_child_lifecycle(
     monkeypatch, tmp_path
 ):
-    observer_cancelled = asyncio.Event()
+    observer_started = asyncio.Event()
+    release_observer = asyncio.Event()
 
     async def observe(_snapshot):
-        try:
-            await asyncio.Event().wait()
-        finally:
-            observer_cancelled.set()
+        observer_started.set()
+        while True:
+            try:
+                await release_observer.wait()
+                return
+            except asyncio.CancelledError:
+                continue
 
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
-    configure_hosted_isolated_runtime_lifecycle(
+    _configure_idle_lifecycle(
         agent,
+        tmp_path,
         idle_timeout_seconds=3600,
         telemetry_observer=observe,
     )
@@ -515,9 +526,348 @@ async def test_async_telemetry_observer_cannot_hang_child_lifecycle(
 
     await asyncio.wait_for(feature.initialize(), timeout=1)
 
-    assert observer_cancelled.is_set()
+    assert observer_started.is_set()
+    assert feature._telemetry_observer_tasks
     assert client.started is True
+    await feature._emit_runtime_telemetry()
+    assert len(feature._telemetry_observer_tasks) == 1
+    release_observer.set()
     await asyncio.wait_for(feature.shutdown(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_reinitialize_after_idle_retirement_restores_live_supervision(
+    monkeypatch, tmp_path
+):
+    probed = asyncio.Event()
+
+    class ProbedClient(FakeIsolatedClient):
+        async def health(self):
+            probed.set()
+            return True
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = ProbedClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=client_factory)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    await feature.shutdown()
+    probed.clear()
+
+    await feature.initialize()
+    await asyncio.wait_for(probed.wait(), timeout=2)
+
+    snapshot = feature.runtime_telemetry_snapshot()
+    assert len(clients) == 2
+    assert feature._idle_retired is False
+    assert snapshot.state == "running"
+    assert snapshot.active_processes == 1
+    assert snapshot.idle_processes == 0
+    assert snapshot.cleanup_eligible is False
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_transient_idle_wake_failure_reopens_for_later_retry(monkeypatch, tmp_path):
+    class FailingStartClient(FakeIsolatedClient):
+        async def start(self):
+            raise RuntimeError("private transient start failure")
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            FailingStartClient(**kwargs)
+            if len(clients) == 1
+            else FakeIsolatedClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=client_factory)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    failed = await feature.call_isolated_tool("ping", {"message": "first"})
+    recovered = await feature.call_isolated_tool("ping", {"message": "retry"})
+
+    assert failed == {
+        "status": "error",
+        "error": "isolated feature could not start",
+        "tool": "ping",
+        "success": False,
+    }
+    assert recovered["success"] is True
+    assert len(clients) == 3
+    assert feature._traffic_gate.sealed is False
+    assert feature._terminal_lifecycle_latched is False
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_during_idle_wake_does_not_seal_feature(
+    monkeypatch, tmp_path
+):
+    wake_started = asyncio.Event()
+    release_wake = asyncio.Event()
+
+    class SlowWakeClient(FakeIsolatedClient):
+        async def start(self):
+            wake_started.set()
+            await release_wake.wait()
+            await super().start()
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            SlowWakeClient(**kwargs)
+            if clients
+            else FakeIsolatedClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=client_factory)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    cancelled_call = asyncio.create_task(
+        feature.call_isolated_tool("ping", {"message": "cancelled"})
+    )
+    await wake_started.wait()
+    cancelled_call.cancel("caller left")
+    release_wake.set()
+    with pytest.raises(asyncio.CancelledError, match="caller left"):
+        await cancelled_call
+
+    recovered = await feature.call_isolated_tool("ping", {"message": "later"})
+    assert recovered["success"] is True
+    assert len(clients) == 2
+    assert feature._traffic_gate.sealed is False
+    assert feature._terminal_lifecycle_latched is False
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_monitor_ordering_never_closes_gate_over_admitted_work(
+    monkeypatch, tmp_path
+):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingClient(FakeIsolatedClient):
+        async def call_tool(self, name, args):
+            entered.set()
+            await release.wait()
+            return await super().call_tool(name, args)
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=BlockingClient)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    call = asyncio.create_task(feature.call_isolated_tool("ping", {"message": "long"}))
+    await entered.wait()
+    monitor_generation = feature._activity_generation
+    monitor_last_used = feature._last_used_monotonic
+
+    assert not await feature._retire_idle_generation(
+        expected_activity_generation=monitor_generation,
+        expected_last_used=monitor_last_used,
+    )
+    assert feature._traffic_gate.closed is False
+    release.set()
+    assert (await call)["success"] is True
+    assert feature._last_used_monotonic > monitor_last_used
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_retirement_refuses_registered_inbound_channel(
+    monkeypatch, tmp_path
+):
+    agent = Mock(
+        did=_TEST_AGENT_DID,
+        features={"ChannelFeature": FakeChannelFeature()},
+    )
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = TelegramChannelClient()
+    feature = ProxyFeature(
+        agent, _idle_test_runtime(), client_factory=lambda **_kwargs: client
+    )
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+
+    assert feature._channel_adapter is not None
+    assert not await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    assert client.stopped is False
+    assert feature.runtime_telemetry_snapshot().state == "running"
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_monitor_retries_after_one_retirement_error(monkeypatch, tmp_path):
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=0.01)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    survived = asyncio.Event()
+    attempts = 0
+
+    async def flaky_retirement(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("private synthetic monitor failure")
+        survived.set()
+        feature._stopping = True
+        return False
+
+    monkeypatch.setattr(feature, "_retire_idle_generation", flaky_retirement)
+    feature._last_used_monotonic -= 1
+    await asyncio.wait_for(survived.wait(), timeout=1)
+
+    assert attempts == 2
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_observer_snapshot_sampling_runs_off_event_loop(monkeypatch, tmp_path):
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    snapshots = []
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=snapshots.append,
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    main_thread = threading.get_ident()
+    sampled_threads = []
+    original_snapshot = feature.runtime_telemetry_snapshot
+
+    def observe_thread():
+        sampled_threads.append(threading.get_ident())
+        return original_snapshot()
+
+    monkeypatch.setattr(feature, "runtime_telemetry_snapshot", observe_thread)
+    await feature.initialize()
+
+    assert snapshots
+    assert sampled_threads
+    assert all(thread_id != main_thread for thread_id in sampled_threads)
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_workspace_byte_telemetry_reports_owned_known_directories(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime_dir = feature._prepare_runtime_workspace()
+    feature._venv_path = runtime_dir / ".venv"
+    feature._venv_path.mkdir()
+    (feature._venv_path / "environment.bin").write_bytes(b"environment")
+    (runtime_dir / "data" / "private.bin").write_bytes(b"private")
+    (runtime_dir / "provisioning_cache" / "download.bin").write_bytes(b"download")
+
+    await feature._refresh_disk_telemetry()
+    snapshot = feature.runtime_telemetry_snapshot()
+
+    assert snapshot.environment_bytes == len(b"environment")
+    assert snapshot.private_writable_bytes == len(b"private")
+    assert snapshot.downloaded_bytes == len(b"download")
+
+
+def test_lifecycle_seam_rejects_unscoped_or_post_discovery_configuration(
+    monkeypatch, tmp_path
+):
+    with pytest.raises(ValueError, match="explicit hosted scope"):
+        configure_hosted_isolated_runtime_lifecycle(
+            SimpleNamespace(did="did:test:unscoped"),
+            idle_timeout_seconds=60,
+        )
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+
+    with pytest.raises(RuntimeError, match="before feature discovery"):
+        configure_hosted_isolated_runtime_lifecycle(
+            agent,
+            idle_timeout_seconds=60,
+        )
+
+
+def test_agent_warns_for_unmatched_idle_timeout_override(caplog):
+    agent = object.__new__(KestrelAgent)
+    agent.isolated_runtime_idle_timeouts = {
+        "KnownFeature": 60.0,
+        "TypoFeature": 60.0,
+    }
+
+    with caplog.at_level("WARNING"):
+        agent._warn_unmatched_isolated_runtime_idle_timeouts(
+            [SimpleNamespace(name="KnownFeature")]
+        )
+
+    assert "undiscovered feature TypoFeature" in caplog.text
+    assert "undiscovered feature KnownFeature" not in caplog.text
 
 
 def test_hosted_lifecycle_policy_requires_and_binds_explicit_agent_scope(tmp_path):
@@ -550,9 +900,14 @@ def test_hosted_lifecycle_policy_requires_and_binds_explicit_agent_scope(tmp_pat
 
 @pytest.mark.parametrize("value", [True, 0, -1, float("inf"), "60"])
 def test_hosted_lifecycle_policy_rejects_invalid_idle_timeout(value):
+    agent = SimpleNamespace(
+        did="did:test:timeout-validation",
+        isolated_runtime_root=Path("/tmp/kestrel-timeout-validation"),
+        isolated_runtime_namespace="tenant/agent",
+    )
     with pytest.raises((TypeError, ValueError)):
         configure_hosted_isolated_runtime_lifecycle(
-            SimpleNamespace(), idle_timeout_seconds=value
+            agent, idle_timeout_seconds=value
         )
 
 
@@ -6133,6 +6488,9 @@ async def test_supervision_restarts_child_on_wedged_health_probe(tmp_path):
                 break
         assert client.stopped is True
         assert client.starts >= 2  # child was restarted after the wedged probe
+        snapshot = feature.runtime_telemetry_snapshot()
+        assert snapshot.restart_count == 1
+        assert snapshot.idle_wake_count == 0
     finally:
         feature._stopping = True
         if feature._supervision_task:
