@@ -267,10 +267,10 @@ class _BoundedDaemonExecutor(Executor):
             if self._shutdown:
                 future.set_exception(RuntimeError("telemetry observer executor stopped"))
                 return future
-        try:
-            self._work.put_nowait((future, fn, args, kwargs))
-        except Full:
-            future.set_exception(RuntimeError("telemetry observer executor saturated"))
+            try:
+                self._work.put_nowait((future, fn, args, kwargs))
+            except Full:
+                future.set_exception(RuntimeError("telemetry observer executor saturated"))
         return future
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
@@ -282,24 +282,33 @@ class _BoundedDaemonExecutor(Executor):
         always cancelled so sentinel delivery cannot block on a full queue.
         """
 
+        queued_futures: list[Future[Any]] = []
         with self._lock:
             if self._shutdown:
                 return
             self._shutdown = True
             threads = tuple(self._threads)
-        while True:
-            try:
-                item = self._work.get_nowait()
-            except Empty:
-                break
-            try:
-                if item is not self._STOP:
-                    future, _fn, _args, _kwargs = item
-                    future.cancel()
-            finally:
-                self._work.task_done()
-        for _thread in threads:
-            self._work.put_nowait(self._STOP)
+            while True:
+                try:
+                    item = self._work.get_nowait()
+                except Empty:
+                    break
+                try:
+                    if item is not self._STOP:
+                        future, _fn, _args, _kwargs = item
+                        queued_futures.append(future)
+                finally:
+                    self._work.task_done()
+            for _thread in threads:
+                try:
+                    self._work.put_nowait(self._STOP)
+                except Full:
+                    # A bounded queue may be smaller than the worker count.
+                    # Unsignalled workers are daemon-only and will remain
+                    # harmlessly parked after the signalled workers exit.
+                    break
+        for future in queued_futures:
+            future.cancel()
 
 
 _TELEMETRY_OBSERVER_EXECUTOR = _BoundedDaemonExecutor(
@@ -6175,15 +6184,10 @@ class ProxyFeature(Feature):
         """Freeze event-loop-owned lifecycle state before process sampling."""
 
         retirement_clients = tuple(self._terminal_retirement_clients)
-        terminal_health_probe = self._terminal_health_probe_task
         uncertain_retirement = bool(
             retirement_clients
             or tuple(self._terminal_lifecycle_tasks)
             or self._terminal_cleanup_uncertain
-            or (
-                terminal_health_probe is not None
-                and not terminal_health_probe.done()
-            )
         )
         client = self._client
         if client is None and retirement_clients:
@@ -6216,7 +6220,12 @@ class ProxyFeature(Feature):
             "downloaded_bytes": self._downloaded_bytes,
             "provision_seconds": self._last_provision_seconds,
             "cache_hit": self._last_cache_hit,
-            "cleanup_eligible": idle and not uncertain_retirement,
+            "cleanup_eligible": (
+                idle
+                and not uncertain_retirement
+                and not self._terminal_lifecycle_latched
+                and not self._stopping
+            ),
             "disk_telemetry_status": self._disk_telemetry_status,
         }
         return values, client, self._process_identity
@@ -6489,6 +6498,12 @@ class ProxyFeature(Feature):
                         "Hosted isolated runtime disk telemetry refresh failed for %s",
                         self.name,
                     )
+                    async with self._telemetry_disk_lock:
+                        if reclaim_generation == self._workspace_reclaim_generation:
+                            self._environment_bytes = None
+                            self._private_writable_bytes = None
+                            self._downloaded_bytes = None
+                            self._disk_telemetry_status = "unavailable"
             await self._emit_runtime_telemetry(rate_limited=not force)
 
         coro = deliver()
@@ -12256,6 +12271,7 @@ class ProxyFeature(Feature):
                     await self._seal_traffic_gate()
                 elif self._client is None:
                     self._idle_retired = True
+                    self._idle_resume_event.clear()
                     if self._traffic_gate.closed:
                         await self._reopen_traffic_gate()
                         reopened = True

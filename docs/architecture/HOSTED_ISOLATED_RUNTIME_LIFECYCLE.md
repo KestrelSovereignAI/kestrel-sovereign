@@ -75,8 +75,9 @@ Before a wake, Core recreates the private workspace, resolves runtime paths, and
 reprovisions a missing Core-managed venv. It also invalidates the prior child's
 memoized config and reads the current durable generation, so a change committed
 by another replica while this process was idle reaches the new child.
-`cleanup_eligible` therefore means the exact child is stopped and the embedding
-host may ask Core to reclaim that feature's owned mutable workspace,
+`cleanup_eligible` therefore means the exact child is idle-retired, Core is not
+in terminal shutdown, and the embedding host may ask Core to reclaim that
+feature's owned mutable workspace,
 Core-managed venv, and provisioning cache through
 `ProxyFeature.reclaim_idle_workspace()`. It is not permission for the host to
 delete a path itself: Core's seam rechecks eligibility and performs secure
@@ -99,7 +100,9 @@ loop with root no-follow descriptor traversal plus entry/time budgets;
 all components in one refresh share the same total time deadline. The
 `disk_telemetry_status` field distinguishes a complete sample, a budget-exceeded
 sample, and an unavailable safe traversal; the first budget exhaustion is also
-logged once per feature. Externally supplied immutable environments remain
+logged once per feature. A refresh failure reports `unavailable` and clears its
+byte counters instead of presenting a stale complete sample. Externally
+supplied immutable environments remain
 `None` without making an otherwise complete sample ambiguous. `cache_hit` means
 Core performed no venv mutation, and venv size is cached across wakes unless
 Core actually provisions, upgrades, or reinstalls it. An embedding host may
@@ -120,8 +123,8 @@ that arrives behind one slow observer is coalesced and delivered when that
 observer settles, so an idle cleanup-eligibility transition is not silently
 dropped. Observer deferral and emit-task deferral have separate latches: a slow
 observer cannot create a reschedule loop, and ordinary coalesced traffic retains
-the hot-path rate limit. Disk refresh and observer delivery are never awaited while Core owns a
-reload lock. Terminal lifecycle
+the hot-path rate limit. Disk refresh and observer delivery are never awaited
+while Core owns a reload lock. Terminal lifecycle
 cancels Core-owned telemetry tasks and does not create a post-cleanup delivery.
 Workspace reclaim advances a generation fence so a previously scheduled disk
 sample cannot overwrite the post-reclaim accounting after deletion, and a disk
