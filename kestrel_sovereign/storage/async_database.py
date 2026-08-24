@@ -2613,17 +2613,21 @@ class AsyncDatabase:
         # index at once. The ALTER is serialized by its own migration lock; a
         # bare CREATE INDEX after it is not, and two boots racing there is a
         # failed request rather than a skipped index.
-        # ``created_at`` trails the pair so the projection can seek the newest
+        # ``created_at, id`` trail the pair so the projection can seek the newest
         # UNSTAMPED row rather than sort them: with ``(agent_id, session_id)``
         # alone SQLite answers that with ``USE TEMP B-TREE FOR ORDER BY`` over
         # every NULL row of the agent's, inside the repair's write transaction,
         # once per chunk — O(legacy rows) per append on exactly the histories
-        # #3061 exists to make cheap. It leaves the ``session_id = ?`` lookups
-        # this index was added for seeking exactly as before.
+        # #3061 exists to make cheap. ``id`` follows because the probe orders by
+        # the canonical pair: SQLite appends the rowid to every index and would
+        # be satisfied without it, PostgreSQL would sort the whole tie group at
+        # the newest second before taking one row. It leaves the
+        # ``session_id = ?`` lookups this index was added for seeking exactly as
+        # before.
         await self.ensure_index(
             "idx_conversation_agent_session",
             "conversation_history",
-            "agent_id, session_id, created_at",
+            "agent_id, session_id, created_at, id",
         )
 
     async def _migrate_conversation_created_at(self) -> None:

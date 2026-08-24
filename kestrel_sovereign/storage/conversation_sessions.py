@@ -3459,7 +3459,8 @@ class ConversationSessionProjection:
         09:01 with a higher id stored ``sess-a=2, sess-b=1`` under a watermark
         reporting itself current, where the reader says ``sess-a=1, sess-b=2``.
 
-        **Extended by the grouping gap, and that is not padding.** A stamped row
+**Extended by the grouping gap, and by the reach of the
+        cluster the newest unstamped row sits in.** A stamped row
         arriving within ``SESSION_GAP_MINUTES`` of the newest unstamped one is
         absorbed into that row's cluster by the grouper — deliberately, because
         the resolver walks a legacy numeric cluster forward in time and does not
@@ -3486,6 +3487,24 @@ class ConversationSessionProjection:
             return None
         newest = coerce_session_timestamp(row[0])
         if newest is None:
+            return _UNDATABLE_FRONTIER
+
+        # **One gap, not the cluster's whole reach, and that is a limit rather
+        # than a choice.** A legacy cluster absorbs stamped rows (#2019), so it
+        # can extend transitively — unstamped at 0, stamped at 20, stamped at 40
+        # is one cluster — and a chunk landing at 40 is past this frontier while
+        # the reader still puts it inside. The projection is where that reach
+        # would be read from, and it cannot be: #3098 means the absorbed row's
+        # column contradicts the grouping, so `project_transcript` refuses the
+        # cluster and the row that would say where it ends is never stored.
+        # Measured on main and on this branch, both disagree with the reader
+        # there; #3098 is what makes an exact frontier possible, and the xfail
+        # in ``test_legacy_session_folding`` pins the shape.
+        #
+        # ``datetime.max`` is a legal stored stamp — the #3009 CHECK admits year
+        # 9999 — and adding to it raises rather than returning a large number.
+        # A frontier nothing can be after is what the sentinel already means.
+        if newest > datetime.max - timedelta(minutes=SESSION_GAP_MINUTES):
             return _UNDATABLE_FRONTIER
         return newest + timedelta(minutes=SESSION_GAP_MINUTES)
 

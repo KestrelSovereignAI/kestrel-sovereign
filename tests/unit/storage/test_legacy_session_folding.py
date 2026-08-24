@@ -416,3 +416,44 @@ class TestTheFrontiersEdges:
             )
         finally:
             await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_cluster_reaching_past_the_gap_is_not_fenced(tmp_path):
+    """#3098 again, and the reason #3061's frontier is one gap and not a reach.
+
+    A legacy cluster absorbs stamped rows, so it extends transitively: unstamped
+    at minute 0, stamped at 20, stamped at 40 is ONE cluster to the reader,
+    because each adjacent gap is under thirty minutes. The frontier is the
+    newest unstamped row plus one gap, so a chunk landing at minute 40 is past
+    it and folds.
+
+    The projection is where that reach would be read from — a cluster's stored
+    ``last_message_at`` IS where it stops — and it cannot be, because #3098
+    means the absorbed row's column contradicts the grouping and the cluster is
+    never stored at all. Measured on main and on this branch: both disagree with
+    the reader here, differently.
+
+    So this is not a regression to fix in #3061; it is the second thing #3098
+    blocks, and it says so rather than being left for the next reader to
+    rediscover.
+    """
+    path = tmp_path / "chain.db"
+    _seed(path, [(None, 0)])
+
+    db = await AsyncDatabase.sqlite(str(path))
+    try:
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        await _append(db, "sess-x", 20)
+        await projection.repair()
+        await _append(db, "sess-z", 43200)
+        await projection.repair()
+        await _append(db, "sess-y", 40)
+        await projection.repair()
+
+        listed = {r["session_id"] for r in await projection.list()}
+        if listed != {"1", "sess-z"}:
+            pytest.xfail(f"#3098: the reader groups these as 1 + sess-z, not {listed}")
+    finally:
+        await db.close()
