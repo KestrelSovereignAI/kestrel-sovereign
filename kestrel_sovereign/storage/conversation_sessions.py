@@ -319,11 +319,14 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
+
 from .session_grouping import (
+    timestamp_predicate,
     SESSION_ORDER,
     SESSION_ORDER_TEXT_COLUMNS,
     canonical_timestamp_sql,
@@ -580,6 +583,31 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: probes below count these rows; two spellings of one membership rule is the
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
+
+#: How far a cluster-reach walk will follow a chain of turns before refusing.
+#:
+#: A legacy cluster extends for as long as consecutive rows stay within
+#: ``SESSION_GAP_MINUTES``, which has no bound in the data — so the walk has one,
+#: and running out is answered by a frontier nothing can be after rather than by
+#: a guess. 512 turns without a half-hour break is well past any real
+#: conversation and is one indexed read.
+CLUSTER_REACH_ROWS = 512
+
+#: "Something is unstamped and nothing can be ordered against it."
+#:
+#: An unstamped row whose ``created_at`` will not parse cannot be placed before
+#: or after anything, so no chunk can be proved to land clear of it.
+#: ``datetime.max`` says that through the same comparison every other frontier
+#: uses, rather than a second branch.
+#:
+#: **NOT COVERED BY A TEST, and it cannot be while #3009 stands.** ``created_at``
+#: carries a CHECK admitting exactly what ``coerce_session_timestamp`` can read,
+#: and the boot migration repairs anything a database already held — so a row
+#: this branch is about is repaired before any projection opens the database. It
+#: stays because what it guards is the difference between an escalation and a
+#: projection that disagrees with the reader, and because the constraint it
+#: leans on is one line in another module.
+_UNDATABLE_FRONTIER = datetime.max
 
 
 def active_history_predicate() -> str:
@@ -2391,11 +2419,10 @@ def project_transcript(
         # 473 of Emma's 1,522 live rows carry no session id at all.
         #
         # Storing them is sound because the two derivations cannot meet over
-        # one. A key outside the column's charset is a key no row's column can
-        # hold, so every row of that session is unstamped, so
-        # `_has_unstamped_rows()` is true and every step takes the transcript
-        # pass — the chunked fold, which is keyed on the column and could not
-        # maintain such a row, never runs while one can exist. Leaving that
+        # one. A key the column cannot hold is a key no row's column can hold,
+        # so every row of that session is unstamped, so any chunk reaching one
+        # escalates (#3061) — the chunked fold, which is keyed on the column and
+        # could not maintain such a row, never stores one. Leaving that
         # state cannot be reached by appends alone (removing an unstamped row is
         # a delete, an archive or a rewrite), so `_plan` answers REBUILT and the
         # discard clears anything left behind.
@@ -2914,8 +2941,7 @@ class ConversationSessionProjection:
                 plan = await self._plan(accounted, observed)
                 if plan is None:
                     return _Step(CURRENT, 0, True)
-                if not await self._has_unstamped_rows():
-                    return await self._chunk(plan)
+                return await self._chunk(plan)
         except Exception as exc:
             # The signal is raised inside the step's transaction so that the
             # rollback is the abort: nothing the chunk wrote stands, and the
@@ -3149,7 +3175,7 @@ class ConversationSessionProjection:
         through = (
             plan.target if len(rows) < self.chunk_rows else int(rows[-1][0])
         )
-        written = await self._fold(rows, through)
+        written = await self._fold(rows, through, await self._unstamped_frontier())
         await self._record(
             SessionWatermark(
                 plan.generation, True, plan.stamp, plan.appends, through,
@@ -3426,37 +3452,157 @@ class ConversationSessionProjection:
             or 0
         )
 
-    async def _has_unstamped_rows(self) -> bool:
-        """Whether any live row of this agent's is filed under no session id.
+    async def _unstamped_frontier(self) -> Optional[datetime]:
+        """How recently an unstamped live row stands, or ``None`` for none at all.
 
-        Seeded by Phase A's ``(agent_id, session_id)`` index and stopped at the
-        first hit, so the ordinary answer costs one seek. It is not free in the
-        pathological case — an agent holding many unstamped rows that are all
-        soft-deleted or archived pays a heap visit per candidate — but that is an
-        agent already on the transcript derivation, whose repair reads its whole
-        live history anyway.
+        A row filed under no ``session_id`` belongs to whichever cluster it falls
+        next to, so a row arriving BESIDE it can take it — and a fold reading
+        sessions by their column would never see that happen. Ordinary appends
+        land after everything and cannot; a row whose id is higher but whose
+        stamp is earlier can, and that is not hypothetical: PostgreSQL's
+        ``NOW()`` is transaction-start time, so an overlapping writer commits a
+        later id carrying an earlier timestamp, and an import or restore can
+        write anything.
 
-        This chooses between the two derivations: with no unstamped rows a
-        session's own rows are the whole of its story, and with any of them
-        attribution has to be read off the transcript (see the module docstring).
+        Measured against the fold without this: ``sess-a`` at 09:00 with an
+        unstamped row at 09:02 stored as ``sess-a=2``; appending ``sess-b`` at
+        09:01 with a higher id stored ``sess-a=2, sess-b=1`` under a watermark
+        reporting itself current, where the reader says ``sess-a=1, sess-b=2``.
+
+**Extended by the grouping gap, and by the reach of the
+        cluster the newest unstamped row sits in.** A stamped row
+        arriving within ``SESSION_GAP_MINUTES`` of the newest unstamped one is
+        absorbed into that row's cluster by the grouper — deliberately, because
+        the resolver walks a legacy numeric cluster forward in time and does not
+        stop on id changes (#2019) — while a fold would file it under its own
+        column id. Measured without the extension: the reader says one session
+        of two rows, the projection stored two sessions of one, and called
+        itself current.
+
+        ``None`` means nothing is unstamped and every chunk lands clear.
+
+        One row, seeked rather than counted. ``COUNT(*)`` alongside ``MAX`` made
+        the engine visit every unstamped row of the agent's to answer, inside
+        the repair's write transaction, once per chunk — which is O(legacy rows)
+        per append on exactly the histories this exists to make cheap. Absence
+        is read off the empty result instead.
         """
         row = await self.db.fetchone(
-            "SELECT 1 FROM conversation_history "
+            "SELECT created_at FROM conversation_history "
             f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE} "
-            "LIMIT 1",
+            f"{canonical_order(self.db.backend_type, descending=True)} LIMIT 1",
             (self.agent_id,),
         )
-        return row is not None
+        if not row:
+            return None
+        newest = coerce_session_timestamp(row[0])
+        if newest is None:
+            return _UNDATABLE_FRONTIER
+
+        # ...and out to the END of the cluster that row sits in, because a
+        # legacy cluster ABSORBS stamped rows (#2019) and so extends
+        # transitively: unstamped at 0, stamped at 20, stamped at 40 is one
+        # conversation, each adjacent gap being under the limit. Fencing one gap
+        # past the unstamped row would leave minute 40 outside it and the reader
+        # still puts it inside.
+        #
+        # Walked over history rather than read from the projection, which is
+        # where a cluster's end is written down and is exactly what #3098 makes
+        # unreadable: the absorbed row's column contradicts the grouping, so
+        # `project_transcript` refuses the cluster and never stores the row that
+        # would say where it stops.
+        newest = await self._cluster_reach(row[0], newest)
+        # ``datetime.max`` is a legal stored stamp — the #3009 CHECK admits year
+        # 9999 — and adding to it raises rather than returning a large number.
+        # A frontier nothing can be after is what the sentinel already means.
+        if newest > datetime.max - timedelta(minutes=SESSION_GAP_MINUTES):
+            return _UNDATABLE_FRONTIER
+        # One gap past where the cluster stops, because the grouper splits on
+        # ``gap > gap_minutes`` — strictly greater — so a row landing exactly
+        # that far after the last one is still absorbed.
+        #
+        # NOT SEPARATELY COVERED, and it is worth saying why rather than leaving
+        # a mutant survivor unexplained: reaching the boundary needs a chunk row
+        # between the chain's end and one gap past it, and a projection settled
+        # enough to fold at all needs an earlier fold BEYOND that point — so the
+        # only constructions that touch this comparison are inversions, which
+        # `_folded`'s own monotonicity check escalates first. Both spellings
+        # behave identically on every input a test can build. The rule is the
+        # grouper's, stated the same way it states it.
+        return newest + timedelta(minutes=SESSION_GAP_MINUTES)
+
+    async def _cluster_reach(
+        self, frontier_stamp: Any, newest: datetime
+    ) -> datetime:
+        """Where the cluster containing the newest unstamped row stops.
+
+        Walks forward from it while each step is within ``SESSION_GAP_MINUTES``
+        of the last — the grouper's own rule for staying in a session — and
+        returns the last row it reached. That row plus one gap is the first
+        point at which a new session provably begins.
+
+        **Bounded, and it says so by refusing rather than by stopping early.**
+        The walk reads at most :data:`CLUSTER_REACH_ROWS`; a chain longer than
+        that is an agent talking without a half-hour break for that many turns,
+        and guessing its end would be worse than not folding. Running out
+        returns ``datetime.max``, which every caller already reads as "nothing
+        can be proved to land clear of this".
+        """
+        rows = await self.db.fetchall(
+            f"SELECT {_canonical_key(self.db.backend_type, 'created_at')}, created_at "
+            "FROM conversation_history "
+            f"WHERE agent_id = ? AND {_LIVE} "
+            f"AND {timestamp_predicate(self.db.backend_type, 'created_at', '>=')} "
+            f"{canonical_order(self.db.backend_type)} LIMIT ?",
+            (
+                self.agent_id,
+                timestamp_query_param(self.db.backend_type, frontier_stamp),
+                CLUSTER_REACH_ROWS + 1,
+            ),
+        )
+        reached = newest
+        for index, row in enumerate(rows):
+            stamp = coerce_session_timestamp(row[1])
+            if stamp is None:
+                return datetime.max
+            if stamp <= reached:
+                continue
+            if (stamp - reached) > timedelta(minutes=SESSION_GAP_MINUTES):
+                return reached
+            reached = stamp
+        if len(rows) > CLUSTER_REACH_ROWS:
+            return datetime.max
+        return reached
 
     async def _fold(
-        self, rows: Sequence[Sequence[Any]], through: int
+        self, rows: Sequence[Sequence[Any]], through: int,
+        frontier: Optional[datetime],
     ) -> int:
         """Fold one chunk's rows into the sessions they belong to.
 
-        Only ever reached with no unstamped live rows in play (see
-        :meth:`_step`), which is what makes a row's column the whole story of
-        where it belongs — so the chunk can be partitioned by that column without
-        consulting anything else, and each partition grouped on its own.
+        A row's column is the whole story of where it belongs for every session
+        this stores, and that is an INVARIANT the escalation below maintains
+        rather than a precondition someone else checks: a chunk holding a row
+        with no ``session_id`` refuses to fold at all, so a walk that reaches
+        ``through`` without escalating has accounted for every live row at or
+        below it. A session first seen above ``through`` therefore already has a
+        stored row describing whatever lies beneath, and folding only ever adds
+        this chunk's rows to it.
+
+        That replaces ``_has_unstamped_rows()`` (#3061), which asked whether the
+        AGENT held any unstamped row and sent the whole step to the transcript
+        if so. Legacy rows are not a transient upgrade state — they are what old
+        history looks like for ever — so one of them made EVERY repair re-derive
+        the agent's entire live history, on the read path #2960 put it on.
+        Measured, SQLite, one session in three legacy, ``list_session_page(50)``
+        straight after an appended row: 18.0 ms at 1,500 live rows against
+        3.4 ms now, and 133.0 ms against 6.3 ms at 15,000. Flat rather than
+        linear, and no row of history is rewritten to get there.
+
+        A per-session guard was tried first and removed: a fold only ever ADDS
+        a chunk's rows to what is already stored, so given the invariant above
+        there is nothing left for it to catch. It survived its own mutant, which
+        is what that always means.
 
         The rows handed here are the rows the chunk read. Nothing re-reads a
         session's history: that is the difference between a walk costing one pass
@@ -3469,11 +3615,33 @@ class ConversationSessionProjection:
         — but a deterministic order costs nothing and means an unforeseen overlap
         is contention rather than a lock cycle.
         """
+        # Nothing here may land among — or beside — rows only the transcript can
+        # attribute.
+        # The check above catches an unstamped row INSIDE the chunk; this one
+        # catches the chunk landing beside one already accounted for, which no
+        # column read can see happen. Asked of the chunk rather than of each
+        # session because it is a question about where these rows fall, and a
+        # per-session form of it was tried, survived its own mutant, and was
+        # removed — it could not catch this because a session's own boundaries
+        # say nothing about a row arriving beside it.
+        if frontier is not None:
+            for row in rows:
+                landed = coerce_session_timestamp(row[_CREATED_AT])
+                if landed is None or landed <= frontier:
+                    raise _NeedsTranscript(row[0])
+
         by_session: Dict[str, List[Sequence[Any]]] = {}
         for row in rows:
             session_id = row[4]
             if session_id is None:
-                continue
+                # **The chunk cannot file this row, so it cannot fold at all.**
+                # Skipping it was the shape before #3061 and it was only safe
+                # because `_step` had already refused to reach here with any
+                # unstamped row anywhere. With the guard now per session, a
+                # skipped row is a session that exists in history and in NO
+                # projection — measured, six legacy rows and an empty list.
+                # Absence is not the permitted direction for a conversation.
+                raise _NeedsTranscript(row[0])
             by_session.setdefault(str(session_id), []).append(row)
 
         written = 0
