@@ -6,6 +6,7 @@ All queries use SQLite-style ? placeholders - automatically converted for Postgr
 """
 import asyncio
 import hashlib
+import json
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -32,7 +33,7 @@ from .conversation_created_at import (
     noncanonical_predicate,
     repairable_bulk_update,
 )
-from .session_id_column import backfill_statement
+from .session_id_column import SESSION_ID_KEY, backfill_statement
 
 logger = logging.getLogger(__name__)
 
@@ -1372,6 +1373,11 @@ class AsyncDatabase:
         # the retrofit rebuilds the table and takes the #2959 triggers with it.
         await self._migrate_conversation_created_at()
 
+        # #3061: every live row gets a session id its column can hold, so
+        # the projection can be maintained by folding an append rather than
+        # by re-deriving the agent's whole history on every list call.
+        await self._migrate_conversation_session_ids()
+
         await self.ensure_session_projection_schema()
 
         logger.debug(f"Database schema initialized ({self.backend_type})")
@@ -2618,6 +2624,190 @@ class AsyncDatabase:
             "conversation_history",
             "agent_id, session_id",
         )
+
+    #: How many rows one stamping statement carries.
+    #:
+    #: The pass below rewrites history, so it is batched rather than run as one
+    #: statement per agent: an unbounded write holds SQLite's single writer slot
+    #: for its whole length, which is the hold every migration in this file is
+    #: written to avoid.
+    SESSION_ID_STAMP_BATCH = 500
+
+    async def _migrate_conversation_session_ids(self) -> None:
+        """Give every live row a session id its column can hold (#3061).
+
+        ``ConversationSessionProjection`` folds an append into the sessions it
+        touched — O(rows appended) — but only when every live row of that agent
+        carries a ``session_id``. One row that does not sends every repair down
+        the whole-transcript path instead, and #2960 put that repair on the
+        conversation list's read path. Re-measured for this fix — SQLite, one
+        session in three legacy, ``list_session_page(50)`` timed straight after
+        one appended row:
+
+        =========  ============  =========================
+        live rows  all stamped   one session in three legacy
+        =========  ============  =========================
+        1,500      3.7 ms        18.0 ms
+        15,000     4.9 ms        133.0 ms
+        =========  ============  =========================
+
+        The stamped column is flat in history size. The other is linear, and it
+        is the column every existing database is in: 473 of one live agent's
+        1,522 rows carried no id the column could hold. This pass moves an agent
+        from the second column to the first, permanently.
+
+        Two populations leave a row NULL, and this pass exists because neither
+        is transient:
+
+        * a metadata id the column's contract excluded. Widening that contract
+          to printable ASCII (#3061) fixes the *writers*; the rows already
+          stored still need lifting, and the Phase A backfill cannot do it
+          because it runs once, inside the ALTER's own transaction, and every
+          existing database has long since passed it.
+        * a cluster carrying no usable id at all. The grouper keys those by
+          ``str(first row id)``, which is all digits and therefore refused by
+          the column on purpose. Those are re-keyed — see
+          :func:`~kestrel_sovereign.storage.conversation_sessions.legacy_session_assignments`
+          for why that writes down an answer rather than inventing one.
+
+        **Guarded by the state itself, not by a marker.** It runs for the agents
+        that have a NULL-column live row and does nothing for the rest, so a
+        database it has already finished skips it on one indexed probe. There is
+        no completion flag that could go on claiming "done" about rows a later
+        writer added.
+
+        **A cluster is re-keyed all or nothing.** Each one's rows are written in
+        a single transaction, because a half-re-keyed cluster does not converge:
+        the rewritten rows group under the new id, the rest group by time gap
+        under a fresh one, and the next pass would keep them apart for ever.
+        Rows that only need the column copied out of their own metadata carry no
+        such requirement — each already agrees with the document beside it — so
+        those are batched for throughput instead.
+
+        Ordered before ``ensure_session_projection_schema`` so the writes below
+        land before the #2959 change triggers exist on a fresh database, for the
+        same reason the relink above is: counting this migration's own UPDATEs
+        as history changes is harmless and pointless.
+        """
+        from .conversation_sessions import (
+            legacy_session_assignments,
+            live_transcript_sql,
+        )
+
+        agents = await self.fetchall(
+            "SELECT DISTINCT agent_id FROM conversation_history "
+            "WHERE session_id IS NULL AND deleted_at IS NULL "
+            "AND archived_at IS NULL"
+        )
+        if not agents:
+            return
+
+        for (agent_id,) in agents:
+            transcript = await self.fetchall(
+                live_transcript_sql(self.backend_type), (agent_id,)
+            )
+            stamp, rekey, titles, left_alone = legacy_session_assignments(transcript)
+            metadata_of = {row[0]: row[2] for row in transcript}
+
+            copied = await self._stamp_session_id_column(stamp)
+            rewritten = await self._rekey_legacy_sessions(
+                agent_id, rekey, titles, metadata_of
+            )
+            if copied or rewritten:
+                logger.info(
+                    "conversation_history: stamped %d and re-keyed %d of %s's "
+                    "live rows so its session index can be maintained "
+                    "incrementally (#3061)",
+                    copied,
+                    rewritten,
+                    agent_id,
+                )
+            if left_alone:
+                logger.warning(
+                    "conversation_history: %d of %s's sessions carry an id the "
+                    "column cannot hold (%s); their rows stay unstamped, so "
+                    "every repair for this agent re-derives its whole history",
+                    len(left_alone),
+                    agent_id,
+                    ", ".join(sorted(left_alone)[:3]),
+                )
+
+    async def _stamp_session_id_column(self, stamp: dict) -> int:
+        """Copy each row's own metadata id into its column, in batches."""
+        rows = [(session_id, row_id) for row_id, session_id in stamp.items()]
+        written = 0
+        for start in range(0, len(rows), self.SESSION_ID_STAMP_BATCH):
+            batch = rows[start : start + self.SESSION_ID_STAMP_BATCH]
+            await self.execute_many(
+                "UPDATE conversation_history SET session_id = ? "
+                "WHERE id = ? AND session_id IS NULL",
+                batch,
+            )
+            written += len(batch)
+        return written
+
+    async def _rekey_legacy_sessions(
+        self, agent_id: str, rekey: dict, titles: dict, metadata_of: dict
+    ) -> int:
+        """Write a minted id into metadata AND the column, one cluster at a time.
+
+        The document is re-serialized from what it parsed to, so a row whose
+        metadata is not a JSON object cannot be given a key without destroying
+        the only copy of whatever it does hold.
+        ``legacy_session_assignments`` has already withheld every cluster
+        containing such a row, WHOLE — half a re-keyed cluster never converges.
+        The same rule is applied again here rather than assumed, because the two
+        halves read the document twice and a skip that dropped one row would
+        split a conversation permanently.
+        """
+        by_session: dict = {}
+        for row_id, session_id in rekey.items():
+            by_session.setdefault(session_id, []).append(row_id)
+
+        written = 0
+        for session_id, row_ids in by_session.items():
+            updates = []
+            for row_id in row_ids:
+                try:
+                    document = json.loads(metadata_of.get(row_id) or "{}")
+                except (TypeError, ValueError):
+                    document = None
+                if not isinstance(document, dict):
+                    updates = []
+                    logger.warning(
+                        "conversation_history: row %s holds metadata that is "
+                        "not a JSON object, so session %s keeps the id its "
+                        "rows can be grouped under rather than being split "
+                        "across two (#3061)",
+                        row_id,
+                        session_id,
+                    )
+                    break
+                document[SESSION_ID_KEY] = session_id
+                updates.append((json.dumps(document), session_id, row_id))
+            if not updates:
+                continue
+            async with self.transaction(immediate=True):
+                await self.execute_many(
+                    "UPDATE conversation_history "
+                    "SET metadata = ?, session_id = ? WHERE id = ?",
+                    updates,
+                )
+            written += len(updates)
+
+        for old_key, new_key in titles.items():
+            # The name follows the conversation it named. Guarded rather than
+            # blind: `conversation_titles` is keyed on (agent_id, session_id),
+            # so an UPDATE onto a row that already exists would raise, and a
+            # migration is the worst place to learn that.
+            await self.execute(
+                "UPDATE conversation_titles SET session_id = ? "
+                "WHERE agent_id = ? AND session_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM conversation_titles "
+                "WHERE agent_id = ? AND session_id = ?)",
+                (new_key, agent_id, old_key, agent_id, new_key),
+            )
+        return written
 
     async def _migrate_conversation_created_at(self) -> None:
         """Give ``conversation_history.created_at`` a guarantee (#3009).

@@ -2289,6 +2289,175 @@ def transcript_membership(rows: Sequence[Sequence[Any]]) -> Dict[str, List[Any]]
     }
 
 
+#: The prefix a re-keyed legacy cluster is given (#3061).
+#:
+#: A cluster carrying no usable session id anywhere is keyed by the grouper as
+#: ``str(first row id)`` — all digits, which is precisely what
+#: :func:`~kestrel_sovereign.storage.session_id_column.is_stampable_session_id`
+#: refuses, because bare integers are the mis-filed legacy keys of #2012 that
+#: the grouper itself ignores. So that key can never reach the column, the rows
+#: stay NULL for ever, and one such row makes every repair of that agent
+#: re-derive its whole live history.
+#:
+#: The prefix turns the same identity into one the column can hold. It is
+#: derived from the old key rather than minted fresh so the migration is
+#: deterministic and re-runnable, and so ``conversation_titles`` — keyed on the
+#: old string — can be carried across by name.
+LEGACY_SESSION_PREFIX = "legacy-"
+
+
+def legacy_session_assignments(
+    rows: Sequence[Sequence[Any]],
+) -> Tuple[Dict[Any, str], Dict[Any, str], Dict[str, str], List[str]]:
+    """What every live row's ``session_id`` column should hold, for a transcript.
+
+    ``rows`` is the agent's whole live history in canonical order — the same
+    read :func:`transcript_membership` takes, and for the same reason: a row
+    carrying no session id belongs to whichever cluster it falls next to, and
+    that is decided by the rows before it.
+
+    Returns ``(stamp, rekey, titles, left_alone)``:
+
+    * ``stamp`` — ``{row id: session id}`` for rows whose METADATA already holds
+      that id. Only the column needs writing, and it cannot disagree with the
+      document because it is being copied out of it.
+    * ``rekey`` — ``{row id: session id}`` for rows whose cluster had no usable
+      id at all. Both the metadata and the column have to be written, together.
+    * ``titles`` — ``{old key: new key}`` so a user-assigned name follows the
+      conversation it named.
+    * ``left_alone`` — cluster keys this pass will not touch, each because it
+      cannot be touched WHOLLY. Two reasons: the key is a real metadata id the
+      column still cannot hold (nothing in this codebase writes one since the
+      charset was widened to printable ASCII), or one of the cluster's rows
+      holds metadata that is not a JSON object, so its document cannot gain a
+      key without destroying whatever it does hold. They are returned rather
+      than assumed absent, because the rows stay NULL and the caller has to be
+      able to say so.
+
+    **A cluster is re-keyed whole or not at all.** Re-keying half of one does
+    not converge: the rewritten rows group under the new id on the next pass
+    while the rest group by time gap under another, so the conversation stays
+    split for ever. That is why an unwritable row disqualifies its cluster
+    rather than just itself — measured against a transcript of five rows where
+    only the third held a parseable document.
+
+    **This writes down the answer the reader already gives.** The identity a
+    re-keyed cluster gets is the grouper's own, spelled so the column can hold
+    it — not a new opinion about where the boundaries are. A row whose metadata
+    holds a bare integer loses that value, and that is the point: every reader
+    already ignores it (#2012), so what is lost is a string nothing consults.
+    """
+    messages, _ = _transcript_messages(rows)
+    grouped = _grouped_transcript(messages)
+    metadata_of = {message["id"]: message["metadata"] for message in messages}
+    # Which rows can be given a key at all. ``parse_message_metadata`` answers
+    # ``{}`` for a document it cannot read, which is the right answer for a
+    # READER and the wrong one for a writer: re-serializing ``{}`` over
+    # ``{not json`` would destroy the only copy of whatever that row holds.
+    rewritable = set()
+    for row in rows:
+        try:
+            document = json.loads(row[2] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(document, dict):
+            rewritable.add(row[0])
+
+    # Every value this transcript FILES a row under, by the grouper's own
+    # acceptance rule. A cluster key absent from this set was invented from a
+    # row id, which is the only case that may be re-keyed: a key that IS in it
+    # is an identity a writer chose and a reader resolves.
+    filed_under = set()
+    for message in messages:
+        candidate = message["metadata"].get(SESSION_ID_KEY)
+        if candidate and not str(candidate).isdigit():
+            filed_under.add(str(candidate))
+
+    stamp: Dict[Any, str] = {}
+    rekey: Dict[Any, str] = {}
+    titles: Dict[str, str] = {}
+    left_alone: List[str] = []
+    taken = set(filed_under)
+
+    for session in grouped:
+        key = str(session["session_id"])
+        members = [message["id"] for message in session.get("messages", ())]
+        minting = not is_stampable_session_id(key)
+        if minting and key in filed_under:
+            # A key a writer chose and a reader resolves. It is not this pass's
+            # to replace; the column simply stays silent about it.
+            left_alone.append(key)
+            continue
+
+        # Decided for the whole cluster before anything is written, because a
+        # cluster is touched whole or not at all.
+        plan: Dict[Any, bool] = {}
+        for row_id in members:
+            held = metadata_of.get(row_id, {}).get(SESSION_ID_KEY)
+            if isinstance(held, str) and held == (key if not minting else None):
+                plan[row_id] = False          # already says it; stamp only
+            elif _ignored_by_grouping(held) and row_id in rewritable:
+                plan[row_id] = True           # says nothing a reader uses
+            else:
+                plan = {}
+                break
+        if not plan:
+            left_alone.append(key)
+            continue
+
+        if minting:
+            target = _minted_key(key, taken)
+            taken.add(target)
+            titles[key] = target
+        else:
+            target = key
+        for row_id, rewriting in plan.items():
+            (rekey if rewriting else stamp)[row_id] = target
+
+    # Structural ``new_session`` markers are excluded from a session's messages
+    # (they are not rows a reader shows), so the loop above never reaches them —
+    # but they are live rows with a NULL column, and one is enough to keep every
+    # repair on the transcript pass. Each carries its own id, which is how a
+    # marker establishes a session at all.
+    for message in messages:
+        row_id = message["id"]
+        if row_id in stamp or row_id in rekey:
+            continue
+        own = message["metadata"].get(SESSION_ID_KEY)
+        if isinstance(own, str) and is_stampable_session_id(own):
+            stamp[row_id] = own
+
+    return stamp, rekey, titles, left_alone
+
+
+def _ignored_by_grouping(value: Any) -> bool:
+    """Whether session grouping files a row under this ``metadata.session_id``.
+
+    ``True`` means it does NOT — the value is absent, empty, or a bare integer
+    (#2012's mis-filed legacy keys) — which is the only case a migration may
+    overwrite. Anything else is an identity a writer chose and a reader
+    resolves, and this pass does not get to rename it.
+
+    The rule is the grouper's own, inverted, rather than a restatement: it files
+    a row under ``metadata.session_id`` when that value is truthy and not
+    ``str(...).isdigit()``.
+    """
+    return not value or str(value).isdigit()
+
+
+def _minted_key(key: str, taken: set) -> str:
+    """``legacy-<key>``, or the first suffix that nothing else in the transcript
+    already answers to. A collision needs a writer to have chosen a literal
+    ``legacy-197``; it costs one set lookup to be sure rather than to hope."""
+    candidate = f"{LEGACY_SESSION_PREFIX}{key}"
+    if candidate not in taken:
+        return candidate
+    attempt = 2
+    while f"{candidate}-{attempt}" in taken:
+        attempt += 1
+    return f"{candidate}-{attempt}"
+
+
 def project_transcript(
     rows: Sequence[Sequence[Any]], expect: Optional[str] = None
 ) -> List[SessionProjection]:

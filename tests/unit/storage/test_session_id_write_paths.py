@@ -95,11 +95,15 @@ async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp
     ``session_id`` reaches salvage from the caller, so it can be an id the
     column may not hold. It must land NULL rather than be rewritten — the
     marker's metadata is what grouping reads, and Phase A changes no reader.
+
+    The id is non-ASCII since #3061 widened the column to printable ASCII;
+    ``did:x:1`` is stampable now, and the claim under test is about what happens
+    to an id that still is not.
     """
     db = await AsyncDatabase.sqlite(str(tmp_path / "salvage-unstampable.db"))
     try:
         store = AsyncConversationStore(db, agent_id=AGENT)
-        await store.add_conversation("user", "long turn", session_id="did:x:1")
+        await store.add_conversation("user", "long turn", session_id="sesión:1")
         original = await db.fetchone(
             "SELECT id FROM conversation_history ORDER BY id LIMIT 1"
         )
@@ -109,7 +113,7 @@ async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp
             original_messages=[{"id": int(original[0])}],
             reason=SalvageReason.AUTO_PRUNE_PRETRIM,
             model="test-model",
-            session_id="did:x:1",
+            session_id="sesión:1",
             token_estimate=42,
         )
 
@@ -117,7 +121,7 @@ async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp
             "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
             (result.salvage_id,),
         )
-        assert json.loads(metadata)["session_id"] == "did:x:1"
+        assert json.loads(metadata)["session_id"] == "sesión:1"
         assert session_id is None
     finally:
         await db.close()
@@ -253,7 +257,7 @@ async def test_a_restore_rederives_the_column_from_the_backup_metadata(tmp_path)
     await source.initialize()
     try:
         await source.add_conversation("user", "carried", session_id=UUID_A)
-        await source.add_conversation("user", "uncarried", session_id="did:x:1")
+        await source.add_conversation("user", "uncarried", session_id="sesión:1")
         blob = await source.create_backup_blob()
     finally:
         await source.close()
@@ -267,7 +271,7 @@ async def test_a_restore_rederives_the_column_from_the_backup_metadata(tmp_path)
         rows = await _rows(target.db)
         assert [row[1] for row in rows] == [UUID_A, None]
         assert [json.loads(row[0])["session_id"] for row in rows] == [
-            UUID_A, "did:x:1",
+            UUID_A, "sesión:1",
         ]
         for metadata, session_id in rows:
             assert session_id == column_session_id(metadata)

@@ -69,11 +69,39 @@ from typing import Any, Dict, Optional, Tuple
 #
 # Every other spelling in this module is COMPUTED from these three lines. They
 # are not documentation of a rule stated elsewhere; there is nowhere else.
-_ALLOWED_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789"
-    "_-"
+#: Printable ASCII a session id may not contain, and why each is out.
+#:
+#: ``^`` ``]`` ``\`` have no shared meaning between a PostgreSQL regex bracket
+#: expression and a SQLite GLOB one, so a rule containing them could not be
+#: written once and compiled twice — :func:`_assert_class_denotes` refuses them
+#: outright rather than trusting a hand-checked escape.
+#:
+#: ``"`` is excluded for a different reason, and it is about READERS rather than
+#: about dialects. ``AsyncConversationStore._get_session_messages`` opens a
+#: session by matching ``metadata LIKE '%"session_id": "<value>"%'`` against the
+#: RAW document, where JSON has escaped the quote to ``\"`` — so a pattern built
+#: from the unescaped value cannot match, and the session would be listed and
+#: not openable. That is the #2960 defect exactly, arriving by another route:
+#: the column must never make stampable an id a reader cannot resolve.
+_EXCLUDED_CHARACTERS = frozenset('^]\\"')
+
+#: Printable ASCII, minus the four above.
+#:
+#: **ASCII is the load-bearing part, not the narrowness.** Every clause below
+#: needs one rule in three languages, and ASCII is what makes the digit test
+#: expressible: for an ASCII string ``str.isdigit()`` is exactly ``[0-9]+``,
+#: which both dialects can say. Non-ASCII is excluded because Python's
+#: ``isdigit()`` is true for ``"١٢٣"`` and neither SQL digit test agrees — a
+#: disagreement the charset settles before the digit test is reached.
+#:
+#: It was once ``[A-Za-z0-9_-]``, which was narrower than that argument requires
+#: and permanently excluded ids this system actually writes: ``rasa_shim`` files
+#: every SMS turn under ``sms:{sender}``. A row whose id the column cannot hold
+#: is a row that stays NULL for ever, and one such row makes every repair of
+#: that agent re-derive its whole history (#3061). Narrow-for-its-own-sake is
+#: what made that permanent.
+_ALLOWED_CHARACTERS = (
+    frozenset(chr(point) for point in range(0x20, 0x7F)) - _EXCLUDED_CHARACTERS
 )
 _DIGITS = frozenset("0123456789")
 

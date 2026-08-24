@@ -330,7 +330,7 @@ async def test_a_table_predating_the_not_null_stamps_is_replaced_and_rederived(
         await projection.repair()
         listed = {row["session_id"] for row in await projection.list()}
         assert "ghost" not in listed, "a row from the retired table survived"
-        assert listed == {"1"}, listed
+        assert listed == {"legacy-1"}, listed
         # ...and the page is still bounded. ``DROP TABLE`` takes the table's
         # indexes with it, so a migration that only restored the ROWS would
         # leave every page sorting the whole table — the cost this epic
@@ -372,6 +372,10 @@ async def test_a_recreated_empty_cache_does_not_report_itself_current(tmp_path):
         )
         projection = ConversationSessionProjection(db, AGENT)
         await projection.repair()
+        # Still the row-id key here: the row was inserted AFTER this database
+        # was opened, so #3061's boot pass has not seen it yet. The reopen
+        # below is what re-keys it, which is incidental to this test and worth
+        # naming so the two spellings do not read as a drift.
         assert [r["session_id"] for r in await projection.list()] == ["1"]
         assert not await projection.is_stale()
         # ...and the cache alone goes.
@@ -388,7 +392,7 @@ async def test_a_recreated_empty_cache_does_not_report_itself_current(tmp_path):
             "rebuild it and the list would serve nothing for ever"
         )
         await projection.repair()
-        assert [r["session_id"] for r in await projection.list()] == ["1"]
+        assert [r["session_id"] for r in await projection.list()] == ["legacy-1"]
     finally:
         await db.close()
 
@@ -808,7 +812,7 @@ async def test_an_emptied_cache_is_invalidated_even_with_no_ledger_row(tmp_path)
             "an emptied cache reported itself current with no ledger to rotate"
         )
         await projection.repair()
-        assert [r["session_id"] for r in await projection.list()] == ["1"]
+        assert [r["session_id"] for r in await projection.list()] == ["legacy-1"]
     finally:
         await db.close()
 
@@ -907,6 +911,8 @@ async def test_a_watermark_from_a_retired_generation_does_not_serve_a_page(tmp_p
         rows, watermark = await store._page_a_whole_projection(
             projection, limit=10, after=None, refresh=False
         )
+        # The row-id key, because the row was inserted after this database was
+        # opened and #3061's boot pass therefore never saw it.
         assert [r["session_id"] for r in rows] == ["1"]
         standing = await store._whole_watermark(projection)
         assert watermark.fence == standing.fence
