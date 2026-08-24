@@ -304,6 +304,9 @@ def cmd_feature_install(args) -> int:
                 "version conflict, move core to a version the feature accepts "
                 "— do not remove the pin."
             )
+        bound_note = guard.manifest_bound_note()
+        if bound_note:
+            print(f"  note: {bound_note}")
         # A failed install can be the very thing that broke the link. An
         # unrepaired core outranks the install failure: the caller must be able
         # to tell "this package did not install" from "the venv's core is not
@@ -734,6 +737,9 @@ def cmd_feature_upgrade(args) -> int:
                     f"      note: core is pinned to {guard.constraints[0]}; a "
                     "version conflict here is a real skew, not the pin's fault."
                 )
+            bound_note = guard.manifest_bound_note()
+            if bound_note:
+                print(f"      note: {bound_note}")
             continue
 
         new_version = _installed_version(name)
@@ -1535,6 +1541,27 @@ class CoreInstallGuard:
         """
         return list(self._manifest_bounds)
 
+    def manifest_bound_note(self) -> Optional[str]:
+        """The sentence naming the windows in force for everything but core.
+
+        Owned by the guard because EVERY surface that reports a guarded
+        install's failure has to say it: a note added at one of them is a note
+        the other three do not have, and an operator on the wrong surface is
+        told to move core over a conflict core is not in (#3106).
+
+        ``None`` when the manifest declares no windows, so a caller can ask
+        without knowing whether there is anything to say.
+        """
+        if not self._manifest_bounds:
+            return None
+        windows = ", ".join(self._manifest_bounds)
+        return (
+            f"the manifest also bounds {windows} for this install, so "
+            "satisfying one entry cannot move another out of its declared "
+            "window. If the conflict names one of these, that entry is the "
+            "one to change."
+        )
+
     @property
     def install_constraints(self) -> list:
         """Every line a guarded install carries: core's pin, then the manifest's.
@@ -2319,20 +2346,11 @@ def cmd_feature_sync(args) -> int:
                     "this is a version conflict, move core to a version the "
                     "feature accepts — do not remove the pin."
                 )
-            if not is_core and guard.manifest_bounds:
-                # Named separately, because a conflict against one of these is
-                # NOT a reason to move core: the resolver was refused by a
-                # window the operator declared for another package. Printing
-                # only the core note sent them to change something unrelated
-                # to the conflict the line above just showed them (#3106).
-                windows = ", ".join(guard.manifest_bounds)
-                print(
-                    "      note: the manifest also bounds "
-                    f"{windows} for this install, so satisfying one entry "
-                    "cannot move another out of its declared window. If the "
-                    "conflict names one of these, that entry is the one to "
-                    "change."
-                )
+            # Not gated on `is_core`: a core install carries these bounds too,
+            # and a conflict against one of them is not a reason to move core.
+            bound_note = guard.manifest_bound_note()
+            if bound_note:
+                print(f"      note: {bound_note}")
             # A failed core action stops the batch only when core is ACTUALLY
             # off its declared source. `_resolve_manifest_action` returns
             # `ensure` for a conforming core that declares extras, and a failed
