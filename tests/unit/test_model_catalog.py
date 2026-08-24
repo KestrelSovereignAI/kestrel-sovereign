@@ -714,8 +714,9 @@ class TestContextLimits:
 "openai:plan" = 32768
 "anthropic:plan" = 65536
 ''')
-        # Run the catalog with the cwd set to where kestrel.toml lives.
-        monkeypatch.chdir(tmp_path)
+        # Name tmp_path as the project dir so the catalog reads THIS
+        # kestrel.toml rather than the machine's.
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         svc = ModelCatalogService(config_path=catalog)
         svc.load()
 
@@ -734,7 +735,7 @@ class TestContextLimits:
 '''
         catalog = tmp_path / "model_catalog.toml"
         catalog.write_text(catalog_content)
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         svc = ModelCatalogService(config_path=catalog)
         svc.load()  # must not raise even though kestrel.toml is missing
         assert svc.get_route_context_cap("openai:plan") == 20480
@@ -750,7 +751,7 @@ class TestContextLimits:
         catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
         kestrel_toml = tmp_path / "kestrel.toml"
         kestrel_toml.write_text('[llm.route_context_caps]\n"openai:plan" = 32768\n')
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "16384")
         svc = ModelCatalogService(config_path=catalog)
         svc.load()
@@ -768,7 +769,7 @@ class TestContextLimits:
         kestrel_toml.write_text(
             '[llm]\nroute_context_caps = "not a table"\n'
         )
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         svc = ModelCatalogService(config_path=catalog)
         svc.load()  # must not raise
         # Catalog default stands when kestrel.toml block is malformed.
@@ -786,7 +787,7 @@ class TestContextLimits:
 "openai:plan" = "not an int"
 "anthropic:plan" = 65536
 ''')
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         svc = ModelCatalogService(config_path=catalog)
         svc.load()
         # Bad value skipped → catalog default stands for openai:plan.
@@ -921,17 +922,21 @@ class TestContextLimits:
 class TestTokenCounterCatalogIntegration:
     """Test integration between TokenCounter and ModelCatalogService."""
 
-    def test_token_counter_uses_catalog(self):
+    def test_token_counter_uses_catalog(self, kestrel_toml_catalog):
         """Test that TokenCounter fetches limits from catalog."""
         from kestrel_sovereign.agent.token_counter import get_token_counter
+
+        kestrel_toml_catalog("context_limits_override", {"gpt-5.1": 256000})
 
         counter = get_token_counter("gpt-5.1")
         limit = counter.get_context_limit()
         assert limit == 256000
 
-    def test_token_counter_uses_catalog_override(self):
+    def test_token_counter_uses_catalog_override(self, kestrel_toml_catalog):
         """Test that TokenCounter uses catalog TOML overrides."""
         from kestrel_sovereign.agent.token_counter import get_token_counter
+
+        kestrel_toml_catalog("context_limits_override", {"phi3:3.8b": 4096})
 
         counter = get_token_counter("phi3:3.8b")
         limit = counter.get_context_limit()
