@@ -2272,9 +2272,24 @@ class AsyncDatabase:
                     retired = await self._backend.execute(
                         shape_change_invalidation(self.backend_type)
                     )
+                    # And the watermarks, for the same reason the emptied-cache
+                    # path above runs both: rotating the generation retires the
+                    # counters a watermark is compared against, but only where
+                    # a counter row EXISTS. An agent whose projection was built
+                    # before the triggers were installed, or restored without
+                    # its ledger, reads back generation '' and stamp 0 — which
+                    # is exactly what a missing ledger reads back as, so the
+                    # numbers go on agreeing and the rotation touches nothing.
+                    # That hole was survivable while the shape was the trigger
+                    # DDL; it is not now the shape includes the GROUPING
+                    # (#3098), because a grouping change makes every stored
+                    # session suspect and those agents are the ones with the
+                    # oldest projections.
+                    await self._backend.execute(emptied_cache_invalidation())
                     logger.info(
                         "change-stamp shape moved; retired the counters for "
-                        "%s agent(s), which will rebuild (#2998)",
+                        "%s agent(s) and every watermark, which will rebuild "
+                        "(#2998, #3098)",
                         retired,
                     )
 

@@ -2457,11 +2457,19 @@ async def test_a_projection_row_is_dropped_when_its_session_stops_existing(seede
     Purging every row of a session leaves nothing for the projection to describe,
     so the row must go rather than linger as the newest "session" in a list
     ordered by ``last_message_at``.
+
+    **Three rows, and the third is #3098's.** B is a marker, a human turn, and
+    the unstamped reply that landed a minute later — which the grouper gives to
+    B, because a row filed under nothing stays with the session it fell next
+    to, and which the projection has always counted in B. The purge used to
+    take two: it resolved a canonical session by metadata alone, so it left the
+    inherited row live to reappear under a session of its own. "Every row of a
+    session" is the list's answer or it is nothing.
     """
     db, store, projection = seeded
     assert await projection.get(UUID_B) is not None
 
-    assert await store.purge_conversation_session(UUID_B) == 2
+    assert await store.purge_conversation_session(UUID_B) == 3
 
     await projection.repair()
     assert await projection.get(UUID_B) is None
@@ -3791,3 +3799,110 @@ def test_the_sqlite_migration_rebuilds_because_it_safely_can():
         "SQLite reparses triggers on rename, against the schema before it "
         "lands, so no ordering of an ALTER-based migration can work here"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_changed_grouping_retires_the_projection(tmp_path, monkeypatch):
+    """The other road to the one outcome this design forbids (#3098).
+
+    :func:`shape_change_invalidation` guards against a projection that reports
+    itself current while holding an answer the grouper would not give, and it
+    guards the road where the TRIGGERS move: widen what counts as a change and
+    every event recorded under the narrower definition was, by the new one,
+    never recorded at all.
+
+    There is a second road, and it was open. Change the GROUPER — where a
+    session ends, what a session's key is — and every trigger, counter and
+    watermark stays perfectly consistent about rows nobody disputes, while the
+    stored answer becomes one this revision would not compute. Measured on
+    Emma's live history: after #3098's boundary change, a plain ``repair()``
+    left eight sessions the reader showed and the list did not, and reported
+    itself current throughout.
+
+    So the fingerprint the mechanism's objects are NAMED for covers the
+    grouping module's source as well as the DDL. A changed grouper renames the
+    triggers, the sweep retires the ones it finds installed, and the path
+    already written for "the shape moved" runs.
+    """
+    from kestrel_sovereign.storage import conversation_sessions
+
+    db, _store, projection = await _open(tmp_path, "grouping.db", CORPUS)
+    try:
+        assert not await projection.is_stale(), "the projection did not settle"
+    finally:
+        await db.close()
+
+    before = {name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")}
+    monkeypatch.setattr(
+        conversation_sessions,
+        "_grouping_source",
+        lambda: "a grouping that ends a session somewhere else",
+    )
+    after = {name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")}
+    assert before.isdisjoint(after), (
+        f"the change-stamp names did not move with the grouping: {before}"
+    )
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "grouping.db"))
+    try:
+        assert await ConversationSessionProjection(db, AGENT).is_stale(), (
+            "a changed grouping left the projection reporting itself current"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_changed_grouping_retires_a_watermark_with_no_ledger(
+    tmp_path, monkeypatch
+):
+    """Rotating the generation retires counters; an agent may have none.
+
+    :func:`shape_change_invalidation` invalidates by making a watermark's
+    generation disagree with the ledger's — which needs a ledger row to
+    disagree with. A projection built before the triggers existed, or restored
+    without its ledger, reads back generation ``''`` and stamp ``0``, and that
+    is exactly what a MISSING ledger reads back as: the numbers agree,
+    ``is_stale()`` answers false, and the rotation touched nothing.
+
+    Survivable while the shape was the trigger DDL. Not now it is the GROUPING
+    too (#3098): a changed grouper makes every stored session suspect, and
+    these are the agents whose projections are oldest.
+    """
+    from kestrel_sovereign.storage import conversation_sessions
+
+    db, _store, projection = await _open(tmp_path, "no-ledger.db", CORPUS)
+    try:
+        # A projection built before the triggers existed, spelled out: no
+        # ledger row, and a watermark carrying what a missing ledger reads back
+        # as. Both halves are needed — deleting the ledger alone leaves the
+        # stored generation disagreeing with the empty string, which is stale
+        # for the ordinary reason and would let this pass without its subject.
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+        await db.execute(
+            "UPDATE conversation_session_watermarks "
+            "SET accounted_generation = '', accounted_stamp = 0, "
+            "accounted_appends = 0 WHERE agent_id = ?",
+            (AGENT,),
+        )
+        assert not await projection.is_stale(), (
+            "the pre-trigger shape did not read as current, so this test "
+            "would pass without the invalidation it is about"
+        )
+    finally:
+        await db.close()
+
+    monkeypatch.setattr(
+        conversation_sessions,
+        "_grouping_source",
+        lambda: "a grouping that ends a session somewhere else",
+    )
+    db = await AsyncDatabase.sqlite(str(tmp_path / "no-ledger.db"))
+    try:
+        assert await ConversationSessionProjection(db, AGENT).is_stale(), (
+            "the generation rotation had no counter row to disagree with"
+        )
+    finally:
+        await db.close()

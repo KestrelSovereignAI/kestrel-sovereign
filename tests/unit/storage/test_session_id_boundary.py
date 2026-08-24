@@ -206,17 +206,106 @@ class TestTheResolverSide:
     async def test_an_explicit_resumption_reopens_the_run(self, store):
         """A boundary ends the implicit run; it does not end the session.
 
-        A later row that names the legacy key outright is a member however far
+        A later row that names this session outright is a member however far
         away it sits and whatever lies between — that is the metadata half of
         the dual-scheme resolver, and the grouper coalesces such clusters back
         together by id.
         """
+        first = await _insert(store, 0, session_id=UUID_A)
+        await _insert(store, 5, session_id=UUID_B)
+        resumed = await _insert(store, 10, session_id=UUID_A)
+
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert sorted(r[0] for r in rows) == [first, resumed]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            first, resumed,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_bare_integer_id_does_not_reopen_a_legacy_run(self, store):
+        """A resumption is judged by the grouper's rule, not by string equality.
+
+        A bare integer in ``session_id`` names a ROW (#2012), and the grouper
+        reads such a row as unlabeled — so it belongs to whatever session it
+        fell into, here the stamped one. Admitting it as a "resumption" of the
+        legacy key filed it under a session the list showed it nowhere near,
+        and deleting that legacy session would have taken a row displayed under
+        another conversation with it.
+
+        It also means a numeric session cannot be resumed at all, which is the
+        truth rather than a restriction: its key IS its first row's id, and no
+        second cluster can begin at that row.
+        """
         legacy = await _insert(store, 0)
-        await _insert(store, 5, session_id=UUID_A)
-        resumed = await _insert(store, 10, session_id=str(legacy))
+        stamped = await _insert(store, 5, session_id=UUID_A)
+        echoed = await _insert(store, 10, session_id=str(legacy))
+
+        assert await store._get_complete_session_message_ids(str(legacy)) == [legacy]
+        sessions = group_messages_into_sessions(
+            [
+                _msg(legacy, 0),
+                _msg(stamped, 5, session_id=UUID_A),
+                _msg(echoed, 10, session_id=str(legacy)),
+            ]
+        )
+        assert [(s["session_id"], s["message_count"]) for s in sessions] == [
+            ("1", 1),
+            (UUID_A, 2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_canonical_session_owns_the_unlabeled_run_after_it(self, store):
+        """Both resolvers, because only one of them can destroy anything.
+
+        An unlabeled row names no session, so the grouper gives it to the one
+        it fell after — including a stamped one. Resolving a canonical id by
+        metadata alone therefore answered with a strict subset of what the list
+        showed: a short count and transcript, and a hard purge that left the
+        inherited row live to reappear under whatever session the reader then
+        put it in.
+        """
+        stamped = await _insert(store, 0, session_id=UUID_A)
+        inherited = await _insert(store, 5)
+
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert sorted(r[0] for r in rows) == [stamped, inherited]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            stamped, inherited,
+        ]
+        sessions = group_messages_into_sessions(
+            [_msg(stamped, 0, session_id=UUID_A), _msg(inherited, 5)]
+        )
+        assert [(s["session_id"], s["message_count"]) for s in sessions] == [
+            (UUID_A, 2)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_trashed_legacy_anchor_does_not_reach_the_session_after_it(
+        self, store
+    ):
+        """The boundary applies to the FIRST candidate too, and this is why.
+
+        A legacy anchor is looked up regardless of its state — its timestamp is
+        needed to restore the session it owned — but a live read filters the
+        row itself out. The next conversation is then the first candidate the
+        walk sees, and exempting the first candidate from the boundary made a
+        retry of the legacy session's DELETE soft-delete an unrelated
+        conversation instead of returning zero.
+        """
+        legacy = await _insert(store, 0)
+        stamped = await _insert(store, 5, session_id=UUID_A)
+        await store.db.execute(
+            "UPDATE conversation_history SET deleted_at = ? WHERE id = ?",
+            ("2026-06-01 10:00:00", legacy),
+        )
 
         rows = await store._get_session_messages(str(legacy), limit=50)
-        assert sorted(r[0] for r in rows) == [legacy, resumed]
+        assert [r[0] for r in rows] == []
+        assert await store.delete_conversation_session(str(legacy)) == 0
+        still_live = await store.db.fetchone(
+            "SELECT deleted_at FROM conversation_history WHERE id = ?", (stamped,)
+        )
+        assert still_live[0] is None, "deleting the legacy session took another one"
 
     @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):

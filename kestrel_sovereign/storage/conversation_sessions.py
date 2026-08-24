@@ -321,6 +321,7 @@ import os
 import re
 from datetime import datetime
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
@@ -1480,14 +1481,55 @@ def _placeholder(kind: str, role: str) -> str:
     return ("fn_" if kind == "function" else "trg_") + role
 
 
-def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
-    """A short digest of the whole mechanism's DDL, names excluded.
+@lru_cache(maxsize=1)
+def _grouping_source() -> str:
+    """The text of the derivation whose ANSWER this projection stores.
 
-    Names are excluded because they are derived FROM this — the templates carry
-    ``{fn_appended}``-style placeholders and are resolved afterwards, which is
-    what stops the definition from depending on its own digest.
+    The whole module, not a curated list of the functions that decide a
+    boundary. A curated list is a second place to remember, and this repository
+    has already paid for one — :data:`PROJECTION_METADATA_KEYS` needed a test
+    that reads ``session_grouping``'s own AST to keep it honest, because a key
+    added there and not here is invisible in the worst direction. There is
+    nothing to keep honest about "the module".
+
+    The cost is that editing a docstring in it rebuilds every agent's
+    projection once. That is the direction this module already chooses
+    everywhere else: rebuild needlessly, never miss a change.
     """
-    material = "\n".join((backend_type, *templates)).encode("utf-8")
+    import inspect
+
+    from kestrel_sovereign.storage import session_grouping
+
+    return inspect.getsource(session_grouping)
+
+
+def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
+    """A short digest of everything the stored answer depends on.
+
+    Two inputs, and the second is not an embellishment of the first.
+
+    The mechanism's DDL, names excluded — excluded because they are derived
+    FROM this, the templates carrying ``{fn_appended}``-style placeholders that
+    are resolved afterwards, which is what stops the definition from depending
+    on its own digest.
+
+    And :func:`_grouping_source`, because the trigger shape is only half of
+    what makes a stored session right. The other half is the function that
+    computed it. :func:`shape_change_invalidation` says the outcome this design
+    exists to make impossible is "the projection reports itself current while
+    holding an answer the grouper would not give" — and a changed GROUPER
+    reaches that outcome by the other road, with every trigger, counter and
+    watermark still perfectly consistent about rows nobody disputes. Measured
+    on Emma's live history at #3098: eight sessions the reader showed and the
+    list did not, after a change to where a session ends, with a projection
+    reporting itself current throughout.
+
+    So the name an object carries is the definition of the answer it maintains,
+    which is what a name probe was always meant to be asking.
+    """
+    material = "\n".join(
+        (backend_type, _grouping_source(), *templates)
+    ).encode("utf-8")
     return hashlib.blake2s(material, digest_size=4).hexdigest()
 
 
@@ -1861,9 +1903,10 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
 def _mechanism(backend_type: str) -> Tuple[Tuple[str, str, str, str], ...]:
     """``(kind, role, name, DDL)`` for the whole mechanism, names resolved.
 
-    Every name ends in :func:`_fingerprint` of the mechanism it belongs to, so
-    the objects installed in a database ARE their definition and a name probe
-    answers the question it was always meant to ask (#2998).
+    Every name ends in :func:`_fingerprint` of the mechanism it belongs to AND
+    of the grouping whose output it maintains, so the objects installed in a
+    database ARE the definition of the answer stored beside them, and a name
+    probe answers the question it was always meant to ask (#2998, #3098).
 
     The fingerprint covers the functions as well as the triggers, and covers all
     of them together. A PostgreSQL trigger's behaviour is its function's body:

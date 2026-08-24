@@ -2210,7 +2210,7 @@ class AsyncConversationStore:
                 # created_at undeletable through count/guard/purge.
                 if (
                     reject_invalid_timestamps
-                    and meta.get("session_id") != session_id_str
+                    and canonical_session_id(meta) != session_id_str
                 ):
                     raise ConversationSessionTimestampError(
                         "Refusing exact conversation-session resolution because "
@@ -2243,17 +2243,25 @@ class AsyncConversationStore:
         run_open = True
 
         for timestamp, _row_id, row, meta in candidates:
-            is_resumed_message = meta.get("session_id") == session_id_str
+            # A row RESUMES this session only under the grouper's own
+            # acceptance rule, which is why this asks `canonical_session_id`
+            # rather than comparing the raw metadata value. A bare integer
+            # there names a row, not a session (#2012), and the grouper reads
+            # such a row as unlabeled — so treating one as a resumption filed
+            # it under a legacy key while the list showed it under the session
+            # it had actually fallen into, and deleting the legacy session
+            # deleted a row displayed elsewhere. It also means a numeric
+            # session cannot be resumed at all, which is the truth: its key is
+            # its first row's id, and no second cluster can start at that row.
+            is_resumed_message = canonical_session_id(meta) == session_id_str
+            foreign = canonical_session_id(meta) not in (None, session_id_str)
 
             if not is_first and not is_resumed_message and meta.get("new_session"):
                 break
 
             if is_resumed_message:
                 run_open = True
-            elif not is_first and canonical_session_id(meta) not in (
-                None,
-                session_id_str,
-            ):
+            elif foreign:
                 run_open = False
             if not run_open:
                 # Deliberately WITHOUT advancing ``last_timestamp``: nothing
@@ -2327,10 +2335,30 @@ class AsyncConversationStore:
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
         archive_clause = "" if include_archived else " AND archived_at IS NULL"
+        # Canonicalize the timestamp prefilter/order: SQLite history mixes
+        # ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and raw TEXT
+        # comparison drops later rows whose stored form sorts below the
+        # anchor's.  The exact purge/count resolver already compares via
+        # julianday; display must see the same membership or hard purge could
+        # destroy rows this path never returned.
+        created_at_predicate = self._timestamp_predicate("created_at", ">=")
+        created_at_order = self._canonical_timestamp_sql("created_at")
+        # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the
+        # match to EVERY row (#1729); ESCAPE '\' makes the backslash the escape
+        # char. For an ordinary UUID this is a no-op.
+        esc = _escape_like_session_value(session_id)
+        spaced_pattern = f'%"session_id": "{esc}"%'
+        # JSON formatting varies; both spellings are the same membership claim.
+        compact_pattern = f'%"session_id":"{esc}"%'
 
-        # Try to interpret session_id as a message ID for time-based grouping.
-        # If it isn't (e.g. a UUID-based implicit session_id), skip this path
-        # and fall through to the metadata-based lookup below.
+        # Where this session's forward walk begins. BOTH kinds of id have one.
+        #
+        # That is #3098. ``group_messages_into_sessions`` gives an unlabeled row
+        # to the session it falls after, so a canonical session owns the
+        # unlabeled run following it exactly as a legacy cluster does. Resolving
+        # a canonical id by metadata alone therefore returned a strict SUBSET of
+        # what the list showed: the count and the transcript were short, and a
+        # hard purge left those rows behind to reappear under another session.
         all_rows = []
         row_id = coerce_persistent_message_id(session_id)
         if row_id is not None:
@@ -2341,42 +2369,43 @@ class AsyncConversationStore:
                 "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
                 (row_id, self.agent_id)
             )
+        else:
+            # A canonical session's anchor is the earliest row that NAMES it,
+            # read through the same filters as the candidates below so the walk
+            # cannot start outside the universe it is about to search.
+            start_row = await self.db.fetchone(
+                f"""SELECT created_at
+                   FROM conversation_history
+                   WHERE agent_id = ?
+                     AND (metadata LIKE ? ESCAPE '\\'
+                          OR metadata LIKE ? ESCAPE '\\')
+                     {del_clause}{archive_clause}
+                   ORDER BY {created_at_order} ASC, id ASC
+                   LIMIT 1""",
+                (self.agent_id, spaced_pattern, compact_pattern),
+            )
 
-            # If session_id is a message ID, get messages from that timestamp forward
-            # rendered_content (#1402) appended at row[5] so existing
-            # positional accesses on metadata/created_at don't shift.
-            if start_row:
-                start_time = start_row[0]
-                # Canonicalize the timestamp prefilter/order: SQLite history
-                # mixes ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and
-                # raw TEXT comparison drops later rows whose stored form sorts
-                # below the anchor's.  The exact purge/count resolver already
-                # compares via julianday; display must see the same membership
-                # or hard purge could destroy rows this path never returned.
-                created_at_predicate = self._timestamp_predicate(
-                    "created_at", ">="
-                )
-                created_at_order = self._canonical_timestamp_sql("created_at")
-                all_rows = await self.db.fetchall(
-                    f"""SELECT id, role, content, metadata, created_at,
-                              rendered_content, model, provider
-                       FROM conversation_history
-                       WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
-                       ORDER BY {created_at_order} ASC
-                       LIMIT ?""",
-                    (
-                        self.agent_id,
-                        self._timestamp_query_param(start_time),
-                        limit * 2,  # Fetch extra in case of filtering
-                    ),
-                )
+        # From the anchor's timestamp forward. rendered_content (#1402) is
+        # appended at row[5] so existing positional accesses on
+        # metadata/created_at don't shift.
+        if start_row:
+            all_rows = await self.db.fetchall(
+                f"""SELECT id, role, content, metadata, created_at,
+                          rendered_content, model, provider
+                   FROM conversation_history
+                   WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
+                   ORDER BY {created_at_order} ASC
+                   LIMIT ?""",
+                (
+                    self.agent_id,
+                    self._timestamp_query_param(start_row[0]),
+                    limit * 2,  # Fetch extra in case of filtering
+                ),
+            )
 
-        # Also get messages that explicitly belong to this session (resumed conversations)
-        # These are messages with session_id in metadata that may come after a time gap.
-        # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the match
-        # to EVERY row (#1729); ESCAPE '\' makes the backslash the escape char. For
-        # an ordinary UUID this is a no-op.
-        esc = _escape_like_session_value(session_id)
+        # Also get messages that explicitly belong to this session (resumed
+        # conversations) — rows naming it in metadata that may come after a time
+        # gap, or past the window above.
         resumed_rows = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
@@ -2384,10 +2413,9 @@ class AsyncConversationStore:
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id": "{esc}"%', limit)
+            (self.agent_id, spaced_pattern, limit)
         )
 
-        # Also try without space after colon (JSON formatting varies)
         resumed_rows_alt = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
@@ -2395,7 +2423,7 @@ class AsyncConversationStore:
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id":"{esc}"%', limit)
+            (self.agent_id, compact_pattern, limit)
         )
 
         return self._filter_session_rows(
@@ -2425,8 +2453,10 @@ class AsyncConversationStore:
         Only fields needed by the shared grouping algorithm are materialized;
         encrypted message bodies remain untouched even for very large sessions.
         """
-        del_clause = self._deleted_filter_clause(deleted_filter).replace(
-            "deleted_at", "c.deleted_at"
+        anchor_del_clause = self._deleted_filter_clause(deleted_filter)
+        del_clause = anchor_del_clause.replace("deleted_at", "c.deleted_at")
+        anchor_archive_clause = (
+            "" if include_archived else " AND archived_at IS NULL"
         )
         archive_clause = (
             "" if include_archived else " AND c.archived_at IS NULL"
@@ -2437,13 +2467,28 @@ class AsyncConversationStore:
         row_id = coerce_persistent_message_id(session_id)
 
         if row_id is None:
-            query_prefix = ""
-            candidate_source = "conversation_history c"
-            membership_predicate = (
-                "(c.metadata LIKE ? ESCAPE '\\' "
-                "OR c.metadata LIKE ? ESCAPE '\\')"
+            # A canonical session gets the SAME anchored forward walk a legacy
+            # one does (#3098): the grouper gives an unlabeled row to the
+            # session it falls after, so this session owns the unlabeled run
+            # that follows it, and a purge that resolved membership by metadata
+            # alone left those rows behind — live, and reappearing under
+            # whatever session the reader then put them in. The anchor is the
+            # earliest row NAMING this session, read through the same filters
+            # as the candidates.
+            query_prefix = (
+                "WITH anchor AS ("
+                "SELECT created_at FROM conversation_history "
+                "WHERE agent_id = ? AND (metadata LIKE ? ESCAPE '\\' "
+                "OR metadata LIKE ? ESCAPE '\\')"
+                f"{anchor_del_clause}{anchor_archive_clause} "
+                f"ORDER BY {self._canonical_timestamp_sql('created_at')} ASC, "
+                "id ASC LIMIT 1"
+                ") "
             )
             params: tuple[Any, ...] = (
+                self.agent_id,
+                spaced_pattern,
+                compact_pattern,
                 self.agent_id,
                 spaced_pattern,
                 compact_pattern,
@@ -2455,22 +2500,6 @@ class AsyncConversationStore:
                 "WHERE id = ? AND agent_id = ?"
                 ") "
             )
-            # LEFT JOIN (not CROSS JOIN): a numeric session id can be
-            # metadata-only — the client supplied it explicitly, or the legacy
-            # anchor row was already hard-deleted.  An empty anchor CTE must
-            # drop only the time-grouping branch, never the metadata branch,
-            # or purge/count would miss rows the display resolver still finds.
-            candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
-            candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
-            anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
-            membership_predicate = (
-                "(EXISTS (SELECT 1 FROM anchor) "
-                f"AND ({candidate_timestamp} >= {anchor_timestamp} "
-                f"OR {candidate_timestamp} IS NULL "
-                f"OR {anchor_timestamp} IS NULL) "
-                "OR c.metadata LIKE ? ESCAPE '\\' "
-                "OR c.metadata LIKE ? ESCAPE '\\')"
-            )
             params = (
                 row_id,
                 self.agent_id,
@@ -2478,6 +2507,24 @@ class AsyncConversationStore:
                 spaced_pattern,
                 compact_pattern,
             )
+
+        # LEFT JOIN (not CROSS JOIN): the anchor CTE can be empty — a numeric
+        # session id can be metadata-only (the client supplied it explicitly,
+        # or the legacy anchor row was already hard-deleted), and a canonical
+        # one names no live row once its session is gone. An empty anchor must
+        # drop only the time-grouping branch, never the metadata branch, or
+        # purge/count would miss rows the display resolver still finds.
+        candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
+        candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
+        anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
+        membership_predicate = (
+            "(EXISTS (SELECT 1 FROM anchor) "
+            f"AND ({candidate_timestamp} >= {anchor_timestamp} "
+            f"OR {candidate_timestamp} IS NULL "
+            f"OR {anchor_timestamp} IS NULL) "
+            "OR c.metadata LIKE ? ESCAPE '\\' "
+            "OR c.metadata LIKE ? ESCAPE '\\')"
+        )
 
         candidates = await self.db.fetchall(
             f"{query_prefix}SELECT c.id, c.metadata, c.created_at "
