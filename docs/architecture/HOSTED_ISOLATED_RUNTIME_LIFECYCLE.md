@@ -78,7 +78,9 @@ Core-managed venv, and provisioning cache through
 `ProxyFeature.reclaim_idle_workspace()`. It is not permission for the host to
 delete a path itself: Core's seam rechecks eligibility and performs secure
 feature-scoped deletion under the same reload lock that serializes a racing
-cold wake. It never removes the agent namespace, sibling feature directories,
+cold wake. Caller cancellation is reported only after the deletion transaction
+has settled, so it cannot release that lock while a worker still mutates the
+tree. The seam never removes the agent namespace, sibling feature directories,
 or an external immutable venv.
 
 `IsolatedRuntimeTelemetrySnapshot` is immutable and deliberately excludes DIDs,
@@ -111,7 +113,9 @@ registry after traffic admission is released, and an asynchronous observer is
 bounded then detached and observed if it refuses to finish. A state transition
 that arrives behind one slow observer is coalesced and delivered when that
 observer settles, so an idle cleanup-eligibility transition is not silently
-dropped. Disk refresh and observer delivery are never awaited while Core owns a
+dropped. Observer deferral and emit-task deferral have separate latches: a slow
+observer cannot create a reschedule loop, and ordinary coalesced traffic retains
+the hot-path rate limit. Disk refresh and observer delivery are never awaited while Core owns a
 reload lock. Terminal lifecycle
 cancels Core-owned telemetry tasks and does not create a post-cleanup delivery.
 Telemetry cannot acquire ownership of child traffic or lifecycle progress.

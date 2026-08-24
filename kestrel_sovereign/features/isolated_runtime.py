@@ -278,14 +278,6 @@ def _measure_directory_tree_bytes(
                 pass
 
 
-def _directory_tree_bytes(
-    path: Path, *, deadline: float | None = None
-) -> int | None:
-    """Compatibility wrapper returning only the best-effort byte count."""
-
-    return _measure_directory_tree_bytes(path, deadline=deadline)[0]
-
-
 # ``ToolExecutionTrigger`` validates identifiers by UTF-8 byte length, not
 # Python character count.  Schedule IDs normally fit unchanged, but legacy
 # imports can contain arbitrarily long IDs while the SDK context permits at
@@ -5978,6 +5970,9 @@ class ProxyFeature(Feature):
         self._telemetry_observer_tasks: set[asyncio.Future[Any]] = set()
         self._telemetry_emit_tasks: set[asyncio.Task[None]] = set()
         self._telemetry_emit_pending = False
+        self._telemetry_emit_force_pending = False
+        self._telemetry_observer_emit_pending = False
+        self._telemetry_observer_force_pending = False
         self._telemetry_disk_refresh_pending = False
         self._telemetry_environment_refresh_pending = False
         self._telemetry_disk_lock = asyncio.Lock()
@@ -6193,6 +6188,7 @@ class ProxyFeature(Feature):
                 refresh_environment
                 and venv is not None
                 and venv == runtime_dir / ".venv"
+                and self._bin_path is None
             ):
                 environment, environment_status = _measure_directory_tree_bytes(
                     venv, deadline=deadline
@@ -6253,7 +6249,8 @@ class ProxyFeature(Feature):
         if any(not task.done() for task in self._telemetry_observer_tasks):
             # Coalesce behind the one retained observer rather than dropping a
             # terminal idle/capacity transition that may have no later trigger.
-            self._telemetry_emit_pending = True
+            self._telemetry_observer_emit_pending = True
+            self._telemetry_observer_force_pending |= not rate_limited
             return
         loop = asyncio.get_running_loop()
         if (
@@ -6292,14 +6289,16 @@ class ProxyFeature(Feature):
                     completed.result()
                 except BaseException:
                     pass
+                pending = self._telemetry_observer_emit_pending
+                force_pending = self._telemetry_observer_force_pending
+                self._telemetry_observer_emit_pending = False
+                self._telemetry_observer_force_pending = False
                 if (
-                    self._telemetry_emit_pending
+                    pending
                     and not self._terminal_lifecycle_latched
                     and not self._stopping
                 ):
-                    asyncio.get_running_loop().call_soon(
-                        lambda: self._schedule_runtime_telemetry(force=True)
-                    )
+                    self._schedule_runtime_telemetry(force=force_pending)
 
             task.add_done_callback(consume_observer)
             done, _pending = await asyncio.wait(
@@ -6339,12 +6338,19 @@ class ProxyFeature(Feature):
             return
         self._telemetry_disk_refresh_pending |= refresh_disk
         self._telemetry_environment_refresh_pending |= refresh_environment
+        if any(not task.done() for task in self._telemetry_observer_tasks):
+            self._telemetry_observer_emit_pending = True
+            self._telemetry_observer_force_pending |= force
+            return
         if any(not task.done() for task in self._telemetry_emit_tasks):
             self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending |= force
             return
         refresh_disk = self._telemetry_disk_refresh_pending
         refresh_environment = self._telemetry_environment_refresh_pending
+        force |= self._telemetry_emit_force_pending
         self._telemetry_emit_pending = False
+        self._telemetry_emit_force_pending = False
         self._telemetry_disk_refresh_pending = False
         self._telemetry_environment_refresh_pending = False
 
@@ -6376,14 +6382,14 @@ class ProxyFeature(Feature):
                 completed.result()
             except BaseException:
                 pass
+            pending = self._telemetry_emit_pending
+            force_pending = self._telemetry_emit_force_pending
             if (
-                self._telemetry_emit_pending
+                pending
                 and not self._terminal_lifecycle_latched
                 and not self._stopping
             ):
-                asyncio.get_running_loop().call_soon(
-                    lambda: self._schedule_runtime_telemetry(force=True)
-                )
+                self._schedule_runtime_telemetry(force=force_pending)
 
         task.add_done_callback(consume)
 
@@ -6994,6 +7000,9 @@ class ProxyFeature(Feature):
         for task in tuple(self._telemetry_observer_tasks):
             task.cancel()
         self._telemetry_emit_pending = False
+        self._telemetry_emit_force_pending = False
+        self._telemetry_observer_emit_pending = False
+        self._telemetry_observer_force_pending = False
         self._telemetry_disk_refresh_pending = False
         self._telemetry_environment_refresh_pending = False
         idle_monitor = self._idle_monitor_task
@@ -12012,6 +12021,21 @@ class ProxyFeature(Feature):
 
         if self._isolated_runtime_scope is None:
             return RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+        task = asyncio.create_task(
+            self._reclaim_idle_workspace_uninterrupted(),
+            name=f"isolated-idle-reclaim:{self.name}",
+        )
+        return await _await_task_until_complete(
+            task,
+            preserve_cancellation=False,
+        )
+
+    async def _reclaim_idle_workspace_uninterrupted(
+        self,
+    ) -> RuntimeNamespaceCleanupOutcome:
+        """Finish deletion and accounting before releasing lifecycle ownership."""
+
+        assert self._isolated_runtime_scope is not None
         # Disk sampling never acquires the lifecycle lock. Taking its lock first
         # prevents deletion beneath a no-follow walk without holding reload
         # ownership while a slow measurement completes.
