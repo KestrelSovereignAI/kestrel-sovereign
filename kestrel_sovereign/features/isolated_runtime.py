@@ -40,10 +40,11 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from types import TracebackType
-from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
+from types import MappingProxyType, TracebackType
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, NoReturn, Optional
 from uuid import uuid4
 
+import psutil
 from kestrel_sdk.channels import ChannelAdapter
 from kestrel_sdk.isolated_feature import (
     CONFIG_TRANSITION_APPLIED,
@@ -69,6 +70,65 @@ from kestrel_sovereign.features.channels.route_ownership import (
 
 logger = logging.getLogger(__name__)
 _CORE_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True, slots=True)
+class IsolatedRuntimeTelemetrySnapshot:
+    """Sanitized lifecycle telemetry for one agent-bound isolated feature."""
+
+    feature: str
+    distribution: str
+    state: str
+    lifecycle_generation: int
+    active_processes: int
+    idle_processes: int
+    restart_count: int
+    last_used_at: datetime | None
+    cold_start_seconds: float | None
+    rss_bytes: int | None
+    cpu_seconds: float | None
+    open_fds: int | None
+    process_count: int | None
+    environment_bytes: int | None = None
+    private_writable_bytes: int | None = None
+    downloaded_bytes: int | None = None
+    provision_seconds: float | None = None
+    cache_hit: bool | None = None
+    cleanup_eligible: bool = False
+
+
+def configure_hosted_isolated_runtime_lifecycle(
+    agent: Any,
+    *,
+    idle_timeout_seconds: float | None = None,
+    idle_timeouts: Mapping[str, float | None] | None = None,
+    telemetry_observer: Callable[[IsolatedRuntimeTelemetrySnapshot], Any] | None = None,
+) -> None:
+    """Install per-agent hosted lifecycle policy before feature discovery."""
+
+    def validate_timeout(value: object) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("isolated runtime idle timeout must be a number or None")
+        if not math.isfinite(float(value)) or value <= 0:
+            raise ValueError("isolated runtime idle timeout must be finite and positive")
+        return float(value)
+
+    idle_timeout_seconds = validate_timeout(idle_timeout_seconds)
+    resolved_timeouts: dict[str, float | None] = {}
+    if idle_timeouts is not None:
+        if not isinstance(idle_timeouts, Mapping):
+            raise TypeError("isolated runtime feature idle timeouts must be a mapping")
+        for feature, timeout in idle_timeouts.items():
+            if type(feature) is not str or _ISOLATED_FEATURE_CLASS_NAME.fullmatch(feature) is None:
+                raise ValueError("isolated runtime feature idle timeout key is invalid")
+            resolved_timeouts[feature] = validate_timeout(timeout)
+    if telemetry_observer is not None and not callable(telemetry_observer):
+        raise TypeError("isolated runtime telemetry observer must be callable")
+    agent.isolated_runtime_idle_timeout_seconds = idle_timeout_seconds
+    agent.isolated_runtime_idle_timeouts = MappingProxyType(resolved_timeouts)
+    agent.isolated_runtime_telemetry_observer = telemetry_observer
 
 
 def canonical_telegram_bot_id(value: object) -> str:
@@ -5677,6 +5737,35 @@ class ProxyFeature(Feature):
                 self.runtime.service
             )
         self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
+        agent_attributes = getattr(agent, "__dict__", {})
+        default_idle_timeout: float | None = (
+            agent_attributes.get("isolated_runtime_idle_timeout_seconds")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        feature_idle_timeouts = (
+            agent_attributes.get("isolated_runtime_idle_timeouts", {})
+            if isinstance(agent_attributes, dict)
+            else {}
+        )
+        self._idle_timeout_seconds = feature_idle_timeouts.get(
+            self.name, default_idle_timeout
+        )
+        self._telemetry_observer = (
+            agent_attributes.get("isolated_runtime_telemetry_observer")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        self._idle_monitor_task: asyncio.Task[None] | None = None
+        self._idle_retired = False
+        self._activity_generation = 0
+        self._last_used_monotonic: float | None = None
+        self._last_used_at: datetime | None = None
+        self._lifecycle_start_count = 0
+        self._last_cold_start_seconds: float | None = None
+        self._last_provision_seconds: float | None = None
+        self._last_cache_hit: bool | None = None
+        self._process_identity: tuple[int, float] | None = None
         # Event acknowledgement requests are intentionally detached from the
         # SDK read loop (which cannot await a response it must itself read).
         # Keep exact task ownership so terminal cleanup can cancel them rather
@@ -5768,6 +5857,93 @@ class ProxyFeature(Feature):
         if self.runtime.description:
             return self.runtime.description
         return f"Isolated feature service for {self.name}"
+
+    def runtime_telemetry_snapshot(self) -> IsolatedRuntimeTelemetrySnapshot:
+        """Return a path-free snapshot for this exact proxy's host."""
+
+        rss_bytes: int | None = None
+        cpu_seconds: float | None = None
+        open_fds: int | None = None
+        process_count: int | None = None
+        client = self._client
+        process = getattr(client, "process", None) if client is not None else None
+        pid = getattr(process, "pid", None)
+        if type(pid) is int and getattr(process, "returncode", None) is None:
+            try:
+                observed = psutil.Process(pid)
+                if self._process_identity != (pid, observed.create_time()):
+                    raise psutil.NoSuchProcess(pid)
+                children = observed.children(recursive=True)
+                memory = observed.memory_info().rss
+                cpu = observed.cpu_times()
+                rss_bytes = int(memory) + sum(
+                    int(child.memory_info().rss) for child in children
+                )
+                cpu_seconds = float(cpu.user + cpu.system) + sum(
+                    float(times.user + times.system)
+                    for times in (child.cpu_times() for child in children)
+                )
+                num_fds = getattr(observed, "num_fds", None)
+                open_fds = int(num_fds()) if callable(num_fds) else None
+                process_count = 1 + len(children)
+            except (OSError, RuntimeError, psutil.Error):
+                pass
+        if self._terminal_lifecycle_latched or self._stopping:
+            state = "stopping" if client is not None else "stopped"
+        elif self._idle_retired:
+            state = "idle"
+        elif client is not None:
+            state = "running"
+        else:
+            state = "starting"
+        return IsolatedRuntimeTelemetrySnapshot(
+            feature=self.name,
+            distribution=self.runtime.distribution,
+            state=state,
+            lifecycle_generation=self._reload_gen,
+            active_processes=int(client is not None),
+            idle_processes=int(self._idle_retired),
+            restart_count=max(0, self._lifecycle_start_count - 1),
+            last_used_at=self._last_used_at,
+            cold_start_seconds=self._last_cold_start_seconds,
+            rss_bytes=rss_bytes,
+            cpu_seconds=cpu_seconds,
+            open_fds=open_fds,
+            process_count=process_count,
+            provision_seconds=self._last_provision_seconds,
+            cache_hit=self._last_cache_hit,
+            cleanup_eligible=self._idle_retired,
+        )
+
+    async def _emit_runtime_telemetry(self) -> None:
+        observer = self._telemetry_observer
+        if observer is None:
+            return
+        snapshot = self.runtime_telemetry_snapshot()
+        try:
+            await _maybe_await(observer(snapshot))
+        except Exception:  # noqa: BLE001 - host observer cannot own child lifecycle
+            logger.warning(
+                "Hosted isolated runtime telemetry observer failed for %s", self.name
+            )
+
+    def _record_runtime_activity(self) -> None:
+        self._activity_generation += 1
+        self._last_used_monotonic = asyncio.get_running_loop().time()
+        self._last_used_at = datetime.now(timezone.utc)
+
+    def _capture_process_identity(self, client: Any) -> None:
+        """Pin PID telemetry to the exact process generation just started."""
+
+        self._process_identity = None
+        process = getattr(client, "process", None)
+        pid = getattr(process, "pid", None)
+        if type(pid) is not int or getattr(process, "returncode", None) is not None:
+            return
+        try:
+            self._process_identity = (pid, psutil.Process(pid).create_time())
+        except (OSError, psutil.Error):
+            pass
 
     def _is_telegram_runtime(self) -> bool:
         return (
@@ -6298,6 +6474,9 @@ class ProxyFeature(Feature):
             await self._reset_traffic_gate_after_initialize()
             self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
+            self._last_used_monotonic = asyncio.get_running_loop().time()
+            self._start_idle_monitor()
+            await self._emit_runtime_telemetry()
 
     async def _ensure_venv_without_blocking_event_loop(self) -> None:
         """Own synchronous preparation in a worker without orphaning it.
@@ -6309,11 +6488,15 @@ class ProxyFeature(Feature):
         venv mutation cannot continue after lifecycle ownership is released.
         """
 
+        started = asyncio.get_running_loop().time()
+        cache_hit = bool(self._venv_path and self._venv_path.exists())
         task = asyncio.create_task(
             asyncio.to_thread(self.ensure_venv),
             name=f"isolated-venv-prepare:{self.name}",
         )
         await _await_task_until_complete(task, preserve_cancellation=False)
+        self._last_provision_seconds = asyncio.get_running_loop().time() - started
+        self._last_cache_hit = cache_hit
 
     def _latch_terminal_lifecycle(self) -> int:
         """Record one terminal intent and revoke queued initialization permits.
@@ -6334,6 +6517,9 @@ class ProxyFeature(Feature):
             task.cancel()
         for task in tuple(self._deferred_acknowledged_event_tasks):
             task.cancel()
+        idle_monitor = self._idle_monitor_task
+        if idle_monitor is not None and idle_monitor is not asyncio.current_task():
+            idle_monitor.cancel()
         return self._terminal_lifecycle_generation
 
     async def _run_traffic_gate_operation(
@@ -6529,8 +6715,12 @@ class ProxyFeature(Feature):
                 "Isolated feature child process could not be prepared."
             ) from exc
         try:
+            started = asyncio.get_running_loop().time()
             await _maybe_await(client.start())
+            self._capture_process_identity(client)
             advertised_tools = await _maybe_await(client.list_tools())
+            self._last_cold_start_seconds = asyncio.get_running_loop().time() - started
+            self._lifecycle_start_count += 1
         except BaseException as exc:
             await self._retire_detached_client(client)
             if isinstance(
@@ -7137,6 +7327,7 @@ class ProxyFeature(Feature):
         # cannot decide to restart the child in the tiny interval before seal.
         self._latch_terminal_lifecycle()
         await self._complete_terminal_cleanup()
+        await self._emit_runtime_telemetry()
 
     def prepare_shutdown_with_agent_deadline(self) -> None:
         """Synchronously establish terminal ownership for agent shutdown.
@@ -9426,45 +9617,64 @@ class ProxyFeature(Feature):
         """Perform an already-snapshotted ingress call inside traffic admission."""
 
         try:
-            async with self._traffic_gate.admit():
-                client = self._client
-                if client is None:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
-                    return
+            while True:
+                wake_idle = False
+                async with self._traffic_gate.admit():
+                    client = self._client
+                    if client is None and self._idle_retired:
+                        wake_idle = True
+                    elif client is None:
+                        outcome_slot.outcome = _HostIngressOutcome(
+                            _HOST_INGRESS_UNSUPPORTED
+                        )
+                        return
+                    else:
+                        try:
+                            capabilities = self._host_ingress_capabilities()
+                        except asyncio.CancelledError:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_CANCELLED
+                            )
+                            return
+                        except BaseException:  # noqa: BLE001 - untrusted capability facade
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_GENERIC_FAILURE
+                            )
+                            return
+                        if capabilities is None:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_UNSUPPORTED
+                            )
+                            return
+                        if request.name not in capabilities.names:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_UNKNOWN_NAME
+                            )
+                            return
 
-                try:
-                    capabilities = self._host_ingress_capabilities()
-                except asyncio.CancelledError:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-                    return
-                except BaseException:  # noqa: BLE001 - untrusted capability facade
-                    outcome_slot.outcome = _HostIngressOutcome(
-                        _HOST_INGRESS_GENERIC_FAILURE
-                    )
-                    return
-                if capabilities is None:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
-                    return
-                if request.name not in capabilities.names:
-                    outcome_slot.outcome = _HostIngressOutcome(
-                        _HOST_INGRESS_UNKNOWN_NAME
-                    )
-                    return
-
-                try:
-                    call = getattr(client, "call_host_ingress", None)
-                except asyncio.CancelledError:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-                    return
-                except BaseException:  # noqa: BLE001 - untrusted descriptor boundary
-                    outcome_slot.outcome = _HostIngressOutcome(
-                        _HOST_INGRESS_GENERIC_FAILURE
-                    )
-                    return
-                if not callable(call):
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
-                    return
-                await self._call_host_ingress_rpc(call, request, outcome_slot)
+                        try:
+                            call = getattr(client, "call_host_ingress", None)
+                        except asyncio.CancelledError:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_CANCELLED
+                            )
+                            return
+                        except BaseException:  # noqa: BLE001 - untrusted descriptor boundary
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_GENERIC_FAILURE
+                            )
+                            return
+                        if not callable(call):
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_UNSUPPORTED
+                            )
+                            return
+                        self._record_runtime_activity()
+                        await self._call_host_ingress_rpc(call, request, outcome_slot)
+                        await self._emit_runtime_telemetry()
+                        return
+                if wake_idle:
+                    await self._wake_idle_runtime()
         except _TrafficGateTerminalError:
             outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_TERMINAL)
         except asyncio.CancelledError:
@@ -9613,17 +9823,29 @@ class ProxyFeature(Feature):
         # is shared (not a reload mutex), so unrelated calls remain concurrent
         # whenever no config transition is active.
         try:
-            async with self._traffic_gate.admit():
-                # This preflight belongs *inside* admission. Otherwise a
-                # terminal shutdown with no published client would leak a
-                # scheduler-specific error instead of the stable fail-closed
-                # result used by every other new tool/channel call.
-                if context is not None and not self._supports_tool_execution_context(context):
-                    raise SchedulerExecutionContextUnavailable(
-                        "scheduled isolated tool calls require a service that advertises "
-                        "ToolExecutionContext support"
-                    )
-                return await self._call_isolated_tool_admitted(name, args, context)
+            while True:
+                wake_idle = False
+                async with self._traffic_gate.admit():
+                    if self._client is None and self._idle_retired:
+                        wake_idle = True
+                    else:
+                        # This preflight belongs *inside* admission. Otherwise a
+                        # terminal shutdown with no published client would leak a
+                        # scheduler-specific error instead of the stable fail-closed
+                        # result used by every other new tool/channel call.
+                        if context is not None and not self._supports_tool_execution_context(context):
+                            raise SchedulerExecutionContextUnavailable(
+                                "scheduled isolated tool calls require a service that advertises "
+                                "ToolExecutionContext support"
+                            )
+                        self._record_runtime_activity()
+                        result = await self._call_isolated_tool_admitted(
+                            name, args, context
+                        )
+                        await self._emit_runtime_telemetry()
+                        return result
+                if wake_idle:
+                    await self._wake_idle_runtime()
         except _TrafficGateTerminalError:
             if context is not None:
                 # Scheduled work must surface terminal admission as an
@@ -11098,6 +11320,136 @@ class ProxyFeature(Feature):
                 return task
         return asyncio.create_task(coro, name=name)
 
+    def _start_idle_monitor(self) -> None:
+        if self._idle_timeout_seconds is None:
+            return
+        task = self._idle_monitor_task
+        if task is not None and not task.done():
+            return
+        coro = self._monitor_idle_runtime()
+        name = f"isolated-feature-idle:{self.name}"
+        tracker = getattr(self.agent, "_track_background_task", None)
+        tracked = None
+        if callable(tracker):
+            try:
+                tracked = tracker(coro, name=name)
+            except Exception:  # noqa: BLE001 - test doubles may reject tracking
+                tracked = None
+        if isinstance(tracked, asyncio.Task):
+            self._idle_monitor_task = tracked
+        else:
+            self._idle_monitor_task = asyncio.create_task(coro, name=name)
+
+    async def _monitor_idle_runtime(self) -> None:
+        """Retire an inactive child through the existing lifecycle owners."""
+
+        assert self._idle_timeout_seconds is not None
+        try:
+            while not self._stopping:
+                baseline = self._last_used_monotonic
+                if baseline is None or self._idle_retired:
+                    await asyncio.sleep(self._idle_timeout_seconds)
+                    continue
+                remaining = (
+                    baseline
+                    + self._idle_timeout_seconds
+                    - asyncio.get_running_loop().time()
+                )
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                await self._retire_idle_generation(
+                    expected_activity_generation=self._activity_generation,
+                    expected_last_used=baseline,
+                )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._idle_monitor_task is asyncio.current_task():
+                self._idle_monitor_task = None
+
+    async def _retire_idle_generation(
+        self, *, expected_activity_generation: int, expected_last_used: float
+    ) -> bool:
+        """Atomically close admission, recheck the deadline, and retire."""
+
+        assert self._idle_timeout_seconds is not None
+        async with self._reload_lock:
+            if self._stopping or self._idle_retired or self._client is None:
+                return False
+            self._reloading = True
+            reopened = False
+            try:
+                await self._close_traffic_gate()
+                current_last_used = self._last_used_monotonic
+                expired = (
+                    self._activity_generation == expected_activity_generation
+                    and current_last_used == expected_last_used
+                    and asyncio.get_running_loop().time()
+                    >= expected_last_used + self._idle_timeout_seconds
+                )
+                if not expired:
+                    await self._reopen_traffic_gate()
+                    reopened = True
+                    return False
+                client = self._client
+                self._client = None
+                retired = await self._retire_detached_client(client)
+                if not retired:
+                    self._latch_terminal_lifecycle()
+                    await self._seal_traffic_gate()
+                    return False
+                self._idle_retired = True
+                self._reload_gen += 1
+                await self._reopen_traffic_gate()
+                reopened = True
+                await self._emit_runtime_telemetry()
+                return True
+            finally:
+                self._reloading = False
+                if (
+                    not reopened
+                    and not self._terminal_lifecycle_latched
+                    and self._traffic_gate.closed
+                ):
+                    await self._reopen_traffic_gate()
+
+    async def _wake_idle_runtime(self) -> None:
+        """Cold-start exactly one generation after idle retirement."""
+
+        async with self._reload_lock:
+            if self._client is not None:
+                return
+            if not self._idle_retired:
+                self._assert_child_start_allowed()
+                raise RuntimeError("isolated feature client is unavailable")
+            self._assert_child_start_allowed()
+            self._reloading = True
+            reopened = False
+            try:
+                await self._close_traffic_gate()
+                if self._client is None:
+                    self._unregister_channel_bridge()
+                    await self._connect_client()
+                    self._reload_gen += 1
+                    self._idle_retired = False
+                    self._last_used_monotonic = asyncio.get_running_loop().time()
+                await self._reopen_traffic_gate()
+                reopened = True
+                await self._emit_runtime_telemetry()
+            except BaseException:
+                self._latch_terminal_lifecycle()
+                await self._seal_traffic_gate()
+                raise
+            finally:
+                self._reloading = False
+                if (
+                    not reopened
+                    and not self._terminal_lifecycle_latched
+                    and self._traffic_gate.closed
+                ):
+                    await self._reopen_traffic_gate()
+
     async def _supervise(self) -> None:
         terminal_unwind = False
         try:
@@ -11107,6 +11459,9 @@ class ProxyFeature(Feature):
                 # A ``set_config`` reload intentionally stops/starts the client;
                 # don't probe (and "restart") a service that is mid-reload.
                 if self._reloading:
+                    backoff = 1.0
+                    continue
+                if self._idle_retired:
                     backoff = 1.0
                     continue
                 # Snapshot the reload generation BEFORE probing: if a reload cycles
@@ -11273,6 +11628,7 @@ class ProxyFeature(Feature):
                             # it reports failure, so the prior exact-stop
                             # completion may no longer prove terminal safety.
                             self._forget_terminal_stop_completion(client)
+                            started = asyncio.get_running_loop().time()
                             await _await_owned_facade_lifecycle_operation(
                                 client.start(),
                                 name=f"isolated-supervisor-start:{self.name}",
@@ -11283,6 +11639,13 @@ class ProxyFeature(Feature):
                                     task, client
                                 ),
                             )
+                            self._capture_process_identity(client)
+                            self._last_cold_start_seconds = (
+                                asyncio.get_running_loop().time() - started
+                            )
+                            self._lifecycle_start_count += 1
+                            self._reload_gen += 1
+                            await self._emit_runtime_telemetry()
                             backoff = 1.0
                         except _FacadeLifecycleOperationTimedOut:
                             # A timed-out start can have spawned a child before
@@ -11592,9 +11955,11 @@ class ProxyFeature(Feature):
                     return
                 if self._inbound_admission_is_durable(admission):
                     if acknowledgement is not None:
+                        self._record_runtime_activity()
                         self._schedule_event_ingress_acknowledgement(
                             source_client, acknowledgement
                         )
+                        await self._emit_runtime_telemetry()
                 elif retry is not None:
                     self._schedule_event_ingress_retry(source_client, retry)
             except asyncio.CancelledError:
@@ -11811,10 +12176,12 @@ class ProxyFeature(Feature):
                 and acknowledgement is not None
                 and source_client is not None
             ):
+                self._record_runtime_activity()
                 self._schedule_event_ingress_acknowledgement(
                     source_client,
                     acknowledgement,
                 )
+                await self._emit_runtime_telemetry()
             elif retry is not None and source_client is not None:
                 self._schedule_event_ingress_retry(source_client, retry)
         elif event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
@@ -12170,10 +12537,12 @@ class ProxyFeature(Feature):
                         ),
                     )
                     if self._inbound_admission_is_durable(admission):
+                        self._record_runtime_activity()
                         self._schedule_event_ingress_acknowledgement(
                             deferred.source_client,
                             deferred.acknowledgement,
                         )
+                        await self._emit_runtime_telemetry()
                     elif deferred.retry is not None:
                         self._schedule_event_ingress_retry(
                             deferred.source_client, deferred.retry

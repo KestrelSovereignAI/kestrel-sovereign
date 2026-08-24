@@ -35,7 +35,7 @@ from kestrel_sovereign.config import (
     TRUSTED_AGENTS_DIR,
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
@@ -583,6 +583,9 @@ class KestrelAgent(
         isolated_runtime_namespace: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_legacy_root: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_hosted: bool = False,
+        isolated_runtime_idle_timeout_seconds: Optional[float] = None,
+        isolated_runtime_idle_timeouts: Optional[Mapping[str, Optional[float]]] = None,
+        isolated_runtime_telemetry_observer: Optional[Callable[[Any], Any]] = None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
@@ -658,6 +661,12 @@ class KestrelAgent(
             isolated_runtime_hosted: Declares that this agent shares a host
                        runtime. Discovery of an isolated feature fails closed
                        unless an explicit root and namespace were supplied.
+            isolated_runtime_idle_timeout_seconds: Optional positive per-feature
+                       inactivity deadline for hosted isolated children.
+            isolated_runtime_idle_timeouts: Optional feature-class overrides;
+                       a None value disables retirement for that feature.
+            isolated_runtime_telemetry_observer: Optional host callback receiving
+                       sanitized snapshots for this exact agent only.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -750,6 +759,25 @@ class KestrelAgent(
             raise ValueError(
                 "isolated_runtime_legacy_root requires the hosted isolated "
                 "runtime root/namespace contract"
+            )
+        if (
+            isolated_runtime_idle_timeout_seconds is not None
+            or isolated_runtime_idle_timeouts is not None
+            or isolated_runtime_telemetry_observer is not None
+        ):
+            from kestrel_sovereign.features.isolated_runtime import (
+                configure_hosted_isolated_runtime_lifecycle,
+            )
+
+            if self.isolated_runtime_scope is None:
+                raise ValueError(
+                    "isolated runtime lifecycle policy requires an explicit hosted scope"
+                )
+            configure_hosted_isolated_runtime_lifecycle(
+                self,
+                idle_timeout_seconds=isolated_runtime_idle_timeout_seconds,
+                idle_timeouts=isolated_runtime_idle_timeouts,
+                telemetry_observer=isolated_runtime_telemetry_observer,
             )
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
