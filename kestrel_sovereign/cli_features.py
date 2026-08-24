@@ -1463,6 +1463,13 @@ class CoreInstallGuard:
         self.before = before
         self._baseline = before
         self._constraints = self._derive(before)
+        # A SECOND set of lines, kept apart from core's on purpose: core's pin
+        # encodes a source policy and is re-derived whenever core moves, while
+        # these are the operator's declared windows for everything else and do
+        # not change during a batch. Folding them together would re-derive the
+        # manifest's bounds from core's shape, which is not where they come
+        # from (issue #3106).
+        self._manifest_bounds: list = []
 
     @classmethod
     def snapshot(cls, source_index=None):
@@ -1483,7 +1490,13 @@ class CoreInstallGuard:
         # them apart. Passing the narrowed value let a damaged venv run entirely
         # unguarded — no constraint, no verification (issue #2949).
         policy = fr.resolve_core_policy(source_index or {}, before)
-        return cls(policy, before)
+        guard = cls(policy, before)
+        # Every install this guard performs is bounded by the WHOLE manifest,
+        # not only by core's pin. Without it, remediating one entry moves
+        # another outside its declared window and the run reports success over
+        # the violation (issue #3106).
+        guard._manifest_bounds = fr.manifest_version_constraints(source_index or {})
+        return guard
 
     @classmethod
     def unguarded(cls):
@@ -1503,8 +1516,12 @@ class CoreInstallGuard:
 
     @property
     def constraints(self) -> list:
-        """The constraint lines applied to each guarded install (may be empty)."""
-        return list(self._constraints)
+        """The constraint lines applied to each guarded install (may be empty).
+
+        Core's pin first — every message that quotes ``constraints[0]`` is about
+        core — then the manifest's declared windows for everything else.
+        """
+        return list(self._constraints) + list(self._manifest_bounds)
 
     def run(self, pip_args: list, *, reinstall=None, timeout=None):
         """Install a FEATURE package with core held inside the policy.
@@ -1517,7 +1534,7 @@ class CoreInstallGuard:
         """
         return self._install(
             pip_args,
-            constraints=self._constraints or None,
+            constraints=self.constraints or None,
             reinstall=reinstall,
             timeout=timeout,
         )
@@ -1535,7 +1552,13 @@ class CoreInstallGuard:
         own dependency tree, and a blanket flag would.
         """
         result = self._install(
-            pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+            pip_args,
+            # Never core's own pin — this IS the operator moving core — but the
+            # rest of the manifest still binds: a core install must not drag a
+            # declared feature outside its window either (issue #3106).
+            constraints=self._manifest_bounds or None,
+            reinstall=reinstall,
+            timeout=timeout,
         )
         self.refresh()
         return result
