@@ -662,9 +662,10 @@ async def test_post_connect_wake_telemetry_failure_never_marks_live_child_idle(
         AsyncMock(side_effect=RuntimeError("synthetic telemetry failure")),
     )
 
-    failed = await feature.call_isolated_tool("ping", {"message": "first"})
+    result = await feature.call_isolated_tool("ping", {"message": "first"})
+    await asyncio.sleep(0)
 
-    assert failed["error"] == "isolated feature could not start"
+    assert result["success"] is True
     assert len(clients) == 2
     assert feature._client is clients[1]
     assert feature._idle_retired is False
@@ -751,6 +752,119 @@ async def test_idle_wake_recreates_missing_core_managed_venv(monkeypatch, tmp_pa
     assert result["success"] is True
     assert provision_calls == 2
     assert (original_venv / "bin" / "python").read_text() == "managed"
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_reloads_durable_config_changed_by_another_replica(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    durable_config = {"api_token": "old-token"}
+    clients = []
+
+    def client_factory(**kwargs):
+        client = FakeIsolatedClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=client_factory)
+
+    async def load_host_config():
+        return dict(durable_config)
+
+    monkeypatch.setattr(feature, "_load_host_config", load_host_config)
+    await feature.initialize()
+    assert clients[0].kwargs["config"] == {"api_token": "old-token"}
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    durable_config["api_token"] = "new-token"
+    assert (await feature.call_isolated_tool("ping", {"message": "wake"}))["success"]
+
+    assert len(clients) == 2
+    assert clients[1].kwargs["config"] == {"api_token": "new-token"}
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_disk_telemetry_never_holds_reload_lock(monkeypatch, tmp_path):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=lambda _snapshot: None,
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    refresh_started = asyncio.Event()
+
+    async def stalled_refresh(*, refresh_environment=False):
+        refresh_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(feature, "_refresh_disk_telemetry", stalled_refresh)
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    await asyncio.wait_for(refresh_started.wait(), timeout=1)
+
+    await asyncio.wait_for(feature.shutdown(), timeout=1)
+    assert feature._reload_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_slow_observer_coalesces_idle_cleanup_snapshot(monkeypatch, tmp_path):
+    release_running = asyncio.Event()
+    snapshots = []
+
+    async def observe(snapshot):
+        snapshots.append(snapshot)
+        if snapshot.state == "running":
+            await release_running.wait()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=observe,
+    )
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    for _ in range(100):
+        if feature._telemetry_emit_pending:
+            break
+        await asyncio.sleep(0.01)
+    assert feature._telemetry_emit_pending is True
+
+    release_running.set()
+    for _ in range(100):
+        if any(snapshot.cleanup_eligible for snapshot in snapshots):
+            break
+        await asyncio.sleep(0.01)
+
+    assert [snapshot.state for snapshot in snapshots] == ["running", "idle"]
+    assert snapshots[-1].cleanup_eligible is True
     await feature.shutdown()
 
 
@@ -13587,6 +13701,18 @@ async def test_deferred_acknowledged_ingress_uses_detached_k1_snapshot(monkeypat
     feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
     try:
         await feature.initialize()
+        telemetry_active_counts = []
+        schedule_telemetry = feature._schedule_runtime_telemetry
+
+        def record_telemetry_admission(**kwargs):
+            telemetry_active_counts.append(feature._traffic_gate._active)
+            schedule_telemetry(**kwargs)
+
+        monkeypatch.setattr(
+            feature,
+            "_schedule_runtime_telemetry",
+            record_telemetry_admission,
+        )
         event = _acknowledged_telegram_event(k1)
         await feature._close_traffic_gate()
         await feature._client.event_handler(event)
@@ -13607,6 +13733,12 @@ async def test_deferred_acknowledged_ingress_uses_detached_k1_snapshot(monkeypat
                 {"dedupe_key": k1, "attempt_token": _TELEGRAM_ATTEMPT_TOKEN},
             )
         ]
+        for _ in range(20):
+            if telemetry_active_counts:
+                break
+            await asyncio.sleep(0)
+        assert telemetry_active_counts
+        assert set(telemetry_active_counts) == {0}
     finally:
         await feature.shutdown()
 

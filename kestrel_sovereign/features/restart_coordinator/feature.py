@@ -223,6 +223,7 @@ _INFRA_TASK_PREFIXES = (
     "a2a_question_supervisor:",
     "isolated-feature:",
     "isolated-feature-idle:",
+    "isolated-runtime-telemetry:",
 )
 
 

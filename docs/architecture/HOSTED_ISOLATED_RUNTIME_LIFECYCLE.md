@@ -69,7 +69,10 @@ Wake preparation failures retain the existing secret-free tool error envelope;
 an ancillary telemetry failure after publication leaves the live child running
 and supervised rather than misclassifying it as idle.
 Before a wake, Core recreates the private workspace, resolves runtime paths, and
-reprovisions a missing Core-managed venv. `cleanup_eligible` therefore means the
+reprovisions a missing Core-managed venv. It also invalidates the prior child's
+memoized config and reads the current durable generation, so a change committed
+by another replica while this process was idle reaches the new child.
+`cleanup_eligible` therefore means the
 exact child is stopped and the embedding host may reclaim that feature's owned
 mutable workspace, Core-managed venv, and provisioning cache. It does not grant
 permission to remove the agent namespace, sibling feature directories, or an
@@ -98,9 +101,13 @@ registry and no lookup API that can select another agent's telemetry. Observer
 delivery is advisory: failures are logged, OS sampling runs in a worker, hot-path
 emissions are rate-limited and scheduled through the agent background-task
 registry after traffic admission is released, and an asynchronous observer is
-bounded then detached and observed if it refuses to finish. Terminal lifecycle
+bounded then detached and observed if it refuses to finish. A state transition
+that arrives behind one slow observer is coalesced and delivered when that
+observer settles, so an idle cleanup-eligibility transition is not silently
+dropped. Disk refresh and observer delivery are never awaited while Core owns a
+reload lock. Terminal lifecycle
 cancels Core-owned telemetry tasks and does not create a post-cleanup delivery.
 Telemetry cannot acquire ownership of child traffic or lifecycle progress.
-The isolated child supervisor and idle monitor are registered as infrastructure
-daemons, so their intentional residency does not itself block an
+The isolated child supervisor, idle monitor, and telemetry delivery tasks are
+registered as infrastructure daemons, so their intentional residency does not itself block an
 `idle_agents_only` restart.

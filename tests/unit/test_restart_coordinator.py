@@ -2472,12 +2472,20 @@ async def test_idle_ignores_isolated_runtime_lifecycle_daemons(tmp_path):
     idle_monitor = asyncio.create_task(
         _never(), name="isolated-feature-idle:Search"
     )
+    telemetry = asyncio.create_task(
+        _never(), name="isolated-runtime-telemetry:Search"
+    )
     work_task = asyncio.create_task(_never(), name="isolated-call:Search")
     try:
-        feat.agent._background_tasks = {supervisor, idle_monitor}
+        feat.agent._background_tasks = {supervisor, idle_monitor, telemetry}
         assert feat._agent_appears_idle()["idle"] is True
 
-        feat.agent._background_tasks = {supervisor, idle_monitor, work_task}
+        feat.agent._background_tasks = {
+            supervisor,
+            idle_monitor,
+            telemetry,
+            work_task,
+        }
         busy = feat._agent_appears_idle()
         assert busy["idle"] is False
         assert "isolated-call:Search" in busy["reason"]
@@ -2485,6 +2493,7 @@ async def test_idle_ignores_isolated_runtime_lifecycle_daemons(tmp_path):
     finally:
         supervisor.cancel()
         idle_monitor.cancel()
+        telemetry.cancel()
         work_task.cancel()
 
 
