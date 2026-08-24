@@ -12,6 +12,12 @@ modes" for the framing:
                 Does NOT enter conversation history; does NOT trigger
                 follow-up cognition. Examples: morning_signal, reflect,
                 memory_consolidate.
+    COGNITION — a genuine agent turn: enters conversation history, may
+                invoke tools. It has no handler at all; the dispatcher
+                renders the source's prompt template instead. Its
+                registration is therefore per-task and comes from
+                COGNITION_CRON_REGISTRATION_BUILDERS rather than from the
+                shared handler factory. Example: self_followup (#3101).
 
 The handler factory (`_make_tool_handler`) is shared across all
 registrations whose underlying implementation is "look up a feature tool
@@ -43,6 +49,10 @@ from kestrel_sdk.signals import (
 )
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.signals.sources.self_followup import (
+    TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
+    build_self_followup_registration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +145,26 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # never-contacted agent is still bootstrap_state=pending past the timeout
     # and escalates status to stale_bootstrap.
     ("bootstrap_timeout_check", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
+    # Agent-authored follow-up turn (#3101). COGNITION — this one really is
+    # an LLM turn, which is the point: it carries an intention the agent
+    # formed inside an earlier turn across the turn boundary. Persisted as a
+    # one-shot deadline row by `schedule_add_deadline`; the intention text
+    # travels in args_json and renders into the prompt. No handler and no
+    # tool lookup — see COGNITION_CRON_REGISTRATION_BUILDERS.
+    (SELF_FOLLOWUP_TASK_NAME, SignalMode.COGNITION, frozenset()),
 ]
+
+
+# COGNITION cron tasks have no handler to build, so their registration
+# (prompt template, result_summary, attention policy) is owned by the source
+# module itself. A COGNITION entry in CRON_TASKS with no builder here is a
+# programming error and raises at registration time rather than producing a
+# source that accepts a dispatch and does nothing with it.
+COGNITION_CRON_REGISTRATION_BUILDERS: dict[
+    str, Callable[[], SourceRegistration]
+] = {
+    SELF_FOLLOWUP_TASK_NAME: build_self_followup_registration,
+}
 
 
 def cron_source_name(task_name: str) -> str:
@@ -385,6 +414,22 @@ def build_cron_registrations(
     registrations: list[SourceRegistration] = []
 
     for task_name, mode, resources in CRON_TASKS:
+        if mode == SignalMode.COGNITION:
+            # No handler exists to build: the dispatcher renders the source's
+            # prompt template and runs a turn. Delegate to the source module
+            # that owns that template rather than assembling a registration
+            # here that could not name one.
+            builder = COGNITION_CRON_REGISTRATION_BUILDERS.get(task_name)
+            if builder is None:
+                raise ValueError(
+                    f"COGNITION cron task {task_name!r} has no registration "
+                    "builder in COGNITION_CRON_REGISTRATION_BUILDERS; it would "
+                    "register a source with no prompt template and dispatch "
+                    "into nothing"
+                )
+            registrations.append(builder())
+            continue
+
         # Pick the handler. Builtins win over tool lookup.
         if mode == SignalMode.ACTION:
             builtin_handler = builtin_handlers.get(task_name)

@@ -58,11 +58,14 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.features.scheduler.constants import (
+    MISSED_COGNITION_STATUS,
+)
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
@@ -83,6 +86,9 @@ from kestrel_sovereign.features.scheduler.runner import (
     validate_schedule_idempotency_base,
 )
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.signals.sources.self_followup import (
+    TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -719,7 +725,7 @@ class SchedulerFeature(Feature):
         Per-task mode (ACTION/ARTIFACT) and resource locks come from the
         SourceRegistration built in `signals/sources/scheduler.py`.
         """
-        from kestrel_sdk.signals import Signal, Visibility
+        from kestrel_sdk.signals import Signal, SignalMode, Visibility
         from kestrel_sovereign.signals.sources.scheduler import (
             CRON_TASKS,
             cron_source_name,
@@ -751,13 +757,29 @@ class SchedulerFeature(Feature):
             )
             return await self._lookup_and_run_tool(task_name, args)
 
+        payload = args or {}
+        # A COGNITION cron task is a real turn, so it has to land somewhere a
+        # human can see when it was scheduled from a chat window. The session
+        # is read from the persisted row (written from the live turn binding
+        # at schedule time), never from anything the fired payload could have
+        # been talked into carrying — SIGNAL_SOURCES_GUIDE rules 1-5. An
+        # unattended schedule has no session and stays INTERNAL/log-only.
+        session_id = None
+        visibility = Visibility.INTERNAL
+        if mode == SignalMode.COGNITION:
+            origin_session_id = str(payload.get("origin_session_id") or "").strip()
+            if origin_session_id:
+                session_id = origin_session_id
+                visibility = Visibility.USER_VISIBLE
+
         signal = Signal(
             source=cron_source_name(task_name),
             kind="run",
             mode=mode,
-            payload=args or {},
+            payload=payload,
             target_agent=self.agent.did,
-            visibility=Visibility.INTERNAL,
+            session_id=session_id,
+            visibility=visibility,
         )
         result = await dispatcher.dispatch_signal(signal)
         return self._translate_signal_result(result, task_name)
@@ -778,7 +800,13 @@ class SchedulerFeature(Feature):
         - DROPPED_RATE_LIMIT, DROPPED_QUIET_HOURS, COALESCED
                                 → "skipped: <status>" string (success
                                   row; benign skip the operator can
-                                  grep for in result_text).
+                                  grep for in result_text) for ACTION and
+                                  ARTIFACT. For COGNITION the same drop is
+                                  recorded as status='missed' instead:
+                                  the turn the schedule promised did not
+                                  happen, and a dropped wake filed as
+                                  'success' is exactly the silent no-op
+                                  #3101 exists to prevent.
         """
         from kestrel_sdk.signals import SignalMode, Status
 
@@ -817,9 +845,23 @@ class SchedulerFeature(Feature):
                 f"{result.error or 'unknown'}"
             )
 
-        # Benign drops (rate limit, quiet hours, coalesced) — recorded
-        # as success with a short text describing the drop.
-        return f"skipped: {result.status.value} ({result.error or ''})".strip(" ()")
+        drop_text = f"{result.status.value} ({result.error or ''})".strip(" ()")
+
+        # A dropped COGNITION dispatch means the scheduled turn never ran.
+        # There is nothing benign about that: the schedule accepted work and
+        # produced none. Record it under its own terminal status so it is
+        # visible in schedule_history / schedule_list rather than filed
+        # alongside genuine successes (#3101 requirement 4).
+        if result.mode == SignalMode.COGNITION:
+            return ScheduledTaskOutcome(
+                status=MISSED_COGNITION_STATUS,
+                result_text=(
+                    f"missed: the scheduled {task_name} turn was dropped "
+                    f"before it ran ({drop_text})."
+                ),
+            )
+
+        return f"skipped: {drop_text}"
 
     # ------------------------------------------------------------------
     # Source-registration handlers
@@ -2318,19 +2360,66 @@ class SchedulerFeature(Feature):
     )
     async def schedule_add_deadline(
         self,
-        run_at: str,
-        task_name: str,
+        run_at: str = "",
+        task_name: str = "",
         args_json: str = "{}",
         misfire_policy: str = "fire_once",
         misfire_grace_seconds: Optional[int] = None,
         idempotency_key: Optional[str] = None,
+        delay_seconds: Optional[int] = None,
     ) -> ToolResult:
         """Persist a one-shot deadline in UTC and execute it at most once.
 
-        ``run_at`` must include an offset (for example
-        ``2026-07-24T14:30:00+00:00``).  The row is disabled and receives a
-        terminal status after its claimed occurrence commits.
+        Give the deadline exactly one way. ``run_at`` is an absolute
+        ISO-8601 timestamp that must include an offset (for example
+        ``2026-07-24T14:30:00+00:00``). ``delay_seconds`` is a relative
+        "fire this long from now" and is resolved against the scheduler's
+        own database clock, so it does not depend on the caller knowing the
+        current time. The row is disabled and receives a terminal status
+        after its claimed occurrence commits.
+
+        To schedule your own follow-up turn, use ``task_name="self_followup"``
+        with the intention in ``args_json`` — for example
+        ``{"intent": "check whether CI on PR 3096 went green, then merge"}``.
+        That fires a real turn carrying the intention, and it is refused
+        (never silently accepted) if it could not.
         """
+        if not str(task_name).strip():
+            return ToolResult.failed("task_name is required")
+        has_run_at = bool(str(run_at).strip())
+        if has_run_at and delay_seconds is not None:
+            return ToolResult.failed(
+                "give either run_at or delay_seconds, not both"
+            )
+        if not has_run_at and delay_seconds is None:
+            return ToolResult.failed(
+                "one-shot schedules need run_at (absolute) or delay_seconds "
+                "(relative to now)"
+            )
+
+        if delay_seconds is not None:
+            try:
+                delay = int(delay_seconds)
+            except (TypeError, ValueError):
+                return ToolResult.failed("delay_seconds must be an integer")
+            if delay < 1:
+                return ToolResult.failed("delay_seconds must be >= 1")
+            # Resolved inside the schedule transaction against database time
+            # so an API replica's clock skew cannot move the deadline.
+            return await self._create_schedule(
+                task_name=task_name,
+                args_json=args_json,
+                cron_expression="",
+                next_run_at=None,
+                schedule_kind="one_shot",
+                run_at=None,
+                timezone_name="UTC",
+                misfire_policy=misfire_policy,
+                misfire_grace_seconds=misfire_grace_seconds,
+                idempotency_key=idempotency_key,
+                delay_seconds=delay,
+            )
+
         try:
             deadline = datetime.fromisoformat(run_at)
         except (TypeError, ValueError):
@@ -2351,6 +2440,159 @@ class SchedulerFeature(Feature):
             idempotency_key=idempotency_key,
         )
 
+    def _prepare_self_followup_args(
+        self, parsed_args: Dict[str, Any], *, schedule_kind: str
+    ) -> Any:
+        """Validate and complete the args for an agent-authored follow-up turn.
+
+        Returns the normalized args dict, or a failed :class:`ToolResult`
+        describing exactly why the follow-up was refused. Every branch here is
+        a refusal rather than a downgrade: accepting a self-schedule that
+        cannot produce a turn — or that produces one nobody can see — is the
+        silent no-op #3101 exists to prevent.
+        """
+        from kestrel_sdk.signals import SignalMode
+        from kestrel_sovereign.signals.context import get_current_signal
+        from kestrel_sovereign.signals.sources.scheduler import cron_source_name
+        from kestrel_sovereign.signals.sources.self_followup import (
+            ALLOWED_PAYLOAD_KEYS,
+            SelfFollowupIntentError,
+            normalize_intent,
+        )
+
+        source_name = cron_source_name(SELF_FOLLOWUP_TASK_NAME)
+
+        # 1. One shot only. A recurring self-followup is an unbounded standing
+        #    order to spend on turns; the agent asked for a single deferred
+        #    intention, so make it say so.
+        if schedule_kind != "one_shot":
+            return ToolResult.failed(
+                f"'{SELF_FOLLOWUP_TASK_NAME}' is one-shot only. Use "
+                "schedule_add_deadline (run_at or delay_seconds), not a cron "
+                "expression: a recurring self-followup would re-run the same "
+                "intention forever.",
+                data={"success": False, "task_name": SELF_FOLLOWUP_TASK_NAME},
+            )
+
+        # 2. Single hop. A persisted row starts a fresh causation chain, so the
+        #    registry's allow_self_loops=False cannot see this; refuse here or
+        #    a follow-up could queue a follow-up without bound (#3101 Q3).
+        current = get_current_signal()
+        if current is not None and getattr(current, "source", "") == source_name:
+            return ToolResult.failed(
+                "A follow-up turn may not schedule another follow-up "
+                "(single-hop bound). Do what you can in this turn and report "
+                "what remains, so the next chat turn can queue it.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "self_followup_chain",
+                },
+            )
+
+        # 3. The intention itself. An empty intent would fire a turn with
+        #    nothing to act on, and an unknown key would only be rejected
+        #    later by the source schema — after the row looked accepted.
+        # `origin_session_id` gets its own refusal below; every other
+        # non-`intent` key in the payload contract is scheduler-owned and
+        # would be silently overwritten here.
+        unexpected = sorted(
+            set(parsed_args) - {"intent", "origin_session_id"}
+        )
+        if unexpected:
+            return ToolResult.failed(
+                f"'{SELF_FOLLOWUP_TASK_NAME}' args_json takes only \"intent\"; "
+                f"unexpected keys: {unexpected}. The scheduler fills the rest "
+                f"of the payload ({sorted(ALLOWED_PAYLOAD_KEYS)}).",
+                data={"success": False, "task_name": SELF_FOLLOWUP_TASK_NAME},
+            )
+        if "intent" not in parsed_args:
+            return ToolResult.failed(
+                f"'{SELF_FOLLOWUP_TASK_NAME}' needs args_json with an "
+                '"intent" describing the follow-up work, e.g. '
+                '{"intent": "check CI on PR 3096, merge if green"}.',
+                data={"success": False, "task_name": SELF_FOLLOWUP_TASK_NAME},
+            )
+        try:
+            intent = normalize_intent(parsed_args["intent"])
+        except SelfFollowupIntentError as error:
+            return ToolResult.failed(
+                f"Invalid self_followup intent: {error}",
+                data={"success": False, "task_name": SELF_FOLLOWUP_TASK_NAME},
+            )
+
+        # 4. The session is resolved locally from the live turn, never taken
+        #    from the caller's args (SIGNAL_SOURCES_GUIDE rule 2). Refuse a
+        #    supplied value rather than overwriting it silently, so an attempt
+        #    to aim a wake at another window is visible.
+        if "origin_session_id" in parsed_args:
+            return ToolResult.failed(
+                "origin_session_id is resolved from the live turn and must "
+                "not be supplied in args_json.",
+                data={"success": False, "task_name": SELF_FOLLOWUP_TASK_NAME},
+            )
+        origin_session_id = self._turn_session_id() or ""
+
+        # 5. The source must actually be able to run the turn. A missing
+        #    registration, a non-COGNITION contract, or a missing prompt
+        #    template all mean the row would come due and produce nothing.
+        registry = getattr(self.agent, "signal_registry", None)
+        registration = (
+            registry.get(source_name) if registry is not None else None
+        )
+        if registration is None:
+            return ToolResult.failed(
+                f"The '{source_name}' signal source is not registered, so this "
+                "schedule could not fire a turn. Refusing rather than "
+                "persisting a row that would silently do nothing.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "source_not_registered",
+                },
+            )
+        if SignalMode.COGNITION not in registration.allowed_modes:
+            return ToolResult.failed(
+                f"The '{source_name}' source does not allow COGNITION, so this "
+                "schedule could not fire a turn.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "source_not_cognition",
+                },
+            )
+        if registration.prompt_template is None:
+            return ToolResult.failed(
+                f"The '{source_name}' source has no prompt template, so the "
+                "intention would never reach a turn.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "source_has_no_prompt_template",
+                },
+            )
+        # 6. A session-bound wake needs BOTH session_id and a result_summary
+        #    to render; with only the former it lands in the transcript and the
+        #    open pane stays blank (#2877/#2922). Fail loudly at schedule time
+        #    rather than firing into a window that shows nothing.
+        if origin_session_id and registration.result_summary is None:
+            return ToolResult.failed(
+                f"The '{source_name}' source registers no result_summary, so a "
+                "session-bound follow-up could not surface in this chat "
+                "window. Refusing rather than firing into a blank pane.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "bound_wake_cannot_surface",
+                },
+            )
+
+        return {
+            "intent": intent,
+            "origin_session_id": origin_session_id,
+            "scheduled_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     async def _create_schedule(
         self,
         *,
@@ -2364,6 +2606,7 @@ class SchedulerFeature(Feature):
         misfire_policy: str,
         misfire_grace_seconds: Optional[int],
         idempotency_key: Optional[str],
+        delay_seconds: Optional[int] = None,
     ) -> ToolResult:
         """Validate shared schedule fields and atomically persist a row."""
         if not self._db:
@@ -2374,6 +2617,14 @@ class SchedulerFeature(Feature):
             return ToolResult.failed(f"Invalid args_json: {e}")
         if not isinstance(parsed_args, dict):
             return ToolResult.failed("args_json must be a JSON object")
+        if task_name == SELF_FOLLOWUP_TASK_NAME:
+            prepared = self._prepare_self_followup_args(
+                parsed_args, schedule_kind=schedule_kind
+            )
+            if isinstance(prepared, ToolResult):
+                return prepared
+            parsed_args = prepared
+            args_json = json.dumps(parsed_args)
         if misfire_policy not in {"skip", "fire_once", "catch_up"}:
             return ToolResult.failed(
                 "misfire_policy must be one of: skip, fire_once, catch_up"
@@ -2435,6 +2686,15 @@ class SchedulerFeature(Feature):
                         ).isoformat()
                     except CronParseError as e:
                         return ToolResult.failed(f"Cannot compute next run: {e}")
+                elif delay_seconds is not None:
+                    # "in 20 minutes" resolved against the same clock the
+                    # runner selects due work with, not the caller's idea of
+                    # now.
+                    deadline_utc = (
+                        schedule_now + timedelta(seconds=delay_seconds)
+                    ).astimezone(timezone.utc).isoformat()
+                    next_run_at = deadline_utc
+                    run_at = deadline_utc
                 inserted = await self._db.execute(
                     """
                     INSERT INTO scheduled_tasks
@@ -2475,6 +2735,26 @@ class SchedulerFeature(Feature):
                 "misfire_grace_seconds": misfire_grace_seconds,
                 "idempotency_key": base_idempotency,
                 "next_run_at": next_run_at, "created_at": now_iso,
+                # The enqueue half of the enqueue/fire/miss record (#3101):
+                # say plainly whether the follow-up turn will surface in a
+                # chat window or run unattended, so a caller never has to
+                # infer it from an empty field.
+                **(
+                    {
+                        "self_followup": {
+                            "session_bound": bool(
+                                parsed_args.get("origin_session_id")
+                            ),
+                            "delivery": (
+                                "user_visible"
+                                if parsed_args.get("origin_session_id")
+                                else "internal_unattended"
+                            ),
+                        }
+                    }
+                    if task_name == SELF_FOLLOWUP_TASK_NAME
+                    else {}
+                ),
             },
         )
 
@@ -3526,3 +3806,183 @@ class SchedulerFeature(Feature):
             confirmation=f"Found {len(records)} execution record(s)",
             data={"executions": records, "count": len(records)},
         )
+
+    @tool(
+        "schedule_self_followups",
+        "Show follow-up turns this agent scheduled for itself, and whether "
+        "each one fired, is still pending, or was missed",
+        category=ToolCategory.UTILITY,
+        command_prefix="!schedule self-followups",
+    )
+    async def schedule_self_followups(self, limit: int = 20) -> ToolResult:
+        """Project every ``self_followup`` schedule with its outcome (#3101).
+
+        ``schedule_list`` and ``schedule_history`` each hold half of this:
+        the pending row with the intention in ``args_json``, and the
+        execution record that says what happened to it. Joining them here is
+        what makes a dropped self-scheduled turn visible rather than silent —
+        a row whose state is ``missed`` or ``failed`` is a follow-up that was
+        promised and did not happen.
+
+        Args:
+            limit: Maximum number of follow-up schedules to return (newest
+                first, default: 20)
+        """
+        if not self._db:
+            return ToolResult.failed("Database not available")
+
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            return ToolResult.failed("limit must be an integer")
+
+        try:
+            schedule_now = await scheduler_database_clock(self._db)
+            rows = await self._db.fetchall(
+                """
+                SELECT id, args_json, enabled, created_at, run_at, next_run_at,
+                       last_run_at, schedule_kind, terminal_status, terminal_at,
+                       lease_owner, lease_expires_at,
+                       scheduler_rollout_fenced, scheduler_claim_fenced
+                FROM scheduled_tasks
+                WHERE agent_id = ? AND task_name = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (self._agent_id, SELF_FOLLOWUP_TASK_NAME, limit),
+            )
+        except Exception as e:
+            logger.error("Failed to list self-followup schedules: %s", e)
+            return ToolResult.failed(str(e))
+
+        followups = []
+        missed = 0
+        pending = 0
+        for row in rows or []:
+            task_id = row[0]
+            intent = ""
+            session_bound = False
+            scheduled_at = None
+            args_error = None
+            try:
+                parsed = json.loads(row[1]) if row[1] else {}
+                if isinstance(parsed, dict):
+                    intent = str(parsed.get("intent") or "")
+                    session_bound = bool(parsed.get("origin_session_id"))
+                    scheduled_at = parsed.get("scheduled_at")
+                else:
+                    args_error = "args_json is not a JSON object"
+            except json.JSONDecodeError as e:
+                args_error = f"args_json malformed: {e}"
+
+            disablement = self._schedule_disablement(
+                enabled=bool(row[2]),
+                schedule_kind=row[7] or "one_shot",
+                terminal_status=row[8],
+                database_now=schedule_now,
+                rollout_fenced=bool(row[12]),
+                claim_fenced=bool(row[13]),
+                lease_owner=row[10],
+                lease_expires_at=row[11],
+            )
+
+            execution = None
+            try:
+                log_row = await self._db.fetchone(
+                    """
+                    SELECT id, status, result_text, executed_at, attempt_count
+                    FROM task_execution_log
+                    WHERE task_id = ? AND agent_id = ?
+                    ORDER BY executed_at DESC
+                    LIMIT 1
+                    """,
+                    (task_id, self._agent_id),
+                )
+            except Exception as e:  # noqa: BLE001 - one bad row must not hide the rest
+                logger.warning(
+                    "Failed to read execution log for follow-up %s: %s",
+                    task_id, e,
+                )
+                log_row = None
+                args_error = args_error or f"execution log unreadable: {e}"
+            if log_row:
+                execution = {
+                    "id": log_row[0],
+                    "status": log_row[1],
+                    "result_text": log_row[2],
+                    "executed_at": log_row[3],
+                    "attempt_count": log_row[4],
+                }
+
+            state = self._self_followup_state(
+                disablement_state=disablement.get("state"),
+                execution_status=(execution or {}).get("status"),
+            )
+            if state == "missed":
+                missed += 1
+            elif state == "pending":
+                pending += 1
+
+            followups.append({
+                "task_id": task_id,
+                "state": state,
+                "intent": intent,
+                "session_bound": session_bound,
+                "delivery": (
+                    "user_visible" if session_bound else "internal_unattended"
+                ),
+                "scheduled_at": scheduled_at or row[3],
+                "due_at": row[4] or row[5],
+                "last_run_at": row[6],
+                "terminal_status": row[8],
+                "terminal_at": row[9],
+                "disablement": disablement,
+                "last_execution": execution,
+                **({"args_error": args_error} if args_error else {}),
+            })
+
+        confirmation = (
+            f"{len(followups)} self-scheduled follow-up(s): "
+            f"{pending} pending, {missed} missed"
+        )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={
+                "followups": followups,
+                "count": len(followups),
+                "pending_count": pending,
+                "missed_count": missed,
+            },
+        )
+
+    @staticmethod
+    def _self_followup_state(
+        *, disablement_state: Optional[str], execution_status: Optional[str]
+    ) -> str:
+        """Name what happened to one follow-up, without rounding up.
+
+        The execution record wins when there is one: it says what the
+        occurrence actually did. Anything unrecognised is reported verbatim
+        rather than folded into ``fired``, so a state this projection has not
+        been taught about cannot masquerade as a success.
+        """
+        if execution_status == "claimed":
+            return "executing"
+        if execution_status == "success":
+            return "fired"
+        if execution_status == MISSED_COGNITION_STATUS:
+            return "missed"
+        if execution_status == "skipped_misfire":
+            return "missed"
+        if execution_status == "failed":
+            return "failed"
+        if execution_status:
+            return execution_status
+        if disablement_state == "executing":
+            return "executing"
+        if disablement_state == "enabled":
+            return "pending"
+        if disablement_state == "terminal":
+            # Terminalized with no execution record of its own.
+            return "terminal_without_execution"
+        return disablement_state or "unknown"
