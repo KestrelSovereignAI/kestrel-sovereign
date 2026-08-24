@@ -75,6 +75,10 @@ Before a wake, Core recreates the private workspace, resolves runtime paths, and
 reprovisions a missing Core-managed venv. It also invalidates the prior child's
 memoized config and reads the current durable generation, so a change committed
 by another replica while this process was idle reaches the new child.
+Configuration changes also wake an idle-retired child before staging so its
+negotiated transition validation and cleanup hooks cannot be bypassed. UI
+contributions parsed from the last successful initialize handshake remain
+available to the live console manifest while only the child process is idle.
 `cleanup_eligible` therefore means the exact child is idle-retired, Core is not
 in terminal shutdown, and the embedding host may ask Core to reclaim that
 feature's owned mutable workspace,
@@ -108,7 +112,9 @@ Core performed no venv mutation, and venv size is cached across wakes unless
 Core actually provisions, upgrades, or reinstalls it. An embedding host may
 merge its own owner-scoped accounting after receiving the snapshot. A failed or
 uncertain retirement reports `state="retirement-uncertain"`, remains active for
-capacity accounting, and is never cleanup-eligible.
+capacity accounting, and is never cleanup-eligible. Telemetry and the reclaim
+seam use the same live-evidence predicate. A successful non-terminal recovery
+does not retain a stale uncertainty marker after its exact facade work settles.
 
 The observer is stored on the exact agent instance. There is no process-global
 registry and no lookup API that can select another agent's telemetry. Observer

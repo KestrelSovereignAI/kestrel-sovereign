@@ -5943,6 +5943,11 @@ class ProxyFeature(Feature):
         self._client_factory = client_factory
         self._client: Any = None
         self._tools: List[AgentTool] = []
+        # UI capabilities are initialize-handshake metadata, not live child
+        # traffic. Preserve the last parsed contribution while an idle child is
+        # deliberately absent so the console manifest does not flap off even
+        # though registry-derived feature capabilities remain enabled.
+        self._idle_ui_contributions: Optional[UIContributions] = None
         self._supervision_task: Optional[asyncio.Task] = None
         # A terminal cleanup owns sealing, lifecycle serialization, and child
         # retirement as one transaction.  Keep one shared task so repeated
@@ -6184,11 +6189,7 @@ class ProxyFeature(Feature):
         """Freeze event-loop-owned lifecycle state before process sampling."""
 
         retirement_clients = tuple(self._terminal_retirement_clients)
-        uncertain_retirement = bool(
-            retirement_clients
-            or tuple(self._terminal_lifecycle_tasks)
-            or self._terminal_cleanup_uncertain
-        )
+        uncertain_retirement = self._retirement_is_uncertain()
         client = self._client
         if client is None and retirement_clients:
             client = retirement_clients[0]
@@ -6229,6 +6230,22 @@ class ProxyFeature(Feature):
             "disk_telemetry_status": self._disk_telemetry_status,
         }
         return values, client, self._process_identity
+
+    def _retirement_is_uncertain(self) -> bool:
+        """Return the predicate shared by telemetry and workspace reclaim."""
+
+        live_evidence = bool(
+            self._terminal_retirement_clients
+            or self._terminal_lifecycle_tasks
+        )
+        # A terminal cleanup can lose its last concrete facade handle while
+        # still being unable to prove completion. Non-terminal recovery does
+        # not inherit that sticky terminal meaning: once all exact evidence is
+        # gone, a republished/cleanly-idle child must report its current truth.
+        return live_evidence or bool(
+            self._terminal_cleanup_uncertain
+            and (self._terminal_lifecycle_latched or self._stopping)
+        )
 
     @staticmethod
     def _build_runtime_telemetry_snapshot(
@@ -7404,6 +7421,11 @@ class ProxyFeature(Feature):
 
         self._client = client
         self._tools = tools
+        self._idle_ui_contributions = self._ui_contributions_from_capabilities(
+            self._client_capabilities()
+        )
+        if not self._terminal_lifecycle_latched and not self._stopping:
+            self._terminal_cleanup_uncertain = False
         if register_channel_bridge:
             self._register_channel_bridge(channel_config)
 
@@ -8246,7 +8268,20 @@ class ProxyFeature(Feature):
         as in-process features, so isolated-venv features can contribute UI
         without the host proxying every static request.
         """
-        caps = self._client_capabilities()
+        if self._client is None:
+            return self._idle_ui_contributions if self._idle_retired else None
+        contribution = self._ui_contributions_from_capabilities(
+            self._client_capabilities()
+        )
+        self._idle_ui_contributions = contribution
+        return contribution
+
+    @staticmethod
+    def _ui_contributions_from_capabilities(
+        caps: Dict[str, Any],
+    ) -> Optional[UIContributions]:
+        """Parse one immutable host-owned view of child UI metadata."""
+
         ui = caps.get("ui_contributions") or caps.get("ui")
         if not isinstance(ui, dict):
             return None
@@ -8339,6 +8374,11 @@ class ProxyFeature(Feature):
         durable active configuration.
         """
         cfg = dict(config) if isinstance(config, dict) else {}
+        # Idle retirement removes only the process, not the feature's lifecycle
+        # contract. Recreate that child before staging so a negotiated
+        # transition validator cannot be bypassed by ``_client is None``.
+        if self._idle_retired and not self._terminal_lifecycle_latched:
+            await self._wake_idle_runtime()
         async with self._reload_lock:
             if self._terminal_lifecycle_latched:
                 await self._persist_terminal_config(
@@ -8347,6 +8387,13 @@ class ProxyFeature(Feature):
                     validate_effective_config=_validate_effective_config,
                 )
                 return
+            if self._idle_retired:
+                # A very short idle deadline can retire again between the wake
+                # and this lock acquisition. Refuse this attempt rather than
+                # promoting without the child-owned transition hook.
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature became idle before config transition."
+                )
             self._begin_reload()
             # The gate closes only after an opt-in external producer has
             # acknowledged that it cannot emit another callback. A cancelled
@@ -12124,6 +12171,7 @@ class ProxyFeature(Feature):
                     return False
                 self._idle_retired = True
                 self._idle_resume_event.clear()
+                self._terminal_cleanup_uncertain = False
                 self._reload_gen += 1
                 await self._reopen_traffic_gate()
                 reopened = True
@@ -12195,6 +12243,7 @@ class ProxyFeature(Feature):
                     or self._stopping
                     or not self._idle_retired
                     or self._client is not None
+                    or self._retirement_is_uncertain()
                 ):
                     raise IsolatedRuntimePreparationError(
                         "Hosted isolated feature workspace is not idle and reclaimable."

@@ -75,6 +75,7 @@ from kestrel_sovereign.operator import OperatorRuntimeRegistry
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from kestrel_sovereign.ui_contributions import compute_ui_manifest
 from kestrel_sovereign.waits import WaitRegistry
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
@@ -735,6 +736,161 @@ async def test_post_publication_wake_failure_reparks_idle_supervisor(
     assert feature._idle_retired is True
     assert feature._client is None
     assert feature._idle_resume_event.is_set() is False
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_set_config_wakes_and_runs_negotiated_validation(monkeypatch, tmp_path):
+    old_config = {"enabled": True, "token": "old-token"}
+    rejected_config = {"enabled": True, "token": "rejected-token"}
+    prepared = []
+
+    class RejectingTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        async def prepare_config_transition(self, config):
+            prepared.append(dict(config))
+            raise ConfigTransitionError("feature rejected this config")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = RejectingTransitionClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.persist_config(old_config)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    with pytest.raises(ConfigTransitionError, match="feature rejected"):
+        await feature.set_config(rejected_config)
+
+    assert len(clients) == 2
+    assert prepared == [rejected_config]
+    assert feature.runtime_telemetry_snapshot().state == "running"
+    assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == old_config
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_successful_recovery_clears_stale_nonterminal_uncertainty(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    # Model the sticky marker left after a non-terminal facade timeout whose
+    # exact late task and retained facade subsequently settled.
+    feature._terminal_cleanup_uncertain = True
+    assert feature.runtime_telemetry_snapshot().state == "running"
+
+    async with feature._reload_lock:
+        await feature._replace_client(feature._host_config)
+
+    assert feature._terminal_cleanup_uncertain is False
+    assert feature.runtime_telemetry_snapshot().state == "running"
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    idle = feature.runtime_telemetry_snapshot()
+    assert idle.state == "idle"
+    assert idle.cleanup_eligible is True
+    await feature.reclaim_idle_workspace()
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reclaim_and_telemetry_share_live_retirement_evidence(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    retained = FakeIsolatedClient()
+    feature._retain_terminal_retirement_client(retained)
+
+    uncertain = feature.runtime_telemetry_snapshot()
+    assert uncertain.state == "retirement-uncertain"
+    assert uncertain.cleanup_eligible is False
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="not idle and reclaimable",
+    ):
+        await feature.reclaim_idle_workspace()
+
+    feature._release_terminal_retirement_client(retained)
+    assert feature.runtime_telemetry_snapshot().cleanup_eligible is True
+    await feature.reclaim_idle_workspace()
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_ui_manifest_retains_last_published_contribution(monkeypatch, tmp_path):
+    static_dir = tmp_path / "feature-static"
+    static_dir.mkdir()
+    (static_dir / "panel.mjs").write_text("export default {};\n")
+
+    class UIClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "ui_contributions": {
+                    "modules": ["panel.mjs"],
+                    "css": [],
+                    "static_dir": str(static_dir),
+                    "capability": "testfeature",
+                }
+            }
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=UIClient)
+    agent.features = {"TestFeature": feature}
+    await feature.initialize()
+    running_manifest = compute_ui_manifest(agent)
+    feature._last_used_monotonic -= 7200
+
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    assert compute_ui_manifest(agent) == running_manifest
+    assert running_manifest == [
+        {
+            "feature": "TestFeature",
+            "capability": "testfeature",
+            "modules": ["/features/testfeature/static/panel.mjs"],
+            "css": [],
+        }
+    ]
     await feature.shutdown()
 
 
