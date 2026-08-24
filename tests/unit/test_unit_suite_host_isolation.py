@@ -1,4 +1,5 @@
-"""The unit suite cannot reach the operator's host-runtime state (#3087).
+"""The unit suite's function-based path resolution cannot reach the operator's
+host-runtime state (#3087).
 
 Every assertion here is about the autouse fixture in ``tests/unit/conftest.py``.
 It exists because the leak it closes was invisible from inside the suite: the
@@ -6,6 +7,9 @@ default host-feature database is ``~/.kestrel/host-data/host-features.db``, CI
 runs with a fresh ``HOME``, and so a developer machine was the only place where
 ``pytest`` migrated a live database — silently, as a side effect of any test
 that entered ``TestClient(server.app)`` without overriding the lifespan.
+
+Scope matches ``tests/unit/conftest.py``: module-scope constants frozen at
+import time are NOT covered here and are tracked in #3104.
 """
 
 from __future__ import annotations
@@ -40,8 +44,8 @@ def test_every_default_branch_behind_the_override_also_lands_in_tmp_path(
     """``KESTREL_HOST_DB_PATH`` is not load-bearing on its own.
 
     Both fallbacks — ``$KESTREL_HOME/host-data`` and ``~/.kestrel/host-data`` —
-    must be closed too, so a caller that ignores the override still cannot
-    name the operator's data.
+    must be closed too, so neither fallback branch resolves outside
+    ``tmp_path``.
     """
     assert tmp_path in paths.host_data_dir().parents
     assert tmp_path in Path.home().parents
