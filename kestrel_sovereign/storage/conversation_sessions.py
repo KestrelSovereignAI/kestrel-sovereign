@@ -581,14 +581,6 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
 
-#: "Something is unstamped and nothing can be ordered against it."
-#:
-#: An unstamped row whose ``created_at`` will not parse cannot be placed before
-#: or after anything, so no session can be proved clear of it. ``datetime.max``
-#: says exactly that through the same comparison every other frontier uses,
-#: rather than adding a second branch that would then need its own test.
-_UNDATABLE_FRONTIER = datetime.max
-
 
 def active_history_predicate() -> str:
     """What the conversation list's DEFAULT view selects — live, not archived.
@@ -2399,11 +2391,10 @@ def project_transcript(
         # 473 of Emma's 1,522 live rows carry no session id at all.
         #
         # Storing them is sound because the two derivations cannot meet over
-        # one. A key outside the column's charset is a key no row's column can
-        # hold, so every row of that session is unstamped, so
-        # `_has_unstamped_rows()` is true and every step takes the transcript
-        # pass — the chunked fold, which is keyed on the column and could not
-        # maintain such a row, never runs while one can exist. Leaving that
+        # one. A key the column cannot hold is a key no row's column can hold,
+        # so every row of that session is unstamped, so any chunk reaching one
+        # escalates (#3061) — the chunked fold, which is keyed on the column and
+        # could not maintain such a row, never stores one. Leaving that
         # state cannot be reached by appends alone (removing an unstamped row is
         # a delete, an archive or a rewrite), so `_plan` answers REBUILT and the
         # discard clears anything left behind.
@@ -3156,7 +3147,7 @@ class ConversationSessionProjection:
         through = (
             plan.target if len(rows) < self.chunk_rows else int(rows[-1][0])
         )
-        written = await self._fold(rows, through, await self._unstamped_frontier())
+        written = await self._fold(rows, through)
         await self._record(
             SessionWatermark(
                 plan.generation, True, plan.stamp, plan.appends, through,
@@ -3433,79 +3424,34 @@ class ConversationSessionProjection:
             or 0
         )
 
-    async def _unstamped_frontier(self) -> Optional[datetime]:
-        """How recently an unstamped live row stands, or ``None`` for none at all.
-
-        A row filed under no ``session_id`` belongs to whichever cluster it falls
-        next to, and only the transcript says which — so a fold, which reads a
-        session's rows BY that column, cannot be trusted about a session holding
-        one. This is the cheap half of that question, asked once per step.
-
-        **A frontier rather than a flag, and that is the fix for #3061.** The
-        guard used to be :meth:`_has_unstamped_rows`, which asked whether ANY
-        live row of the agent's was unstamped and sent the whole step to the
-        transcript if so. That is a global answer to a local hazard: legacy rows
-        are not a transient upgrade state, they are what old history looks like
-        for ever, so one of them made EVERY repair re-derive the agent's entire
-        live history — and #2960 put that repair on the conversation list's read
-        path. Measured, SQLite, one session in three legacy,
-        ``list_session_page(50)`` straight after an appended row: 18.0 ms at
-        1,500 live rows against 3.7 ms with none, and 133.0 ms against 4.9 ms at
-        15,000. Flat against linear, on a path a user waits for.
-
-        A session cannot hold a row that stands after its own last message, and
-        it cannot hold one that stands before its first. So a session starting
-        after every unstamped row provably has none, and its fold is sound —
-        which is the ordinary case for every conversation begun since the agent
-        started stamping. :meth:`_provably_whole` applies it.
-
-        ``None`` means nothing is unstamped and every fold is sound.
-        :data:`_UNDATABLE_FRONTIER` means something is unstamped and cannot be
-        placed in time at all, so no session can be proved clear of it.
-        """
-        row = await self.db.fetchone(
-            "SELECT COUNT(*), MAX(created_at) FROM conversation_history "
-            f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE}",
-            (self.agent_id,),
-        )
-        if not row or not row[0]:
-            return None
-        newest = coerce_session_timestamp(row[1])
-        return _UNDATABLE_FRONTIER if newest is None else newest
-
-    @staticmethod
-    def _provably_whole(
-        projection: SessionProjection, frontier: Optional[datetime]
-    ) -> bool:
-        """Whether this session can be trusted to be all of itself.
-
-        The fold read it by ``session_id`` column, so it is complete exactly
-        when no unstamped row belongs to it — and a row that stands after the
-        newest unstamped row cannot be one. Conservative in the direction that
-        costs correctness nothing: a session STARTING at or before the frontier
-        merely *may* hold one, and is sent to the transcript rather than stored
-        on a guess.
-
-        A session whose own ``started_at`` cannot be read back is not provable
-        either, and says so here rather than comparing ``None``.
-        """
-        if frontier is None:
-            return True
-        started = coerce_session_timestamp(projection.started_at)
-        return started is not None and started > frontier
-
     async def _fold(
-        self, rows: Sequence[Sequence[Any]], through: int,
-        frontier: Optional[datetime],
+        self, rows: Sequence[Sequence[Any]], through: int
     ) -> int:
         """Fold one chunk's rows into the sessions they belong to.
 
         A row's column is the whole story of where it belongs for every session
-        this may store — so the chunk is partitioned by that column and each
-        partition grouped on its own. ``frontier`` is what makes that true per
-        session rather than per agent: see :meth:`_unstamped_frontier` for why
-        the guard used to be a flag and why a flag cost every repair the agent's
-        whole history.
+        this stores, and that is an INVARIANT the escalation below maintains
+        rather than a precondition someone else checks: a chunk holding a row
+        with no ``session_id`` refuses to fold at all, so a walk that reaches
+        ``through`` without escalating has accounted for every live row at or
+        below it. A session first seen above ``through`` therefore already has a
+        stored row describing whatever lies beneath, and folding only ever adds
+        this chunk's rows to it.
+
+        That replaces ``_has_unstamped_rows()`` (#3061), which asked whether the
+        AGENT held any unstamped row and sent the whole step to the transcript
+        if so. Legacy rows are not a transient upgrade state — they are what old
+        history looks like for ever — so one of them made EVERY repair re-derive
+        the agent's entire live history, on the read path #2960 put it on.
+        Measured, SQLite, one session in three legacy, ``list_session_page(50)``
+        straight after an appended row: 18.0 ms at 1,500 live rows against
+        3.4 ms now, and 133.0 ms against 6.3 ms at 15,000. Flat rather than
+        linear, and no row of history is rewritten to get there.
+
+        A per-session guard was tried first and removed: a fold only ever ADDS
+        a chunk's rows to what is already stored, so given the invariant above
+        there is nothing left for it to catch. It survived its own mutant, which
+        is what that always means.
 
         The rows handed here are the rows the chunk read. Nothing re-reads a
         session's history: that is the difference between a walk costing one pass
@@ -3540,16 +3486,9 @@ class ConversationSessionProjection:
             # and the branch that handled it (forgetting the session) outlived
             # the case by several rounds, looking like live handling of a
             # Phase A violation that in fact reached the transcript pass.
-            projection = await self._folded(
-                session_id, by_session[session_id], through
+            written += await self._store(
+                await self._folded(session_id, by_session[session_id], through)
             )
-            if not self._provably_whole(projection, frontier):
-                # An unstamped row may belong here, and only the transcript can
-                # say. Escalating the STEP rather than this session is the same
-                # reasoning `_folded`'s own escalations use: a session's
-                # boundaries are not a property of its own rows.
-                raise _NeedsTranscript(session_id)
-            written += await self._store(projection)
         return written
 
     async def _folded(

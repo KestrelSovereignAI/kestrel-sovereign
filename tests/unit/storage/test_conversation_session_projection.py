@@ -724,23 +724,29 @@ async def test_an_insert_is_detected_and_repaired_incrementally(modern):
 
 
 @pytest.mark.asyncio
-async def test_an_append_to_a_history_holding_unstamped_rows_is_not_incremental(
-    seeded,
-):
-    """The exclusion that keeps the cheap branch honest.
+async def test_an_append_beside_unstamped_rows_does_not_re_derive_them(seeded):
+    """The exclusion that keeps the cheap branch honest, asked of the CHUNK.
 
-    An appended row carrying no session id belongs to whichever session it fell
-    next to, and the incremental branch finds the sessions to refresh by asking
-    which ids the new rows are FILED under — which for such a row is none. So an
-    agent whose history still holds unstamped rows is rebuilt rather than caught
-    up, and the session that grew is right afterwards either way.
+    A row carrying no session id belongs to whichever session it fell next to,
+    and a fold — which finds a row's session by reading its column — cannot
+    place it. So a chunk holding one refuses to fold and the transcript is
+    derived instead.
+
+    Until #3061 that question was asked of the whole AGENT, and legacy rows are
+    not a transient upgrade state: one of them made every repair re-derive the
+    agent's entire live history, on the read path #2960 put it on. Asked of the
+    chunk, an append lands in a chunk of its own and folds, while the unstamped
+    rows below it keep the answer the transcript already gave them.
+
+    The claim that matters is unchanged and is checked the same way: whatever
+    branch ran, the projection afterwards is what the reader would derive.
     """
     db, store, projection = seeded
 
     await store.add_conversation("user", "a stamped append", session_id=UUID_B)
 
     outcome = await projection.repair()
-    assert outcome.kind == REBUILT, outcome
+    assert outcome.kind == INCREMENTAL, outcome
     assert (await projection.get(UUID_B))["message_count"] == 3
     await _assert_repaired_projection_is_true(db, projection)
 
@@ -2096,8 +2102,8 @@ async def test_a_row_arriving_during_a_chunk_leaves_the_watermark_behind(modern)
     class _WritesMidChunk(ConversationSessionProjection):
         arrived = False
 
-        async def _fold(self, rows, through, frontier):
-            written = await super()._fold(rows, through, frontier)
+        async def _fold(self, rows, through):
+            written = await super()._fold(rows, through)
             if not self.arrived:
                 self.arrived = True
                 await store.add_conversation(

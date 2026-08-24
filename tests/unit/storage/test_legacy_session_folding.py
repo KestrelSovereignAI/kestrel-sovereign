@@ -33,6 +33,7 @@ writing it — silently dropping the rows it cannot file.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -149,7 +150,7 @@ class TestTheAcceptance:
 
     @pytest.mark.asyncio
     async def test_a_wholly_unstamped_session_is_still_listed(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, caplog
     ):
         """The defect the first version of this fix had.
 
@@ -167,28 +168,41 @@ class TestTheAcceptance:
         db = await AsyncDatabase.sqlite(str(path))
         try:
             projection = ConversationSessionProjection(db, AGENT)
-            await projection.repair()
+            with caplog.at_level(logging.ERROR):
+                await projection.repair()
             listed = {r["session_id"]: r["message_count"] for r in await projection.list()}
             assert listed == {"1": 4}
             assert passes == [AGENT], (
                 "the chunk folded rows it could not file rather than escalating"
             )
+            # ...and escalated on purpose rather than by falling into the
+            # violation branch. Filing a NULL column under the string "None"
+            # also reaches the transcript, by way of `project_transcript`
+            # refusing a session the grouping does not show — the same outcome
+            # logged as a Phase A violation that has not happened.
+            assert not [
+                record for record in caplog.records
+                if record.levelno >= logging.ERROR
+            ], "an expected state was reported as a contract violation"
         finally:
             await db.close()
 
 
-class TestWhatTheFrontierRefuses:
+class TestWhatTheInvariantBuys:
     @pytest.mark.asyncio
-    async def test_a_session_that_may_hold_an_unstamped_row_escalates(
+    async def test_a_fold_beside_an_unstamped_row_keeps_the_count_it_was_given(
         self, tmp_path, monkeypatch
     ):
-        """The frontier is a bound on where an unstamped row can be, not a flag.
+        """A fold ADDS; it never recounts what is already stored.
 
         This session has an id the column holds AND an unstamped row inside its
         own span — the row carries no id of its own, so grouping attributes it
-        here. Folding by column would count three rows and store that under a
-        watermark saying current. It starts before the frontier, so it is not
-        provably whole, and the transcript is derived instead.
+        here, and no column read can see it. The transcript derives it once;
+        every later append folds on top of that answer rather than replacing it
+        with what the column alone can see.
+
+        Which is why the escalation lives at the CHUNK and not per session: a
+        per-session guard was tried here and had nothing left to catch.
         """
         path = tmp_path / "straddle.db"
         _seed(path, [("sess-a", 0), ("sess-a", 1), (None, 2)])
@@ -198,47 +212,29 @@ class TestWhatTheFrontierRefuses:
         try:
             projection = ConversationSessionProjection(db, AGENT)
             await projection.repair()
+            assert passes == [AGENT], "the unstamped row was folded, not escalated"
+            assert {
+                r["session_id"]: r["message_count"] for r in await projection.list()
+            } == {"sess-a": 3}
+
+            # Settle first. The first append after a build rotates the ledger
+            # generation, which discards and walks from the floor — over the
+            # unstamped row, so it escalates. Asserting on THAT step would be
+            # asserting on the transcript pass, not on a fold; the mutant that
+            # made a fold overwrite instead of adding survived exactly that.
             await _append(db, "sess-a", 3)
             await projection.repair()
-            listed = {r["session_id"]: r["message_count"] for r in await projection.list()}
-            assert listed == {"sess-a": 4}, (
-                f"{listed}: the fold counted only the rows its column could see"
-            )
-            assert passes, "the straddling session was folded rather than escalated"
-        finally:
-            await db.close()
+            settled = len(passes)
 
-    @pytest.mark.asyncio
-    async def test_an_unstamped_row_that_cannot_be_dated_stops_every_fold(
-        self, tmp_path, monkeypatch
-    ):
-        """Nothing can be proved to stand after a row that stands nowhere.
-
-        ``created_at`` is NOT NULL with a CHECK since #3009, so this state is
-        only reachable from a database that predates it — which is exactly the
-        database this ticket is about.
-        """
-        path = tmp_path / "undatable.db"
-        _seed(path, [("sess-a", 0)])
-        conn = sqlite3.connect(str(path))
-        conn.execute(
-            "INSERT INTO conversation_history "
-            "(agent_id, role, content, metadata, created_at) VALUES (?,?,?,?,NULL)",
-            (AGENT, "user", "undatable", "{}"),
-        )
-        conn.commit()
-        conn.close()
-
-        passes = _counting_transcript_passes(monkeypatch)
-        db = await AsyncDatabase.sqlite(str(path))
-        try:
-            projection = ConversationSessionProjection(db, AGENT)
+            await _append(db, "sess-a", 4)
             await projection.repair()
-            before = len(passes)
-            await _append(db, "sess-b", 900)
-            await projection.repair()
-            assert len(passes) > before, (
-                "a session was proved clear of a row that cannot be placed in time"
+            assert len(passes) == settled, "this step escalated, so it folded nothing"
+            listed = {
+                r["session_id"]: r["message_count"] for r in await projection.list()
+            }
+            assert listed == {"sess-a": 5}, (
+                f"{listed}: the fold recounted the session from its column and "
+                "lost the row only the transcript can attribute"
             )
         finally:
             await db.close()
