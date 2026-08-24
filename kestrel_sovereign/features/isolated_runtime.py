@@ -32,8 +32,10 @@ import secrets
 import shutil
 import stat
 import subprocess
+import threading
 import time
 import weakref
+from concurrent.futures import Executor, Future
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -41,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from queue import Empty, Full, Queue
 from types import MappingProxyType, TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, NoReturn, Optional
 from uuid import uuid4
@@ -208,6 +211,101 @@ _TELEMETRY_EMIT_MIN_INTERVAL = 5.0
 _DISK_TELEMETRY_ENTRY_BUDGET = 250_000
 _DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
 _DISK_TELEMETRY_DEPTH_BUDGET = 64
+
+
+class _BoundedDaemonExecutor(Executor):
+    """Small daemon pool reserved for advisory host callbacks.
+
+    Standard ``ThreadPoolExecutor`` workers are non-daemon and can let a
+    hostile synchronous observer acquire interpreter-exit ownership. These
+    workers deliberately cannot do that, and the bounded queue prevents an
+    unbounded retained-snapshot backlog when every observer slot is wedged.
+    """
+
+    _STOP = object()
+
+    def __init__(self, *, max_workers: int, queue_capacity: int) -> None:
+        self._max_workers = max_workers
+        self._work: Queue[object] = Queue(maxsize=queue_capacity)
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._shutdown = False
+
+    def _start_workers(self) -> None:
+        with self._lock:
+            if self._threads or self._shutdown:
+                return
+            for index in range(self._max_workers):
+                thread = threading.Thread(
+                    target=self._worker,
+                    name=f"kestrel-telemetry-observer-{index}",
+                    daemon=True,
+                )
+                self._threads.append(thread)
+                thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            item = self._work.get()
+            try:
+                if item is self._STOP:
+                    return
+                future, fn, args, kwargs = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - Future owns outcome
+                    future.set_exception(exc)
+            finally:
+                self._work.task_done()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        future: Future[Any] = Future()
+        self._start_workers()
+        with self._lock:
+            if self._shutdown:
+                future.set_exception(RuntimeError("telemetry observer executor stopped"))
+                return future
+        try:
+            self._work.put_nowait((future, fn, args, kwargs))
+        except Full:
+            future.set_exception(RuntimeError("telemetry observer executor saturated"))
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        """Reject new callbacks and abandon queued advisory work.
+
+        ``wait`` is intentionally ignored: a hostile observer must not regain
+        process-lifecycle ownership through explicit executor shutdown. Running
+        callbacks remain isolated on daemon threads and queued callbacks are
+        always cancelled so sentinel delivery cannot block on a full queue.
+        """
+
+        with self._lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            threads = tuple(self._threads)
+        while True:
+            try:
+                item = self._work.get_nowait()
+            except Empty:
+                break
+            try:
+                if item is not self._STOP:
+                    future, _fn, _args, _kwargs = item
+                    future.cancel()
+            finally:
+                self._work.task_done()
+        for _thread in threads:
+            self._work.put_nowait(self._STOP)
+
+
+_TELEMETRY_OBSERVER_EXECUTOR = _BoundedDaemonExecutor(
+    max_workers=4,
+    queue_capacity=8,
+)
 
 
 def _measure_directory_tree_bytes(
@@ -5966,6 +6064,7 @@ class ProxyFeature(Feature):
         self._downloaded_bytes: int | None = None
         self._disk_telemetry_status: str | None = None
         self._disk_budget_warning_emitted = False
+        self._workspace_reclaim_generation = 0
         self._last_telemetry_emit_monotonic: float | None = None
         self._telemetry_observer_tasks: set[asyncio.Future[Any]] = set()
         self._telemetry_emit_tasks: set[asyncio.Task[None]] = set()
@@ -5977,6 +6076,7 @@ class ProxyFeature(Feature):
         self._telemetry_environment_refresh_pending = False
         self._telemetry_disk_lock = asyncio.Lock()
         self._idle_resume_event = asyncio.Event()
+        self._observed_inbound_producer = False
         # Event acknowledgement requests are intentionally detached from the
         # SDK read loop (which cannot await a response it must itself read).
         # Keep exact task ownership so terminal cleanup can cancel them rather
@@ -6171,7 +6271,10 @@ class ProxyFeature(Feature):
         )
 
     async def _refresh_disk_telemetry(
-        self, *, refresh_environment: bool = False
+        self,
+        *,
+        refresh_environment: bool = False,
+        expected_reclaim_generation: int | None = None,
     ) -> None:
         """Refresh owned workspace byte counters outside the event loop."""
 
@@ -6225,6 +6328,11 @@ class ProxyFeature(Feature):
             return environment, private, downloaded, status
 
         async with self._telemetry_disk_lock:
+            if (
+                expected_reclaim_generation is not None
+                and expected_reclaim_generation != self._workspace_reclaim_generation
+            ):
+                return
             (
                 self._environment_bytes,
                 self._private_writable_bytes,
@@ -6271,9 +6379,14 @@ class ProxyFeature(Feature):
             )
             async def invoke_observer() -> None:
                 # A host may supply a normal callable or an async callable. Run
-                # the call itself in a worker so a slow synchronous observer
-                # cannot freeze every agent sharing this event loop.
-                result = await asyncio.to_thread(observer, snapshot)
+                # the call itself in a dedicated bounded pool so a slow
+                # synchronous observer cannot freeze the event loop or occupy
+                # the default executor needed by venv/lifecycle work.
+                result = await asyncio.get_running_loop().run_in_executor(
+                    _TELEMETRY_OBSERVER_EXECUTOR,
+                    observer,
+                    snapshot,
+                )
                 if inspect.isawaitable(result):
                     await result
 
@@ -6285,10 +6398,17 @@ class ProxyFeature(Feature):
 
             def consume_observer(completed: asyncio.Future[Any]) -> None:
                 self._telemetry_observer_tasks.discard(completed)
+                if completed.cancelled():
+                    self._telemetry_observer_emit_pending = False
+                    self._telemetry_observer_force_pending = False
+                    return
                 try:
                     completed.result()
-                except BaseException:
-                    pass
+                except BaseException:  # noqa: BLE001 - advisory host callback
+                    logger.warning(
+                        "Hosted isolated runtime telemetry observer failed for %s",
+                        self.name,
+                    )
                 pending = self._telemetry_observer_emit_pending
                 force_pending = self._telemetry_observer_force_pending
                 self._telemetry_observer_emit_pending = False
@@ -6348,6 +6468,7 @@ class ProxyFeature(Feature):
             return
         refresh_disk = self._telemetry_disk_refresh_pending
         refresh_environment = self._telemetry_environment_refresh_pending
+        reclaim_generation = self._workspace_reclaim_generation
         force |= self._telemetry_emit_force_pending
         self._telemetry_emit_pending = False
         self._telemetry_emit_force_pending = False
@@ -6356,9 +6477,18 @@ class ProxyFeature(Feature):
 
         async def deliver() -> None:
             if refresh_disk:
-                await self._refresh_disk_telemetry(
-                    refresh_environment=refresh_environment
-                )
+                try:
+                    await self._refresh_disk_telemetry(
+                        refresh_environment=refresh_environment,
+                        expected_reclaim_generation=reclaim_generation,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:  # noqa: BLE001 - telemetry stays advisory
+                    logger.warning(
+                        "Hosted isolated runtime disk telemetry refresh failed for %s",
+                        self.name,
+                    )
             await self._emit_runtime_telemetry(rate_limited=not force)
 
         coro = deliver()
@@ -6378,6 +6508,10 @@ class ProxyFeature(Feature):
 
         def consume(completed: asyncio.Task[None]) -> None:
             self._telemetry_emit_tasks.discard(completed)
+            if completed.cancelled():
+                self._telemetry_emit_pending = False
+                self._telemetry_emit_force_pending = False
+                return
             try:
                 completed.result()
             except BaseException:
@@ -11873,7 +12007,7 @@ class ProxyFeature(Feature):
     def _owns_inbound_producer(self) -> bool:
         """Return whether retiring this child would remove its only wake source."""
 
-        if self._hosted_telegram_startup_attested:
+        if self._hosted_telegram_startup_attested or self._observed_inbound_producer:
             return True
         try:
             capabilities = self._client_capabilities()
@@ -12056,8 +12190,13 @@ class ProxyFeature(Feature):
                     _agent_runtime_owner(self.agent),
                     self._runtime_directory_name,
                 )
+                self._workspace_reclaim_generation += 1
+                self._telemetry_disk_refresh_pending = False
+                self._telemetry_environment_refresh_pending = False
                 self._environment_bytes = (
-                    0 if not self._venv_is_overridden() else None
+                    0
+                    if self._bin_path is None and not self._venv_is_overridden()
+                    else None
                 )
                 self._private_writable_bytes = 0
                 self._downloaded_bytes = 0
@@ -12477,6 +12616,11 @@ class ProxyFeature(Feature):
         # that could reach cognition; otherwise cognition calling channels_send
         # can deadlock the reader against its own response stream.
         if self._is_inbound_event(event):
+            if source_client is self._client:
+                # Event names are part of Core's inbound contract even when a
+                # legacy producer omits capability metadata. Once observed,
+                # fail resident: this child has no out-of-process wake source.
+                self._observed_inbound_producer = True
             await self._schedule_event_ingress_routing(event, source_client)
             return
         try:

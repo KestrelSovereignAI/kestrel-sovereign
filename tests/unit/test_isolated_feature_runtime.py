@@ -16,6 +16,7 @@ import traceback
 import types
 import weakref
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -809,7 +810,7 @@ async def test_idle_disk_telemetry_never_holds_reload_lock(monkeypatch, tmp_path
     await feature.initialize()
     refresh_started = asyncio.Event()
 
-    async def stalled_refresh(*, refresh_environment=False):
+    async def stalled_refresh(**_kwargs):
         refresh_started.set()
         await asyncio.Event().wait()
 
@@ -988,6 +989,85 @@ async def test_sync_observer_never_blocks_initialize_or_event_loop(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_sync_observer_never_occupies_lifecycle_default_executor(
+    monkeypatch, tmp_path
+):
+    observer_started = threading.Event()
+    release_observer = threading.Event()
+    default_executor = ThreadPoolExecutor(max_workers=1)
+    asyncio.get_running_loop().set_default_executor(default_executor)
+
+    def observe(_snapshot):
+        observer_started.set()
+        assert release_observer.wait(timeout=2)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=observe,
+    )
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    for _ in range(100):
+        if observer_started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert observer_started.is_set()
+    assert all(
+        thread.daemon
+        for thread in isolated_runtime._TELEMETRY_OBSERVER_EXECUTOR._threads
+    )
+
+    prepared = threading.Event()
+
+    def ensure_venv():
+        prepared.set()
+        return False
+
+    monkeypatch.setattr(feature, "ensure_venv", ensure_venv)
+    await asyncio.wait_for(
+        feature._ensure_venv_without_blocking_event_loop(),
+        timeout=0.5,
+    )
+
+    assert prepared.is_set()
+    release_observer.set()
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sync_observer_failure_is_logged(monkeypatch, tmp_path, caplog):
+    def observe(_snapshot):
+        raise RuntimeError("private observer failure")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=observe,
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+
+    with caplog.at_level("WARNING"):
+        await feature.initialize()
+        for _ in range(100):
+            if any("telemetry observer failed" in line for line in caplog.messages):
+                break
+            await asyncio.sleep(0.01)
+
+    assert any("telemetry observer failed" in line for line in caplog.messages)
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_idle_workspace_reclaim_serializes_racing_wake(monkeypatch, tmp_path):
     agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1078,6 +1158,64 @@ async def test_cancelled_idle_reclaim_keeps_wake_serialized(monkeypatch, tmp_pat
         await reclaim
     assert (await wake)["success"] is True
     assert runtime_dir.is_dir()
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reclaim_fences_coalesced_disk_refresh_and_preserves_bin_accounting(
+    monkeypatch, tmp_path
+):
+    snapshots = []
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=snapshots.append,
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    for _ in range(100):
+        if snapshots and not feature._telemetry_emit_tasks:
+            break
+        await asyncio.sleep(0.01)
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    for _ in range(100):
+        if not feature._telemetry_emit_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    delete_started = threading.Event()
+    release_delete = threading.Event()
+    original_remove = isolated_runtime._remove_isolated_feature_runtime
+
+    def slow_remove(*args):
+        delete_started.set()
+        assert release_delete.wait(timeout=2)
+        return original_remove(*args)
+
+    monkeypatch.setattr(isolated_runtime, "_remove_isolated_feature_runtime", slow_remove)
+    reclaim = asyncio.create_task(feature.reclaim_idle_workspace())
+    assert await asyncio.to_thread(delete_started.wait, 1)
+    feature._schedule_runtime_telemetry(force=True, refresh_disk=True)
+    release_delete.set()
+    assert await reclaim is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+    for _ in range(100):
+        if not feature._telemetry_emit_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    snapshot = feature.runtime_telemetry_snapshot()
+    assert snapshot.environment_bytes is None
+    assert snapshot.private_writable_bytes == 0
+    assert snapshot.downloaded_bytes == 0
+    assert snapshot.disk_telemetry_status == "complete"
     await feature.shutdown()
 
 
@@ -1565,6 +1703,39 @@ async def test_incomplete_advertised_channel_remains_resident(monkeypatch, tmp_p
     await feature.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_observed_legacy_inbound_producer_latches_resident(monkeypatch, tmp_path):
+    class MetadataPoorProducer(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {"tools": {}}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = MetadataPoorProducer()
+    feature = ProxyFeature(
+        agent, _idle_test_runtime(), client_factory=lambda **_kwargs: client
+    )
+    await feature.initialize()
+
+    await feature._handle_event(
+        {"type": "message.inbound", "payload": {}},
+        source_client=client,
+    )
+    feature._last_used_monotonic -= 7200
+
+    assert feature._observed_inbound_producer is True
+    assert feature._owns_inbound_producer() is True
+    assert not await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    assert client.stopped is False
+    await feature.shutdown()
+
+
 def test_disk_telemetry_rejects_root_symlink_and_entry_overflow(
     monkeypatch, tmp_path
 ):
@@ -1577,6 +1748,15 @@ def test_disk_telemetry_rejects_root_symlink_and_entry_overflow(
     assert isolated_runtime._measure_directory_tree_bytes(linked) == (
         None,
         "unavailable",
+    )
+
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "local.bin").write_bytes(b"local")
+    (owned / "nested-link").symlink_to(outside, target_is_directory=True)
+    assert isolated_runtime._measure_directory_tree_bytes(owned) == (
+        len(b"local"),
+        "complete",
     )
 
     bounded = tmp_path / "bounded"
@@ -1638,6 +1818,98 @@ async def test_shutdown_cancels_owned_telemetry_tasks(monkeypatch, tmp_path):
 
     assert not feature._telemetry_observer_tasks
     assert not feature._telemetry_emit_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancelled_telemetry_callbacks_do_not_reschedule(monkeypatch, tmp_path):
+    observer_started = asyncio.Event()
+
+    async def observe(_snapshot):
+        observer_started.set()
+        await asyncio.Event().wait()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=observe,
+    )
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    await asyncio.wait_for(observer_started.wait(), timeout=1)
+    for _ in range(100):
+        if not feature._telemetry_emit_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    feature._schedule_runtime_telemetry(force=True)
+    assert feature._telemetry_observer_emit_pending is True
+    observer_task = next(iter(feature._telemetry_observer_tasks))
+    observer_task.cancel()
+    await asyncio.sleep(0.05)
+    assert not feature._telemetry_emit_tasks
+
+    refresh_started = asyncio.Event()
+
+    async def blocked_refresh(**_kwargs):
+        refresh_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(feature, "_refresh_disk_telemetry", blocked_refresh)
+    feature._schedule_runtime_telemetry(force=True, refresh_disk=True)
+    await asyncio.wait_for(refresh_started.wait(), timeout=1)
+    feature._schedule_runtime_telemetry(force=True)
+    emit_task = next(iter(feature._telemetry_emit_tasks))
+    emit_task.cancel()
+    await asyncio.sleep(0.05)
+
+    assert not feature._telemetry_emit_tasks
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_disk_refresh_failure_still_emits_forced_idle_snapshot(
+    monkeypatch, tmp_path, caplog
+):
+    snapshots = []
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=snapshots.append,
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    for _ in range(100):
+        if snapshots and not feature._telemetry_emit_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    async def fail_refresh(**_kwargs):
+        raise RuntimeError("private disk failure")
+
+    monkeypatch.setattr(feature, "_refresh_disk_telemetry", fail_refresh)
+    feature._last_used_monotonic -= 7200
+    with caplog.at_level("WARNING"):
+        assert await feature._retire_idle_generation(
+            expected_activity_generation=feature._activity_generation,
+            expected_last_used=feature._last_used_monotonic,
+        )
+        for _ in range(100):
+            if snapshots[-1].cleanup_eligible:
+                break
+            await asyncio.sleep(0.01)
+
+    assert snapshots[-1].cleanup_eligible is True
+    assert any("disk telemetry refresh failed" in line for line in caplog.messages)
+    await feature.shutdown()
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,9 @@ also refuses idle retirement whenever the child owns a channel bridge, hosted
 Telegram route attestation, or negotiated external-ingress lifecycle: an inbound
 producer with no independent wake source must remain resident even if a host
 accidentally assigns it a timeout.
+Core also latches a feature resident after it observes any canonical inbound
+event name from the published child, protecting legacy producers whose
+capability metadata omitted their inbound role.
 The idle monitor is not started for a child that already advertises an inbound
 producer, and it stops if a later reload adds one. Other non-retirement outcomes
 use a bounded retry interval rather than a zero-yield loop.
@@ -106,8 +109,10 @@ capacity accounting, and is never cleanup-eligible.
 
 The observer is stored on the exact agent instance. There is no process-global
 registry and no lookup API that can select another agent's telemetry. Observer
-delivery is advisory: failures are logged, OS sampling and synchronous host
-observers run in workers, hot-path
+delivery is advisory: failures are logged, OS sampling runs in the default
+worker pool, and synchronous host observers run in a separate bounded daemon
+executor so they cannot starve venv or lifecycle work or hold process exit.
+Hot-path
 emissions are rate-limited and scheduled through the agent background-task
 registry after traffic admission is released, and an asynchronous observer is
 bounded then detached and observed if it refuses to finish. A state transition
@@ -118,6 +123,9 @@ observer cannot create a reschedule loop, and ordinary coalesced traffic retains
 the hot-path rate limit. Disk refresh and observer delivery are never awaited while Core owns a
 reload lock. Terminal lifecycle
 cancels Core-owned telemetry tasks and does not create a post-cleanup delivery.
+Workspace reclaim advances a generation fence so a previously scheduled disk
+sample cannot overwrite the post-reclaim accounting after deletion, and a disk
+sampling failure is logged without suppressing the forced lifecycle snapshot.
 Telemetry cannot acquire ownership of child traffic or lifecycle progress.
 The isolated child supervisor, idle monitor, and telemetry delivery tasks are
 registered as infrastructure daemons, so their intentional residency does not itself block an
