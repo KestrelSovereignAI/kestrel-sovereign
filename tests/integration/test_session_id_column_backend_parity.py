@@ -1093,7 +1093,7 @@ async def test_a_decoy_index_in_an_earlier_schema_does_not_suppress_the_real_one
                 f'CREATE TABLE "{decoy_schema}".unrelated (id BIGSERIAL PRIMARY KEY)'
             )
             await db.execute(
-                f'CREATE INDEX {_wanted_index_name(db, index, "agent_id, session_id, created_at")} '
+                f'CREATE INDEX {_wanted_index_name(db, index, "agent_id, session_id, created_at, id")} '
                 f'ON "{decoy_schema}".unrelated (id)'
             )
             await db.execute(
@@ -1110,7 +1110,7 @@ async def test_a_decoy_index_in_an_earlier_schema_does_not_suppress_the_real_one
                 "SELECT n.nspname FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE c.oid = to_regclass(?)",
-                (_wanted_index_name(db, index, "agent_id, session_id, created_at"),),
+                (_wanted_index_name(db, index, "agent_id, session_id, created_at, id"),),
             ) == decoy_schema
 
             assert await _index_present(db, index, "conversation_history") is False
@@ -1125,7 +1125,7 @@ async def test_a_decoy_index_in_an_earlier_schema_does_not_suppress_the_real_one
                 "JOIN pg_namespace n ON n.oid = t.relnamespace "
                 "WHERE ix.relname = ? AND n.nspname = ?",
                 (
-                    _wanted_index_name(db, index, "agent_id, session_id, created_at"),
+                    _wanted_index_name(db, index, "agent_id, session_id, created_at, id"),
                     target_schema,
                 ),
             )
@@ -1158,7 +1158,7 @@ async def test_a_same_schema_name_collision_is_reported_not_shrugged_off(postgre
             await db.execute("CREATE TABLE decoy (id BIGSERIAL PRIMARY KEY)")
             await db.execute(
                 f"CREATE INDEX "
-                f"{_wanted_index_name(db, index, 'agent_id, session_id, created_at')} "
+                f"{_wanted_index_name(db, index, 'agent_id, session_id, created_at, id')} "
                 "ON decoy (id)"
             )
             await _create_pre_migration_table(db)
