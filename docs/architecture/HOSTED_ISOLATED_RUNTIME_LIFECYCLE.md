@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Hosted Isolated Runtime Lifecycle
+description: Host-scoped idle retirement and sanitized telemetry for isolated feature children.
+resource: /docs/architecture/HOSTED_ISOLATED_RUNTIME_LIFECYCLE.md
+tags:
+- docs
+- architecture
+- isolated-runtime
+timestamp: '2026-08-22T00:00:00Z'
+status: active
+owner: architecture
+canonical: true
+generated: false
+privacy: public
+---
+
 # Hosted isolated runtime lifecycle
 
 Hosted applications can apply idle-retirement policy and receive sanitized
