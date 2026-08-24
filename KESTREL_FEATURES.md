@@ -544,7 +544,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `schedule_add` | `!schedule add` | `utility` | `cron_expression`, `task_name`, `args_json`, `timezone_name`, `misfire_policy`, `misfire_grace_seconds`, `idempotency_key` | 320 | `enabled` |
-| `schedule_add_deadline` | `!schedule deadline` | `utility` | `run_at`, `task_name`, `args_json`, `misfire_policy`, `misfire_grace_seconds`, `idempotency_key` | 141 | `enabled` |
+| `schedule_add_deadline` | `!schedule deadline` | `utility` | `run_at`, `task_name`, `args_json`, `misfire_policy`, `misfire_grace_seconds`, `idempotency_key`, `delay_seconds` | 213 | `enabled` |
 | `schedule_engagement` | `!schedule engagement` | `utility` | `days` | 55 | `enabled` |
 | `schedule_history` | `!schedule history` | `utility` | `limit` | 55 | `enabled` |
 | `schedule_list` | `!schedule list` | `utility` |  | 19 | `enabled` |
@@ -552,6 +552,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `schedule_record_outcome` | `!schedule outcome` | `utility` | `execution_id`, `signal` | 79 | `enabled` |
 | `schedule_remove` | `!schedule remove` | `utility` | `task_id` | 42 | `enabled` |
 | `schedule_resume` | `!schedule resume` | `utility` | `task_id`, `acknowledge_ambiguous_effect` | 80 | `enabled` |
+| `schedule_self_followups` | `!schedule self-followups` | `utility` | `limit` | 73 | `enabled` |
 | `schedule_update` | `!schedule update` | `utility` | `task_id`, `cron_expression`, `timezone_name` | 119 | `enabled` |
 
 ### `security` (SecurityFeature)
@@ -1054,7 +1055,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!save item` | `save` | `<name> <content> [item_type] [summary] [tags] [schema_id]` | Save arbitrary content (text, JSON) for later retrieval. Good for recipes, notes, decisions, and other content you want to recall. item_type must be one of: stash, file, excerpt, structured (default: structured) — do NOT invent your own type or the item becomes unfindable via recall. To finely type a 'structured' item (recipe, user_story, etc.) pass schema_id, not a custom item_type. |
 | `!save stash` | `save` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage for later retrieval. The stash content gets an embedding so you can find it later with semantic search. |
 | `!schedule add` | `scheduler` | `<cron_expression> <task_name> [args_json] [timezone_name] [misfire_policy] [misfire_grace_seconds] [idempotency_key]` | Add a new scheduled task with a cron expression |
-| `!schedule deadline` | `scheduler` | `<run_at> <task_name> [args_json] [misfire_policy] [misfire_grace_seconds] [idempotency_key]` | Add a one-shot scheduled task that fires at an absolute deadline |
+| `!schedule deadline` | `scheduler` | `[run_at] [task_name] [args_json] [misfire_policy] [misfire_grace_seconds] [idempotency_key] [delay_seconds]` | Add a one-shot scheduled task that fires once at an absolute deadline (run_at) or after a relative delay (delay_seconds). Use task_name='self_followup' with {"intent": "..."} in args_json to schedule your own follow-up turn |
 | `!schedule engagement` | `scheduler` | `[days]` | Report aggregate engagement scores per scheduled task |
 | `!schedule history` | `scheduler` | `[limit]` | Show recent task execution history |
 | `!schedule list` | `scheduler` |  | List all scheduled tasks for this agent |
@@ -1062,6 +1063,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!schedule pause` | `scheduler` | `<task_id>` | Pause a scheduled task (stops it from running until resumed) |
 | `!schedule remove` | `scheduler` | `<task_id>` | Remove a scheduled task by ID |
 | `!schedule resume` | `scheduler` | `<task_id> [acknowledge_ambiguous_effect]` | Resume a paused scheduled task |
+| `!schedule self-followups` | `scheduler` | `[limit]` | Show follow-up turns this agent scheduled for itself, and whether each one fired, is still pending, or was missed |
 | `!schedule update` | `scheduler` | `<task_id> <cron_expression> [timezone_name]` | Update the cron expression of an existing scheduled task |
 | `!security-approve` | `security` | `<request_id> [scope]` | Approve a pending request. scope: 'once', 'session', or 'always'. |
 | `!security-audit` | `security` | `[limit]` | Show recent security audit log |

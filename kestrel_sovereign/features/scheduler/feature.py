@@ -2354,7 +2354,10 @@ class SchedulerFeature(Feature):
 
     @tool(
         "schedule_add_deadline",
-        "Add a one-shot scheduled task that fires at an absolute deadline",
+        "Add a one-shot scheduled task that fires once at an absolute deadline "
+        "(run_at) or after a relative delay (delay_seconds). Use "
+        "task_name='self_followup' with {\"intent\": \"...\"} in args_json to "
+        "schedule your own follow-up turn",
         category=ToolCategory.UTILITY,
         command_prefix="!schedule deadline",
     )

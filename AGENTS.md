@@ -201,6 +201,40 @@ COGNITION signal only when a watched field changes (state, merge,
 comments, checks) — args travel in the scheduled task's `args_json`
 (`repo`, `pr`/`issue`/`number`, optional `triggers`, `notify`).
 
+#### Scheduling your own follow-up turn (`self_followup`)
+
+An intention formed inside a turn ("verify PR N once CI settles, then merge")
+does not survive the turn boundary on its own. `self_followup` (#3101) is the
+one-shot cron source that carries one across: it is the only COGNITION entry in
+`CRON_TASKS`, so the deadline fires a *genuine turn* with the intention text
+rendered into its prompt — not a liveness ping, not an echo.
+
+```text
+!schedule deadline delay_seconds=1200 task_name=self_followup \
+  args_json={"intent": "check whether CI on PR 3096 went green, then merge"}
+```
+
+Give the deadline exactly one way — `run_at` (absolute, needs an offset) or
+`delay_seconds` (relative, resolved against the scheduler's database clock).
+`args_json` takes only `intent`; the scheduler fills the rest of the payload.
+
+Two bounds are deliberate and are enforced as **refusals at schedule time**,
+never as a silent downgrade — an accept that produces no turn is worse than an
+explicit refusal:
+
+- **Single hop.** A follow-up turn may not schedule another follow-up. A
+  persisted row starts a fresh causation chain, so `allow_self_loops=False`
+  cannot see this case; `SchedulerFeature` refuses it directly.
+- **One-shot only.** A recurring self-followup is a standing order to spend on
+  turns forever.
+
+A follow-up scheduled from a chat turn is bound to that session and comes back
+`USER_VISIBLE` in the same pane; one scheduled from unattended work stays
+`INTERNAL` and log-only. A bound follow-up whose source could not surface is
+refused rather than fired into a blank pane (#2877/#2922). Use
+`!schedule self-followups` to see every follow-up with its outcome — a dropped
+turn is recorded `missed`, never filed alongside genuine successes.
+
 #### Coding workflows and provider ownership
 
 Core retains the provider-neutral `stalled_work_rescue` workflow registrations
