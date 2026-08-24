@@ -308,6 +308,67 @@ class TestTheResolverSide:
         assert still_live[0] is None, "deleting the legacy session took another one"
 
     @pytest.mark.asyncio
+    async def test_a_metadata_document_that_is_not_an_object_is_empty(self, store):
+        """One legacy row must not take a whole conversation down with it.
+
+        ``metadata`` is free text and legacy rows hold documents no parser can
+        read — ``parse_message_metadata`` exists because three call sites had
+        grown their own copy and disagreed about a document that parses to
+        something other than an OBJECT. ``"[]"`` is valid JSON and is not
+        metadata. This walk had a fourth copy, which handed a list to code that
+        calls ``.get``, so every read, count and purge of the session that row
+        fell in raised AttributeError.
+        """
+        stamped = await _insert(store, 0, session_id=UUID_A)
+        await store.db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (AGENT, "user", "legacy blob", "[]", None, _stamp(5)),
+        )
+        inherited = (
+            await store.db.fetchone(
+                "SELECT id FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (AGENT,),
+            )
+        )[0]
+
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert sorted(r[0] for r in rows) == [stamped, inherited]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            stamped, inherited,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_resumption_past_the_window_brings_its_tail(self, store):
+        """A cap on the ANSWER is not a cap on where the answer may be found.
+
+        The forward walk reads a window of rows, and a session resumed further
+        away than one window used to lose the unlabeled replies that followed
+        the resumption — the naming row itself came back from the metadata
+        query, but the walk needs a contiguous run to decide where a session
+        stops, and those rows were simply absent. The count beside it and the
+        purge behind it are uncapped, so the transcript was the only one of the
+        three that was short.
+
+        Twelve rows of another conversation sit between, which is three times
+        the window this ``limit`` opens.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for minute in range(1, 13):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 500, session_id=UUID_A)
+        tail = await _insert(store, 501)
+
+        rows = await store._get_session_messages(UUID_A, limit=5)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail]
+        # The uncapped resolver is the authority the capped one must match.
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            first, resumed, tail,
+        ]
+
+    @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):
         """Unchanged behaviour, pinned because the walk now decides it too."""
         first = await _insert(store, 0, session_id=UUID_A)

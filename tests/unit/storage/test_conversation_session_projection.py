@@ -3904,5 +3904,17 @@ async def test_a_changed_grouping_retires_a_watermark_with_no_ledger(
         assert await ConversationSessionProjection(db, AGENT).is_stale(), (
             "the generation rotation had no counter row to disagree with"
         )
+        # And the claim is made where a FENCE will look, not only where
+        # `is_stale` will. An older revision's rebuild already in flight for
+        # this agent re-reads the generation before publishing; with no row it
+        # would read the empty string it started from, find it unchanged, and
+        # commit a valid watermark over the invalidation.
+        seeded = await db.fetchone(
+            "SELECT generation FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot = 0",
+            (AGENT,),
+        )
+        assert seeded is not None, "no ledger row for the fence to re-read"
+        assert seeded[0], "the seeded generation is the empty string it started from"
     finally:
         await db.close()

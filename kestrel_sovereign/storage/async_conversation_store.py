@@ -604,6 +604,18 @@ def search_session_summaries(
 class AsyncConversationStore:
     """Async conversation history storage with per-agent encryption."""
 
+    #: How many forward windows :meth:`_get_session_messages` will open before
+    #: it stops and says so.
+    #:
+    #: One window resolves a conversation that ran to its end. A second
+    #: resolves one resumed past it, and each further one another resumption
+    #: cluster — so this is a bound on how many times a session was picked up
+    #: again far from where it stopped, not on its length. Eight is well past
+    #: any shape observed on live history; a session that exceeds it logs
+    #: rather than returning a quietly short transcript, because the count
+    #: beside it and the purge behind it are uncapped and will not agree.
+    SESSION_WINDOW_PAGES = 8
+
     def __init__(
         self,
         db: AsyncDatabase,
@@ -2189,17 +2201,13 @@ class AsyncConversationStore:
             if row_id in seen_ids:
                 continue
             seen_ids.add(row_id)
-            metadata_json = row[metadata_index]
-            meta: dict[str, Any] = {}
-            if metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                except json.JSONDecodeError as error:
-                    logger.warning(
-                        "Failed to parse metadata for message in session %s: %s",
-                        session_id,
-                        error,
-                    )
+            # The module's authored-once answer, not a fourth local copy of it.
+            # This one WAS a local copy and it differed in the way that
+            # matters: a document parsing to something other than an object —
+            # ``"[]"``, a bare string — came back as that value and was then
+            # asked ``.get``, so one legacy row raised AttributeError through
+            # every read, count and purge of the session it fell in.
+            meta: dict[str, Any] = parse_message_metadata(row[metadata_index])
             timestamp = coerce_session_timestamp(row[created_at_index])
             if timestamp is None:
                 # Fail closed only when membership would depend on gap
@@ -2385,27 +2393,9 @@ class AsyncConversationStore:
                 (self.agent_id, spaced_pattern, compact_pattern),
             )
 
-        # From the anchor's timestamp forward. rendered_content (#1402) is
-        # appended at row[5] so existing positional accesses on
-        # metadata/created_at don't shift.
-        if start_row:
-            all_rows = await self.db.fetchall(
-                f"""SELECT id, role, content, metadata, created_at,
-                          rendered_content, model, provider
-                   FROM conversation_history
-                   WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
-                   ORDER BY {created_at_order} ASC
-                   LIMIT ?""",
-                (
-                    self.agent_id,
-                    self._timestamp_query_param(start_row[0]),
-                    limit * 2,  # Fetch extra in case of filtering
-                ),
-            )
-
-        # Also get messages that explicitly belong to this session (resumed
-        # conversations) — rows naming it in metadata that may come after a time
-        # gap, or past the window above.
+        # The rows that NAME this session, whatever the distance — a resumption
+        # past a time gap, or past the window below. Fetched first because they
+        # are what decides where the forward walk has to look next.
         resumed_rows = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
@@ -2425,6 +2415,76 @@ class AsyncConversationStore:
                LIMIT ?""",
             (self.agent_id, compact_pattern, limit)
         )
+
+        # The forward walk, PAGED rather than capped once.
+        #
+        # One window from the anchor is the whole story for a conversation that
+        # ran to its end, and wrong for one RESUMED past it. The naming rows
+        # above come back whatever the distance; the unlabeled replies that
+        # followed them do not, and the walk cannot decide where a run stops
+        # from a set with holes in it — so a resumption further away than one
+        # window silently lost its tail while the count and the purge kept it.
+        #
+        # Jumping to the next naming row rather than crawling contiguously is
+        # sound, and the argument is the walk's own: a full page that yielded
+        # fewer than ``limit`` members contains either a row filed elsewhere,
+        # which closes the run, or a row past the gap, after which every later
+        # row is past it too. Either way nothing but a row NAMING this session
+        # can join from there, and those are exactly the stamps paged to.
+        resumption_stamps = sorted(
+            stamp
+            for stamp in (
+                coerce_session_timestamp(row[4])
+                for row in (*resumed_rows, *resumed_rows_alt)
+            )
+            if stamp is not None
+        )
+        cursor = start_row[0] if start_row else None
+        pages = 0
+        while cursor is not None:
+            if pages >= self.SESSION_WINDOW_PAGES:
+                logger.warning(
+                    "session %s resolution stopped after %s windows with "
+                    "resumptions still unreached; the transcript may be "
+                    "shorter than the session's count",
+                    session_id,
+                    pages,
+                )
+                break
+            # rendered_content (#1402) is appended at row[5] so existing
+            # positional accesses on metadata/created_at don't shift.
+            page = await self.db.fetchall(
+                f"""SELECT id, role, content, metadata, created_at,
+                          rendered_content, model, provider
+                   FROM conversation_history
+                   WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
+                   ORDER BY {created_at_order} ASC
+                   LIMIT ?""",
+                (
+                    self.agent_id,
+                    self._timestamp_query_param(cursor),
+                    limit * 2,  # Fetch extra in case of filtering
+                ),
+            )
+            pages += 1
+            all_rows.extend(page)
+            if len(page) < limit * 2:
+                break  # history exhausted
+            if len(self._filter_session_rows(
+                [*all_rows, *resumed_rows, *resumed_rows_alt],
+                session_id,
+                limit=limit,
+                include_markers=include_markers,
+            )) >= limit:
+                break  # the answer is already as long as it may be
+            covered = coerce_session_timestamp(page[-1][4])
+            cursor = next(
+                (
+                    stamp for stamp in resumption_stamps
+                    if covered is None or stamp > covered
+                ),
+                None,
+            )
 
         return self._filter_session_rows(
             [*all_rows, *resumed_rows, *resumed_rows_alt],

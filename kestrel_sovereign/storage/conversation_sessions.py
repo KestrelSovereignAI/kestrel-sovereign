@@ -1226,9 +1226,19 @@ def _anchor(generation: str, *, row: str = "", agents: str = "", where: str = ""
     nothing — one row per row written, and one uuid generated per row of a bulk
     insert.
     """
+    # ``WHERE true`` is not filler. SQLite cannot parse ``INSERT ... SELECT ...
+    # ON CONFLICT`` without one: the upsert clause is ambiguous against a join
+    # on the SELECT, and its answer is to require a WHERE before it. The form
+    # went unnoticed while only PostgreSQL's statement triggers used it —
+    # SQLite has no transition tables and so no per-statement bump — and
+    # raised the moment #3098 asked for the same row for a set of agents on
+    # both engines. PostgreSQL accepts the term and ignores it.
     values = (
         f"VALUES ({row}.agent_id, 0, 0, 0, {generation})" if row
-        else f"SELECT agent_id, 0, 0, 0, {generation} FROM ({agents}) AS kestrel_agents"
+        else (
+            f"SELECT agent_id, 0, 0, 0, {generation} "
+            f"FROM ({agents}) AS kestrel_agents WHERE true"
+        )
     )
     if where:
         # The conditional form has to be a SELECT: SQLite has no way to put a
@@ -2031,6 +2041,35 @@ def shape_change_invalidation(backend_type: str) -> str:
         # Slot 0 only: it is the one row that carries a generation, and the
         # writers' slots hold the empty string by construction (#3005).
         + " WHERE slot = 0"
+    )
+
+
+def watermark_only_ledger_seed(backend_type: str) -> str:
+    """SQL giving a ledger row to every agent that has a watermark and none.
+
+    :func:`shape_change_invalidation` invalidates by rotating the generation a
+    watermark is compared against, which needs a row to rotate. An agent whose
+    projection was built before the triggers existed, or restored without its
+    ledger, has none — it reads back generation ``''`` and stamp ``0``, exactly
+    what a missing ledger reads back as, so the numbers agree and the rotation
+    touches nothing.
+
+    :func:`emptied_cache_invalidation` says the same thing to the watermark and
+    is enough to make ``is_stale()`` answer true. It is NOT enough during a
+    rolling upgrade. An older revision's rebuild may already be running for
+    such an agent, having read history under the old grouping; its publication
+    fence re-reads the GENERATION, still sees ``''``, finds it unchanged, and
+    commits a valid watermark over the invalidation. Both revisions then read
+    two empty generations that agree, and the stale answer is served for as
+    long as nothing else moves.
+
+    So the claim is made where the fence will look. Creating the row is the
+    rotation for an agent that had nothing to rotate, and ``DO NOTHING`` leaves
+    every agent that does have one to :func:`shape_change_invalidation`.
+    """
+    return _anchor(
+        _new_generation(backend_type),
+        agents="SELECT agent_id FROM conversation_session_watermarks",
     )
 
 
