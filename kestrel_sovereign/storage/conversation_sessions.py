@@ -319,9 +319,11 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
 from .session_grouping import (
     SESSION_ORDER,
@@ -3457,17 +3459,35 @@ class ConversationSessionProjection:
         09:01 with a higher id stored ``sess-a=2, sess-b=1`` under a watermark
         reporting itself current, where the reader says ``sess-a=1, sess-b=2``.
 
+        **Extended by the grouping gap, and that is not padding.** A stamped row
+        arriving within ``SESSION_GAP_MINUTES`` of the newest unstamped one is
+        absorbed into that row's cluster by the grouper — deliberately, because
+        the resolver walks a legacy numeric cluster forward in time and does not
+        stop on id changes (#2019) — while a fold would file it under its own
+        column id. Measured without the extension: the reader says one session
+        of two rows, the projection stored two sessions of one, and called
+        itself current.
+
         ``None`` means nothing is unstamped and every chunk lands clear.
+
+        One row, seeked rather than counted. ``COUNT(*)`` alongside ``MAX`` made
+        the engine visit every unstamped row of the agent's to answer, inside
+        the repair's write transaction, once per chunk — which is O(legacy rows)
+        per append on exactly the histories this exists to make cheap. Absence
+        is read off the empty result instead.
         """
         row = await self.db.fetchone(
-            "SELECT COUNT(*), MAX(created_at) FROM conversation_history "
-            f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE}",
+            "SELECT created_at FROM conversation_history "
+            f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE} "
+            f"{canonical_order(self.db.backend_type, descending=True)} LIMIT 1",
             (self.agent_id,),
         )
-        if not row or not row[0]:
+        if not row:
             return None
-        newest = coerce_session_timestamp(row[1])
-        return _UNDATABLE_FRONTIER if newest is None else newest
+        newest = coerce_session_timestamp(row[0])
+        if newest is None:
+            return _UNDATABLE_FRONTIER
+        return newest + timedelta(minutes=SESSION_GAP_MINUTES)
 
     async def _fold(
         self, rows: Sequence[Sequence[Any]], through: int,
@@ -3510,7 +3530,8 @@ class ConversationSessionProjection:
         — but a deterministic order costs nothing and means an unforeseen overlap
         is contention rather than a lock cycle.
         """
-        # Nothing here may land among rows only the transcript can attribute.
+        # Nothing here may land among — or beside — rows only the transcript can
+        # attribute.
         # The check above catches an unstamped row INSIDE the chunk; this one
         # catches the chunk landing beside one already accounted for, which no
         # column read can see happen. Asked of the chunk rather than of each

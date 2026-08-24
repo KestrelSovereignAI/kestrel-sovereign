@@ -45,6 +45,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_sessions import (
     ConversationSessionProjection,
@@ -278,11 +279,14 @@ class TestWhatTheInvariantBuys:
             # unstamped row, so it escalates. Asserting on THAT step would be
             # asserting on the transcript pass, not on a fold; the mutant that
             # made a fold overwrite instead of adding survived exactly that.
-            await _append(db, "sess-a", 3)
+            # Well past the grouping gap: a row inside it is absorbed by the
+            # cluster beside it, so the frontier carries the gap and such a
+            # chunk escalates (see TestTheFrontiersEdges).
+            await _append(db, "sess-a", 2000)
             await projection.repair()
             settled = len(passes)
 
-            await _append(db, "sess-a", 4)
+            await _append(db, "sess-a", 2001)
             await projection.repair()
             assert len(passes) == settled, "this step escalated, so it folded nothing"
             listed = {
@@ -337,18 +341,18 @@ class TestTheFrontiersEdges:
     async def test_a_chunk_landing_exactly_at_the_frontier_escalates(
         self, tmp_path, monkeypatch
     ):
-        """``<=`` rather than ``<``, and the tie is the reason it is a choice.
+        """``<=`` rather than ``<``, and the boundary is load-bearing.
 
-        A row sharing the newest unstamped row's timestamp sorts after it — the
-        canonical order breaks ties by id and the new row's is higher — so it
-        cannot take that row, and folding would in fact be sound. The comparison
-        is conservative anyway because ties are ordinary (SQLite stores history
-        to the second) and the cost of being wrong here is a projection that
-        disagrees with the reader, against a cost of one extra transcript pass
-        for an append landing in the same second as a two-month-old row.
+        The frontier is the newest unstamped row plus ``SESSION_GAP_MINUTES``,
+        and the grouper splits on ``gap > gap_minutes`` — strictly greater. So a
+        row landing EXACTLY that many minutes later is still absorbed into the
+        cluster beside it, and a fold filing it under its own id would disagree
+        with the reader by one row at the one input where the two comparisons
+        differ.
 
         Stated as a test because the alternative is a boundary nobody can see:
-        both spellings behave identically on every other input.
+        both spellings behave identically on every other input, and ``<`` did
+        survive this test while it used a row well inside the window.
         """
         path = tmp_path / "tie.db"
         _seed(path, [("sess-a", 0), (None, 2)])
@@ -362,10 +366,53 @@ class TestTheFrontiersEdges:
             await projection.repair()
             settled = len(passes)
 
-            await _append(db, "sess-b", 2)  # exactly the frontier
+            # Exactly SESSION_GAP_MINUTES after the unstamped row at minute 2,
+            # which is exactly the frontier — and still absorbed by it.
+            await _append(db, "sess-b", 2 + SESSION_GAP_MINUTES)
             await projection.repair()
             assert len(passes) > settled, (
                 "a chunk landing exactly at the frontier folded"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_chunk_inside_the_gap_window_escalates(self, tmp_path, monkeypatch):
+        """The frontier carries the grouping gap, and that is not padding.
+
+        A stamped row arriving within ``SESSION_GAP_MINUTES`` of the newest
+        unstamped one is absorbed into that row's cluster by the grouper —
+        deliberately (#2019), because the resolver walks a legacy numeric
+        cluster forward in time and does not stop on id changes. A fold files it
+        under its own column id instead. Measured without the extension: the
+        reader saw one session of two rows and the projection stored two
+        sessions of one, calling itself current.
+
+        What the escalation hands over to is #3098: the transcript pass then
+        drops that cluster, because the absorbed row's column contradicts the
+        grouping. That is pre-existing and identical on main — asserted here as
+        "the fold did not invent a different answer", which is this ticket's
+        part of it.
+        """
+        path = tmp_path / "gap.db"
+        _seed(path, [(None, 0)])
+
+        passes = _counting_transcript_passes(monkeypatch)
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            projection = ConversationSessionProjection(db, AGENT)
+            await projection.repair()
+            await _append(db, "sess-z", 43200)
+            await projection.repair()
+            settled = len(passes)
+
+            await _append(db, "sess-b", 5)  # above the frontier, inside the gap
+            await projection.repair()
+            assert len(passes) > settled, "a chunk inside the gap window folded"
+            listed = {r["session_id"] for r in await projection.list()}
+            assert "sess-b" not in listed, (
+                f"{listed}: the fold listed a session the reader absorbs into "
+                "the legacy cluster beside it"
             )
         finally:
             await db.close()
