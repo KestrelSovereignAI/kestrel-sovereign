@@ -24,8 +24,11 @@ from .context import (
     build_host_context,
 )
 from .discovery import (
+    DEFAULT_ENABLED_KEY,
     HOST_FEATURE_ENTRY_POINT_GROUP,
     HOST_MANIFEST_FILENAME,
+    HOST_SCOPE_TABLE,
+    HostScopedManifest,
     discover_host_feature_classes,
     instantiate_host_features,
     read_host_scoped_manifest,
@@ -54,8 +57,11 @@ __all__ = [
     "FleetSessionFactory",
     "SovereignHostContext",
     "build_host_context",
+    "DEFAULT_ENABLED_KEY",
     "HOST_FEATURE_ENTRY_POINT_GROUP",
     "HOST_MANIFEST_FILENAME",
+    "HOST_SCOPE_TABLE",
+    "HostScopedManifest",
     "discover_host_feature_classes",
     "instantiate_host_features",
     "read_host_scoped_manifest",

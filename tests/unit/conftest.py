@@ -11,7 +11,15 @@ effect of ``pytest``, and the real host features named by the project's
 against it. CI never notices: the runner's ``HOME`` is fresh, so the same
 code writes a throwaway file.
 
-The autouse fixture below moves those roots into the test's own ``tmp_path``.
+The autouse fixture below moves those roots into a temporary directory of its
+own, and seeds that directory with a host manifest that starts no host features
+(#3099). Isolating ``KESTREL_HOME`` alone would have *widened* enablement: the
+manifest is read from the resolved project dir, and
+``instantiate_host_features`` treats a missing one as enable-all, so hiding the
+operator's manifest could start host features they had explicitly disabled.
+The seeded manifest says ``[host_features] default_enabled = false``, which is a
+policy rather than a list -- host feature number seven cannot appear in the
+suite without an edit here that says so.
 
 Scope, precisely: this isolates *function-based* path resolution --
 ``paths.host_data_dir()``, ``paths.project_dir()``, ``host_database_path()``
@@ -41,6 +49,11 @@ import pytest
 
 from kestrel_sovereign import paths
 from kestrel_sovereign.agent import token_counter
+from kestrel_sovereign.host_features.discovery import (
+    DEFAULT_ENABLED_KEY,
+    HOST_MANIFEST_FILENAME,
+    HOST_SCOPE_TABLE,
+)
 from kestrel_sovereign.host_features.storage import (
     HOST_DB_PATH_ENV,
     HOST_FEATURE_DB_FILENAME,
@@ -49,15 +62,26 @@ from kestrel_sovereign.host_features.storage import (
 #: Marker name for tests that own host/home path resolution themselves.
 OWNS_HOST_PATHS_MARKER = "owns_host_paths"
 
-#: Namespaced container inside ``tmp_path``. Tests are free to create their
-#: own ``tmp_path`` children (including ones called ``home``), so the
-#: isolation roots live under a name no test would pick.
+#: Name of the fixture's own temporary root. It is a sibling of each test's
+#: ``tmp_path``, not a child: the fixture writes a host manifest, and a
+#: directory the test owns is the wrong place for the fixture's state — one
+#: test asserts its ``tmp_path`` is empty, and every test is entitled to.
 ISOLATION_DIRNAME = "_kestrel_host_runtime_isolation"
+
+#: The seeded manifest. A *default*, deliberately not a list of slugs: a list
+#: would name today's host features and silently miss tomorrow's, which is the
+#: same silent widening this fixture exists to close (#3099).
+HOST_FEATURES_DISABLED_MANIFEST = (
+    "# Seeded by tests/unit/conftest.py — the unit suite starts no host\n"
+    "# features. Opt out per test with @pytest.mark.owns_host_paths.\n"
+    f"[{HOST_SCOPE_TABLE}]\n"
+    f"{DEFAULT_ENABLED_KEY} = false\n"
+)
 
 
 @pytest.fixture(autouse=True)
-def _isolate_host_runtime_paths(request, tmp_path, monkeypatch):
-    """Point every host-runtime root at this test's ``tmp_path``.
+def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
+    """Point every host-runtime root at a temporary directory of our own.
 
     ``KESTREL_HOST_DB_PATH`` is the authoritative override for the
     host-feature database. ``HOME`` and ``KESTREL_HOME`` close the two
@@ -67,22 +91,33 @@ def _isolate_host_runtime_paths(request, tmp_path, monkeypatch):
     fallback — still lands in the temporary directory rather than on the
     operator's disk.
 
-    Nothing here is created eagerly. Every writer on these paths already
-    creates what it needs — ``prepare_host_database`` even creates its own
-    parent ``0700``, the same custody path production takes — and a test is
-    entitled to assert that its ``tmp_path`` stayed empty.
+    The one thing created eagerly is the host manifest, because
+    ``instantiate_host_features`` reads it from the resolved project dir at
+    lifespan time and cannot be told to look elsewhere. Everything else is
+    left to its writer — ``prepare_host_database`` even creates its own parent
+    ``0700``, the same custody path production takes.
     """
     if request.node.get_closest_marker(OWNS_HOST_PATHS_MARKER):
         yield
         return
 
-    root = tmp_path / ISOLATION_DIRNAME
+    root = tmp_path_factory.mktemp(ISOLATION_DIRNAME)
+    project_home = root / "kestrel-home"
 
     monkeypatch.setenv("HOME", str(root / "home"))
-    monkeypatch.setenv("KESTREL_HOME", str(root / "kestrel-home"))
+    monkeypatch.setenv("KESTREL_HOME", str(project_home))
     monkeypatch.setenv(
         HOST_DB_PATH_ENV,
         str(root / "host-data" / HOST_FEATURE_DB_FILENAME),
+    )
+
+    # Hiding the operator's manifest is not neutral: absent means enable-all,
+    # so isolation without this file would start host features the operator
+    # had turned off. Written before the first test line runs, since the
+    # lifespan reads it during startup.
+    project_home.mkdir(parents=True, exist_ok=True)
+    project_home.joinpath(HOST_MANIFEST_FILENAME).write_text(
+        HOST_FEATURES_DISABLED_MANIFEST, encoding="utf-8"
     )
 
     # ``token_counter`` freezes its cache path at import time, so ``HOME``
@@ -105,9 +140,25 @@ def _isolate_host_runtime_paths(request, tmp_path, monkeypatch):
     # and per-test temporary homes would otherwise evict real entries.
     paths.reset_cache()
     try:
-        yield
+        yield root
     finally:
         paths.reset_cache()
+
+
+@pytest.fixture
+def host_runtime_isolation_root(_isolate_host_runtime_paths):
+    """The temporary root this test's host-runtime paths were redirected into.
+
+    Requesting it is how a test asserts *where* a resolved path landed without
+    reconstructing the layout from the environment.
+    """
+    if _isolate_host_runtime_paths is None:
+        pytest.fail(
+            f"host-runtime isolation is off under the "
+            f"{OWNS_HOST_PATHS_MARKER!r} opt-out, so there is no isolation "
+            f"root; drop the marker or resolve the path yourself."
+        )
+    return _isolate_host_runtime_paths
 
 
 @pytest.fixture
@@ -116,7 +167,7 @@ def kestrel_toml_catalog(request, monkeypatch):
 
     The model catalog is a process-wide singleton loaded from
     ``project_dir()/kestrel.toml``. Since the isolation above resolves that
-    directory inside ``tmp_path``, a test asserting catalog-driven behaviour
+    directory into a temporary one, a test asserting catalog-driven behaviour
     has to write the catalog rather than read whichever ``kestrel.toml`` the
     machine happens to carry.
 
