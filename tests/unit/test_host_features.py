@@ -80,8 +80,14 @@ class _UIHostFeature(_DemoHostFeature):
 # ---------------------------------------------------------------------------
 
 
-def test_instantiate_host_features_uses_provided_classes():
-    features = hf.instantiate_host_features({"_UIHostFeature": _UIHostFeature})
+def test_instantiate_host_features_uses_provided_classes(tmp_path: Path):
+    # Name a manifest that does not exist, rather than inheriting the suite's
+    # disabling one (tests/unit/conftest.py): this test is about the classes
+    # argument, so it states the enablement policy it wants.
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature},
+        manifest_path=tmp_path / ".kestrel-host-features.toml",
+    )
     assert len(features) == 1
     assert isinstance(features[0], HostFeature)
     assert features[0].name == "demo-host"
@@ -114,6 +120,103 @@ def test_manifest_ignores_non_host_scoped_entries(tmp_path: Path):
     manifest = tmp_path / ".kestrel-host-features.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')  # not host-scoped
     assert hf.read_host_scoped_manifest(manifest) == {}
+
+
+# --- manifest-level default enablement (#3099) ------------------------------
+
+
+def test_absent_manifest_still_enables_every_discovered_host_feature(tmp_path: Path):
+    """The zero-config default, asserted so a change to it cannot be silent."""
+    policy = hf.read_host_manifest(tmp_path / ".kestrel-host-features.toml")
+    assert policy.default_enabled is True
+    assert policy.enablement == {}
+
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature},
+        manifest_path=tmp_path / ".kestrel-host-features.toml",
+    )
+    assert len(features) == 1
+
+
+def test_manifest_default_false_disables_a_host_feature_it_never_names(
+    tmp_path: Path,
+):
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text("[host_features]\ndefault_enabled = false\n")
+
+    policy = hf.read_host_manifest(manifest)
+    assert policy.default_enabled is False
+    assert policy.enablement == {}
+    # The per-entry view cannot express this, which is why it is not the
+    # thing `instantiate_host_features` consults.
+    assert hf.read_host_scoped_manifest(manifest) == {}
+
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
+    )
+    assert features == []
+
+
+def test_manifest_default_false_still_honours_an_explicit_enable(tmp_path: Path):
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text(
+        "[host_features]\ndefault_enabled = false\n\n"
+        '[[feature]]\nname = "demo-host"\nhost_scoped = true\nenabled = true\n'
+    )
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
+    )
+    assert [f.name for f in features] == ["demo-host"]
+
+
+def test_manifest_default_matches_on_class_name_too(tmp_path: Path):
+    """`_feature_slug` prefers `name`; the class name remains a valid key."""
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text(
+        "[host_features]\ndefault_enabled = false\n\n"
+        '[[feature]]\nname = "_UIHostFeature"\nscope = "host"\n'
+    )
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
+    )
+    assert len(features) == 1
+
+
+def test_manifest_default_non_boolean_fails_closed(tmp_path: Path):
+    """A restriction that will not parse must not be read as no restriction."""
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text('[host_features]\ndefault_enabled = "false"\n')
+
+    assert hf.read_host_manifest(manifest).default_enabled is False
+    assert (
+        hf.instantiate_host_features(
+            {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
+        )
+        == []
+    )
+
+
+def test_manifest_default_survives_a_malformed_feature_array(tmp_path: Path):
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text('[host_features]\ndefault_enabled = false\n\nfeature = "nope"\n')
+    assert hf.read_host_manifest(manifest).default_enabled is False
+
+
+def test_unparseable_manifest_keeps_the_permissive_default(tmp_path: Path):
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text("this is not toml =\n")
+    policy = hf.read_host_manifest(manifest)
+    assert policy.default_enabled is True
+    assert policy.enablement == {}
+
+
+def test_host_scoped_manifest_is_enabled_prefers_the_first_named(tmp_path: Path):
+    policy = hf.HostScopedManifest(
+        default_enabled=False, enablement={"slug": True, "ClassName": False}
+    )
+    assert policy.is_enabled("slug", "ClassName") is True
+    assert policy.is_enabled("ClassName", "slug") is False
+    assert policy.is_enabled("neither") is False
 
 
 # ---------------------------------------------------------------------------

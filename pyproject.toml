@@ -416,6 +416,7 @@ markers = [
     "live: Tests that call live external providers when credentials exist",
     "slow: Slow-running tests",
     "bench: Performance benchmarks (the integration tier excludes these in CI; see .github/workflows/ci.yml)",
+    "owns_host_feature_manifest: Test resolves the host-feature manifest itself and opts out of the unit suite's disabled-by-default host-feature enablement (tests/unit/conftest.py)",
     "anyio",
 ]
 

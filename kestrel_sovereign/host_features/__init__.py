@@ -26,8 +26,13 @@ from .context import (
 from .discovery import (
     HOST_FEATURE_ENTRY_POINT_GROUP,
     HOST_MANIFEST_FILENAME,
+    HOST_SCOPE_DEFAULT_KEY,
+    HOST_SCOPE_TABLE,
+    HostScopedManifest,
+    default_host_manifest_path,
     discover_host_feature_classes,
     instantiate_host_features,
+    read_host_manifest,
     read_host_scoped_manifest,
 )
 from .runtime import (
@@ -56,8 +61,13 @@ __all__ = [
     "build_host_context",
     "HOST_FEATURE_ENTRY_POINT_GROUP",
     "HOST_MANIFEST_FILENAME",
+    "HOST_SCOPE_DEFAULT_KEY",
+    "HOST_SCOPE_TABLE",
+    "HostScopedManifest",
+    "default_host_manifest_path",
     "discover_host_feature_classes",
     "instantiate_host_features",
+    "read_host_manifest",
     "read_host_scoped_manifest",
     "HOST_FEATURE_STATIC_ASSET_RE",
     "host_feature_path_prefixes",

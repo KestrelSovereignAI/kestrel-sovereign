@@ -33,6 +33,32 @@
 # a statement about the VERSION, not permission to fetch it from somewhere
 # else, so a failure is reported rather than silently satisfied from git.
 
+# ---------------------------------------------------------------------------
+# Host-scoped ENABLEMENT (issue #2293 / #3099) — a separate question from the
+# source map above. Installing a `HostFeature` package makes it discoverable;
+# this manifest decides whether the host actually starts it.
+#
+# Per host feature, on its own entry:
+#
+#     [[feature]]
+#     name = "kestrel-feature-observability-fleet"
+#     host_scoped = true      # or: scope = "host"
+#     enabled = false         # installed, but not started at host scope
+#
+# For host features this manifest does NOT name, `default_enabled` decides.
+# It is `true` when absent, so a fresh install starts everything it discovered
+# rather than nothing. Set it to `false` on a host that wants the opposite —
+# then a host feature installed later cannot start merely because no line here
+# mentions it:
+#
+#     [host_features]
+#     default_enabled = false
+#
+# Leave it commented out unless you mean it: uncommenting disables every host
+# feature that has no explicit `enabled = true` entry above. It must be a TOML
+# boolean; anything else is a manifest error and is read as `false`.
+# ---------------------------------------------------------------------------
+
 # The core distribution is a first-class entry here (issue #2949). Every
 # `kestrel-feature-*` depends on `kestrel-sovereign`, and the installer
 # (`uv pip`) is project-blind: it does not read `uv.lock`, so it treats core as

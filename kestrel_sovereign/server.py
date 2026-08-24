@@ -2490,7 +2490,6 @@ async def _lifespan_startup(app: FastAPI):
     from kestrel_sovereign.features.contribution_runtime import (
         FeatureContributionRuntimeError,
     )
-    from kestrel_sovereign.paths import project_dir as _host_project_dir
 
     if not hasattr(app.state, "host_features"):
         app.state.host_features = []
@@ -2502,14 +2501,10 @@ async def _lifespan_startup(app: FastAPI):
     candidate_ctx = None
     candidate_started = []
     try:
-        # Resolve the host manifest from the resolved PROJECT_DIR (KESTREL_HOME /
-        # marker walk-up / ~/.kestrel), NOT Path.cwd(). A service launched under
-        # KESTREL_HOME, systemd, cron, or a direct path may have a CWD that
-        # misses the real manifest — reading from CWD there would let a
-        # host-disabled feature still mount (issue #2293 P2).
-        features = _hf.instantiate_host_features(
-            manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
-        )
+        # The manifest location is discovery's own business — one resolver
+        # (`default_host_manifest_path`, PROJECT_DIR-based, not Path.cwd();
+        # issue #2293 P2) rather than a copy of the path assembly here.
+        features = _hf.instantiate_host_features()
         if features:
             host_cfg = getattr(app.state, "multi_agent_config", None)
             ctx = await _hf.build_host_context(
