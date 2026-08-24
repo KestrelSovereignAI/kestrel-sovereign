@@ -784,6 +784,101 @@ async def test_idle_set_config_wakes_and_runs_negotiated_validation(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_idle_unstartable_child_allows_durable_config_repair(monkeypatch, tmp_path):
+    bad_config = {"enabled": True, "token": "bad-token"}
+    fixed_config = {"enabled": True, "token": "fixed-token"}
+
+    class FailingWakeClient(FakeIsolatedClient):
+        async def start(self):
+            raise RuntimeError("bad active config prevents startup")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            FakeIsolatedClient(**kwargs)
+            if not clients
+            else FailingWakeClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.persist_config(bad_config)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    await feature.set_config(fixed_config)
+
+    assert len(clients) == 2
+    assert feature._client is None
+    assert feature._idle_retired is True
+    assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == fixed_config
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_latch_during_idle_wake_routes_config_to_repair(
+    monkeypatch, tmp_path
+):
+    old_config = {"enabled": True, "token": "old-token"}
+    repaired_config = {"enabled": True, "token": "new-token"}
+    wake_started = asyncio.Event()
+    release_wake = asyncio.Event()
+
+    class SlowWakeClient(FakeIsolatedClient):
+        async def start(self):
+            wake_started.set()
+            await release_wake.wait()
+            await super().start()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            FakeIsolatedClient(**kwargs)
+            if not clients
+            else SlowWakeClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.persist_config(old_config)
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    update = asyncio.create_task(feature.set_config(repaired_config))
+    await asyncio.wait_for(wake_started.wait(), timeout=1)
+    feature._latch_terminal_lifecycle()
+    release_wake.set()
+
+    await update
+
+    assert feature._terminal_lifecycle_latched is True
+    assert feature._idle_retired is False
+    assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == repaired_config
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_successful_recovery_clears_stale_nonterminal_uncertainty(
     monkeypatch, tmp_path
 ):
@@ -851,13 +946,12 @@ async def test_reclaim_and_telemetry_share_live_retirement_evidence(
 
 @pytest.mark.asyncio
 async def test_idle_ui_manifest_retains_last_published_contribution(monkeypatch, tmp_path):
-    static_dir = tmp_path / "feature-static"
-    static_dir.mkdir()
-    (static_dir / "panel.mjs").write_text("export default {};\n")
+    static_dir = None
 
     class UIClient(FakeIsolatedClient):
         @property
         def capabilities(self):
+            assert static_dir is not None
             return {
                 "ui_contributions": {
                     "modules": ["panel.mjs"],
@@ -872,6 +966,17 @@ async def test_idle_ui_manifest_retains_last_published_contribution(monkeypatch,
     _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=UIClient)
+    static_dir = (
+        feature._feature_runtime_dir()
+        / ".venv"
+        / "lib"
+        / "python3.14"
+        / "site-packages"
+        / "test_pkg"
+        / "static"
+    )
+    static_dir.mkdir(parents=True)
+    (static_dir / "panel.mjs").write_text("export default {};\n")
     agent.features = {"TestFeature": feature}
     await feature.initialize()
     running_manifest = compute_ui_manifest(agent)
@@ -891,7 +996,17 @@ async def test_idle_ui_manifest_retains_last_published_contribution(monkeypatch,
             "css": [],
         }
     ]
+    assert (
+        await feature.reclaim_idle_workspace()
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+    )
+    assert static_dir.exists() is False
+    assert compute_ui_manifest(agent) == []
     await feature.shutdown()
+    stopped = feature.runtime_telemetry_snapshot()
+    assert stopped.state == "stopped"
+    assert stopped.idle_processes == 0
+    assert compute_ui_manifest(agent) == []
 
 
 @pytest.mark.asyncio

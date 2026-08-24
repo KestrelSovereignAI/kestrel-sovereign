@@ -79,6 +79,10 @@ Configuration changes also wake an idle-retired child before staging so its
 negotiated transition validation and cleanup hooks cannot be bypassed. UI
 contributions parsed from the last successful initialize handshake remain
 available to the live console manifest while only the child process is idle.
+If the active config prevents the child from waking, Core uses the existing
+clientless staged repair path; if terminal lifecycle lands during that wake, it
+uses terminal config repair. Reclaiming the environment or latching terminal
+lifecycle clears the cached UI contribution before its assets can be advertised.
 `cleanup_eligible` therefore means the exact child is idle-retired, Core is not
 in terminal shutdown, and the embedding host may ask Core to reclaim that
 feature's owned mutable workspace,

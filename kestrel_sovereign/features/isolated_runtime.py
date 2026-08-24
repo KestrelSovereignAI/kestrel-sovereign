@@ -7154,6 +7154,8 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_generation += 1
         self._terminal_lifecycle_latched = True
         self._stopping = True
+        self._idle_retired = False
+        self._idle_ui_contributions = None
         self._idle_resume_event.set()
         for task in tuple(self._event_ack_tasks):
             task.cancel()
@@ -8377,8 +8379,17 @@ class ProxyFeature(Feature):
         # Idle retirement removes only the process, not the feature's lifecycle
         # contract. Recreate that child before staging so a negotiated
         # transition validator cannot be bypassed by ``_client is None``.
+        idle_wake_failed = False
         if self._idle_retired and not self._terminal_lifecycle_latched:
-            await self._wake_idle_runtime()
+            try:
+                await self._wake_idle_runtime()
+            except IsolatedRuntimePreparationError:
+                # An unstartable child may be unstartable *because* its active
+                # config is bad. Re-evaluate under the lifecycle lock: terminal
+                # repair remains permitted, and a still-clientless idle feature
+                # can use the existing staged repair path without bypassing a
+                # live negotiated hook.
+                idle_wake_failed = True
         async with self._reload_lock:
             if self._terminal_lifecycle_latched:
                 await self._persist_terminal_config(
@@ -8387,7 +8398,7 @@ class ProxyFeature(Feature):
                     validate_effective_config=_validate_effective_config,
                 )
                 return
-            if self._idle_retired:
+            if self._idle_retired and not idle_wake_failed:
                 # A very short idle deadline can retire again between the wake
                 # and this lock acquisition. Refuse this attempt rather than
                 # promoting without the child-owned transition hook.
@@ -12257,6 +12268,7 @@ class ProxyFeature(Feature):
                 self._workspace_reclaim_generation += 1
                 self._telemetry_disk_refresh_pending = False
                 self._telemetry_environment_refresh_pending = False
+                self._idle_ui_contributions = None
                 self._environment_bytes = (
                     0
                     if self._bin_path is None and not self._venv_is_overridden()
@@ -12315,7 +12327,10 @@ class ProxyFeature(Feature):
                     or self._terminal_lifecycle_tasks
                     or self._terminal_cleanup_uncertain
                 )
-                if uncertain:
+                if self._terminal_lifecycle_latched or self._stopping:
+                    self._idle_retired = False
+                    self._idle_ui_contributions = None
+                elif uncertain:
                     self._latch_terminal_lifecycle()
                     await self._seal_traffic_gate()
                 elif self._client is None:
