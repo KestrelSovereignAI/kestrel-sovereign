@@ -1516,10 +1516,24 @@ class CoreInstallGuard:
 
     @property
     def constraints(self) -> list:
-        """The constraint lines applied to each guarded install (may be empty).
+        """CORE's constraint lines, and only core's (may be empty).
 
-        Core's pin first — every message that quotes ``constraints[0]`` is about
-        core — then the manifest's declared windows for everything else.
+        Every caller reads this to say "core is pinned to ``constraints[0]``",
+        so it stays what that sentence claims. Folding the manifest's other
+        windows in here made that message name a FEATURE's window on a host
+        with no core pin — two facts in one list, and the caller reading it
+        positionally could not tell.
+        """
+        return list(self._constraints)
+
+    @property
+    def install_constraints(self) -> list:
+        """Every line a guarded install carries: core's pin, then the manifest's.
+
+        The other fact, under its own name. Core's pin bounds core's source and
+        version; the manifest's windows bound everything else it declares, and
+        an install that has to satisfy one entry must not move another out of
+        its own (issue #3106).
         """
         return list(self._constraints) + list(self._manifest_bounds)
 
@@ -1534,7 +1548,7 @@ class CoreInstallGuard:
         """
         return self._install(
             pip_args,
-            constraints=self.constraints or None,
+            constraints=self.install_constraints or None,
             reinstall=reinstall,
             timeout=timeout,
         )
@@ -1815,7 +1829,15 @@ class CoreInstallGuard:
         pip_args, reinstall, rendered, shell = self._restore_plan()
         try:
             result = self._install(
-                pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+                pip_args,
+                # Core is never constrained against itself, here least of all —
+                # this install exists to put core back. The rest of the manifest
+                # still binds: a repair that resolves a dependency outside
+                # another entry's declared window has moved it, and this rechecks
+                # only core (issue #3106).
+                constraints=self._manifest_bounds or None,
+                reinstall=reinstall,
+                timeout=timeout,
                 repairing=True,
             )
         except subprocess.TimeoutExpired as expired:
