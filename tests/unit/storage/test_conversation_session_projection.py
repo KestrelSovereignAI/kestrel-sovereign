@@ -2102,8 +2102,8 @@ async def test_a_row_arriving_during_a_chunk_leaves_the_watermark_behind(modern)
     class _WritesMidChunk(ConversationSessionProjection):
         arrived = False
 
-        async def _fold(self, rows, through):
-            written = await super()._fold(rows, through)
+        async def _fold(self, rows, through, frontier):
+            written = await super()._fold(rows, through, frontier)
             if not self.arrived:
                 self.arrived = True
                 await store.add_conversation(

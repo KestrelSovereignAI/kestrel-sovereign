@@ -11,11 +11,15 @@ history. That is a global answer to a local hazard, and legacy rows are not a
 transient upgrade state: they are what old history looks like for ever, so one
 of them made every repair pay for all of it, on the read path #2960 put it on.
 
-The guard is now the chunk. A chunk holding a row it cannot file refuses to fold
-at all, so a walk that reaches its frontier without escalating has accounted for
-every live row at or below it — and a fold only ever ADDS a chunk's rows to what
-is already stored. An append lands in a chunk of its own and folds; the legacy
-rows below keep the answer the transcript already gave them.
+The guard is the CHUNK now, and it asks two things. A chunk holding a row it
+cannot file refuses to fold at all — so a walk that reaches its frontier without
+escalating has accounted for every live row at or below it, and a fold only ever
+ADDS a chunk's rows to what is already stored. And a chunk whose rows land at or
+before the newest unstamped row refuses too, because a row arriving BESIDE one
+can take it and no column read can see that happen.
+
+An ordinary append satisfies both and folds; the legacy rows below keep the
+answer the transcript already gave them.
 
 Measured, SQLite, one session in three legacy, ``list_session_page(50)`` timed
 straight after one appended row:
@@ -192,6 +196,56 @@ class TestTheAcceptance:
 
 class TestWhatTheInvariantBuys:
     @pytest.mark.asyncio
+    async def test_an_append_landing_beside_an_unstamped_row_escalates(
+        self, tmp_path, monkeypatch
+    ):
+        """A row can arrive BESIDE an unstamped one and take it (codex R2 P1).
+
+        Ordinary appends land after everything and cannot. A row whose id is
+        higher but whose stamp is earlier can, and that is not hypothetical:
+        PostgreSQL's ``NOW()`` is transaction-start time, so an overlapping
+        writer commits a later id carrying an earlier timestamp, and an import
+        or a restore can write anything.
+
+        The unstamped row is not in this chunk and no column read can see it
+        move. Measured without the frontier: stored ``sess-a=2, sess-b=1`` under
+        a watermark reporting itself current, where the reader says
+        ``sess-a=1, sess-b=2``.
+
+        The projection must be settled first — the first append after a build
+        rotates the ledger generation and walks from the floor, which escalates
+        for a different reason and would make this pass without testing
+        anything. A per-session guard was tried and survived its own mutant
+        precisely because no test here could construct an inversion.
+        """
+        path = tmp_path / "inversion.db"
+        _seed(path, [("sess-a", 0), (None, 2)])
+
+        passes = _counting_transcript_passes(monkeypatch)
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            projection = ConversationSessionProjection(db, AGENT)
+            await projection.repair()
+            await _append(db, "sess-z", 2000)
+            await projection.repair()
+            assert {
+                r["session_id"]: r["message_count"] for r in await projection.list()
+            } == {"sess-a": 2, "sess-z": 1}
+            settled = len(passes)
+
+            # Higher id, earlier stamp: it lands between sess-a and the row only
+            # the transcript can attribute.
+            await _append(db, "sess-b", 1)
+            await projection.repair()
+            assert len(passes) > settled, "the chunk folded beside an unstamped row"
+            listed = {
+                r["session_id"]: r["message_count"] for r in await projection.list()
+            }
+            assert listed == {"sess-a": 1, "sess-b": 2, "sess-z": 1}, listed
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_a_fold_beside_an_unstamped_row_keeps_the_count_it_was_given(
         self, tmp_path, monkeypatch
     ):
@@ -276,3 +330,42 @@ async def test_a_stamped_row_absorbed_into_a_legacy_cluster_still_lists(tmp_path
         assert listed == {"1": 2}
     finally:
         await db.close()
+
+
+class TestTheFrontiersEdges:
+    @pytest.mark.asyncio
+    async def test_a_chunk_landing_exactly_at_the_frontier_escalates(
+        self, tmp_path, monkeypatch
+    ):
+        """``<=`` rather than ``<``, and the tie is the reason it is a choice.
+
+        A row sharing the newest unstamped row's timestamp sorts after it — the
+        canonical order breaks ties by id and the new row's is higher — so it
+        cannot take that row, and folding would in fact be sound. The comparison
+        is conservative anyway because ties are ordinary (SQLite stores history
+        to the second) and the cost of being wrong here is a projection that
+        disagrees with the reader, against a cost of one extra transcript pass
+        for an append landing in the same second as a two-month-old row.
+
+        Stated as a test because the alternative is a boundary nobody can see:
+        both spellings behave identically on every other input.
+        """
+        path = tmp_path / "tie.db"
+        _seed(path, [("sess-a", 0), (None, 2)])
+
+        passes = _counting_transcript_passes(monkeypatch)
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            projection = ConversationSessionProjection(db, AGENT)
+            await projection.repair()
+            await _append(db, "sess-z", 2000)
+            await projection.repair()
+            settled = len(passes)
+
+            await _append(db, "sess-b", 2)  # exactly the frontier
+            await projection.repair()
+            assert len(passes) > settled, (
+                "a chunk landing exactly at the frontier folded"
+            )
+        finally:
+            await db.close()

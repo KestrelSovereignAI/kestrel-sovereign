@@ -581,6 +581,22 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
 
+#: "Something is unstamped and nothing can be ordered against it."
+#:
+#: An unstamped row whose ``created_at`` will not parse cannot be placed before
+#: or after anything, so no chunk can be proved to land clear of it.
+#: ``datetime.max`` says that through the same comparison every other frontier
+#: uses, rather than a second branch.
+#:
+#: **NOT COVERED BY A TEST, and it cannot be while #3009 stands.** ``created_at``
+#: carries a CHECK admitting exactly what ``coerce_session_timestamp`` can read,
+#: and the boot migration repairs anything a database already held — so a row
+#: this branch is about is repaired before any projection opens the database. It
+#: stays because what it guards is the difference between an escalation and a
+#: projection that disagrees with the reader, and because the constraint it
+#: leans on is one line in another module.
+_UNDATABLE_FRONTIER = datetime.max
+
 
 def active_history_predicate() -> str:
     """What the conversation list's DEFAULT view selects — live, not archived.
@@ -3147,7 +3163,7 @@ class ConversationSessionProjection:
         through = (
             plan.target if len(rows) < self.chunk_rows else int(rows[-1][0])
         )
-        written = await self._fold(rows, through)
+        written = await self._fold(rows, through, await self._unstamped_frontier())
         await self._record(
             SessionWatermark(
                 plan.generation, True, plan.stamp, plan.appends, through,
@@ -3424,8 +3440,38 @@ class ConversationSessionProjection:
             or 0
         )
 
+    async def _unstamped_frontier(self) -> Optional[datetime]:
+        """How recently an unstamped live row stands, or ``None`` for none at all.
+
+        A row filed under no ``session_id`` belongs to whichever cluster it falls
+        next to, so a row arriving BESIDE it can take it — and a fold reading
+        sessions by their column would never see that happen. Ordinary appends
+        land after everything and cannot; a row whose id is higher but whose
+        stamp is earlier can, and that is not hypothetical: PostgreSQL's
+        ``NOW()`` is transaction-start time, so an overlapping writer commits a
+        later id carrying an earlier timestamp, and an import or restore can
+        write anything.
+
+        Measured against the fold without this: ``sess-a`` at 09:00 with an
+        unstamped row at 09:02 stored as ``sess-a=2``; appending ``sess-b`` at
+        09:01 with a higher id stored ``sess-a=2, sess-b=1`` under a watermark
+        reporting itself current, where the reader says ``sess-a=1, sess-b=2``.
+
+        ``None`` means nothing is unstamped and every chunk lands clear.
+        """
+        row = await self.db.fetchone(
+            "SELECT COUNT(*), MAX(created_at) FROM conversation_history "
+            f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE}",
+            (self.agent_id,),
+        )
+        if not row or not row[0]:
+            return None
+        newest = coerce_session_timestamp(row[1])
+        return _UNDATABLE_FRONTIER if newest is None else newest
+
     async def _fold(
-        self, rows: Sequence[Sequence[Any]], through: int
+        self, rows: Sequence[Sequence[Any]], through: int,
+        frontier: Optional[datetime],
     ) -> int:
         """Fold one chunk's rows into the sessions they belong to.
 
@@ -3464,6 +3510,20 @@ class ConversationSessionProjection:
         — but a deterministic order costs nothing and means an unforeseen overlap
         is contention rather than a lock cycle.
         """
+        # Nothing here may land among rows only the transcript can attribute.
+        # The check above catches an unstamped row INSIDE the chunk; this one
+        # catches the chunk landing beside one already accounted for, which no
+        # column read can see happen. Asked of the chunk rather than of each
+        # session because it is a question about where these rows fall, and a
+        # per-session form of it was tried, survived its own mutant, and was
+        # removed — it could not catch this because a session's own boundaries
+        # say nothing about a row arriving beside it.
+        if frontier is not None:
+            for row in rows:
+                landed = coerce_session_timestamp(row[_CREATED_AT])
+                if landed is None or landed <= frontier:
+                    raise _NeedsTranscript(row[0])
+
         by_session: Dict[str, List[Sequence[Any]]] = {}
         for row in rows:
             session_id = row[4]
