@@ -9,6 +9,12 @@ import pytest
 
 from kestrel_sovereign import paths
 
+# The resolver's own tests: each one states the HOME / KESTREL_HOME it is
+# resolving from, so they opt out of the suite-wide host-runtime path
+# isolation in tests/unit/conftest.py (#3087) rather than assert against a
+# fixture-injected home.
+pytestmark = pytest.mark.owns_host_paths
+
 
 @pytest.fixture(autouse=True)
 def _reset_paths_cache():

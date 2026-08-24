@@ -15,6 +15,18 @@ from kestrel_sovereign.agent.token_budget import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _pinned_context_limit(kestrel_toml_catalog):
+    """State the context limit these allocation tests budget against.
+
+    Per the module docstring, catalog resolution belongs to the
+    token-counter and model-catalog suites. Pinning ``gpt-4`` here keeps
+    the allocation math deterministic instead of reading whichever
+    ``kestrel.toml`` the machine happens to carry (#3087).
+    """
+    kestrel_toml_catalog("context_limits_override", {"gpt-4": 8192})
+
+
 def test_token_allocation_remaining_and_utilization_matrix():
     cases = (
         (1000, 0, 1000, 0.0),

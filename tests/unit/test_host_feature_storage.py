@@ -19,6 +19,13 @@ from kestrel_sovereign.host_features.storage import (
     prepare_host_database,
 )
 
+# These tests are *about* default host-database resolution, so they set
+# HOME / KESTREL_HOME / KESTREL_HOST_DB_PATH themselves (or pass an explicit
+# path) and opt out of the suite-wide isolation in tests/unit/conftest.py
+# (#3087). Every test below must keep doing so: without the fixture's
+# override, a test that forgot would resolve the operator's real database.
+pytestmark = pytest.mark.owns_host_paths
+
 
 def _mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
