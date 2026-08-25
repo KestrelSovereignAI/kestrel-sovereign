@@ -214,6 +214,70 @@ class TestWhatItLeavesAlone:
         assert plan.stamps == []
 
 
+    def test_an_empty_document_is_not_replaced(self):
+        """Only SQL NULL is absent.
+
+        An empty string is a value someone stored, and ``json.loads`` refuses
+        it — treating it as missing would replace it with a document of our
+        own, which is the one thing this promises not to do.
+        """
+        rows = _derived([(1, {"session_id": UUID_A}, 0)])
+        rows.append((2, "user", "", _stamp(5), None, _stamp(5)))
+        assert plan_stamps(rows).stamps == []
+
+    def test_a_duplicated_key_is_not_resolved(self):
+        """A document with the key twice has no single reading.
+
+        SQLite's ``json_extract`` takes the first, PostgreSQL's ``jsonb`` and
+        Python's ``json.loads`` take the last — so whichever is "right", two of
+        the three readers disagree, and rewriting it would silently pick one.
+        """
+        rows = _derived([(1, {"session_id": UUID_A}, 0)])
+        rows.append(
+            (2, "user", '{"session_id": "9999", "session_id": "1"}',
+             _stamp(5), None, _stamp(5))
+        )
+        assert plan_stamps(rows).stamps == []
+
+    def test_a_claim_naming_a_live_marker_is_refused(self):
+        """A marker is structural, and the grouper leaves it out of the
+        messages it collects — so a claim naming one is placed by asking the
+        marker itself, not by looking it up among rows that never contain it.
+        Reading "not placed" as "names nothing live" would overwrite the claim
+        instead of reporting the conflict it is.
+        """
+        rows = _derived(
+            [
+                (1, {"session_id": UUID_B, "new_session": True,
+                     "type": "session_marker"}, 0),
+                (2, {"session_id": UUID_B}, 1),
+                (3, {"session_id": UUID_A}, 100),
+                (4, {"session_id": "1"}, 105),
+            ]
+        )
+        plan = plan_stamps(rows)
+        assert plan.stamps == []
+        assert plan.conflicts == [(4, "1", UUID_A)]
+
+    def test_a_claim_naming_this_session_s_own_marker_agrees(self):
+        """And placing the marker is what makes that a claim rather than a
+        conflict: the marker STARTS this session, so a later row naming it is
+        saying where it already is. Refusing here would leave a whole session's
+        continuation unstamped for naming the row that opened it — which is
+        precisely what #2012 says the UI round-tripped.
+        """
+        rows = _derived(
+            [
+                (1, {"session_id": UUID_A, "new_session": True,
+                     "type": "session_marker"}, 0),
+                (2, {"session_id": "1"}, 1),
+            ]
+        )
+        plan = plan_stamps(rows)
+        assert [(s.row_id, s.session_id) for s in plan.stamps] == [(2, UUID_A)]
+        assert plan.conflicts == []
+
+
 class TestThePass:
     @pytest.mark.asyncio
     async def test_it_writes_the_rows_and_records_that_it_did(self, tmp_path):
@@ -230,6 +294,41 @@ class TestThePass:
             # Metadata AND the column, because a reader that consults one and
             # not the other is the shape #3098 was about.
             assert (await _metadata(db))[2] == (UUID_A, UUID_A)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_every_view_is_planned_before_the_marker_is_written(
+        self, tmp_path
+    ):
+        """Each of the list's three views groups its OWN rows.
+
+        An agent whose legacy session is archived, or in Trash, would otherwise
+        be recorded complete without those rows being read at all — and the
+        marker then refuses every retry, including after a restore, leaving a
+        lifecycle op to act on part of a session for ever.
+        """
+        path = tmp_path / "views.db"
+        _seed(
+            path,
+            [
+                ({"session_id": UUID_A}, 0),
+                ({"session_id": "1"}, 5),
+                ({"session_id": UUID_B}, 100),
+                ({"session_id": "3"}, 105),
+            ],
+        )
+        conn = sqlite3.connect(str(path))
+        conn.execute("UPDATE conversation_history SET archived_at = ? WHERE id IN (3, 4)",
+                     ("2026-06-01 12:00:00",))
+        conn.commit()
+        conn.close()
+
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            observed = await _metadata(db)
+            assert observed[2] == (UUID_A, UUID_A), "the active view was not stamped"
+            assert observed[4] == (UUID_B, UUID_B), "the archived view was not stamped"
         finally:
             await db.close()
 
