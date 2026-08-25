@@ -23,11 +23,18 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
+from .conversation_created_at import UNDATED_TABLE
 from .session_grouping import (
+    UNDATABLE_ROW_FALLBACK,
+    canonical_session_id,
     canonical_timestamp_sql,
+    iso_session_timestamp,
+    parse_message_metadata,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    session_cursor_values,
+    sort_sessions,
     summarize_sessions,
     timestamp_predicate,
     timestamp_query_param,
@@ -50,6 +57,33 @@ from .encryption import (
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
+
+
+class ProjectionNotReady(RuntimeError):
+    """The session index is not complete enough to answer the list (#2960).
+
+    Its own type because the caller has to tell it from a storage failure: this
+    one is temporary and self-correcting — the next request continues the walk
+    — so it is a 503 rather than a 500.
+    """
+
+
+#: How many budgeted repairs one list request will run before refusing.
+#:
+#: Each is ``STEP_BUDGET * CHUNK_ROWS`` live rows, so this is tens of millions
+#: of rows for one agent — far past anything measured, and past the point where
+#: a synchronous rebuild belongs on a request at all. It is a backstop on the
+#: refusal, not a work budget: the loop exits the moment the walk lands, which
+#: for every agent this has been measured on is the first pass.
+REPAIR_PASSES = 8
+
+#: How many times a list request will re-read a page that was rebuilt under it.
+#:
+#: Each attempt is three primary-key reads and one bounded page query, so this
+#: is cheap; it is a bound on a race rather than on work. Losing it three times
+#: running means a projection being rebuilt continuously, which is a state to
+#: report rather than to keep retrying inside a request.
+_PAGE_ATTEMPTS = 3
 
 # Current key version for new encryptions
 CURRENT_KEY_VERSION = 1
@@ -326,7 +360,7 @@ _NEGATION_TOKENS = frozenset({
 })
 
 
-def _token_match_score(query_tokens: List[str], content_lower: str) -> float:
+def _token_match_score(query_tokens: Sequence[str], content_lower: str) -> float:
     """Return the fraction of *query_tokens* found in *content_lower*.
 
     Plain substring matching for all tokens, with one semantic-safety
@@ -372,28 +406,158 @@ def _build_match_snippet(text: str, query_lower: str, radius: int = _MATCH_SNIPP
     return ("…" if start > 0 else "") + stripped[start:end].strip() + ("…" if end < len(stripped) else "")
 
 
+@dataclass(frozen=True)
+class SearchTerms:
+    """A query compiled once, so every session is asked the same question.
+
+    Search reaches sessions two ways now (#2961) — the grouper, for the paths
+    with no table, and the #2959 projection for the active list — and both have
+    to apply *identical* matching rules or a session would be findable through
+    one and not the other. Compiling the query into a value both feed to
+    :func:`session_match_decoration` is what makes that structural instead of a
+    pair of loops that look alike.
+    """
+
+    #: The query as it is compared: stripped, lowercased.
+    query_lower: str
+    #: Its tokens with search wrappers removed, for the overlap fallback.
+    tokens: Tuple[str, ...]
+    #: Whether that fallback applies at all.
+    use_token_fallback: bool
+
+    @classmethod
+    def compile(cls, query: str) -> Optional["SearchTerms"]:
+        """``None`` for a query that can match nothing — an empty one.
+
+        A *wrapper-only* query is not that: it still matches by substring, and
+        only the tokenized fallback is withheld (#1554), because a query made
+        entirely of transport scaffolding would otherwise score ≥0.6 against
+        every sent-form row in the history.
+        """
+        query_lower = query.strip().lower()
+        if not query_lower:
+            return None
+        query_tokens = _tokenize_for_search(query)
+        stripped_query_tokens = _tokenize_for_search(_strip_search_wrappers(query))
+        query_is_wrapper_only = bool(query_tokens) and not stripped_query_tokens
+        return cls(
+            query_lower=query_lower,
+            tokens=tuple(stripped_query_tokens),
+            use_token_fallback=(
+                not query_is_wrapper_only and len(stripped_query_tokens) >= 2
+            ),
+        )
+
+
+def session_match_decoration(
+    messages: Iterable[Dict[str, Any]],
+    name: Optional[str],
+    terms: SearchTerms,
+) -> Optional[Dict[str, Any]]:
+    """One session's ``match_*`` fields, or ``None`` when it does not match.
+
+    ``messages`` are that session's rows, **decrypted and canonicalized**;
+    ``name`` its user-assigned title, which is matched too so a renamed
+    conversation is findable by the name the user gave it even when nothing in
+    its text says so.
+
+    Matching reuses the exact semantics of ``search_history``: substring match
+    against the wrapper-stripped projection first (#1537/#1549), then the
+    tokenized ≥0.6-overlap fallback for multi-term queries.
+
+    The one function both search paths call. It is given rows rather than
+    finding them, because *which* rows a session is made of is the question the
+    two paths answer differently — the grouper computes it for a transcript it
+    holds, the active path reads it out of the membership map — and that is the
+    only part that should differ.
+    """
+    match_count = 0
+    first_hit: Optional[Dict[str, Any]] = None
+    best_token: Optional[Tuple[float, Dict[str, Any]]] = None
+    for msg in messages:
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            continue
+        content_lower = _strip_search_wrappers(content).lower()
+        if terms.query_lower in content_lower:
+            match_count += 1
+            if first_hit is None:
+                first_hit = msg
+        elif terms.use_token_fallback and match_count == 0:
+            score = _token_match_score(terms.tokens, content_lower)
+            if score >= _TOKEN_MATCH_THRESHOLD and (
+                best_token is None or score > best_token[0]
+            ):
+                best_token = (score, msg)
+
+    name_match = bool(name) and terms.query_lower in name.lower()
+    if match_count == 0 and first_hit is None and best_token is not None:
+        first_hit = best_token[1]
+        match_count = 1
+    if match_count == 0 and not name_match:
+        return None
+
+    if first_hit is None:
+        # Title-only hit: the name itself is the evidence.
+        return {"match_count": match_count, "match_role": None, "match_snippet": None}
+    return {
+        "match_count": match_count,
+        "match_role": first_hit.get("role"),
+        "match_snippet": _build_match_snippet(
+            first_hit.get("content") or "", terms.query_lower
+        ),
+    }
+
+
+def _within_row_budget(
+    page: Sequence[Dict[str, Any]],
+    membership: Dict[str, List[Any]],
+    budget: int,
+) -> Iterable[List[Dict[str, Any]]]:
+    """Split a page of sessions into groups whose rows fit one read.
+
+    A step of the search walk is bounded in *sessions*, and a session is not
+    bounded in anything — one long-running conversation can hold more rows than
+    the rest of the page together. Reading a step's rows in one go would
+    therefore be an unbounded read wearing a bounded number's clothes, so the
+    rows are what the batches are counted in.
+
+    A session larger than ``budget`` on its own is still read whole, in a batch
+    of one: its rows cannot be matched apart from each other, and splitting it
+    would report two partial answers where the session has one.
+    """
+    batch: List[Dict[str, Any]] = []
+    rows = 0
+    for session in page:
+        size = len(membership.get(session["session_id"], ()))
+        if batch and rows + size > budget:
+            yield batch
+            batch, rows = [], 0
+        batch.append(session)
+        rows += size
+    if batch:
+        yield batch
+
+
 def search_session_summaries(
     normalized_messages: List[Dict[str, Any]],
     query: str,
     names: Optional[Dict[str, str]] = None,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
-    """Full-text search over conversations, grouped into session summaries.
+    """Full-text search over a transcript this caller holds, grouped and matched.
 
-    The pure core behind conversation search: callers hand in **decrypted**,
-    oldest-first normalized message dicts (``id``/``role``/``content``/
-    ``metadata``/``created_at``) — the persistent store after
-    ``_decrypt_with_fallback`` + ``_resolve_canonical``, the privacy wrapper
-    its in-memory ISOLATED buffer — and get back newest-first session
-    summaries for the sessions whose content (or user-assigned title) matches
-    *query*.
+    **The path for a membership with no sessions table.** ISOLATED privacy mode
+    keeps its conversations in an in-memory buffer, and the archived view is
+    disjoint from what the #2959 projection describes (#3062) — neither has a
+    row to look a session up in, so both derive the sessions from the rows they
+    have. The active view does not come through here any more: it walks the
+    table, in :meth:`AsyncConversationStore._search_active_sessions`.
 
-    Matching reuses the exact semantics of ``search_history``: substring
-    match against the wrapper-stripped projection first (#1537/#1549), then
-    the tokenized ≥0.6-overlap fallback for multi-term queries, with
-    wrapper-only queries gated out entirely (#1554). Grouping reuses the
-    shared #2019 boundary algorithm, so a search hit is always a session the
-    list view (and the delete/archive lifecycle) agrees exists.
+    Callers hand in **decrypted**, oldest-first normalized message dicts
+    (``id``/``role``/``content``/``metadata``/``created_at``) and get back
+    newest-first session summaries for the sessions whose content — or
+    user-assigned title — matches *query*.
 
     Returns session dicts shaped like ``group_messages_into_sessions`` output
     (``preview_content``/``preview_metadata``/``preview_wake_source`` retained
@@ -402,16 +566,9 @@ def search_session_summaries(
     the first hit.
     """
     names = names or {}
-    query_lower = query.strip().lower()
-    if not query_lower:
+    terms = SearchTerms.compile(query)
+    if terms is None:
         return []
-
-    query_tokens = _tokenize_for_search(query)
-    stripped_query_tokens = _tokenize_for_search(_strip_search_wrappers(query))
-    query_is_wrapper_only = bool(query_tokens) and not stripped_query_tokens
-    use_token_fallback = (
-        not query_is_wrapper_only and len(stripped_query_tokens) >= 2
-    )
 
     # keep_empty_markers=True to mirror the UI list (#2222): a just-started,
     # renamed-but-still-empty conversation is list-visible, so its title must
@@ -431,47 +588,18 @@ def search_session_summaries(
         if name is not None:
             session["name"] = name
 
-        match_count = 0
-        first_hit: Optional[Dict[str, Any]] = None
-        best_token: Optional[Tuple[float, Dict[str, Any]]] = None
-        for msg in messages:
-            content = msg.get("content") or ""
-            if not isinstance(content, str):
-                continue
-            content_lower = _strip_search_wrappers(content).lower()
-            if query_lower in content_lower:
-                match_count += 1
-                if first_hit is None:
-                    first_hit = msg
-            elif use_token_fallback and match_count == 0:
-                score = _token_match_score(stripped_query_tokens, content_lower)
-                if score >= _TOKEN_MATCH_THRESHOLD and (
-                    best_token is None or score > best_token[0]
-                ):
-                    best_token = (score, msg)
-
-        name_match = bool(name) and query_lower in name.lower()
-        if match_count == 0 and first_hit is None and best_token is not None:
-            first_hit = best_token[1]
-            match_count = 1
-        if match_count == 0 and not name_match:
+        decoration = session_match_decoration(messages, name, terms)
+        if decoration is None:
             continue
-
-        session["match_count"] = match_count
-        if first_hit is not None:
-            session["match_role"] = first_hit.get("role")
-            session["match_snippet"] = _build_match_snippet(
-                first_hit.get("content") or "", query_lower
-            )
-        else:
-            # Title-only hit: the name itself is the evidence.
-            session["match_role"] = None
-            session["match_snippet"] = None
+        session.update(decoration)
         results.append(session)
 
-    results.sort(key=lambda s: s["last_message_at"], reverse=True)
+    # The same order the list and the #2959 projection page by, not a third
+    # spelling of "newest first". Ties are ordinary and `limit` truncates, so
+    # sorting on `last_message_at` alone let search and the list disagree about
+    # WHICH session made the page (round-8/9 review).
+    sort_sessions(results)
     return results[:limit]
-
 
 class AsyncConversationStore:
     """Async conversation history storage with per-agent encryption."""
@@ -703,6 +831,20 @@ class AsyncConversationStore:
             projection, lexical_tokens_available = (
                 await self._conversation_lexical_purge_capability()
             )
+            # Same question as the lexical one, asked the same way and inside
+            # the same writer/DDL boundary: does this database HAVE the table
+            # whose rows must die alongside the messages? A database that never
+            # ran #3009's migration has no record table and therefore no
+            # records — nothing to leak — so the purge proceeds. Refusing a
+            # hard purge because a record of "we could not date this row" is
+            # unavailable would trade a real deletion for a bookkeeping one,
+            # which is the wrong way round for a privacy primitive
+            # (test_conversation_purge_schema_compat pins that a degraded
+            # schema keeps hard purge AVAILABLE).
+            #
+            # Existence, not exceptions: a DELETE that fails for any other
+            # reason must still take the transaction down with it.
+            undated_records_available = await self.db.table_exists(UNDATED_TABLE)
 
             active_scope = dict(scope)
             active_queries = selection_queries
@@ -784,6 +926,20 @@ class AsyncConversationStore:
                     (self.agent_id, *batch),
                 )
                 purged += _rows_affected(affected)
+                # In the SAME statement batch, and for the same reason the
+                # lexical tokens are: ``conversation_history_undated`` has no
+                # cascade either, and it holds the ORIGINAL text of a stamp
+                # #3009's migration could not read. That text came out of the
+                # agent's own history and can be anything at all, so a row left
+                # behind here is exactly the residue this primitive exists to
+                # prevent — a permanent purge that leaves the message's
+                # agent_id and a fragment of its content addressable.
+                if undated_records_available:
+                    await self.db.execute(
+                        f"DELETE FROM {UNDATED_TABLE} "
+                        f"WHERE agent_id = ? AND message_id IN ({placeholders})",
+                        (self.agent_id, *batch),
+                    )
 
             # Delete a key only after its selected owners are gone, and only
             # when no surviving row still owns it.  Legacy databases did not
@@ -1778,8 +1934,13 @@ class AsyncConversationStore:
         meta: Optional[Dict],
         content: str,
         rendered_raw: Optional[str],
+        migrate: bool = True,
     ) -> tuple[str, Optional[str]]:
         """Apply the canonical/transport split (#1402) for a single row.
+
+        ``migrate=False`` withholds the opportunistic backfill below without
+        changing what is returned. Search passes it — see
+        :meth:`_normalized_search_row` for why a scan must not write.
 
         Returns ``(canonical_content, rendered_content)`` where
         ``canonical_content`` is the raw user turn (or original content for
@@ -1817,7 +1978,7 @@ class AsyncConversationStore:
             # form. Move it into rendered_content and strip wrappers.
             rendered_content = content
             content = extract_raw_user_content(content)
-            if self._migrate_on_read:
+            if migrate and self._migrate_on_read:
                 try:
                     await self._migrate_split_sent_form(
                         row_id, content, rendered_content, meta
@@ -1996,6 +2157,8 @@ class AsyncConversationStore:
         metadata_index: int = 3,
         created_at_index: int = 4,
         reject_invalid_timestamps: bool = False,
+        anchor_missing: bool = False,
+        anchor_key: Optional[Tuple[datetime, int]] = None,
     ) -> List[tuple]:
         """Apply the canonical time-gap/resumption rules to candidate rows.
 
@@ -2009,24 +2172,32 @@ class AsyncConversationStore:
 
         seen_ids: set[int] = set()
         candidates: list[tuple[datetime, int, tuple, dict[str, Any]]] = []
-        fallback_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+        # NOT a clock. An unreadable timestamp dated with `now()` sorts to the
+        # end of the candidates and is gap-filtered out of the session the
+        # conversation list says it belongs to — and it does so differently
+        # depending on when the read happens, so the same session opens with
+        # different contents on two consecutive requests. `group_messages_into_
+        # sessions` stopped consulting a clock for #2959 (a grouping that reads
+        # one cannot be cached); this is the same constant it falls back to.
+        #
+        # This does not make the two agree about which session an unreadable row
+        # joins: the grouper inherits the row's predecessor, and the candidates
+        # here are a subset that need not contain it. That is one rule with two
+        # implementations, which is #2961's subject.
+        fallback_timestamp = UNDATABLE_ROW_FALLBACK
         session_id_str = str(session_id)
         for row in rows:
             row_id = int(row[0])
             if row_id in seen_ids:
                 continue
             seen_ids.add(row_id)
-            metadata_json = row[metadata_index]
-            meta: dict[str, Any] = {}
-            if metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                except json.JSONDecodeError as error:
-                    logger.warning(
-                        "Failed to parse metadata for message in session %s: %s",
-                        session_id,
-                        error,
-                    )
+            # The module's authored-once answer, not a fourth local copy of it.
+            # This one WAS a local copy and it differed in the way that
+            # matters: a document parsing to something other than an object —
+            # ``"[]"``, a bare string — came back as that value and was then
+            # asked ``.get``, so one legacy row raised AttributeError through
+            # every read, count and purge of the session it fell in.
+            meta: dict[str, Any] = parse_message_metadata(row[metadata_index])
             timestamp = coerce_session_timestamp(row[created_at_index])
             if timestamp is None:
                 # Fail closed only when membership would depend on gap
@@ -2037,7 +2208,7 @@ class AsyncConversationStore:
                 # created_at undeletable through count/guard/purge.
                 if (
                     reject_invalid_timestamps
-                    and meta.get("session_id") != session_id_str
+                    and canonical_session_id(meta) != session_id_str
                 ):
                     raise ConversationSessionTimestampError(
                         "Refusing exact conversation-session resolution because "
@@ -2049,15 +2220,126 @@ class AsyncConversationStore:
             )
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
 
+
         session_rows = []
         last_timestamp: Optional[datetime] = None
         is_first = True
+        # The row a session's run STARTS at, when its key names one. A legacy
+        # key IS a row id (#2012), so the session begins there and at no other
+        # row; a canonical key begins wherever the first row naming it is.
+        anchor_row_id = coerce_persistent_message_id(session_id)
+        # ...and when the key names NO row, the rows that name IT open it
+        # instead. A numeric session id can be metadata-only — a client
+        # supplied it, or the legacy anchor was hard-deleted out from under it
+        # — and those rows would otherwise be unreachable by the only key
+        # anyone has for them, which for purge means unpurgeable. This is not
+        # the case the grouper's acceptance rule refuses: there the anchor
+        # EXISTS and the bare integer beside it is a stale echo of a row that
+        # belongs to another session. Here there is nothing to echo.
+        exact_opens_the_run = anchor_missing and anchor_row_id is not None
+        # Whether the anchor row is among the candidates at all. It may not be:
+        # a session lifecycle op selects one deletion state, and a partially
+        # restored session can have its anchor live while the rows under it are
+        # still in Trash. The session did not stop starting where it starts, so
+        # the run opens at the anchor's POSITION instead — at the first
+        # candidate standing at or after it, which the boundary test below can
+        # still refuse. Only the first: once a boundary closes the run, only
+        # the session's own rows may re-open it.
+        anchor_position_open = (
+            anchor_key is not None
+            and anchor_row_id is not None
+            and not any(candidate[1] == anchor_row_id for candidate in candidates)
+        )
+        if anchor_position_open:
+            # The gap is measured from where the session STARTS, so a hidden
+            # anchor still sets the clock: a candidate standing half an hour
+            # past it is a later conversation whatever else is true of it.
+            last_timestamp = anchor_key[0]
+        # Whether the requested session's run is currently taking rows.
+        #
+        # It starts CLOSED, which is the difference between "these candidates
+        # begin at the session" and "these candidates begin near it". The
+        # candidate query selects a timestamp RANGE, and two rows can share a
+        # second — so the row before the anchor in canonical order arrives
+        # first, and a run that started open would take it out of the session
+        # before this one. The same range is what a metadata ``LIKE`` can widen
+        # by matching this session's id nested inside some other document: that
+        # row is not a member, it must not open the run, and now it cannot.
+        #
+        # A row filed under a DIFFERENT canonical id closes the run, and so
+        # does a ``new_session`` marker — the grouper's other two boundaries.
+        # Closing is not the same as skipping the row: an unlabeled row after
+        # one inherits THAT session, so it must not rejoin this one by merely
+        # falling inside the gap. Only the anchor or a row NAMING this session
+        # opens the run — the latter is a resumption, which the grouper
+        # coalesces back by id, and which is why a boundary must not end the
+        # scan the way it used to.
+        #
+        # Until #3098 the walk had no boundary at all, so a legacy numeric
+        # cluster absorbed a following stamped row. The grouper had to absorb
+        # it too, or deleting the cluster the list showed would have destroyed
+        # the stamped session beside it — and that absorption is what made
+        # Phase A's per-row column disagree with the grouping and drop the
+        # whole conversation from the list.
+        run_open = False
 
-        for timestamp, _row_id, row, meta in candidates:
-            is_resumed_message = meta.get("session_id") == session_id_str
+        for timestamp, row_id, row, meta in candidates:
+            # A row RESUMES this session only under the grouper's own
+            # acceptance rule, which is why this asks `canonical_session_id`
+            # rather than comparing the raw metadata value. A bare integer
+            # there names a row, not a session (#2012), and the grouper reads
+            # such a row as unlabeled — so treating one as a resumption filed
+            # it under a legacy key while the list showed it under the session
+            # it had actually fallen into, and deleting the legacy session
+            # deleted a row displayed elsewhere. It also means a numeric
+            # session cannot be resumed at all, which is the truth: its key is
+            # its first row's id, and no second cluster can start at that row.
+            is_resumed_message = canonical_session_id(meta) == session_id_str
 
-            if not is_first and not is_resumed_message and meta.get("new_session"):
-                break
+            opens_the_run = (
+                is_resumed_message
+                or row_id == anchor_row_id
+                or (
+                    exact_opens_the_run
+                    and meta.get(SESSION_ID_KEY) is not None
+                    and str(meta[SESSION_ID_KEY]) == session_id_str
+                )
+            )
+            # The session's start POSITION, when its anchor row is hidden by
+            # the deletion filter. It is a position and nothing more: the
+            # boundary test below still decides, so a row beginning another
+            # session — a ``new_session`` marker, a row filed under another
+            # canonical id — standing there refuses rather than inherits, and
+            # the gap from the anchor is measured by ``last_timestamp`` above.
+            at_anchor_position = False
+            if anchor_position_open and (timestamp, row_id) >= anchor_key:
+                at_anchor_position = True
+                anchor_position_open = False
+
+            # A row filed under another canonical id closes the run even when
+            # it is the row the key names: a key whose own row files itself
+            # elsewhere names no session the grouper would show — the list keys
+            # a legacy cluster by its first row only when that row carries no
+            # id of its own — so the honest answer is an empty one, not that
+            # row by itself.
+            #
+            # A ``new_session`` marker closes the run for everyone EXCEPT the
+            # session it opens, which is not a special case but the same rule
+            # read the right way round: a marker starts a session, and this can
+            # be that session's. Nellie has one — a legacy marker carrying the
+            # bare integer of the session before it, anchoring three turns of
+            # its own — and testing the boundary first resolved it to nothing.
+            if canonical_session_id(meta) not in (None, session_id_str) or (
+                not opens_the_run and meta.get("new_session")
+            ):
+                run_open = False
+            elif opens_the_run or at_anchor_position:
+                run_open = True
+            if not run_open:
+                # Deliberately WITHOUT advancing ``last_timestamp``: nothing
+                # else can join this session until the anchor or a resumption
+                # opens the run, and both are admitted regardless of the gap.
+                continue
 
             if last_timestamp and not is_resumed_message:
                 gap_minutes = (
@@ -2125,82 +2407,135 @@ class AsyncConversationStore:
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
         archive_clause = "" if include_archived else " AND archived_at IS NULL"
+        # Canonicalize the timestamp prefilter/order: SQLite history mixes
+        # ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and raw TEXT
+        # comparison drops later rows whose stored form sorts below the
+        # anchor's.  The exact purge/count resolver already compares via
+        # julianday; display must see the same membership or hard purge could
+        # destroy rows this path never returned.
+        # ``(created_at, id) >= (cursor)``, spelled as the disjunction both
+        # dialects can index. A stamp-only cursor cannot step past a second
+        # that holds more rows than one window: the same page comes back for
+        # ever, and the loop consumed the resumption key it was paging TO.
+        created_at_predicate = (
+            "("
+            + self._timestamp_predicate("created_at", ">")
+            + " OR ("
+            + self._timestamp_predicate("created_at", ">=")
+            + " AND id >= ?))"
+        )
+        created_at_order = self._canonical_timestamp_sql("created_at")
+        # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the
+        # match to EVERY row (#1729); ESCAPE '\' makes the backslash the escape
+        # char. For an ordinary UUID this is a no-op.
+        esc = _escape_like_session_value(session_id)
+        spaced_pattern = f'%"session_id": "{esc}"%'
+        # JSON formatting varies; both spellings are the same membership claim.
+        compact_pattern = f'%"session_id":"{esc}"%'
 
-        # Try to interpret session_id as a message ID for time-based grouping.
-        # If it isn't (e.g. a UUID-based implicit session_id), skip this path
-        # and fall through to the metadata-based lookup below.
+        # Where a LEGACY session's forward walk begins. A canonical session has
+        # no such walk here, and that is deliberate rather than an omission.
+        #
+        # The grouper gives an unlabeled row to the session it falls after, so a
+        # canonical session owns the unlabeled run following it and resolving it
+        # by metadata alone answers with a strict subset of what the list shows.
+        # Measured across the four live agents: the resolver and the grouper
+        # disagree about 65 conversations before this ticket, 16 after it, and
+        # the last 16 are exactly that subset. Closing them needs a forward walk
+        # for canonical ids too, and a forward walk carries a scope: it was
+        # measured letting an ARCHIVED row bridge two twenty-minute gaps under
+        # `deleted_filter="all"`, so purging one session destroyed another the
+        # active list showed separately. The legacy path has always had that
+        # exposure; giving it to every session is a decision about lifecycle
+        # scope across deletion universes, and it is not this ticket's (#3120).
         all_rows = []
         row_id = coerce_persistent_message_id(session_id)
+        start_row = None
         if row_id is not None:
             # The anchor row itself is looked up regardless of state — we
             # need its timestamp even if it's been soft-deleted, otherwise
             # we can't restore the session that owned it.
             start_row = await self.db.fetchone(
-                "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
+                "SELECT created_at, id FROM conversation_history "
+                "WHERE id = ? AND agent_id = ?",
                 (row_id, self.agent_id)
             )
 
-            # If session_id is a message ID, get messages from that timestamp forward
-            # rendered_content (#1402) appended at row[5] so existing
-            # positional accesses on metadata/created_at don't shift.
-            if start_row:
-                start_time = start_row[0]
-                # Canonicalize the timestamp prefilter/order: SQLite history
-                # mixes ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and
-                # raw TEXT comparison drops later rows whose stored form sorts
-                # below the anchor's.  The exact purge/count resolver already
-                # compares via julianday; display must see the same membership
-                # or hard purge could destroy rows this path never returned.
-                created_at_predicate = self._timestamp_predicate(
-                    "created_at", ">="
-                )
-                created_at_order = self._canonical_timestamp_sql("created_at")
-                all_rows = await self.db.fetchall(
-                    f"""SELECT id, role, content, metadata, created_at,
-                              rendered_content, model, provider
-                       FROM conversation_history
-                       WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
-                       ORDER BY {created_at_order} ASC
-                       LIMIT ?""",
-                    (
-                        self.agent_id,
-                        self._timestamp_query_param(start_time),
-                        limit * 2,  # Fetch extra in case of filtering
-                    ),
-                )
+        # Whether the key names a row at all. A numeric session id can be
+        # metadata-only — a client supplied it, or the legacy anchor was
+        # hard-deleted — and then the rows naming it are the only thing that
+        # can open the walk (see `_filter_session_rows`).
+        anchor_missing = row_id is not None and start_row is None
 
-        # Also get messages that explicitly belong to this session (resumed conversations)
-        # These are messages with session_id in metadata that may come after a time gap.
-        # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the match
-        # to EVERY row (#1729); ESCAPE '\' makes the backslash the escape char. For
-        # an ordinary UUID this is a no-op.
-        esc = _escape_like_session_value(session_id)
+        # Where the session starts, as the pair everything here compares in.
+        # Carried into the walk so a lifecycle op whose deletion filter hides
+        # the anchor — a partially restored session has its anchor live and its
+        # rows in Trash — still opens the run where the session opens.
+        anchor_key = (
+            (
+                coerce_session_timestamp(start_row[0]) or UNDATABLE_ROW_FALLBACK,
+                int(start_row[1]),
+            )
+            if start_row is not None and row_id is not None
+            else None
+        )
+
+        # The rows that NAME this session, whatever the distance — a resumption
+        # past a time gap, or past the window below.
         resumed_rows = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY created_at ASC
+               ORDER BY {created_at_order} ASC, id ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id": "{esc}"%', limit)
+            (self.agent_id, spaced_pattern, limit)
         )
 
-        # Also try without space after colon (JSON formatting varies)
         resumed_rows_alt = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY created_at ASC
+               ORDER BY {created_at_order} ASC, id ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id":"{esc}"%', limit)
+            (self.agent_id, compact_pattern, limit)
         )
+
+        # One window forward from the anchor, ordered by ``(created_at, id)``
+        # and cut by ``(created_at, id) >= anchor`` — the order the walk itself
+        # sorts candidates into. ``created_at`` is stored to the second, so a
+        # bound on the stamp alone admits the row BEFORE the anchor and a LIMIT
+        # over it truncates a tie group wherever the engine felt like it:
+        # measured on sqlite 3.50, a LIMIT of eight over ten rows returned the
+        # last row of the tie and dropped the two before it.
+        #
+        # rendered_content (#1402) is appended at row[5] so existing positional
+        # accesses on metadata/created_at don't shift.
+        if start_row is not None:
+            all_rows = await self.db.fetchall(
+                f"""SELECT id, role, content, metadata, created_at,
+                          rendered_content, model, provider
+                   FROM conversation_history
+                   WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
+                   ORDER BY {created_at_order} ASC, id ASC
+                   LIMIT ?""",
+                (
+                    self.agent_id,
+                    self._timestamp_query_param(start_row[0]),
+                    self._timestamp_query_param(start_row[0]),
+                    int(start_row[1]),
+                    limit * 2,  # Fetch extra in case of filtering
+                ),
+            )
 
         return self._filter_session_rows(
             [*all_rows, *resumed_rows, *resumed_rows_alt],
             session_id,
             limit=limit,
             include_markers=include_markers,
+            anchor_missing=anchor_missing,
+            anchor_key=anchor_key,
         )
 
     async def _get_complete_session_message_ids(
@@ -2223,8 +2558,10 @@ class AsyncConversationStore:
         Only fields needed by the shared grouping algorithm are materialized;
         encrypted message bodies remain untouched even for very large sessions.
         """
-        del_clause = self._deleted_filter_clause(deleted_filter).replace(
-            "deleted_at", "c.deleted_at"
+        anchor_del_clause = self._deleted_filter_clause(deleted_filter)
+        del_clause = anchor_del_clause.replace("deleted_at", "c.deleted_at")
+        anchor_archive_clause = (
+            "" if include_archived else " AND archived_at IS NULL"
         )
         archive_clause = (
             "" if include_archived else " AND c.archived_at IS NULL"
@@ -2235,12 +2572,25 @@ class AsyncConversationStore:
         row_id = coerce_persistent_message_id(session_id)
 
         if row_id is None:
+            # A canonical session is resolved by the rows that NAME it, and no
+            # further. The grouper also gives it the unlabeled run that follows
+            # it, so this is a strict subset of what the list shows — measured
+            # at 16 conversations across the four live agents. Closing that
+            # needs a forward walk here, and a forward walk under
+            # ``deleted_filter="all"`` lets a HIDDEN row bridge two gaps the
+            # active view splits: measured, an archived row twenty minutes
+            # after this session and twenty before another one merged the two,
+            # and purging this one destroyed the other permanently. The legacy
+            # branch below has always carried that exposure; extending it to
+            # every session is a decision about lifecycle scope across deletion
+            # universes and is #3120's, not this ticket's.
             query_prefix = ""
-            candidate_source = "conversation_history c"
             membership_predicate = (
                 "(c.metadata LIKE ? ESCAPE '\\' "
                 "OR c.metadata LIKE ? ESCAPE '\\')"
             )
+            anchor_column = "0, NULL"
+            candidate_source = "conversation_history c"
             params: tuple[Any, ...] = (
                 self.agent_id,
                 spaced_pattern,
@@ -2253,11 +2603,12 @@ class AsyncConversationStore:
                 "WHERE id = ? AND agent_id = ?"
                 ") "
             )
-            # LEFT JOIN (not CROSS JOIN): a numeric session id can be
-            # metadata-only — the client supplied it explicitly, or the legacy
-            # anchor row was already hard-deleted.  An empty anchor CTE must
-            # drop only the time-grouping branch, never the metadata branch,
-            # or purge/count would miss rows the display resolver still finds.
+            # LEFT JOIN (not CROSS JOIN): the anchor CTE can be empty, because
+            # a numeric session id can be metadata-only — the client supplied
+            # it explicitly, or the legacy anchor row was already hard-deleted.
+            # An empty anchor must drop only the time-grouping branch, never
+            # the metadata branch, or purge/count would miss rows the display
+            # resolver still finds.
             candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
             candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
             anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
@@ -2269,6 +2620,9 @@ class AsyncConversationStore:
                 "OR c.metadata LIKE ? ESCAPE '\\' "
                 "OR c.metadata LIKE ? ESCAPE '\\')"
             )
+            anchor_column = (
+                "(SELECT count(*) FROM anchor), (SELECT created_at FROM anchor)"
+            )
             params = (
                 row_id,
                 self.agent_id,
@@ -2277,8 +2631,13 @@ class AsyncConversationStore:
                 compact_pattern,
             )
 
+        # Whether the key names a row, read in the SAME statement as the
+        # candidates. It decides whether a row naming this session may open the
+        # walk (see `_filter_session_rows`), and asking separately would put
+        # that decision in a different snapshot from the rows it is about.
         candidates = await self.db.fetchall(
-            f"{query_prefix}SELECT c.id, c.metadata, c.created_at "
+            f"{query_prefix}SELECT c.id, c.metadata, c.created_at, "
+            f"{anchor_column} "
             f"FROM {candidate_source} WHERE c.agent_id = ? AND "
             f"{membership_predicate}{del_clause}{archive_clause} "
             "ORDER BY c.id ASC",
@@ -2292,6 +2651,20 @@ class AsyncConversationStore:
             metadata_index=1,
             created_at_index=2,
             reject_invalid_timestamps=True,
+            anchor_missing=bool(candidates) and not candidates[0][3],
+            # The anchor's position, so a deletion filter that hides the row
+            # itself still opens the run where the session opens. Its id is
+            # ``row_id`` by construction — a canonical key has no anchor row
+            # id, and `_filter_session_rows` ignores the pair without one.
+            anchor_key=(
+                (
+                    coerce_session_timestamp(candidates[0][4])
+                    or UNDATABLE_ROW_FALLBACK,
+                    row_id,
+                )
+                if candidates and candidates[0][3] and row_id is not None
+                else None
+            ),
         )
         return sorted({int(row[0]) for row in session_rows})
 
@@ -2501,8 +2874,29 @@ class AsyncConversationStore:
 
         return exact_results
 
-    # Row budget for a session search scan — matches search_history's cap.
-    SEARCH_SESSIONS_SCAN_LIMIT = 5000
+    #: How many sessions one step of a search walk takes off the table.
+    #:
+    #: Not the caller's ``limit``: the walk stops when it has that many
+    #: *matching* sessions, and how many it must look at to find them is a
+    #: property of the query rather than of the request. This is only how far
+    #: ahead it reads while looking — big enough that an ordinary query is
+    #: answered from one step, small enough that a query matching nothing does
+    #: not have to materialize the whole table to discover that.
+    #:
+    #: It is not a horizon. What stood here was: ``SEARCH_SESSIONS_SCAN_LIMIT``
+    #: bounded the *rows* a search could see at 5,000, so a conversation whose
+    #: messages had all aged past that was findable by no query at any limit —
+    #: the same defect #2960 removed from the list, one control across. The walk
+    #: below has no such bound; it stops on an answer, not on a row count.
+    SEARCH_SESSION_STEP = 200
+
+    #: How many rows one content read pulls at a time.
+    #:
+    #: Matching has to decrypt, so the rows a search examines are held in memory
+    #: while it does. This bounds that to a batch rather than to "every row of
+    #: every session on this step", which nothing bounds — one conversation may
+    #: be arbitrarily long.
+    SEARCH_CONTENT_BATCH = 500
 
     async def search_sessions(
         self,
@@ -2510,68 +2904,409 @@ class AsyncConversationStore:
         view: str = "active",
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Full-text search across this agent's conversations (#2019 grouping).
+        """Full-text search across this agent's conversations (#2019, #2961).
 
-        Backs the conversations pane's server-side search: scans up to
-        ``SEARCH_SESSIONS_SCAN_LIMIT`` newest live rows (``view='archived'``
-        scans archived ones), decrypts client-side — SQL LIKE cannot see
-        encrypted content, same constraint as ``search_history`` — resolves
-        canonical content (#1402), and returns newest-first session summaries
-        whose content or title matches, via :func:`search_session_summaries`.
+        Backs the conversations pane's server-side search. Matching necessarily
+        decrypts client-side — SQL ``LIKE`` cannot see encrypted content, the
+        same constraint ``search_history`` works under — and resolves canonical
+        content (#1402) so a hit is against the raw user turn rather than the
+        transport bytes it was replayed as.
+
+        Returns newest-first session summaries, at most ``limit`` of them,
+        decorated with ``match_count`` / ``match_role`` / ``match_snippet``.
+
+        **Search is the list, filtered.** For the active view the sessions come
+        out of the #2959 projection in the order the list pages them, shaped by
+        the same function — so a session that search finds is one paging
+        reaches, and the counts and previews beside it are the list's own rather
+        than a second derivation's. Before this they were two derivations with
+        two different horizons, 1,000 rows and 5,000, neither a retention policy
+        anyone chose; a session outside either was simply absent from that
+        surface with nothing to say so.
+
+        The archived view has no table yet (#3062), so it still derives its
+        sessions by grouping — over *every* archived row, with no cap, exactly
+        as the archived list does.
         """
+        bounded = max(1, int(limit))
         if view == "archived":
-            archive_clause = "archived_at IS NOT NULL"
-        else:
-            archive_clause = "archived_at IS NULL"
+            return await self._search_archived_sessions(query, bounded)
+        terms = SearchTerms.compile(query)
+        if terms is None:
+            return []
+        return await self._search_active_sessions(terms, bounded)
+
+    async def _search_archived_sessions(
+        self, query: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Search the archived view, by grouping — the membership with no table.
+
+        No row cap, and that is the point: the archived list reads its rows
+        uncapped for the same reason (#2960), so capping here would put a
+        conversation in the archive list that no query could find. The cost is
+        proportional to what the user chose to archive, which is a set they
+        control, rather than to history, which grows on its own.
+        """
+        from .conversation_sessions import archived_history_predicate, canonical_order
+
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata, created_at, rendered_content "
             "FROM conversation_history "
-            f"WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause} "
-            "ORDER BY id DESC LIMIT ?",
-            (self.agent_id, self.SEARCH_SESSIONS_SCAN_LIMIT),
+            f"WHERE agent_id = ? AND {archived_history_predicate()} "
+            f"{canonical_order(self.db.backend_type)}",
+            (self.agent_id,),
+        )
+        normalized = [await self._normalized_search_row(row) for row in rows]
+        return search_session_summaries(
+            normalized, query, names=await self._search_names(), limit=limit
         )
 
-        normalized: List[Dict[str, Any]] = []
-        for row in reversed(rows):  # oldest-first for the shared grouper
-            row_id = row[0]
-            meta = json.loads(row[3]) if row[3] else None
-            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+    async def _search_active_sessions(
+        self, terms: SearchTerms, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Search the active view by walking the sessions table (#2961).
 
-            # Opportunistic per-agent key migration, as in search_history.
-            if needs_migration and self._migrate_on_read:
-                try:
-                    await self._migrate_message(row_id, content, meta)
-                except Exception as e:
-                    logger.warning(
-                        f"Migration failed for message {row_id} in search_sessions: {e}"
-                    )
+        Three reads, each answering the part it is the authority on:
 
-            # Canonical/transport split (#1402): match and snippet against the
-            # raw user turn, never the rendered transport bytes.
-            content, _ = await self._resolve_canonical(
-                row_id, row[1], meta, content, row[5]
+        * the **projection**, paged newest-first exactly as the list pages it,
+          which decides both which sessions exist and what order they come in;
+        * the **membership map**, which says which rows each of those sessions
+          is made of — the grouper's answer, because 473 of Emma's 1,522 live
+          rows carry no ``session_id`` and only gap arithmetic can place them;
+        * the **rows themselves**, decrypted, but only for the sessions the walk
+          actually reaches.
+
+        **What it costs, measured rather than hoped.** The decryption is
+        proportional to the answer — the walk stops at ``limit`` matches, so an
+        ordinary query reads a step's worth of rows rather than 5,000 — but the
+        map is not: it is the whole live history, every time, at about 5.4
+        microseconds a row on SQLite (measured: 81 ms at 15,000 live rows,
+        323 ms at 60,000, 671 ms at 120,000 — linear).
+
+        So this is NOT cheaper than the 5,000-row scan it replaces on a large
+        history, and saying otherwise would be the kind of claim this epic keeps
+        finding underneath its bugs. That scan was cheap because it was bounded,
+        and bounded is what made 34% of a real agent's conversations unfindable.
+        The cheapest complete alternative — scan every row WITH its content and
+        group once — costs strictly more than this, because it adds the content
+        and the decryption to the same pass. #3075 is what would make the map
+        proportional to the page instead of to history.
+
+        The walk is retried, not resumed, when the projection moves under it.
+        See :meth:`_walk_for_matches` for why a search cannot inherit the list's
+        tolerance for that.
+        """
+        from .conversation_sessions import ConversationSessionProjection
+
+        projection = ConversationSessionProjection(self.db, self.agent_id)
+        names = await self._search_names()
+        for _ in range(_PAGE_ATTEMPTS):
+            walked = await self._walk_for_matches(projection, terms, names, limit)
+            if walked is not None:
+                return walked
+        raise ProjectionNotReady(
+            f"{self.agent_id}'s conversation index was rebuilt underneath "
+            f"{_PAGE_ATTEMPTS} attempts to search it"
+        )
+
+    async def _walk_for_matches(
+        self,
+        projection,
+        terms: SearchTerms,
+        names: Dict[str, str],
+        limit: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One walk of the table, or ``None`` if the projection moved under it.
+
+        **A walk of several pages has to be a walk of ONE projection.** The list
+        tolerates a repair between its pages and says so: a session whose
+        activity moves across the cursor mid-walk can be shown twice or not at
+        all, which is a visible oddity in a list the user is scrolling. Search
+        cannot inherit that tolerance, because the same event produces a
+        different kind of wrong answer. Measured, not reasoned about: an old
+        session holding the only match receives a new, non-matching message and
+        another request repairs the projection between two pages. Its
+        ``last_message_at`` moves AHEAD of this walk's cursor, so no later page
+        can reach it — and the search returns *no matches* for a conversation
+        that plainly matches, with nothing in the response to say a page was
+        skipped. Silence is the answer search gives when it finds nothing, so
+        there is no shape left for "and also I lost your cursor".
+
+        So every page is required to come from the revision the first page
+        established, and the walk starts again from the top when it is not. The
+        revision moves only when a repair WRITES it — ordinary appends do not
+        touch it — so this is rare, and starting again is honest where resuming
+        would be a guess about where the cursor now points.
+
+        **What the fence covers, and what it does not.** It covers what the
+        projection describes — which rows exist, in which session, live or not.
+        It does not cover a row's BODY: ``content`` and ``rendered_content`` are
+        deliberately outside the change stamp (see ``conversation_sessions``'
+        ``_DERIVED_FROM``), because watching them would make every
+        re-encryption rebuild the projection, which is the cost that table
+        exists to remove.
+
+        That is sound rather than convenient, and it rests on a fact about the
+        writers rather than on the fence. Three paths rewrite a body in place,
+        and none can move a query term BETWEEN sessions: ``_migrate_message``
+        re-encrypts the same plaintext; ``_migrate_split_sent_form`` moves the
+        transport bytes into their own column and leaves the canonical text this
+        matches against unchanged; ``salvage._mark_durable_folded`` writes a
+        summary into one marker row, in place, in its own session. A body edit
+        can therefore make a session start or stop matching mid-walk, which is
+        an ordinary later truth about a live corpus and the same thing an append
+        does — it cannot make a session that matched throughout come back
+        unmatched. **A writer that edits bodies across sessions in one statement
+        would break that, and there is no fence here that would notice.**
+
+        The map is read AFTER the first page, which repairs, and re-read on
+        every restart for the same reason. The projection is then no newer than
+        the map, so every session the walk can return has its rows in it. The
+        reverse order would leave a conversation written between the two reads
+        listed but unsearchable. A session the map has no entry for — one
+        appended under the walk, or one that exists only as its ``new_session``
+        marker — can still match on its title, and matches on nothing else.
+        """
+        from .conversation_sessions import live_history_predicate
+
+        snapshot = None
+        membership: Optional[Dict[str, List[Any]]] = None
+        results: List[Dict[str, Any]] = []
+        after: Optional[Tuple[Any, ...]] = None
+
+        while len(results) < limit:
+            page, standing = await self._page_a_whole_projection(
+                projection,
+                limit=self.SEARCH_SESSION_STEP,
+                after=after,
+                refresh=snapshot is None,
             )
+            if snapshot is None:
+                snapshot = standing
+            elif standing.fence != snapshot.fence:
+                return None
+            if not page:
+                break
+            # After the page, not before it: an agent whose projection is empty
+            # has nothing to search, and reading its whole history to discover
+            # that would be the one cost this walk can avoid paying.
+            if membership is None:
+                membership = await self._live_membership(snapshot.target)
 
-            cleaned_meta = remove_enc_flag(meta)
-            if cleaned_meta:
-                cleaned_meta.pop('key_version', None)
+            matched: List[Tuple[Dict[str, Any], Optional[str], Dict[str, Any]]] = []
+            for batch in _within_row_budget(
+                page, membership, self.SEARCH_CONTENT_BATCH
+            ):
+                bodies = await self._search_rows(
+                    [
+                        row_id
+                        for row in batch
+                        for row_id in membership.get(row["session_id"], ())
+                    ]
+                )
+                for row in batch:
+                    name = names.get(row["session_id"])
+                    decoration = session_match_decoration(
+                        [
+                            bodies[row_id]
+                            for row_id in membership.get(row["session_id"], ())
+                            if row_id in bodies
+                        ],
+                        name,
+                        terms,
+                    )
+                    if decoration is not None:
+                        matched.append((row, name, decoration))
+                if len(results) + len(matched) >= limit:
+                    break
 
-            normalized.append({
-                "id": row_id,
-                "role": row[1],
-                "content": content,
-                "metadata": cleaned_meta if cleaned_meta else {},
-                "created_at": row[4],
-            })
+            # Previews for the matches only. The list resolves one per listed
+            # session; here most of what the walk looked at is not listed, and
+            # fetching a preview for it would pay the list's cost for rows
+            # nobody is going to see.
+            previews = await self._preview_rows(
+                [
+                    row["first_user_message_id"]
+                    for row, _, _ in matched
+                    if row["first_user_message_id"] is not None
+                ],
+                live_history_predicate(),
+            )
+            for row, name, decoration in matched:
+                session = self._as_listed_session(row, previews)
+                if name is not None:
+                    session["name"] = name
+                session.update(decoration)
+                results.append(session)
+                if len(results) >= limit:
+                    break
 
+            if len(page) < self.SEARCH_SESSION_STEP:
+                break
+            # No `sort_sessions` on the way out, and that is deliberate: these
+            # arrive in the projection's own order, which IS the list's order.
+            # Re-sorting would be a second spelling of it, and a second spelling
+            # is what let search and the list disagree about which session made
+            # the page before (round-8/9 review of #2960).
+            after = session_cursor_values(self._as_listed_session(page[-1], {}))
+
+        # The other end of the same boundary. The frontier above keeps rows that
+        # ARRIVED after the snapshot out of the answer; this asks whether any row
+        # already inside it MOVED — archived, trashed, restored, re-grouped — in
+        # which case the summaries and the rows no longer describe one history
+        # and the walk starts again. It is one question asked once at the end
+        # rather than per read, because holding for the whole walk is what has to
+        # be true, and three primary-key reads is what asking costs.
+        if membership is not None and not await projection.unchanged_below(snapshot):
+            return None
+        return results
+
+    async def _live_membership(self, through: int) -> Dict[str, List[Any]]:
+        """``{session_id: [row id, ...]}`` for this agent's live history.
+
+        ``through`` is the ``conversation_history.id`` frontier the projection
+        has accounted for, and this read stops there. **Not an optimization — a
+        correctness requirement.** The summaries come out of the projection and
+        the matching comes out of these rows, so if the two describe different
+        frontiers one result carries both: measured, a session returned with
+        ``message_count: 1`` and a snippet from the second message, because the
+        append landed between the page read and this one (codex R2 P2). Bounded
+        here, the rows a query is matched against are exactly the rows the count
+        beside it was computed from.
+
+        A message appended DURING a search is therefore not found by that
+        search. That is the same lag the list already has — the projection is a
+        cache and may be behind — and the next query repairs before it walks, so
+        it is one query wide.
+
+        Unbounded in the other direction on purpose, and it has to be: a row
+        carrying no ``session_id`` belongs to whichever cluster it falls next
+        to, and that is decided by the rows before it. A read windowed at the
+        RECENT end would attribute the rows at its edge to sessions that merely
+        look like theirs — which is the failure the 5,000-row scan this replaces
+        had, silently. A frontier is not that window: it is the same cut the
+        projection made, so both sides stop in the same place.
+
+        The read is the light one — no ``content``, no decryption — and it is
+        the same statement and the same derivation the projection's own
+        transcript pass uses, so a row is in the session here that the
+        projection describes there.
+        """
+        from .conversation_sessions import (
+            TRANSCRIPT_PASS_NOISY_ROWS,
+            live_transcript_sql,
+            transcript_membership,
+        )
+
+        rows = await self.db.fetchall(
+            live_transcript_sql(self.db.backend_type, through=True),
+            (self.agent_id, through),
+        )
+        # Said out loud for the same reason the projection's transcript pass
+        # says it, and against the same threshold — it is the same read over the
+        # same rows, so "how large is worth mentioning" is one question, not two.
+        #
+        # The message says only what is true of EVERY search: the map covers the
+        # whole history. It deliberately does not blame unstamped rows the way
+        # the projection's pass does, because this read is taken whether or not
+        # any exist — the attribution has to be the grouper's, and the grouper
+        # needs the transcript. #3075 is the ticket for making it proportional
+        # to the page.
+        if len(rows) >= TRANSCRIPT_PASS_NOISY_ROWS:
+            logger.warning(
+                "search_sessions: %s's search attributed all %d of its live "
+                "rows to sessions, because which session a row belongs to is "
+                "decided by the rows before it and the map is built for the "
+                "whole history rather than for the page (#3075). Search "
+                "latency for this agent grows with its history.",
+                self.agent_id,
+                len(rows),
+            )
+        return transcript_membership(rows)
+
+    async def _search_rows(
+        self, message_ids: Sequence[Any]
+    ) -> Dict[Any, Dict[str, Any]]:
+        """``{id: normalized row}`` for the rows a search step has to read.
+
+        By primary key, in batches, scoped to this agent and to the membership
+        the projection describes — so a map entry pointing at a row that has
+        since been deleted or archived resolves to nothing rather than letting a
+        search match content the list no longer shows.
+        """
+        from .conversation_sessions import live_history_predicate
+
+        rows: Dict[Any, Dict[str, Any]] = {}
+        ids = list(message_ids)
+        for start in range(0, len(ids), self.SEARCH_CONTENT_BATCH):
+            batch = ids[start : start + self.SEARCH_CONTENT_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            raw = await self.db.fetchall(
+                "SELECT id, role, content, metadata, created_at, rendered_content "
+                "FROM conversation_history "
+                f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                f"AND {live_history_predicate()}",
+                (self.agent_id, *batch),
+            )
+            for row in raw:
+                rows[row[0]] = await self._normalized_search_row(row)
+        return rows
+
+    async def _normalized_search_row(self, row: Sequence[Any]) -> Dict[str, Any]:
+        """One history row decrypted and canonicalized, as search matches it.
+
+        ``row`` is ``(id, role, content, metadata, created_at,
+        rendered_content)``. Both search paths normalize through here, so the
+        text a query is compared against is the same text whichever path found
+        the row.
+
+        **This one does not migrate**, and the other read paths still do. They
+        read what a user asked to see; this reads whatever it has to in order to
+        answer whether a word appears, which since #2961 is bounded by the query
+        rather than by 5,000 rows. Opportunistically rewriting every row it
+        touched would make one search of a legacy history a bulk UPDATE of it —
+        tens of thousands of serialized writes on the corpus #3075 was filed
+        against — inside a request the user made by typing in a box.
+
+        It would also be a write inside this walk's own consistency fence. A
+        rewritten row whose metadata is malformed compares unequal on the raw
+        text (measured: valid JSON is unchanged, ``not json at all`` bumps the
+        stamp), so the scan would move the change stamp it is about to check and
+        restart itself. A read that invalidates its own snapshot is not a
+        contract worth keeping.
+
+        The rows still migrate: the one-shot backfill in
+        ``security/encryption_backfill.py`` does it deliberately, and every path
+        that shows a message to someone does it on the way past.
+        """
+        row_id, role = row[0], row[1]
+        meta = parse_message_metadata(row[3])
+        content, _needs_migration = self._decrypt_with_fallback(row[2], meta)
+
+        # Canonical/transport split (#1402): match and snippet against the
+        # raw user turn, never the rendered transport bytes.
+        content, _ = await self._resolve_canonical(
+            row_id, role, meta, content, row[5], migrate=False
+        )
+
+        cleaned_meta = remove_enc_flag(meta)
+        if cleaned_meta:
+            cleaned_meta.pop('key_version', None)
+        return {
+            "id": row_id,
+            "role": role,
+            "content": content,
+            "metadata": cleaned_meta if cleaned_meta else {},
+            "created_at": row[4],
+        }
+
+    async def _search_names(self) -> Dict[str, str]:
+        """User-assigned titles, best-effort — they decorate, they never gate."""
         try:
-            names = await self.get_conversation_names()
-        except Exception as e:  # titles are best-effort decoration
+            return await self.get_conversation_names()
+        except Exception as e:
             logger.warning(f"search_sessions: name lookup failed: {e}")
-            names = {}
-
-        return search_session_summaries(normalized, query, names=names, limit=limit)
-
+            return {}
     async def clear_history(self) -> None:
         """Soft-delete every live message for this agent (#763).
 
@@ -3137,6 +3872,24 @@ class AsyncConversationStore:
         ``list_conversations`` tool and the UI never disagree on where one
         conversation ends and the next begins.
 
+        **Audited under #2961 and deliberately left on the grouper.** It has no
+        table to read, for two independent reasons, and neither is fixed by
+        pointing it at one:
+
+        * its membership is not the projection's. The read below excludes only
+          *deleted* rows, so an archived conversation is in this list and is not
+          in ``conversation_sessions`` — and with ``include_trashed`` the
+          membership is Trash, which nothing projects.
+        * it has no horizon to remove. The read is unbounded (``limit`` bounds
+          the sessions returned, not the rows examined), so the defect #2948 was
+          filed about — a fixed row window putting 34% of conversations out of
+          reach — was never present here.
+
+        That the agent's list mixes archived conversations in with active ones
+        while the UI's does not is a real difference between the two surfaces.
+        It is a question about what this tool should show, not about where it
+        should read from, so it is named here rather than changed in passing.
+
         Args:
             limit: maximum number of sessions to return, most-recent first.
             include_trashed: when True, list soft-deleted (Trash) sessions
@@ -3170,6 +3923,281 @@ class AsyncConversationStore:
             # <retrieved_context>.../<user_input>... replay wrappers.
             preview_transform=extract_raw_user_content,
         )
+
+    async def list_session_page(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One page of the active conversation list, from the sessions table.
+
+        Phase C of #2948, and the read the epic exists for. What this replaces
+        fetched a fixed window of ``conversation_history`` — ``limit * 20``
+        rows, capped at 1000 — and grouped whatever fell inside it. Measured on
+        Emma's live database, 34% of her conversations were outside that window
+        and no ``limit`` could reach them, because the cap was a constant rather
+        than a function of the request. Here the bound is the page and the
+        continuation is a key, so every session is reachable by asking again.
+
+        Returns ``{"sessions": [...], "next_cursor": str | None}``. The session
+        dicts carry exactly the fields the shared grouper emits — including the
+        undecorated ``preview_content`` / ``preview_metadata`` /
+        ``preview_wake_source`` triple — so the endpoint decorates one shape
+        whichever path produced it.
+
+        **The preview is a pointer, resolved here, never a stored copy.**
+        ``content`` is ciphertext, so a preview column would be a plaintext copy
+        of encrypted text and a record outliving what it describes (#2948).
+        The projection stores which row the picker chose; this reads that row's
+        body at request time, and a pointer at a row that has since gone
+        resolves to nothing rather than to a stale excerpt.
+
+        **Repair runs on the first page only.** The list must be current, and
+        the projection is a cache that knows how far behind it is — three
+        primary-key reads answer that, at any size of history. Repeating it per
+        page would be work for no answer, and worse: a repair between two pages
+        can move ``last_message_at`` under the cursor, so a page sequence is
+        consistent to the extent that it is read from one repair's output.
+        Keyset pagination over a table the agent is still writing to can still
+        show a session twice or not at all if that session's activity moves
+        across the cursor mid-walk — that is inherent to paging live data, and
+        it is a far smaller window than the one this replaces, in which 34% of
+        sessions could not be shown at all.
+        """
+        from .conversation_sessions import (
+            ConversationSessionProjection,
+            decode_session_cursor,
+            encode_session_cursor,
+            live_history_predicate,
+        )
+
+
+        # Named by the caller, defaulting to the one this store was built for.
+        # Every other method here is bound to ``self.agent_id``, and this one
+        # would be too if its caller were not the privacy wrapper, whose read
+        # methods take the agent as an argument. Ignoring that argument and
+        # answering for a different agent is the one behaviour that must not
+        # happen — the read this replaces scoped its SQL to the value it was
+        # given, so silently substituting another agent's would report an empty
+        # list rather than refusing.
+        agent = agent_id or self.agent_id
+        bounded = max(1, int(limit))
+        after = decode_session_cursor(cursor, "active") if cursor else None
+        projection = ConversationSessionProjection(self.db, agent)
+        # One more than asked for, which is how "is there another page" is
+        # answered without a second query and without a COUNT over the whole
+        # table — the cost this table exists to remove.
+        rows, _ = await self._page_a_whole_projection(
+            projection, limit=bounded + 1, after=after, refresh=after is None
+        )
+        has_more = len(rows) > bounded
+        rows = rows[:bounded]
+
+        previews = await self._preview_rows(
+            [
+                row["first_user_message_id"]
+                for row in rows
+                if row["first_user_message_id"] is not None
+            ],
+            live_history_predicate(),
+            agent_id=agent,
+        )
+        sessions = [self._as_listed_session(row, previews) for row in rows]
+        next_cursor = (
+            encode_session_cursor(sessions[-1], "active")
+            if has_more and sessions
+            else None
+        )
+        return {"sessions": sessions, "next_cursor": next_cursor}
+
+    async def _whole_watermark(self, projection):
+        """This projection's watermark if it describes the WHOLE history, else None.
+
+        Three questions, and all three have to hold before a page read means
+        anything:
+
+        * **valid** — something has been accounted for at all. All-zero is both
+          "never built" and "built over an empty history", and only the flag
+          separates them.
+        * **complete** — the walk reached its target. A part-walked projection
+          holds the OLDEST sessions (the walk goes forward by row id) while the
+          list is ordered by most recent activity, so it is missing the FRONT of
+          the list, not its tail.
+        * **the same generation** — the counters this watermark was compared
+          against are the ones standing now. A recreated cache rotates the
+          generation and leaves the watermark, which is then ``valid`` and
+          ``complete`` about a table that no longer exists; without this the
+          continuation would page an empty cache and call it the end.
+        """
+        accounted = await projection.accounted()
+        if not accounted.valid or not accounted.complete:
+            return None
+        if accounted.generation != await projection.observed_generation():
+            return None
+        return accounted
+
+    async def _page_a_whole_projection(
+        self, projection, *, limit: int, after, refresh: bool
+    ) -> Tuple[List[Dict[str, Any]], Any]:
+        """Read one page, having established the projection was whole THROUGHOUT.
+
+        Returns ``(rows, watermark)`` — the page, and what the projection it came
+        out of had accounted for. The watermark is returned rather than left
+        inside because a page carries two things a caller cannot ask for
+        afterwards without a gap in which the answer changes:
+
+        * its ``fence``, so a caller walking further than one page can require
+          that every page came from the same projection — one page being
+          self-consistent does not make a SEQUENCE of pages one read;
+        * its ``target``, which is the ``conversation_history.id`` frontier
+          these summaries describe. A caller that then reads ROWS — search does
+          — has to read the same rows the summaries were computed from, or it
+          reports one snapshot's count beside another snapshot's content.
+
+        The check and the read are one observation, not two. A repair started by
+        another request between them clears the table and commits chunks as it
+        goes, so a page read in that window is a partial one — and its last row
+        comes back with ``next_cursor: null``, which is a truncated list wearing
+        the shape of a complete one. So the watermark is read before and after
+        and required to be identical: it moves only when a repair writes it, and
+        that is exactly the concurrency this cannot tolerate. Ordinary appends
+        do not move it, so a page read beside a live conversation is unaffected.
+
+        ``refresh`` is page one, which repairs first so the list reflects
+        messages written since the last request. A continuation does not, on
+        purpose: repairing moves ``last_message_at``, and a keyset cursor
+        resumed against moved keys skips rows. It DOES repair when the
+        projection is not whole — the cursor is meaningless over a partial table
+        anyway, and refusing without repairing would make the 503 unclearable,
+        since only page-one requests would ever advance the walk.
+        """
+        for _ in range(_PAGE_ATTEMPTS):
+            before = await self._whole_watermark(projection)
+            if refresh or before is None:
+                await self._repair_until_whole(projection)
+                before = await self._whole_watermark(projection)
+                if before is None:
+                    # Whole a moment ago and not whole now: another repair got
+                    # in between. Try again rather than raise — the loop below
+                    # is where giving up lives, and a repair that has just
+                    # started will have finished by the next attempt.
+                    continue
+            rows = await projection.page(limit=limit, after=after)
+            # The SAME question afterwards, and it turns on the REVISION rather
+            # than on the watermark's fields. Two reasons, and the second is why
+            # the column exists:
+            #
+            # * a generation rotation leaves the watermark row untouched, so a
+            #   cache recreated under the read would pass a field comparison;
+            # * `rebuild()` over an unchanged history invalidates, discards
+            #   every row, walks, and lands on a watermark identical to the one
+            #   it replaced — field for field. A page read during that walk is
+            #   partial, and a field comparison certifies it. ABA.
+            #
+            # The revision only ever increases, so neither can hide.
+            after_read = await self._whole_watermark(projection)
+            if after_read is not None and after_read.fence == before.fence:
+                return rows, before
+        raise ProjectionNotReady(
+            f"{projection.agent_id}'s conversation index was rebuilt underneath "
+            f"{_PAGE_ATTEMPTS} attempts to read a page of it"
+        )
+
+    async def _repair_until_whole(
+        self, projection, *, passes: int = REPAIR_PASSES
+    ) -> None:
+        """Repair until the walk has reached its target, or refuse to serve.
+
+        A repair is budgeted — ``STEP_BUDGET`` chunks of ``CHUNK_ROWS`` — and
+        may legitimately stop part-way on a history bigger than that product.
+        The projection is then *partial*, and partial is not "a bit behind":
+        the walk goes forward by row id, so what it has written is the OLDEST
+        sessions, and the list is ordered by most recent activity. A partial
+        projection is therefore missing the FRONT of the list — the
+        conversations the user is most likely looking for — and it says so
+        nowhere: the last page comes back with ``next_cursor: null``, which
+        reads as the end of a list that is missing its beginning.
+
+        So this loops rather than serving what happens to be there, and if the
+        walk still has not landed it refuses. That is a worse answer for the
+        request and the only honest one: an error says the list is not ready,
+        while a truncated list says these are your conversations.
+
+        ``accounted().complete`` is the question, not ``RepairOutcome.current``.
+        They differ in the case that matters: a row arriving DURING a repair
+        makes ``current`` false while the walk has reached its target perfectly
+        well, and that is the ordinary state of an agent being written to. Only
+        an unfinished WALK leaves a hole.
+        """
+        for _ in range(max(1, int(passes))):
+            await projection.repair()
+            if await self._whole_watermark(projection) is not None:
+                return
+        raise ProjectionNotReady(
+            f"{projection.agent_id}'s conversation index is still being built; "
+            "serving it now would list the oldest conversations and omit the "
+            "newest, with nothing to say so"
+        )
+
+    async def _preview_rows(
+        self,
+        message_ids: List[Any],
+        membership: str,
+        *,
+        agent_id: Optional[str] = None,
+    ) -> Dict[Any, Tuple[Any, Dict[str, Any]]]:
+        """``{id: (content, metadata)}`` for the rows a page previews.
+
+        One statement for the whole page rather than one per row: a list of 50
+        is 50 round trips otherwise, which on the read path is the cost the
+        projection just removed reappearing one layer up.
+
+        Scoped to this agent AND to the membership the projection describes, so
+        a pointer at a row that has since been deleted or archived resolves to
+        nothing. That is the designed direction — the pointer is a *detectable*
+        stale state, and the change stamp has already moved, so the next repair
+        replaces it.
+        """
+        if not message_ids:
+            return {}
+        placeholders = ",".join("?" for _ in message_ids)
+        rows = await self.db.fetchall(
+            "SELECT id, content, metadata FROM conversation_history "
+            f"WHERE agent_id = ? AND id IN ({placeholders}) AND {membership}",
+            (agent_id or self.agent_id, *message_ids),
+        )
+        return {
+            row[0]: (row[1], parse_message_metadata(row[2])) for row in rows
+        }
+
+    @staticmethod
+    def _as_listed_session(
+        row: Dict[str, Any], previews: Dict[Any, Tuple[Any, Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        """One projection row shaped exactly as the grouper shapes a session.
+
+        The timestamps are re-spelled with ``isoformat()`` because that is what
+        the grouper emits and therefore what every consumer of this endpoint
+        has always received — the browser parses it, and the projection holds
+        the column's own spelling instead (canonical text on SQLite, a
+        ``datetime`` on PostgreSQL, which would serialize as neither). A value
+        that cannot be read is passed through as text rather than dropped: it is
+        wrong to show, but it is what the row says, and a ``None`` here would
+        move the session to the end of the list on the strength of a spelling.
+        """
+        content, metadata = previews.get(row["first_user_message_id"], (None, {}))
+        return {
+            "session_id": row["session_id"],
+            "started_at": iso_session_timestamp(row["started_at"]),
+            "last_message_at": iso_session_timestamp(row["last_message_at"]),
+            "message_count": row["message_count"],
+            "user_message_count": row["user_message_count"],
+            "preview_content": content,
+            "preview_metadata": metadata,
+            "preview_wake_source": row["wake_source"],
+        }
 
     async def count_session_messages(
         self, session_id: str, deleted_filter: str = "all"

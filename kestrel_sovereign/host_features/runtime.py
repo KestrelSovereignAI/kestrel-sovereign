@@ -179,13 +179,36 @@ async def start_host_features(
     their sanitized wrapper crosses intact with the original failure chained.
     """
     runtime = _host_contribution_runtime(ctx)
-    prepared = runtime.prepare_transition(features)
-    by_feature = {id(item.feature): item for item in prepared}
+    transition = runtime.prepare_transition(features)
+    for rejection in transition.rejected:
+        # Loud, and never silent: a host feature that did not load must not be
+        # mistaken for one that loaded and did nothing (issue #2951).
+        logger.error(
+            "Host feature %s did not load — %s",
+            rejection.feature_name,
+            rejection.reason,
+        )
+    # Merged, not overwritten. Repeated calls against one context are
+    # supported (`previously_started`), and a plain assignment made health stop
+    # reporting feature A the moment a later call started feature B cleanly.
+    # A prior rejection is superseded only for a feature THIS call carried —
+    # its verdict now comes from this transition (#2951).
+    # Superseded by stable NAME, not object id: a fixed feature is retried as a
+    # freshly constructed instance, so an id-keyed match never fires and health
+    # goes on reporting a now-live feature as not loaded (#2951).
+    carried = {item.feature_name for item in transition.accepted} | {
+        rejection.feature_name for rejection in transition.rejected
+    }
+    ctx.rejected_host_feature_contributions = tuple(
+        rejection
+        for rejection in getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+        if rejection.feature_name not in carried
+    ) + tuple(transition.rejected)
     previously_started = tuple(getattr(ctx, "started_host_features", ()))
     started: List[HostFeature] = []
-    for feature in features:
+    for feature, prepared_item in transition.activatable(features):
         try:
-            runtime.activate(by_feature[id(feature)])
+            runtime.activate(prepared_item)
         except Exception as exc:
             # A declarative commit failure is not an optional imperative
             # lifecycle failure. Reverse the already-started prefix and reject
@@ -198,7 +221,23 @@ async def start_host_features(
         try:
             await feature.on_host_start(ctx)
         except Exception as exc:  # noqa: BLE001 - isolate a reversible failure
-            logger.warning("Host feature %s on_host_start failed: %s", feature, exc)
+            # ERROR, and recorded where health reads it. A feature dropped here
+            # is dropped WHOLE -- no router, no panel, no service -- and every
+            # downstream consumer then sees an empty list rather than an error.
+            # #3058: WorkflowsHostFeature's start hook refused a host with no
+            # database, the feature vanished, Talon's router refused without
+            # it, and /health went on reporting ok over an entire missing
+            # operator run plane. A start-hook failure is the same fact as a
+            # contribution rejection -- the feature is not loaded -- so it goes
+            # through the same door rather than getting a second one.
+            logger.error(
+                "Host feature %s did not start — %s",
+                _host_feature_name(feature),
+                exc,
+            )
+            _record_host_feature_rejection(
+                ctx, feature, f"on_host_start failed: {exc}"
+            )
             try:
                 runtime.deactivate(feature)
             except Exception:  # noqa: BLE001 - unsafe rollback cannot be hidden
@@ -225,6 +264,38 @@ async def start_host_features(
         raise
     ctx.started_host_features = (*previously_started, *started)
     return started
+
+
+def _host_feature_name(feature: Any) -> str:
+    """The stable name health reports a feature under.
+
+    Matches what ``prepare_transition`` records, so a start-hook rejection and
+    a contribution rejection for the same feature supersede each other by name
+    rather than accumulating two entries that disagree.
+    """
+    name = getattr(feature, "name", None) or type(feature).__name__
+    return str(name)
+
+
+def _record_host_feature_rejection(ctx: Any, feature: Any, reason: str) -> None:
+    """File a not-loaded verdict where ``/health/detailed`` reads it."""
+    from kestrel_sovereign.features.contribution_runtime import (
+        ContributionRejection,
+    )
+
+    # Appended, not deduplicated. A prior verdict for this feature was already
+    # dropped by the `carried` filter at the top of this call -- the name is in
+    # the transition either way -- so a second pass here could not change an
+    # outcome, and a guard that cannot is one nothing can test.
+    ctx.rejected_host_feature_contributions = tuple(
+        getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+    ) + (
+        ContributionRejection(
+            feature=feature,
+            feature_name=_host_feature_name(feature),
+            reason=reason,
+        ),
+    )
 
 
 async def _rollback_started_host_features(

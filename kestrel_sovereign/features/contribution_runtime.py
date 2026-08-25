@@ -28,7 +28,12 @@ from kestrel_sovereign.operator import (
     OperatorRegistrationSet,
     OperatorRuntimeRegistry,
 )
-from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+from kestrel_sovereign.signals import (
+    CLAIM_CONTRIBUTION,
+    RegistrationPolicy,
+    RegistrationState,
+    SourceRegistry,
+)
 from kestrel_sovereign.waits import WaitRegistry
 
 
@@ -207,6 +212,74 @@ class PreparedFeatureContributions:
 
 
 @dataclass(frozen=True, slots=True)
+class ContributionRejection:
+    """One feature refused activation, and why — reported, never silent."""
+
+    feature: object
+    feature_name: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTransition:
+    """The prospective active set: what may activate, and what was refused.
+
+    A collision with an ALREADY-registered key is a capability gap for the
+    offending feature, not an identity gap for the agent, so it must not be
+    able to abort boot for every agent on the host (issue #2951). The rejected
+    features are carried here rather than raised, and
+    :meth:`activatable` derives the pairing every caller needs so none of them
+    has to remember to skip a rejected feature.
+    """
+
+    accepted: tuple[PreparedFeatureContributions, ...] = ()
+    rejected: tuple[ContributionRejection, ...] = ()
+
+    def activatable(
+        self, features: Iterable[object]
+    ) -> tuple[tuple[object, PreparedFeatureContributions], ...]:
+        """``(feature, prepared)`` for exactly the features that may activate.
+
+        Callers used to build ``{id(item.feature): item}`` and index into it
+        per feature, which raises ``KeyError`` the moment a feature is excluded.
+        Deriving the list here means a new call site cannot forget the skip —
+        the pairing simply does not contain what must not be activated.
+        """
+        by_feature = {id(item.feature): item for item in self.accepted}
+        return tuple(
+            (feature, by_feature[id(feature)])
+            for feature in features
+            if id(feature) in by_feature
+        )
+
+    def only(self) -> PreparedFeatureContributions:
+        """The single accepted item — or raise the rejection that refused it.
+
+        The one-feature paths (registering or enabling a named feature) are not
+        the boot batch: the caller asked for exactly this feature, and there is
+        no fleet to keep up by continuing without it. A rejection there IS that
+        operation's failure, so it surfaces as one.
+        """
+        if self.rejected:
+            raise FeatureContributionRuntimeError(self.rejected[0].reason)
+        return self.accepted[0]
+
+    def rejection_for(self, feature: object) -> ContributionRejection | None:
+        """The rejection recorded for *feature*, if it was refused."""
+        for rejection in self.rejected:
+            if rejection.feature is feature:
+                return rejection
+        return None
+
+    def __iter__(self):
+        """Iterate the ACCEPTED set, so ``for item in prepared`` still reads true."""
+        return iter(self.accepted)
+
+    def __len__(self) -> int:
+        return len(self.accepted)
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveFeatureContributions:
     """The exact teardown capability retained for one active lifecycle."""
 
@@ -250,10 +323,14 @@ class FeatureContributionRuntime:
         )
         self._active: dict[int, ActiveFeatureContributions] = {}
 
-    def prepare_transition(
-        self, features: Iterable[object]
-    ) -> tuple[PreparedFeatureContributions, ...]:
-        """Collect once and validate a complete prospective active set."""
+    def prepare_transition(self, features: Iterable[object]) -> PreparedTransition:
+        """Collect once and validate a complete prospective active set.
+
+        Returns what may activate AND what was refused. A feature clashing with
+        an already-registered key is excluded rather than raised, so one stale
+        third-party package cannot abort boot for every agent on the host
+        (issue #2951).
+        """
 
         feature_values = tuple(features)
         if len({id(feature) for feature in feature_values}) != len(feature_values):
@@ -279,8 +356,14 @@ class FeatureContributionRuntime:
                 failing.feature,
                 "validate_contribution_owner_uniqueness",
             ) from exc
-        self._preflight_keys(prepared, validate_setup_order=True)
-        return prepared
+        rejections = self._preflight_keys(prepared, validate_setup_order=True)
+        refused = {id(rejection.feature) for rejection in rejections}
+        return PreparedTransition(
+            accepted=tuple(
+                item for item in prepared if id(item.feature) not in refused
+            ),
+            rejected=rejections,
+        )
 
     def activate(
         self, prepared: PreparedFeatureContributions
@@ -298,7 +381,12 @@ class FeatureContributionRuntime:
                 prepared.owner,
             ]
         )
-        self._preflight_keys((prepared,), validate_setup_order=False)
+        # One feature, committing now: a clash here IS this activation's
+        # failure and belongs to the caller that asked for it. The per-feature
+        # transaction boundary is unchanged — only the whole-set gate moved.
+        rejections = self._preflight_keys((prepared,), validate_setup_order=False)
+        if rejections:
+            raise FeatureContributionRuntimeError(rejections[0].reason)
 
         values = prepared.contributions
         operator_set: OperatorRegistrationSet | None = None
@@ -321,10 +409,20 @@ class FeatureContributionRuntime:
                 for source in workflow.sources
             )
             if sources:
-                self.source_registry.register_batch(
-                    sources, RegistrationPolicy.MANDATORY
-                )
-                registered_sources.extend(sources)
+                # The registry records the claim AND reports what this
+                # activation acquired, so the rollback below releases exactly
+                # that — not a claim the feature already held from registering
+                # the same source imperatively (#3053).
+                with self.source_registry.claims_acquired(
+                    prepared.feature
+                ) as acquired:
+                    self.source_registry.register_batch(
+                        sources,
+                        RegistrationPolicy.MANDATORY,
+                        owner=prepared.feature,
+                        role=CLAIM_CONTRIBUTION,
+                    )
+                registered_sources.extend(acquired)
             if values.permission_defaults is not None:
                 candidate_permission_registration = PermissionDefaultRegistration(
                     owner=prepared.owner,
@@ -350,9 +448,12 @@ class FeatureContributionRuntime:
                 self.setup_step_registry.unregister_batch(values.setup_steps)
             if permission_registration is not None:
                 self.permission_defaults_registry.unregister(permission_registration)
-            for source in reversed(registered_sources):
-                if self.source_registry.get(source.name) is source:
-                    self.source_registry.unregister(source.name)
+            # Release exactly what THIS activation acquired: another holder may
+            # already depend on the source, and a claim the feature held before
+            # this activation is not this rollback's to drop (#3053).
+            self.source_registry.release_acquired(
+                list(reversed(registered_sources)), prepared.feature
+            )
             for registration in reversed(registered_waits):
                 self.wait_registry.deregister(
                     registration.name, registration.provider
@@ -415,11 +516,15 @@ class FeatureContributionRuntime:
                 "active feature contribution identity does not match"
             )
         values = active.prepared.contributions
-        sources = tuple(
-            source for workflow in values.workflows for source in workflow.sources
-        )
-
-        # Validate every exact inverse before mutating any registry.
+        # No per-lifecycle source list any more: the registry holds the claims,
+        # so teardown just lets go of what this feature held. A source another
+        # holder still needs simply stays (#3053).
+        # Validate every exact inverse before mutating any registry — the
+        # ownership transfer below included. Handing the source to the heir
+        # before validation meant an UNRELATED mismatch (a missing wait
+        # provider, say) raised after a registry had already been mutated
+        # feature stayed active recording the same source: two owners, and one
+        # more copy appended on every retry (#2951).
         for registration in values.wait_providers:
             if not self.wait_registry.contains(
                 registration.name, registration.provider
@@ -427,8 +532,29 @@ class FeatureContributionRuntime:
                 raise FeatureContributionRuntimeError(
                     "active wait-provider registration identity does not match"
                 )
-        for source in sources:
-            if self.source_registry.get(source.name) is not source:
+        for source in (
+            source
+            for workflow in values.workflows
+            for source in workflow.sources
+        ):
+            # Every successful owner-scoped activation claims each declared
+            # source, equivalent incumbents included — so a MISSING claim is not
+            # "not ours", it is drift. Skipping silently let deactivate() strip
+            # the other capabilities and erase `_active` as though the exact
+            # inverse had succeeded (#3053).
+            if feature not in self.source_registry.owners_of(source.name):
+                raise FeatureContributionRuntimeError(
+                    "active signal-source registration identity does not match"
+                )
+            current = self.source_registry.get(source.name)
+            # CONTRACT, not object identity. A feature holding a claim on an
+            # equivalent incumbent never registered that object, so demanding
+            # `is` rejected a teardown that was entirely correct. What the
+            # inverse actually needs to know is that the source still carries
+            # the contract this claim was granted against (#3053).
+            if current is None or not SourceRegistry.contract_equivalent(
+                current, source
+            ):
                 raise FeatureContributionRuntimeError(
                     "active signal-source registration identity does not match"
                 )
@@ -458,13 +584,15 @@ class FeatureContributionRuntime:
         self.operator_registry.unregister(active.operator_registrations)
         for registration in values.wait_providers:
             self.wait_registry.deregister(registration.name, registration.provider)
-        for source in sources:
-            self.source_registry.unregister(source.name)
         if active.permission_registration is not None:
             self.permission_defaults_registry.unregister(
                 active.permission_registration
             )
         self.setup_step_registry.unregister_batch(values.setup_steps)
+        # Past every validation, in the same mutating stretch as the other
+        # unregistrations: drop this feature's claims. The registry removes each
+        # source only when its last holder lets go.
+        self.source_registry.release_all(feature)
         del self._active[id(feature)]
         return True
 
@@ -614,7 +742,21 @@ class FeatureContributionRuntime:
         prepared: tuple[PreparedFeatureContributions, ...],
         *,
         validate_setup_order: bool,
-    ) -> None:
+    ) -> tuple[ContributionRejection, ...]:
+        """Validate a prospective set. TWO failure classes, resolved differently.
+
+        **Transition-invalid** — two features in this same batch claiming one
+        key, or a setup order the resulting set cannot satisfy. The proposed set
+        is incoherent and there is no subset to prefer, so this still raises.
+
+        **Feature-rejected** — one feature clashing with something ALREADY
+        registered. That is a capability gap for *that feature*; it is not an
+        identity gap for the agent, and it must not abort boot for every agent
+        on the host. Core registers the same generic sources under ``OPTIONAL``
+        ("nothing ever raises"), so the identical collision was survivable on
+        the core path and fatal here (issue #2951). Returned as rejections for
+        the caller to exclude and report.
+        """
         service_refs = []
         workflow_names = []
         wait_names = []
@@ -644,42 +786,77 @@ class FeatureContributionRuntime:
             [registration.name for registration in setup_steps], "setup step name"
         )
 
-        for reference in service_refs:
-            if self.operator_registry.resolve_service(reference) is not None:
-                raise FeatureContributionRuntimeError(
-                    "service registration conflicts with an active service"
-                )
-        for name in workflow_names:
-            if self.operator_registry.get_workflow_registration(name) is not None:
-                raise FeatureContributionRuntimeError(
-                    f"workflow actor already registered: {name}"
-                )
-        for name in wait_names:
-            if self.wait_registry.get(name) is not None:
-                raise FeatureContributionRuntimeError(
-                    f"wait provider already registered: {name}"
-                )
-        for item in prepared:
-            for workflow in item.contributions.workflows:
-                for source in workflow.sources:
-                    SourceRegistry._validate(source)
-                    if self.source_registry.get(source.name) is not None:
-                        raise FeatureContributionRuntimeError(
-                            f"signal source already registered: {source.name}"
-                        )
-        for name in permission_names:
-            if self.permission_defaults_registry.registration(name) is not None:
-                raise FeatureContributionRuntimeError(
-                    f"permission defaults already registered for {name}"
-                )
+        rejections = tuple(
+            ContributionRejection(item.feature, item.feature_name, reason)
+            for item, reason in (
+                (item, self._active_conflict(item))
+                for item in prepared
+            )
+            if reason is not None
+        )
+
         if validate_setup_order:
-            self.setup_step_registry.preflight(tuple(setup_steps))
-        else:
-            for registration in setup_steps:
-                if self.setup_step_registry.get(registration.name) is not None:
-                    raise FeatureContributionRuntimeError(
-                        f"setup step already registered: {registration.name}"
+            # Over the ACCEPTED steps only: a rejected feature never activates,
+            # so its steps are not part of the resulting set and ordering the
+            # batch around them would validate a set that will not exist.
+            refused = {id(rejection.feature) for rejection in rejections}
+            self.setup_step_registry.preflight(
+                tuple(
+                    registration
+                    for item in prepared
+                    if id(item.feature) not in refused
+                    for registration in item.contributions.setup_steps
+                )
+            )
+        return rejections
+
+    def _active_conflict(self, item: PreparedFeatureContributions) -> str | None:
+        """Why ONE feature cannot activate against what is already registered.
+
+        Returns the first reason, or None. Per-feature by construction: the flat
+        key lists above cannot say which feature contributed a colliding name,
+        and a rejection that cannot name its feature cannot exclude it either.
+        """
+        values = item.contributions
+        for registration in values.services:
+            if self.operator_registry.resolve_service(registration.reference) is not None:
+                return "service registration conflicts with an active service"
+        for registration in values.workflows:
+            if self.operator_registry.get_workflow_registration(registration.name) is not None:
+                return f"workflow actor already registered: {registration.name}"
+        for registration in values.wait_providers:
+            if self.wait_registry.get(registration.name) is not None:
+                return f"wait provider already registered: {registration.name}"
+        for workflow in values.workflows:
+            for source in workflow.sources:
+                try:
+                    SourceRegistry._validate(source)
+                except Exception as exc:  # noqa: BLE001 - reject the feature, not the boot
+                    return f"invalid signal source {source.name!r}: {exc}"
+                existing = self.source_registry.get(source.name)
+                if existing is None:
+                    continue
+                # The registry already knows what "the same source" means, and
+                # it is not the NAME. A byte-identical re-registration — the
+                # common case when core and a feature ship the same generic
+                # source through an extraction — is a no-op success under every
+                # declared policy; only a DIFFERENT contract is a clash.
+                if not SourceRegistry.contract_equivalent(existing, source):
+                    return (
+                        "signal source already registered with a different "
+                        f"contract: {source.name}"
                     )
+        if values.permission_defaults is not None:
+            if self.permission_defaults_registry.registration(item.feature_name) is not None:
+                return f"permission defaults already registered for {item.feature_name}"
+        # Unconditional: `preflight` ALSO raises on a name already registered,
+        # so gating this on the order-validating path left a setup-step
+        # collision aborting the whole boot — the very blast radius this split
+        # exists to remove, still intact for one key type (#2951).
+        for registration in values.setup_steps:
+            if self.setup_step_registry.get(registration.name) is not None:
+                return f"setup step already registered: {registration.name}"
+        return None
 
     @staticmethod
     def _require_unique(values: list[object], description: str) -> None:
@@ -695,7 +872,9 @@ __all__ = [
     "FeatureContributionRuntime",
     "FeatureContributionRuntimeError",
     "PermissionDefaultRegistration",
+    "ContributionRejection",
     "PermissionDefaultsRegistry",
     "PreparedFeatureContributions",
+    "PreparedTransition",
     "SetupStepRegistry",
 ]

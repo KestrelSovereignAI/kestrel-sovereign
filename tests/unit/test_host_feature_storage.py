@@ -19,6 +19,13 @@ from kestrel_sovereign.host_features.storage import (
     prepare_host_database,
 )
 
+# These tests are *about* default host-database resolution, so they set
+# HOME / KESTREL_HOME / KESTREL_HOST_DB_PATH themselves (or pass an explicit
+# path) and opt out of the suite-wide isolation in tests/unit/conftest.py
+# (#3087). Every test below must keep doing so: without the fixture's
+# override, a test that forgot would resolve the operator's real database.
+pytestmark = pytest.mark.owns_host_paths
+
 
 def _mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
@@ -126,7 +133,12 @@ async def test_custom_env_path_is_supported_hardened_and_reopened(
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX custody contract")
 def test_custom_path_refuses_shared_parent_without_chmod(tmp_path):
     shared_parent = tmp_path / "shared"
-    shared_parent.mkdir(mode=0o755)
+    shared_parent.mkdir()
+    # chmod, not mkdir(mode=...): mkdir's mode is masked by the process
+    # umask, so under a 0o077 umask this "shared" parent was created 0o700
+    # and the custody guard correctly did not fire -- the test then failed
+    # against its own setup rather than against the contract.
+    shared_parent.chmod(0o755)
 
     with pytest.raises(HostStorageError, match="must have mode 0700"):
         prepare_host_database(str(shared_parent / "host.db"))
@@ -141,7 +153,12 @@ async def test_context_disables_store_when_custom_parent_is_not_private(
     tmp_path, monkeypatch,
 ):
     shared_parent = tmp_path / "shared"
-    shared_parent.mkdir(mode=0o755)
+    shared_parent.mkdir()
+    # chmod, not mkdir(mode=...): mkdir's mode is masked by the process
+    # umask, so under a 0o077 umask this "shared" parent was created 0o700
+    # and the custody guard correctly did not fire -- the test then failed
+    # against its own setup rather than against the contract.
+    shared_parent.chmod(0o755)
     monkeypatch.setenv(HOST_DB_PATH_ENV, str(shared_parent / "host.db"))
 
     ctx = await build_host_context()

@@ -92,7 +92,11 @@ async def test_sign_and_export_replacement_outside_configured_roots_is_refused(
     configured = tmp_path / "configured"
     configured.mkdir(mode=0o700)
     outside = tmp_path / "outside"
-    outside.mkdir(mode=0o755)
+    outside.mkdir()
+    # chmod, not mkdir(mode=...): mkdir's mode is masked by the process umask,
+    # so under a 0o077 umask this deliberately-loose directory was created
+    # 0o700 and the closing assertion failed against the test's own setup.
+    outside.chmod(0o755)
     output = outside / "identity_signed.json"
     output.write_text("original", encoding="utf-8")
     output.chmod(0o644)

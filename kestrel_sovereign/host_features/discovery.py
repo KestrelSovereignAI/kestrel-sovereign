@@ -11,14 +11,22 @@ This mirrors :func:`kestrel_sovereign.features.discover_entrypoint_feature_class
 but for the host scope, and layers on the host manifest
 (``.kestrel-host-features.toml``): a host feature may be marked host-scoped and
 enabled/disabled there (issue #2293, Q for UI + enablement).
+
+A manifest may also state what happens to a host feature it does **not** name,
+via ``[host_features] default_enabled`` (issue #3099). Without that key —
+including when there is no manifest at all — an unnamed host feature is
+enabled, which is what a fresh install wants. A manifest that sets it ``false``
+declares the opposite: only what this manifest names runs, so installing host
+feature number seven cannot start it without an edit here that says so.
 """
 
 from __future__ import annotations
 
 import importlib.metadata
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Mapping, Optional, Type
 
 from kestrel_sdk.features.host_base import HostFeature
 
@@ -32,6 +40,15 @@ HOST_FEATURE_ENTRY_POINT_GROUP = "kestrel_sovereign.host_features"
 
 #: Default host manifest filename (shared with ``kestrel feature sync``).
 HOST_MANIFEST_FILENAME = ".kestrel-host-features.toml"
+
+#: Manifest table carrying host-scope policy that is not about one feature.
+#: ``kestrel feature sync`` reads only ``[[feature]]``, so this table is inert
+#: to the installer and read solely here.
+HOST_SCOPE_TABLE = "host_features"
+
+#: Key inside :data:`HOST_SCOPE_TABLE` answering "what about a host feature this
+#: manifest never names?".
+DEFAULT_ENABLED_KEY = "default_enabled"
 
 
 def discover_host_feature_classes() -> Dict[str, Type[HostFeature]]:
@@ -81,20 +98,54 @@ def _feature_slug(cls: Type[HostFeature]) -> str:
     return getattr(cls, "name", None) or cls.__name__
 
 
-def read_host_scoped_manifest(manifest_path: Optional[Path] = None) -> Dict[str, bool]:
+@dataclass(frozen=True)
+class HostScopedManifest:
+    """The host-scope enablement a manifest declares.
+
+    ``features`` maps a host-scoped ``[[feature]]`` entry's name to its
+    ``enabled`` value. ``default_enabled`` answers the question that mapping
+    cannot: what becomes of a discovered host feature the manifest never names.
+
+    Both halves are needed because only one of them can track a set that grows.
+    A manifest listing six features by name says nothing about the seventh
+    someone installs tomorrow; ``default_enabled = false`` does, permanently
+    (issue #3099).
+    """
+
+    default_enabled: bool = True
+    features: Mapping[str, bool] = field(default_factory=dict)
+
+    def is_enabled(self, *names: str) -> bool:
+        """Whether a host feature runs, given the names it may be declared under.
+
+        ``names`` is tried in order — a class's slug before its class name — so
+        that an explicit entry under either spelling beats the default. A
+        feature named by none of them inherits :attr:`default_enabled`.
+        """
+        for name in names:
+            if name in self.features:
+                return self.features[name]
+        return self.default_enabled
+
+
+def read_host_scoped_manifest(
+    manifest_path: Optional[Path] = None,
+) -> HostScopedManifest:
     """Read host-scoped enablement from the host manifest.
 
-    Returns a mapping ``{slug: enabled}`` for every manifest ``[[feature]]``
-    entry marked host-scoped (``host_scoped = true`` or ``scope = "host"``).
-    An entry may set ``enabled = false`` to keep a host feature installed but
-    disabled at host scope; enablement defaults to ``True``.
+    Collects every manifest ``[[feature]]`` entry marked host-scoped
+    (``host_scoped = true`` or ``scope = "host"``). An entry may set
+    ``enabled = false`` to keep a host feature installed but disabled at host
+    scope; a host-scoped entry's enablement defaults to ``True``.
 
-    A missing or malformed manifest yields an empty mapping (all discovered
-    host features stay enabled by default — see :func:`instantiate_host_features`).
+    ``[host_features] default_enabled`` sets the answer for a host feature no
+    entry names. It defaults to ``True``, so a missing or malformed manifest
+    yields the permissive zero-config policy: everything discovered runs (see
+    :func:`instantiate_host_features`).
     """
     path = manifest_path or (Path.cwd() / HOST_MANIFEST_FILENAME)
     if not path.is_file():
-        return {}
+        return HostScopedManifest()
     try:
         try:
             import tomllib  # Python 3.11+
@@ -104,13 +155,15 @@ def read_host_scoped_manifest(manifest_path: Optional[Path] = None) -> Dict[str,
             data = tomllib.load(f)
     except Exception as exc:  # noqa: BLE001 - never let a bad manifest break the host
         logger.warning("Failed to read host manifest %s: %s", path, exc)
-        return {}
+        return HostScopedManifest()
+
+    default_enabled = _read_default_enabled(data, path)
 
     entries = data.get("feature", [])
     if not isinstance(entries, list):
-        return {}
+        return HostScopedManifest(default_enabled=default_enabled)
 
-    result: Dict[str, bool] = {}
+    features: Dict[str, bool] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -120,8 +173,34 @@ def read_host_scoped_manifest(manifest_path: Optional[Path] = None) -> Dict[str,
         host_scoped = bool(entry.get("host_scoped")) or entry.get("scope") == "host"
         if not host_scoped:
             continue
-        result[str(name)] = bool(entry.get("enabled", True))
-    return result
+        features[str(name)] = bool(entry.get("enabled", True))
+    return HostScopedManifest(default_enabled=default_enabled, features=features)
+
+
+def _read_default_enabled(data: dict, path: Path) -> bool:
+    """Read ``[host_features] default_enabled``, or ``True`` if it is absent.
+
+    Only a real TOML boolean is honoured. ``bool("false")`` is ``True``, so
+    coercing a string here would read a typo as the *opposite* of what it says
+    — and in the permissive direction, which is the failure mode this key
+    exists to remove. A malformed value is reported and the documented default
+    stands, matching how this reader already treats a manifest it cannot parse.
+    """
+    table = data.get(HOST_SCOPE_TABLE)
+    if not isinstance(table, dict) or DEFAULT_ENABLED_KEY not in table:
+        return True
+    value = table[DEFAULT_ENABLED_KEY]
+    if isinstance(value, bool):
+        return value
+    logger.warning(
+        "Host manifest %s: [%s] %s must be a boolean, got %r; "
+        "host features not named by this manifest stay enabled",
+        path,
+        HOST_SCOPE_TABLE,
+        DEFAULT_ENABLED_KEY,
+        value,
+    )
+    return True
 
 
 def instantiate_host_features(
@@ -133,9 +212,10 @@ def instantiate_host_features(
 
     Discovery gates on installation (entry points); the host manifest gates on
     *enablement*. A discovered host feature is instantiated unless the manifest
-    explicitly disables it (``enabled = false`` on its host-scoped entry). When
-    the manifest contains no host-scoped entries, all discovered host features
-    are enabled (back-compat / zero-config).
+    disables it — either explicitly (``enabled = false`` on its host-scoped
+    entry) or by declaring ``[host_features] default_enabled = false`` and not
+    naming it. When the manifest says neither, all discovered host features are
+    enabled (back-compat / zero-config, and the answer for no manifest at all).
     """
     if classes is None:
         classes = discover_host_feature_classes()
@@ -145,7 +225,7 @@ def instantiate_host_features(
     features: List[HostFeature] = []
     for cls in classes.values():
         slug = _feature_slug(cls)
-        if manifest.get(slug, manifest.get(cls.__name__, True)) is False:
+        if not manifest.is_enabled(slug, cls.__name__):
             logger.info("Host feature %s disabled via host manifest; skipping", slug)
             continue
         try:
@@ -156,8 +236,11 @@ def instantiate_host_features(
 
 
 __all__ = [
+    "DEFAULT_ENABLED_KEY",
     "HOST_FEATURE_ENTRY_POINT_GROUP",
     "HOST_MANIFEST_FILENAME",
+    "HOST_SCOPE_TABLE",
+    "HostScopedManifest",
     "discover_host_feature_classes",
     "read_host_scoped_manifest",
     "instantiate_host_features",

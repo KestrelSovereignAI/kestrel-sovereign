@@ -6,6 +6,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from kestrel_sovereign.storage.conversation_created_at import (
+    canonical_created_at,
+)
 from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.storage.memory_system import MemorySystem
@@ -107,7 +110,11 @@ async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
         memory_system = MemorySystem(storage, AGENT_ID)
         await memory_system.initialize()
 
-        old_created_at = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+        # Canonical, because the column carries a CHECK since #3009. This
+        # case is about consolidation age, not timestamp text.
+        old_created_at = canonical_created_at(
+            datetime.now(timezone.utc) - timedelta(days=200)
+        )
         base_metadata = {"importance": 0.5, "session_id": "decay-session"}
         await storage.conversation.add_conversation(
             "assistant",
@@ -173,8 +180,24 @@ async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
 
         # Manual unarchive clears the sole state column. Decay evidence stays
         # metadata-only and does not wedge a later consolidation pass.
+        #
+        # By the session's KEY, which is what a session lifecycle op takes. A
+        # row id is a session key only for a legacy cluster whose first row
+        # carries no id of its own (#2012), and these rows carry one — the
+        # write path mints it, overwriting the ``session_id`` this test put in
+        # ``base_metadata``, so neither that string nor a row id names the
+        # session these messages are actually in. Answering a key that names
+        # nothing invents a session no other surface shows (#3098).
+        decay_session_id = json.loads(
+            (
+                await storage.db.fetchone(
+                    "SELECT metadata FROM conversation_history WHERE id = ?",
+                    (unused_id,),
+                )
+            )[0]
+        )["session_id"]
         assert await storage.conversation.unarchive_conversation_session(
-            str(unused_id)
+            decay_session_id
         ) == 1
         normal = await storage.conversation.get_conversation_history(limit=10)
         assert unused_id in {row["id"] for row in normal}

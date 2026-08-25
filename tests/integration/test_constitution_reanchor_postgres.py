@@ -254,12 +254,15 @@ def _make_local_anchor(agent_dir: Path, agent_did: str = AGENT_DID) -> bytes:
     """
     import sqlite3
 
-    from kestrel_sovereign.storage.async_database import CORE_SCHEMA
+    from kestrel_sovereign.storage.async_database import core_schema_sql
 
     agent_dir.mkdir(parents=True, exist_ok=True)
     path = agent_dir / "kestrel_prime.db"
     with sqlite3.connect(str(path)) as conn:
-        conn.executescript(CORE_SCHEMA)
+        # ``core_schema_sql`` rather than ``CORE_SCHEMA``: since #3009
+        # conversation_history is declared per-backend, and the indexes
+        # CORE_SCHEMA still carries for it fail without it.
+        conn.executescript(core_schema_sql("sqlite"))
         conn.execute(
             "INSERT OR REPLACE INTO graph_nodes VALUES (?, 'agent', 'PgTargetAgent', '{}')",
             (agent_did,),

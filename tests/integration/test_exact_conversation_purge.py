@@ -22,6 +22,7 @@ from kestrel_sovereign.storage.async_conversation_store import (
     AsyncConversationStore,
     ConversationSessionTimestampError,
 )
+from kestrel_sovereign.storage.conversation_created_at import created_at_bind
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import TransactionError
 from kestrel_sovereign.storage.destructive_audit import hash_rows
@@ -86,7 +87,13 @@ async def _seed_indexed_message(
             metadata,
             lexical_index_id,
             "v1:test",
-            _timestamp_value(db, created_at),
+            # ``created_at`` goes through the module its CHECK is computed
+            # from (#3009). ``_timestamp_value``'s ``isoformat(sep=" ")`` is
+            # canonical right up until the caller passes microseconds — which
+            # one below deliberately does, to sit just past a session boundary
+            # — and the column refuses a fraction. ``deleted_at`` carries no
+            # such rule and keeps the old rendering.
+            created_at_bind(db.backend_type, created_at),
             _timestamp_value(db, deleted_at),
         ),
     )
@@ -119,7 +126,22 @@ async def _cancel_and_observe(task: asyncio.Task[Any] | None) -> None:
 
 
 class _TwoPartyCleanupGate:
-    """Drive two transactions to one key boundary and expose lock overlap."""
+    """Drive two transactions to one key boundary and expose lock overlap.
+
+    The barrier is load-bearing and was briefly wrong. While #2959's change
+    ledger held one row per agent, the trigger maintaining it upserted that row
+    inside the writing transaction — so the second purge parked at its own
+    DELETE, before this boundary, and the leading party waited here forever for
+    a party stuck behind it. The ledger is sharded per writer now (#3005), so
+    two purges for one agent reach this point concurrently again and the
+    advisory lock is once more the only thing that serializes them, which is
+    what this case exists to check.
+
+    That episode is why ``arrivals`` is asserted and not merely counted: if
+    anything upstream ever serializes these two again, the exclusivity below
+    would hold vacuously — one arrival can hardly race itself — and this would
+    keep passing while testing nothing.
+    """
 
     def __init__(self) -> None:
         self.arrivals = 0
@@ -152,8 +174,13 @@ class _TwoPartyCleanupGate:
     async def assert_exclusive_first_holder(self) -> None:
         await asyncio.wait_for(self.first_acquired.wait(), timeout=5)
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.second_acquired.wait(), timeout=0.1)
+            await asyncio.wait_for(self.second_acquired.wait(), timeout=0.5)
         assert len(self.acquired) == 1
+        assert self.arrivals == 2, (
+            "only one party reached the shared-key boundary, so the exclusivity "
+            "asserted above is vacuous — something upstream serialized these "
+            "two transactions before they got here"
+        )
 
 
 async def _assert_destroyed(db: AsyncDatabase, message: _IndexedMessage) -> None:
@@ -492,8 +519,12 @@ async def test_session_preview_and_hard_purge_are_not_capped_at_ten_thousand(
                 "user",
                 f"large session row {index}",
                 json.dumps({"session_id": session_id}),
-                _timestamp_value(
-                    storage.db,
+                # Microsecond spacing, canonicalised: the column refuses a
+                # fraction since #3009, so all 10,001 rows land in the same
+                # second and order by id. This case is about the row CAP, not
+                # about distinct stamps.
+                created_at_bind(
+                    storage.db.backend_type,
                     started_at + timedelta(microseconds=index),
                 ),
             )
@@ -634,7 +665,12 @@ async def test_implicit_session_gap_boundaries_match_on_both_backends(db_backend
         storage.db,
         agent_id,
         content="more than thirty minutes after the boundary",
-        created_at=started_at + timedelta(minutes=60, microseconds=1),
+        # One SECOND past the gap, not one microsecond. The microsecond was
+        # load-bearing — it is what put this row just over 30 minutes from
+        # `boundary` — and `created_at` is second-granularity since #3009, so
+        # the smallest step past the boundary is now a second. Same claim, in
+        # the units the column has.
+        created_at=started_at + timedelta(minutes=60, seconds=1),
     )
     prior = await _seed_indexed_message(
         storage.db,
@@ -664,61 +700,99 @@ async def test_implicit_session_gap_boundaries_match_on_both_backends(db_backend
     await _assert_present(storage.db, prior)
 
 
-@pytest.mark.asyncio
+def _row(row_id: int, session_id, created_at):
+    """One candidate row in the shape ``_filter_session_rows`` is handed.
+
+    ``(id, role, content, metadata, created_at)`` — the display read's shape,
+    which is the filter's default ``metadata_index``/``created_at_index``.
+    """
+    metadata = json.dumps({"session_id": session_id}) if session_id else None
+    return (row_id, "user", "body", metadata, created_at)
+
+
 @pytest.mark.parametrize(
-    ("anchor_timestamp", "other_timestamp"),
+    ("anchor_stamp", "other_stamp"),
     [
         ("not-a-timestamp", "2026-06-01 12:01:00"),
         ("2026-06-01 12:00:00", "not-a-timestamp"),
     ],
     ids=["invalid-anchor", "invalid-candidate"],
 )
-async def test_malformed_implicit_session_timestamp_fails_before_audit_or_purge(
-    tmp_path,
-    anchor_timestamp,
-    other_timestamp,
-):
-    db_path = tmp_path / "malformed-session-timestamp.db"
-    agent_id = f"did:test:malformed-session-timestamp:{uuid4()}"
-    async with AsyncStorage(str(db_path), agent_id=agent_id) as storage:
-        anchor = await _seed_indexed_message(
-            storage.db,
-            agent_id,
-            content="must not be partially purged",
-            created_at=anchor_timestamp,
-        )
-        other = await _seed_indexed_message(
-            storage.db,
-            agent_id,
-            content="chronology cannot be proven",
-            created_at=other_timestamp,
-        )
-        audit = _CollectingAudit()
-        storage.conversation._destructive_audit = audit
-        session_id = str(anchor.row_id)
+def test_session_resolution_refuses_a_row_it_cannot_date(anchor_stamp, other_stamp):
+    """Membership that depends on chronology fails closed on an undatable row.
 
-        with pytest.raises(
-            ConversationSessionTimestampError,
-            match="invalid created_at timestamp",
-        ):
-            await storage.conversation.count_session_messages(session_id)
-        with pytest.raises(
-            ConversationSessionTimestampError,
-            match="invalid created_at timestamp",
-        ):
-            await storage.conversation.message_belongs_to_session(
-                other.row_id,
-                session_id,
-            )
-        with pytest.raises(
-            ConversationSessionTimestampError,
-            match="invalid created_at timestamp",
-        ):
-            await storage.conversation.purge_conversation_session(session_id)
+    **This case used to build a database.** It seeded a malformed ``created_at``
+    through the store and drove ``count_session_messages`` /
+    ``message_belongs_to_session`` / ``purge_conversation_session``, asserting
+    each raised before any audit event or deletion.
 
-        assert audit.events == []
-        await _assert_present(storage.db, anchor)
-        await _assert_present(storage.db, other)
+    Since #3009 that database cannot exist: the column's CHECK refuses the
+    value, and a legacy database holding one is repaired at boot rather than
+    reaching a reader. Keeping the old shape would mean dismantling the schema
+    to reach the guard, which is a test of a fabricated world — and the guard
+    is on a PERMANENT deletion, where a fabricated precondition is the worst
+    place to be reassured by a green check.
+
+    So the level moved to where the row genuinely is an input.
+    ``_filter_session_rows`` is a static method over a row sequence; handing it
+    an undatable row is a true statement about its contract rather than a
+    claim about a database. The guard STAYS: a purge cannot be undone, the
+    schema guarantee is one release old, and this filter is a seam that can be
+    handed rows from anywhere.
+
+    What the old shape proved and this does not is the ORDERING — that nothing
+    was audited or deleted first. That ordering is a consequence of the raise
+    happening during resolution, which is what this pins; asserting it end to
+    end now requires the fabricated database above.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+        ConversationSessionTimestampError,
+    )
+
+    rows = [_row(1, None, anchor_stamp), _row(2, None, other_stamp)]
+    with pytest.raises(
+        ConversationSessionTimestampError, match="invalid created_at timestamp"
+    ):
+        AsyncConversationStore._filter_session_rows(
+            rows, "1", limit=None, include_markers=True,
+            reject_invalid_timestamps=True,
+        )
+
+
+def test_an_exact_session_match_is_a_member_whatever_its_timestamp_says():
+    """The other half, and the reason the guard is narrow rather than blanket.
+
+    A row whose ``metadata.session_id`` matches the requested session EXACTLY
+    is a proven member — chronology plays no part — so refusing it would leave
+    an explicit (UUID/resumed) session containing one undatable row permanently
+    undeletable. Failing closed everywhere would be the safer-looking choice
+    and the wrong one.
+
+    Same relocation as its neighbour above, for the same reason.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
+
+    session_id = str(uuid4())
+    kept = AsyncConversationStore._filter_session_rows(
+        [
+            _row(1, session_id, "2026-06-01 12:00:00"),
+            _row(2, session_id, "not-a-timestamp"),
+            # Hours away, so the TIME-GAP rule cannot pull it in. Handed
+            # directly, this filter sees every row as a candidate; the store
+            # narrows the set before calling it, which is why the bystander has
+            # to be excluded here on the rule rather than on the query.
+            _row(3, str(uuid4()), "2026-06-01 20:00:00"),
+        ],
+        session_id, limit=None, include_markers=True,
+        reject_invalid_timestamps=True,
+    )
+    assert sorted(row[0] for row in kept) == [1, 2], (
+        "an exactly-matching row was dropped for a timestamp its membership "
+        "does not depend on"
+    )
 
 
 @pytest.mark.asyncio
@@ -1731,46 +1805,3 @@ async def test_cancelled_backfill_token_write_rolls_back_before_purge(
         loop.set_exception_handler(previous_handler)
 
 
-@pytest.mark.asyncio
-async def test_explicit_session_with_malformed_timestamp_still_purges(tmp_path):
-    """A UUID/resumed session row whose membership is proven by an exact
-    metadata.session_id match must remain countable/guardable/purgeable even
-    when its created_at is malformed — chronology plays no part in explicit
-    membership, so failing closed there would leave the session undeletable
-    (final review round P2)."""
-    db_path = tmp_path / "explicit-session-bad-timestamp.db"
-    agent_id = f"did:test:explicit-bad-timestamp:{uuid4()}"
-    session_id = str(uuid4())
-    async with AsyncStorage(str(db_path), agent_id=agent_id) as storage:
-        good = await _seed_indexed_message(
-            storage.db,
-            agent_id,
-            content="valid timestamp member",
-            session_id=session_id,
-            created_at="2026-06-01 12:00:00",
-        )
-        malformed = await _seed_indexed_message(
-            storage.db,
-            agent_id,
-            content="malformed timestamp member",
-            session_id=session_id,
-            created_at="not-a-timestamp",
-        )
-        bystander = await _seed_indexed_message(
-            storage.db,
-            agent_id,
-            content="different session entirely",
-            session_id=str(uuid4()),
-            created_at="2026-06-01 12:00:30",
-        )
-
-        assert await storage.conversation.count_session_messages(session_id) == 2
-        assert await storage.conversation.message_belongs_to_session(
-            malformed.row_id, session_id
-        )
-
-        purged = await storage.conversation.purge_conversation_session(session_id)
-        assert purged == 2
-        await _assert_destroyed(storage.db, good)
-        await _assert_destroyed(storage.db, malformed)
-        await _assert_present(storage.db, bystander)

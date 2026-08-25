@@ -12,13 +12,40 @@ The function is pure (no I/O, no decryption, no privacy concerns): each caller
 fetches rows however it must — the endpoint through the privacy-wrapped
 storage, the store method through the conversation store — normalizes them into
 plain dicts, and hands them here.
+
+Where it stands after #2948
+===========================
+
+This is no longer the primary read path. The active conversation list and the
+search behind it read ``conversation_sessions`` — the #2959 projection — which
+is *this* algorithm's output, cached and maintained by triggers. What remains
+here is the answer for rows no table describes:
+
+* **the memberships with no table.** ISOLATED privacy mode keeps its
+  conversations in an in-memory buffer, and the archived view (#3062) is
+  disjoint from what the projection covers. Both derive their sessions per
+  request, from the rows they hold.
+* **the rows no column can key.** 473 of Emma's 1,522 live rows carry no
+  ``session_id`` at all. Their session is decided by the gap arithmetic below
+  and by nothing else, which is why the projection's transcript pass and
+  search's membership map both come back through here rather than reading the
+  indexed column.
+
+So: still the single source of truth for *where a session begins and ends*, and
+no longer the thing a reader calls to find out what sessions exist. A caller
+reaching for :func:`group_messages_into_sessions` on the active view is
+re-deriving something the table already holds, and the two will drift — that is
+the shape #2948 was filed about.
 """
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
+from kestrel_sovereign.storage.session_id_column import SESSION_ID_KEY
 
 
 def signal_wake_source(metadata: Dict[str, Any]) -> Optional[str]:
@@ -60,12 +87,24 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
     accept datetimes as-is, try the historical SQL/ISO string formats, and
     fall back to :meth:`datetime.fromisoformat` for ``Z``/offset-bearing values.
 
-    SQLite conversation history legitimately contains a mixture of naive SQL
-    timestamps and ISO-8601 values.  Treat naive values as UTC and normalize
-    aware values to naive UTC so sorting and gap arithmetic can never raise on
-    an aware/naive mixture.  ``None`` means chronology cannot be established;
-    presentation callers may substitute a clock, while destructive callers
-    must fail closed.
+    Treat naive values as UTC and normalize aware values to naive UTC so
+    sorting and gap arithmetic can never raise on an aware/naive mixture.
+    ``None`` means chronology cannot be established; presentation callers may
+    substitute a clock, while destructive callers must fail closed.
+
+    This used to be gated by a regex admitting exactly what SQLite's
+    ``julianday`` could order, because a value Python dated but SQL could not
+    would sort at the far end of the canonical order and fall out of a
+    ``LIMIT``. Since #3009 the ordering compares ``created_at`` as itself and
+    the column admits one spelling, so there is no second domain to stay inside
+    — and a parameter is canonicalized by ``comparable_created_at`` before it
+    reaches SQL. The gate protected nothing and made the reader narrower than
+    the repairer for no reason.
+
+    It still returns ``None`` for a value with no date, and that is NOT dead:
+    ISOLATED privacy mode keeps conversations in an in-memory buffer whose
+    entries carry no ``created_at`` at all, so the grouper below genuinely
+    receives undatable rows from a path that has no database to constrain.
     """
     parsed: Optional[datetime]
     if isinstance(created_at, datetime):
@@ -87,6 +126,8 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
                 )
             except ValueError:
                 return None
+        if parsed is None:
+            return None
     else:
         return None
 
@@ -96,28 +137,94 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
 
 
 def timestamp_query_param(backend_type: str, value: Any) -> Any:
-    """Bind a timestamp without relying on SQLite's implicit adapters.
+    """Bind a timestamp in the spelling the column it is compared against uses.
 
-    Conversation history contains historical SQL-style text and public ISO
-    forms. SQLite compares those values through ``julianday`` and must receive
-    an explicit ISO string; binding an aware ``datetime`` would otherwise use
-    Python's deprecated implicit SQLite adapter. PostgreSQL binds timestamp
-    predicates as naive UTC ``datetime`` objects for asyncpg.
+    Binding an aware ``datetime`` on SQLite would otherwise go through Python's
+    deprecated implicit adapter, and PostgreSQL wants a naive UTC ``datetime``
+    for asyncpg. Those two were always the job; the spelling is the part that
+    changed with #3009.
+
+    It used to be ``value.isoformat()`` on SQLite — a ``T`` separator — which
+    was safe only because every comparison ran through ``julianday`` on both
+    sides. ``created_at`` now holds exactly one spelling, and that is what
+    makes a raw text comparison correct; a parameter in a different spelling
+    would be the one value in the comparison that still needed converting. So
+    it is rendered by the same module the column's CHECK is computed from.
+
+    Sub-second precision is KEPT, which is why this is ``comparable_`` and not
+    the storage spelling. Nothing stores a fraction, but a boundary may carry
+    one, and rounding it down moves the boundary — ``purge_all_since`` compares
+    ``>=`` and would permanently delete a row that predates the watermark it
+    was given.
+
+    A value nothing can date is passed through unchanged rather than becoming
+    NULL: a predicate against it found nothing before and must go on finding
+    nothing, rather than quietly matching every row with a NULL comparison.
     """
     if backend_type == "postgres":
         parsed = coerce_session_timestamp(value)
         return value if parsed is None else parsed
-    if backend_type == "sqlite" and isinstance(value, datetime):
-        if value.tzinfo is not None:
-            value = value.astimezone(timezone.utc)
-        return value.isoformat()
+    if backend_type == "sqlite":
+        from .conversation_created_at import comparable_created_at
+
+        return comparable_created_at(value) or value
     return value
 
 
 def canonical_timestamp_sql(backend_type: str, expression: str) -> str:
-    """Normalize a timestamp SQL expression for the active backend."""
-    if backend_type == "sqlite":
+    """Compare a timestamp column as itself, on both backends (#3009 step 5).
+
+    This wrapped SQLite in ``julianday()`` for as long as ``created_at`` could
+    hold more than one spelling of an instant. It had to: ``"T"`` is 0x54 and a
+    space is 0x20, so ``'2026-03-01T09:00:00'`` compares GREATER than
+    ``'2026-03-01 10:00:00'`` and an hour-earlier row sorts last. A raw text
+    comparison was not merely uglier, it was wrong.
+
+    The column now carries a CHECK that admits exactly one spelling, and it is
+    fixed-width, so **lexicographic order IS chronological order** — pinned by
+    ``test_the_canonical_spelling_sorts_as_the_clock_does``. Comparing the
+    column as itself is now both correct and indexable: a function call is not,
+    which is why removing this is the point rather than a tidy-up.
+
+    **Only for a column that carries the constraint.** ``created_at`` does;
+    ``deleted_at`` and ``archived_at`` do not, and they are TIMESTAMP columns on
+    the same table written by the same code, so they look interchangeable at
+    every call site. SQLite history really does hold both spellings in them, and
+    comparing those as text is wrong in the direction that destroys data — a row
+    deleted at ``2026-06-01T11:59:59Z`` compares GREATER than a
+    ``2026-06-01 12:00:00`` cutoff and survives a purge that should have taken
+    it. So an unconstrained column keeps ``julianday``, and which columns are
+    constrained is read from :data:`CANONICAL_COLUMNS` rather than decided here.
+
+    Kept as a function, and still called at every site, because the question
+    "how is this column compared" must have exactly one answer. Two call sites
+    spelling it differently is the defect ``canonical_order()`` was written to
+    end; inlining it would scatter the decision again.
+    """
+    from .conversation_created_at import CANONICAL_COLUMNS
+
+    if backend_type == "sqlite" and expression not in CANONICAL_COLUMNS:
         return f"julianday({expression})"
+    return expression
+
+
+def bytewise_sql(backend_type: str, expression: str) -> str:
+    """Compare a text expression by code point, as Python's ``sorted`` does.
+
+    PostgreSQL databases are commonly created with a locale-aware default
+    collation — ``en_US.utf8`` here — under which punctuation and case are not
+    primary distinctions. Measured: ``('A-1','a-1','A_1','ab1')`` sorts
+    ``a-1,A-1,A_1,ab1`` under that collation and ``A-1,A_1,a-1,ab1`` under
+    ``"C"``, which is what Python produces. Session ids may contain uppercase
+    letters, hyphens and underscores, so an ordering meant to be shared between
+    a SQL page and a Python sort has to name the comparison rather than inherit
+    whichever one the cluster was initialised with.
+
+    SQLite's default is already bytewise, and it has no ``COLLATE "C"``, so the
+    expression is returned unchanged there.
+    """
+    if backend_type == "postgres":
+        return f'{expression} COLLATE "C"'
     return expression
 
 
@@ -125,9 +232,88 @@ def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
     """Compare timestamp columns and parameters across supported backends."""
     if operator not in {"<", ">", ">="}:
         raise ValueError(f"Unsupported timestamp comparison: {operator}")
+    # BOTH sides from the column's treatment, never judged independently. The
+    # placeholder is not a column and can carry no guarantee of its own, so
+    # asking `canonical_timestamp_sql` about "?" renders `julianday(?)` beside a
+    # bare `created_at` — text compared against a float, which SQLite answers by
+    # type order rather than by chronology and never raises. A destructive
+    # predicate built that way silently matches the wrong set.
     left = canonical_timestamp_sql(backend_type, column)
-    right = canonical_timestamp_sql(backend_type, "?")
+    right = "?" if left == column else canonical_timestamp_sql(backend_type, "?")
     return f"{left} {operator} {right}"
+
+
+#: Substituted for a stamp when a transcript carries no readable one at all.
+#: Any instant would do; what matters is that it is the SAME instant every time,
+#: so two groupings of one transcript agree.
+_GROUPING_EPOCH = datetime(1970, 1, 1)
+
+#: The same constant, for the OTHER implementation of session membership.
+#:
+#: ``AsyncConversationStore._filter_session_rows`` re-derives the gap rules for
+#: reads and lifecycle snapshots, and it used to date an unreadable timestamp
+#: with ``datetime.now()`` — as this function did, which is why the two agreed.
+#: They stopped agreeing when this one became a function of the rows, which the
+#: #2959 projection requires: a grouping that consults a clock cannot be cached,
+#: because re-deriving it later gives a different answer.
+#:
+#: Sharing the constant does not make the two agree about WHICH session an
+#: unreadable row joins — this one inherits its predecessor and the other cannot
+#: always see one. What it does remove is the part that made the answer depend
+#: on when you asked. The disagreement that remains is one mechanism with two
+#: implementations, which is #2961's subject and not something a shared constant
+#: can fix.
+UNDATABLE_ROW_FALLBACK = _GROUPING_EPOCH
+
+
+def parse_message_metadata(raw: Any) -> Dict[str, Any]:
+    """A row's ``metadata`` as every reader of it wants: a dict, or an empty one.
+
+    ``metadata`` is free text and legacy rows hold documents no parser can read,
+    so an unreadable one becomes an empty dict rather than dropping the row: a
+    message with a broken blob is still a message in the conversation, and the
+    flags read off it (``enc``, ``sent_form``, ``new_session``) are absent
+    rather than wrong.
+
+    Authored once because three call sites had grown their own copy — the
+    projection's derivation, the list endpoint's normalization and the preview
+    resolution — and they disagreed about a JSON document that parses to
+    something other than an object. ``"[]"`` is valid JSON and is not metadata;
+    two of the three would have handed a list to code that calls ``.get``.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def canonical_session_id(metadata: Dict[str, Any]) -> Optional[str]:
+    """The session key a row files ITSELF under, or ``None`` if it names none.
+
+    A bare-integer ``session_id`` is a mis-filed legacy key (#2012): the list
+    used to hand the UI a row id as a session id and the UI round-tripped it
+    back, so the value names a row rather than a session and the row-id
+    fallback groups more stably. Everything else truthy is the row's own key,
+    rendered with ``str`` so a document that stored a non-string there files
+    itself under one spelling rather than under a value whose equality depends
+    on its Python type.
+
+    Authored here because two readers have to agree on it, and when they did
+    not a conversation disappeared (#3098). This function answers where a
+    session ENDS for :func:`group_messages_into_sessions`, and where the walk
+    STOPS for ``AsyncConversationStore._filter_session_rows``, the resolver
+    that turns one of those session ids back into its rows. Those are the same
+    boundary seen from either side.
+    """
+    sid = metadata.get(SESSION_ID_KEY)
+    if sid and not str(sid).isdigit():
+        return str(sid)
+    return None
 
 
 def group_messages_into_sessions(
@@ -149,8 +335,16 @@ def group_messages_into_sessions(
               canonical ``session_id``.
             - ``created_at``: datetime or ISO/SQL string.
         gap_minutes: minutes of inactivity that start a new session.
-        now: clock used when a row has an unparseable/missing timestamp;
-            defaults to ``datetime.now()`` (injectable for tests).
+        now: the stamp substituted for a row whose ``created_at`` is missing or
+            unparseable. Defaults to the stamp of the row BEFORE it (the epoch,
+            for a transcript that begins with one) — deliberately not the wall
+            clock. A wall clock made grouping a function of *when it was asked*:
+            the same transcript grouped one way now and another way an hour
+            later, because a bad row kept sliding forward and rejoining
+            whichever session was newest. It also made the #2959 projection
+            unable to cache this result, since a cache has to be reproducible
+            from what it caches. Still injectable, and an injected value still
+            wins, which is what the tests use.
         keep_empty_markers: when ``True``, a session established solely by a
             ``new_session`` marker row (no real messages yet) is still returned,
             with ``message_count == 0`` (#2222). A freshly-created conversation
@@ -176,6 +370,16 @@ def group_messages_into_sessions(
             and — only when ``collect_messages`` — ``messages``.
         Callers reverse / slice / decorate as needed.
     """
+    # The stamp last used, so an undatable row inherits the one before it.
+    # LOCAL on purpose. An earlier fix made the substitute the transcript's
+    # MAXIMUM stamp, which is deterministic but global: appending a row to one
+    # session then re-dated an undatable row in a different, untouched session,
+    # so an incremental repair that recomputed only the appended session left
+    # the other stale and recorded a current watermark over it. A row-local rule
+    # has no such coupling — a row's stamp depends on what precedes it, and
+    # appending never changes that.
+    previous: Optional[datetime] = None
+
     sessions: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
     # Whether ``current`` was established by a ``new_session`` marker row and has
@@ -213,20 +417,19 @@ def group_messages_into_sessions(
         if not isinstance(meta, dict):
             meta = {}
 
+        # No wall-clock arm anywhere: every fallback here is a function of the
+        # rows (or of a clock the caller injected deliberately), which is what
+        # lets the #2959 projection cache this result at all.
         timestamp = (
             coerce_session_timestamp(msg.get("created_at"))
             or coerce_session_timestamp(now)
-            or datetime.now(timezone.utc).replace(tzinfo=None)
+            or previous
+            or _GROUPING_EPOCH
         )
+        previous = timestamp
 
         is_new_session_marker = bool(meta.get("new_session"))
-        meta_session_id = None
-        sid = meta.get("session_id")
-        # Only treat non-integer values as a canonical UUID. A bare-integer
-        # session_id is a mis-filed legacy key (#2012) where the row-id fallback
-        # groups more stably.
-        if sid and not str(sid).isdigit():
-            meta_session_id = sid
+        meta_session_id = canonical_session_id(meta)
 
         if current is None:
             current = _new_session(msg_id, timestamp, meta_session_id)
@@ -241,19 +444,25 @@ def group_messages_into_sessions(
         # so lifecycle tools would act on a different scope than the list shows
         # (#2019). None ids (unlabeled turns) stay with the current session.
         #
-        # Only split when the CURRENT session already carries a real id (a UUID,
-        # not a legacy row-id fallback). A legacy cluster (numeric anchor) is
-        # resolved by ``_get_session_messages`` via a forward time-walk that
-        # does NOT stop on id changes, so it absorbs a following UUID row; if we
-        # split the list there, deleting the listed legacy session would also
-        # destroy the UUID session the list showed as separate. Keeping them
-        # merged matches what the delete resolver actually touches. Two distinct
-        # UUID sessions DO split — there the resolver matches by metadata
-        # membership, so each delete stays scoped to its own id.
+        # This used to make an exception when the CURRENT session carried a
+        # legacy row-id anchor: such a cluster ABSORBED a following stamped row
+        # instead of splitting, because ``_get_session_messages`` resolved a
+        # numeric id by a forward time-walk that did not stop on id changes, so
+        # a split list would have let deleting the legacy session destroy the
+        # stamped one too. The exception cost more than it bought. Phase A's
+        # column is derived per row from that row's own metadata, so it filed
+        # the absorbed row under the id the grouping denied it; the two
+        # disagreed; and ``project_transcript`` — which may not guess — dropped
+        # the whole conversation from the list (#3098).
+        #
+        # The premise was the resolver's, so the fix is the resolver's:
+        # ``_filter_session_rows`` now ends a session's run at a row filed
+        # under a different canonical id, which is this same boundary read from
+        # the other side. Delete stays scoped to what the list shows without
+        # the grouping having to lie about where the session ended.
         session_changed = (
             meta_session_id is not None
             and current["session_id"] != meta_session_id
-            and not str(current["session_id"]).isdigit()
         )
 
         if gap > gap_minutes or is_new_session_marker or session_changed:
@@ -353,6 +562,235 @@ def coalesce_sessions_by_session_id(
     return [merged[sid] for sid in order]
 
 
+#: How a page of sessions is ordered, once. Newest activity first; ``session_id``
+#: breaks ties.
+#:
+#: The tie-break is the point. Every caller used to sort on ``last_message_at``
+#: alone and rely on Python's sort being *stable*, which silently made the
+#: answer "whatever order grouping happened to emit". Ties are ordinary here —
+#: SQLite stores history to the second, and a wake and the turn it triggers are
+#: written in one transaction — so with a limit applied, which session appeared
+#: on the page was decided by an implementation detail of the sort. Worse, that
+#: rule cannot be expressed in SQL, so the #2959 projection could not reproduce
+#: it and would have reordered tied sessions the day it replaced this path
+#: (round-7 review).
+#:
+#: ``(column, descending)`` so the SQL clause and the Python sort are generated
+#: from one declaration rather than written twice in two languages.
+SESSION_ORDER: Tuple[Tuple[str, bool], ...] = (
+    ("last_message_at", True),
+    ("session_id", False),
+)
+
+#: Which of :data:`SESSION_ORDER`'s keys are text rather than timestamps.
+#:
+#: Named once because three places need the distinction and were spelling it as
+#: ``column == "session_id"`` each time: the comparable rendering of a key, the
+#: binding of a cursor for its engine, and the validation of a cursor arriving
+#: from a client. A key added to the ordering and forgotten in one of the three
+#: is a cursor that compares a timestamp as text or hands a client's string to
+#: asyncpg as a ``TIMESTAMP``.
+SESSION_ORDER_TEXT_COLUMNS = frozenset({"session_id"})
+
+
+def _session_order_key(backend_type: str, column: str) -> str:
+    """One ordering key of :data:`SESSION_ORDER`, spelled for this backend.
+
+    ``session_id`` is compared through :func:`bytewise_sql` so the SQL page and
+    :func:`sort_sessions` break ties the same way. Without it the two agree only
+    on a cluster whose default collation happens to be bytewise, which is not
+    the common case.
+    """
+    return bytewise_sql(backend_type, column) if column == "session_id" else column
+
+
+def _session_order_terms(backend_type: str) -> List[str]:
+    """Every key of :data:`SESSION_ORDER`, with its direction.
+
+    No NULL placement, because there are no NULLs to place: both keys are
+    ``NOT NULL`` in the projection's schema (see
+    ``NON_NULL_PROJECTION_COLUMNS``), and stating a placement here would be a
+    rule about a state the table cannot hold — one SQLite rejects outright
+    inside ``CREATE INDEX`` ("unsupported use of NULLS LAST", 3.50.4), so the
+    ordering and the index that serves it could not even be spelled the same
+    way.
+    """
+    return [
+        f"{_session_order_key(backend_type, column)} "
+        f"{'DESC' if descending else 'ASC'}"
+        for column, descending in SESSION_ORDER
+    ]
+
+
+def session_order_sql(backend_type: str) -> str:
+    """:data:`SESSION_ORDER` as an ``ORDER BY`` clause."""
+    return "ORDER BY " + ", ".join(_session_order_terms(backend_type))
+
+
+def session_order_index_columns(backend_type: str) -> str:
+    """:data:`SESSION_ORDER` as index columns, directions included.
+
+    An index on the first key alone does not bound a page: ties on
+    ``last_message_at`` are ordinary at second resolution, and the engine must
+    then sort the whole tie group before applying ``LIMIT``. The tie-break is
+    compared bytewise for the same reason the ``ORDER BY`` compares it that way,
+    so the index and the ordering are the same comparison — and the NULL
+    placement travels with it, because an index whose NULLs sit at the other end
+    from the query's does not serve that query's ``ORDER BY``.
+    """
+    return ", ".join(_session_order_terms(backend_type))
+
+
+def session_cursor_clause(
+    backend_type: str, after: Sequence[Any]
+) -> Tuple[str, Tuple[Any, ...]]:
+    """``(predicate, params)`` selecting the rows strictly after ``after``.
+
+    ``after`` is one row's :data:`SESSION_ORDER` values, in that order. The
+    result is the standard lexicographic keyset expansion — equal on every
+    earlier key, past the cursor on this one — generated from the same
+    declaration :func:`session_order_sql` is, so a page and its continuation
+    cannot come to order by different things. A predicate rather than an
+    ``OFFSET`` because an offset counts rows that may have moved between two
+    requests, which is how a paging list silently drops or repeats a session
+    while the agent is still writing.
+
+    **The leading conjunct is redundant and load-bearing.** ``last_message_at
+    <= ?`` is implied by every branch of the disjunction that follows, and
+    without it the engine cannot use the index to SEEK: measured on 200,000
+    sessions, SQLite plans ``(agent_id=?)`` and walks every entry above the
+    cursor at 17.7 ms per page, and ``(agent_id=? AND last_message_at<?)`` at
+    0.11 ms. A disjunction is not a range, so the range has to be stated
+    separately — otherwise the continuation costs ``O(rows already paged)``,
+    which is the shape this epic exists to remove, reappearing one page in.
+    """
+    if len(after) != len(SESSION_ORDER):
+        raise ValueError(
+            f"session cursor needs {len(SESSION_ORDER)} values, got {len(after)}"
+        )
+    lead_column, lead_descending = SESSION_ORDER[0]
+    lead_key = _session_order_key(backend_type, lead_column)
+    conjuncts = [f"{lead_key} {'<=' if lead_descending else '>='} ?"]
+    params: List[Any] = [after[0]]
+
+    terms: List[str] = []
+    for index, (column, descending) in enumerate(SESSION_ORDER):
+        clauses = [
+            f"{_session_order_key(backend_type, SESSION_ORDER[earlier][0])} = ?"
+            for earlier in range(index)
+        ]
+        params.extend(after[earlier] for earlier in range(index))
+        key = _session_order_key(backend_type, column)
+        clauses.append(f"{key} {'<' if descending else '>'} ?")
+        params.append(after[index])
+        terms.append("(" + " AND ".join(clauses) + ")")
+    conjuncts.append("(" + " OR ".join(terms) + ")")
+    return "(" + " AND ".join(conjuncts) + ")", tuple(params)
+
+
+def iso_session_timestamp(value: Any) -> Any:
+    """A stored session timestamp spelled the way the grouper spells one.
+
+    ``started_at`` / ``last_message_at`` reach a client as
+    ``datetime.isoformat()`` text and always have, because the grouper is what
+    produced them. The #2959 projection holds the column's own spelling instead
+    — canonical space-separated text on SQLite, a ``datetime`` on PostgreSQL —
+    and serializing either of those would change what every existing consumer
+    parses. One conversion, named, so the two producers of a listed session
+    cannot present the same instant two ways.
+
+    A value that cannot be read is returned as text rather than as ``None``:
+    it is wrong to show, but it is what the row says, and ``None`` is a
+    different claim that this ordering places at a specific end of the list.
+    """
+    if value is None:
+        return None
+    parsed = coerce_session_timestamp(value)
+    return parsed.isoformat() if parsed is not None else str(value)
+
+
+def session_order_value(column: str, value: Any) -> Any:
+    """One :data:`SESSION_ORDER` key, spelled so any two of them compare.
+
+    The paths that page in Python hold the grouper's ISO output
+    (``2026-03-01T09:00:00``) while a cursor carries the comparable spelling
+    (``2026-03-01 09:00:00``), and ``"T"`` is 0x54 against a space's 0x20 — so
+    comparing the two as they arrive makes an hour-earlier row sort *after* a
+    later one. Both sides pass through here first, which is also what makes the
+    Python comparison the same comparison the SQL one performs: canonical text
+    is fixed-width, so its lexicographic order IS chronological order, on both
+    engines.
+
+    An unreadable timestamp is returned unchanged rather than becoming ``None``.
+    ``None`` means "no value", which this ordering places at a specific end; a
+    value that merely cannot be parsed is not that, and turning one into the
+    other would move a session to the end of the list on the strength of a
+    spelling.
+    """
+    if value is None:
+        return None
+    if column in SESSION_ORDER_TEXT_COLUMNS:
+        return str(value)
+    from .conversation_created_at import comparable_created_at
+
+    comparable = comparable_created_at(value)
+    return comparable if comparable is not None else str(value)
+
+
+def session_cursor_values(session: Dict[str, Any]) -> Tuple[Any, ...]:
+    """One session's :data:`SESSION_ORDER` keys, comparably spelled."""
+    return tuple(
+        session_order_value(column, session.get(column))
+        for column, _ in SESSION_ORDER
+    )
+
+
+def sort_sessions(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Order session dicts by :data:`SESSION_ORDER`, in place.
+
+    Least significant key first, leaning on the sort being stable — which is
+    the standard way to compose a multi-key ordering whose directions differ,
+    and is safe precisely because no key is left implicit.
+    """
+    for column, descending in reversed(SESSION_ORDER):
+        sessions.sort(key=lambda session: session[column], reverse=descending)
+    return sessions
+
+
+def page_grouped_sessions(
+    messages: Iterable[Dict[str, Any]],
+    *,
+    limit: int,
+    offset: int = 0,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Group an OLDEST-FIRST transcript into one page of sessions.
+
+    ``(sessions, has_more)``. The Python counterpart of
+    :meth:`~kestrel_sovereign.storage.conversation_sessions.ConversationSessionProjection.page`,
+    for the two read paths that have no table to page — ISOLATED privacy mode's
+    in-memory buffer, and the archived view, whose membership the #2959
+    projection does not describe.
+
+    Everything after the grouping is the same sequence the SQL page performs in
+    the engine: coalesce same-id clusters into unique delete targets (#2019),
+    order by :data:`SESSION_ORDER`, resume past the cursor, take the page. Doing
+    it in the same order matters — coalescing after ordering would merge two
+    rows whose merged activity belongs elsewhere in the list.
+
+    ``keep_empty_markers=True`` so a just-started conversation (a session marker
+    with no messages yet) is list-visible immediately (#2222): the UI
+    optimistically prepends a tile for it, and this reconciling list must
+    include it or the tile vanishes on the next refresh.
+    """
+    grouped = coalesce_sessions_by_session_id(
+        group_messages_into_sessions(messages, keep_empty_markers=True)
+    )
+    sort_sessions(grouped)
+    remaining = grouped[max(0, int(offset)):]
+    bounded = max(1, int(limit))
+    return remaining[:bounded], len(remaining) > bounded
+
+
 def summarize_sessions(
     messages: Iterable[Dict[str, Any]],
     names: Optional[Dict[str, str]] = None,
@@ -383,7 +821,7 @@ def summarize_sessions(
     # Newest-first by last activity. Sorting on last_message_at (not list
     # position) so a conversation resumed past the gap ranks by its latest
     # message, never buried under older threads or dropped by ``limit`` (#2019).
-    grouped.sort(key=lambda s: s["last_message_at"], reverse=True)
+    sort_sessions(grouped)
     sessions = grouped[:limit]
     for session in sessions:
         preview = session.pop("preview_content", None) or ""

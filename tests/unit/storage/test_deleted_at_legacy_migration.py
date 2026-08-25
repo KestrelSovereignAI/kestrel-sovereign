@@ -63,7 +63,7 @@ async def test_legacy_db_loads_and_migrates_deleted_at(tmp_path):
             "AND tbl_name='conversation_history'"
         )
         idx_names = {row[0] for row in idx_rows}
-        assert "idx_conversation_deleted_at" in idx_names, (
+        assert any(n.startswith("idx_conversation_deleted_at_") for n in idx_names), (
             "Dependent index was not created after migration"
         )
 

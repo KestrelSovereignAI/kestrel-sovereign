@@ -87,6 +87,26 @@ jobs:
   # and it would be one more job the test tiers could be orphaned by. This
   # job is the root of the graph, so every tier can read its output no matter
   # how the tiers are wired to each other.
+  #
+  # WHAT THIS JOB CHECKS, in order:
+  #   1. the duplicate-run gate above (not a check — it decides tier fan-out)
+  #   2. ruff F811 over the Python files THIS change touched
+  #   3. `compileall` under the minimum supported interpreter (3.11 syntax)
+  #   4. `run_tests.py --validate-only` — every module imports
+  #
+  # (2) was missing until #3067, and the job was named for a linter it did not
+  # run. A merge that resolves the same function being added on both sides by
+  # keeping BOTH copies produces a module with two top-level definitions of one
+  # name. That is valid Python, so (3) passes; it imports, so (4) passes. The
+  # second definition silently wins and the first is dead. It reached main once
+  # (#3065) and was caught only because a behavioural test happened to exercise
+  # the shadowed path — on an uncovered function it would have merged green.
+  #
+  # The name stays `lint-and-imports` deliberately. GitHub matches required
+  # status checks on the check-run name, so renaming the job (or giving it a
+  # `name:` that differs) makes the old required check never report and blocks
+  # every PR until branch protection is edited by hand. Not worth a better
+  # label. Four `needs:` references and publish.yml also key on this id.
   lint-and-imports:
     runs-on: ubuntu-latest
     permissions:
@@ -101,6 +121,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.ref }}  # release SHA when called from publish.yml; default ref otherwise
+          # The F811 gate below diffs against a base commit. The default
+          # depth-1 checkout has no ancestors, so every diff would resolve to
+          # "nothing changed" and the gate would pass on everything —
+          # inert, not absent, which is worse. Asserted by
+          # tests/unit/test_ci_redefinition_gate.py::TestWiring.
+          fetch-depth: 0
 
       # Decides whether the expensive tiers (integration-tests, and llm-tests
       # through its `needs:`) should run. Fails OPEN: every unexpected state
@@ -198,6 +224,94 @@ jobs:
 
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }} 3.11
+
+      # The linter this job is named for. Scoped to F811 (redefinition of an
+      # unused name) and to the files this change touched — see #3067.
+      #
+      # Why only F811: it is the rule that would have caught the defect that
+      # filed the ticket. F401 (~51 hits) and F821 (~28) are untriaged against
+      # the current tree and would make this gate about something else; they
+      # get their own tickets.
+      #
+      # Why only changed files: F811 reports 22 pre-existing sites, enumerated
+      # in #3094. A `per-file-ignores` baseline was rejected deliberately — an
+      # ignore list is a standing invitation to grow, and nothing would ever
+      # remove an entry from it. Gating the diff blocks NEW duplication without
+      # charging a 22-site cleanup as the price of admission. Ruff has no
+      # baseline feature, so this is the diff-scoped equivalent.
+      #
+      # The trade, stated plainly: ruff's unit is the file, not the line. A PR
+      # that touches one of those 22 files for an unrelated reason does have to
+      # clear that file's finding. That is a one-file, mostly mechanical ask
+      # (`--select F811 --fix` handles 12 of the 22), not a tree-wide cleanup,
+      # and it is the honest cost of not carrying an ignore list.
+      #
+      # Expressions go through `env:` rather than into the script body, so a
+      # hostile branch name cannot inject shell. Exercised against a real git
+      # repository by tests/unit/test_ci_redefinition_gate.py.
+      - id: f811-gate
+        name: Reject redefinitions introduced by this change (ruff F811)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CALLED_REF: ${{ inputs.ref }}
+          RUFF_VERSION: "0.16.4"
+        run: |
+          set -uo pipefail
+          skip() { echo "F811 gate: no changed-file set — $1"; exit 0; }
+
+          # publish.yml calls this workflow pinned to a release SHA. That gate
+          # validates one commit rather than reviewing a change, and `before`
+          # would name whatever the caller's own ref pointed at, so there is no
+          # base here to diff against.
+          [ -z "$CALLED_REF" ] || skip "called with an explicit ref ($CALLED_REF)"
+
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" ;;
+            push)
+              # Only a branch push has a meaningful predecessor. A tag push is
+              # publish.yml's release gate; anchor on refs/heads/ so it cannot
+              # reach the before-SHA path. Same trap as the dedupe gate above.
+              case "$REF" in
+                refs/heads/*) base="$PUSH_BEFORE" ;;
+                *) skip "ref $REF is not a branch" ;;
+              esac
+              ;;
+            *) skip "event $EVENT_NAME carries no base" ;;
+          esac
+
+          # A branch's FIRST push reports an all-zeroes before-SHA, and a
+          # force-push reports a SHA this clone no longer contains. Both are
+          # expected states, not errors. Falling back to "nothing changed,
+          # pass" here is DELIBERATE: erroring would fail a required check on
+          # every new branch, and the next ordinary push re-covers the same
+          # files against a base that does resolve.
+          [ -n "$base" ] || skip "event supplied no before-SHA"
+          case "$base" in
+            *[!0]*) ;;
+            *) skip "all-zeroes before-SHA (first push of this branch)" ;;
+          esac
+          git cat-file -e "${base}^{commit}" 2>/dev/null || \
+            skip "base $base is not in this clone (force-push or rewritten history)"
+
+          merge_base=$(git merge-base "$base" HEAD) || \
+            skip "no merge base between $base and HEAD"
+
+          # Deletions are excluded (lowercase `d`) — there is no file left to
+          # lint. An unexpected git failure is NOT swallowed: it exits non-zero
+          # here rather than reading as an empty changed set.
+          list="${RUNNER_TEMP:-/tmp}/f811-changed-paths"
+          git diff -z --name-only --diff-filter=d "$merge_base" HEAD -- '*.py' > "$list"
+
+          changed=()
+          while IFS= read -r -d '' path; do changed+=("$path"); done < "$list"
+          [ "${#changed[@]}" -gt 0 ] || skip "no Python files changed since $merge_base"
+
+          echo "F811 gate: ${#changed[@]} changed Python file(s) since ${merge_base}"
+          printf '  %s\n' "${changed[@]}"
+          uvx "ruff@${RUFF_VERSION}" check --no-cache --force-exclude --select F811 -- "${changed[@]}"
 
       - name: Validate minimum-version Python syntax
         run: uv run --no-project --python 3.11 python -m compileall -q kestrel_sovereign
@@ -506,28 +620,31 @@ jobs:
         # runner. It still runs weekly via weekly-analysis.yml, which
         # invokes run_tests.py with no marker filter.
         run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource and not bench"
-        # 20 was too tight and started killing PASSING runs, the same way 10
-        # did for the unit tier above (#2795). Successes cluster tightly at
-        # 13.8-15.2 min, so the cap sat at only ~1.4x the median and a slow
-        # runner cleared it.
+        # 20 was too tight, for the same reason 10 was too tight on the unit
+        # tier above: it started killing PASSING runs. This tier is far closer
+        # to its ceiling than that one ever was. Over the last 17 successful
+        # runs it took 14.3-16.4 min (median 15.9) against a 20 min budget —
+        # ~80% utilization, i.e. ~4 min of headroom. Unit sits at ~6 min
+        # against 20.
         #
-        # Measured on #2939's head 58144815, which ran this tier TWICE: the
-        # push run passed in 13.8 min (31622820974) and the pull_request run
-        # on the identical SHA timed out at 68% (31624099416). Reconstructing
-        # both logs, the second runner was 1.99x slower at the same progress
-        # point, uniformly across every file — no single test regressed, and
-        # the largest gap between two consecutive lines was 61s. Projected
-        # full duration was 25.6 min. An unrelated branch (issue-2940, run
-        # 31611668739) timed out the same way 2h earlier, so this is runner
-        # luck, not a property of either change.
+        # A runner ~1.3x slower than median is therefore enough to discard a
+        # green suite, and one turned up: #3099's push stalled at 91% on the
+        # wall clock. It was measured against the immediately preceding run on
+        # the same tree — median per-test ratio 1.32 across the 256 tests
+        # common to both. The tell that it was the machine and not the code:
+        # the wall-clock-bound tests were untouched (53.1s -> 55.9s, 33.3s ->
+        # 33.4s, 10.3s -> 10.2s) while CPU-bound ones moved as a block. A
+        # regression does not spare sleeps and inflate everything else.
         #
-        # 30 covers that observed worst case with ~17% to spare and is 2.1x
-        # the median. This does not mask a hang: per-test `--timeout=120`
-        # above is what catches those, and it bounds a stuck test long before
-        # the wall clock. The cap is only reached by a tier that would
-        # otherwise have passed, so raising it costs nothing on a healthy run
-        # — it decides how much passing work gets thrown away. Runner sizing,
-        # the real fix, stays in #2795.
+        # 30 absorbs ~1.9x on the median and ~1.55x on the slowest observed
+        # pass, which brackets the 1.32 actually seen.
+        #
+        # This does not mask a hang, and the ceiling is not a cost. Per-test
+        # `--timeout=120` catches a stuck test in 2 min, and `-x` exits on the
+        # first real failure; a healthy run still finishes and exits at ~16
+        # min. The wall clock only decides how much passing work gets thrown
+        # away. Parallelizing this tier (#2794) is the fix that would actually
+        # lower the number; runner sizing is #2795.
         timeout-minutes: 30
         env:
           KESTREL_AUDIT_MODE: skip

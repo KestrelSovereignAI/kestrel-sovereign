@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import inspect
 import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -27,11 +28,15 @@ from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.base import Feature
-from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+from kestrel_sovereign.features.isolated_runtime import (
+    IsolatedRuntimeNamespaceError,
+    ProxyFeature,
+)
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
+from kestrel_sovereign.signals import DurableSignalStore
 from tests.utils.aiosqlite_workers import (
     aiosqlite_worker,
     delay_aiosqlite_worker_exit,
@@ -52,8 +57,57 @@ def _durable_backend_double() -> MagicMock:
     backend.backend_type = "sqlite"
     backend.execute_script = AsyncMock()
     backend.execute = AsyncMock(return_value=1)
-    backend.fetch_one = AsyncMock(return_value=None)
-    backend.fetch_all = AsyncMock(return_value=[])
+
+    async def fetch_one(query, params=()):
+        if "FROM sqlite_master" in query and "COLLATE NOCASE" in query:
+            return (
+                "index",
+                DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                DurableSignalStore.EVENTS,
+            )
+        return None
+
+    backend.fetch_one = AsyncMock(side_effect=fetch_one)
+
+    async def fetch_all(query, params=()):
+        if query.strip() == "PRAGMA table_info(durable_signal_events)":
+            # Signal boot's normal path now trusts the same catalog evidence
+            # as a real freshly-created SQLite ledger. Keep this production-
+            # wiring double honest instead of making it resemble a partially
+            # migrated database whose history would need scanning.
+            return [
+                (0, "caller_identity", "TEXT", 0, None, 0),
+                (1, "source_sequence", "BIGINT", 1, None, 0),
+            ]
+        if "FROM sqlite_master" in query and "type = 'trigger'" in query:
+            return [
+                (name, "durable_signal_events", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_GUARDS
+            ] + [
+                (name, "durable_signal_source_sequences", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_COUNTER_FENCES
+            ]
+        if query.startswith("PRAGMA index_list"):
+            return [
+                (
+                    0,
+                    DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                    1,
+                    "c",
+                    0,
+                )
+            ]
+        if query.startswith("PRAGMA index_xinfo"):
+            return [
+                (0, 0, "agent_id", 0, "BINARY", 1),
+                (1, 1, "source", 0, "BINARY", 1),
+                (2, 2, "source_sequence", 0, "BINARY", 1),
+                (3, -1, None, 0, "BINARY", 0),
+            ]
+        return []
+
+    backend.fetch_all = AsyncMock(side_effect=fetch_all)
+    backend.fetch_val = AsyncMock(return_value=None)
 
     @contextlib.asynccontextmanager
     async def transaction(*, immediate: bool = False):
@@ -129,6 +183,11 @@ async def _initialize_with_features(
                     mock_storage.add_node = AsyncMock()
                     mock_storage.db = MagicMock()
                     mock_storage._backend = _durable_backend_double()
+                    # Hosted feature config is deliberately accessible only
+                    # through a store bound to the current agent identity.
+                    # Keep this full-initialize test double faithful to the
+                    # production AsyncStorage construction contract.
+                    mock_storage.agent_id = agent.did
                     MockStorage.return_value = mock_storage
 
                     mock_memory_system = AsyncMock()
@@ -325,6 +384,42 @@ class TestKestrelAgentInit:
 
         assert agent._db_backend == "postgres"
         assert agent._database_url == "postgresql://user:pass@localhost/kestrel"
+
+    def test_init_threads_explicit_hosted_runtime_scope(self, tmp_path):
+        root = tmp_path / "hosted-runtime"
+        agent = KestrelAgent(
+            did="did:test:hosted-agent",
+            database_url="postgresql://host/kestrel",
+            db_backend="postgres",
+            isolated_runtime_root=root,
+            isolated_runtime_namespace="agent-hosted",
+            isolated_runtime_hosted=True,
+        )
+
+        assert agent.isolated_runtime_hosted is True
+        assert agent.isolated_runtime_root == root.resolve()
+        assert str(agent.isolated_runtime_namespace) == "agent-hosted"
+        assert agent.isolated_runtime_path == root.resolve() / "agent-hosted"
+        assert agent.isolated_runtime_scope.path == agent.isolated_runtime_path
+
+    def test_init_rejects_partial_hosted_runtime_scope(self, tmp_path):
+        with pytest.raises(IsolatedRuntimeNamespaceError, match="namespace"):
+            KestrelAgent(
+                did="did:test:partial-hosted-agent",
+                isolated_runtime_root=tmp_path / "hosted-runtime",
+                isolated_runtime_hosted=True,
+            )
+
+    def test_init_marks_pathless_postgres_agent_as_hosted(self):
+        agent = KestrelAgent(
+            did="did:test:pathless-postgres",
+            storage_path=None,
+            database_url="postgresql://host/kestrel",
+            db_backend="postgres",
+        )
+
+        assert agent.isolated_runtime_hosted is True
+        assert agent.isolated_runtime_scope is None
 
     def test_init_defaults_to_sqlite_backend(self, tmp_path):
         """Defaults to SQLite backend."""
@@ -3183,6 +3278,202 @@ class TestInitialize:
                         assert agent.features["TestFeature"] is mock_feature
                         mock_feature.initialize.assert_called_once()
                         await _shutdown_feature_init_test_agent(agent)
+
+    @pytest.mark.asyncio
+    async def test_core_feature_failure_never_imports_isolated_runtime(
+        self,
+        monkeypatch,
+    ):
+        """The real optional-core failure path has no isolated dependency."""
+
+        agent = KestrelAgent(did="did:test:core-registration")
+        module_name = "kestrel_sovereign.features.isolated_runtime"
+        # This test module imports ProxyFeature for separate hosted tests. Make
+        # the production classifier face a genuinely absent optional module,
+        # then drive a real Feature.initialize failure through _register_feature
+        # rather than mocking the exact seam under test.
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+        class OrdinaryCoreFeature(Feature):
+            @property
+            def tool_description(self):
+                return "ordinary core test feature"
+
+            async def initialize(self):
+                raise RuntimeError("ordinary core initialization failed")
+
+        feature = OrdinaryCoreFeature(agent)
+        real_import = __import__
+
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == module_name:
+                raise AssertionError("core registration imported isolated runtime")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch(
+            "builtins.__import__",
+            side_effect=guarded_import,
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="ordinary core initialization failed",
+            ):
+                await agent._register_startup_feature(feature)
+
+        assert module_name not in sys.modules
+        assert feature.name not in agent.features
+
+    @pytest.mark.asyncio
+    async def test_hosted_boot_quarantines_late_optional_environment_config(
+        self,
+        caplog,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A post-discovery env mutation cannot take down mandatory features."""
+
+        agent = KestrelAgent(
+            did="did:test:late-hosted-feature-config",
+            storage_path=str(tmp_path / "agent" / "test.db"),
+            isolated_runtime_root=tmp_path / "hosted-runtime",
+            isolated_runtime_namespace="tenant/agent",
+            isolated_runtime_hosted=True,
+        )
+        runtime = InstalledFeatureRuntime(
+            class_name="LateScopedConfigFeature",
+            entry_point="test.feature:LateScopedConfigFeature",
+            distribution="late-scoped-config-feature",
+            runtime="isolated-venv",
+            service="late-scoped-config-service",
+        )
+        bin_key = "KESTREL_FEATURE_LATESCOPEDCONFIGFEATURE_BIN"
+        unsafe_key = "KESTREL_FEATURE_LATESCOPEDCONFIGFEATURE_TOKEN"
+        monkeypatch.setenv(bin_key, "/usr/bin/true")
+        client_factory = MagicMock(
+            side_effect=AssertionError("quarantined child must not start")
+        )
+        optional = ProxyFeature(
+            agent,
+            runtime,
+            client_factory=client_factory,
+        )
+        # Construction validated the then-safe environment. Mutating it now
+        # exercises the second validation inside _isolated_child_env during
+        # initialize, closing the discovery-to-start TOCTOU window.
+        secret = "late-process-wide-secret"
+        monkeypatch.setenv(unsafe_key, secret)
+        mandatory_features = [
+            _mandatory_feature_double(name)
+            for name in sorted(MANDATORY_FEATURES)
+        ]
+        for feature in mandatory_features:
+            feature.agent = agent
+
+        try:
+            with caplog.at_level("ERROR"):
+                await _initialize_with_features(
+                    agent,
+                    [*mandatory_features, optional],
+                )
+
+            assert set(MANDATORY_FEATURES).issubset(agent.features)
+            assert optional.name not in agent.features
+            assert optional._client is None
+            client_factory.assert_not_called()
+            assert "Optional isolated feature 'LateScopedConfigFeature'" in caplog.text
+            assert unsafe_key in caplog.text
+            assert "unsafe process-wide environment keys" in caplog.text
+            assert "persisted per-agent feature configuration" in caplog.text
+            assert "runtime could not be prepared" not in caplog.text
+            assert secret not in caplog.text
+            rejections = agent.rejected_feature_contributions
+            assert [item.feature_name for item in rejections] == [optional.name]
+            assert unsafe_key in rejections[0].reason
+            from kestrel_sovereign.server import _with_contribution_rejections
+
+            health = _with_contribution_rejections(
+                agent,
+                {"status": "healthy", "checks": {}},
+            )
+            assert health["status"] == "degraded"
+            assert health["features_not_loaded"] == [
+                {
+                    "feature": optional.name,
+                    "reason": rejections[0].reason,
+                }
+            ]
+        finally:
+            await _shutdown_feature_init_test_agent(agent)
+
+    @pytest.mark.asyncio
+    async def test_hosted_boot_quarantines_operational_child_start_failure(
+        self,
+        caplog,
+        monkeypatch,
+        tmp_path,
+    ):
+        """An optional subprocess failure degrades health, not agent identity."""
+
+        agent = KestrelAgent(
+            did="did:test:optional-child-start",
+            storage_path=str(tmp_path / "agent" / "test.db"),
+            isolated_runtime_root=tmp_path / "hosted-runtime",
+            isolated_runtime_namespace="tenant/agent",
+            isolated_runtime_hosted=True,
+        )
+        runtime = InstalledFeatureRuntime(
+            class_name="StartFailureFeature",
+            entry_point="test.feature:StartFailureFeature",
+            distribution="start-failure-feature",
+            runtime="isolated-venv",
+            service="start-failure-service",
+        )
+        monkeypatch.setenv(
+            "KESTREL_FEATURE_STARTFAILUREFEATURE_BIN",
+            "/usr/bin/true",
+        )
+
+        class FailingClient:
+            async def start(self):
+                raise RuntimeError("third-party-secret-start-detail")
+
+            async def stop(self):
+                return None
+
+        def client_factory(command, *, env, cwd, **_kwargs):
+            assert env is not None
+            assert cwd is not None
+            return FailingClient()
+
+        optional = ProxyFeature(
+            agent,
+            runtime,
+            client_factory=client_factory,
+        )
+        mandatory_features = [
+            _mandatory_feature_double(name)
+            for name in sorted(MANDATORY_FEATURES)
+        ]
+        for feature in mandatory_features:
+            feature.agent = agent
+
+        try:
+            with caplog.at_level("ERROR"):
+                await _initialize_with_features(
+                    agent,
+                    [*mandatory_features, optional],
+                )
+
+            assert set(MANDATORY_FEATURES).issubset(agent.features)
+            assert optional.name not in agent.features
+            assert [
+                item.feature_name
+                for item in agent.rejected_feature_contributions
+            ] == [optional.name]
+            assert "agent-scoped runtime could not be prepared" in caplog.text
+            assert "third-party-secret-start-detail" not in caplog.text
+        finally:
+            await _shutdown_feature_init_test_agent(agent)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))

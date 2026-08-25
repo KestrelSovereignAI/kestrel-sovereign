@@ -15,6 +15,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Dict, Iterable, List, Mapping, Optional, Set, Type
 
 from kestrel_sovereign.features.base import Feature
@@ -29,12 +30,61 @@ logger = logging.getLogger(__name__)
 
 # Features directory location
 FEATURES_DIR = Path(__file__).parent
+_CORE_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 # Environment variable for disabling features
 DISABLED_FEATURES_ENV = "KESTREL_DISABLED_FEATURES"
 
 # Entry point group for external feature packages
 FEATURE_ENTRY_POINT_GROUP = "kestrel_sovereign.features"
+
+
+def _safe_exception_type_name(error: BaseException) -> str:
+    """Return one Core-selected label without reflecting subclass metadata."""
+
+    if type(error) is ModuleNotFoundError:
+        return "ModuleNotFoundError"
+    if type(error) is ImportError:
+        return "ImportError"
+    return "Exception"
+
+
+def _sanitized_isolated_runtime_import_exc_info(
+    error: BaseException,
+) -> tuple[type[BaseException], BaseException, TracebackType | None]:
+    """Keep Core import frames while replacing dependency-controlled text."""
+
+    core_frames = []
+    current = error.__traceback__
+    while current is not None:
+        try:
+            frame_path = Path(current.tb_frame.f_code.co_filename).resolve(
+                strict=False
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            frame_path = None
+        if frame_path is not None and (
+            frame_path == _CORE_PACKAGE_ROOT
+            or _CORE_PACKAGE_ROOT in frame_path.parents
+        ):
+            core_frames.append(current)
+        current = current.tb_next
+    safe_traceback: TracebackType | None = None
+    for frame in reversed(core_frames):
+        safe_traceback = TracebackType(
+            safe_traceback,
+            frame.tb_frame,
+            frame.tb_lasti,
+            frame.tb_lineno,
+        )
+    safe_error = ImportError(
+        "the Core isolated-runtime module could not be imported; verify the "
+        "installed Core and SDK dependencies"
+    )
+    safe_error.__cause__ = None
+    safe_error.__context__ = None
+    safe_error.__suppress_context__ = True
+    return (ImportError, safe_error, safe_traceback)
 
 
 class DuplicateFeatureEntryPointError(RuntimeError):
@@ -842,17 +892,6 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         discovered_names.add(class_name)
         logger.info(f"Discovered feature: {class_name} from {source}")
 
-    def _try_add_isolated(runtime, source: str) -> None:
-        class_name = runtime.class_name
-        if not _feature_allowed(class_name):
-            return
-        from kestrel_sovereign.features.isolated_runtime import ProxyFeature
-
-        feature = ProxyFeature(agent, runtime)
-        features.append(feature)
-        discovered_names.add(class_name)
-        logger.info(f"Discovered isolated feature: {class_name} from {source}")
-
     # Phase 0: import the sovereignty foundation explicitly and fail closed.
     # Generic directory discovery is intentionally best-effort for optional
     # features and therefore cannot own this invariant: it logs import errors
@@ -906,19 +945,105 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
                 e,
             )
 
-    # Phase 2: Entry-point features (external packages)
+    # Phase 2: Entry-point features (external packages). Keep the isolated
+    # runtime itself optional: a core-only profile, or a profile that filters
+    # out every isolated feature, must never import its SDK-coupled module.
     try:
         from kestrel_sovereign.feature_registry import discover_installed_feature_runtimes
 
-        for class_name, runtime in discover_installed_feature_runtimes().items():
-            if runtime.runtime != "isolated-venv":
-                continue
-            try:
-                _try_add_isolated(runtime, f"entry_point:{runtime.entry_point}")
-            except Exception as e:
-                logger.error(f"Error loading isolated entry_point feature {class_name}: {e}")
+        installed_runtimes = discover_installed_feature_runtimes()
     except Exception as e:
         logger.warning("Failed to inspect entry_point feature runtime metadata: %s", e)
+        installed_runtimes = {}
+
+    for class_name, runtime in installed_runtimes.items():
+        if runtime.runtime != "isolated-venv" or not _feature_allowed(class_name):
+            continue
+        try:
+            isolated_runtime = importlib.import_module(
+                "kestrel_sovereign.features.isolated_runtime"
+            )
+        except Exception as e:
+            exception_type = _safe_exception_type_name(e)
+            logger.error(
+                "Error loading isolated entry_point feature %s: the Core "
+                "isolated-runtime module could not be imported; verify the "
+                "installed Core and SDK dependencies (exception type: %s)",
+                class_name,
+                exception_type,
+                exc_info=_sanitized_isolated_runtime_import_exc_info(e),
+            )
+            recorder = getattr(agent, "record_feature_unavailable", None)
+            if callable(recorder):
+                recorder(
+                    feature=None,
+                    feature_name=class_name,
+                    reason="the optional isolated runtime could not be imported",
+                )
+            continue
+
+        try:
+            # Resolve scope during discovery. A selected hosted feature with an
+            # unsafe/missing namespace is a tenant-boundary violation and must
+            # still escape this optional-feature containment path.
+            feature = isolated_runtime.ProxyFeature(agent, runtime)
+        except isolated_runtime.IsolatedRuntimeNamespaceError:
+            raise
+        except Exception as e:
+            safe_exc_info = None
+            unexpected_type = None
+            if isinstance(e, isolated_runtime.IsolatedRuntimeConfigurationError):
+                reason = (
+                    isolated_runtime.IsolatedRuntimeConfigurationError.safe_diagnostic(
+                        e
+                    )
+                )
+            elif isinstance(e, isolated_runtime.IsolatedRuntimePreparationError):
+                reason = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
+                    e
+                )
+                safe_exc_info = (
+                    isolated_runtime.sanitized_isolated_runtime_preparation_exc_info(
+                        e
+                    )
+                )
+            else:
+                reason = "the isolated feature could not be prepared for discovery"
+                unexpected_type = (
+                    isolated_runtime.safe_isolated_runtime_exception_type_name(e)
+                )
+                safe_exc_info = (
+                    isolated_runtime.sanitized_isolated_runtime_preparation_exc_info(
+                        e
+                    )
+                )
+            logger.error(
+                "Error loading isolated entry_point feature %s: %s%s",
+                class_name,
+                reason,
+                (
+                    f" (unexpected exception type: {unexpected_type})"
+                    if unexpected_type is not None
+                    else ""
+                ),
+                exc_info=safe_exc_info,
+            )
+            recorder = getattr(agent, "record_feature_unavailable", None)
+            if callable(recorder):
+                recorder(
+                    feature=None,
+                    feature_name=class_name,
+                    reason=reason,
+                )
+            continue
+
+        features.append(feature)
+        discovered_names.add(class_name)
+        logger.info(
+            "Discovered isolated feature: %s from entry_point:%s",
+            class_name,
+            runtime.entry_point,
+        )
 
     verify_mandatory_feature_set(features, stage="discovery")
     return features

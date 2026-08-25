@@ -70,6 +70,12 @@ class _RecordingBackend:
             name = sql.split()[5]
             table = sql.split()[7].split("(")[0]
             self.indexes.setdefault(name, table)  # IF NOT EXISTS, by name
+        elif sql.startswith("DROP INDEX"):
+            # DROP INDEX IF EXISTS "<name>" — the retirement of a superseded
+            # family member. Modelled so a case can tell a retirement from a
+            # no-op; a double that swallowed it would let the old index appear
+            # to have gone while it was still there.
+            self.indexes.pop(sql.split()[4].strip('"'), None)
         return 0
 
     async def fetch_one(self, sql: str, params: tuple = ()):
@@ -82,9 +88,49 @@ class _RecordingBackend:
         assert "sqlite_master" in sql and "tbl_name" in sql, sql
         return (self.indexes.get(params[0]),)
 
+    async def fetch_all(self, sql: str, params: tuple = ()):
+        """The family probe: every index on this table whose name matches.
+
+        Modelled on the same single-valued mapping as ``fetch_one`` rather than
+        returning a canned list — a double that reports a family the ``indexes``
+        dict does not contain would let the retirement DROP look correct while
+        naming an index that never existed.
+        """
+        await asyncio.sleep(0)
+        assert "sqlite_master" in sql and "type = 'index'" in sql, sql
+        assert "LIKE" not in sql.upper(), (
+            "the family query filters in Python now — a LIKE here would be "
+            "treating every '_' in an index name as a wildcard again"
+        )
+        (table,) = params
+        return [
+            (name,) for name, owner in sorted(self.indexes.items())
+            if owner == table
+        ]
+
     @property
     def creates(self) -> list[str]:
         return [e for e in self.events if e.startswith("CREATE INDEX")]
+
+    @property
+    def drops(self) -> list[str]:
+        return [e for e in self.events if e.startswith("DROP INDEX")]
+
+
+def _named(name: str, columns: str, where: str = "", backend: str = "sqlite") -> str:
+    """The name ``ensure_index`` will actually use for this definition.
+
+    Computed the same way the method computes it rather than pasted, so a case
+    cannot drift from the mechanism it is about (#3009 step 5).
+    """
+    from kestrel_sovereign.storage.async_database import _definition_fingerprint
+
+    return f"{name}_{_definition_fingerprint(backend, columns, where)}"
+
+
+def _family(name: str, names) -> bool:
+    """Whether any index in ``names`` belongs to the ``name`` family."""
+    return any(str(n).startswith(f"{name}_") for n in names)
 
 
 @pytest.mark.asyncio
@@ -102,7 +148,7 @@ async def test_concurrent_initializers_build_the_index_once():
     )
 
     assert backend.creates == [
-        "CREATE INDEX IF NOT EXISTS idx_conversation_agent_session "
+        f"CREATE INDEX IF NOT EXISTS {_named('idx_conversation_agent_session', 'agent_id, session_id')} "
         "ON conversation_history(agent_id, session_id)"
     ]
 
@@ -129,7 +175,7 @@ async def test_the_create_runs_inside_the_lock():
 async def test_an_existing_index_is_not_relocked():
     """The common path — every boot after the first — takes no write lock."""
     backend = _RecordingBackend()
-    backend.indexes["idx_probe"] = "conversation_history"
+    backend.indexes[_named("idx_probe", "agent_id")] = "conversation_history"
     db = AsyncDatabase(backend)
 
     await db.ensure_index("idx_probe", "conversation_history", "agent_id")
@@ -151,7 +197,7 @@ async def test_a_name_taken_by_another_table_is_reported_not_shrugged_off():
     raised from ``ensure_index`` itself and names the colliding table.
     """
     backend = _RecordingBackend()
-    backend.indexes["idx_probe"] = "some_other_table"
+    backend.indexes[_named("idx_probe", "agent_id")] = "some_other_table"
     db = AsyncDatabase(backend)
 
     with pytest.raises(RuntimeError, match="some_other_table"):
@@ -159,7 +205,8 @@ async def test_a_name_taken_by_another_table_is_reported_not_shrugged_off():
 
     # It did try — the raise is about the outcome, not a refusal to attempt.
     assert backend.creates == [
-        "CREATE INDEX IF NOT EXISTS idx_probe ON conversation_history(agent_id)"
+        f"CREATE INDEX IF NOT EXISTS {_named('idx_probe', 'agent_id')} "
+        "ON conversation_history(agent_id)"
     ]
 
 
@@ -175,7 +222,9 @@ async def test_a_name_collision_really_no_ops_on_a_live_sqlite_database(tmp_path
     try:
         await db.execute("CREATE TABLE decoy (agent_id TEXT)")
         await db.execute("CREATE TABLE target (agent_id TEXT)")
-        await db.execute("CREATE INDEX idx_collide ON decoy(agent_id)")
+        await db.execute(
+            f"CREATE INDEX {_named('idx_collide', 'agent_id')} ON decoy(agent_id)"
+        )
 
         with pytest.raises(Exception) as raised:
             await db.ensure_index("idx_collide", "target", "agent_id")
@@ -183,9 +232,9 @@ async def test_a_name_collision_really_no_ops_on_a_live_sqlite_database(tmp_path
 
         # The engine really did nothing: the name still belongs to the decoy.
         assert await db.fetchall(
-            "SELECT name, tbl_name FROM sqlite_master WHERE name = 'idx_collide'",
-            (),
-        ) == [("idx_collide", "decoy")]
+            "SELECT name, tbl_name FROM sqlite_master WHERE name = ?",
+            (_named("idx_collide", "agent_id"),),
+        ) == [(_named("idx_collide", "agent_id"), "decoy")]
     finally:
         await db.close()
 
@@ -205,8 +254,124 @@ async def test_session_index_survives_a_second_boot_of_a_real_database(tmp_path)
                 (),
             )
         }
-        assert "idx_conversation_agent_session" in names
-        assert "idx_conversation_deleted_at" in names
-        assert "idx_conversation_archived_at" in names
+        assert _family("idx_conversation_agent_session", names)
+        assert _family("idx_conversation_deleted_at", names)
+        assert _family("idx_conversation_archived_at", names)
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_changed_definition_retires_the_index_it_replaces():
+    """The reason the name carries a fingerprint at all (#3009 step 5).
+
+    ``ensure_index`` used to answer "is there an index called X on this table",
+    and nothing answered "is it the index we meant". Several of these
+    definitions are COMPUTED — ``canonical_order_index_columns()`` renders the
+    ordering key per backend — so changing the ordering left the old index in
+    place, matching nothing the new ``ORDER BY`` asked for. No error, no
+    missing index, just the O(history) scan back, visible only in a query plan.
+
+    This is the #2998 shape a second time: an object identified by NAME when
+    what matters is its SHAPE.
+    """
+    backend = _RecordingBackend()
+    db = AsyncDatabase(backend)
+
+    await db.ensure_index("idx_order", "conversation_history", "julianday(created_at), id")
+    first = _named("idx_order", "julianday(created_at), id")
+    assert backend.indexes == {first: "conversation_history"}
+
+    await db.ensure_index("idx_order", "conversation_history", "created_at, id")
+    second = _named("idx_order", "created_at, id")
+
+    assert second in backend.indexes, "the new definition was never built"
+    assert first not in backend.indexes, (
+        "the superseded index survived; the ORDER BY it was built for no "
+        "longer exists, so it matches nothing and nothing says so"
+    )
+    # Built BEFORE the old one is dropped. A window with two indexes costs a
+    # little redundant work; a window with none is an unindexed scan taken
+    # during a boot.
+    assert backend.events.index(f"DROP INDEX IF EXISTS \"{first}\"") > next(
+        i for i, e in enumerate(backend.events) if e.startswith("CREATE INDEX") and second in e
+    ), "the old index was dropped before its replacement existed"
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_definition_is_not_rebuilt_on_the_next_boot():
+    """The fingerprint must be stable, or every boot rebuilds every index."""
+    backend = _RecordingBackend()
+    db = AsyncDatabase(backend)
+
+    await db.ensure_index("idx_stable", "conversation_history", "agent_id, id")
+    await db.ensure_index("idx_stable", "conversation_history", "agent_id, id")
+
+    assert len(backend.creates) == 1, backend.creates
+    assert backend.drops == [], backend.drops
+
+
+@pytest.mark.asyncio
+async def test_a_family_does_not_claim_a_longer_name_that_starts_the_same():
+    """``idx_foo_archived_<hash>`` is not a member of the ``idx_foo`` family.
+
+    Both are shipped, both are managed by separate ``ensure_index`` calls, and a
+    prefix test makes the active one drop the archived one on every boot — which
+    the next call then rebuilds. A full index rebuild of the biggest table, on
+    every boot, reported nowhere.
+
+    ``LIKE`` made it looser still: every ``_`` in these names is a
+    single-character wildcard.
+    """
+    backend = _RecordingBackend()
+    db = AsyncDatabase(backend)
+
+    # The archived index exists; the active one does NOT. That ordering is the
+    # whole test: `ensure_index` returns early when its own index is already
+    # there, so the retirement pass only runs on the boot that BUILDS one — the
+    # upgrade boot, which is exactly when a bad family boundary does its damage.
+    await db.ensure_index("idx_foo_archived", "conversation_history", "agent_id, id")
+    archived = _named("idx_foo_archived", "agent_id, id")
+    assert backend.indexes == {archived: "conversation_history"}
+
+    await db.ensure_index("idx_foo", "conversation_history", "agent_id")
+
+    assert archived in backend.indexes, (
+        "building the active index retired the archived one; they are separate "
+        "families and the next boot would rebuild it, every boot"
+    )
+    assert backend.drops == [], backend.drops
+
+
+@pytest.mark.asyncio
+async def test_an_index_from_before_the_fingerprint_is_retired():
+    """Every existing database has bare-named indexes; they are members too.
+
+    Excluded from the family they are never retired, so an upgraded database
+    keeps a duplicate (PostgreSQL) or a stale expression index (SQLite) for
+    good, paying write amplification on ``conversation_history`` for it.
+    """
+    backend = _RecordingBackend()
+    backend.indexes["idx_legacy"] = "conversation_history"  # the pre-#3009 name
+    db = AsyncDatabase(backend)
+
+    await db.ensure_index("idx_legacy", "conversation_history", "agent_id")
+
+    assert "idx_legacy" not in backend.indexes, "the bare-named index survived"
+    assert _named("idx_legacy", "agent_id") in backend.indexes
+
+
+def test_a_long_name_stays_within_postgresqls_identifier_limit():
+    """PostgreSQL truncates silently past 63 bytes, and the probe then misses.
+
+    The BASE is shortened, never the fingerprint: the suffix is what makes a
+    changed definition a changed name, so truncating it would collapse distinct
+    definitions onto one name — this mechanism's own bug, harder to see.
+    """
+    from kestrel_sovereign.storage.async_database import (
+        _fingerprinted_index_name,
+    )
+
+    generated = _fingerprinted_index_name("idx_" + "x" * 70, "deadbeef")
+    assert len(generated.encode("utf-8")) == 63
+    assert generated.endswith("_deadbeef")

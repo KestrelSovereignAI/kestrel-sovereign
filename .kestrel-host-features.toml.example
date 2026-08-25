@@ -22,8 +22,44 @@
 # decide each feature's update mode. Each entry records ONE source:
 #   - `editable = "/path"`  -> git pull --ff-only the checkout on update
 #   - `pypi = ">=x,<y"`     -> pip install --upgrade within the pin on update
+#   - `pypi = ""`           -> from the index, any version
 #   - neither               -> install latest from PyPI (back-compat)
 # `editable` and `pypi` are mutually exclusive — a feature has one source.
+#
+# `pypi = ""` and omitting the key are NOT the same. A failed install of an
+# entry that declares no source falls back to the registry's git URL (repo
+# HEAD) — the back-compat behaviour from before this file was a source map.
+# Writing `pypi = ""` says the index IS this package's source: "any version" is
+# a statement about the VERSION, not permission to fetch it from somewhere
+# else, so a failure is reported rather than silently satisfied from git.
+
+# The core distribution is a first-class entry here (issue #2949). Every
+# `kestrel-feature-*` depends on `kestrel-sovereign`, and the installer
+# (`uv pip`) is project-blind: it does not read `uv.lock`, so it treats core as
+# an ordinary dependency and will resolve a wheel from PyPI whenever the
+# installed version fails a feature's pin — silently replacing an editable
+# checkout. Declaring core here makes its intended source explicit; `feature
+# sync` and the `kestrel update` reconcile step then pin core's VERSION for
+# every feature install, keep core out of the reinstall set when a feature
+# switches source, and re-link it if anything breaks the link anyway.
+#
+# Whatever you declare is applied FIRST and held for the whole batch, in
+# manifest order or not:
+#   - `editable = "/path"`  -> core is re-linked to that checkout, then every
+#     feature install is pinned to the version that checkout builds.
+#   - `pypi = ">=x,<y"`     -> core comes from the index, and features may move
+#     it only WITHIN that window; one that needs more fails loudly.
+#   - `pypi = ""`           -> from the index, any version. No version window is
+#     held, but the SOURCE is: core must be installed, and not editable.
+# Omit the entry entirely and the live editable link (if any) is guarded anyway.
+#
+# This entry is a SOURCE POLICY, not a feature to load: `kestrel feature status`
+# reports where core is installed from, but never gives it a per-agent column —
+# dozens of bundled features share the `kestrel-sovereign` package, so no single
+# column could honestly stand for all of them.
+[[feature]]
+name = "kestrel-sovereign"
+editable = "/path/to/kestrel-sovereign"
 
 # Install from PyPI/git via the feature registry (name resolves through
 # `kestrel feature list`). A raw dist name like "kestrel-feature-voice" works
@@ -47,6 +83,28 @@ pypi = ">=0.3,<0.4"
 [[feature]]
 name = "github"
 editable = "/Volumes/data2/projects/kestrel-feature-github"
+
+# --- Host-scoped enablement -------------------------------------------------
+#
+# Everything above is about which packages stay INSTALLED. Which host features
+# then RUN is a separate question, and it has a default: a host feature (the
+# `kestrel_sovereign.host_features` entry-point group) runs once installed —
+# including one installed long after this file was written.
+#
+# Uncomment to invert that. Only host features this manifest names with an
+# enabled host-scoped entry run, so a newly installed host-feature package
+# cannot start without an edit here that says so:
+#
+#     [host_features]
+#     default_enabled = false
+#
+# A host-scoped entry is an ordinary `[[feature]]` marked `host_scoped = true`
+# (or `scope = "host"`); its `enabled` value wins over that default either way,
+# which is how you run a chosen subset. The fleet observability entry below is
+# an example of a package that provides one.
+#
+# Per-agent features are not affected: those are enabled per agent in
+# `multi_agent.toml`.
 
 # Fleet observability host feature. Consumes the identity→tenant resolver from
 # host config key `observability_tenant_resolver` (issue #2444). Pin to the

@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from kestrel_sovereign.storage.providers.base import StorageTier
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
+from kestrel_sovereign.storage.conversation_created_at import created_at_bind
 from kestrel_sovereign.storage.session_id_column import column_session_id
 
 # Lazy-imported below inside import_agent — identity/__init__ pulls in
@@ -349,23 +350,15 @@ class SovereignStorageAdapter:
     def _restored_created_at(self, metadata: Dict[str, Any]):
         """Original ``created_at`` to bind on restore, from ``metadata.timestamp``.
 
-        Returns ``None`` when no usable timestamp is present (caller falls back to
-        ``_now_sql()``). For SQLite the value is formatted to match
-        ``datetime('now')`` (``YYYY-MM-DD HH:MM:SS``, UTC) so restored rows sort
-        consistently with natively-inserted ones; for Postgres a naive UTC
-        ``datetime`` is returned for the ``timestamp`` column (#1725)."""
-        ts_str = metadata.get("timestamp")
-        if not ts_str:
-            return None
-        try:
-            dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            return None
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(UTC).replace(tzinfo=None)
-        if self.db.backend_type == "postgres":
-            return dt
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        Returns ``None`` when no usable timestamp is present (caller falls back
+        to ``_now_sql()``). The spelling is not decided here: since #3009 it
+        belongs to ``conversation_created_at``, which the column's CHECK is
+        also computed from, so a writer cannot drift from what the column will
+        accept. For SQLite that is ``YYYY-MM-DD HH:MM:SS`` in UTC, matching
+        ``datetime('now')`` so restored rows sort with natively-inserted ones;
+        for Postgres a naive UTC ``datetime`` for the ``timestamp`` column
+        (#1725)."""
+        return created_at_bind(self.db.backend_type, metadata.get("timestamp"))
 
     async def _get_conversations(self) -> List[Dict]:
         """Get all conversations from DB for this agent.

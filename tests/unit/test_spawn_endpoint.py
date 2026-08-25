@@ -112,6 +112,7 @@ async def test_spawn_history_filtered_by_parent_did(monkeypatch):
         started_at="2026-05-09T09:00:00Z",
         parent_did="did:parent:A",
         budget_consumed=Decimal("0"),
+        finalized_from_absence=True,
     )
     result_b = SpawnResult(
         child_name="finished-b",
@@ -141,6 +142,10 @@ async def test_spawn_history_filtered_by_parent_did(monkeypatch):
     assert history_names == {"child-of-a", "finished-a"}, (
         f"Expected only parent A's history, got {history_names}"
     )
+    finished = next(
+        item for item in result["history"] if item["child_name"] == "finished-a"
+    )
+    assert finished["finalized_from_absence"] is True
 
 
 @pytest.mark.asyncio

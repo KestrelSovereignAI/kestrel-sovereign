@@ -430,6 +430,12 @@ export function mountConversations(containerEl, config = {}) {
     let agentName = config.agentName;
     let lastConversations = [];
     let refreshSeq = 0;
+    // The token for the page AFTER the ones currently held, or null at the end
+    // of the list (#2960). Before that ticket the server answered with one
+    // fixed window of history and 34% of a long-lived agent's conversations
+    // were outside it at every `limit`; this is how the rest are reached.
+    let nextCursor = null;
+    let loadingMore = false;
     // The agent the CURRENTLY-PAINTED rows were rendered for (#2199 P2-3).
     // retarget() flips `agentName` synchronously and then fires an async
     // reload; until that reload repaints, the visible rows still belong to
@@ -751,6 +757,12 @@ export function mountConversations(containerEl, config = {}) {
                     ? 'Nothing in trash.'
                     : (view === 'archived' ? 'No archived conversations.' : 'No conversations yet.'));
             listEl.appendChild(empty);
+            // ...and the paging affordance, which the empty state used to
+            // swallow. A client-side filter that matches nothing on the pages
+            // loaded so far is exactly when the user needs the next page: with
+            // the button gone, a conversation that matches only on a later page
+            // cannot be reached at all when server search is unavailable.
+            renderLoadMore();
             return;
         }
         const activeId = currentActiveId();
@@ -764,29 +776,48 @@ export function mountConversations(containerEl, config = {}) {
         });
         if (!group) {
             for (const conv of convs) listEl.appendChild(build(conv));
-            return;
+        } else {
+            const grouped = new Map();
+            for (const conv of convs) {
+                const raw = conv.started_at || conv.last_message_at || conv.deleted_at
+                    || conv.archived_at;
+                const key = raw ? new Date(raw).toLocaleDateString() : 'Unknown';
+                if (!grouped.has(key)) grouped.set(key, []);
+                grouped.get(key).push(conv);
+            }
+            for (const [dateKey, list] of grouped) {
+                const groupEl = document.createElement('div');
+                groupEl.className = 'date-group';
+                const label = document.createElement('div');
+                label.className = 'date-group-label';
+                label.textContent = formatDateLabel(dateKey);
+                groupEl.appendChild(label);
+                for (const conv of list) groupEl.appendChild(build(conv));
+                listEl.appendChild(groupEl);
+            }
         }
-        const grouped = new Map();
-        for (const conv of convs) {
-            const raw = conv.started_at || conv.last_message_at || conv.deleted_at
-                || conv.archived_at;
-            const key = raw ? new Date(raw).toLocaleDateString() : 'Unknown';
-            if (!grouped.has(key)) grouped.set(key, []);
-            grouped.get(key).push(conv);
-        }
-        for (const [dateKey, list] of grouped) {
-            const groupEl = document.createElement('div');
-            groupEl.className = 'date-group';
-            const label = document.createElement('div');
-            label.className = 'date-group-label';
-            label.textContent = formatDateLabel(dateKey);
-            groupEl.appendChild(label);
-            for (const conv of list) groupEl.appendChild(build(conv));
-            listEl.appendChild(groupEl);
-        }
+        renderLoadMore();
     }
 
-    async function loadData() {
+    // The paging affordance (#2960). Painted only when the server said there IS
+    // a next page — its absence is the honest end-of-list, and a button that
+    // fetches nothing is a list that looks incomplete forever.
+    //
+    // Not painted over a search overlay: those hits come from the search
+    // endpoint, which has its own bound and no cursor until Phase D (#2961), so
+    // a "load more" there would continue a list the user is not looking at.
+    function renderLoadMore() {
+        if (!nextCursor || usingSearchOverlay()) return;
+        const more = document.createElement('button');
+        more.className = 'conversations-load-more';
+        more.type = 'button';
+        more.textContent = loadingMore ? 'Loading…' : 'Load more';
+        more.disabled = loadingMore;
+        more.addEventListener('click', () => { loadMore(); });
+        listEl.appendChild(more);
+    }
+
+    async function loadData(cursor = null) {
         const decrypt = state ? state.showDecrypted : true;
         if (view === 'trash') {
             const data = await api.listTrash(500);
@@ -809,11 +840,14 @@ export function mountConversations(containerEl, config = {}) {
                 deleted_at: m.deleted_at,
                 started_at: m.deleted_at,
             }));
-            return [...sessionRows, ...orphanRows]
-                .sort((a, b) => (b.deleted_at || '').localeCompare(a.deleted_at || ''));
+            // Trash is assembled client-side from /api/trash, which has no
+            // cursor of its own — one response is the whole view.
+            return { rows: [...sessionRows, ...orphanRows]
+                .sort((a, b) => (b.deleted_at || '').localeCompare(a.deleted_at || '')),
+                cursor: null };
         }
-        const data = await api.getConversations(decrypt, view);
-        return data.conversations || [];
+        const data = await api.getConversations(decrypt, view, cursor);
+        return { rows: data.conversations || [], cursor: data.next_cursor || null };
     }
 
     async function refresh() {
@@ -830,10 +864,26 @@ export function mountConversations(containerEl, config = {}) {
         // rows shown with Archived actions). Same guard identity.js's list had
         // (conversationListRequestSeq, #1358).
         const seq = ++refreshSeq;
+        // Any continuation still fetching belongs to the generation this
+        // supersedes. Cleared HERE rather than only in setView/retarget,
+        // because an ordinary same-view reload — after a rename, an archive, a
+        // trash, a New conversation, or a host-triggered refresh — bumps the
+        // generation too, and a flag left set then leaves the reloaded list's
+        // Load more button disabled as "Loading…" for good.
+        loadingMore = false;
+        // The cursor goes too, and this is not the same statement. The old
+        // Load more button is still painted while page one is in flight, and
+        // a click on it would capture the NEW generation — so it would not be
+        // discarded as stale, and it would append the previous generation's
+        // rows and overwrite the cursor page one is about to set. Dropping the
+        // cursor makes that click inert until page one lands with its own.
+        nextCursor = null;
         try {
-            const data = await loadData();
+            const page = await loadData();
             if (seq !== refreshSeq) return; // stale — a newer refresh owns the list
+            const data = page.rows;
             lastConversations = data;
+            nextCursor = page.cursor;
             // Pin the stale-row anchor to the agent this data was loaded for
             // (#2199 P2-3). A pure re-filter repaint (search keystroke) leaves
             // this pointing at the old agent until a retarget's reload lands, so
@@ -845,6 +895,7 @@ export function mountConversations(containerEl, config = {}) {
             }
         } catch (e) {
             if (seq !== refreshSeq) return;
+            nextCursor = null;
             listEl.innerHTML = '';
             const err = document.createElement('p');
             err.className = 'conversations-error';
@@ -853,9 +904,60 @@ export function mountConversations(containerEl, config = {}) {
         }
     }
 
+    // Fetch the page after the ones already held and APPEND it (#2960).
+    //
+    // Seq-guarded against `refreshSeq` like refresh() itself: a view switch or
+    // agent retarget mid-flight invalidates this page, and appending it anyway
+    // would paint one agent's conversations under another's. Deduplicated by
+    // session_id because keyset paging over a table the agent is still writing
+    // to can hand back a session whose activity moved across the cursor — a
+    // repeat is the benign direction, a repeated ROW is not.
+    async function loadMore() {
+        if (!nextCursor || loadingMore) return;
+        const seq = refreshSeq;
+        const cursor = nextCursor;
+        loadingMore = true;
+        renderCurrent();
+        try {
+            const page = await loadData(cursor);
+            if (seq !== refreshSeq) return;
+            const seen = new Set(lastConversations.map((c) => c.session_id));
+            lastConversations = [
+                ...lastConversations,
+                ...page.rows.filter((c) => !seen.has(c.session_id)),
+            ];
+            nextCursor = page.cursor;
+        } catch (e) {
+            if (seq !== refreshSeq) return;
+            // Keep what is already painted and keep the button: the pages held
+            // are still valid, and clearing the list on a failed CONTINUATION
+            // would lose conversations the user can already see.
+            Toast.show(`Failed to load more conversations: ${e.message}`, 'error');
+        } finally {
+            // Cleared only if this continuation still owns the list. A page
+            // that lost the race clearing the flag would clear one a NEWER
+            // continuation had set — the flag belongs to a generation, not to
+            // the pane. Ownership changes clear it themselves (setView /
+            // retarget), which is what stops an obsolete request that has not
+            // settled yet from leaving the new view's Load more disabled: these
+            // fetches carry no timeout, so "until it settles" can be for ever.
+            if (seq === refreshSeq) {
+                loadingMore = false;
+                renderCurrent();
+            }
+        }
+    }
+
     function setView(next) {
         if (next === view) return;
         view = next;
+        // Dropped BEFORE the reload, not after it. A cursor belongs to the view
+        // that minted it — the server refuses one replayed against another —
+        // so a Load more clicked in the window before the new page lands would
+        // otherwise send the previous view's token and fail (#2960). The
+        // (The in-flight flag is cleared by the refresh() below, which every
+        // ownership change goes through.)
+        nextCursor = null;
         searchTerm = '';
         search.value = '';
         searchResults = null;
@@ -866,6 +968,8 @@ export function mountConversations(containerEl, config = {}) {
 
     function retarget(nextAgentName) {
         agentName = nextAgentName;
+        // The previous agent's place in the previous agent's list.
+        nextCursor = null;
         // Routing is handled by the API layer (API.setHostAgent); just reload.
         // A pending/answered server search belongs to the OLD agent — drop it
         // so stale hits never paint post-switch; refresh() re-runs the search
@@ -938,8 +1042,13 @@ export function mountConversations(containerEl, config = {}) {
         setView,
         setActiveSessionId,
         newConversation,
+        loadMore,
         destroy,
         get view() { return view; },
+        // Whether the server said there is another page. Exposed so an
+        // embedding host can drive its own paging affordance (infinite scroll,
+        // a footer of its own) instead of the button this module paints.
+        get hasMore() { return Boolean(nextCursor); },
     };
 }
 

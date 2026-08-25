@@ -2,7 +2,11 @@
 Tests for the Privacy-Enforcing Storage Wrapper.
 """
 
+import asyncio
 import warnings
+import json
+from datetime import datetime, timedelta
+
 import pytest
 from unittest.mock import Mock, AsyncMock, PropertyMock
 from kestrel_sovereign.privacy import PrivacyMode
@@ -443,59 +447,215 @@ class TestPrivacyAwareQueries:
         storage.conversation.encryption_enabled = True
         return storage
 
-    # --- query_conversations ---
+    # --- list_session_page ---
 
     @pytest.mark.asyncio
-    async def test_query_conversations_normal_mode(self, mock_storage):
-        """NORMAL mode should query the persistent database."""
+    async def test_list_session_page_normal_mode_reads_the_projection(self, mock_storage):
+        """NORMAL mode delegates to the sessions table, not to raw history."""
+        mock_storage.list_session_page = AsyncMock(
+            return_value={"sessions": [{"session_id": "s1"}], "next_cursor": "tok"}
+        )
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        page = await wrapper.list_session_page("agent-1", limit=25)
+
+        assert page == {"sessions": [{"session_id": "s1"}], "next_cursor": "tok"}
+        # The agent is NAMED, not inherited. The read this replaced scoped its
+        # SQL to the id it was given, and a page that quietly answered for the
+        # store's own agent instead would return an empty list rather than
+        # refuse — which is how this was found.
+        mock_storage.list_session_page.assert_awaited_once_with(
+            agent_id="agent-1", limit=25, cursor=None
+        )
+        # The list no longer reads history rows itself — that read, and the
+        # 1,000-row cap on it, are what #2960 removed.
+        mock_storage.db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_session_page_ephemeral_projects_nothing(self, mock_storage):
+        """EPHEMERAL returns no data AND maintains no projection.
+
+        Not merely an empty answer: the repair that would build one reads
+        history outside its own transaction, so a pass started before a purge
+        can publish a pre-purge snapshot after it. Not projecting is what makes
+        that unreachable, and it is #2959's own recommendation.
+        """
+        mock_storage.list_session_page = AsyncMock()
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        # EVERY branch, not only the projection one. The archived view reads
+        # rows directly and the isolated branch reads a buffer, so a guard that
+        # only covered the projection would leak both.
+        for view in ("active", "archived", "nonsense"):
+            assert await wrapper.list_session_page("agent-1", view=view) == {
+                "sessions": [], "next_cursor": None
+            }
+        # ...including with a buffer already holding messages from before the
+        # transition, which is the isolated branch's input.
+        wrapper._session_conversations.append(
+            {"role": "user", "content": "from before", "metadata": {}}
+        )
+        assert await wrapper.list_session_page("agent-1") == {
+            "sessions": [], "next_cursor": None
+        }
+        mock_storage.list_session_page.assert_not_called()
+        mock_storage.db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_session_page_isolated_groups_the_buffer_oldest_first(
+        self, mock_storage
+    ):
+        """ISOLATED has no database, so the grouper stays the derivation.
+
+        The order is the point. The read this replaces handed the buffer to a
+        caller that reversed it — correct for the SQL branch beside it, which
+        returned newest-first, and backwards for this one. Grouped backwards,
+        the "first user message" a card previews is the last one.
+        """
+        mock_storage.list_session_page = AsyncMock()
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
+
+        # TWO USER turns, because that is what makes the order observable: the
+        # preview picker takes the FIRST user row, so a transcript with one user
+        # turn previews the same text whichever way round it is read, and a test
+        # built that way passes with the buffer reversed.
+        await wrapper.add_conversation("user", "Hello")
+        await wrapper.add_conversation("assistant", "Hi")
+        await wrapper.add_conversation("user", "and another thing")
+
+        page = await wrapper.list_session_page("agent-1")
+        assert len(page["sessions"]) == 1
+        assert page["sessions"][0]["preview_content"] == "Hello"
+        assert page["sessions"][0]["message_count"] == 3
+        assert page["next_cursor"] is None
+        # Should NOT touch persistent storage.
+        mock_storage.list_session_page.assert_not_called()
+        mock_storage.db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_session_page_isolated_has_no_archive(self, mock_storage):
+        """The in-memory buffer has no archive concept, so that view is empty."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
+        await wrapper.add_conversation("user", "Hello")
+
+        assert await wrapper.list_session_page("agent-1", view="archived") == {
+            "sessions": [], "next_cursor": None
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_projection_read_refuses_a_privacy_transition_mid_flight(
+        self, mock_storage
+    ):
+        """The mode is LEASED across the await, not merely read before it.
+
+        The repair a page triggers WRITES the projection and its watermark. If
+        the mode could flip to EPHEMERAL while that is in flight, the sweep
+        could clear those tables and the repair could then republish a
+        description of pre-EPHEMERAL conversations after the purge reported
+        success — the exact hazard #2959 named and #2960 claims to make
+        unreachable by not projecting at all.
+        """
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
+
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_page(**kwargs):
+            entered.set()
+            await release.wait()
+            return {"sessions": [], "next_cursor": None}
+
+        mock_storage.list_session_page = slow_page
+        reading = asyncio.ensure_future(wrapper.list_session_page("agent-1"))
+        await entered.wait()
+        try:
+            with pytest.raises(PrivacyViolationError):
+                wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        finally:
+            release.set()
+            await reading
+        # ...and once it has returned, the transition is allowed again, so the
+        # lease is a fence rather than a lock somebody forgot to drop.
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        assert await wrapper.list_session_page("agent-1") == {
+            "sessions": [], "next_cursor": None
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_projection_read_takes_no_lease_under_ephemeral(self, mock_storage):
+        """EPHEMERAL serves nothing and leases nothing, so it cannot wedge a
+        later transition."""
+        mock_storage.list_session_page = AsyncMock()
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        assert await wrapper.list_session_page("agent-1") == {
+            "sessions": [], "next_cursor": None
+        }
+        mock_storage.list_session_page.assert_not_called()
+        assert wrapper._active_session_projection_leases == 0
+        wrapper.set_privacy_mode(PrivacyMode.NORMAL)
+
+    @pytest.mark.asyncio
+    async def test_a_grouped_page_mints_a_cursor_the_endpoint_accepts(
+        self, mock_storage
+    ):
+        """The grouped paths page by OFFSET, and that is why.
+
+        Nothing bounds a session id arriving in ``metadata.session_id`` on
+        these paths — the projection's storability rule does not apply, because
+        there is no projection. A keyset cursor would carry that id, and a
+        4,000-character one mints a 5,408-character token against a bound of
+        4,224: the server would hand back a ``next_cursor`` its own parameter
+        then refuses with 422, and every later session would be unreachable.
+
+        An offset names a position in a set this path materializes anyway.
+        """
+        from kestrel_sovereign.storage.conversation_sessions import (
+            SESSION_CURSOR_MAX_LENGTH,
+        )
+
+        huge = "s" * 4000
+        now = datetime(2026, 5, 1, 9, 0, 0)
         mock_storage.db.fetchall.return_value = [
-            (1, "user", "Hello", None, "2026-01-01 12:00:00"),
-            (2, "assistant", "Hi", None, "2026-01-01 12:00:01"),
+            (index, "user", f"m{index}", json.dumps({"session_id": f"{huge}-{index}"}),
+             now + timedelta(hours=index * 3))
+            for index in range(3)
         ]
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
 
-        rows = await wrapper.query_conversations("agent-1")
-        assert len(rows) == 2
-        assert rows[0][1] == "user"
-        mock_storage.db.fetchall.assert_awaited_once()
-        sql, params = mock_storage.db.fetchall.await_args.args
-        assert "LIMIT ?" in sql
-        assert params == ("agent-1", 50)
+        page = await wrapper.list_session_page("agent-1", limit=1, view="archived")
+
+        assert len(page["sessions"]) == 1
+        token = page["next_cursor"]
+        assert token, "three sessions and a page of one must offer a next page"
+        assert len(token) <= SESSION_CURSOR_MAX_LENGTH, (
+            f"the archived view minted a {len(token)}-character cursor its own "
+            f"endpoint refuses past {SESSION_CURSOR_MAX_LENGTH}"
+        )
+        # ...and it resumes where it stopped.
+        second = await wrapper.list_session_page(
+            "agent-1", limit=1, view="archived", cursor=token
+        )
+        assert second["sessions"][0]["session_id"] != page["sessions"][0]["session_id"]
 
     @pytest.mark.asyncio
-    async def test_query_conversations_clamps_sql_limit(self, mock_storage):
-        """NORMAL mode should keep list queries under the raw-row safety cap."""
+    async def test_list_session_page_archived_reads_without_a_row_cap(self, mock_storage):
+        """The archived view is derived, and derived WITHOUT a LIMIT.
+
+        Its membership is disjoint from the one the projection describes, so it
+        is still grouped from rows — but a cap here is the same defect #2960
+        removes from the active list, one tab across.
+        """
+        mock_storage.db.fetchall.return_value = []
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
 
-        await wrapper.query_conversations("agent-1", limit=5000)
+        await wrapper.list_session_page("agent-1", view="archived")
 
         sql, params = mock_storage.db.fetchall.await_args.args
-        assert "LIMIT ?" in sql
-        assert params == ("agent-1", 1000)
-
-    @pytest.mark.asyncio
-    async def test_query_conversations_ephemeral_returns_empty(self, mock_storage):
-        """EPHEMERAL mode should return empty list, not query db."""
-        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
-
-        rows = await wrapper.query_conversations("agent-1")
-        assert rows == []
-        mock_storage.db.fetchall.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_query_conversations_isolated_returns_session(self, mock_storage):
-        """ISOLATED mode should return session-local data."""
-        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
-
-        await wrapper.add_conversation("user", "Hello")
-        await wrapper.add_conversation("assistant", "Hi")
-
-        rows = await wrapper.query_conversations("agent-1")
-        assert len(rows) == 2
-        assert rows[0][1] == "user"
-        assert rows[1][1] == "assistant"
-        # Should NOT touch persistent storage
-        mock_storage.db.fetchall.assert_not_called()
+        assert "archived_at IS NOT NULL" in sql
+        assert "LIMIT" not in sql.upper(), sql
+        assert params == ("agent-1",)
 
     # --- query_conversation_start ---
 

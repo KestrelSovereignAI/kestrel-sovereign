@@ -66,6 +66,7 @@ from kestrel_sovereign.signals.durable import (
     DurableEventPersistence,
     DurableInitialDeliveryReservation,
     DurableSignalEvent,
+    DurableSourceBoundary,
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
@@ -75,6 +76,8 @@ from kestrel_sovereign.signals.prompt_overrides import (
     SourceRegistrationWithPromptOverride,
 )
 from kestrel_sovereign.signals.registry import (
+    CLAIM_CONTRIBUTION,
+    CLAIM_IMPERATIVE,
     RegistrationError,
     RegistrationOutcome,
     RegistrationPolicy,
@@ -114,6 +117,7 @@ __all__ = [
     "DurableEventPersistence",
     "DurableInitialDeliveryReservation",
     "DurableSignalEvent",
+    "DurableSourceBoundary",
     "DurableSignalStore",
     "ACKNOWLEDGED",
     "FAILED",
@@ -125,6 +129,8 @@ __all__ = [
     "RegistrationError",
     "RegistrationOutcome",
     "RegistrationPolicy",
+    "CLAIM_CONTRIBUTION",
+    "CLAIM_IMPERATIVE",
     "RegistrationState",
     "SignalDispatcher",
     "SignalDispatchHandle",

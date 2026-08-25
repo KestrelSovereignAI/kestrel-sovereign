@@ -24,8 +24,12 @@ import threading
 import warnings
 from contextlib import asynccontextmanager, contextmanager
 
-from kestrel_sovereign.storage.session_grouping import summarize_sessions
-from typing import Dict, List, Optional, Any, Tuple, Union
+from kestrel_sovereign.storage.session_grouping import (
+    page_grouped_sessions,
+    parse_message_metadata,
+    summarize_sessions,
+)
+from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
@@ -1335,6 +1339,14 @@ class StorePurgeResult:
 
 # Content stores that hold user text. A FAILED sweep of any of these means the
 # "leave no trace" contract cannot be certified, so mode exit must fail closed.
+# The #2959 session projection sweep does not certify CONTENT — it stores a
+# pointer and counts, never text — so it is not in this set. It is required
+# nonetheless, through `REQUIRED_TRACE_STORES` below, because its residue names
+# the agent. Only `REQUIRED_CONTENT_STORES` feeds `leaked_rows`, so a clean
+# stint still cannot report a leak it did not have: the case that paragraph
+# once warned about — an agent that hard-purged its NORMAL history before
+# entering EPHEMERAL, leaving an empty history and a legitimate ledger row —
+# is a CLEAN or PURGED outcome, and only a FAILED one closes the exit.
 # The observability sink (F076) holds content-free metrics and is NOT required —
 # a failure there is recorded but never blocks a transition.
 REQUIRED_CONTENT_STORES = frozenset({
@@ -1342,6 +1354,21 @@ REQUIRED_CONTENT_STORES = frozenset({
     "graph_nodes",
     "channel_messages",
 })
+
+#: Stores that hold no user content but whose residue NAMES the agent, and whose
+#: sweep must therefore also be certified before EPHEMERAL exit.
+#:
+#: Kept separate from :data:`REQUIRED_CONTENT_STORES` because the reason differs
+#: and the name should not lie: the #2959 projection stores a pointer and
+#: counts, never text, which is why it does not certify content. But the
+#: contract is "leave no trace", and the history deletions performed by the
+#: sweep immediately before it fire the change trigger — so a projection sweep
+#: that FAILS leaves a freshly written row carrying this agent's id, after an
+#: exit that reported success (round-17 review).
+REQUIRED_TRACE_STORES = frozenset({
+    "session_projection",
+})
+
 
 
 class EphemeralPurgeReport(dict):
@@ -1382,7 +1409,8 @@ class EphemeralPurgeReport(dict):
     def required_sweep_failed(self) -> bool:
         """True if any REQUIRED content sweep failed (outcome unknown)."""
         return any(
-            r.store in REQUIRED_CONTENT_STORES and r.outcome is PurgeOutcome.FAILED
+            r.store in (REQUIRED_CONTENT_STORES | REQUIRED_TRACE_STORES)
+            and r.outcome is PurgeOutcome.FAILED
             for r in self.store_results.values()
         )
 
@@ -1441,6 +1469,47 @@ class _PrivacyGuardedSemanticVectorProjection:
             return await self._projection.erasure_observation()
         finally:
             self._owner._release_semantic_vector_lease()
+
+
+def _normalized_history_row(row: Sequence[Any]) -> Dict[str, Any]:
+    """One ``conversation_history`` tuple as the grouper's message dict.
+
+    ``metadata`` is parsed to a dict here because the ``enc`` / ``sent_form``
+    flags on it are what the endpoint's preview decoration reads.
+    """
+    return {
+        "id": row[0],
+        "role": row[1],
+        "content": row[2],
+        "metadata": parse_message_metadata(row[3]),
+        "created_at": row[4],
+    }
+
+
+def _page_grouped_sessions(
+    rows: List[Dict[str, Any]], *, limit: int, cursor: Optional[str], view: str
+) -> Dict[str, Any]:
+    """:func:`page_grouped_sessions`, paged by OFFSET (#2960).
+
+    These paths have no table. They derive and order the whole set inside one
+    request and then slice it, so a position in that slice is what a cursor
+    names here — and an offset is exactly that. The projection's keyset cursor
+    would be wrong twice over: nothing bounds a grouped session's id, so the
+    token could outgrow the parameter the endpoint accepts (measured: a 4,000
+    character id mints a 5,408 character token against a 4,224 bound), and the
+    set is re-derived per request anyway, so the stability a keyset buys is
+    stability this path never had.
+    """
+    from .conversation_sessions import decode_offset_cursor, encode_offset_cursor
+
+    offset = decode_offset_cursor(cursor, view) if cursor else 0
+    sessions, has_more = page_grouped_sessions(rows, limit=limit, offset=offset)
+    next_cursor = (
+        encode_offset_cursor(offset + len(sessions), view)
+        if has_more and sessions
+        else None
+    )
+    return {"sessions": sessions, "next_cursor": next_cursor}
 
 
 class PrivacyEnforcingStorage:
@@ -1506,6 +1575,7 @@ class PrivacyEnforcingStorage:
         # privacy transition must not land between the facade's policy check
         # and the producer returning its registered artifact.
         self._active_semantic_artifact_producer_leases = 0
+        self._active_session_projection_leases = 0
 
         # Explicit semantic teaching is intentionally captured per wrapper.
         # There is no module-level adapter that accepts caller-supplied storage
@@ -2112,6 +2182,40 @@ class PrivacyEnforcingStorage:
                 raise RuntimeError("semantic vector privacy lease underflow")
             self._active_semantic_vector_leases -= 1
 
+    def _acquire_session_projection_lease(self) -> bool:
+        """Fence a session-projection read against a privacy transition.
+
+        Returns whether a lease was taken — ``False`` means the mode is
+        EPHEMERAL and the caller must serve nothing rather than build anything.
+
+        The check and the lease are one step, under the same lock every other
+        lease uses, and that is the whole point. ``list_session_page`` reads the
+        mode and then AWAITS a repair that writes ``conversation_sessions`` and
+        its watermark. Without a lease the mode can flip to EPHEMERAL in that
+        window and the sweep can finish clearing those tables before the repair
+        resumes — so the repair republishes a description of pre-EPHEMERAL
+        conversations after the purge reported success. That is precisely the
+        hazard #2959 named and #2960 claimed to make unreachable by not
+        projecting; not projecting is only true if the decision cannot be
+        overtaken by the transition it is deciding about.
+
+        No new mechanism: ``set_privacy_mode`` already refuses a transition
+        while any lease is held, so adding this one to that list is the whole
+        of the fix.
+        """
+        with self._explicit_fact_lease_lock:
+            if self._privacy_config.is_ephemeral():
+                return False
+            self._active_session_projection_leases += 1
+            return True
+
+    def _release_session_projection_lease(self) -> None:
+        """Release one projection lease, including cancellation paths."""
+        with self._explicit_fact_lease_lock:
+            if self._active_session_projection_leases <= 0:
+                raise RuntimeError("session projection privacy lease underflow")
+            self._active_session_projection_leases -= 1
+
     def _acquire_semantic_artifact_producer_lease(self) -> None:
         """Fence a governed artifact producer before its policy checks.
 
@@ -2153,12 +2257,13 @@ class PrivacyEnforcingStorage:
                     self._active_explicit_fact_leases > 0
                     or self._active_semantic_vector_leases > 0
                     or self._active_semantic_artifact_producer_leases > 0
+                    or self._active_session_projection_leases > 0
                 )
             ):
                 raise PrivacyViolationError(
                     "privacy configuration transition refused while an "
-                    "explicit semantic fact, vector operation, or governed artifact "
-                    "producer is in flight; retry "
+                    "explicit semantic fact, vector operation, governed artifact "
+                    "producer, or session-projection read is in flight; retry "
                     "the transition after that operation completes"
                 )
             was_ephemeral = old_config.is_ephemeral()
@@ -2288,6 +2393,29 @@ class PrivacyEnforcingStorage:
         report.record(await self._sweep_store(
             "channel_messages",
             lambda: self._storage.purge_channel_messages_since(since, reason=reason),
+        ))
+
+        # Last, because the sweeps above fire the projection's change trigger
+        # themselves; clearing first would leave a fresh row naming the very
+        # agent being erased.
+        #
+        # All of it, not just the ledger. At this phase the ledger is the only
+        # projection table that ordinarily holds anything — nothing in
+        # production maintains the projection yet (Phase C, #2960, is where that
+        # starts, and where this question has to be asked again against rows
+        # that exist). But the ledger cannot be erased on its own: a stored
+        # watermark stamp is only meaningful against the ledger incarnation it
+        # was read from, and deleting the row restarts the counter, so a
+        # surviving watermark can match it again and report a projection of
+        # purged history as CURRENT (round-6 review; see the method).
+        #
+        # This costs none of the machinery an earlier revision needed — the
+        # leak-detection condition, the orphan probe — because that was for the
+        # scoped case. Here nothing survives, so the correct projection is the
+        # empty one and every row gets the same answer.
+        report.record(await self._sweep_store(
+            "session_projection",
+            lambda: self._storage.purge_session_projection(reason=reason),
         ))
 
         # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /
@@ -4080,72 +4208,114 @@ class PrivacyEnforcingStorage:
     # operations that were previously done via direct storage.db access.
     # Use these instead of accessing .db, .conversation, or .files directly.
 
-    async def query_conversations(
-        self, agent_id: str, limit: int = 50, view: str = "active"
-    ) -> List[Tuple]:
+    async def list_session_page(
+        self,
+        agent_id: str,
+        *,
+        limit: int = 50,
+        view: str = "active",
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One page of the conversation list, respecting privacy mode (#2960).
+
+        Returns ``{"sessions": [...], "next_cursor": str | None}``. The session
+        dicts are the shared grouper's shape on every branch, so the endpoint
+        decorates one thing.
+
+        Four branches, and each is a different answer to "where do this agent's
+        sessions live":
+
+        * **EPHEMERAL** — nowhere. No data is exposed, and no projection is
+          maintained either: this returns before the repair that would build
+          one. That is #2959's own recommendation rather than a new position.
+          A projection kept while EPHEMERAL is in force is state the sweep must
+          then erase, and a repair reads history outside its transaction, so a
+          pass that began before a purge can publish a pre-purge snapshot after
+          it. Not projecting has nothing to erase and nothing to republish.
+        * **ISOLATED** — an in-memory buffer, with no database behind it, so the
+          grouper stays the derivation for this path (and Phase D keeps it for
+          the same reason).
+        * **archived** — live rows the user tidied away (#2149). The #2959
+          projection describes ``deleted_at IS NULL AND archived_at IS NULL``
+          and this membership is disjoint from it, so these are still derived by
+          grouping. They are read WITHOUT a row cap: capping them is what put
+          34% of the active list out of reach, and reintroducing it here would
+          leave the same defect standing behind the archive tab. The cost is
+          proportional to what the user chose to archive rather than to history,
+          which keeps growing on its own.
+        * **anything else** — the projection, paged by key, in SQL.
         """
-        Query conversation history rows respecting privacy mode.
-
-        In EPHEMERAL mode, returns an empty list (no persistent data exposed).
-        In ISOLATED mode, returns session-local conversations as tuple rows.
-        In other modes, queries the persistent database.
-
-        Args:
-            view: ``active`` (default) returns live, non-archived rows;
-                ``archived`` returns live rows with ``archived_at`` set
-                (#2149). Any other value falls back to ``active``.
-
-        Returns rows as tuples:
-        (id, role, content, metadata, created_at, model, provider)
-        """
-        bounded_limit = max(1, min(int(limit), 1000))
         if view not in ("active", "archived"):
             view = "active"
+        bounded = max(1, int(limit))
 
         if self._privacy_config.is_ephemeral():
-            logger.debug("query_conversations blocked: ephemeral mode returns no data")
-            return []
+            logger.debug("list_session_page blocked: ephemeral mode returns no data")
+            return {"sessions": [], "next_cursor": None}
 
         if self._policy.use_session_storage:
             # In-memory session storage has no archive concept: the archived
-            # view is always empty, the active view returns the buffer.
+            # view is always empty, the active view is the buffer.
             if view == "archived":
-                return []
-            # Return session conversations formatted as tuple rows. Surface the
-            # resolved session_id in the metadata (real id, else the sentinel)
-            # so the /api/conversations grouping labels each session with an id
-            # that delete_conversation_session can actually resolve — the UI and
-            # the agent tools share one identity (#2019).
+                return {"sessions": [], "next_cursor": None}
+            # OLDEST-FIRST, which is what the grouper reads and what the buffer
+            # already is. The read this replaces handed these rows to a caller
+            # that reversed them, because the SQL branch beside it returns
+            # newest-first — so in ISOLATED mode the transcript was grouped
+            # backwards, and the "first user message" a card previewed was the
+            # last one. Returning grouped sessions rather than raw rows is what
+            # removes the chance to get that wrong: the order is decided once,
+            # here, next to the rows it describes.
             rows = []
-            for i, conv in enumerate(self._session_conversations):
+            for index, conv in enumerate(self._session_conversations):
                 meta = dict(conv.get("metadata") or {})
                 sid = _conv_session_id(conv)
                 meta["session_id"] = (
                     sid if sid is not None else _ISOLATED_UNLABELED_SESSION_ID
                 )
-                rows.append((
-                    i,  # synthetic row id (message id, not session id)
-                    conv.get("role", ""),
-                    conv.get("content", ""),
-                    json.dumps(meta),
-                    conv.get("created_at", None),
-                    conv.get("model"),
-                    conv.get("provider"),
-                ))
-            return rows
+                rows.append({
+                    "id": index,
+                    "role": conv.get("role", ""),
+                    "content": conv.get("content", ""),
+                    "metadata": meta,
+                    "created_at": conv.get("created_at", None),
+                })
+            return _page_grouped_sessions(rows, limit=bounded, cursor=cursor, view=view)
 
         if view == "archived":
-            archive_clause = "archived_at IS NOT NULL"
-        else:
-            archive_clause = "archived_at IS NULL"
+            from .conversation_sessions import (
+                archived_history_predicate,
+                canonical_order,
+            )
 
-        return await self._storage.db.fetchall(f"""
-            SELECT id, role, content, metadata, created_at, model, provider
-            FROM conversation_history
-            WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause}
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (agent_id, bounded_limit))
+            # No LIMIT. See the docstring: a cap here is the same defect this
+            # ticket removes from the active list, one tab across.
+            raw = await self._storage.db.fetchall(f"""
+                SELECT id, role, content, metadata, created_at
+                FROM conversation_history
+                WHERE agent_id = ? AND {archived_history_predicate()}
+                {canonical_order(self._storage.db.backend_type)}
+            """, (agent_id,))
+            return _page_grouped_sessions(
+                [_normalized_history_row(row) for row in raw],
+                limit=bounded,
+                cursor=cursor,
+                view=view,
+            )
+
+        # Leased across the await, not merely checked before it. The repair
+        # this triggers WRITES the projection, so a mode transition landing
+        # mid-await would let it republish pre-EPHEMERAL state after the sweep
+        # had cleared it.
+        if not self._acquire_session_projection_lease():
+            logger.debug("list_session_page blocked: ephemeral mode returns no data")
+            return {"sessions": [], "next_cursor": None}
+        try:
+            return await self._storage.list_session_page(
+                agent_id=agent_id, limit=bounded, cursor=cursor
+            )
+        finally:
+            self._release_session_projection_lease()
 
     async def search_conversations(
         self, agent_id: str, query: str, limit: int = 20, view: str = "active"
@@ -4154,13 +4324,13 @@ class PrivacyEnforcingStorage:
         Full-text search across conversations, respecting privacy mode.
 
         In EPHEMERAL mode, returns an empty list (no persistent data exposed).
-        In ISOLATED mode, searches the in-memory session buffer.
-        In other modes, delegates to the conversation store, which decrypts
-        client-side and groups hits into session summaries (#2019).
+        In ISOLATED mode, searches the in-memory session buffer. In other modes,
+        delegates to the conversation store, which decrypts client-side —
+        SQL cannot see encrypted content — and answers the active view out of
+        the #2959 projection, the archived one by grouping (#2961).
 
-        Returns newest-first session summary dicts as produced by
-        :func:`~kestrel_sovereign.storage.async_conversation_store.search_session_summaries`
-        (``match_count`` / ``match_role`` / ``match_snippet`` decorated).
+        Returns newest-first session summary dicts decorated with
+        ``match_count`` / ``match_role`` / ``match_snippet``.
         """
         bounded_limit = max(1, min(int(limit), 500))
         if view not in ("active", "archived"):
@@ -4203,9 +4373,24 @@ class PrivacyEnforcingStorage:
         conv_store = getattr(self._storage, "conversation", None)
         if conv_store is None:
             return []
-        return await conv_store.search_sessions(
-            query, view=view, limit=bounded_limit
-        )
+        # Leased for the same reason the list is (#2961): the active view's
+        # search walks the #2959 projection and REPAIRS it on its first step, so
+        # a mode transition landing mid-await would let that repair republish
+        # pre-EPHEMERAL state after the sweep had cleared it. The archived view
+        # writes nothing, but it is served by the same call, and a lease taken
+        # over both is one rule rather than a branch that has to be kept in step
+        # with which view repairs.
+        if not self._acquire_session_projection_lease():
+            logger.debug(
+                "search_conversations blocked: ephemeral mode returns no data"
+            )
+            return []
+        try:
+            return await conv_store.search_sessions(
+                query, view=view, limit=bounded_limit
+            )
+        finally:
+            self._release_session_projection_lease()
 
     async def query_conversation_start(
         self, message_id: str, agent_id: str
@@ -5005,7 +5190,7 @@ class PrivacyEnforcingStorage:
         warnings.warn(
             f"Direct access to PrivacyEnforcingStorage.{property_name} is deprecated. "
             f"Use privacy-aware methods instead "
-            f"(e.g., query_conversations, get_conversation_history).",
+            f"(e.g., list_session_page, get_conversation_history).",
             DeprecationWarning,
             stacklevel=3,
         )

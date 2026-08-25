@@ -1997,6 +1997,19 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
         await _shutdown_single_agent(agent)
 
 
+def _split_lifecycle_cancellation(
+    failure: BaseException | None,
+) -> tuple[bool, BaseException | None]:
+    """Separate cancellation leaves while preserving every ordinary failure."""
+
+    if isinstance(failure, asyncio.CancelledError):
+        return True, None
+    if isinstance(failure, BaseExceptionGroup):
+        cancellation, remaining = failure.split(asyncio.CancelledError)
+        return cancellation is not None, remaining
+    return False, failure
+
+
 async def _rollback_startup_agent_manager(manager) -> bool:
     """Drain a partially-started multi-agent manager before dropping it.
 
@@ -2009,13 +2022,15 @@ async def _rollback_startup_agent_manager(manager) -> bool:
         manager.shutdown_all(), name="server_startup:rollback_agents"
     )
     cancelled, failure = await await_lifecycle_task_completion(rollback)
-    if failure is not None and not isinstance(failure, asyncio.CancelledError):
+    failure_cancelled, failure = _split_lifecycle_cancellation(failure)
+    cancelled = cancelled or failure_cancelled
+    if failure is not None:
         logger.warning(
             "Multi-agent startup rollback did not fully shut down loaded agents: %s",
             failure,
             exc_info=(type(failure), failure, failure.__traceback__),
         )
-    elif isinstance(failure, asyncio.CancelledError):
+    elif failure_cancelled:
         logger.warning(
             "Multi-agent startup rollback was cancelled after its cleanup task "
             "reached a cancelled terminal state"
@@ -2035,17 +2050,18 @@ async def _run_lifespan_shutdown_phase(
     """
     phase_task = asyncio.create_task(operation(), name=f"server_shutdown:{name}")
     cancelled, failure = await await_lifecycle_task_completion(phase_task)
-    if failure is not None and not isinstance(failure, asyncio.CancelledError):
+    task_had_failure = failure is not None
+    failure_cancelled, failure = _split_lifecycle_cancellation(failure)
+    cancelled = cancelled or failure_cancelled
+    if failure is not None:
         logger.warning(
             "Server shutdown phase %r failed: %s",
             name,
             failure,
             exc_info=(type(failure), failure, failure.__traceback__),
         )
-    if isinstance(failure, asyncio.CancelledError):
-        cancelled = True
     result = None
-    if failure is None:
+    if not task_had_failure:
         result = phase_task.result()
     return cancelled, failure, result
 
@@ -3359,7 +3375,126 @@ async def _phoenix_tracing_status(app) -> dict:
     }
 
 
+def _with_host_feature_rejections(app_state, payload: dict) -> dict:
+    """Fold HOST feature rejections into a detailed-health payload.
+
+    Host features are not agent-scoped, so a refused one is invisible in every
+    per-agent result. Recorded on the host context at startup, it would
+    otherwise live only in boot logs while `/health/detailed` reported healthy
+    over skipped host routes and services (#2951).
+    """
+    ctx = getattr(app_state, "host_context", None)
+    rejections = tuple(
+        getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+    )
+    # Why the host store is missing, when it is. Reported beside the features
+    # it took down rather than only in the boot log: every one of them reports
+    # an empty result instead of an error, so the symptom never names the
+    # cause and the cause is a scroll away (#3058).
+    #
+    # A STRING, checked, not coerced. `str()` of any object is truthy, so
+    # coercing would turn a context whose attribute is absent-but-not-missing
+    # -- a stand-in, a partially built object -- into a fabricated outage
+    # report naming its repr. This surface exists to stop health lying; it
+    # must not invent a failure to do it.
+    raw_backend_error = getattr(ctx, "backend_error", "")
+    backend_error = (
+        raw_backend_error.strip() if isinstance(raw_backend_error, str) else ""
+    )
+    if not rejections and not backend_error:
+        return payload
+    merged = dict(payload)
+    if rejections:
+        merged["host_features_not_loaded"] = [
+            {"feature": rejection.feature_name, "reason": rejection.reason}
+            for rejection in rejections
+        ]
+    if backend_error:
+        merged["host_backend_unavailable"] = backend_error
+    if merged.get("status") == "healthy":
+        merged["status"] = "degraded"
+    if "overall_healthy" in merged:
+        # Two fields, one fact. A monitor reading the boolean and a human
+        # reading the string must not get different answers -- leaving
+        # overall_healthy true beside a degraded status reproduces exactly the
+        # silent-healthy report this fold exists to end (#3058).
+        merged["overall_healthy"] = merged.get("status") == "healthy"
+    return merged
+
+
+def _with_contribution_rejections(agent, result: dict) -> dict:
+    """Surface features that were REFUSED activation alongside health.
+
+    A feature that did not load is a capability the operator believes the host
+    has. Logging that at boot files it where nobody is looking by the time it
+    matters; ``/health/detailed`` is where a missing capability has to be
+    visible, or a silently-degraded host reads as a healthy one (#2951).
+
+    Never reports ``healthy`` over a refused contribution — the host is running
+    without something it was configured to have, which is the definition of
+    degraded.
+
+    Takes ONE agent, and its entries do not name it, because every response
+    that uses it is already scoped to that agent. A host-level response is not:
+    see :func:`_contribution_rejection_records`, which walks the fleet and
+    names each one.
+    """
+    rejections = tuple(getattr(agent, "rejected_feature_contributions", ()) or ())
+    if not rejections:
+        return result
+    merged = dict(result)   # copied: the health feature's cached dict is shared
+    merged["features_not_loaded"] = [
+        {"feature": rejection.feature_name, "reason": rejection.reason}
+        for rejection in rejections
+    ]
+    if merged.get("status") == "healthy":
+        merged["status"] = "degraded"
+    return merged
+
+
+def _contribution_rejection_records(agent, manager) -> list[dict]:
+    """Refused feature contributions across the whole host, each naming its agent.
+
+    The same singleton-then-fleet walk as
+    :func:`_constitution_safe_mode_records`, and for the same reason: on a
+    multi-agent host ``app.state.agent`` is ``None``, so anything that asks only
+    the singleton reports nothing while the fleet is degraded. That is exactly
+    what happened to the safe-mode branch of ``/health/detailed`` — it called
+    the single-agent helper, which read through ``getattr`` and no-oped, and
+    the fleet walk that carries these was never reached (#3079).
+
+    Entries name their agent because a host-level list is not scoped to one:
+    "some feature somewhere did not load" is not a diagnostic.
+    """
+    records: list[dict] = []
+    seen: set[int] = set()
+
+    def collect(name, candidate) -> None:
+        if candidate is None or id(candidate) in seen:
+            return
+        seen.add(id(candidate))
+        for rejection in getattr(candidate, "rejected_feature_contributions", ()) or ():
+            records.append(
+                {
+                    "agent": name,
+                    "feature": rejection.feature_name,
+                    "reason": rejection.reason,
+                }
+            )
+
+    collect(getattr(agent, "_agent_name", None) or "default", agent)
+    if manager is not None:
+        for name, managed_agent in manager.list_agents().items():
+            collect(name, managed_agent)
+    return records
+
+
 async def _agent_detailed_health(agent) -> dict:
+    """Detailed health for one agent, including any refused contributions."""
+    return _with_contribution_rejections(agent, await _agent_health_result(agent))
+
+
+async def _agent_health_result(agent) -> dict:
     """Compute the detailed health result for a single agent.
 
     Prefers the agent's ``HealthFeature.get_latest()`` (its cached liveness
@@ -3442,26 +3577,47 @@ async def health_detailed(request: Request):
     # backend (and its disabled reason) is visible regardless of agent health.
     tracing = await _phoenix_tracing_status(request.app)
     if getattr(request.app.state, "startup_error", None):
+        # Host features are started AFTER a startup error is recorded, so a
+        # refused host contribution can coexist with this branch — and this is
+        # the response an operator reads during exactly that combined failure
+        # (#2951).
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "unhealthy",
-                "error": "Server startup failed",
-                "checks": [],
-                "tracing": tracing,
-            },
+            content=_with_host_feature_rejections(
+                request.app.state,
+                {
+                    "status": "unhealthy",
+                    "error": "Server startup failed",
+                    "checks": [],
+                    "tracing": tracing,
+                },
+            ),
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
     if safe_mode_records:
+        # Safe mode does not exclude a refused feature — optional agent features
+        # can be rejected in safe mode, and host features start independently of
+        # the agent entirely. A diagnostic response that drops the diagnostics is
+        # the one place it is least affordable (#2951).
+        #
+        # Asked of the FLEET, not of the singleton. This branch used to call the
+        # single-agent helper, which reads through `getattr` and no-ops on the
+        # `None` that every multi-agent host has — and it returns before the
+        # fleet walk below, so the diagnostic was dropped in exactly the two
+        # conditions that co-occur when a host is already degraded (#3079).
+        content = {
+            "status": "restricted",
+            "constitution_safe_mode": safe_mode_records,
+            "checks": [],
+            "tracing": tracing,
+        }
+        rejections = _contribution_rejection_records(agent, manager)
+        if rejections:
+            content["features_not_loaded"] = rejections
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "restricted",
-                "constitution_safe_mode": safe_mode_records,
-                "checks": [],
-                "tracing": tracing,
-            },
+            content=_with_host_feature_rejections(request.app.state, content),
         )
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
@@ -3499,8 +3655,11 @@ async def health_detailed(request: Request):
             )
             content.setdefault("checks", [])
             content.setdefault("tracing", tracing)
-            return JSONResponse(status_code=503, content=content)
-        return result
+            return JSONResponse(
+                status_code=503,
+                content=_with_host_feature_rejections(request.app.state, content),
+            )
+        return _with_host_feature_rejections(request.app.state, result)
 
     # No singleton default agent (multi-agent deployments set app.state.agent to
     # None). Resolve health from the live fleet rather than reporting a false
@@ -3526,6 +3685,14 @@ async def health_detailed(request: Request):
                 breakdown[name] = {
                     "status": res.get("status", "unhealthy"),
                     "checks": res.get("checks", []),
+                    # Carried through: a fleet entry that says "degraded"
+                    # without naming the refused feature reports the symptom
+                    # and drops the diagnostic (#2951).
+                    **(
+                        {"features_not_loaded": res["features_not_loaded"]}
+                        if res.get("features_not_loaded")
+                        else {}
+                    ),
                 }
         overall = _roll_up_fleet_status(
             [entry["status"] for entry in breakdown.values()]
@@ -3548,8 +3715,11 @@ async def health_detailed(request: Request):
                     "scheduler_readiness_failures": scheduler_failures,
                 }
             )
-            return JSONResponse(status_code=503, content=content)
-        return content
+            return JSONResponse(
+                status_code=503,
+                content=_with_host_feature_rejections(request.app.state, content),
+            )
+        return _with_host_feature_rejections(request.app.state, content)
 
     content = {
         "status": "unhealthy",
@@ -3565,8 +3735,13 @@ async def health_detailed(request: Request):
                 "scheduler_readiness_failures": scheduler_failures,
             }
         )
-        return JSONResponse(status_code=503, content=content)
-    return content
+        return JSONResponse(
+            status_code=503,
+            content=_with_host_feature_rejections(request.app.state, content),
+        )
+    # Host features start independently of agent availability, so "no agent"
+    # must still name a refused host feature rather than drop the diagnostic.
+    return _with_host_feature_rejections(request.app.state, content)
 
 
 def _enforce_host_csrf(request: Request):

@@ -201,6 +201,9 @@ def _build_spawn_history(agent, manager, request: Request | None = None) -> list
                 "budget_consumed": float(result.budget_consumed),
                 "started_at": result.started_at,
                 "ended_at": result.ended_at,
+                "finalized_from_absence": getattr(
+                    result, "finalized_from_absence", False
+                ),
             })
 
         # Currently tracked (active spawns) — _TrackedChild always

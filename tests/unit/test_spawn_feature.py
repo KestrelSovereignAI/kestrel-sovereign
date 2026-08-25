@@ -1,14 +1,27 @@
 """Unit tests for SpawnFeature and AgentManager spawn extensions."""
 
 import asyncio
+from pathlib import Path
 import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
-from kestrel_sovereign.multi_agent.agent_manager import AgentManager
-from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+from kestrel_sovereign.features.isolated_runtime import (
+    derive_isolated_runtime_namespace,
+    prepare_isolated_runtime_namespace,
+    resolve_isolated_runtime_namespace,
+)
+from kestrel_sovereign.multi_agent.agent_manager import (
+    AgentManager,
+    ChildTerminationNotPerformedError,
+    ChildTerminationReconciliationError,
+    RuntimeOffboardingNotPerformedError,
+    RuntimeOffboardingRetainedError,
+    _uncommitted_spawn_not_hosted_cancellation,
+)
+from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle, SpawnMode
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
@@ -22,6 +35,55 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
     agent._private_key = None  # No signing in unit tests
     agent.identity = None
     return agent
+
+
+def _exception_leaves(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        leaves: list[BaseException] = []
+        for nested in error.exceptions:
+            leaves.extend(_exception_leaves(nested))
+        return leaves
+    return [error]
+
+
+def test_uncommitted_spawn_not_hosted_classifier_is_narrow() -> None:
+    not_hosted = RuntimeOffboardingNotPerformedError(
+        agent_name="Kid",
+        agent_id="did:test:kid",
+        cleanup_state="not_hosted",
+    )
+    already_absent = RuntimeOffboardingNotPerformedError(
+        agent_name="Kid",
+        agent_id="did:test:kid",
+        cleanup_state="already_absent",
+    )
+    custody_unknown = RuntimeOffboardingNotPerformedError(
+        agent_name="Kid",
+        agent_id="did:test:kid",
+        cleanup_state="custody_unknown",
+    )
+
+    assert _uncommitted_spawn_not_hosted_cancellation(not_hosted) is False
+    assert (
+        _uncommitted_spawn_not_hosted_cancellation(
+            BaseExceptionGroup(
+                "cancelled storage-backed rollback",
+                [asyncio.CancelledError(), not_hosted],
+            )
+        )
+        is True
+    )
+    assert _uncommitted_spawn_not_hosted_cancellation(already_absent) is None
+    assert _uncommitted_spawn_not_hosted_cancellation(custody_unknown) is None
+    assert (
+        _uncommitted_spawn_not_hosted_cancellation(
+            ExceptionGroup(
+                "refund failure must survive",
+                [not_hosted, RuntimeError("refund failed")],
+            )
+        )
+        is None
+    )
 
 
 def _make_spawn_feature(parent_agent=None, manager=None):
@@ -179,6 +241,43 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["children"][0]["status"] == "running"
 
     @pytest.mark.asyncio
+    async def test_list_children_surfaces_exhausted_ttl_refusal(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=child)
+        manager.terminate_child = AsyncMock(return_value=False)
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=0.01,
+        )
+        for _ in range(100):
+            if lifecycle.get_termination_refusal("helper") is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        envelope = await feature.list_children()
+
+        child_record = envelope.data["children"][0]
+        assert child_record["status"] == "running"
+        assert child_record["has_result"] is False
+        assert child_record["operator_action_required"] is True
+        refusal = child_record["termination_refusal"]
+        assert refusal["automatic_termination_attempts"] == 3
+        assert refusal["automatic_retries_exhausted"] is True
+        assert refusal["retry_termination"] is True
+        assert lifecycle.get_result("helper") is None
+
+        manager.terminate_child.return_value = True
+        await lifecycle.terminate("helper")
+
+    @pytest.mark.asyncio
     async def test_delegate_task_success(self):
         parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
@@ -327,10 +426,1187 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.terminate_child(child_name="helper")
 
         assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained_for_restart"] is True
         manager._lifecycle.terminate.assert_awaited_once_with(
             child_name="helper",
             reason="explicit termination",
         )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_explicit_offboard_threads_destructive_intent(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager._lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle.terminate = AsyncMock(return_value=SimpleNamespace())
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["runtime_offboarded"] is True
+        assert envelope.data["runtime_retained_for_restart"] is False
+        manager._lifecycle.terminate.assert_awaited_once_with(
+            child_name="helper",
+            reason="explicit termination",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_reports_stopped_with_retained_runtime(self, caplog):
+        """The tool separates successful stop from retained runtime custody."""
+
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager.terminate_child = AsyncMock()
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        secret_path = Path("/operator/private/runtime/helper")
+        secret = "retained-cause-secret"
+        manager.terminate_child.side_effect = RuntimeOffboardingRetainedError(
+            agent_name="helper",
+            agent_id="did:child",
+            runtime_path=secret_path,
+            cause=OSError(secret),
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        with caplog.at_level("ERROR"):
+            envelope = await feature.terminate_child(
+                child_name="helper",
+                offboard_runtime=True,
+            )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.confirmation == "Terminated child 'helper'."
+        assert "runtime custody was retained" in envelope.error
+        assert "Do not retry termination" in envelope.error
+        assert envelope.data == {
+            "terminated": True,
+            "child_name": "helper",
+            "agent_removed": True,
+            "runtime_offboard_requested": True,
+            "runtime_offboarded": False,
+            "runtime_retained": True,
+            "runtime_retained_for_restart": False,
+            "named_child_runtime_retained": True,
+            "named_child_runtime_removed": False,
+            "runtime_cleanup_pending": False,
+            "runtime_cleanup_state": "retained",
+            "operator_action_required": True,
+            "retry_termination": False,
+            "retained_outcome_count": 1,
+            "retained_agents": ["helper"],
+            "retained_agent": "helper",
+            "pending_agents": [],
+            "retained_only_agents": ["helper"],
+            "additional_outcome_count": 0,
+            "additional_outcome_types": [],
+            "runtime_custody_code": "runtime_offboarding_retained",
+            "retained_cause_types": ["OSError"],
+            "retained_cause_type": "OSError",
+        }
+        serialized = str(envelope.to_dict()) + caplog.text
+        assert str(secret_path) not in serialized
+        assert secret not in serialized
+        assert lifecycle.is_tracked("helper") is False
+        assert lifecycle.get_result("helper").status.value == "terminated"
+        manager.terminate_child.assert_awaited_once_with(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("cleanup_state", "runtime_retained"),
+        (("not_hosted", True), ("already_absent", False)),
+    )
+    async def test_terminate_child_reports_noop_destructive_cleanup_truthfully(
+        self,
+        cleanup_state,
+        runtime_retained,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager.terminate_child = AsyncMock(
+            side_effect=RuntimeOffboardingNotPerformedError(
+                agent_name="helper",
+                agent_id="did:child",
+                cleanup_state=cleanup_state,
+            )
+        )
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is runtime_retained
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["named_child_runtime_retained"] is runtime_retained
+        assert envelope.data["runtime_cleanup_state"] == cleanup_state
+        assert envelope.data["runtime_already_absent"] is (
+            cleanup_state == "already_absent"
+        )
+        assert envelope.data["not_performed_agents"] == ["helper"]
+        assert envelope.data["retry_termination"] is False
+        assert "Do not retry termination" in envelope.error
+        assert lifecycle.is_tracked("helper") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "named_state",
+            "descendant_state",
+            "named_runtime_retained",
+            "hosted_runtime_configured",
+            "runtime_already_absent",
+        ),
+        (
+            ("already_absent", "not_hosted", False, True, True),
+            ("not_hosted", "already_absent", True, False, False),
+        ),
+    )
+    async def test_mixed_noop_cascade_fields_are_named_child_scoped(
+        self,
+        named_state,
+        descendant_state,
+        named_runtime_retained,
+        hosted_runtime_configured,
+        runtime_already_absent,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "mixed no-op custody",
+                [
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="Grandchild",
+                        agent_id="did:grandchild",
+                        cleanup_state=descendant_state,
+                    ),
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="Child",
+                        agent_id="did:child",
+                        cleanup_state=named_state,
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == named_state
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is True
+        assert (
+            envelope.data["named_child_runtime_retained"]
+            is named_runtime_retained
+        )
+        assert (
+            envelope.data["hosted_runtime_configured"]
+            is hosted_runtime_configured
+        )
+        assert envelope.data["runtime_already_absent"] is runtime_already_absent
+        assert envelope.data["not_performed_agents"] == ["Child", "Grandchild"]
+        assert "finalized_from_absence" not in envelope.data
+        manager.terminate_child.assert_awaited_once_with(
+            parent.agent_id,
+            "Child",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("descendant_state", "runtime_retained"),
+        (("not_hosted", True), ("already_absent", False)),
+    )
+    async def test_descendant_only_noop_never_scopes_named_removed_child(
+        self,
+        descendant_state,
+        runtime_retained,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=RuntimeOffboardingNotPerformedError(
+                agent_name="Grandchild",
+                agent_id="did:grandchild",
+                cleanup_state=descendant_state,
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["runtime_cleanup_state"] == "removed"
+        assert envelope.data["runtime_retained"] is runtime_retained
+        assert envelope.data["named_child_runtime_retained"] is False
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert "hosted_runtime_configured" not in envelope.data
+        assert "runtime_already_absent" not in envelope.data
+        assert envelope.data["not_performed_agents"] == ["Grandchild"]
+        assert "mixed runtime custody outcomes" in envelope.error
+
+    @pytest.mark.asyncio
+    async def test_retained_named_child_and_descendant_noop_preserve_both_facts(
+        self,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        retained = RuntimeOffboardingRetainedError(
+            agent_name="Child",
+            agent_id="did:child",
+            runtime_path=Path("/private/child-runtime"),
+            cause=OSError("private-retained-detail"),
+        )
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "mixed retained and no-op custody",
+                [
+                    retained,
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="Grandchild",
+                        agent_id="did:grandchild",
+                        cleanup_state="not_hosted",
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == "retained"
+        assert envelope.data["runtime_retained"] is True
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["retained_agents"] == ["Child"]
+        assert envelope.data["pending_agents"] == []
+        assert envelope.data["retained_only_agents"] == ["Child"]
+        assert envelope.data["not_performed_agents"] == ["Grandchild"]
+        assert envelope.data["runtime_custody_code"] == (
+            "runtime_offboarding_retained"
+        )
+        assert envelope.data["runtime_custody_codes"] == [
+            "runtime_offboarding_retained",
+            "runtime_offboarding_not_performed",
+        ]
+        assert "hosted_runtime_configured" not in envelope.data
+        assert "runtime_already_absent" not in envelope.data
+        assert "Child" in envelope.error
+        assert "Grandchild" in envelope.error
+        assert "retained tree" in envelope.error
+        assert "was retained for Child" in envelope.error
+        assert "may complete" not in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "/private/child-runtime" not in serialized
+        assert "private-retained-detail" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_descendant_retention_does_not_override_removed_named_child(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=RuntimeOffboardingRetainedError(
+                agent_name="Grandchild",
+                agent_id="did:grandchild",
+                runtime_path=Path("/private/grandchild-runtime"),
+                cause=OSError("private-grandchild-detail"),
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == "removed"
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["named_child_runtime_retained"] is False
+        assert envelope.data["retained_agents"] == ["Grandchild"]
+        assert envelope.data["runtime_retained"] is True
+        assert "Grandchild" in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "/private/grandchild-runtime" not in serialized
+        assert "private-grandchild-detail" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("named_state", "named_runtime_retained"),
+        (("already_absent", False), ("not_hosted", True)),
+    )
+    async def test_descendant_retention_preserves_named_child_noop_state(
+        self,
+        named_state,
+        named_runtime_retained,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "descendant retained and named child no-op",
+                [
+                    RuntimeOffboardingRetainedError(
+                        agent_name="Grandchild",
+                        agent_id="did:grandchild",
+                        runtime_path=Path("/private/grandchild-runtime"),
+                        cause=OSError("private-grandchild-detail"),
+                    ),
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="Child",
+                        agent_id="did:child",
+                        cleanup_state=named_state,
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == named_state
+        assert (
+            envelope.data["named_child_runtime_retained"]
+            is named_runtime_retained
+        )
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["retained_agents"] == ["Grandchild"]
+        assert envelope.data["not_performed_agents"] == ["Child"]
+        assert envelope.data["runtime_custody_code"] == (
+            "runtime_offboarding_retained"
+        )
+        assert envelope.data["runtime_custody_codes"] == [
+            "runtime_offboarding_retained",
+            "runtime_offboarding_not_performed",
+        ]
+        serialized = str(envelope.to_dict())
+        assert "/private/grandchild-runtime" not in serialized
+        assert "private-grandchild-detail" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("named_pending", "descendant_pending", "named_cleanup_state"),
+        ((True, False, "pending"), (False, True, "retained")),
+    )
+    async def test_retained_cleanup_state_is_named_child_scoped(
+        self,
+        named_pending,
+        descendant_pending,
+        named_cleanup_state,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "opposite retained cleanup states",
+                [
+                    RuntimeOffboardingRetainedError(
+                        agent_name="Child",
+                        agent_id="did:child",
+                        runtime_path=Path("/private/child-runtime"),
+                        cause=OSError("private-child-detail"),
+                        cleanup_pending=named_pending,
+                    ),
+                    RuntimeOffboardingRetainedError(
+                        agent_name="Grandchild",
+                        agent_id="did:grandchild",
+                        runtime_path=Path("/private/grandchild-runtime"),
+                        cause=OSError("private-grandchild-detail"),
+                        cleanup_pending=descendant_pending,
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == named_cleanup_state
+        assert envelope.data["runtime_cleanup_pending"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["retained_agents"] == ["Child", "Grandchild"]
+        pending_agent = "Child" if named_pending else "Grandchild"
+        retained_agent = "Grandchild" if named_pending else "Child"
+        assert envelope.data["pending_agents"] == [pending_agent]
+        assert envelope.data["retained_only_agents"] == [retained_agent]
+        assert f"still pending for {pending_agent}" in envelope.error
+        assert f"was retained for {retained_agent}" in envelope.error
+        assert f"still pending for {retained_agent}" not in envelope.error
+        assert f"{retained_agent} and may complete" not in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "/private/child-runtime" not in serialized
+        assert "/private/grandchild-runtime" not in serialized
+        assert "private-child-detail" not in serialized
+        assert "private-grandchild-detail" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("named_pending", "descendant_pending", "named_cleanup_state"),
+        ((True, False, "pending"), (False, True, "retained")),
+    )
+    async def test_mixed_retained_and_noop_messages_scope_pending_agents(
+        self,
+        named_pending,
+        descendant_pending,
+        named_cleanup_state,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "mixed retained states and no-op custody",
+                [
+                    RuntimeOffboardingRetainedError(
+                        agent_name="Child",
+                        agent_id="did:child",
+                        runtime_path=Path("/private/child-runtime"),
+                        cause=OSError("private-child-detail"),
+                        cleanup_pending=named_pending,
+                    ),
+                    RuntimeOffboardingRetainedError(
+                        agent_name="Grandchild",
+                        agent_id="did:grandchild",
+                        runtime_path=Path("/private/grandchild-runtime"),
+                        cause=OSError("private-grandchild-detail"),
+                        cleanup_pending=descendant_pending,
+                    ),
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="StorageGrandchild",
+                        agent_id="did:storage-grandchild",
+                        cleanup_state="not_hosted",
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        pending_agent = "Child" if named_pending else "Grandchild"
+        retained_agent = "Grandchild" if named_pending else "Child"
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == named_cleanup_state
+        assert envelope.data["runtime_cleanup_pending"] is True
+        assert envelope.data["pending_agents"] == [pending_agent]
+        assert envelope.data["retained_only_agents"] == [retained_agent]
+        assert envelope.data["not_performed_agents"] == ["StorageGrandchild"]
+        assert f"still pending for {pending_agent}" in envelope.error
+        assert f"was retained for {retained_agent}" in envelope.error
+        assert f"still pending for {retained_agent}" not in envelope.error
+        assert f"{retained_agent} and may complete" not in envelope.error
+        assert "not performed for StorageGrandchild" in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "/private/child-runtime" not in serialized
+        assert "/private/grandchild-runtime" not in serialized
+        assert "private-child-detail" not in serialized
+        assert "private-grandchild-detail" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_maps_real_shutdown_handoff_to_pending_partial(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT",
+            0.01,
+        )
+
+        class HostileChild:
+            agent_id = "did:child:handoff"
+
+            def __init__(self):
+                self.shutdown_entered = asyncio.Event()
+                self.allow_shutdown_finish = asyncio.Event()
+
+            async def shutdown(self):
+                self.shutdown_entered.set()
+                while not self.allow_shutdown_finish.is_set():
+                    try:
+                        await self.allow_shutdown_finish.wait()
+                    except asyncio.CancelledError:
+                        pass
+
+            def handoff_shutdown_to_reaper(self, shutdown_task):
+                async def reap():
+                    await asyncio.shield(shutdown_task)
+
+                return asyncio.create_task(reap())
+
+        parent = _make_mock_agent("did:parent")
+        child = HostileChild()
+        manager = AgentManager()
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children[parent.agent_id] = ["helper"]
+        manager._offboard_agent_runtime_namespace = AsyncMock(return_value=(False, None))
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=3600,
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        try:
+            envelope = await feature.terminate_child(
+                child_name="helper",
+                offboard_runtime=True,
+            )
+
+            assert envelope.status is ToolResultStatus.PARTIAL
+            assert envelope.data["runtime_cleanup_state"] == "pending"
+            assert envelope.data["retry_termination"] is False
+            assert envelope.data["retained_agent"] == "helper"
+            assert manager.get_agent("helper") is None
+            manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+            child.allow_shutdown_finish.set()
+            assert await manager.drain_quarantined_shutdowns() is False
+        finally:
+            child.allow_shutdown_finish.set()
+
+        manager._offboard_agent_runtime_namespace.assert_awaited_once_with(child)
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_flattens_grouped_retained_agents(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager.terminate_child = AsyncMock()
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        manager.terminate_child.side_effect = ExceptionGroup(
+            "retained descendants",
+            [
+                RuntimeOffboardingRetainedError(
+                    agent_name="helper",
+                    agent_id="did:child",
+                    runtime_path=Path("/private/helper"),
+                    cause=OSError("helper-secret"),
+                ),
+                ExceptionGroup(
+                    "nested",
+                    [
+                        RuntimeOffboardingRetainedError(
+                            agent_name="grandchild",
+                            agent_id="did:grandchild",
+                            runtime_path=Path("/private/grandchild"),
+                            cause=PermissionError("grandchild-secret"),
+                        )
+                    ],
+                ),
+            ],
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["retained_agents"] == ["grandchild", "helper"]
+        assert "retained_agent" not in envelope.data
+        assert envelope.data["retained_outcome_count"] == 2
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["additional_outcome_count"] == 0
+        assert envelope.data["retained_cause_types"] == [
+            "OSError",
+            "PermissionError",
+        ]
+        serialized = str(envelope.to_dict())
+        assert "/private" not in serialized
+        assert "helper-secret" not in serialized
+        assert "grandchild-secret" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_reports_descendant_custody_truthfully(self):
+        parent = _make_mock_agent("did:parent")
+        manager = AgentManager()
+        child = _make_mock_agent("did:child")
+        grandchild = _make_mock_agent("did:grandchild")
+        manager._agents.update({"Child": child, "Grandchild": grandchild})
+        manager._agent_names.update(
+            {child.agent_id: "Child", grandchild.agent_id: "Grandchild"}
+        )
+        manager._parent_children["did:parent"] = ["Child"]
+        manager._parent_children[child.agent_id] = ["Grandchild"]
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="Child",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        descendant_retained = RuntimeOffboardingRetainedError(
+            agent_name="Grandchild",
+            agent_id="did:grandchild",
+            runtime_path=Path("/private/grandchild"),
+            cause=OSError("descendant-secret"),
+        )
+
+        async def remove_agent(name: str, *, offboard_runtime: bool) -> bool:
+            assert offboard_runtime is True
+            removed = manager._agents.pop(name, None)
+            if removed is None:
+                return False
+            manager._agent_names.pop(removed.agent_id, None)
+            if name == "Grandchild":
+                raise descendant_retained
+            return True
+
+        manager.remove_agent = AsyncMock(side_effect=remove_agent)
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["retained_agent"] == "Grandchild"
+        assert envelope.data["retained_agents"] == ["Grandchild"]
+        assert envelope.data["named_child_runtime_retained"] is False
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert "Child" not in envelope.error
+        assert "Grandchild" in envelope.error
+        assert "descendant-secret" not in str(envelope.to_dict())
+        assert manager.remove_agent.await_args_list == [
+            (("Grandchild",), {"offboard_runtime": True}),
+            (("Child",), {"offboard_runtime": True}),
+        ]
+        assert manager.get_agent("Child") is None
+        assert manager.get_agent("Grandchild") is None
+        assert manager.get_children("did:parent") == []
+
+    @pytest.mark.asyncio
+    async def test_descendant_not_performed_never_claims_runtime_offboarded(self):
+        """A surviving grandchild makes subtree custody unknown, not removed."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        grandchild = _make_mock_agent("did:grandchild")
+        manager = AgentManager()
+        manager._agents.update({"Child": child, "Grandchild": grandchild})
+        manager._agent_names.update(
+            {child.agent_id: "Child", grandchild.agent_id: "Grandchild"}
+        )
+        manager._parent_children[parent.agent_id] = ["Child"]
+        manager._parent_children[child.agent_id] = ["Grandchild"]
+        manager._lifecycle = None
+        manager.terminate_children = AsyncMock(
+            side_effect=BaseExceptionGroup(
+                "descendant was not removed",
+                [
+                    asyncio.CancelledError(),
+                    ChildTerminationNotPerformedError(child_name="Grandchild"),
+                ],
+            )
+        )
+
+        async def remove_named_child(name: str, *, offboard_runtime: bool) -> bool:
+            assert name == "Child"
+            assert offboard_runtime is True
+            removed = manager._agents.pop(name)
+            manager._agent_names.pop(removed.agent_id)
+            return True
+
+        manager.remove_agent = AsyncMock(side_effect=remove_named_child)
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is True
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["runtime_cleanup_state"] == "removed"
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["surviving_subtree_agents"] == ["Grandchild"]
+        assert envelope.data["retry_termination"] is False
+        assert envelope.data["retry_descendant_termination"] is True
+        assert envelope.data["retry_descendant_agents"] == ["Grandchild"]
+        assert "Grandchild" in envelope.error
+        assert "Retry termination" in envelope.error
+        manager.terminate_children.assert_awaited_once_with(
+            child.agent_id,
+            offboard_runtime=True,
+        )
+        manager.remove_agent.assert_awaited_once_with(
+            "Child",
+            offboard_runtime=True,
+        )
+        assert manager.get_agent("Grandchild") is grandchild
+
+    @pytest.mark.asyncio
+    async def test_descendant_tnp_and_retention_leave_named_removed_state(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=BaseExceptionGroup(
+                "descendant termination and custody outcomes",
+                [
+                    ChildTerminationNotPerformedError(child_name="Grandchild"),
+                    RuntimeOffboardingRetainedError(
+                        agent_name="OtherGrandchild",
+                        agent_id="did:other-grandchild",
+                        runtime_path=Path("/private/other-grandchild"),
+                        cause=OSError("private-retained-detail"),
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == "removed"
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["named_child_runtime_retained"] is False
+        assert envelope.data["named_child_termination_not_performed"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["surviving_subtree_agents"] == ["Grandchild"]
+        assert envelope.data["retained_agents"] == ["OtherGrandchild"]
+        assert envelope.data["retained_only_agents"] == ["OtherGrandchild"]
+        assert envelope.data["pending_agents"] == []
+        assert "OtherGrandchild" in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "/private/other-grandchild" not in serialized
+        assert "private-retained-detail" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("named_outcome", "named_cleanup_state", "named_runtime_retained"),
+        (
+            ("already_absent", "already_absent", False),
+            ("retained", "retained", True),
+        ),
+    )
+    async def test_descendant_tnp_preserves_named_child_custody_state(
+        self,
+        named_outcome,
+        named_cleanup_state,
+        named_runtime_retained,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        if named_outcome == "retained":
+            named_error = RuntimeOffboardingRetainedError(
+                agent_name="Child",
+                agent_id="did:child",
+                runtime_path=Path("/private/child-runtime"),
+                cause=OSError("private-child-detail"),
+            )
+        else:
+            named_error = RuntimeOffboardingNotPerformedError(
+                agent_name="Child",
+                agent_id="did:child",
+                cleanup_state=named_outcome,
+            )
+        manager.terminate_child = AsyncMock(
+            side_effect=BaseExceptionGroup(
+                "descendant termination and named custody outcomes",
+                [
+                    ChildTerminationNotPerformedError(child_name="Grandchild"),
+                    named_error,
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == named_cleanup_state
+        assert (
+            envelope.data["named_child_runtime_retained"]
+            is named_runtime_retained
+        )
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["named_child_termination_not_performed"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["surviving_subtree_agents"] == ["Grandchild"]
+        serialized = str(envelope.to_dict())
+        assert "/private/child-runtime" not in serialized
+        assert "private-child-detail" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_descendant_not_performed_rejects_unsafe_name_metadata(self):
+        """Manager metadata cannot reflect traversal-like names into a tool result."""
+
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        unsafe = ChildTerminationNotPerformedError(child_name="../private")
+        manager.terminate_child = AsyncMock(
+            side_effect=BaseExceptionGroup(
+                "unsafe descendant metadata",
+                [asyncio.CancelledError(), unsafe],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await feature.terminate_child(
+                child_name="Child",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.exceptions[1] is unsafe
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_flattens_retained_and_cancellation(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager.terminate_child = AsyncMock()
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        manager.terminate_child.side_effect = BaseExceptionGroup(
+            "cancelled cleanup",
+            [
+                asyncio.CancelledError("private-cancel-text"),
+                RuntimeOffboardingRetainedError(
+                    agent_name="helper",
+                    agent_id="did:child",
+                    runtime_path=Path("/private/helper"),
+                    cause=TimeoutError("private-timeout-text"),
+                    cleanup_pending=True,
+                ),
+            ],
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["additional_outcome_count"] == 1
+        assert envelope.data["additional_outcome_types"] == ["CancelledError"]
+        assert envelope.data["runtime_cleanup_pending"] is True
+        assert envelope.data["runtime_cleanup_state"] == "pending"
+        assert "may complete" in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "private-cancel-text" not in serialized
+        assert "private-timeout-text" not in serialized
+        assert "/private/helper" not in serialized
+        manager.terminate_child.assert_awaited_once_with(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_preserves_active_cancellation_group(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        retained = RuntimeOffboardingRetainedError(
+            agent_name="helper",
+            agent_id="did:child",
+            runtime_path=Path("/private/helper"),
+            cause=OSError("private-custody-text"),
+        )
+
+        async def actively_cancelled(*_args, **_kwargs):
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            raise BaseExceptionGroup(
+                "active cancellation and custody",
+                [asyncio.CancelledError(), retained],
+            )
+
+        manager.terminate_child = AsyncMock(side_effect=actively_cancelled)
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        task = asyncio.current_task()
+        assert task is not None
+
+        try:
+            with pytest.raises(BaseExceptionGroup) as raised:
+                await feature.terminate_child(child_name="helper")
+            assert any(
+                isinstance(item, asyncio.CancelledError)
+                for item in raised.value.exceptions
+            )
+        finally:
+            while task.cancelling():
+                task.uncancel()
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_supports_typed_reconciliation_outcome(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ChildTerminationReconciliationError(
+                child_name="helper",
+                cause=OSError("private-reconcile-text"),
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(child_name="helper")
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_offboard_requested"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is True
+        assert envelope.data["runtime_retained_for_restart"] is True
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["runtime_cleanup_state"] == "not_requested"
+        assert envelope.data["tracking_reconciled"] is False
+        assert envelope.data["additional_outcome_types"] == [
+            "ChildTerminationReconciliationError"
+        ]
+        assert "private-reconcile-text" not in str(envelope.to_dict())
+
+    @pytest.mark.asyncio
+    async def test_destructive_reconciliation_partial_reports_runtime_removed(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ChildTerminationReconciliationError(
+                child_name="helper",
+                cause=OSError("private-reconcile-text"),
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_offboard_requested"] is True
+        assert envelope.data["runtime_offboarded"] is True
+        assert envelope.data["runtime_retained"] is False
+        assert envelope.data["runtime_retained_for_restart"] is False
+        assert envelope.data["named_child_runtime_retained"] is False
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["runtime_cleanup_state"] == "removed"
+        assert envelope.data["tracking_reconciled"] is False
+        assert "private-reconcile-text" not in str(envelope.to_dict())
+        manager.terminate_child.assert_awaited_once_with(
+            parent.agent_id,
+            "helper",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_flattens_retained_and_reconciliation(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "custody and reconciliation",
+                [
+                    RuntimeOffboardingRetainedError(
+                        agent_name="grandchild",
+                        agent_id="did:grandchild",
+                        runtime_path=Path("/private/grandchild"),
+                        cause=OSError("private-custody-text"),
+                    ),
+                    ChildTerminationReconciliationError(
+                        child_name="helper",
+                        cause=OSError("private-reconcile-text"),
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(child_name="helper")
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["retained_agent"] == "grandchild"
+        assert envelope.data["runtime_offboard_requested"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained_for_restart"] is True
+        assert envelope.data["runtime_cleanup_state"] == "not_requested"
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["tracking_reconciled"] is False
+        assert envelope.data["additional_outcome_count"] == 1
+        assert envelope.data["additional_outcome_types"] == [
+            "ChildTerminationReconciliationError"
+        ]
+        serialized = str(envelope.to_dict())
+        assert "/private/grandchild" not in serialized
+        assert "private-custody-text" not in serialized
+        assert "private-reconcile-text" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_reraises_unsupported_grouped_failure(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        retained = RuntimeOffboardingRetainedError(
+            agent_name="helper",
+            agent_id="did:child",
+            runtime_path=Path("/private/helper"),
+            cause=OSError("private-custody-text"),
+        )
+        programmer_failure = AssertionError("programmer invariant")
+        manager.terminate_child = AsyncMock(
+            side_effect=BaseExceptionGroup(
+                "mixed unsupported outcome",
+                [retained, programmer_failure],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await feature.terminate_child(child_name="helper")
+
+        assert programmer_failure in raised.value.exceptions
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_reraises_untyped_operational_failure(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        failure = RuntimeError("untyped lifecycle failure")
+        manager.terminate_child = AsyncMock(side_effect=failure)
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        with pytest.raises(RuntimeError) as raised:
+            await feature.terminate_child(child_name="helper")
+
+        assert raised.value is failure
 
     @pytest.mark.asyncio
     async def test_terminate_child_falls_back_without_lifecycle(self):
@@ -346,6 +1622,274 @@ class TestSpawnFeatureWithManager:
 
         assert envelope.status is ToolResultStatus.OK
         manager.terminate_child.assert_awaited_once_with("did:parent", "helper")
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_false_result_remains_error(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(return_value=False)
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(child_name="helper")
+
+        assert envelope.status is ToolResultStatus.ERROR
+        assert envelope.error == "Failed to terminate 'helper'"
+        manager.terminate_child.assert_awaited_once_with("did:parent", "helper")
+
+    @pytest.mark.asyncio
+    async def test_real_lifecycle_preserves_manager_false_as_tool_error(self):
+        """Lifecycle tracking cannot turn a pruned manager edge into success."""
+
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.terminate_child = AsyncMock(return_value=False)
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            "helper",
+            "did:helper",
+            parent.agent_id,
+            ttl_seconds=3600,
+        )
+        lifecycle._fire_hook = AsyncMock()
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        ttl_task = lifecycle._tracked["helper"].ttl_task
+
+        envelope = await feature.terminate_child(child_name="helper")
+
+        assert envelope.status is ToolResultStatus.ERROR
+        assert envelope.error == "Failed to terminate 'helper'"
+        assert lifecycle.is_tracked("helper")
+        assert lifecycle.get_result("helper") is None
+        assert lifecycle._tracked["helper"].ttl_task is ttl_task
+        assert ttl_task is not None and not ttl_task.done()
+        lifecycle._fire_hook.assert_not_awaited()
+        manager.terminate_child.assert_awaited_once_with(parent.agent_id, "helper")
+
+        manager.terminate_child.return_value = True
+        retried = await feature.terminate_child(child_name="helper")
+
+        assert retried.status is ToolResultStatus.OK
+        assert manager.terminate_child.await_count == 2
+        assert not lifecycle.is_tracked("helper")
+        assert lifecycle.get_result("helper").status.value == "terminated"
+        lifecycle._fire_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_destructive_terminate_losing_to_offboard_has_unknown_custody(
+        self, tmp_path, caplog
+    ):
+        """A destructive winner is not retention proof for the losing request."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child:destructive-request-race")
+        manager = AgentManager(base_data_dir=tmp_path)
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("deleted-by-concurrent-offboard")
+        child.isolated_runtime_scope = scope
+        manager._agents["worker"] = child
+        manager._agent_names[child.agent_id] = "worker"
+        manager._parent_children[parent.agent_id] = ["worker"]
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="worker",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=3600,
+            mode=SpawnMode.EPHEMERAL,
+        )
+        lifecycle._fire_hook = AsyncMock()
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        caplog.set_level("WARNING", logger="kestrel_sovereign.spawn.lifecycle")
+
+        await lifecycle._lock.acquire()
+        tool_task = asyncio.create_task(
+            feature.terminate_child("worker", offboard_runtime=True)
+        )
+        try:
+            for _ in range(100):
+                if getattr(lifecycle._lock, "_waiters", None):
+                    break
+                await asyncio.sleep(0)
+            assert getattr(lifecycle._lock, "_waiters", None)
+            assert (
+                await manager.remove_agent("worker", offboard_runtime=True) is True
+            )
+            assert manager.get_agent("worker") is None
+            assert manager.get_children(parent.agent_id) == []
+            assert not scope.path.exists()
+        finally:
+            lifecycle._lock.release()
+
+        envelope = await tool_task
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["runtime_offboarded"] is False
+        assert "runtime_retained" not in envelope.data
+        assert "named_child_runtime_retained" not in envelope.data
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["runtime_retention_unknown"] is True
+        assert envelope.data["runtime_cleanup_state"] == "custody_unknown"
+        assert envelope.data["runtime_already_absent"] is False
+        assert envelope.data["finalized_from_absence"] is True
+        assert "hosted_runtime_configured" not in envelope.data
+        assert envelope.data["operator_action_required"] is True
+        assert "operator reconciliation" in envelope.error
+        assert not credential.exists()
+        assert not lifecycle.is_tracked("worker")
+        stored_result = lifecycle.get_result("worker")
+        assert stored_result.status.value == "terminated"
+        assert stored_result.finalized_from_absence is True
+        assert "Finalizing child 'worker' from routing absence" in caplog.text
+        assert "offboard_runtime=True" in caplog.text
+        assert "runtime custody is unknown" in caplog.text
+        assert str(scope.path) not in caplog.text
+        lifecycle._fire_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_nondestructive_terminate_losing_to_offboard_has_unknown_custody(
+        self, tmp_path, caplog
+    ):
+        """Routing absence cannot be promoted to a restart-retention claim."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child:destructive-delete-race")
+        manager = AgentManager(base_data_dir=tmp_path)
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("deleted-by-concurrent-offboard")
+        child.isolated_runtime_scope = scope
+        manager._agents["worker"] = child
+        manager._agent_names[child.agent_id] = "worker"
+        manager._parent_children[parent.agent_id] = ["worker"]
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="worker",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=3600,
+            mode=SpawnMode.EPHEMERAL,
+        )
+        lifecycle._fire_hook = AsyncMock()
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        caplog.set_level("WARNING", logger="kestrel_sovereign.spawn.lifecycle")
+
+        await lifecycle._lock.acquire()
+        tool_task = asyncio.create_task(feature.terminate_child("worker"))
+        try:
+            for _ in range(100):
+                if getattr(lifecycle._lock, "_waiters", None):
+                    break
+                await asyncio.sleep(0)
+            assert getattr(lifecycle._lock, "_waiters", None)
+            assert (
+                await manager.remove_agent("worker", offboard_runtime=True) is True
+            )
+            assert manager.get_agent("worker") is None
+            assert manager.get_children(parent.agent_id) == []
+            assert not scope.path.exists()
+        finally:
+            lifecycle._lock.release()
+
+        envelope = await tool_task
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["finalized_from_absence"] is True
+        assert envelope.data["runtime_offboard_requested"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_cleanup_state"] == "custody_unknown"
+        assert envelope.data["runtime_already_absent"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["runtime_retention_unknown"] is True
+        assert "runtime_retained" not in envelope.data
+        assert "runtime_retained_for_restart" not in envelope.data
+        assert "named_child_runtime_retained" not in envelope.data
+        assert "named_child_runtime_removed" not in envelope.data
+        assert envelope.data["retry_termination"] is False
+        assert "reconcile runtime custody" in envelope.error
+        assert not credential.exists()
+        assert not lifecycle.is_tracked("worker")
+        stored_result = lifecycle.get_result("worker")
+        assert stored_result.status.value == "terminated"
+        assert stored_result.finalized_from_absence is True
+        assert "Finalizing child 'worker' from routing absence" in caplog.text
+        assert "offboard_runtime=False" in caplog.text
+        assert "runtime custody is unknown" in caplog.text
+        assert str(scope.path) not in caplog.text
+        lifecycle._fire_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_descendant_failure_never_claims_named_child_removed(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = AgentManager()
+        manager._agents["Child"] = child
+        manager._agent_names[child.agent_id] = "Child"
+        manager._parent_children[parent.agent_id] = ["Child"]
+        manager.terminate_children = AsyncMock(
+            side_effect=ChildTerminationReconciliationError(
+                child_name="Grandchild",
+                cause=OSError("private descendant path"),
+            )
+        )
+        manager.remove_agent = AsyncMock(return_value=False)
+        manager._lifecycle = None
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is False
+        assert envelope.data["agent_removed"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["runtime_cleanup_state"] == (
+            "termination_not_performed"
+        )
+        assert envelope.data["runtime_retained"] is True
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["retry_termination"] is True
+        assert envelope.data["named_child_termination_not_performed"] is True
+        assert envelope.data["retry_named_child_termination"] is True
+        assert envelope.data["surviving_subtree_agents"] == []
+        assert envelope.data["retry_descendant_termination"] is False
+        assert envelope.data["retry_descendant_agents"] == []
+        assert envelope.data["additional_outcome_types"] == [
+            "ChildTerminationNotPerformedError",
+            "ChildTerminationReconciliationError",
+        ]
+        assert "named child" in envelope.error
+        assert "named descendant" not in envelope.error
+        assert "private descendant path" not in str(envelope.to_dict())
 
     @pytest.mark.asyncio
     async def test_terminate_child_not_ours(self):
@@ -375,22 +1919,6 @@ class TestSpawnFeatureWithManager:
 
         assert len(feature._child_tasks) == 0
         assert len(feature._child_results) == 0
-
-
-class TestSpawnFeatureDefaultPermissions:
-    """Verify default permission levels."""
-
-    def test_spawn_agent_requires_ask(self):
-        feature = _make_spawn_feature()
-        assert feature.default_permissions["spawn_agent"] == "ask"
-
-    def test_delegate_task_defaults_to_allow(self):
-        feature = _make_spawn_feature()
-        assert feature.default_permissions["delegate_task"] == "allow"
-
-    def test_terminate_child_defaults_to_allow(self):
-        feature = _make_spawn_feature()
-        assert feature.default_permissions["terminate_child"] == "allow"
 
 
 class TestAgentManagerSpawn:
@@ -562,11 +2090,16 @@ class TestAgentManagerSpawn:
 
         assert any(
             isinstance(error, asyncio.CancelledError)
-            for error in exc_info.value.exceptions
+            for error in _exception_leaves(exc_info.value)
         )
         assert any(
             "rollback refund failed" in str(error)
-            for error in exc_info.value.exceptions
+            for error in _exception_leaves(exc_info.value)
+        )
+        assert any(
+            isinstance(error, RuntimeOffboardingNotPerformedError)
+            and error.cleanup_state == "not_hosted"
+            for error in _exception_leaves(exc_info.value)
         )
         assert manager.get_agent("helper") is None
         assert manager._child_budgets["helper"] is budget_entry
@@ -575,7 +2108,6 @@ class TestAgentManagerSpawn:
 
     @pytest.mark.asyncio
     async def test_terminate_child(self):
-        parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
 
         manager = AgentManager()
@@ -595,6 +2127,66 @@ class TestAgentManagerSpawn:
         child.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_terminate_child_default_retains_hosted_runtime_for_restart(
+        self,
+        tmp_path,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        child = _make_mock_agent("did:child:retained")
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("retain-on-stop")
+        child.isolated_runtime_scope = scope
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+
+        assert await manager.terminate_child("did:parent", "helper") is True
+
+        assert credential.read_text() == "retain-on-stop"
+        assert scope.path.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_explicit_offboard_deletes_hosted_runtime(
+        self,
+        tmp_path,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        child = _make_mock_agent("did:child:offboard")
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        (scope.path / "feature_venvs" / "feature-safe" / "credential").write_text(
+            "delete-on-offboard"
+        )
+        child.isolated_runtime_scope = scope
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+
+        assert await manager.terminate_child(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        ) is True
+
+        assert not scope.path.exists()
+
+    @pytest.mark.asyncio
     async def test_terminate_child_not_found(self):
         manager = AgentManager()
         removed = await manager.terminate_child("did:parent", "ghost")
@@ -603,7 +2195,6 @@ class TestAgentManagerSpawn:
     @pytest.mark.asyncio
     async def test_terminate_children_cascading(self):
         """Terminating children should cascade to grandchildren."""
-        parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
         grandchild = _make_mock_agent("did:grandchild")
 

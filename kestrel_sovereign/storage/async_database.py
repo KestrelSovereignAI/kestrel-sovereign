@@ -7,8 +7,9 @@ All queries use SQLite-style ? placeholders - automatically converted for Postgr
 import asyncio
 import hashlib
 import logging
+import re
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .db import (
     ConnectionError,
@@ -18,12 +19,72 @@ from .db import (
     normalize_schema,
 )
 from .db.sqlite import _minimum_close_timeout_s
+from .conversation_created_at import (
+    CONSTRAINT_NAME as CREATED_AT_CONSTRAINT,
+    UNDATED_DDL,
+    UNDATED_TABLE,
+    canonical_created_at,
+    canonical_sql,
+    conversation_history_ddl,
+    created_at_bind,
+    created_at_check,
+    derived_stamp,
+    noncanonical_predicate,
+    repairable_bulk_update,
+)
 from .session_id_column import backfill_statement
 
 logger = logging.getLogger(__name__)
 
 
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
+
+#: ``(name, table, columns)`` of the index that makes the #2959 projection worth
+#: having — Phase C lists an agent's sessions newest-activity-first.
+#:
+#: There is deliberately no completion-marker constant beside this. The #2959
+#: projection is a rebuildable cache whose watermark records the state of history
+#: it has accounted for, so the watermark IS its marker; a ``schema_backfills``
+#: row asserting "built" would be a second, weaker claim about the same thing,
+#: and the weaker one is the one that goes on saying "done" after the table has
+#: drifted. Nothing needs building at boot: a fresh watermark is *invalid*, which
+#: is detected on first read and rebuilt then.
+#:
+#: Declared here and created through :meth:`AsyncDatabase.ensure_index` rather
+#: than as a ``CREATE INDEX IF NOT EXISTS`` line in ``CORE_SCHEMA``, because that
+#: spelling is idempotent in SEQUENCE and unsafe in PARALLEL: PostgreSQL
+#: evaluates the existence test before taking the lock that would exclude a
+#: peer, so two ``from_pool()`` initializers racing the first post-upgrade boot
+#: can both proceed and one dies on ``pg_class``' unique index — failing its
+#: whole request, not merely skipping an index. ``ensure_index`` owns the
+#: probe → lock → re-probe that closes it. (The older index lines still in
+#: ``CORE_SCHEMA`` predate that helper; this one has no excuse to join them.)
+#:
+#: One tuple, unpacked into the call and read by the test that races it, so the
+#: declaration a concurrency test exercises is provably the shipped one.
+#: Name and table only — the columns come from ``SESSION_ORDER`` at ensure time,
+#: because they are dialect-dependent (the tie-break is compared bytewise, which
+#: PostgreSQL needs told) and because an index that does not carry every key the
+#: page orders by does not bound the page.
+_SESSION_PROJECTION_INDEX = (
+    "idx_conversation_sessions_recent",
+    "conversation_sessions",
+)
+
+#: ``(name, table, columns)`` of the index that makes the #2959 staleness probe
+#: the "one indexed ``max(id)`` lookup" it is described as.
+#:
+#: ``idx_conversation_agent_id`` is not enough on PostgreSQL. It covers
+#: ``agent_id`` alone, so ``MAX(id) WHERE agent_id = ?`` has to walk every index
+#: entry for that agent and visit the heap for each — O(history), for a question
+#: that should be one backward index step. SQLite gets the same plan for free
+#: because ``id`` is its rowid and every index carries the rowid as a trailing
+#: key column; PostgreSQL has no such implicit column and must be told.
+_SESSION_FRONTIER_INDEX = (
+    "idx_conversation_agent_row_id",
+    "conversation_history",
+    "agent_id, id",
+)
 
 
 def _collapse_ws(text: str) -> str:
@@ -144,22 +205,13 @@ CREATE TABLE IF NOT EXISTS schema_backfills (
     completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS conversation_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id TEXT NOT NULL DEFAULT '',
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    rendered_content TEXT DEFAULT NULL,
-    model TEXT DEFAULT NULL,
-    provider TEXT DEFAULT NULL,
-    metadata TEXT,
-    session_id TEXT DEFAULT NULL,
-    lexical_index_id TEXT DEFAULT NULL,
-    lexical_index_version TEXT DEFAULT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP DEFAULT NULL,
-    archived_at TIMESTAMP DEFAULT NULL
-);
+-- conversation_history is created from
+-- ``conversation_created_at.conversation_history_ddl()``, immediately before
+-- this schema runs, and NOT from this text. Its CHECK is per-backend, and
+-- ``normalize_schema`` strips ``DEFAULT CURRENT_TIMESTAMP`` on the way to
+-- SQLite (#3048) — the column that has to stop being nullable is the last one
+-- that can afford to lose its default. The indexes below still belong here,
+-- because the table exists by the time they run.
 
 CREATE TABLE IF NOT EXISTS conversation_lexical_tokens (
     agent_id TEXT NOT NULL,
@@ -192,6 +244,18 @@ CREATE TABLE IF NOT EXISTS conversation_titles (
 
 CREATE INDEX IF NOT EXISTS idx_conversation_titles_agent
     ON conversation_titles(agent_id);
+
+-- The #2959 session projection -- conversation_sessions, its watermark and the
+-- change ledger the triggers fill -- is deliberately NOT declared in this
+-- block. Those three tables and the triggers that keep them honest are one
+-- design (a table without its trigger is a projection that reports itself
+-- current forever), and CREATE TABLE IF NOT EXISTS in this loop is idempotent
+-- in SEQUENCE but unsafe in PARALLEL: _init_schema runs on every from_pool(),
+-- so a post-upgrade request burst has concurrent initializers racing in
+-- PostgreSQL's catalogs. They are created together through
+-- AsyncDatabase.ensure_session_projection_schema, which owns the probe ->
+-- migration lock -> re-probe that closes it. The DDL lives beside the contract
+-- in storage/conversation_sessions.py.
 
 CREATE TABLE IF NOT EXISTS model_usage (
     model_id TEXT PRIMARY KEY,
@@ -647,6 +711,15 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     last_delivery_error TEXT,
     last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
     last_delivery_attempt_at TIMESTAMP,
+    -- Attempts belong to a TRANSITION, not to a handle (#3105). A provider
+    -- that corrects a terminal state (talon finished_unknown -> failed) starts
+    -- a new transition whose first wake is news, not attempt N+1 of the old
+    -- one. This records which signaled token the counter is counting.
+    attempts_signaled_target TEXT NOT NULL DEFAULT '',
+    -- When the current attempt was DISPATCHED. last_delivery_attempt_at is
+    -- rewritten at harvest time, so it answers "when did we last look", not
+    -- "when did we try" — a difference measured at 41 minutes live.
+    last_attempt_started_at TIMESTAMP,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
@@ -762,6 +835,67 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));
 """
+
+
+#: Hex digits in an index-name fingerprint. Named because ``_index_family``
+#: matches on it: a family boundary and the names it generates have to be the
+#: same length or the boundary is not exact.
+_FINGERPRINT_HEX = 8
+
+#: PostgreSQL truncates an identifier over this many BYTES without complaining,
+#: after which the exact probe cannot find what was just created and boot
+#: raises. SQLite has no such limit, but one rule is easier to keep true.
+_MAX_IDENTIFIER_BYTES = 63
+
+
+def _fingerprinted_index_name(name: str, fingerprint: str) -> str:
+    """``name`` plus its fingerprint, within PostgreSQL's identifier limit.
+
+    The BASE is shortened, never the fingerprint: the suffix is what makes a
+    changed definition a changed name, and truncating it would collapse
+    distinct definitions onto one name — reintroducing the exact bug this
+    mechanism exists to fix, in a form far harder to see.
+    """
+    suffix = f"_{fingerprint}"
+    budget = _MAX_IDENTIFIER_BYTES - len(suffix.encode("utf-8"))
+    trimmed = name.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    return f"{trimmed}{suffix}"
+
+
+def _definition_fingerprint(backend_type: str, columns: str, where: str) -> str:
+    """A short digest of what an index actually IS, for its name to carry.
+
+    Covers the backend as well as the expression: the same call renders a
+    different index on each engine, and a database that somehow saw both must
+    not treat them as the same object.
+    """
+    material = "\n".join((backend_type, columns, where)).encode("utf-8")
+    return hashlib.blake2s(material, digest_size=4).hexdigest()
+
+
+def core_schema_sql(backend_type: str) -> str:
+    """The whole core schema for one backend, in dependency order.
+
+    ``CORE_SCHEMA`` stopped being the whole of it when #3009 moved
+    ``conversation_history`` into ``conversation_created_at``: its CHECK is
+    per-backend, and ``normalize_schema`` strips the column default on the way
+    to SQLite (#3048). Its indexes stayed behind in ``CORE_SCHEMA``, so the
+    table has to come FIRST.
+
+    This exists because three callers build a database out of that text and
+    each was silently left with a schema missing one table — and, because the
+    indexes are still declared, an error rather than a quiet gap. They asked
+    for "the core schema" and should go on getting it; where a table happens to
+    be declared is this module's business, not theirs.
+    """
+    return (
+        conversation_history_ddl(backend_type).replace(
+            "CREATE TABLE {table}",
+            "CREATE TABLE IF NOT EXISTS conversation_history",
+        )
+        + ";\n"
+        + normalize_schema(CORE_SCHEMA, backend_type)
+    )
 
 
 class AsyncDatabase:
@@ -882,7 +1016,10 @@ class AsyncDatabase:
     
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
-        schema = normalize_schema(CORE_SCHEMA, self.backend_type)
+        # Through the accessor, not CORE_SCHEMA directly: conversation_history
+        # is declared per-backend and has to be created before the indexes
+        # CORE_SCHEMA still carries for it. See ``core_schema_sql``.
+        schema = core_schema_sql(self.backend_type)
 
         # Execute each statement separately for PostgreSQL compatibility
         for statement in schema.split(';'):
@@ -1061,6 +1198,21 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "wait_signal_state", "last_surface_status", "TEXT"
         )
+        # Attempt provenance (#3105), same reasoning as the column above: the
+        # table is CREATE TABLE IF NOT EXISTS, so an existing database never
+        # receives these from the schema. No backfill — the defaults are the
+        # honest legacy answer. An existing row mid-retry has an empty
+        # ``attempts_signaled_target``, so its next detect reads as a new
+        # transition and restarts the counter at 1. That is a one-time, bounded
+        # loss of cap history in the direction of delivering rather than
+        # suppressing, which is the safe direction for a wake.
+        await self._migrate_add_column(
+            "wait_signal_state", "attempts_signaled_target",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        await self._migrate_add_column(
+            "wait_signal_state", "last_attempt_started_at", "TIMESTAMP"
+        )
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
         # sequence but not safe in parallel, and ``_init_schema`` runs on every
@@ -1225,6 +1377,26 @@ class AsyncDatabase:
                 "integer-keyed messages remain split until next boot.",
                 e, exc_info=True,
             )
+
+        # #2959: the session projection's tables, change triggers and indexes,
+        # all behind one concurrency-safe boundary. LAST, and specifically after
+        # the #2012 relink above, because that migration REWRITES session_id:
+        # creating the triggers first would count the relink's own UPDATEs as
+        # changes, which is harmless but pointless work on every boot that finds
+        # something to relink.
+        #
+        # No projection is BUILT here, and that is the contract rather than an
+        # omission. It is a rebuildable cache whose watermark starts *invalid*,
+        # so the first read finds it stale and rebuilds it then. A boot-time
+        # backfill would have to sit behind a completion marker that would go on
+        # claiming "built" for a table the next relink had already moved.
+        # #3009: conversation_history.created_at gains the guarantee its
+        # readers have been standing in for. Before the projection's schema
+        # pass, which the docstring on the method explains at length: on SQLite
+        # the retrofit rebuilds the table and takes the #2959 triggers with it.
+        await self._migrate_conversation_created_at()
+
+        await self.ensure_session_projection_schema()
 
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
@@ -1607,13 +1779,14 @@ class AsyncDatabase:
         """Record that the named one-time backfill has completed. Idempotent."""
         if self.backend_type == "postgres":
             await self._backend.execute(
-                "INSERT INTO schema_backfills (name) VALUES (?) "
-                "ON CONFLICT DO NOTHING",
+                "INSERT INTO schema_backfills (name, completed_at) "
+                "VALUES (?, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING",
                 (name,),
             )
         else:
             await self._backend.execute(
-                "INSERT OR IGNORE INTO schema_backfills (name) VALUES (?)",
+                "INSERT OR IGNORE INTO schema_backfills (name, completed_at) "
+                "VALUES (?, CURRENT_TIMESTAMP)",
                 (name,),
             )
 
@@ -1748,6 +1921,7 @@ class AsyncDatabase:
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",
+        where: str = "",
     ) -> None:
         """Create an index if it is absent, serialized across initializers.
 
@@ -1782,25 +1956,66 @@ class AsyncDatabase:
         parentheses (``"agent_id, session_id"``). Neither it nor ``name`` may
         come from untrusted input — both are interpolated, as no backend binds
         parameters into DDL.
+
+        **The name carries a fingerprint of the definition**, so ``name`` is a
+        family rather than an object: ``idx_foo`` becomes ``idx_foo_a1b2c3d4``
+        and a changed ``columns``/``where`` is a different name. Members of the
+        family that do not match are dropped.
+
+        Without that, this method answers "is there an index called X on this
+        table" and nothing answers "is it the index we meant". Several of these
+        definitions are COMPUTED — ``canonical_order_index_columns()`` renders
+        the ordering key per backend — so changing the ordering leaves the old
+        index in place, matching nothing the new ``ORDER BY`` asks for. The
+        symptom is a query plan: no error, no missing index, just the
+        O(history) scan the epic exists to remove, silently back.
+
+        The fingerprint is in the NAME because that is the only place both
+        engines compare exactly. SQLite stores the ``CREATE INDEX`` verbatim, so
+        its text could be compared; PostgreSQL normalizes it —
+        ``(agent_id, created_at ASC NULLS FIRST, id ASC)`` reads back as
+        ``USING btree (agent_id, created_at NULLS FIRST, id)`` — so a text
+        comparison there rebuilds on every boot. Measured on PostgreSQL 16.14.
+        Same reasoning, and the same shape, as the #2998 trigger names.
         """
-        if await self._index_exists(name, table):
+        wanted = _fingerprinted_index_name(
+            name, _definition_fingerprint(self.backend_type, columns, where)
+        )
+        if await self._index_exists(wanted, table):
             return
         created = False
         async with self.migration_lock(lock_name or f"index_{name}"):
             # Re-probed under the lock: a concurrent initializer may have
             # created it while this one waited.
-            if not await self._index_exists(name, table):
+            if not await self._index_exists(wanted, table):
                 await self._backend.execute(
-                    f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})"
+                    f"CREATE INDEX IF NOT EXISTS {wanted} ON {table}({columns})"
+                    + (f" WHERE {where}" if where else "")
                 )
                 created = True
+            # Created BEFORE the superseded members are dropped. A window with
+            # two indexes is a little redundant work; a window with none is the
+            # unindexed scan this exists to prevent, taken during a boot.
+            for stale in await self._index_family(name, table):
+                if stale != wanted:
+                    schema = await self._index_namespace(stale, table)
+                    qualified = (
+                        f"{self._quoted(schema)}.{self._quoted(stale)}"
+                        if schema else self._quoted(stale)
+                    )
+                    await self._backend.execute(
+                        f"DROP INDEX IF EXISTS {qualified}"
+                    )
+                    logger.info(
+                        "%s: retired index %s; its definition moved", table, stale
+                    )
         # Outside the lock deliberately: the statement has committed, so this
         # reads what the next boot would read, and a raise here is the caller's
         # own error rather than a rolled-back transaction's.
-        if not await self._index_exists(name, table):
-            owner = await self._index_name_owner(name, table)
+        if not await self._index_exists(wanted, table):
+            owner = await self._index_name_owner(wanted, table)
             raise RuntimeError(
-                f"{table}: index {name}({columns}) was not created. The name "
+                f"{table}: index {wanted}({columns}) was not created. The name "
                 f"is already taken by "
                 + (f"an index on {owner!r}" if owner else "another relation")
                 + " — index names are unique per database on SQLite and per "
@@ -1808,7 +2023,485 @@ class AsyncDatabase:
                 "it as already present and did nothing. Rename one of them."
             )
         if created:
-            logger.info("%s: created index %s(%s)", table, name, columns)
+            logger.info("%s: created index %s(%s)", table, wanted, columns)
+
+    async def ensure_session_projection_schema(self) -> None:
+        """Create the #2959 projection's tables, triggers and indexes. (#2959)
+
+        One boundary for all of them, because they are one design: a table
+        without its change trigger is a projection that reports itself current
+        forever, and an index created beside a table that a peer initializer is
+        still creating is a request that fails rather than an index that is
+        merely late.
+
+        **Why not ``CORE_SCHEMA``.** That loop issues bare
+        ``CREATE TABLE IF NOT EXISTS`` statements, which are idempotent in
+        SEQUENCE and unsafe in PARALLEL for the same reason
+        :meth:`ensure_index` exists: PostgreSQL evaluates the existence test
+        before taking the lock that would exclude a peer, so two initializers
+        racing the first post-upgrade boot can both proceed and one dies on
+        ``pg_class``' unique index — failing its whole ``from_pool()``, which
+        frinz calls per request. Everything here therefore goes through
+        probe → ``migration_lock`` → re-probe.
+
+        **The fast path takes no lock**, which matters because this runs on
+        every ``from_pool()`` and not only after an upgrade: a database whose
+        objects are all present answers with one existence probe per object and
+        never enters the lock at all.
+
+        Ordering inside the lock is load-bearing. Tables before triggers,
+        because a trigger's target and the table it writes into must both exist
+        — PostgreSQL refuses the ``CREATE TRIGGER`` outright, while SQLite
+        accepts it and fails at *fire* time, which is a boot that looks fine
+        until the first message is written. The PL/pgSQL function before the
+        triggers that call it, for the same reason.
+
+        The DDL itself lives in
+        :mod:`kestrel_sovereign.storage.conversation_sessions`, beside the
+        contract it implements and the column list the triggers watch. This
+        method owns HOW to create things safely; that module owns WHAT.
+        """
+        from .session_grouping import session_order_index_columns
+        from .conversation_sessions import (
+            FUNCTION_NAME_PREFIX,
+            TRIGGER_NAME_PREFIX,
+            active_history_predicate,
+            archived_history_predicate,
+            canonical_order_index_columns,
+            live_history_predicate,
+            mutation_trigger_functions,
+            mutation_triggers,
+            NON_NULL_PROJECTION_COLUMNS,
+            emptied_cache_invalidation,
+            publishing_agent_ledger_seed,
+            CHANGES_PRE_SLOT_TABLE,
+            CHANGES_SLOT_COLUMN,
+            changes_slot_migration,
+            WATERMARK_EPOCH_COLUMN,
+            WATERMARK_REVISION_COLUMN,
+            projection_tables,
+            shape_change_invalidation,
+        )
+
+        tables = projection_tables()
+        triggers = mutation_triggers(self.backend_type)
+        functions = mutation_trigger_functions(self.backend_type)
+        wanted_triggers = {name: ddl for name, ddl in triggers}
+        wanted_functions = {name: ddl for name, ddl in functions}
+
+        missing_tables = [
+            (table, ddl)
+            for table, ddl in tables
+            if not await self.table_exists(table)
+        ]
+        # A projection table carrying an EARLIER shape is as good as missing.
+        # #2960 made ``started_at`` / ``last_message_at`` NOT NULL — the page's
+        # keyset predicate cannot seek while it must also admit NULL — and a
+        # database created before that still permits one. There is no ALTER for
+        # it on SQLite and no reason to reach for one on either engine: this
+        # table is a rebuildable cache, so the migration is to drop it and let a
+        # repair derive it again, which is cheaper than rewriting it in place.
+        async def _predates_the_not_null_stamps(table: str) -> bool:
+            for column in NON_NULL_PROJECTION_COLUMNS:
+                if await self._column_accepts_null(table, column):
+                    return True
+            return False
+
+        outdated_tables = [
+            table
+            for table in ("conversation_sessions",)
+            if not any(table == name for name, _ in missing_tables)
+            and await _predates_the_not_null_stamps(table)
+        ]
+        # A counter ledger from before #3005 has no `slot`, and `slot` is half
+        # of its primary key -- so the CREATE TABLE IF NOT EXISTS below is a
+        # no-op on it and `shape_change_invalidation`, which addresses slot 0,
+        # raises. That failure is swallowed by `build_host_context` into
+        # `db=None`, and a host then boots with its whole operator run plane
+        # missing while /health reports ok (#3058).
+        # Existence comes from the probe above rather than a second query of
+        # its own: this method runs on every from_pool(), so a duplicate
+        # `SELECT to_regclass` here is a round trip on every request. Only the
+        # column probe is new work, and the re-probe under the lock still
+        # settles any race.
+        changes_present = not any(
+            name == "conversation_history_changes" for name, _ in missing_tables
+        )
+        changes_predates_slot = changes_present and not await self._column_exists(
+            "conversation_history_changes", CHANGES_SLOT_COLUMN
+        )
+        # Set equality, not "are the ones I want present". The names carry the
+        # mechanism's fingerprint, so a database running a SUPERSEDED shape has
+        # names this run has never heard of — and that database is exactly the
+        # one that used to be missed (#2998).
+        installed_triggers = await self._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        )
+        installed_functions = await self._trigger_function_family(
+            FUNCTION_NAME_PREFIX
+        )
+        if (
+            missing_tables
+            or outdated_tables
+            or changes_predates_slot
+            or installed_triggers != set(wanted_triggers)
+            or installed_functions != set(wanted_functions)
+        ):
+            async with self.migration_lock("conversation_sessions_2959"):
+                # Re-probed under the lock: a concurrent initializer may have
+                # replaced this while this one waited.
+                # Whether this block leaves `conversation_sessions` EMPTY —
+                # by replacing it, or by creating one that was not there.
+                emptied_the_cache = False
+                # FIRST, and re-probed under the lock: everything below this
+                # point may address slot 0, and on a pre-#3005 ledger there is
+                # no such column to address.
+                if await self.table_exists(
+                    "conversation_history_changes"
+                ) and not await self._column_exists(
+                    "conversation_history_changes", CHANGES_SLOT_COLUMN
+                ):
+                    # A leftover from a migration interrupted before the drop.
+                    # The rename/copy/drop is one transaction, so this should
+                    # be unreachable -- but a leftover would make the RENAME
+                    # below fail on the name already existing, turning a
+                    # recoverable state into a boot that never succeeds again.
+                    await self._backend.execute(
+                        f"DROP TABLE IF EXISTS {self._quoted(CHANGES_PRE_SLOT_TABLE)}"
+                    )
+                    for statement in changes_slot_migration(self.backend_type):
+                        await self._backend.execute(statement)
+                    logger.info(
+                        "migrated conversation_history_changes to the sharded "
+                        "shape, counters preserved at slot 0 (#3058)"
+                    )
+                for table in outdated_tables:
+                    if not await _predates_the_not_null_stamps(table):
+                        continue
+                    await self._backend.execute(
+                        f"DROP TABLE IF EXISTS {self._quoted(table)}"
+                    )
+                    logger.info(
+                        "dropped %s: it predates the NOT NULL stamps and will "
+                        "be derived again (#2960)", table,
+                    )
+                    # No flag set here on purpose: a dropped table is recreated
+                    # by the loop below, which is where "the cache is empty" is
+                    # recorded. Setting it in both places reads as belt and
+                    # braces and is really one statement that cannot change the
+                    # outcome — a mutation removing it survived, which is what
+                    # that always means.
+                # Re-probed under the lock: a concurrent initializer may have
+                # created every one of these while this one waited.
+                for table, ddl in tables:
+                    if not await self.table_exists(table):
+                        await self._backend.execute(
+                            normalize_schema(ddl, self.backend_type)
+                        )
+                        logger.info("created %s (#2959)", table)
+                        # Creating this one is the same event as replacing it,
+                        # and both reach here by ordinary routes: a restore that
+                        # carried the watermarks but not the cache, or a hand
+                        # recovery that dropped it. The watermarks then describe
+                        # rows that are gone, `is_stale()` compares numbers that
+                        # still match, and the projection reports itself current
+                        # over an EMPTY table — so the conversation list serves
+                        # nothing, for ever, beside intact history. Measured
+                        # before this was here.
+                        if table == "conversation_sessions":
+                            emptied_the_cache = True
+                if emptied_the_cache:
+                    # Two statements, because one of them can match no rows.
+                    #
+                    # Rotating the generation is the mechanism already written
+                    # for "the shape moved": both `is_stale` and `_plan` read a
+                    # changed generation as counters belonging to a different
+                    # incarnation, and answer REBUILD — including for a repair
+                    # already in flight, whose publish fence re-reads it. But it
+                    # updates the LEDGER, and an agent can have a watermark with
+                    # no ledger row at all (a projection built before the
+                    # triggers existed, a restore that carried one table and not
+                    # the other). Its generation is '' and its stamp is 0, which
+                    # is precisely what a missing ledger reads back as, so the
+                    # rotation touches nothing and the numbers go on agreeing.
+                    await self._backend.execute(
+                        shape_change_invalidation(self.backend_type)
+                    )
+                    await self._backend.execute(emptied_cache_invalidation())
+                    logger.info(
+                        "conversation_sessions is empty; every agent's "
+                        "projection will be derived again (#2960)"
+                    )
+                installed_triggers = await self._trigger_family(
+                    TRIGGER_NAME_PREFIX, "conversation_history"
+                )
+                installed_functions = await self._trigger_function_family(
+                    FUNCTION_NAME_PREFIX
+                )
+                # CREATE BEFORE DROP, and the order is the whole safety
+                # argument. Between the two there is a moment when the old
+                # shape and the new one are both installed, and every row
+                # event is counted twice. That is survivable: a doubled delta
+                # fails the equality `_plan` requires, and a failed equality
+                # costs a full rebuild. Dropping first would instead leave a
+                # window with NO stamp, in which writes land unrecorded and the
+                # projection afterwards reports itself current — the one
+                # outcome this design does not tolerate. Slow beats silent.
+                changed = False
+                for name, ddl in functions:
+                    if name not in installed_functions:
+                        await self._backend.execute(ddl)
+                        logger.info("created function %s (#2959)", name)
+                        changed = True
+                for name, ddl in triggers:
+                    if name not in installed_triggers:
+                        await self._backend.execute(ddl)
+                        logger.info("created trigger %s (#2959)", name)
+                        changed = True
+                for name in sorted(installed_triggers - set(wanted_triggers)):
+                    await self._backend.execute(self._drop_trigger_sql(
+                        name, "conversation_history"
+                    ))
+                    logger.info("retired superseded trigger %s (#2998)", name)
+                # Functions last: PostgreSQL refuses to drop one a trigger
+                # still uses, and the triggers that used these are gone by now.
+                # No CASCADE, so a dependency we failed to account for raises
+                # here rather than taking a live trigger down with it.
+                for name in sorted(installed_functions - set(wanted_functions)):
+                    await self._backend.execute(
+                        f"DROP FUNCTION IF EXISTS {self._quoted(name)}()"
+                    )
+                    logger.info("retired superseded function %s (#2998)", name)
+                    changed = True
+                if changed:
+                    # LAST, and only when the shape actually moved. Counters
+                    # accumulated under a different definition of "a change"
+                    # cannot be compared to ones accumulated under this
+                    # definition, and a watermark that still matches such a
+                    # counter is a projection reporting itself current about a
+                    # change it was never told of. On a fresh database this
+                    # updates nothing, because there is nothing yet to
+                    # disbelieve.
+                    #
+                    # It is also what makes a MIXED DEPLOYMENT safe rather than
+                    # merely unlikely. Two revisions with different watched
+                    # lists each see the other's objects as superseded, and
+                    # this runs on every `from_pool()`, so the shape flaps —
+                    # but a revision cannot read the projection without first
+                    # passing through here, and every flip retires the
+                    # counters. A write that landed while the narrower shape
+                    # was installed is therefore repaired before the revision
+                    # that cares about it reads anything. The cost is that each
+                    # flip rebuilds every agent, which is why this logs how
+                    # many rather than staying quiet.
+                    retired = await self._backend.execute(
+                        shape_change_invalidation(self.backend_type)
+                    )
+                    # And the watermarks, for the same reason the emptied-cache
+                    # path above runs both: rotating the generation retires the
+                    # counters a watermark is compared against, but only where
+                    # a counter row EXISTS. An agent whose projection was built
+                    # before the triggers were installed, or restored without
+                    # its ledger, reads back generation '' and stamp 0 — which
+                    # is exactly what a missing ledger reads back as, so the
+                    # numbers go on agreeing and the rotation touches nothing.
+                    # That hole was survivable while the shape was the trigger
+                    # DDL; it is not now the shape includes the GROUPING
+                    # (#3098), because a grouping change makes every stored
+                    # session suspect and those agents are the ones with the
+                    # oldest projections.
+                    await self._backend.execute(emptied_cache_invalidation())
+                    # And a ledger row for every agent that could publish
+                    # without one, because the two statements above are claims
+                    # a fence may not look at. An older revision's rebuild
+                    # already running for such an agent re-reads the
+                    # GENERATION before it publishes, still sees the empty
+                    # string, finds it unchanged, and commits a valid
+                    # watermark over the invalidation — after which both
+                    # revisions compare two empty generations that agree. The
+                    # agent that most needs this is the one whose FIRST
+                    # rebuild is in flight, which has no watermark either.
+                    await self._backend.execute(
+                        publishing_agent_ledger_seed(self.backend_type)
+                    )
+                    logger.info(
+                        "change-stamp shape moved; retired the counters for "
+                        "%s agent(s) and every watermark, which will rebuild "
+                        "(#2998, #3098)",
+                        retired,
+                    )
+
+        # Outside the lock deliberately: the statements have committed, so this
+        # reads what the next boot would read, and a raise here is this
+        # method's own error rather than a rolled-back transaction's.
+        for table, _ddl in tables:
+            if not await self.table_exists(table):
+                raise RuntimeError(
+                    f"{table} was not created; the #2959 session projection "
+                    "cannot be maintained without it"
+                )
+        final_triggers = await self._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        )
+        if final_triggers != set(wanted_triggers):
+            missing = sorted(set(wanted_triggers) - final_triggers)
+            stray = sorted(final_triggers - set(wanted_triggers))
+            raise RuntimeError(
+                "conversation_history: the change-stamp triggers are not the "
+                f"ones this build defines (missing: {missing or 'none'}; "
+                f"superseded and still installed: {stray or 'none'}). Without "
+                "the right ones the session projection cannot detect that a "
+                "row changed, and would report itself current forever."
+            )
+
+        # Additive, for a watermark table created before #2960 gave it a write
+        # counter. Through the shared helper rather than by hand: it does the
+        # ALTER and its verification inside one migration lock, and a column
+        # that silently failed to land here would make the page fence compare
+        # a value that never moves.
+        await self.migrate_columns_once(
+            "conversation_session_watermarks",
+            (
+                (WATERMARK_REVISION_COLUMN, "BIGINT NOT NULL DEFAULT 0"),
+                (WATERMARK_EPOCH_COLUMN, "TEXT NOT NULL DEFAULT ''"),
+            ),
+        )
+        await self.ensure_index(
+            *_SESSION_PROJECTION_INDEX,
+            f"agent_id, {session_order_index_columns(self.backend_type)}",
+        )
+        # FULL, and it stays full. `_max_id()` and `_rows_above()` deliberately
+        # count EVERY row — the watermark's target is `MAX(id)` over all of
+        # history, live or not — so a partial index cannot answer them, and
+        # narrowing this one sent the hot repair path back to scanning the
+        # agent's whole history on PostgreSQL. Added a partial one below rather
+        # than narrowing this one; they serve different queries.
+        await self.ensure_index(*_SESSION_FRONTIER_INDEX)
+        # PARTIAL, for the chunk walk, which asks only about live rows. `LIMIT`
+        # bounds the rows a chunk RETURNS, not the rows it reads: an agent whose
+        # history is mostly trashed or archived would scan past all of it to
+        # find one chunk of live rows — inside `BEGIN IMMEDIATE`, so on SQLite
+        # that blocks every writer. Measured at 200,000 trashed rows before 50
+        # live ones: 9.8 ms and O(history) on the full index, 0.0 ms here.
+        await self.ensure_index(
+            "idx_conversation_agent_live_row_id",
+            "conversation_history",
+            "agent_id, id",
+            where=live_history_predicate(),
+        )
+        # The index that keeps `canonical_order()` a bounded traversal. Its
+        # columns are the ORDER BY's own key expressions, so it cannot drift
+        # from the ordering it exists for — and without it BOTH engines fall
+        # back to reading and sorting the agent's whole live history before
+        # applying LIMIT, which is the O(history) cost this epic removes.
+        # One per view, both partial. The list filters on liveness as well as
+        # ordering by the canonical keys, and an index that carries the ordering
+        # but not the filter still walks past every non-matching row before
+        # `LIMIT` is satisfied — page-bounded in the plan's shape but O(history)
+        # in what it reads, for an agent whose newest history is mostly trashed.
+        await self.ensure_index(
+            "idx_conversation_agent_canonical",
+            "conversation_history",
+            canonical_order_index_columns(self.backend_type),
+            where=active_history_predicate(),
+        )
+        await self.ensure_index(
+            "idx_conversation_agent_canonical_archived",
+            "conversation_history",
+            canonical_order_index_columns(self.backend_type),
+            where=archived_history_predicate(),
+        )
+
+    @staticmethod
+    def _quoted(name: str) -> str:
+        """``name`` as a quoted SQL identifier, for the DROPs below.
+
+        Object names cannot be bound as parameters, so they have to be
+        interpolated. The names being dropped are read back OUT of the
+        catalogue rather than assembled here, and quoting rather than
+        validating is the difference between a database that can be swept and
+        one that cannot: a stray object whose name this build would never
+        produce is exactly the thing the sweep exists to remove, so refusing to
+        spell it would wedge every boot with the mess still installed.
+
+        Both dialects quote with ``"`` and escape an embedded one by doubling,
+        so one spelling serves.
+        """
+        return '"' + str(name).replace('"', '""') + '"'
+
+    def _drop_trigger_sql(self, name: str, table: str) -> str:
+        """``DROP TRIGGER`` in this engine's dialect.
+
+        PostgreSQL scopes a trigger to its table and demands ``ON``; SQLite
+        scopes it to the database and rejects the clause.
+        """
+        dropped = self._quoted(name)
+        if self.backend_type == "postgres":
+            return f"DROP TRIGGER IF EXISTS {dropped} ON {self._quoted(table)}"
+        return f"DROP TRIGGER IF EXISTS {dropped}"
+
+    async def _trigger_family(self, prefix: str, table: str) -> Set[str]:
+        """Every trigger on ``table`` whose name begins with ``prefix``.
+
+        Enumerating rather than probing one name at a time is what makes a
+        SUPERSEDED shape visible. The names carry a fingerprint of the
+        mechanism, so the question worth asking is not "is the trigger I want
+        here" — it is "what is here", answered against the set this build
+        defines (#2998).
+
+        Asked of the TABLE, never of the prefix alone, for the reason
+        :meth:`_index_exists` spells out: on PostgreSQL a trigger name is unique
+        only per table, and on SQLite only per database — so the name-only
+        question has a different answer from the one the ``CREATE TRIGGER`` will
+        act on.
+
+        ``tgisinternal`` excludes the triggers PostgreSQL creates for foreign
+        keys and constraints, which share the namespace and would otherwise let
+        an unrelated constraint's trigger answer for one of ours.
+        """
+        if self.backend_type == "postgres":
+            rows = await self._backend.fetch_all(
+                "SELECT tgname FROM pg_trigger "
+                "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal",
+                (table,),
+            )
+        else:
+            rows = await self._backend.fetch_all(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = ?",
+                (table,),
+            )
+        # Filtered here rather than in SQL: the two dialects disagree about how
+        # a literal underscore is escaped inside LIKE, and both prefixes are
+        # mostly underscores.
+        return {row[0] for row in (rows or []) if str(row[0]).startswith(prefix)}
+
+    async def _trigger_function_family(self, prefix: str) -> Set[str]:
+        """Every zero-argument trigger function named with ``prefix``.
+
+        Empty on SQLite, which has no function objects — its trigger bodies are
+        the statements themselves, so a trigger's shape is wholly described by
+        the trigger.
+
+        Narrowed to ``returns trigger`` and ``pronargs = 0`` so that the DROP
+        this feeds needs no argument list to be unambiguous, and so an unrelated
+        function that happens to share the prefix is not swept up by it.
+
+        ``current_schema()`` because that is where an unqualified ``CREATE
+        FUNCTION`` puts it — the same schema the triggers will resolve the name
+        in.
+        """
+        if self.backend_type != "postgres":
+            return set()
+        rows = await self._backend.fetch_all(
+            "SELECT p.proname FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = current_schema() "
+            "AND p.prorettype = 'pg_catalog.trigger'::regtype "
+            "AND p.pronargs = 0",
+            (),
+        )
+        return {row[0] for row in (rows or []) if str(row[0]).startswith(prefix)}
 
     async def _index_name_owner(self, name: str, table: str) -> Optional[str]:
         """Which relation already holds the index name ``name``, if any.
@@ -1840,6 +2533,64 @@ class AsyncDatabase:
                 "SELECT tbl_name FROM sqlite_master WHERE name = ?", (name,)
             )
         return row[0] if row and row[0] else None
+
+    async def _index_family(self, name: str, table: str) -> Set[str]:
+        """Every index on ``table`` that is a member of the ``name`` family.
+
+        A member is ``<name>`` itself or ``<name>_<fingerprint>``, and nothing
+        else. Three things that a prefix test gets wrong, all of them silent:
+
+        * ``idx_foo_archived_<hash>`` begins with ``idx_foo_`` but belongs to a
+          DIFFERENT family that this method's caller also manages. Matched by
+          prefix, ensuring the active index drops the archived one on every
+          boot, which then gets rebuilt by the next call — a full index rebuild
+          of the biggest table, every boot, reported nowhere.
+        * SQL ``LIKE`` treats ``_`` as a single-character wildcard, and every
+          name here is full of them, so the pattern was looser still.
+        * The BARE name is a member. Databases predating the fingerprint have
+          indexes called exactly ``name``; excluded from the family they are
+          never retired, so every upgraded database keeps a duplicate (on
+          PostgreSQL) or a stale expression index (on SQLite) forever, paying
+          write amplification on ``conversation_history`` for it.
+
+        Filtered in Python against an anchored pattern rather than in SQL, so
+        there is no escaping to get wrong and the boundary is exact.
+        """
+        member = re.compile(rf"\A{re.escape(name)}(_[0-9a-f]{{{_FINGERPRINT_HEX}}})?\Z")
+        if self.backend_type == "postgres":
+            rows = await self._backend.fetch_all(
+                "SELECT c.relname FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = to_regclass(?)",
+                (table,),
+            )
+        else:
+            rows = await self._backend.fetch_all(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = ?",
+                (table,),
+            )
+        return {row[0] for row in rows if member.match(row[0])}
+
+    async def _index_namespace(self, name: str, table: str) -> Optional[str]:
+        """The schema holding ``table``'s index called ``name``, on PostgreSQL.
+
+        A bare ``DROP INDEX`` resolves by ``search_path``, so with a same-named
+        index in an EARLIER schema it removes that one and leaves the target's
+        alone — the same trap ``_index_exists`` documents for the probe, in the
+        destructive direction. The catalogue already knows which relation was
+        found; the drop is qualified with it.
+        """
+        if self.backend_type != "postgres":
+            return None
+        row = await self._backend.fetch_one(
+            "SELECT n.nspname FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE i.indrelid = to_regclass(?) AND c.relname = ?",
+            (table, name),
+        )
+        return row[0] if row else None
 
     async def _index_exists(self, name: str, table: str) -> bool:
         """Whether ``table`` already carries an index called ``name``.
@@ -1915,11 +2666,185 @@ class AsyncDatabase:
         # index at once. The ALTER is serialized by its own migration lock; a
         # bare CREATE INDEX after it is not, and two boots racing there is a
         # failed request rather than a skipped index.
+        # ``created_at, id`` trail the pair so the projection can seek the newest
+        # UNSTAMPED row rather than sort them: with ``(agent_id, session_id)``
+        # alone SQLite answers that with ``USE TEMP B-TREE FOR ORDER BY`` over
+        # every NULL row of the agent's, inside the repair's write transaction,
+        # once per chunk — O(legacy rows) per append on exactly the histories
+        # #3061 exists to make cheap. ``id`` follows because the probe orders by
+        # the canonical pair: SQLite appends the rowid to every index and would
+        # be satisfied without it, PostgreSQL would sort the whole tie group at
+        # the newest second before taking one row. It leaves the
+        # ``session_id = ?`` lookups this index was added for seeking exactly as
+        # before.
         await self.ensure_index(
             "idx_conversation_agent_session",
             "conversation_history",
-            "agent_id, session_id",
+            "agent_id, session_id, created_at, id",
         )
+
+    async def _migrate_conversation_created_at(self) -> None:
+        """Give ``conversation_history.created_at`` a guarantee (#3009).
+
+        The column promised nothing: nullable, and on SQLite holding whatever
+        text a writer supplied, because ``TIMESTAMP`` there is NUMERIC affinity
+        and an ISO string is stored as TEXT. Every reader carried a fallback
+        for a value only that absence let through. This installs the CHECK the
+        readers have been standing in for, and repairs whatever a database
+        already holds so the CHECK can be true of it.
+
+        Idempotent and cheap after the first run: the constraint IS the marker,
+        so a database that has it skips the scan entirely — no separate ledger
+        that could disagree with the schema.
+
+        Ordered BEFORE ``ensure_session_projection_schema``, and that is
+        load-bearing rather than tidy. On SQLite the retrofit rebuilds the
+        table, and ``DROP TABLE`` takes the #2959 change triggers with it.
+        Running the projection's schema pass afterwards finds the trigger
+        family missing, recreates it, and — because the shape changed —
+        rotates the generation, which invalidates a projection whose rows were
+        just rewritten underneath it. Reversed, the projection would go on
+        claiming to be current for a table it no longer has triggers on.
+        """
+        # Created by the migration that writes to it, and OUTSIDE the
+        # constraint probe below, so it exists on every boot rather than only
+        # on the one that retrofits. A database born with the constraint never
+        # reaches the repair, and would otherwise have nowhere to answer "which
+        # rows did a repair have to date from a neighbour" — including "none",
+        # which is the answer on every healthy host and still worth being able
+        # to ask for. Not routed through ``normalize_schema`` for the same
+        # reason as conversation_history itself: it would strip
+        # ``recorded_at``'s default on the way to SQLite (#3048), which its NOT
+        # NULL then makes unsatisfiable.
+        #
+        # Probe -> lock -> re-probe, not a bare ``CREATE TABLE IF NOT EXISTS``.
+        # That spelling is idempotent in SEQUENCE and unsafe in PARALLEL, which
+        # is the same trap ``ensure_index`` documents at length: PostgreSQL
+        # evaluates the existence test before taking the lock that would
+        # exclude a peer, so two initializers that pass it together both build
+        # the relation and the loser fails on ``pg_class``'s unique index.
+        # ``_init_schema`` runs on every ``from_pool()`` — frinz calls it per
+        # request — so the first post-upgrade request burst IS the parallel
+        # case, and the loser does not merely skip the table: its whole
+        # initialization raises and the request fails.
+        if not await self.table_exists(UNDATED_TABLE):
+            async with self.migration_lock(f"create_{UNDATED_TABLE}"):
+                if not await self.table_exists(UNDATED_TABLE):
+                    await self.execute(UNDATED_DDL)
+        await self.ensure_check_constraint(
+            "conversation_history",
+            CREATED_AT_CONSTRAINT,
+            created_at_check(self.backend_type),
+            canonical_ddl=conversation_history_ddl(self.backend_type),
+            remediation=self._repair_conversation_created_at,
+        )
+
+    async def _repair_conversation_created_at(self) -> None:
+        """Make every existing ``created_at`` canonical, in three passes.
+
+        Runs inside ``ensure_check_constraint``'s migration transaction, so a
+        failure anywhere leaves both the rows and the constraint untouched.
+
+        1. **The engine's pass.** One set-based UPDATE re-spells every row
+           SQLite can read: a ``T`` separator, a ``Z``, an offset (converted to
+           UTC), a bare date, fractional seconds. Nothing on PostgreSQL, where
+           a ``timestamp`` column has no spelling to get wrong.
+        2. **Python's pass**, over what the engine could not read. It accepts
+           more — ``2026-01-02Z``, a lowercase ``t``, the basic form — and
+           re-spells those exactly. Second, deliberately: it and ``strftime``
+           disagree about an impossible day-of-month, and running the engine
+           first means such a value is normalized by the reading that can
+           handle it rather than thrown to the derivation below.
+        3. **Derivation**, for a value neither can read. The row takes its
+           nearest readable neighbour's stamp — which is what every reader
+           already computed for it — and the original text is recorded in
+           ``conversation_history_undated`` beside it. That table is the whole
+           reason this is a repair rather than a quiet overwrite: the database
+           is being rewritten in place, so a value not kept here is gone.
+        """
+        broken = await self.fetchone(
+            "SELECT COUNT(*) FROM conversation_history WHERE "
+            + noncanonical_predicate(self.backend_type)
+        )
+        if not broken or not broken[0]:
+            return
+
+        bulk = repairable_bulk_update(self.backend_type)
+        if bulk:
+            await self.execute(bulk)
+
+        residue = await self.fetchall(
+            "SELECT id, agent_id, created_at FROM conversation_history "
+            "WHERE " + noncanonical_predicate(self.backend_type)
+            + " ORDER BY id"
+        )
+        repaired, derived = 0, 0
+        for message_id, agent_id, raw in residue:
+            stamp = canonical_created_at(raw)
+            origin = "stored"
+            if stamp is None:
+                stamp, origin = derived_stamp(
+                    await self._readable_neighbour(agent_id, message_id, "<"),
+                    await self._readable_neighbour(agent_id, message_id, ">"),
+                )
+                derived += 1
+            else:
+                repaired += 1
+            await self.execute(
+                "UPDATE conversation_history SET created_at = ? WHERE id = ?",
+                (created_at_bind(self.backend_type, stamp), message_id),
+            )
+            if origin == "stored":
+                continue
+            await self.execute(
+                f"INSERT INTO {UNDATED_TABLE} "
+                "(message_id, agent_id, original_created_at, "
+                "derived_created_at, derived_from) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                (
+                    message_id, agent_id,
+                    None if raw is None else str(raw),
+                    created_at_bind(self.backend_type, stamp),
+                    origin,
+                ),
+            )
+        rewritten = broken[0] - len(residue)
+        logger.info(
+            "conversation_history.created_at: %d row(s) were not canonical — "
+            "%d re-spelled by the engine, %d by the parser, %d dated from a "
+            "neighbour and recorded in %s (#3009)",
+            broken[0], rewritten, repaired, derived, UNDATED_TABLE,
+        )
+        if derived:
+            logger.warning(
+                "conversation_history.created_at: %d row(s) carried a value "
+                "nothing could date. Their original text is in %s; the stamp "
+                "now stored is the neighbouring row's, which is what the "
+                "readers were already using for them.",
+                derived, UNDATED_TABLE,
+            )
+
+    async def _readable_neighbour(
+        self, agent_id: str, message_id: int, direction: str
+    ) -> Optional[str]:
+        """The canonical stamp of the nearest datable row on one side of a row.
+
+        ``direction`` is ``"<"`` for the predecessor or ``">"`` for the
+        successor. Scoped to the agent, because a stamp borrowed across a
+        tenant boundary would date one agent's message from another's history.
+        Rows repaired earlier in this pass are eligible: their value is by then
+        their own nearest readable predecessor's, so a run of undatable rows
+        converges on the same stamp whichever way it is read.
+        """
+        order = "DESC" if direction == "<" else "ASC"
+        row = await self.fetchone(
+            "SELECT created_at FROM conversation_history "
+            f"WHERE agent_id = ? AND id {direction} ? "
+            f"AND ({created_at_check(self.backend_type)}) "
+            f"ORDER BY id {order} LIMIT 1",
+            (agent_id, message_id),
+        )
+        return canonical_created_at(row[0]) if row else None
 
     async def ensure_check_constraint(
         self,
@@ -1945,11 +2870,15 @@ class AsyncDatabase:
         the table fresh and rebuilds it here, so the two cannot drift — passing
         a second, hand-copied spelling is exactly the divergence being fixed.
 
-        ``remediation`` is ``(sql, params)`` applied under the lock BEFORE the
-        constraint. Rows predating the constraint may already violate it, and
-        both backends refuse to add it while they do — Postgres fails
-        ``VALIDATE``, SQLite fails the rebuild's INSERT. Deciding what those
-        rows become is the caller's: only it knows which value is the safe one.
+        ``remediation`` is applied under the lock BEFORE the constraint —
+        either ``(sql, params)`` or a zero-argument coroutine function, for a
+        repair no single statement can express. Rows predating the constraint
+        may already violate it, and both backends refuse to add it while they
+        do — Postgres fails ``VALIDATE``, SQLite fails the rebuild's INSERT.
+        Deciding what those rows become is the caller's: only it knows which
+        value is the safe one. A callable runs inside this method's transaction
+        and must not open its own, so a failed repair rolls back with the
+        constraint that depended on it.
 
         Idempotent and safe to call every boot: it probes first, and the whole
         migration runs inside one ``migration_lock`` transaction, so an
@@ -1966,7 +2895,9 @@ class AsyncDatabase:
             # rebuilt the table while this one waited.
             if await self._check_constraint_exists(table, constraint, expression):
                 return
-            if remediation is not None:
+            if callable(remediation):
+                await remediation()
+            elif remediation is not None:
                 sql, params = remediation
                 await self.execute(sql, params)
 
@@ -2033,16 +2964,28 @@ class AsyncDatabase:
         ``sqlite_master`` and replayed, because ``DROP TABLE`` takes them with
         it and a silently-missing index degrades queries without failing them.
 
+        **Columns the canonical DDL does not declare are carried across**, with
+        the type and default the live table gives them. A constraint retrofit
+        is not a reshaping: a column present here but absent from the template
+        is almost always one a later ``ALTER`` added — ``conversation_history``
+        gains ``embedding_vec`` and ``embedding_profile_id`` that way, in
+        backend-shaped migrations no single template can declare — and copying
+        only the intersection would silently delete every stored embedding on
+        SQLite. This helper cannot tell a deliberate removal from an
+        un-templated column, so it keeps the data and lets the caller drop a
+        column explicitly if it ever means to.
+
         Runs inside the caller's ``migration_lock`` transaction, so a failure
         anywhere leaves the original table untouched.
         """
         staging = f"{table}__rebuild"
-        old_columns = [
-            r[1]
+        live = [
+            (r[1], r[2], r[3], r[4])
             for r in await self._backend.fetch_all(
                 f"PRAGMA table_info('{table}')"
             )
         ]
+        old_columns = [name for name, _type, _notnull, _default in live]
         index_ddl = [
             r[0]
             for r in await self._backend.fetch_all(
@@ -2060,8 +3003,8 @@ class AsyncDatabase:
                 f"PRAGMA table_info('{staging}')"
             )
         ]
-        # Copy the intersection in the NEW table's order. A column the new
-        # shape drops is intentionally left behind; one it adds takes its
+        # Copy the intersection in the NEW table's order, then everything the
+        # template did not declare. A column the new shape adds takes its
         # declared default rather than a NULL the DDL may forbid.
         shared = [c for c in new_columns if c in old_columns]
         if not shared:
@@ -2069,7 +3012,22 @@ class AsyncDatabase:
                 f"{table}: canonical DDL shares no columns with the live "
                 "table; refusing to rebuild"
             )
-        column_list = ", ".join(shared)
+        carried = [c for c in old_columns if c not in new_columns]
+        for name, col_type, notnull, default in live:
+            if name not in carried:
+                continue
+            # Spelled from what the live table reports, so a carried column
+            # keeps the shape it had. ``ADD COLUMN`` cannot introduce NOT NULL
+            # without a default, but a column that reached the live table by
+            # ``ADD COLUMN`` already satisfies that; anything else raises here
+            # rather than being quietly dropped.
+            definition = f"{name} {col_type or 'BLOB'}"
+            if default is not None:
+                definition += f" DEFAULT {default}"
+            if notnull:
+                definition += " NOT NULL"
+            await self.execute(f"ALTER TABLE {staging} ADD COLUMN {definition}")
+        column_list = ", ".join(shared + carried)
         await self.execute(
             f"INSERT INTO {staging} ({column_list}) "
             f"SELECT {column_list} FROM {table}"
@@ -2146,7 +3104,34 @@ class AsyncDatabase:
                 f"WHERE name='{column}'"
             )
         return bool(row and row[0] > 0)
-    
+
+    async def _column_accepts_null(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` still permits NULL.
+
+        Asked of the same relation ``ALTER TABLE`` and every unqualified read
+        resolve — ``to_regclass`` on PostgreSQL, ``pragma_table_info`` on SQLite
+        — for the reason :meth:`_column_exists` spells out: a name-based
+        ``information_schema`` probe answers about whichever same-named table
+        the search path happens to union in.
+
+        A column that does not exist reads as ``False``: "this column accepts
+        NULL" is a claim about a column, and the absent one is not a nullable
+        one. The callers that care create the table when it is missing.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT attnotnull FROM pg_attribute "
+                "WHERE attrelid = to_regclass(?) AND attname = ? "
+                "AND attnum > 0 AND NOT attisdropped",
+                (table, column),
+            )
+        else:
+            row = await self._backend.fetch_one(
+                f"SELECT \"notnull\" FROM pragma_table_info('{table}') "
+                f"WHERE name='{column}'"
+            )
+        return bool(row) and not bool(row[0])
+
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
     # ─────────────────────────────────────────────────────────────────
@@ -2208,8 +3193,21 @@ class AsyncDatabase:
         return await self._backend.fetch_val(sql, params)
     
     @asynccontextmanager
-    async def transaction(self):
-        """Transaction context manager with automatic rollback on error."""
+    async def transaction(self, *, immediate: bool = False):
+        """Transaction context manager with automatic rollback on error.
+
+        ``immediate`` asks SQLite for its writer slot at ``BEGIN`` instead of on
+        the first write. Pass it for a read-then-write unit: a deferred
+        transaction that has already read cannot upgrade, so a second writer
+        fails outright rather than waiting its turn. It is ignored on backends
+        whose transactions do not have the deferred/immediate distinction —
+        PostgreSQL serializes such a unit with a row lock instead (see
+        ``ConversationSessionProjection._claim``).
+        """
+        if immediate and self.backend_type == "sqlite":
+            async with self._backend.transaction(immediate=True):  # type: ignore[call-arg]
+                yield
+            return
         async with self._backend.transaction():
             yield
     

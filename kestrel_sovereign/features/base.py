@@ -364,19 +364,152 @@ class Feature(_SdkFeature):
     # host's pre-existing source. It records the names it newly registered here
     # and tears them down in ``shutdown()``.
     # ------------------------------------------------------------------
-    def _own_signal_sources(self, result) -> None:
-        """Record the signal-source names this feature NEWLY registered.
+    @staticmethod
+    def _registry_holds_claims(registry) -> bool:
+        """Can *registry* record who holds a source, in a stated role?
 
-        ``result`` is whatever a ``register_*`` helper returned — a
-        :class:`RegistrationOutcome`, a list of outcomes, a list of names, or a
-        single name. Only *newly created* sources are recorded: a
-        ``RegistrationOutcome`` counts only in the ``REGISTERED`` state, and the
-        name-list helpers already exclude sources a host owned. Recording just
-        the newly-owned names means :meth:`_unregister_owned_signal_sources`
-        tears down exactly this feature's sources and never a host's.
+        The ONE capability question asked about a signal registry, and it asks
+        about the WHOLE contract a claim needs: state the owner and the role at
+        registration, and release by owner and role at teardown. It used to be
+        asked twice with two different markers — ``adopt`` when registering,
+        ``release_all`` when tearing down — and two questions about one
+        capability is how the ledgers this replaced came to disagree (#3053).
+
+        Both halves are checked because they arrived at different times: a
+        registry written against the ledger as it first shipped has
+        ``release_all`` and takes ``owner=`` but not ``role=``, and calling it
+        with the keyword is a ``TypeError`` mid-``initialize()``. Such a
+        registry takes the name-tracking path instead — no claims, but correct
+        teardown, which is the half that cannot be skipped.
+
+        Asked about ``register_with_policy``, the call every registration can
+        be expressed as. ``register_batch`` is asked about SEPARATELY, at the
+        point of use (:meth:`_register_signal_sources`), because it is an
+        optimisation rather than a capability: a registry that cannot take the
+        role in its batch — or has no batch at all — can still hold claims
+        perfectly well one source at a time. Requiring both here refused a
+        registry over a method it did not need, and pushed it onto the name
+        path, whose teardown removes by name and cannot see a peer's claim.
+
+        A method taking ``**kwargs`` counts. That is the forwarding-proxy
+        shape, and refusing it would push a proxy onto the name path, whose
+        teardown removes by name and cannot see a peer's claim in the registry
+        behind it. The other way round — a registry that accepts the keyword
+        and ignores it — leaks a claim its teardown never releases. A leak is
+        the better failure than deleting a source something else is dispatching
+        on, so that is the way this errs.
+
+        No compatibility path for the shape in between, deliberately. The claims
+        ledger's first form — ``adopt`` / ``release_all`` / ``owner=`` without
+        ``role=`` — exists only in unreleased main (#3053 landed after v0.53.4
+        and ships in the same release as this), so nothing was ever built
+        against it. Keeping a path for it would mean keeping ``adopt``'s
+        ``created=`` flag, which is the guess this change exists to delete.
         """
-        if not result:
-            return
+        if not hasattr(registry, "release_all"):
+            return False
+        return Feature._takes_claim_role(
+            getattr(registry, "register_with_policy", None)
+        )
+
+    @staticmethod
+    def _takes_claim_role(method) -> bool:
+        """Can *method* be told which role a claim is held in?
+
+        ``**kwargs`` counts — see :meth:`_registry_holds_claims` for why that
+        is the direction to err in.
+        """
+        if not callable(method):
+            return False
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):  # a C callable, or an odd wrapper
+            return False
+        if "role" in parameters:
+            return True
+        return any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+
+    def _register_signal_sources(self, registrations, policy):
+        """Register signal sources AS THIS FEATURE; return the outcomes.
+
+        The one door imperative registration goes through. Ownership is stated
+        at the moment of registration, so ``owner=None`` means the host and
+        nothing has to be inferred from the policy — the guess that three
+        consecutive review rounds each found a different edge of (#3074).
+
+        A registry that predates the claims ledger cannot take ``owner=``. For
+        that case ONLY, the names this feature created are tracked on the
+        feature, because nothing else can know them and its sources would
+        otherwise never be torn down. That is not the second ledger #3053
+        removed: there is exactly one record per registry, and which one is
+        decided by what the registry can actually do.
+
+        The registry is always the agent's. It used to be overridable, for a
+        feature that had resolved one itself — but teardown reads the agent's,
+        so an override could only ever be a way for the two halves to disagree
+        about which registry holds the claim. Every call site was passing the
+        agent's registry anyway.
+
+        A caller that decides it cannot use what it registered must hand the
+        claim back (:meth:`_disown_signal_sources`) — taking it at registration
+        and declining afterwards are two halves of one door.
+        """
+        registry = getattr(getattr(self, "agent", None), "signal_registry", None)
+        if registry is None:
+            return []
+        items = (
+            list(registrations)
+            if isinstance(registrations, (list, tuple, set))
+            else [registrations]
+        )
+        if not items:
+            return []
+        claims = self._registry_holds_claims(registry)
+        owner_kw = {}
+        if claims:
+            # CLAIM_IMPERATIVE, because this is the feature registering a source
+            # ITSELF. Its declared contributions claim the other role, and
+            # `shutdown()` releases only this one — the two are torn down by
+            # different paths and either can fail alone (#3053).
+            from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+
+            owner_kw = {"owner": self, "role": CLAIM_IMPERATIVE}
+        batch = getattr(registry, "register_batch", None)
+        register = getattr(registry, "register_with_policy", None)
+        # The batch is asked about HERE, not in the capability question, because
+        # it is an optimisation and not a capability: a registry with no batch,
+        # or one that cannot take the role in it, still holds claims perfectly
+        # well one source at a time. What it costs is atomicity, which matters
+        # only under the raising policies — every imperative site registers
+        # OPTIONAL, where each source is independent by definition.
+        usable_batch = callable(batch) and (
+            not claims or self._takes_claim_role(batch)
+        )
+        if len(items) > 1 and usable_batch:
+            # Several sources go through `register_batch` because it is ATOMIC
+            # under the raising policies: registering them one at a time would
+            # leave a half-registered set behind on the failure the batch exists
+            # to roll back.
+            outcomes = list(batch(items, policy, **owner_kw))
+        elif callable(register):
+            outcomes = [register(item, policy, **owner_kw) for item in items]
+        else:
+            return []
+        if not claims:
+            self._track_unowned_signal_sources(outcomes)
+        return outcomes
+
+    def _signal_source_names(self, outcomes, *, created_only: bool):
+        """Names out of whatever a ``register_*`` call returned.
+
+        Accepts a :class:`RegistrationOutcome`, a list of them, a list of
+        names, or a single name, because the helpers this reads from return all
+        four shapes. *created_only* excludes a source this feature merely rode
+        as an equivalent incumbent — the distinction a name-tracking registry
+        has no way to express, so it must not remove what it did not create.
+        """
         try:
             from kestrel_sovereign.signals import (
                 RegistrationOutcome,
@@ -386,23 +519,99 @@ class Feature(_SdkFeature):
             RegistrationOutcome = None  # type: ignore[assignment]
             RegistrationState = None  # type: ignore[assignment]
 
-        items = result if isinstance(result, (list, tuple, set)) else [result]
-        owned = getattr(self, "_owned_signal_source_names", None)
-        if owned is None:
-            owned = []
-            self._owned_signal_source_names = owned
+        items = outcomes if isinstance(outcomes, (list, tuple, set)) else [outcomes]
+        names = []
         for item in items:
-            name = None
             if isinstance(item, str):
-                name = item
+                # A name-list helper already excluded sources a host owned, so
+                # anything reaching here by name was created by this feature.
+                names.append(item)
             elif (
                 RegistrationOutcome is not None
                 and isinstance(item, RegistrationOutcome)
             ):
                 if item.state is RegistrationState.REGISTERED:
-                    name = item.name
-            if name and name not in owned:
+                    names.append(item.name)
+                elif (
+                    not created_only
+                    and item.state is RegistrationState.ALREADY_EQUIVALENT
+                ):
+                    # Rode an incumbent: a real dependency, but not this
+                    # feature's to remove — it claims ALONGSIDE the holder.
+                    names.append(item.name)
+        return names
+
+    def _track_unowned_signal_sources(self, outcomes) -> None:
+        """Record names for a registry that cannot hold claims."""
+        owned = getattr(self, "_owned_signal_source_names", None)
+        if owned is None:
+            owned = []
+            self._owned_signal_source_names = owned
+        for name in self._signal_source_names(outcomes, created_only=True):
+            if name not in owned:
                 owned.append(name)
+
+    def _drop_tracked_signal_sources(self, registry, names) -> None:
+        """Unregister *names* this feature created, and stop tracking them.
+
+        The whole of the name-tracking path's removal, in one place: teardown
+        and declining a source do the same thing to it, and having them differ
+        is how declining left a source registered AND untracked — dispatchable
+        forever, and no longer removable by shutdown.
+
+        Best-effort and idempotent: unregistering an already-absent source is a
+        benign no-op, so repeated shutdowns are safe.
+        """
+        owned = getattr(self, "_owned_signal_source_names", None) or []
+        removing = [name for name in owned if name in names]
+        self._owned_signal_source_names = [n for n in owned if n not in removing]
+        for name in removing:
+            try:
+                registry.unregister(name)
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                logger.warning(
+                    "feature '%s': could not unregister signal source '%s': %s",
+                    getattr(self, "name", type(self).__name__),
+                    name,
+                    exc,
+                )
+
+    def _disown_signal_sources(self, outcomes) -> None:
+        """Hand back claims :meth:`_register_signal_sources` took.
+
+        For a feature that registers a source and then finds it cannot use it.
+        The claim is taken at registration now, so declining has to give it
+        back — and giving back the LAST claim on a source removes it, which is
+        the right answer: nothing needs a source its only holder refused.
+
+        Reads the agent's registry, the same one
+        :meth:`_register_signal_sources` claimed through — releasing from a
+        different instance than the one holding the claim is the divergence
+        that removing the override closed.
+        """
+        registry = getattr(getattr(self, "agent", None), "signal_registry", None)
+        if registry is None:
+            return
+        names = self._signal_source_names(outcomes, created_only=False)
+        if not self._registry_holds_claims(registry):
+            # Only what this feature CREATED is removed — a ridden incumbent is
+            # a peer's, and this path has no claims to express shared use. But
+            # what it created IS removed: dropping only the bookkeeping left a
+            # refused source dispatchable and beyond the reach of shutdown.
+            self._drop_tracked_signal_sources(registry, names)
+            return
+        from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+
+        for name in names:
+            try:
+                registry.release(name, self, CLAIM_IMPERATIVE)
+            except Exception as exc:  # noqa: BLE001 - best-effort
+                logger.warning(
+                    "feature '%s': could not release signal source '%s': %s",
+                    getattr(self, "name", type(self).__name__),
+                    name,
+                    exc,
+                )
 
     async def _unregister_owned_signal_sources(self) -> None:
         """Unregister the signal sources this feature registered (#2522 P2).
@@ -410,23 +619,32 @@ class Feature(_SdkFeature):
         Best-effort and idempotent: unregistering an already-absent source is a
         benign no-op, so repeated shutdowns are safe.
         """
-        names = getattr(self, "_owned_signal_source_names", None)
-        if not names:
-            return
         registry = getattr(getattr(self, "agent", None), "signal_registry", None)
-        if registry is not None and hasattr(registry, "unregister"):
-            for name in names:
-                try:
-                    registry.unregister(name)
-                except Exception as exc:  # noqa: BLE001 - best-effort teardown
-                    logger.warning(
-                        "feature '%s': could not unregister signal source "
-                        "'%s': %s",
-                        getattr(self, "name", type(self).__name__),
-                        name,
-                        exc,
-                    )
-        self._owned_signal_source_names = []
+        if registry is None:
+            return
+        if not self._registry_holds_claims(registry):
+            # Registry without the ownership API: fall back to removing exactly
+            # the names recorded for it.
+            self._drop_tracked_signal_sources(
+                registry, list(getattr(self, "_owned_signal_source_names", None) or ()),
+            )
+            return
+        try:
+            # ONLY the sources this feature registered itself. Its declared
+            # contributions are released by the contribution runtime, which is a
+            # different teardown that can fail on its own — and
+            # `_unregister_feature_runtime` deliberately continues to here after
+            # a rejected `deactivate()`. Releasing both roles together dropped a
+            # still-active contribution's claim (#3053).
+            from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+
+            registry.release_all(self, CLAIM_IMPERATIVE)
+        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            logger.warning(
+                "feature '%s': could not release its signal sources: %s",
+                getattr(self, "name", type(self).__name__),
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Wait-provider ownership (#2522, identity-aware stack in P3)
@@ -451,7 +669,7 @@ class Feature(_SdkFeature):
         The single call features use in ``post_all_features_loaded``. It records
         the exact provider this feature pushed so :meth:`shutdown` can remove it
         from the registry's per-kind stack by identity (#2522 P3). This is the
-        wait-provider analogue of :meth:`_own_signal_sources`.
+        wait-provider analogue of :meth:`_register_signal_sources`.
         """
         kind = getattr(provider, "kind", None)
         owned = getattr(self, "_owned_wait_providers", None)
@@ -532,7 +750,7 @@ class Feature(_SdkFeature):
         records it here so :meth:`shutdown` cancels exactly this feature's tasks
         on runtime disable / boot rollback / soft disable. Returns the created
         ``asyncio.Task``. This is the background-task analogue of
-        :meth:`_own_signal_sources` / :meth:`_register_wait_provider`.
+        :meth:`_register_signal_sources` / :meth:`_register_wait_provider`.
         """
         agent = getattr(self, "agent", None)
         track = getattr(agent, "_track_background_task", None)

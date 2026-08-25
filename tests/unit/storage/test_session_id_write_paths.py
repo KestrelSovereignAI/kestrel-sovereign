@@ -23,6 +23,7 @@ against both engines in
 
 from __future__ import annotations
 
+import io
 import json
 
 import pytest
@@ -123,60 +124,123 @@ async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["counter_field", "timestamp_field"])
-async def test_the_counter_api_declines_the_session_key_rather_than_desyncing(
-    tmp_path, field
+async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
+    tmp_path,
 ):
-    """The second door onto ``metadata.session_id``, and it says no.
+    """The restore reads a FILE, so the column's CHECK cannot police it (#3009).
 
-    Both of this method's field names come from the caller, so it *can* be
-    pointed at the indexed key — and what it would write there is a counter or
-    an ISO timestamp, neither of which is a session identity. Teaching it to
-    keep the column in step would make that call succeed quietly; refusing
-    leaves the caller's bug where the caller can see it.
+    Every other path into ``conversation_history.created_at`` writes through
+    ``AsyncDatabase``, where the constraint applies. This one opens the backup's
+    SQLite file directly with ``aiosqlite`` and copies rows out of it, so it is
+    handed whatever text an older kestrel, an import, or a hand-edited row put
+    there — and it used to pass that straight through on SQLite, because
+    converting was only ever done to satisfy asyncpg.
 
-    The row must be untouched afterwards. A refusal that had already written
-    half of what it was asked for would be worse than the desync.
+    The backup is therefore built by hand from the pre-#3009 table shape, which
+    is what a backup taken before this change actually contains. Producing it
+    by rewriting a live database is no longer possible, and would not be the
+    same thing if it were.
+
+    The spellings are ones ``julianday`` and the parser DISAGREE about — a
+    ``T``, a ``Z``, an offset — plus one nothing can date at all. The first
+    three must come back in the single form the readers date without any
+    fallback; the last must take a neighbour's stamp, be counted, and not
+    arrive as text the CHECK would refuse.
     """
-    db = await AsyncDatabase.sqlite(str(tmp_path / "counter.db"))
+    import tarfile
+
+    from kestrel_sovereign.storage.session_grouping import coerce_session_timestamp
+    from tests.utils.legacy_conversation_history import write_legacy_history
+
+    backup_db = str(tmp_path / "kestrel.db")
+    write_legacy_history(
+        backup_db,
+        [
+            (AGENT, "user", "one", None, None, "2026-01-02T03:04:05"),
+            (AGENT, "user", "two", None, None, "2026-01-02T05:04:05Z"),
+            (AGENT, "user", "three", None, None, "2026-01-02 07:04:05+01:00"),
+            # A spelling PYTHON reads and SQLite's `julianday` does not. It is
+            # here because ordering the restore in SQL filed it as undatable and
+            # renumbered it first, while the Python pass a moment later dated it
+            # perfectly well — two parsers, one column (#3049).
+            (AGENT, "user", "basic", None, None, "20260102T040405"),
+            (AGENT, "user", "four", None, None, "an older kestrel's idea"),
+        ],
+    )
+    blob = AsyncStorage._tar_gzip_paths([(backup_db, "kestrel.db")])
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        assert tar.getnames() == ["kestrel.db"], (
+            "the hand-built blob does not have the shape the restore looks for"
+        )
+
+    target = AsyncStorage(str(tmp_path / "odd-target.db"), agent_id=AGENT)
+    await target.initialize()
     try:
-        store = AsyncConversationStore(db, agent_id=AGENT)
-        await store.add_conversation("user", "turn", session_id=UUID_A)
-        message_id = int((await db.fetchone(
-            "SELECT id FROM conversation_history ORDER BY id LIMIT 1"
-        ))[0])
+        stats = await target.restore_from_backup_blob(blob)
+        assert stats["messages_restored"] == 5
+        assert stats.get("messages_with_unreadable_created_at", 0) == 1, (
+            "the row nothing could date was not reported to the caller"
+        )
 
-        with pytest.raises(ValueError, match="session identity"):
-            await store.atomic_increment_metadata_counter(
-                message_id, **{
-                    "counter_field": "access_count",
-                    field: "session_id",
-                }
+        restored = [
+            row[0] for row in await target.db.fetchall(
+                "SELECT created_at FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id", (AGENT,),
             )
-
-        metadata, session_id = await db.fetchone(
-            "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
-            (message_id,),
+        ]
+        for value in restored:
+            assert coerce_session_timestamp(value) is not None, (
+                f"restored created_at {value!r} is a value no reader can date"
+            )
+            # One spelling, and it is the one CURRENT_TIMESTAMP produces.
+            assert len(value) == 19 and value[10] == " ", (
+                f"restored created_at {value!r} is not the canonical form"
+            )
+        # The offset is APPLIED, not discarded: 07:04:05+01:00 is 06:04:05 UTC.
+        assert "2026-01-02 06:04:05" in restored, restored
+        # ...and it lands in the right PLACE, which is #3049. New ids are
+        # assigned in the order this SELECT returns and
+        # `get_conversation_history()` sorts by id, so that ordering IS the
+        # restored transcript's reading order. Ordering by the source's raw
+        # text put the 07:04+01:00 row first — a space sorts before `T` — so
+        # the transcript came back 06:04, 03:04, 05:04. Normalising the stamp
+        # before ordering is not a new decision about what a restore means: it
+        # is the order `canonical_order` already defines, applied to a file
+        # that has earned none of the guarantees the live column's CHECK gives.
+        assert restored == sorted(restored), (
+            f"the restored transcript is not in chronological order: {restored}"
         )
-        assert json.loads(metadata)["session_id"] == UUID_A
-        assert "access_count" not in json.loads(metadata)
-        assert session_id == UUID_A
-
-        # The ordinary call it exists for is unaffected.
-        assert await store.atomic_increment_metadata_counter(
-            message_id, "access_count", "last_accessed"
+        # The undatable row sorts FIRST, which is the answer `canonical_order`
+        # gives — undatable means earliest, always.
+        #
+        # Asserted by WHICH ROW is first, not by the stamp at index 0: sorting
+        # it last is also chronological (it would take its PREDECESSOR's stamp
+        # instead, 06:04:05, and the list would still be ordered), so a stamp
+        # assertion passes either way and proves nothing. Placement is the
+        # claim, and the consequence is which neighbour it inherits from.
+        placed = [
+            row[0] for row in await target.db.fetchall(
+                "SELECT content FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id", (AGENT,),
+            )
+        ]
+        assert placed[0] == "four", (
+            f"the undatable row should sort first, got order {placed}"
         )
-        metadata, session_id = await db.fetchone(
-            "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
-            (message_id,),
+        assert restored[0] == "2026-01-02 03:04:05", (
+            "...having taken its SUCCESSOR's stamp, since a row ordered first "
+            "has no predecessor and never can acquire one"
         )
-        assert json.loads(metadata)["access_count"] == 1
-        assert session_id == UUID_A
+        # ...and the basic-ISO row is dated, not filed as undatable: it sits in
+        # its own place in the sequence rather than at the front.
+        assert "2026-01-02 04:04:05" in restored, restored
+        assert restored.index("2026-01-02 04:04:05") > restored.index(
+            "2026-01-02 03:04:05"
+        ), restored
     finally:
-        await db.close()
+        await target.close()
 
 
-@pytest.mark.asyncio
 async def test_a_restore_rederives_the_column_from_the_backup_metadata(tmp_path):
     """A backup older than the column still restores with it populated.
 

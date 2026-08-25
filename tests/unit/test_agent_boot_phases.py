@@ -26,6 +26,7 @@ import pytest
 
 from kestrel_sovereign.agent.boot import AgentBootError, BootContext, BootPhaseState
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.signals import DurableSignalStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 
@@ -56,8 +57,57 @@ def _durable_backend_double() -> MagicMock:
     backend.backend_type = "sqlite"
     backend.execute_script = AsyncMock()
     backend.execute = AsyncMock(return_value=1)
-    backend.fetch_one = AsyncMock(return_value=None)
-    backend.fetch_all = AsyncMock(return_value=[])
+
+    async def fetch_one(query, params=()):
+        if "FROM sqlite_master" in query and "COLLATE NOCASE" in query:
+            return (
+                "index",
+                DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                DurableSignalStore.EVENTS,
+            )
+        return None
+
+    backend.fetch_one = AsyncMock(side_effect=fetch_one)
+
+    async def fetch_all(query, params=()):
+        if query.strip() == "PRAGMA table_info(durable_signal_events)":
+            # Signal boot's normal path now trusts the same catalog evidence
+            # as a real freshly-created SQLite ledger. Keep this production-
+            # wiring double honest instead of making it resemble a partially
+            # migrated database whose history would need scanning.
+            return [
+                (0, "caller_identity", "TEXT", 0, None, 0),
+                (1, "source_sequence", "BIGINT", 1, None, 0),
+            ]
+        if "FROM sqlite_master" in query and "type = 'trigger'" in query:
+            return [
+                (name, "durable_signal_events", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_GUARDS
+            ] + [
+                (name, "durable_signal_source_sequences", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_COUNTER_FENCES
+            ]
+        if query.startswith("PRAGMA index_list"):
+            return [
+                (
+                    0,
+                    DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                    1,
+                    "c",
+                    0,
+                )
+            ]
+        if query.startswith("PRAGMA index_xinfo"):
+            return [
+                (0, 0, "agent_id", 0, "BINARY", 1),
+                (1, 1, "source", 0, "BINARY", 1),
+                (2, 2, "source_sequence", 0, "BINARY", 1),
+                (3, -1, None, 0, "BINARY", 0),
+            ]
+        return []
+
+    backend.fetch_all = AsyncMock(side_effect=fetch_all)
+    backend.fetch_val = AsyncMock(return_value=None)
 
     @contextlib.asynccontextmanager
     async def transaction(*, immediate: bool = False):
@@ -601,12 +651,11 @@ async def test_feature_owned_signal_sources_absent_after_rollback(tmp_path):
         async def initialize(self):
             from kestrel_sovereign.signals import RegistrationPolicy
 
-            outcome = self.agent.signal_registry.register_with_policy(
+            # Registered AS THIS FEATURE, so base shutdown releases it.
+            self._register_signal_sources(
                 _fake_source_registration(self.FAKE_SOURCE),
                 RegistrationPolicy.OPTIONAL,
             )
-            # Record the newly-owned source so base shutdown unregisters it.
-            self._own_signal_sources(outcome)
 
         async def shutdown(self):
             self.shutdown_calls += 1
@@ -694,11 +743,10 @@ async def test_feature_hooks_and_wait_providers_absent_after_rollback(tmp_path):
         async def initialize(self):
             from kestrel_sovereign.signals import RegistrationPolicy
 
-            outcome = self.agent.signal_registry.register_with_policy(
+            self._register_signal_sources(
                 _fake_source_registration(self.FAKE_SOURCE),
                 RegistrationPolicy.OPTIONAL,
             )
-            self._own_signal_sources(outcome)
 
         def get_hooks(self):
             return [self._hook]
@@ -774,11 +822,10 @@ async def test_feature_source_unregistered_when_its_own_init_fails_after_registe
         async def initialize(self):
             from kestrel_sovereign.signals import RegistrationPolicy
 
-            outcome = self.agent.signal_registry.register_with_policy(
+            self._register_signal_sources(
                 _fake_source_registration(self.FAKE_SOURCE),
                 RegistrationPolicy.OPTIONAL,
             )
-            self._own_signal_sources(outcome)
             raise RuntimeError("feature init boom after registering source")
 
     agent = _make_agent(tmp_path)
@@ -1078,3 +1125,102 @@ async def test_storage_phase_uses_sqlite_by_default(tmp_path):
         assert args and args[0] == str(tmp_path / "boot.db")
         assert "backend" not in kwargs
     assert "storage" in ctx.rollback_labels
+
+
+# ---------------------------------------------------------------------------
+# A feature's duplicate signal source must not abort boot (issue #2951)
+# ---------------------------------------------------------------------------
+
+
+def _feature_contributing(agent, source_name: str):
+    """A fixture feature whose workflow contributes *source_name*.
+
+    The contract deliberately differs from core's registration of the same
+    name — which is the real shape: two `fleet_stalled_sweep` registrations
+    bound to different callbacks are a genuine mismatch, not a duplicate.
+    """
+    import dataclasses
+
+    from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+    feature = SDKFixtureFeature(agent)
+    colliding = dataclasses.replace(feature.source, name=source_name)
+    feature.workflow_registration = type(feature.workflow_registration)(
+        owner=feature.contribution_owner,
+        name=feature.workflow_registration.name,
+        actor=feature.actor,
+        sources=(colliding,),
+    )
+    return feature
+
+
+@pytest.mark.asyncio
+async def test_one_features_duplicate_source_does_not_abort_boot(tmp_path):
+    """The regression: one stale feature took every agent on the host down.
+
+    `kestrel-feature-talon` 0.2.0 contributed a source core had just reclaimed,
+    and boot failed for Meridian, Claw, Nellie and Emma alike. The agent must
+    now boot, without that feature, and say why.
+    """
+    from kestrel_sovereign.signals.sources.workflow_rescue import SOURCE_NAMES
+
+    agent = _make_agent(tmp_path)
+    feature = _feature_contributing(agent, sorted(SOURCE_NAMES)[0])
+    try:
+        with _boot_mocks(), patch(
+            "kestrel_sovereign.kestrel_agent.discover_features",
+            return_value=[feature],
+        ):
+            await agent.initialize()
+
+        # The agent boots.
+        assert agent._boot_state is BootPhaseState.READY
+        # The offending feature does not load...
+        assert feature not in agent.features.values()
+        # ...and the reason is REPORTED, not merely logged.
+        reasons = [r.reason for r in agent.rejected_feature_contributions]
+        assert len(reasons) == 1
+        assert sorted(SOURCE_NAMES)[0] in reasons[0]
+        # Core's own registration is untouched.
+        assert all(name in agent.signal_registry for name in SOURCE_NAMES)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_feature_is_absent_from_the_mandatory_readiness_check(tmp_path):
+    """A rejected MANDATORY feature must still fail boot.
+
+    Degrading a mandatory feature to "did not load" would turn an identity gap
+    into a capability gap — the inversion #2871 warns against. The postcondition
+    that catches it is `verify_mandatory_feature_set`, which can only do so if
+    the rejected feature is genuinely ABSENT from the mapping it is handed.
+
+    That absence is what this asserts. The raising behaviour of the
+    postcondition itself is covered by its own tests; this pins the half that
+    this change could break.
+    """
+    from kestrel_sovereign.signals.sources.workflow_rescue import SOURCE_NAMES
+
+    agent = _make_agent(tmp_path)
+    feature = _feature_contributing(agent, sorted(SOURCE_NAMES)[0])
+    try:
+        with _boot_mocks(), patch(
+            "kestrel_sovereign.kestrel_agent.discover_features",
+            return_value=[feature],
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set"
+        ) as verify:
+            await agent.initialize()
+
+        # It ran at agent readiness...
+        stages = [c.kwargs.get("stage") for c in verify.call_args_list]
+        assert "agent readiness" in stages
+        # ...over a feature set that does NOT contain the rejected feature, so a
+        # mandatory one would be counted as missing.
+        checked = verify.call_args_list[stages.index("agent readiness")].args[0]
+        assert feature not in (
+            checked.values() if hasattr(checked, "values") else checked
+        )
+    finally:
+        await _cleanup(agent)

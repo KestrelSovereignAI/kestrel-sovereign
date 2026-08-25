@@ -2,9 +2,11 @@ import logging
 import json
 import os
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import math
+import sys
 import time
 from dataclasses import dataclass, replace as _replace_dataclass
 from datetime import datetime
@@ -44,6 +46,11 @@ from kestrel_sovereign.features import (
     verify_mandatory_feature_set,
 )
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.config_validation import validate_feature_config
+
+
+class HostFeatureConfigError(RuntimeError):
+    """The host could not read the feature configuration it was asked to apply."""
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
@@ -548,6 +555,12 @@ class KestrelAgent(
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.
     """
 
+    #: Features refused activation because a contribution clashed with an
+    #: already-registered key. Class-level so `/health/detailed` can be asked
+    #: before boot has run and get "none refused" rather than an attribute
+    #: error — an absent answer must not read as a clean one (#2951).
+    rejected_feature_contributions: tuple = ()
+
     def __init__(
         self,
         did: str,
@@ -566,6 +579,10 @@ class KestrelAgent(
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
         isolated_feature_data_dir: Optional[Path] = None,
+        isolated_runtime_root: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_namespace: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_legacy_root: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_hosted: bool = False,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
@@ -624,10 +641,23 @@ class KestrelAgent(
                        This is injected by the embedding runtime, never derived
                        from a tool caller or user-id field.
             isolated_feature_data_dir: Optional host-owned per-agent directory
-                       for isolated feature venvs and provisioning manifests.
-                       This lets a PostgreSQL-backed multi-tenant embedding
-                       isolate feature runtimes without pretending it owns a
-                       SQLite storage path.
+                       retained for standalone embedding compatibility. Hosted
+                       and multi-tenant factories must use the explicit root /
+                       namespace contract below instead.
+            isolated_runtime_root: Host-owned root for isolated-feature mutable
+                       runtime state. Hosted factories must pair this with
+                       ``isolated_runtime_namespace``.
+            isolated_runtime_namespace: Canonical relative tenant/agent
+                       namespace below ``isolated_runtime_root``. The runtime
+                       validates it and securely binds it to this agent DID.
+            isolated_runtime_legacy_root: Explicit, agent-scoped location of
+                       the released hosted feature runtime layout. Managed
+                       factories may supply this only to adopt existing
+                       ``feature_venvs/<ClassName>`` state into the new
+                       namespace; it is never a runtime fallback.
+            isolated_runtime_hosted: Declares that this agent shares a host
+                       runtime. Discovery of an isolated feature fails closed
+                       unless an explicit root and namespace were supplied.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -658,6 +688,69 @@ class KestrelAgent(
         self.did = did
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
+        effective_db_backend = db_backend or os.environ.get(
+            "KESTREL_DB_BACKEND", "sqlite"
+        )
+        if type(isolated_runtime_hosted) is not bool:
+            raise TypeError("isolated_runtime_hosted must be a bool")
+        if isolated_feature_data_dir is not None and (
+            isolated_runtime_root is not None
+            or isolated_runtime_namespace is not None
+        ):
+            raise ValueError(
+                "isolated_feature_data_dir cannot be combined with the hosted "
+                "isolated runtime root/namespace contract"
+            )
+        # PostgreSQL hosts commonly have no agent-local filesystem database.
+        # Treat that construction shape as hosted even if its factory predates
+        # the explicit runtime-scope arguments.  An isolated feature then fails
+        # before startup instead of silently collapsing into agent_data/default.
+        # A factory which knows its host-owned root and namespace can (and must)
+        # supply them below to make the feature usable.
+        self.isolated_runtime_hosted = bool(
+            isolated_runtime_hosted
+            or isolated_runtime_root is not None
+            or isolated_runtime_namespace is not None
+            or (
+                storage_path is None
+                and effective_db_backend.lower() == "postgres"
+            )
+        )
+        self.isolated_runtime_root: Optional[Path] = None
+        self.isolated_runtime_namespace: Optional[Path] = None
+        self.isolated_runtime_path: Optional[Path] = None
+        self.isolated_runtime_legacy_root: Optional[Path] = None
+        self.isolated_runtime_scope = None
+        if isolated_runtime_root is not None or isolated_runtime_namespace is not None:
+            # Keep the hosted runtime boundary owned by the isolated-runtime
+            # module. This validates path traversal once at construction and
+            # the proxy reuses the same canonical scope when it launches a
+            # feature, rather than deriving mutable placement from database
+            # storage (which PostgreSQL-backed hosted agents deliberately lack).
+            from kestrel_sovereign.features.isolated_runtime import (
+                resolve_legacy_isolated_runtime_root,
+                resolve_isolated_runtime_namespace,
+            )
+
+            runtime_scope = resolve_isolated_runtime_namespace(
+                isolated_runtime_root, isolated_runtime_namespace
+            )
+            self.isolated_runtime_root = runtime_scope.root
+            self.isolated_runtime_namespace = runtime_scope.namespace
+            self.isolated_runtime_path = runtime_scope.path
+            self.isolated_runtime_scope = runtime_scope
+            if isolated_runtime_legacy_root is not None:
+                self.isolated_runtime_legacy_root = (
+                    resolve_legacy_isolated_runtime_root(
+                        isolated_runtime_legacy_root,
+                        runtime_scope,
+                    )
+                )
+        elif isolated_runtime_legacy_root is not None:
+            raise ValueError(
+                "isolated_runtime_legacy_root requires the hosted isolated "
+                "runtime root/namespace contract"
+            )
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
         # attribute from birth — no construction path (fleet load, spawn /
@@ -1128,7 +1221,7 @@ class KestrelAgent(
                     raise IdentityReadinessError.from_load_error(exc) from None
 
         # Determine database backend
-        self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+        self._db_backend = effective_db_backend
         # Birth-record capability the runtime database could not be given and
         # no retry can supply (#2871). Surfaced by the ``birth_record`` health
         # check; empty on every healthy agent.
@@ -1255,6 +1348,7 @@ class KestrelAgent(
 
         # Features will be initialized after storage
         self.features: Dict[str, Feature] = {}
+        self.rejected_feature_contributions = ()
 
         # Hooks manager for security and middleware
         self.hooks_manager = HooksManager()
@@ -2854,13 +2948,13 @@ class KestrelAgent(
         prepared_contributions = self._prepare_feature_contribution_transition(
             enabled_discovered_features
         )
-        prepared_by_feature = {
-            id(item.feature): item for item in prepared_contributions
-        }
-        for feature in enabled_discovered_features:
-            await self._register_feature(
+        self._record_contribution_rejections(prepared_contributions)
+        for feature, prepared_item in prepared_contributions.activatable(
+            enabled_discovered_features
+        ):
+            await self._register_startup_feature(
                 feature,
-                prepared_contributions=prepared_by_feature[id(feature)],
+                prepared_contributions=prepared_item,
             )
         verify_mandatory_feature_set(
             self.features,
@@ -4179,6 +4273,57 @@ class KestrelAgent(
         self.setup_step_registry = runtime.setup_step_registry
         return runtime
 
+    def _record_contribution_rejections(self, transition) -> None:
+        """Log and RETAIN the features refused activation.
+
+        Retained, not just logged: a feature that did not load must not be
+        indistinguishable from one that loaded and had nothing to do. This is
+        what ``/health/detailed`` reports (issue #2951).
+        """
+        existing = tuple(self.rejected_feature_contributions)
+        self.rejected_feature_contributions = existing + tuple(
+            rejection
+            for rejection in transition.rejected
+            if not any(
+                prior.feature_name == rejection.feature_name
+                for prior in existing
+            )
+        )
+        for rejection in transition.rejected:
+            logging.error(
+                "Feature '%s' did not load — %s. The agent is running WITHOUT "
+                "it; every other feature and agent is unaffected.",
+                rejection.feature_name,
+                rejection.reason,
+            )
+
+    def record_feature_unavailable(
+        self,
+        *,
+        feature: object,
+        feature_name: str,
+        reason: str,
+    ) -> None:
+        """Retain one safely described optional-feature quarantine for health."""
+
+        from kestrel_sovereign.features.contribution_runtime import (
+            ContributionRejection,
+        )
+
+        if any(
+            rejection.feature_name == feature_name
+            for rejection in self.rejected_feature_contributions
+        ):
+            return
+        self.rejected_feature_contributions = (
+            *self.rejected_feature_contributions,
+            ContributionRejection(
+                feature=feature,
+                feature_name=feature_name,
+                reason=reason,
+            ),
+        )
+
     def _prepare_feature_contribution_transition(self, features):
         """Collect and prevalidate one complete feature activation transition."""
         from kestrel_sovereign.features.contribution_runtime import (
@@ -4249,6 +4394,228 @@ class KestrelAgent(
                 exc,
             )
 
+    async def _apply_host_feature_config(self, feature: Feature) -> None:
+        """Hand a freshly initialized feature the config the operator declared.
+
+        A feature that declares a ``config_schema`` has, until now, had no
+        declarative way to be given values: the only route was an HTTP call to
+        the configuration endpoint. That is why extracting Talon silently broke
+        it on every existing agent — the package correctly requires the host to
+        supply explicit paths, and the host had no mechanism with which to
+        supply them (#3008). Features that needed configuration either read the
+        agent's TOML themselves, re-deriving a file location per feature, or
+        were simply unconfigurable without a control-panel visit.
+
+        Core cannot know what any feature's configuration means, and must never
+        import a feature package to find out. It does not need to: the registry
+        already maps a feature class to the package that owns it, so the block
+        is addressed by the *operator-facing* package name — ``[features.talon
+        .config]``, the name used by ``kestrel feature enable`` — rather than
+        by the class name, which is an implementation detail that happens to
+        leak through ``self.features``.
+
+        A declared block that will not apply is a capability gap rather than an
+        identity gap: the agent boots and says so, rather than refusing. It is
+        safe to be loud instead of fatal here precisely because an unconfigured
+        feature now reports itself unconfigured instead of claiming readiness.
+        """
+        schema = getattr(feature, "config_schema", None)
+        if schema is None:
+            return
+        # ``feature.name`` rather than the concrete class: an isolated feature
+        # is loaded as a ProxyFeature and only ``name`` carries the advertised
+        # registry class, so keying on type() would silently skip every
+        # isolated feature — reintroducing the exact silence this closes.
+        declared = self._declared_feature_config(getattr(feature, "name", "") or "")
+        if declared is None:
+            return
+        # An explicitly empty [features.X.config] means "clear it", which is a
+        # different instruction from "no block". Treating them alike would let
+        # an operator who deliberately emptied the table keep running the
+        # settings they just removed — and would skip required-field
+        # validation on the way past.
+        declared = dict(declared)
+        if isinstance(schema, dict):
+            # The same rule the HTTP configuration route applies. Validating
+            # here means a bad value is refused before any feature persists it.
+            validate_feature_config(declared, schema)
+        await feature.set_config(declared)
+
+    def _agent_toml_path(self) -> Optional[Path]:
+        """The per-agent TOML, beside the agent's database file."""
+        if not self.storage_path:
+            return None
+        return Path(self.storage_path).parent / "kestrel.toml"
+
+    def _declared_feature_config(
+        self, feature_class_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read ``[features.<package>.config]`` for one feature class.
+
+        Returns ``None`` when no block is declared, and a (possibly empty)
+        mapping when one is — the distinction is load-bearing.
+        """
+        path = self._agent_toml_path()
+        if path is None or not path.exists():
+            return None
+        from kestrel_sovereign.feature_registry import get_package_for_feature
+
+        package = get_package_for_feature(feature_class_name)
+        if package is None:
+            return None
+        try:
+            try:
+                import tomllib  # type: ignore[import-not-found]
+            except ImportError:
+                import tomli as tomllib  # type: ignore[import-not-found]
+            with open(path, "rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, ValueError) as exc:
+            # Do NOT degrade to "no declaration". A malformed file is not an
+            # absent one: reporting it as absent lets an initialized feature
+            # keep configuration the operator believes they replaced, which is
+            # the silent divergence this mechanism exists to end.
+            raise HostFeatureConfigError(
+                f"Feature configuration in {path} could not be read: {exc}"
+            ) from exc
+        features = data.get("features")
+        if not isinstance(features, dict):
+            return None
+        entry = features.get(package.name)
+        if not isinstance(entry, dict):
+            # The confusable spelling is the class name, because that is what
+            # the HTTP configuration route and ``self.features`` are keyed by.
+            # A block written there would be silently ignored, which is the
+            # failure this whole mechanism exists to end — so say so.
+            mistaken = features.get(feature_class_name)
+            if isinstance(mistaken, dict) and "config" in mistaken:
+                logging.warning(
+                    "%s declares [features.%s.config], which is never read. "
+                    "Feature configuration is addressed by package name: use "
+                    "[features.%s.config].",
+                    path,
+                    feature_class_name,
+                    package.name,
+                )
+            return None
+        declared = entry.get("config")
+        return declared if isinstance(declared, dict) else None
+
+    async def _register_startup_feature(
+        self,
+        feature: Feature,
+        *,
+        prepared_contributions=None,
+    ) -> bool:
+        """Register one discovered feature, quarantining safe prep failures.
+
+        A transient OS failure, an ambiguous legacy/stable custody migration,
+        or unsafe process-wide feature configuration makes an optional isolated
+        feature unavailable, but does not weaken the rest of the agent.  True
+        namespace/ownership violations use the separate
+        ``IsolatedRuntimeNamespaceError`` hierarchy and continue to fail the
+        hosted agent closed.
+        """
+
+        try:
+            await self._register_feature(
+                feature,
+                prepared_contributions=prepared_contributions,
+            )
+        except Exception as exc:
+            # Do not import the optional isolated runtime while registering
+            # ordinary core features. An actual ProxyFeature proves the module
+            # is already loaded, so classify its narrow quarantine outcomes
+            # from that exact module and let every other exception propagate.
+            isolated_runtime = sys.modules.get(
+                "kestrel_sovereign.features.isolated_runtime"
+            )
+            proxy_type = getattr(isolated_runtime, "ProxyFeature", None)
+            configuration_error = getattr(
+                isolated_runtime,
+                "IsolatedRuntimeConfigurationError",
+                None,
+            )
+            preparation_error = getattr(
+                isolated_runtime,
+                "IsolatedRuntimePreparationError",
+                None,
+            )
+            is_isolated_feature = isinstance(proxy_type, type) and isinstance(
+                feature, proxy_type
+            )
+            if not is_isolated_feature:
+                raise
+            if isinstance(configuration_error, type) and isinstance(
+                exc, configuration_error
+            ):
+                # Derive text through the exception type's closed diagnostic
+                # map. Third-party code can raise this public type with an
+                # arbitrary base message, so logging ``exc`` could disclose
+                # values.
+                diagnostic = configuration_error.safe_diagnostic(exc)
+                logging.error(
+                    "Optional isolated feature '%s' is unavailable because %s; "
+                    "other agent features will continue.",
+                    getattr(feature, "name", type(feature).__name__),
+                    diagnostic,
+                )
+                self.record_feature_unavailable(
+                    feature=feature,
+                    feature_name=getattr(
+                        feature,
+                        "name",
+                        type(feature).__name__,
+                    ),
+                    reason=diagnostic,
+                )
+                return False
+            if isinstance(preparation_error, type) and isinstance(
+                exc, preparation_error
+            ):
+                diagnostic_factory = getattr(
+                    isolated_runtime,
+                    "safe_isolated_runtime_preparation_diagnostic",
+                    None,
+                )
+                exc_info_factory = getattr(
+                    isolated_runtime,
+                    "sanitized_isolated_runtime_preparation_exc_info",
+                    None,
+                )
+                diagnostic = (
+                    diagnostic_factory(exc)
+                    if callable(diagnostic_factory)
+                    else (
+                        "the agent-scoped runtime could not be prepared; inspect "
+                        "host filesystem health"
+                    )
+                )
+                safe_exc_info = (
+                    exc_info_factory(exc)
+                    if callable(exc_info_factory)
+                    else None
+                )
+                logging.error(
+                    "Optional isolated feature '%s' is unavailable because %s; "
+                    "other agent features will continue.",
+                    getattr(feature, "name", type(feature).__name__),
+                    diagnostic,
+                    exc_info=safe_exc_info,
+                )
+                self.record_feature_unavailable(
+                    feature=feature,
+                    feature_name=getattr(
+                        feature,
+                        "name",
+                        type(feature).__name__,
+                    ),
+                    reason=diagnostic,
+                )
+                return False
+            raise
+        return True
+
     async def _register_feature(
         self,
         feature: Feature,
@@ -4263,7 +4630,7 @@ class KestrelAgent(
         if prepared_contributions is None:
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
-            )[0]
+            ).only()
         try:
             await feature.initialize()
         except Exception as exc:
@@ -4274,6 +4641,36 @@ class KestrelAgent(
                     "initialization",
                     "could not initialize",
                 ) from exc
+            raise
+        try:
+            await self._apply_host_feature_config(feature)
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so the handler below never
+            # sees it. initialize() has already run at this point and the
+            # feature is not yet in self.features, so boot rollback cannot
+            # find it — its tasks and signal sources would outlive the failed
+            # boot. Tear down, then let the cancellation continue.
+            with contextlib.suppress(Exception):
+                await self._shutdown_failed_feature(feature)
+            raise
+        except Exception as exc:
+            # Deliberately fatal to this feature. A rejected block does NOT
+            # leave the feature unconfigured — a feature that validates before
+            # replacing its active config (Talon does) keeps running its
+            # PREVIOUS configuration, so swallowing this would leave the agent
+            # dispatching with paths and policy the operator did not declare
+            # and believes they replaced. Silent divergence between declared
+            # and running configuration is the whole subject of #3008; it must
+            # not be reintroduced by its own fix.
+            await self._shutdown_failed_feature(feature)
+            logging.error(
+                "Feature '%s' rejected the configuration declared in %s: %s. "
+                "The feature is NOT loaded, so it cannot run with settings "
+                "other than the ones declared.",
+                feature_class_name,
+                self._agent_toml_path(),
+                exc,
+            )
             raise
         self.features[feature.name] = feature
 
@@ -4460,9 +4857,13 @@ class KestrelAgent(
         if prepared_contributions is None:
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
-            )[0]
+            ).only()
         try:
             await feature.initialize()
+            # initialize() can reset config a feature does not persist (a
+            # volatile-privacy host key, for example), so a disable/enable
+            # cycle would otherwise lose the declared value until restart.
+            await self._apply_host_feature_config(feature)
             self._ensure_feature_contribution_runtime().activate(
                 prepared_contributions
             )

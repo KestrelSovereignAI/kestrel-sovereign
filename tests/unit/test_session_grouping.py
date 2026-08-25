@@ -98,20 +98,21 @@ def test_session_id_change_splits_even_within_gap():
     assert all(s["message_count"] == 1 for s in sessions)
 
 
-def test_legacy_then_uuid_stays_merged_to_match_resolver():
-    # A legacy row (no session_id) followed within the gap by a UUID row must
-    # stay ONE session: _get_session_messages(<legacy row id>) time-walks
-    # through the UUID row, so splitting the list there would let a legacy
-    # delete also destroy the UUID session (#2019). Two distinct UUIDs still
-    # split — see test_session_id_change_splits_even_within_gap.
+def test_legacy_then_uuid_splits_because_the_resolver_stops_there():
+    # A legacy row (no session_id) followed within the gap by a stamped row is
+    # TWO sessions. It used to be one: the resolver's time-walk from a legacy
+    # row-id did not stop on id changes, so a split list would have let a
+    # legacy delete destroy the stamped session too (#2019). The walk stops
+    # now (`_filter_session_rows`), and merging them was what made Phase A's
+    # per-row column contradict the grouping and drop the conversation from
+    # the list entirely (#3098).
     msgs = [
         _msg(1, "user", "legacy", minutes=0),               # no session_id
         _msg(2, "user", "stamped", minutes=1, session_id="u-1234"),
     ]
     sessions = group_messages_into_sessions(msgs)
-    assert len(sessions) == 1
-    assert sessions[0]["session_id"] == "1"  # legacy anchor wins
-    assert sessions[0]["message_count"] == 2
+    assert [s["session_id"] for s in sessions] == ["1", "u-1234"]
+    assert [s["message_count"] for s in sessions] == [1, 1]
 
 
 def test_unlabeled_turn_stays_with_current_session():
@@ -168,18 +169,72 @@ def test_timestamp_coercion_normalizes_iso_offsets_to_naive_utc():
 
 
 def test_timestamp_sql_boundary_normalizes_sqlite_and_preserves_postgres_binds():
+    """Both sides of a timestamp comparison, in the spellings each backend uses.
+
+    The SQLite parameter used to be ``value.isoformat()`` — a ``T`` separator,
+    a ``+00:00`` offset — which was safe only because ``julianday`` was applied
+    to BOTH sides and reads either. Since #3009 the column holds exactly one
+    spelling, and the parameter is rendered in it: a bound value in a different
+    spelling would be the one term in the comparison still needing conversion,
+    which is what has to stop being true before ``julianday`` can come out of
+    the ordering at all.
+    """
     aware = datetime(2026, 6, 29, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
 
-    assert canonical_timestamp_sql("sqlite", "created_at") == "julianday(created_at)"
-    assert timestamp_predicate("sqlite", "created_at", ">") == (
-        "julianday(created_at) > julianday(?)"
+    # The column compares as ITSELF on both backends now — the whole of step 5
+    # in one assertion. A function call around it is not indexable, which is
+    # why removing it is the point rather than a tidy-up.
+    assert canonical_timestamp_sql("sqlite", "created_at") == "created_at"
+    assert timestamp_predicate("sqlite", "created_at", ">") == "created_at > ?"
+    assert timestamp_query_param("sqlite", aware) == "2026-06-29 12:00:00"
+    # The offset is APPLIED on the way, not dropped: 07:00-05:00 is 12:00 UTC.
+    assert timestamp_query_param("sqlite", "2026-06-29T07:00:00-05:00") == (
+        "2026-06-29 12:00:00"
     )
-    assert timestamp_query_param("sqlite", aware) == "2026-06-29T12:00:00+00:00"
-
+    # A value nothing can date is passed through rather than becoming NULL: a
+    # predicate against it matched nothing before and must go on matching
+    # nothing, instead of comparing NULL against every row.
+    assert timestamp_query_param("sqlite", "not a date") == "not a date"
     postgres_bound = timestamp_query_param("postgres", aware)
     assert postgres_bound == datetime(2026, 6, 29, 12, 0, 0)
     assert postgres_bound.tzinfo is None
     assert timestamp_predicate("postgres", "created_at", ">") == "created_at > ?"
+
+
+def test_a_fractional_boundary_is_not_rounded_into_a_row_it_excludes():
+    """Sub-second precision survives the bind, because a purge compares on it.
+
+    Stored values are whole seconds — no writer produces a fraction and #3009's
+    migration truncates them — but a caller's BOUNDARY may carry one, and the
+    canonical spelling would round it down. ``purge_all_since`` compares
+    ``>=``, so a boundary of ``12:00:00.500`` truncated to ``12:00:00`` starts
+    selecting the row stamped ``12:00:00``, which predates it, and PERMANENTLY
+    deletes it. PostgreSQL keeps the fraction, so the two backends would also
+    disagree about what a purge destroys.
+
+    Asked of the real predicate rather than of the formatting, because it is
+    the comparison that decides which rows die.
+    """
+    import sqlite3
+
+    engine = sqlite3.connect(":memory:")
+    engine.execute("CREATE TABLE t (created_at TEXT)")
+    engine.executemany(
+        "INSERT INTO t VALUES (?)",
+        [("2026-01-01 12:00:00",), ("2026-01-01 12:00:01",)],
+    )
+    predicate = timestamp_predicate("sqlite", "created_at", ">=")
+    doomed = [
+        row[0]
+        for row in engine.execute(
+            f"SELECT created_at FROM t WHERE {predicate}",
+            (timestamp_query_param("sqlite", "2026-01-01 12:00:00.500"),),
+        )
+    ]
+    assert doomed == ["2026-01-01 12:00:01"], (
+        "a row stamped before the boundary was selected for permanent "
+        "deletion, because the boundary was rounded down to meet it"
+    )
 
 
 def test_grouping_safely_mixes_naive_and_aware_timestamp_shapes():
@@ -410,3 +465,130 @@ def test_coalesce_leaves_distinct_sessions_untouched():
     ]
     coalesced = coalesce_sessions_by_session_id(group_messages_into_sessions(msgs))
     assert [s["session_id"] for s in coalesced] == ["s1", "s2"]
+
+
+def test_an_undatable_row_is_dated_from_the_transcript_not_the_clock():
+    """Grouping must be a function of the rows, not of when it was asked.
+
+    ``now`` used to default to the wall clock, so a row with an unparseable
+    ``created_at`` was dated to the moment of the call. Two consequences, both
+    real: the same transcript grouped one way now and another way an hour
+    later, as the bad row slid forward and kept rejoining whichever session was
+    newest; and the #2959 projection could not cache the result, because a
+    cache has to be reproducible from what it caches.
+
+    The transcript here is historical, so a wall-clock default would date the
+    bad row to today — months past every real stamp — and the gap rule would
+    give it a session of its own. Pinning the newest stamp present keeps it
+    with the run it was found in.
+    """
+    msgs = [
+        _msg(1, "user", "hello", minutes=0, session_id="s1"),
+        {"id": 2, "role": "assistant", "content": "undatable",
+         "metadata": {"session_id": "s1"}, "created_at": "not-a-date"},
+        _msg(3, "user", "still here", minutes=5, session_id="s1"),
+    ]
+
+    sessions = group_messages_into_sessions(msgs)
+
+    assert len(sessions) == 1, (
+        "the undatable row was dated far from the transcript and split off "
+        f"into its own session: {[s['started_at'] for s in sessions]}"
+    )
+    assert sessions[0]["last_message_at"] == (BASE + timedelta(minutes=5)).isoformat()
+    assert sessions[0]["message_count"] == 3
+
+
+def test_grouping_an_undatable_row_is_repeatable():
+    """The same transcript, grouped twice, must give the same answer.
+
+    The wall-clock default made this false by construction — only by a few
+    microseconds between two immediate calls, which is why asserting equality
+    of two results catches it only when the value is compared exactly.
+    """
+    msgs = [
+        _msg(1, "user", "hello", minutes=0, session_id="s1"),
+        {"id": 2, "role": "assistant", "content": "undatable",
+         "metadata": {"session_id": "s1"}, "created_at": None},
+    ]
+
+    assert group_messages_into_sessions(msgs) == group_messages_into_sessions(msgs)
+
+
+def test_text_order_is_clock_order_for_everything_the_column_can_hold():
+    """The claim that replaced "the parser and ``julianday`` agree" (#3009).
+
+    This case used to require that ``coerce_session_timestamp`` accept exactly
+    what SQLite's ``julianday`` could read, because the canonical order compared
+    through ``julianday`` and a row the parser dated but SQL could not would
+    sort at the far end of that order — where ``LIMIT`` drops it out of the
+    conversation list.
+
+    Step 5 removed the reason. ``created_at`` admits one fixed-width spelling
+    now and the ordering compares the column as itself, so the requirement is
+    no longer an agreement between two domains: it is that **text order is
+    clock order** over the values the column can hold, and that the parser
+    reads all of them. Two domains agreeing was always the weaker property —
+    it had to be maintained. This one follows from the spelling.
+
+    Still GENERATED rather than listed, for the reason the old case gave: the
+    gap that got through last time was not an exotic spelling but an ordinary
+    date carrying an ordinary offset, which no hand-written corpus happened to
+    contain. A list can only fail to include something; a product cannot.
+    """
+    import itertools
+
+    from kestrel_sovereign.storage.conversation_created_at import (
+        canonical_created_at,
+    )
+
+    base = datetime(2026, 1, 1, 11, 0, 0)
+    canonical = [
+        canonical_created_at(base + timedelta(days=d, seconds=sec))
+        for d, sec in itertools.product(
+            (-400, -1, 0, 1, 400, 4000), (0, 1, 59, 3600, 86399)
+        )
+    ]
+    assert len(set(canonical)) == len(canonical), "the corpus repeats itself"
+
+    parsed = {value: coerce_session_timestamp(value) for value in canonical}
+    unreadable = [v for v, dt in parsed.items() if dt is None]
+    assert not unreadable, f"the parser cannot read stored values: {unreadable}"
+
+    assert sorted(canonical) == sorted(canonical, key=lambda v: parsed[v]), (
+        "lexicographic order diverged from chronological order, which is the "
+        "property that lets the ordering compare created_at as itself"
+    )
+
+
+def test_a_predicate_compares_both_sides_the_same_way():
+    """The two halves of a comparison must get the SAME treatment (#3009).
+
+    Only ``created_at`` carries the canonical CHECK. ``deleted_at`` and
+    ``archived_at`` are TIMESTAMP columns on the same table, written by the same
+    code, and unconstrained — SQLite history really does hold both spellings in
+    them — so they still have to be compared through ``julianday``.
+
+    The placeholder is not a column and carries no guarantee of its own, so
+    asking about it independently renders ``julianday(?)`` beside a bare
+    ``created_at``: text compared against a float. SQLite answers that by TYPE
+    order rather than by chronology and never raises, so a destructive
+    predicate built that way silently matches the wrong set — and
+    ``purge_trash_older_than`` is one of these.
+    """
+    import sqlite3
+
+    assert timestamp_predicate("sqlite", "created_at", ">") == "created_at > ?"
+    assert timestamp_predicate("sqlite", "deleted_at", ">") == (
+        "julianday(deleted_at) > julianday(?)"
+    )
+
+    # And the mismatched form really does answer by type, not by clock.
+    engine = sqlite3.connect(":memory:")
+    mismatched = engine.execute(
+        "SELECT '2026-06-01 12:00:00' > julianday('2026-06-01 11:00:00')"
+    ).fetchone()[0]
+    assert mismatched == 1, (
+        "the premise died: SQLite no longer orders text above numbers, so a "
+        "mismatched comparison would now fail loudly instead of silently"
+    )
