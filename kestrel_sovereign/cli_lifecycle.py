@@ -1100,6 +1100,9 @@ def _run_feature_reconcile(
                     "declared core. If this is a version conflict, update "
                     "the checkout to satisfy the feature — do not remove the pin."
                 )
+            bound_note = guard.manifest_bound_note()
+            if bound_note:
+                print(f"      note: {bound_note}")
             if not continue_on_error:
                 print(
                     "• reconcile: FAILED — aborting before restart. "

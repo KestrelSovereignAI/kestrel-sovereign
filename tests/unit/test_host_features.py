@@ -7,7 +7,6 @@ endpoints, the host-scoped UI surface, and that per-agent behavior is untouched.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -80,8 +79,14 @@ class _UIHostFeature(_DemoHostFeature):
 # ---------------------------------------------------------------------------
 
 
-def test_instantiate_host_features_uses_provided_classes():
-    features = hf.instantiate_host_features({"_UIHostFeature": _UIHostFeature})
+def test_instantiate_host_features_uses_provided_classes(tmp_path: Path):
+    # An explicit path to a manifest that does not exist: the default is
+    # otherwise read from CWD, which on a developer machine is the operator's
+    # own manifest and would make this assertion depend on their config.
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature},
+        manifest_path=tmp_path / ".kestrel-host-features.toml",
+    )
     assert len(features) == 1
     assert isinstance(features[0], HostFeature)
     assert features[0].name == "demo-host"
@@ -93,7 +98,7 @@ def test_manifest_can_disable_host_feature(tmp_path: Path):
         '[[feature]]\nname = "demo-host"\nhost_scoped = true\nenabled = false\n'
     )
     scoped = hf.read_host_scoped_manifest(manifest)
-    assert scoped == {"demo-host": False}
+    assert scoped.features == {"demo-host": False}
 
     features = hf.instantiate_host_features(
         {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
@@ -113,7 +118,96 @@ def test_manifest_enables_host_scoped_entry(tmp_path: Path):
 def test_manifest_ignores_non_host_scoped_entries(tmp_path: Path):
     manifest = tmp_path / ".kestrel-host-features.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')  # not host-scoped
-    assert hf.read_host_scoped_manifest(manifest) == {}
+    assert hf.read_host_scoped_manifest(manifest).features == {}
+
+
+# --- The default for a host feature the manifest never names (#3099) --------
+
+
+def test_absent_manifest_enables_everything_discovered(tmp_path: Path):
+    """The zero-config answer, unchanged: a fresh install runs what it has."""
+    missing = tmp_path / ".kestrel-host-features.toml"
+
+    assert hf.read_host_scoped_manifest(missing) == hf.HostScopedManifest()
+    assert hf.read_host_scoped_manifest(missing).default_enabled is True
+    assert len(
+        hf.instantiate_host_features(
+            {"_UIHostFeature": _UIHostFeature}, manifest_path=missing
+        )
+    ) == 1
+
+
+def test_manifest_default_disables_a_feature_it_never_names(tmp_path: Path):
+    """``default_enabled = false`` is a policy, so it also covers what is added
+    to the entry-point group later — which is what naming every slug cannot do.
+    """
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text(
+        f"[{hf.HOST_SCOPE_TABLE}]\n{hf.DEFAULT_ENABLED_KEY} = false\n"
+    )
+
+    scoped = hf.read_host_scoped_manifest(manifest)
+    assert scoped.default_enabled is False
+    assert scoped.features == {}
+
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
+    )
+    assert features == []
+
+
+def test_an_explicit_entry_beats_the_manifest_default(tmp_path: Path):
+    """Otherwise the default could not be used to run a chosen subset."""
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text(
+        f"[{hf.HOST_SCOPE_TABLE}]\n{hf.DEFAULT_ENABLED_KEY} = false\n\n"
+        '[[feature]]\nname = "demo-host"\nhost_scoped = true\nenabled = true\n'
+    )
+
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
+    )
+    assert [f.name for f in features] == ["demo-host"]
+
+
+def test_a_class_name_entry_also_beats_the_manifest_default(tmp_path: Path):
+    """The class name is the second spelling ``instantiate`` accepts."""
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text(
+        f"[{hf.HOST_SCOPE_TABLE}]\n{hf.DEFAULT_ENABLED_KEY} = false\n\n"
+        '[[feature]]\nname = "_UIHostFeature"\nscope = "host"\n'
+    )
+
+    features = hf.instantiate_host_features(
+        {"_UIHostFeature": _UIHostFeature}, manifest_path=manifest
+    )
+    assert len(features) == 1
+
+
+def test_a_non_boolean_default_is_reported_and_ignored(tmp_path: Path, caplog):
+    """``bool("false")`` is ``True``, so a string is never coerced.
+
+    Reading a typo as the opposite of what it says — in the permissive
+    direction — is the failure this key exists to remove.
+    """
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text(
+        f'[{hf.HOST_SCOPE_TABLE}]\n{hf.DEFAULT_ENABLED_KEY} = "false"\n'
+    )
+
+    with caplog.at_level("WARNING"):
+        scoped = hf.read_host_scoped_manifest(manifest)
+
+    assert scoped.default_enabled is True
+    assert hf.DEFAULT_ENABLED_KEY in caplog.text
+
+
+def test_a_malformed_manifest_keeps_the_documented_default(tmp_path: Path):
+    """Unparseable TOML must not break the host, nor invent a policy."""
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text("[host_features\nnot toml at all")
+
+    assert hf.read_host_scoped_manifest(manifest) == hf.HostScopedManifest()
 
 
 # ---------------------------------------------------------------------------

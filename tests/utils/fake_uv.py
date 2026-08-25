@@ -102,6 +102,7 @@ class FakeUv:
         feature_requires=">=0.53",
         feature_installed_requires=None,
         installed_requires=None,
+        package_index=None,
         core_index=("0.52.0", "0.53.0"),
         honours_constraints=True,
         repair_fails=False,
@@ -142,6 +143,11 @@ class FakeUv:
         #: `present` now has to answer (#3080). The modelled default is the one
         #: dependency this double has always had: the feature requires core.
         self.installed_requires = {k: list(v) for k, v in (installed_requires or {}).items()}
+        #: Versions the index publishes per package, for the ONE resolver
+        #: question this double answers about non-core dependencies: is there a
+        #: version satisfying both a requirement and that package's own
+        #: constraint line? (#3106)
+        self.package_index = {k: list(v) for k, v in (package_index or {}).items()}
         self.core_index = list(core_index)
         self.honours_constraints = honours_constraints
         self.repair_fails = repair_fails
@@ -163,6 +169,9 @@ class FakeUv:
         # UNKNOWN, which is a third state distinct from both of the above.
         self.unreadable_provenance = set(unreadable_provenance or ())
         self.commands = []
+        #: The TEXT of each install's constraints file, captured because
+        #: `_extension_install_run` deletes the file before a test can read it.
+        self.constraint_files = []
         self.pins = []  # the core pin seen per install (None = unconstrained)
 
     # -- venv state, read back by the code under test ------------------------
@@ -227,6 +236,10 @@ class FakeUv:
         # Read the pin now: `_extension_install_run` deletes the file on return.
         pin = self._core_pin(cmd)
         self.pins.append(pin)
+        if "-c" in cmd:
+            self.constraint_files.append(
+                Path(cmd[cmd.index("-c") + 1]).read_text(encoding="utf-8")
+            )
 
         target = str(cmd[-1])
         if self._is_core_target(cmd, target):
@@ -261,6 +274,10 @@ class FakeUv:
             if self.feature_install_fails:
                 return self._failed(cmd, f"x Failed to build `{self.feature}`")
             return self._install_feature(cmd)
+
+        blocked = self._requirement_outside_its_pin(cmd, self.feature)
+        if blocked is not None:
+            return self._failed(cmd, blocked)
 
         wanted = SpecifierSet(self._resolved_feature_requires(cmd))
         if Version(self.installed[CORE]) in wanted:
@@ -456,6 +473,12 @@ class FakeUv:
             # already put core back (it ran this same branch and wrote), so this
             # exit code describes the command, not the venv.
             return self._failed(cmd, f"x Failed to install {target}: connection reset")
+        blocked = self._requirement_outside_its_pin(cmd, CORE)
+        if blocked is not None:
+            # Core declares dependencies too, and the manifest bounds them: a
+            # core install must not move a declared feature out of its window
+            # any more than a feature install may (#3106).
+            return self._failed(cmd, blocked)
         if self._reinstalls_dependencies(cmd):
             # Core is the target, so its OWN dependencies are the ones a blanket
             # reinstall drags off their checkouts.
@@ -527,14 +550,65 @@ class FakeUv:
             candidates = {v for v in candidates if Version(v) in allowed}
         return candidates
 
-    def _core_pin(self, cmd):
-        """The core pin read out of the ``-c <file>`` constraints file, if any."""
+    def _constraint_lines(self, cmd) -> dict:
+        """Every constraint line in the ``-c <file>``, by package name."""
         if "-c" not in cmd:
-            return None
+            return {}
         text = Path(cmd[cmd.index("-c") + 1]).read_text(encoding="utf-8")
+        pins = {}
         for line in (ln.strip() for ln in text.splitlines()):
-            if line.startswith(CORE):
-                return line[len(CORE):]
+            if not line:
+                continue
+            cut = len(line)
+            for index, char in enumerate(line):
+                if char in "<>=!~":
+                    cut = index
+                    break
+            pins[line[:cut]] = line[cut:]
+        return pins
+
+    def _core_pin(self, cmd):
+        """The core pin read out of the ``-c <file>`` constraints file, if any.
+
+        Keyed EXACTLY: the file now carries a line per declared package (#3106),
+        and ``kestrel-sovereign-sdk`` starts with core's name, so a prefix match
+        would report the SDK's window as core's pin.
+        """
+        return self._constraint_lines(cmd).get(CORE)
+
+    def _requirement_outside_its_pin(self, cmd, dist):
+        """A requirement of *dist* that its package's own pin cannot satisfy.
+
+        The manifest bounds every install, so a dependency whose declared
+        window and whose requirement do not intersect has no solution — which
+        is the answer, rather than moving that package out of the window the
+        operator declared for it (#3106).
+        """
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        pins = self._constraint_lines(cmd)
+        for raw in self.requires(dist):
+            if ";" in raw or raw.startswith(CORE):
+                continue  # markers are unmodelled; core has its own handling
+            cut = len(raw)
+            for index, char in enumerate(raw):
+                if char in "<>=!~":
+                    cut = index
+                    break
+            name, spec = raw[:cut], raw[cut:]
+            pin = pins.get(name)
+            if pin is None or not spec:
+                continue
+            wanted = SpecifierSet(spec) & SpecifierSet(pin)
+            if not any(
+                Version(v) in wanted for v in self.package_index.get(name, ())
+            ):
+                return (
+                    "x No solution found when resolving dependencies: "
+                    f"{dist} depends on {name}{spec}, but you require "
+                    f"{name}{pin}."
+                )
         return None
 
 
