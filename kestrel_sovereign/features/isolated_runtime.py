@@ -52,6 +52,7 @@ import psutil
 from kestrel_sdk.channels import ChannelAdapter
 from kestrel_sdk.isolated_feature import (
     CONFIG_TRANSITION_APPLIED,
+    INBOUND_PRODUCER_CAPABILITY,
     MAX_HOST_INGRESS_PAYLOAD_BYTES,
     ConfigTransitionResult,
     HostIngressCapabilities,
@@ -422,12 +423,6 @@ _PENDING_LEASE_EXPIRES_AT_KEY = "_isolated_pending_lease_expires_at"
 _EXTERNAL_INGRESS_QUIESCE = "external-ingress-quiesce"
 _EXTERNAL_INGRESS_RESUME = "external-ingress-resume"
 _EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
-# A child with no inbound producer may opt into default idle retirement by
-# declaring this initialize capability as exactly ``False``. Missing, malformed,
-# or true values fail resident because Core cannot infer whether stopping a
-# quiet child would remove its only source of future inbound traffic.
-_INBOUND_PRODUCER_CAPABILITY = "inbound_producer"
-
 # A service-to-host event is a JSON-RPC notification and therefore has no
 # response channel. An opted-in producer may wrap a channel inbound payload in
 # this private descriptor; after the host has completed the inbound handler it
@@ -12177,11 +12172,21 @@ class ProxyFeature(Feature):
         if self._idle_timeout_seconds is None:
             return
         if self._owns_inbound_producer():
-            logger.warning(
-                "Hosted isolated runtime %s remains resident because it owns "
-                "an inbound producer",
-                self.name,
-            )
+            if self._inbound_producer_role_is_ambiguous():
+                logger.warning(
+                    "Hosted isolated runtime %s remains resident because its "
+                    "inbound-producer declaration is missing or malformed; "
+                    "declare it with IsolatedFeatureService."
+                    "advertise_inbound_producer(False), or set a named "
+                    "isolated_runtime_idle_timeouts override",
+                    self.name,
+                )
+            else:
+                logger.warning(
+                    "Hosted isolated runtime %s remains resident because it owns "
+                    "an inbound producer",
+                    self.name,
+                )
             return
         task = self._idle_monitor_task
         if task is not None and not task.done():
@@ -12211,7 +12216,7 @@ class ProxyFeature(Feature):
                 return True
             if self._new_external_ingress_quiesce() is not None:
                 return True
-            declaration = capabilities.get(_INBOUND_PRODUCER_CAPABILITY)
+            declaration = self._inbound_producer_declaration(capabilities)
             if declaration is False:
                 return False
             if declaration is True:
@@ -12224,6 +12229,37 @@ class ProxyFeature(Feature):
             # declares it has no unmanaged inbound producer.
             return not self._idle_timeout_explicit_override
         except BaseException:  # noqa: BLE001 - ambiguous producer state fails resident
+            return True
+
+    def _inbound_producer_declaration(
+        self, capabilities: Mapping[str, Any] | None = None
+    ) -> bool | None:
+        """Read the SDK-normalized declaration, with a test-double fallback."""
+
+        for target in (self._client, getattr(self._client, "client", None)):
+            if target is None:
+                continue
+            declaration = getattr(target, "inbound_producer_declaration", None)
+            if declaration is True or declaration is False:
+                return declaration
+        raw = (
+            self._client_capabilities() if capabilities is None else capabilities
+        ).get(INBOUND_PRODUCER_CAPABILITY)
+        return raw if raw is True or raw is False else None
+
+    def _inbound_producer_role_is_ambiguous(self) -> bool:
+        """Return whether fail-resident policy, rather than evidence, blocked idle."""
+
+        if self._hosted_telegram_startup_attested or self._observed_inbound_producer:
+            return False
+        try:
+            capabilities = self._client_capabilities()
+            if "channel" in capabilities:
+                return False
+            if self._new_external_ingress_quiesce() is not None:
+                return False
+            return self._inbound_producer_declaration(capabilities) is None
+        except BaseException:  # noqa: BLE001 - diagnostic uncertainty is ambiguity
             return True
 
     async def _monitor_idle_runtime(self) -> None:

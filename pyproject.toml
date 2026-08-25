@@ -89,7 +89,9 @@ dependencies = [
     # 0.35.0 floor: owner-scoped idle renewal plus the absolute lease-lifetime
     # ceiling used to reject provider acquisition/touch results that outlive
     # the request's readiness deadline and expected session.
-    # 0.36.0 floor: public lifecycle-owned operator service, workflow,
+    # 0.37.0 floor: isolated services can negotiate inbound-producer ownership
+    # so hosted Core may safely apply default idle retirement.
+    # 0.36.0 also added the public lifecycle-owned operator service, workflow,
     # execution-target, authorization-context, and contribution contracts.
     # The ceiling tracks the MINOR, not the major, and 0.35.0 is itself the
     # evidence for that: it added a required member to a runtime-checkable
@@ -103,7 +105,7 @@ dependencies = [
     # Release cascade: Frinz and the observability fleet must publish/test
     # constraints that admit this line before Core is released. Do not weaken
     # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[tracing]>=0.36.0,<0.37",
+    "kestrel-sovereign-sdk[tracing]>=0.37.0,<0.38",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -291,7 +293,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.36.0,<0.37",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.37.0,<0.38",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the

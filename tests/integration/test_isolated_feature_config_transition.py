@@ -192,6 +192,7 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
                 "class IdleLifecycleService(IsolatedFeatureService):",
                 "    def __init__(self):",
                 "        super().__init__(name='idle-lifecycle', version='1.0.0')",
+                "        self.advertise_inbound_producer(False)",
                 "        self.register_host_ingress('poke', self.poke)",
                 "",
                 "    async def poke(self, payload):",
@@ -225,7 +226,7 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
     agent.isolated_runtime_namespace = "tenant/agent"
     configure_hosted_isolated_runtime_lifecycle(
         agent,
-        idle_timeouts={"IdleLifecycleFeature": 3600},
+        idle_timeout_seconds=3600,
         telemetry_observer=snapshots.append,
     )
     monkeypatch.setenv(
