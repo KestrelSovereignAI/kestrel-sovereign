@@ -18,6 +18,10 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
+from kestrel_sovereign.features.security.args_summary import (
+    SENSITIVE_KEY_SUBSTRINGS,
+    mask_sensitive,
+)
 
 #: The audit-search tool's own name. Its rows are excluded from every search
 #: (see ``_match_predicate``) because the security hook records the call, query
@@ -56,14 +60,59 @@ def fold_searchable(text):
         return text
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, (dict, list)):
-            return json.dumps(parsed, ensure_ascii=False).casefold()
-        if isinstance(parsed, str):
-            return parsed.casefold()
     except (ValueError, TypeError):
-        pass
-    return _unescape_best_effort(text).casefold()
+        # Truncated past parsing. Decode what escapes we can so a non-ASCII
+        # fragment still matches, and drop it if it names a sensitive key —
+        # an unparseable row cannot be masked field-by-field, so it must not
+        # be searchable field-by-field either.
+        if _NAMES_SENSITIVE_KEY.search(text):
+            return ""
+        return _unescape_best_effort(text).casefold()
 
+    if isinstance(parsed, (dict, list)):
+        # MASK BEFORE FOLDING. Masking only on the way out closes the display
+        # and leaves the MATCH open: a caller could compare the query against a
+        # raw legacy secret and read it back one character at a time from
+        # hit/no-hit, while every returned row dutifully showed ***MASKED***
+        # (#3107 review round 7). The searchable projection has to be the
+        # masked one, so matching and display are the same text.
+        parsed = mask_sensitive(parsed)
+        # Walk the VALUES rather than re-serializing: json.dumps would put back
+        # the standard escapes (\", \n, doubled backslashes) that summarize_args
+        # introduced, so `say "hello"`, multiline text and Windows paths would
+        # not match their own stored form. ensure_ascii=False happens to fix
+        # \uXXXX and nothing else.
+        return _flatten_json(parsed).casefold()
+    if isinstance(parsed, str):
+        return parsed.casefold()
+    return str(parsed).casefold()
+
+
+def _flatten_json(value):
+    """Concatenate every key and string value, decoded, for matching."""
+    parts = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                parts.append(str(k))
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        else:
+            parts.append(node if isinstance(node, str) else str(node))
+
+    walk(value)
+    return " ".join(parts)
+
+
+#: A row too truncated to parse cannot be masked field-by-field. If it names a
+#: sensitive key at all, it is dropped from the searchable projection entirely
+#: rather than matched raw — losing a match is the safe failure.
+_NAMES_SENSITIVE_KEY = re.compile(
+    "|".join(re.escape(s) for s in SENSITIVE_KEY_SUBSTRINGS), re.IGNORECASE
+)
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 _SURROGATE_PAIR = re.compile(

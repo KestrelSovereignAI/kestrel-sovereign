@@ -31,6 +31,18 @@ from kestrel_sovereign.features.security.permissions import (
 #: unbounded disclosure by another route. This is a disclosure bound, not a
 #: page-size preference, which is why ``limit`` is clamped to it rather than
 #: being allowed to exceed it.
+#: Decisions that mean "this call was permitted to execute". Deliberately an
+#: allowlist: see the inversion note in ``security_audit_search``. Anything not
+#: here — a refusal, a block, an outcome row, or a value added after this was
+#: written — is reported as not-an-authorization.
+_AUTHORIZED_DECISIONS = frozenset({
+    "allowed",
+    "auto_allowed",
+    "auto_approved",
+    "auto_mode_allowed",
+    "user_approved",
+})
+
 MAX_DISCLOSING_MATCHES = 25
 
 
@@ -1318,25 +1330,35 @@ class SecurityFeature(Feature):
         for entry in matches:
             entry["args_summary"] = remask_summary(entry.get("args_summary"))
 
-        # Decisions that mean the call was refused or never reached a decider.
-        # A blanket "these were authorized" line contradicts the decision shown
-        # beside it, and tells the model blocked work ran.
-        _NOT_AUTHORIZED = {
-            "auto_denied", "user_denied", "timeout", "user_cancelled",
-            "no_approver",
-        }
-        refused = sum(1 for e in matches if e["decision"] in _NOT_AUTHORIZED)
+        # An ALLOWLIST, not a refusal list. Listing the refusals means a
+        # decision value added later — or one already in the table that this
+        # list never knew about — silently reads as "authorized", which is the
+        # direction that suppresses a retry of work that never ran. This agent's
+        # own log carries fifteen distinct decision values including `blocked`,
+        # `filing_failed` and a `refused-*` family; a refusal list had missed
+        # three of them (#3107 review round 7). Inverted, an unrecognised
+        # decision is reported as not-an-authorization, which is the safe read.
+        refused = sum(
+            1 for e in matches if e["decision"] not in _AUTHORIZED_DECISIONS
+        )
         allowed = len(matches) - refused
         headline = f"{len(matches)} prior attempt(s) matched ({scope_text})"
         if refused and allowed:
-            headline += f" — {allowed} authorized, {refused} refused"
+            headline += (
+                f" — {allowed} authorized, {refused} NOT authorized "
+                "(refused, blocked, or an outcome rather than a decision)"
+            )
         elif refused:
-            headline += f" — all {refused} REFUSED, so none of this work ran"
+            headline += (
+                f" — none of the {refused} was an authorization to run, "
+                "so this work may never have happened"
+            )
         else:
             headline += " — authorized to run, which is not proof it succeeded"
         lines = [headline + ". Read `decision` per row:\n"]
         for entry in matches:
-            marker = "✗" if entry["decision"] in _NOT_AUTHORIZED else "→"
+            authorized = entry["decision"] in _AUTHORIZED_DECISIONS
+            marker = "→" if authorized else "✗"
             lines.append(
                 f"  {marker} {entry['timestamp']}  "
                 f"{entry['feature']}.{entry['tool']} [{entry['decision']}]"

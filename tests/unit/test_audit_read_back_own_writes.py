@@ -389,7 +389,10 @@ async def test_the_tool_withholds_arguments_for_a_broad_query(tmp_path):
         "a query too broad to be a description must disclose no arguments"
     )
 
-    narrow = await feature.security_audit_search(query="issue number 3\"")
+    # A real description, not a serialization artifact: the searchable
+    # projection is now decoded values, so JSON punctuation is deliberately
+    # absent from it.
+    narrow = await feature.security_audit_search(query="issue number 3")
     assert narrow.data["too_broad"] is False
     assert narrow.data["matches"], "a real description is still answerable"
 
@@ -1023,7 +1026,12 @@ def test_a_whole_emoji_still_folds_to_one_character():
     pair from rejoining, or every emoji becomes two escapes nobody can match."""
     from kestrel_sovereign.features.security.permissions import fold_searchable
 
-    assert fold_searchable('{"t": "hi \\ud83d\\ude00"}') == '{"t": "hi 😀"}'.casefold()
+    # The projection is decoded keys and values, not re-serialized JSON — so
+    # the assertion is that the emoji survives as ONE character in it, not that
+    # the JSON round-trips.
+    folded = fold_searchable('{"t": "hi \\ud83d\\ude00"}')
+    assert "😀" in folded
+    assert "\\ud83d" not in folded
 
 
 @pytest.mark.asyncio
@@ -1089,10 +1097,18 @@ async def test_a_legacy_unmasked_secret_is_masked_on_the_way_out(store):
 
 
 @pytest.mark.asyncio
-async def test_the_tool_never_surfaces_an_unmaskable_summary(tmp_path):
-    """A summary too truncated to parse cannot be re-masked field by field,
-    and returning it raw would be the exact hole this closes. Losing a match's
-    detail is the safe failure; leaking a legacy secret is not."""
+async def test_an_unmaskable_row_naming_a_secret_is_not_searchable(tmp_path):
+    """Stricter than round 6, and deliberately so.
+
+    Round 6 masked on the way OUT, which closed the display and left the MATCH
+    open: a caller could compare a query against the raw stored secret and read
+    it back a character at a time from hit/no-hit, while every returned row
+    showed ***MASKED***. So the searchable projection is the masked one now.
+
+    A row too truncated to parse cannot be masked field-by-field, which means it
+    cannot be *searched* field-by-field either. If it names a sensitive key at
+    all it leaves the corpus. Losing the match is the safe failure; being an
+    oracle for a legacy credential is not."""
     from kestrel_sovereign.features.security.feature import SecurityFeature
 
     store = PermissionStore(str(tmp_path / "unmaskable.db"))
@@ -1107,9 +1123,19 @@ async def test_the_tool_never_surfaces_an_unmaskable_summary(tmp_path):
     feature.permission_store = store
     result = await feature.security_audit_search(query="orphaned worker")
 
-    assert result.data["count"] == 1, "it must still be FOUND"
+    assert result.data["count"] == 0, (
+        "an unparseable row naming a sensitive key leaves the searchable "
+        "corpus entirely — it cannot be masked, so it must not be matchable"
+    )
     assert "sk-live-CUT" not in result.confirmation
     assert "sk-live-CUT" not in str(result.data)
+
+    # And the oracle is closed at the source: the query never reaches the raw
+    # value, so hit/no-hit cannot be used to walk it out.
+    from kestrel_sovereign.features.security.permissions import fold_searchable
+    assert fold_searchable(
+        '{"memo": "orphaned worker", "api_key": "sk-live-CUT'
+    ) == ""
 
 
 @pytest.mark.asyncio
@@ -1131,9 +1157,40 @@ async def test_a_refused_attempt_is_not_described_as_authorized(tmp_path):
     feature.permission_store = store
     result = await feature.security_audit_search(query="worker is orphaned")
 
-    assert "REFUSED" in result.confirmation
-    assert "none of this work ran" in result.confirmation
+    assert "an authorization to run" in result.confirmation
     assert result.data["matches"][0]["decision"] == "auto_denied"
+
+
+@pytest.mark.asyncio
+async def test_an_unrecognised_decision_is_not_called_authorized(tmp_path):
+    """The inversion, tested at the point it matters.
+
+    `record_tool_rejection` writes `decision="blocked"` and demo isolation
+    writes `refused`; a hand-listed refusal set had neither, so both read as
+    "authorized to run" — the direction that suppresses a retry of work that
+    never happened. This agent's own log carries fifteen distinct decision
+    values. Listing the refusals is a list that grows; listing the
+    authorizations means anything new is safe by default."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "unknown_decision.db"))
+    await store.initialize()
+    for decision in ("blocked", "refused", "a_value_invented_next_year"):
+        await store.log_decision(
+            feature_name="GitHubFeature", tool_name="create_github_issue",
+            action="tool_execution", decision=decision,
+            args_summary=f'{{"title": "orphaned worker {decision}"}}',
+        )
+
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="orphaned worker")
+
+    assert result.data["count"] == 3
+    assert "an authorization to run" in result.confirmation
+    assert result.confirmation.count("✗") == 3, (
+        "every unrecognised decision must be marked as not-authorized"
+    )
 
 
 @pytest.mark.asyncio
@@ -1163,3 +1220,40 @@ async def test_a_removed_features_dispatch_name_still_filters(tmp_path):
     assert matches == [], (
         "the name outlives the feature because the rows do"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_secret_cannot_be_walked_out_by_hit_or_miss(store):
+    """The oracle, closed at the match rather than at the display.
+
+    Round 6 masked on the way out and I called the leak fixed. It was not: the
+    LIKE predicate still compared the query against the RAW stored value, so a
+    caller could test `sk-live-L`, `sk-live-LE`, `sk-live-LEA` and read a
+    credential out one character at a time from hit/no-hit, while every
+    returned row dutifully displayed ***MASKED***. Masking the display closed
+    the half a human looks at and left the half a program can use.
+
+    Mutation testing caught that removing the mask from the searchable
+    projection broke nothing — because every existing test covered the
+    unparseable case. This one covers the parseable case, which is the common
+    one."""
+    await store.log_decision(
+        feature_name="WalletAgent",
+        tool_name="send_payment",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        # Written raw, as a pre-F252 ApprovalQueue row would have been.
+        args_summary='{"api_key": "sk-live-ORACLE-9Q7", "memo": "orphaned"}',
+    )
+
+    # The row is findable by its non-sensitive content...
+    found, _ = await store.search_audit_log("orphaned")
+    assert len(found) == 1
+
+    # ...and by no prefix of the secret, at any length.
+    for probe in ("sk-live-O", "sk-live-ORACLE", "sk-live-ORACLE-9Q7", "9Q7"):
+        hits, _ = await store.search_audit_log(probe)
+        assert hits == [], (
+            f"searching {probe!r} must not confirm it; a hit/no-hit answer is "
+            "a read of the value even when the row renders masked"
+        )
