@@ -598,6 +598,10 @@ class SecurityFeature(Feature):
         # feature-wide DENY or ALWAYS_ASK rail.
         subagent_tool_name = getattr(feature, "tool_name", None)
         if subagent_tool_name and not isinstance(subagent_tool_name, property):
+            # Tell the store this name is a DISPATCH entry, not a tool. It is
+            # the only place that distinction is known, and a read-back over
+            # the audit log needs it to tell a request from an action (#3107).
+            self.permission_store.mark_dispatch_entry(subagent_tool_name)
             await self.permission_store.register_tool(
                 feature_name=feature_name,
                 tool_name=subagent_tool_name,

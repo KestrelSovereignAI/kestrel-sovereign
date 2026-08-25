@@ -804,3 +804,143 @@ async def test_a_decision_answered_later_still_labels_the_dispatch(tmp_path):
 
     matches, _ = await store.search_audit_log(phrase)
     assert matches == []
+
+
+# ---------------------------------------------------------------------------
+# Review round 4 (#3107)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_inner_dispatch_envelope_is_excluded_too(tmp_path):
+    """Labelling by hook EVENT could not cover this, by construction.
+
+    `orchestrator_engine` fires PRE_SUBAGENT_CALL for a dispatch and then a
+    second PRE_TOOL_USE around `execute_as_subagent` with the same arguments —
+    deliberately, so PRE_TOOL_USE-only hooks see chat-path and inline-path
+    dispatches alike (PR #1385). Only the first row carries the dispatch event,
+    so the second passed the exclusion, contained the current query, and came
+    back as prior work.
+
+    Both rows name the feature's dispatch ENTRY. That is the fact they share,
+    and it is what the exclusion keys on now."""
+    from kestrel_sovereign.features.security.permissions import (
+        SUBAGENT_DISPATCH_ACTION,
+    )
+
+    store = PermissionStore(str(tmp_path / "inner_envelope.db"))
+    await store.initialize()
+    store.mark_dispatch_entry("security_feature")
+
+    phrase = "whether the wrapper orphans the worker"
+    task_args = f'{{"task": "Search the audit log for {phrase}"}}'
+    # The pair the orchestrator actually writes.
+    await store.log_decision(
+        feature_name="SecurityFeature", tool_name="security_feature",
+        action=SUBAGENT_DISPATCH_ACTION, decision="auto_mode_allowed",
+        args_summary=task_args,
+    )
+    await store.log_decision(
+        feature_name="SecurityFeature", tool_name="security_feature",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary=task_args,
+    )
+
+    matches, _ = await store.search_audit_log(phrase)
+    assert matches == [], (
+        "the inner PRE_TOOL_USE envelope carries the same task text and must "
+        "not read as a prior attempt at the work it is still requesting"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_inner_tool_row_survives_the_name_exclusion(tmp_path):
+    """The other end again: excluding a feature's dispatch ENTRY must not
+    exclude the tools that feature actually ran."""
+    store = PermissionStore(str(tmp_path / "inner_survives.db"))
+    await store.initialize()
+    store.mark_dispatch_entry("security_feature")
+
+    phrase = "orphans the worker"
+    await store.log_decision(
+        feature_name="SecurityFeature", tool_name="security_feature",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary=f'{{"task": "file an issue about {phrase}"}}',
+    )
+    await store.log_decision(
+        feature_name="GitHubFeature", tool_name="create_github_issue",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary=f'{{"title": "the wrapper {phrase}"}}',
+    )
+
+    matches, _ = await store.search_audit_log(phrase)
+    assert len(matches) == 1
+    assert matches[0]["tool"] == "create_github_issue"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_summary_still_matches_non_ascii(store):
+    """The escape-decoding and the truncation fallback met in the worst place.
+
+    `summarize_args` cuts at 500 characters, mid-structure, so a long issue
+    body is not valid JSON — and long issue bodies are exactly the motivating
+    case. Falling back to raw text there left every escape undecoded, which is
+    the round-3 bug one row-shape over: `échec` could not match a stored
+    `\\u00c9chec` even when it sat at character 12."""
+    import json
+
+    long_body = "## Detail. " * 80
+    stored = json.dumps(
+        {"title": "Échec — the worker is orphaned", "body": long_body}
+    )[:500]
+    with pytest.raises(ValueError):
+        json.loads(stored)  # precondition: genuinely truncated
+
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary=stored,
+    )
+
+    for query in ("échec", "Échec — the worker", "—"):
+        matches, _ = await store.search_audit_log(query)
+        assert len(matches) == 1, f"{query!r} must match inside a truncated row"
+
+
+@pytest.mark.asyncio
+async def test_registering_a_feature_marks_its_dispatch_entry(tmp_path):
+    """The wiring, not the mechanism.
+
+    Mutation testing found that every test above called `mark_dispatch_entry`
+    itself, so nothing noticed when `register_feature_tools` stopped calling
+    it. The exclusion would then be correct and never armed — a guard that is
+    right about nothing because it was never told what to guard.
+
+    Third time this session that a fix and its test covered the same one of two
+    doors."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    class _FeatureWithDispatch:
+        tool_name = "pretend_feature"
+        tools = []
+
+        def get_tools(self):
+            return []
+
+    store = PermissionStore(str(tmp_path / "registration.db"))
+    await store.initialize()
+    assert store.dispatch_entries == frozenset(), "precondition: nothing marked"
+
+    security = SecurityFeature.__new__(SecurityFeature)
+    security.permission_store = store
+    security.agent = None
+    await security.register_feature_tools(
+        "PretendFeature", _FeatureWithDispatch(),
+    )
+
+    assert "pretend_feature" in store.dispatch_entries, (
+        "registration is the only place that knows a name is a dispatch "
+        "entry; if it does not say so, the exclusion never arms"
+    )

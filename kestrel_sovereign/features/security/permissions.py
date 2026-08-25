@@ -44,23 +44,45 @@ def fold_searchable(text):
     against a query of "échec". Decoding first makes both sides the same kind
     of thing before either is folded.
 
-    Best-effort by design: a truncated summary is not valid JSON, and a value
-    that cannot be decoded is folded as the raw text it is rather than
-    dropped. Returning nothing for an unparseable row would silently shrink
-    the corpus the caller believes it searched.
+    A truncated summary is not valid JSON — ``summarize_args`` cuts at 500
+    characters mid-structure — and those are exactly the long issue bodies the
+    motivating case searches. Falling back to the raw text there would leave
+    every escape undecoded and reintroduce the bug one row-shape over, so the
+    fallback unescapes ``\\uXXXX`` directly instead. Returning nothing for an
+    unparseable row is not an option either: it would silently shrink the
+    corpus the caller believes it searched.
     """
     if not text:
         return text
-    decoded = text
     try:
         parsed = json.loads(text)
         if isinstance(parsed, (dict, list)):
-            decoded = json.dumps(parsed, ensure_ascii=False)
-        elif isinstance(parsed, str):
-            decoded = parsed
+            return json.dumps(parsed, ensure_ascii=False).casefold()
+        if isinstance(parsed, str):
+            return parsed.casefold()
     except (ValueError, TypeError):
         pass
-    return decoded.casefold()
+    return _unescape_best_effort(text).casefold()
+
+
+_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _unescape_best_effort(text):
+    """Decode ``\\uXXXX`` escapes in text that is not valid JSON.
+
+    Surrogate pairs are joined so an emoji stored as two escapes reads as one
+    character; a lone surrogate is left as written rather than raising, because
+    a truncated summary can end mid-pair and a search must not fail on it.
+    """
+    def _one(match):
+        return chr(int(match.group(1), 16))
+
+    decoded = _UNICODE_ESCAPE.sub(_one, text)
+    try:
+        return decoded.encode("utf-16", "surrogatepass").decode("utf-16")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return decoded
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +377,10 @@ class PermissionStore:
         """
         self.db_path = db_path
         self._session_overrides: Dict[str, PermissionLevel] = {}
+        # Tool names that are feature-as-subagent DISPATCH entries — see
+        # :meth:`mark_dispatch_entry`. Repopulated on every boot by feature
+        # registration, so it is always current without a schema column.
+        self._dispatch_entries: set = set()
         # Global Auto has two tiers backing one effective state:
         #   - _global_auto_session: in-memory, cleared on session reset.
         #   - _global_auto_always:  persisted in security_global_settings,
@@ -853,6 +879,35 @@ class PermissionStore:
             for name, tools in features_dict.items()
         ]
 
+    def mark_dispatch_entry(self, tool_name: str) -> None:
+        """Record that ``tool_name`` is a feature-as-subagent DISPATCH entry.
+
+        The audit table cannot tell a dispatch envelope from a tool call by
+        inspection, and it needs to: an envelope records what a task ASKED FOR,
+        the inner rows record what was DONE, and a read-back that confuses them
+        reports a request as prior work (#3107).
+
+        Labelling by hook event was not enough. ``orchestrator_engine`` fires
+        PRE_SUBAGENT_CALL for the dispatch AND a second PRE_TOOL_USE around
+        ``execute_as_subagent`` with the same arguments — deliberately, so
+        PRE_TOOL_USE-only hooks see chat-path and inline-path dispatches alike
+        (PR #1385). Only the first carries the dispatch event, so a rule keyed
+        on the event misses the second by construction.
+
+        This is keyed on the NAME instead, which both rows share and which the
+        feature itself declares at registration. In memory rather than a
+        column: registration runs every boot, so the set is always current,
+        and a column would be a second source of truth for something the
+        registry already knows.
+        """
+        if tool_name:
+            self._dispatch_entries.add(tool_name)
+
+    @property
+    def dispatch_entries(self) -> frozenset:
+        """Tool names registered as feature-as-subagent dispatch entries."""
+        return frozenset(self._dispatch_entries)
+
     async def register_tool(
         self,
         feature_name: str,
@@ -1056,6 +1111,17 @@ class PermissionStore:
         params: List[Any] = [
             folded, folded, SUBAGENT_DISPATCH_ACTION, f"{SEARCH_TOOL_NAME}%",
         ]
+
+        # ...and by NAME, which is what actually covers the case. The
+        # orchestrator fires PRE_SUBAGENT_CALL for a dispatch AND a second
+        # PRE_TOOL_USE around ``execute_as_subagent`` carrying the same
+        # arguments, so only the first row gets the dispatch ACTION. Both name
+        # the feature's dispatch entry, and that is the fact both share.
+        dispatch_names = sorted(self._dispatch_entries)
+        if dispatch_names:
+            placeholders = ", ".join("?" for _ in dispatch_names)
+            clauses.append(f"tool_name NOT IN ({placeholders})")
+            params.extend(dispatch_names)
 
         if tool_name:
             clauses.append("tool_name = ?")
