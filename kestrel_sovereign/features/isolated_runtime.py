@@ -150,6 +150,14 @@ def configure_hosted_isolated_runtime_lifecycle(
     agent.isolated_runtime_idle_timeout_seconds = idle_timeout_seconds
     agent.isolated_runtime_idle_timeouts = MappingProxyType(resolved_timeouts)
     agent.isolated_runtime_telemetry_observer = telemetry_observer
+    # Serialize submissions per loaded agent before they enter the bounded
+    # process-wide worker pool. One tenant with wedged synchronous callbacks
+    # can therefore occupy at most one worker/queue slot rather than starving
+    # every other agent in the host.
+    observer_lock = agent_attributes.get("_isolated_runtime_telemetry_observer_lock")
+    if not isinstance(observer_lock, asyncio.Lock):
+        observer_lock = asyncio.Lock()
+        agent._isolated_runtime_telemetry_observer_lock = observer_lock
 
 
 def canonical_telegram_bot_id(value: object) -> str:
@@ -208,6 +216,8 @@ _HEALTH_PROBE_TIMEOUT = 5.0
 # ownership of child startup, retirement, reload, or shutdown progress.
 _TELEMETRY_OBSERVER_TIMEOUT = 1.0
 _TELEMETRY_EMIT_MIN_INTERVAL = 5.0
+_TELEMETRY_RETRY_BASE_SECONDS = 0.05
+_TELEMETRY_RETRY_MAX_SECONDS = 5.0
 _DISK_TELEMETRY_ENTRY_BUDGET = 250_000
 _DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
 _DISK_TELEMETRY_DEPTH_BUDGET = 64
@@ -6061,6 +6071,21 @@ class ProxyFeature(Feature):
             if isinstance(agent_attributes, dict)
             else None
         )
+        self._telemetry_observer_agent_lock = (
+            agent_attributes.get("_isolated_runtime_telemetry_observer_lock")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        if self._telemetry_observer is not None and not isinstance(
+            self._telemetry_observer_agent_lock, asyncio.Lock
+        ):
+            # Preserve the historical direct-attribute construction seam while
+            # still binding every proxy for this exact agent to one lock.
+            self._telemetry_observer_agent_lock = asyncio.Lock()
+            if isinstance(agent_attributes, dict):
+                agent_attributes["_isolated_runtime_telemetry_observer_lock"] = (
+                    self._telemetry_observer_agent_lock
+                )
         self._idle_monitor_task: asyncio.Task[None] | None = None
         self._idle_retired = False
         self._activity_generation = 0
@@ -6086,6 +6111,8 @@ class ProxyFeature(Feature):
         self._telemetry_emit_force_pending = False
         self._telemetry_observer_emit_pending = False
         self._telemetry_observer_force_pending = False
+        self._telemetry_retry_task: asyncio.Task[None] | None = None
+        self._telemetry_retry_attempt = 0
         self._telemetry_disk_refresh_pending = False
         self._telemetry_environment_refresh_pending = False
         self._telemetry_disk_lock = asyncio.Lock()
@@ -6376,6 +6403,55 @@ class ProxyFeature(Feature):
                 self.name,
             )
 
+    def _schedule_forced_runtime_telemetry_retry(self) -> None:
+        """Retry one durable transition snapshot with bounded backoff."""
+
+        if (
+            self._telemetry_observer is None
+            or self._terminal_lifecycle_latched
+            or self._stopping
+        ):
+            return
+        current = self._telemetry_retry_task
+        if current is not None and not current.done():
+            self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending = True
+            return
+        exponent = min(self._telemetry_retry_attempt, 10)
+        delay = min(
+            _TELEMETRY_RETRY_BASE_SECONDS * (2**exponent),
+            _TELEMETRY_RETRY_MAX_SECONDS,
+        )
+        self._telemetry_retry_attempt += 1
+
+        async def retry() -> None:
+            await asyncio.sleep(delay)
+            if self._telemetry_retry_task is asyncio.current_task():
+                self._telemetry_retry_task = None
+            if not self._terminal_lifecycle_latched and not self._stopping:
+                self._schedule_runtime_telemetry(force=True)
+
+        task = asyncio.create_task(
+            retry(),
+            name=f"isolated-runtime-telemetry-retry:{self.name}",
+        )
+        self._telemetry_retry_task = task
+
+        def consume_retry(completed: asyncio.Task[None]) -> None:
+            if self._telemetry_retry_task is completed:
+                self._telemetry_retry_task = None
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except BaseException:  # noqa: BLE001 - advisory retry cannot own lifecycle
+                logger.warning(
+                    "Hosted isolated runtime telemetry retry failed for %s",
+                    self.name,
+                )
+
+        task.add_done_callback(consume_retry)
+
     async def _emit_runtime_telemetry(self, *, rate_limited: bool = False) -> None:
         observer = self._telemetry_observer
         if observer is None:
@@ -6407,14 +6483,18 @@ class ProxyFeature(Feature):
                 # A host may supply a normal callable or an async callable. Run
                 # the call itself in a dedicated bounded pool so a slow
                 # synchronous observer cannot freeze the event loop or occupy
-                # the default executor needed by venv/lifecycle work.
-                result = await asyncio.get_running_loop().run_in_executor(
-                    _TELEMETRY_OBSERVER_EXECUTOR,
-                    observer,
-                    snapshot,
-                )
-                if inspect.isawaitable(result):
-                    await result
+                # the default executor needed by venv/lifecycle work. The
+                # agent-scoped lock keeps one tenant from occupying every
+                # process-global worker or queue slot.
+                assert isinstance(self._telemetry_observer_agent_lock, asyncio.Lock)
+                async with self._telemetry_observer_agent_lock:
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        _TELEMETRY_OBSERVER_EXECUTOR,
+                        observer,
+                        snapshot,
+                    )
+                    if inspect.isawaitable(result):
+                        await result
 
             task = asyncio.create_task(
                 invoke_observer(),
@@ -6425,12 +6505,18 @@ class ProxyFeature(Feature):
             def consume_observer(completed: asyncio.Future[Any]) -> None:
                 self._telemetry_observer_tasks.discard(completed)
                 if completed.cancelled():
-                    self._telemetry_observer_emit_pending = False
-                    self._telemetry_observer_force_pending = False
+                    if (
+                        not rate_limited
+                        and not self._terminal_lifecycle_latched
+                        and not self._stopping
+                    ):
+                        self._schedule_forced_runtime_telemetry_retry()
                     return
+                failed = False
                 try:
                     completed.result()
                 except BaseException:  # noqa: BLE001 - advisory host callback
+                    failed = True
                     logger.warning(
                         "Hosted isolated runtime telemetry observer failed for %s",
                         self.name,
@@ -6439,6 +6525,13 @@ class ProxyFeature(Feature):
                 force_pending = self._telemetry_observer_force_pending
                 self._telemetry_observer_emit_pending = False
                 self._telemetry_observer_force_pending = False
+                if failed and (not rate_limited or force_pending):
+                    self._telemetry_emit_pending |= pending
+                    self._telemetry_emit_force_pending = True
+                    self._schedule_forced_runtime_telemetry_retry()
+                    return
+                if not failed:
+                    self._telemetry_retry_attempt = 0
                 if (
                     pending
                     and not self._terminal_lifecycle_latched
@@ -6457,6 +6550,12 @@ class ProxyFeature(Feature):
                     self.name,
                 )
         except asyncio.CancelledError:
+            if (
+                not rate_limited
+                and not self._terminal_lifecycle_latched
+                and not self._stopping
+            ):
+                self._schedule_forced_runtime_telemetry_retry()
             if asyncio.current_task() is not None and asyncio.current_task().cancelling():
                 raise
             logger.warning(
@@ -6466,6 +6565,8 @@ class ProxyFeature(Feature):
             logger.warning(
                 "Hosted isolated runtime telemetry observer failed for %s", self.name
             )
+            if not rate_limited:
+                self._schedule_forced_runtime_telemetry_retry()
 
     def _schedule_runtime_telemetry(
         self,
@@ -6484,6 +6585,11 @@ class ProxyFeature(Feature):
             return
         self._telemetry_disk_refresh_pending |= refresh_disk
         self._telemetry_environment_refresh_pending |= refresh_environment
+        retry_task = self._telemetry_retry_task
+        if retry_task is not None and not retry_task.done():
+            self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending |= force
+            return
         if any(not task.done() for task in self._telemetry_observer_tasks):
             self._telemetry_observer_emit_pending = True
             self._telemetry_observer_force_pending |= force
@@ -7167,6 +7273,11 @@ class ProxyFeature(Feature):
             task.cancel()
         for task in tuple(self._telemetry_observer_tasks):
             task.cancel()
+        retry_task = self._telemetry_retry_task
+        if retry_task is not None:
+            retry_task.cancel()
+        self._telemetry_retry_task = None
+        self._telemetry_retry_attempt = 0
         self._telemetry_emit_pending = False
         self._telemetry_emit_force_pending = False
         self._telemetry_observer_emit_pending = False
