@@ -255,42 +255,28 @@ class TestTheResolverSide:
 
     @pytest.mark.asyncio
     async def test_a_canonical_session_owns_the_unlabeled_run_after_it(self, store):
-        """#3120, pinned here because #3098 is what measured it.
+        """Both resolvers, because only one of them can destroy anything.
 
         An unlabeled row names no session, so the grouper gives it to the one
-        it fell after — including a stamped one. A canonical id resolved by
-        metadata alone therefore answers with a strict SUBSET of what the list
-        shows: a short count and transcript, and a hard purge that leaves the
+        it fell after — including a stamped one. Resolving a canonical id by
+        metadata alone therefore answered with a strict subset of what the list
+        showed: a short count and transcript, and a hard purge that left the
         inherited row live to reappear under whatever session the reader then
-        puts it in.
-
-        Measured across the four live agents: the resolver and the grouper
-        disagreed about 65 conversations before #3098, 16 after it, and the
-        last 16 are this shape. Closing them needs a forward walk for canonical
-        ids, and a forward walk carries a scope — measured letting an ARCHIVED
-        row bridge two twenty-minute gaps under ``deleted_filter="all"``, so
-        purging one session destroyed another the active list showed
-        separately. That is a decision about lifecycle scope across deletion
-        universes, which is why it is its own ticket.
-
-        The grouping half already holds; it is the resolver that is behind.
+        put it in.
         """
         stamped = await _insert(store, 0, session_id=UUID_A)
         inherited = await _insert(store, 5)
 
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert sorted(r[0] for r in rows) == [stamped, inherited]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            stamped, inherited,
+        ]
         sessions = group_messages_into_sessions(
             [_msg(stamped, 0, session_id=UUID_A), _msg(inherited, 5)]
         )
         assert [(s["session_id"], s["message_count"]) for s in sessions] == [
             (UUID_A, 2)
-        ]
-
-        rows = await store._get_session_messages(UUID_A, limit=50)
-        if [r[0] for r in rows] == [stamped]:
-            pytest.xfail("#3120: a canonical id resolves by metadata alone")
-        assert sorted(r[0] for r in rows) == [stamped, inherited]
-        assert await store._get_complete_session_message_ids(UUID_A) == [
-            stamped, inherited,
         ]
 
     @pytest.mark.asyncio
@@ -333,14 +319,14 @@ class TestTheResolverSide:
         calls ``.get``, so every read, count and purge of the session that row
         fell in raised AttributeError.
         """
-        legacy = await _insert(store, 0)
+        stamped = await _insert(store, 0, session_id=UUID_A)
         await store.db.execute(
             "INSERT INTO conversation_history "
             "(agent_id, role, content, metadata, session_id, created_at) "
             "VALUES (?,?,?,?,?,?)",
             (AGENT, "user", "legacy blob", "[]", None, _stamp(5)),
         )
-        blob = (
+        inherited = (
             await store.db.fetchone(
                 "SELECT id FROM conversation_history WHERE agent_id = ? "
                 "ORDER BY id DESC LIMIT 1",
@@ -348,10 +334,38 @@ class TestTheResolverSide:
             )
         )[0]
 
-        rows = await store._get_session_messages(str(legacy), limit=50)
-        assert sorted(r[0] for r in rows) == [legacy, blob]
-        assert await store._get_complete_session_message_ids(str(legacy)) == [
-            legacy, blob,
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert sorted(r[0] for r in rows) == [stamped, inherited]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            stamped, inherited,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_resumption_past_the_window_brings_its_tail(self, store):
+        """A cap on the ANSWER is not a cap on where the answer may be found.
+
+        The forward walk reads a window of rows, and a session resumed further
+        away than one window used to lose the unlabeled replies that followed
+        the resumption — the naming row itself came back from the metadata
+        query, but the walk needs a contiguous run to decide where a session
+        stops, and those rows were simply absent. The count beside it and the
+        purge behind it are uncapped, so the transcript was the only one of the
+        three that was short.
+
+        Twelve rows of another conversation sit between, which is three times
+        the window this ``limit`` opens.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for minute in range(1, 13):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 500, session_id=UUID_A)
+        tail = await _insert(store, 501)
+
+        rows = await store._get_session_messages(UUID_A, limit=5)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail]
+        # The uncapped resolver is the authority the capped one must match.
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            first, resumed, tail,
         ]
 
     @pytest.mark.asyncio
@@ -438,6 +452,71 @@ class TestTheResolverSide:
         assert await store._get_complete_session_message_ids(UUID_A) == [stamped]
 
     @pytest.mark.asyncio
+    async def test_a_resumption_sharing_the_window_s_last_second_is_reached(
+        self, store
+    ):
+        """``(stamp, id)`` in the cursor AND in the query, for one reason.
+
+        ``created_at`` is stored to the second, so a window ending on the same
+        second as the resumption after it is an ordinary collision rather than
+        a curiosity, and this case is both halves of it. A cursor that advanced
+        on a strictly greater STAMP never opened a window at that resumption.
+        And a window ordered by the stamp ALONE truncates a tie group wherever
+        the engine felt like it — measured on sqlite 3.50, a LIMIT of eight
+        over ten rows returned the last row of the tie and dropped the two
+        before it, which is a hole in the middle of the walk rather than an end
+        to it.
+
+        The naming row survives either way; it comes back from the metadata
+        query whatever the windows do. The unlabeled replies behind it are what
+        is lost, and the count and the purge keep them.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for minute in range(1, 8):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 7, session_id=UUID_A)
+        tail = await _insert(store, 7)
+
+        second_tail = await _insert(store, 7)
+
+        rows = await store._get_session_messages(UUID_A, limit=4)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail, second_tail]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            first, resumed, tail, second_tail,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_running_out_of_windows_answers_from_the_uncapped_resolver(
+        self, store, monkeypatch
+    ):
+        """A bound may stop a strategy. It may not shorten the answer.
+
+        A session picked up again in more separated places than the window
+        budget allows used to return what it had and log — a transcript missing
+        rows the count beside it and the purge behind it both keep, which is
+        the disagreement this ticket exists to end. It falls back to the
+        resolver that has no windows instead.
+        """
+        monkeypatch.setattr(
+            AsyncConversationStore, "SESSION_WINDOW_PAGES", 2, raising=True
+        )
+        expected = []
+        minute = 0
+        for _ in range(3):
+            expected.append(await _insert(store, minute, session_id=UUID_A))
+            expected.append(await _insert(store, minute + 1))  # its unlabeled tail
+            minute += 2
+            for _ in range(21):  # more than one window of another conversation
+                await _insert(store, minute, session_id=UUID_B)
+                minute += 1
+
+        rows = await store._get_session_messages(UUID_A, limit=10)
+        assert sorted(r[0] for r in rows) == sorted(expected)
+        assert await store._get_complete_session_message_ids(UUID_A) == sorted(
+            expected
+        )
+
+    @pytest.mark.asyncio
     async def test_a_legacy_marker_anchors_the_session_it_opens(self, store):
         """A marker closes the run for everyone except the session it opens.
 
@@ -505,6 +584,102 @@ class TestTheResolverSide:
         assert survivor not in [r[0] for r in rows]
 
     @pytest.mark.asyncio
+    async def test_a_full_answer_is_the_first_rows_not_the_reachable_ones(
+        self, store
+    ):
+        """``limit`` members BELOW the covered point, not ``limit`` members.
+
+        The naming rows come back from the metadata query whatever the windows
+        have reached, so counting all of them declared the answer full while an
+        earlier resumption's unlabeled tail was still unread. The transcript
+        was not merely short then — it was WRONG, a later resumption standing
+        where that tail belongs.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for minute in range(1, 7):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 100, session_id=UUID_A)
+        tail = await _insert(store, 101)
+        await _insert(store, 200, session_id=UUID_A)
+
+        rows = await store._get_session_messages(UUID_A, limit=3)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail]
+
+    @pytest.mark.asyncio
+    async def test_a_second_holding_more_rows_than_a_window_is_stepped_past(
+        self, store
+    ):
+        """The SQL cursor carries the id half too, or it cannot advance.
+
+        A stamp-only predicate re-reads the same page for ever when one second
+        holds more rows than a window, and the loop has meanwhile consumed the
+        resumption key it was paging TO — so the naming row came back from the
+        metadata query and its unlabeled tail did not.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for _ in range(6):
+            await _insert(store, 50, session_id=UUID_B)
+        resumed = await _insert(store, 50, session_id=UUID_A)
+        tail = await _insert(store, 50)
+
+        rows = await store._get_session_messages(UUID_A, limit=3)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail]
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_reads_its_ids_in_batches(
+        self, store, monkeypatch
+    ):
+        """SQLite documents a 999-variable ceiling and this path invites it.
+
+        The fallback is reached by exactly the sessions long enough to pass
+        that limit — one resumed in more separated places than the window
+        budget allows for — so a single ``IN (...)`` would raise on the very
+        case it exists to answer. Batched here at two, so the seam between
+        batches is exercised rather than assumed: the order this contract is in
+        is canonical, and the batches are id ranges.
+        """
+        monkeypatch.setattr(
+            AsyncConversationStore, "SESSION_WINDOW_PAGES", 1, raising=True
+        )
+        monkeypatch.setattr(
+            AsyncConversationStore, "SESSION_ID_BATCH", 2, raising=True
+        )
+        expected = []
+        minute = 0
+        for _ in range(3):
+            expected.append(await _insert(store, minute, session_id=UUID_A))
+            expected.append(await _insert(store, minute + 1))
+            minute += 2
+            for _ in range(9):
+                await _insert(store, minute, session_id=UUID_B)
+                minute += 1
+
+        # The requirement is about the QUERIES, so it is asserted on them:
+        # no id lookup may carry more binds than one batch plus the agent.
+        widest = 0
+        original = store.db.fetchall
+
+        async def watched(query, params=(), *args, **kwargs):
+            nonlocal widest
+            if "id IN (" in query:
+                widest = max(widest, len(params))
+            return await original(query, params, *args, **kwargs)
+
+        store.db.fetchall = watched
+        try:
+            rows = await store._get_session_messages(UUID_A, limit=10)
+        finally:
+            store.db.fetchall = original
+
+        assert 0 < widest <= AsyncConversationStore.SESSION_ID_BATCH + 1, (
+            f"an id lookup carried {widest} binds"
+        )
+        assert sorted(r[0] for r in rows) == sorted(expected)
+        # Newest-first, which is this method's contract, over the whole set
+        # rather than within each batch.
+        assert [r[0] for r in rows] == sorted(expected, reverse=True)
+
+    @pytest.mark.asyncio
     async def test_a_partly_restored_session_still_restores(self, store):
         """A deletion filter hides rows. It does not move where a session starts.
 
@@ -527,6 +702,89 @@ class TestTheResolverSide:
             (AGENT,),
         )
         assert [row[0] for row in live] == [anchor, second]
+
+    @pytest.mark.asyncio
+    async def test_a_resumption_past_the_capped_metadata_rows_is_paged_to(
+        self, store
+    ):
+        """The keys that decide where to look next are not capped by ``limit``.
+
+        The first ``limit`` metadata matches can be structural markers, or
+        documents that merely mention this id — so a real resumption beyond
+        them was missing from the key list, the loop declared the keys
+        exhausted, and the transcript stopped at the first window while the
+        count and the purge kept going.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        marker = await _insert(
+            store, 1, session_id=UUID_A, new_session=True, type="session_marker"
+        )
+        for minute in range(2, 8):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 100, session_id=UUID_A)
+        tail = await _insert(store, 101)
+
+        rows = await store._get_session_messages(UUID_A, limit=2)
+        assert sorted(r[0] for r in rows) == [first, resumed]
+        # The uncapped resolver keeps the marker (lifecycle ops act on it) and
+        # the tail the display's cap of two leaves off.
+        assert await store._get_complete_session_message_ids(UUID_A) == sorted(
+            [first, marker, resumed, tail]
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_hidden_row_cannot_bridge_a_gap_the_view_splits(self, store):
+        """The walk runs per VIEW, and this is what that buys (#3120).
+
+        The list is three views — active, archived and Trash — and each groups
+        its own rows. A lifecycle op may span them: hard purge asks for every
+        state so a session partly in Trash goes whole. Walked as one sequence,
+        a row HIDDEN from a view bridges a gap that view splits: an archived
+        row twenty minutes after this session and twenty before the next one
+        joins them, and purging this one destroys the other — permanently, and
+        while the active list is showing them apart.
+
+        Forty minutes is two gaps, so the active view splits here and the
+        archived row is the only thing that could close the distance.
+        """
+        stamped = await _insert(store, 0, session_id=UUID_A)
+        hidden = await _insert(store, 20)
+        await store.db.execute(
+            "UPDATE conversation_history SET archived_at = ? WHERE id = ?",
+            ("2026-06-01 12:00:00", hidden),
+        )
+        beyond = await _insert(store, 40)
+
+        assert await store._get_complete_session_message_ids(UUID_A) == [stamped]
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert [r[0] for r in rows] == [stamped]
+        assert await store.delete_conversation_session(UUID_A) == 1
+        still_live = await store.db.fetchone(
+            "SELECT deleted_at FROM conversation_history WHERE id = ?", (beyond,)
+        )
+        assert still_live[0] is None, "deleting one session reached into another"
+
+    @pytest.mark.asyncio
+    async def test_an_archived_row_joins_the_session_archived_beside_it(
+        self, store
+    ):
+        """A view partition is not a wall; it is where the gap is measured.
+
+        The archived view groups archived rows, so a session whose rows were
+        archived together keeps its unlabeled tail there — the partition
+        contributes through a row that NAMES the session inside it, exactly as
+        the active one does.
+        """
+        stamped = await _insert(store, 0, session_id=UUID_A)
+        tail = await _insert(store, 5)
+        await store.db.execute(
+            "UPDATE conversation_history SET archived_at = ? WHERE id IN (?, ?)",
+            ("2026-06-01 12:00:00", stamped, tail),
+        )
+
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            stamped, tail,
+        ]
 
     @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):

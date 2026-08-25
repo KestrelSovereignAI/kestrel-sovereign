@@ -601,8 +601,186 @@ def search_session_summaries(
     sort_sessions(results)
     return results[:limit]
 
+def _row_view(row: Sequence[Any], state_indexes: Optional[Tuple[int, int]]) -> int:
+    """Which of the list's three views a candidate row belongs to.
+
+    ``0`` Trash, ``1`` archived, ``2`` active — ordered so a walk over the
+    sorted keys is deterministic and nothing more. A caller that did not select
+    the state columns gets one view, which is what a query already narrowed to
+    a single state has.
+    """
+    if state_indexes is None:
+        return 2
+    deleted_index, archived_index = state_indexes
+    if len(row) > deleted_index and row[deleted_index] is not None:
+        return 0
+    if len(row) > archived_index and row[archived_index] is not None:
+        return 1
+    return 2
+
+
+def _walk_one_view(
+    candidates: Sequence[tuple],
+    *,
+    session_id_str: str,
+    anchor_row_id: Optional[int],
+    anchor_key: Optional[Tuple[datetime, int]],
+    exact_opens_the_run: bool,
+    include_markers: bool,
+) -> List[tuple]:
+    """The session's members among one view's candidates, oldest first.
+
+    ``candidates`` are ``(timestamp, row_id, row, metadata)`` in canonical
+    order. Returns the same triples for the rows that belong, so the caller can
+    merge several views and order the union.
+    """
+    from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
+
+    members: List[tuple] = []
+    last_timestamp: Optional[datetime] = None
+    is_first = True
+    # Whether the anchor row is among THESE candidates. It may not be: a
+    # lifecycle op selects one deletion state, and a partially restored session
+    # can have its anchor live while the rows under it are still in Trash. The
+    # session did not stop starting where it starts, so the run opens at the
+    # anchor's POSITION instead — at the first candidate standing at or after
+    # it, which the boundary test below can still refuse. Only the first: once
+    # a boundary closes the run, only the session's own rows may re-open it.
+    anchor_position_open = (
+        anchor_key is not None
+        and anchor_row_id is not None
+        and not any(candidate[1] == anchor_row_id for candidate in candidates)
+    )
+    if anchor_position_open:
+        # The gap is measured from where the session STARTS, so a hidden anchor
+        # still sets the clock: a candidate standing half an hour past it is a
+        # later conversation whatever else is true of it.
+        last_timestamp = anchor_key[0]
+    # Whether the requested session's run is currently taking rows.
+    #
+    # It starts CLOSED, which is the difference between "these candidates begin
+    # at the session" and "these candidates begin near it". The candidate query
+    # selects a timestamp RANGE, and two rows can share a second — so the row
+    # before the anchor in canonical order arrives first, and a run that
+    # started open would take it out of the session before this one. The same
+    # range is what a metadata ``LIKE`` can widen by matching this session's id
+    # nested inside some other document: that row is not a member, it must not
+    # open the run, and now it cannot.
+    #
+    # A row filed under a DIFFERENT canonical id closes the run, and so does a
+    # ``new_session`` marker — the grouper's other two boundaries. Closing is
+    # not the same as skipping the row: an unlabeled row after one inherits
+    # THAT session, so it must not rejoin this one by merely falling inside the
+    # gap. Only the anchor or a row NAMING this session opens the run — the
+    # latter is a resumption, which the grouper coalesces back by id, and which
+    # is why a boundary must not end the scan the way it once did.
+    #
+    # Until #3098 the walk had no boundary at all, so a legacy numeric cluster
+    # absorbed a following stamped row. The grouper had to absorb it too, or
+    # deleting the cluster the list showed would have destroyed the stamped
+    # session beside it — and that absorption is what made Phase A's per-row
+    # column disagree with the grouping and drop the whole conversation from
+    # the list.
+    run_open = False
+
+    for timestamp, row_id, row, meta in candidates:
+        # A row RESUMES this session only under the grouper's own acceptance
+        # rule, which is why this asks `canonical_session_id` rather than
+        # comparing the raw metadata value. A bare integer there names a row,
+        # not a session (#2012), and the grouper reads such a row as unlabeled
+        # — so treating one as a resumption filed it under a legacy key while
+        # the list showed it under the session it had actually fallen into, and
+        # deleting the legacy session deleted a row displayed elsewhere. It
+        # also means a numeric session cannot be resumed at all, which is the
+        # truth: its key is its first row's id, and no second cluster can start
+        # at that row.
+        is_resumed_message = canonical_session_id(meta) == session_id_str
+
+        opens_the_run = (
+            is_resumed_message
+            or row_id == anchor_row_id
+            or (
+                exact_opens_the_run
+                and meta.get(SESSION_ID_KEY) is not None
+                and str(meta[SESSION_ID_KEY]) == session_id_str
+            )
+        )
+        # The session's start POSITION, when its anchor row is hidden from this
+        # view. It is a position and nothing more: the boundary test below
+        # still decides, so a row beginning another session — a ``new_session``
+        # marker, a row filed under another canonical id — standing there
+        # refuses rather than inherits, and the gap from the anchor is measured
+        # by ``last_timestamp`` above.
+        at_anchor_position = False
+        if anchor_position_open and (timestamp, row_id) >= anchor_key:
+            at_anchor_position = True
+            anchor_position_open = False
+
+        # A row filed under another canonical id closes the run even when it is
+        # the row the key names: a key whose own row files itself elsewhere
+        # names no session the grouper would show — the list keys a legacy
+        # cluster by its first row only when that row carries no id of its own
+        # — so the honest answer is an empty one, not that row by itself.
+        #
+        # A ``new_session`` marker closes the run for everyone EXCEPT the
+        # session it opens, which is not a special case but the same rule read
+        # the right way round: a marker starts a session, and this can be that
+        # session's. Nellie has one — a legacy marker carrying the bare integer
+        # of the session before it, anchoring three turns of its own — and
+        # testing the boundary first resolved it to nothing.
+        if canonical_session_id(meta) not in (None, session_id_str) or (
+            not opens_the_run and meta.get("new_session")
+        ):
+            run_open = False
+        elif opens_the_run or at_anchor_position:
+            run_open = True
+        if not run_open:
+            # Deliberately WITHOUT advancing ``last_timestamp``: nothing else
+            # can join this session until the anchor or a resumption opens the
+            # run, and both are admitted regardless of the gap.
+            continue
+
+        if last_timestamp and not is_resumed_message:
+            gap_minutes = (timestamp - last_timestamp).total_seconds() / 60
+            if gap_minutes > SESSION_GAP_MINUTES:
+                # It belongs to a later implicit session. Keep scanning for
+                # explicit resumptions of the requested session.
+                continue
+
+        if not include_markers and meta.get("type") == "session_marker":
+            last_timestamp = timestamp
+            is_first = False
+            continue
+
+        members.append((timestamp, row_id, row))
+        last_timestamp = timestamp
+        is_first = False
+
+    return members
+
+
 class AsyncConversationStore:
     """Async conversation history storage with per-agent encryption."""
+
+    #: How many forward windows :meth:`_get_session_messages` will open before
+    #: it stops and says so.
+    #:
+    #: One window resolves a conversation that ran to its end. A second
+    #: resolves one resumed past it, and each further one another resumption
+    #: cluster — so this is a bound on how many times a session was picked up
+    #: again far from where it stopped, not on its length. Eight is well past
+    #: any shape observed on live history; a session that exceeds it logs
+    #: rather than returning a quietly short transcript, because the count
+    #: beside it and the purge behind it are uncapped and will not agree.
+    SESSION_WINDOW_PAGES = 8
+
+    #: How many row ids one ``IN (...)`` may carry.
+    #:
+    #: SQLite documents a 999-variable ceiling and builds differ about whether
+    #: they enforce it; the agent id takes one of those slots. Well under it,
+    #: because the cost of being wrong is a query that raises on exactly the
+    #: longest sessions.
+    SESSION_ID_BATCH = 500
 
     def __init__(
         self,
@@ -2159,6 +2337,7 @@ class AsyncConversationStore:
         reject_invalid_timestamps: bool = False,
         anchor_missing: bool = False,
         anchor_key: Optional[Tuple[datetime, int]] = None,
+        state_indexes: Optional[Tuple[int, int]] = None,
     ) -> List[tuple]:
         """Apply the canonical time-gap/resumption rules to candidate rows.
 
@@ -2220,15 +2399,29 @@ class AsyncConversationStore:
             )
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
 
+        # Walked once per VIEW, and the union is the answer.
+        #
+        # The list is three views — active, archived (#3062) and Trash — and
+        # each groups its own rows. A lifecycle op may span them: hard purge
+        # asks for every state so a session partly in Trash goes whole. Walking
+        # that union as one sequence lets a row HIDDEN from a view bridge a gap
+        # the view splits, which is not a theory: an archived row twenty
+        # minutes after one session and twenty before another merges the two,
+        # and purging the first destroys the second — permanently, and while
+        # the active list is showing them apart.
+        #
+        # So the gap arithmetic never crosses a view. A partition contributes
+        # only through a row that opens the run inside it, and for a canonical
+        # key that means a row NAMING the session: membership recorded at write
+        # time, not inferred across a boundary the reader cannot see.
+        partitions: Dict[int, list] = {}
+        for candidate in candidates:
+            partitions.setdefault(_row_view(candidate[2], state_indexes), []).append(
+                candidate
+            )
 
-        session_rows = []
-        last_timestamp: Optional[datetime] = None
-        is_first = True
-        # The row a session's run STARTS at, when its key names one. A legacy
-        # key IS a row id (#2012), so the session begins there and at no other
-        # row; a canonical key begins wherever the first row naming it is.
         anchor_row_id = coerce_persistent_message_id(session_id)
-        # ...and when the key names NO row, the rows that name IT open it
+        # When the key names NO row, the rows that name IT open the run
         # instead. A numeric session id can be metadata-only — a client
         # supplied it, or the legacy anchor was hard-deleted out from under it
         # — and those rows would otherwise be unreachable by the only key
@@ -2237,130 +2430,23 @@ class AsyncConversationStore:
         # EXISTS and the bare integer beside it is a stale echo of a row that
         # belongs to another session. Here there is nothing to echo.
         exact_opens_the_run = anchor_missing and anchor_row_id is not None
-        # Whether the anchor row is among the candidates at all. It may not be:
-        # a session lifecycle op selects one deletion state, and a partially
-        # restored session can have its anchor live while the rows under it are
-        # still in Trash. The session did not stop starting where it starts, so
-        # the run opens at the anchor's POSITION instead — at the first
-        # candidate standing at or after it, which the boundary test below can
-        # still refuse. Only the first: once a boundary closes the run, only
-        # the session's own rows may re-open it.
-        anchor_position_open = (
-            anchor_key is not None
-            and anchor_row_id is not None
-            and not any(candidate[1] == anchor_row_id for candidate in candidates)
-        )
-        if anchor_position_open:
-            # The gap is measured from where the session STARTS, so a hidden
-            # anchor still sets the clock: a candidate standing half an hour
-            # past it is a later conversation whatever else is true of it.
-            last_timestamp = anchor_key[0]
-        # Whether the requested session's run is currently taking rows.
-        #
-        # It starts CLOSED, which is the difference between "these candidates
-        # begin at the session" and "these candidates begin near it". The
-        # candidate query selects a timestamp RANGE, and two rows can share a
-        # second — so the row before the anchor in canonical order arrives
-        # first, and a run that started open would take it out of the session
-        # before this one. The same range is what a metadata ``LIKE`` can widen
-        # by matching this session's id nested inside some other document: that
-        # row is not a member, it must not open the run, and now it cannot.
-        #
-        # A row filed under a DIFFERENT canonical id closes the run, and so
-        # does a ``new_session`` marker — the grouper's other two boundaries.
-        # Closing is not the same as skipping the row: an unlabeled row after
-        # one inherits THAT session, so it must not rejoin this one by merely
-        # falling inside the gap. Only the anchor or a row NAMING this session
-        # opens the run — the latter is a resumption, which the grouper
-        # coalesces back by id, and which is why a boundary must not end the
-        # scan the way it used to.
-        #
-        # Until #3098 the walk had no boundary at all, so a legacy numeric
-        # cluster absorbed a following stamped row. The grouper had to absorb
-        # it too, or deleting the cluster the list showed would have destroyed
-        # the stamped session beside it — and that absorption is what made
-        # Phase A's per-row column disagree with the grouping and drop the
-        # whole conversation from the list.
-        run_open = False
 
-        for timestamp, row_id, row, meta in candidates:
-            # A row RESUMES this session only under the grouper's own
-            # acceptance rule, which is why this asks `canonical_session_id`
-            # rather than comparing the raw metadata value. A bare integer
-            # there names a row, not a session (#2012), and the grouper reads
-            # such a row as unlabeled — so treating one as a resumption filed
-            # it under a legacy key while the list showed it under the session
-            # it had actually fallen into, and deleting the legacy session
-            # deleted a row displayed elsewhere. It also means a numeric
-            # session cannot be resumed at all, which is the truth: its key is
-            # its first row's id, and no second cluster can start at that row.
-            is_resumed_message = canonical_session_id(meta) == session_id_str
-
-            opens_the_run = (
-                is_resumed_message
-                or row_id == anchor_row_id
-                or (
-                    exact_opens_the_run
-                    and meta.get(SESSION_ID_KEY) is not None
-                    and str(meta[SESSION_ID_KEY]) == session_id_str
+        walked: list = []
+        for view in sorted(partitions):
+            walked.extend(
+                _walk_one_view(
+                    partitions[view],
+                    session_id_str=session_id_str,
+                    anchor_row_id=anchor_row_id,
+                    anchor_key=anchor_key,
+                    exact_opens_the_run=exact_opens_the_run,
+                    include_markers=include_markers,
                 )
             )
-            # The session's start POSITION, when its anchor row is hidden by
-            # the deletion filter. It is a position and nothing more: the
-            # boundary test below still decides, so a row beginning another
-            # session — a ``new_session`` marker, a row filed under another
-            # canonical id — standing there refuses rather than inherits, and
-            # the gap from the anchor is measured by ``last_timestamp`` above.
-            at_anchor_position = False
-            if anchor_position_open and (timestamp, row_id) >= anchor_key:
-                at_anchor_position = True
-                anchor_position_open = False
-
-            # A row filed under another canonical id closes the run even when
-            # it is the row the key names: a key whose own row files itself
-            # elsewhere names no session the grouper would show — the list keys
-            # a legacy cluster by its first row only when that row carries no
-            # id of its own — so the honest answer is an empty one, not that
-            # row by itself.
-            #
-            # A ``new_session`` marker closes the run for everyone EXCEPT the
-            # session it opens, which is not a special case but the same rule
-            # read the right way round: a marker starts a session, and this can
-            # be that session's. Nellie has one — a legacy marker carrying the
-            # bare integer of the session before it, anchoring three turns of
-            # its own — and testing the boundary first resolved it to nothing.
-            if canonical_session_id(meta) not in (None, session_id_str) or (
-                not opens_the_run and meta.get("new_session")
-            ):
-                run_open = False
-            elif opens_the_run or at_anchor_position:
-                run_open = True
-            if not run_open:
-                # Deliberately WITHOUT advancing ``last_timestamp``: nothing
-                # else can join this session until the anchor or a resumption
-                # opens the run, and both are admitted regardless of the gap.
-                continue
-
-            if last_timestamp and not is_resumed_message:
-                gap_minutes = (
-                    timestamp - last_timestamp
-                ).total_seconds() / 60
-                if gap_minutes > SESSION_GAP_MINUTES:
-                    # It belongs to a later implicit session. Keep scanning for
-                    # explicit resumptions of the requested session.
-                    continue
-
-            if not include_markers and meta.get("type") == "session_marker":
-                last_timestamp = timestamp
-                is_first = False
-                continue
-
-            session_rows.append(row)
-            last_timestamp = timestamp
-            is_first = False
-
-            if limit is not None and len(session_rows) >= limit:
-                break
+        walked.sort(key=lambda member: (member[0], member[1]))
+        session_rows = [member[2] for member in walked]
+        if limit is not None:
+            session_rows = session_rows[:limit]
 
         # Match the historical newest-first raw-row contract.
         return list(reversed(session_rows))
@@ -2433,24 +2519,16 @@ class AsyncConversationStore:
         # JSON formatting varies; both spellings are the same membership claim.
         compact_pattern = f'%"session_id":"{esc}"%'
 
-        # Where a LEGACY session's forward walk begins. A canonical session has
-        # no such walk here, and that is deliberate rather than an omission.
+        # Where this session's forward walk begins. BOTH kinds of id have one.
         #
-        # The grouper gives an unlabeled row to the session it falls after, so a
-        # canonical session owns the unlabeled run following it and resolving it
-        # by metadata alone answers with a strict subset of what the list shows.
-        # Measured across the four live agents: the resolver and the grouper
-        # disagree about 65 conversations before this ticket, 16 after it, and
-        # the last 16 are exactly that subset. Closing them needs a forward walk
-        # for canonical ids too, and a forward walk carries a scope: it was
-        # measured letting an ARCHIVED row bridge two twenty-minute gaps under
-        # `deleted_filter="all"`, so purging one session destroyed another the
-        # active list showed separately. The legacy path has always had that
-        # exposure; giving it to every session is a decision about lifecycle
-        # scope across deletion universes, and it is not this ticket's (#3120).
+        # That is #3098. ``group_messages_into_sessions`` gives an unlabeled row
+        # to the session it falls after, so a canonical session owns the
+        # unlabeled run following it exactly as a legacy cluster does. Resolving
+        # a canonical id by metadata alone therefore returned a strict SUBSET of
+        # what the list showed: the count and the transcript were short, and a
+        # hard purge left those rows behind to reappear under another session.
         all_rows = []
         row_id = coerce_persistent_message_id(session_id)
-        start_row = None
         if row_id is not None:
             # The anchor row itself is looked up regardless of state — we
             # need its timestamp even if it's been soft-deleted, otherwise
@@ -2459,6 +2537,21 @@ class AsyncConversationStore:
                 "SELECT created_at, id FROM conversation_history "
                 "WHERE id = ? AND agent_id = ?",
                 (row_id, self.agent_id)
+            )
+        else:
+            # A canonical session's anchor is the earliest row that NAMES it,
+            # read through the same filters as the candidates below so the walk
+            # cannot start outside the universe it is about to search.
+            start_row = await self.db.fetchone(
+                f"""SELECT created_at, id
+                   FROM conversation_history
+                   WHERE agent_id = ?
+                     AND (metadata LIKE ? ESCAPE '\\'
+                          OR metadata LIKE ? ESCAPE '\\')
+                     {del_clause}{archive_clause}
+                   ORDER BY {created_at_order} ASC, id ASC
+                   LIMIT 1""",
+                (self.agent_id, spaced_pattern, compact_pattern),
             )
 
         # Whether the key names a row at all. A numeric session id can be
@@ -2480,11 +2573,30 @@ class AsyncConversationStore:
             else None
         )
 
+        # Every stamp this session is NAMED at, uncapped and two columns wide.
+        #
+        # These decide where the forward walk looks next, so a cap on them is a
+        # cap on the answer: the first ``limit`` metadata matches can be markers
+        # or documents that merely mention this id, and a real resumption beyond
+        # them then never opened a window — the loop declared the keys exhausted
+        # and returned a short transcript. Cheap because it is two columns of
+        # one session's own rows; the bodies below stay capped.
+        naming_keys = await self.db.fetchall(
+            f"""SELECT created_at, id
+               FROM conversation_history
+               WHERE agent_id = ?
+                 AND (metadata LIKE ? ESCAPE '\\'
+                      OR metadata LIKE ? ESCAPE '\\')
+                 {del_clause}{archive_clause}
+               ORDER BY {created_at_order} ASC, id ASC""",
+            (self.agent_id, spaced_pattern, compact_pattern),
+        )
+
         # The rows that NAME this session, whatever the distance — a resumption
         # past a time gap, or past the window below.
         resumed_rows = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
-                      model, provider
+                      model, provider, deleted_at, archived_at
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY {created_at_order} ASC, id ASC
@@ -2494,7 +2606,7 @@ class AsyncConversationStore:
 
         resumed_rows_alt = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
-                      model, provider
+                      model, provider, deleted_at, archived_at
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY {created_at_order} ASC, id ASC
@@ -2502,41 +2614,196 @@ class AsyncConversationStore:
             (self.agent_id, compact_pattern, limit)
         )
 
-        # One window forward from the anchor, ordered by ``(created_at, id)``
-        # and cut by ``(created_at, id) >= anchor`` — the order the walk itself
-        # sorts candidates into. ``created_at`` is stored to the second, so a
-        # bound on the stamp alone admits the row BEFORE the anchor and a LIMIT
-        # over it truncates a tie group wherever the engine felt like it:
-        # measured on sqlite 3.50, a LIMIT of eight over ten rows returned the
-        # last row of the tie and dropped the two before it.
+        # The forward walk, PAGED rather than capped once.
         #
-        # rendered_content (#1402) is appended at row[5] so existing positional
-        # accesses on metadata/created_at don't shift.
-        if start_row is not None:
-            all_rows = await self.db.fetchall(
+        # Every query above and below orders by ``(created_at, id)`` — the
+        # order the walk itself sorts candidates into — and not by the stamp
+        # alone. ``created_at`` is stored to the second, so a LIMIT over a
+        # stamp-only order truncates a tie group at an arbitrary point: three
+        # rows sharing one second returned the LAST of them and dropped the two
+        # before it, which is a hole in the middle of the walk rather than an
+        # end to it.
+        #
+        # One window from the anchor is the whole story for a conversation that
+        # ran to its end, and wrong for one RESUMED past it. The naming rows
+        # above come back whatever the distance; the unlabeled replies that
+        # followed them do not, and the walk cannot decide where a run stops
+        # from a set with holes in it — so a resumption further away than one
+        # window silently lost its tail while the count and the purge kept it.
+        #
+        # Jumping to the next naming row rather than crawling contiguously is
+        # sound, and the argument is the walk's own: a full page that yielded
+        # fewer than ``limit`` members contains either a row filed elsewhere,
+        # which closes the run, or a row past the gap, after which every later
+        # row is past it too. Either way nothing but a row NAMING this session
+        # can join from there, and those are exactly the stamps paged to.
+        # Keyed by ``(stamp, id)``, the order everything else here compares in.
+        # A stamp alone cannot separate a resumption from the window that just
+        # ended on the same second — ``created_at`` is stored to the second, so
+        # that is an ordinary collision, and a strictly-greater STAMP test
+        # skipped such a resumption and left its tail behind.
+        resumption_keys = sorted(
+            (stamp, int(row[1]))
+            for stamp, row in (
+                (coerce_session_timestamp(row[0]), row) for row in naming_keys
+            )
+            if stamp is not None
+        )
+        # An INDEX into that list, never a re-scan of it. Each window consumes
+        # at least one key, which is what makes the loop terminate: a window
+        # whose rows all share one second cannot otherwise advance past itself.
+        next_key = 0
+        cursor = (start_row[0], int(start_row[1])) if start_row else None
+        pages = 0
+        exhausted_the_windows = False
+        while cursor is not None:
+            if pages >= self.SESSION_WINDOW_PAGES:
+                exhausted_the_windows = True
+                break
+            # rendered_content (#1402) is appended at row[5] so existing
+            # positional accesses on metadata/created_at don't shift.
+            page = await self.db.fetchall(
                 f"""SELECT id, role, content, metadata, created_at,
-                          rendered_content, model, provider
+                          rendered_content, model, provider,
+                          deleted_at, archived_at
                    FROM conversation_history
                    WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
                    ORDER BY {created_at_order} ASC, id ASC
                    LIMIT ?""",
                 (
                     self.agent_id,
-                    self._timestamp_query_param(start_row[0]),
-                    self._timestamp_query_param(start_row[0]),
-                    int(start_row[1]),
+                    self._timestamp_query_param(cursor[0]),
+                    self._timestamp_query_param(cursor[0]),
+                    cursor[1],
                     limit * 2,  # Fetch extra in case of filtering
                 ),
             )
+            pages += 1
+            all_rows.extend(page)
+            if len(page) < limit * 2:
+                break  # history exhausted
+            covered = (
+                coerce_session_timestamp(page[-1][4]) or UNDATABLE_ROW_FALLBACK,
+                int(page[-1][0]),
+            )
+            # ``limit`` members BELOW the covered point, not ``limit`` members.
+            # The naming rows come back from the metadata query whatever the
+            # windows have reached, so counting them all declared the answer
+            # full while an earlier resumption's unlabeled tail was still
+            # unread — and the rows returned were then the wrong ones, later
+            # resumptions standing where that tail belongs.
+            settled = [
+                row for row in self._filter_session_rows(
+                    [*all_rows, *resumed_rows, *resumed_rows_alt],
+                    session_id,
+                    limit=None,
+                    include_markers=include_markers,
+                    anchor_missing=anchor_missing,
+                    anchor_key=anchor_key,
+                    state_indexes=(8, 9),
+                )
+                if (
+                    coerce_session_timestamp(row[4]) or UNDATABLE_ROW_FALLBACK,
+                    int(row[0]),
+                ) <= covered
+            ]
+            if len(settled) >= limit:
+                break  # the answer is already as long as it may be
+            while next_key < len(resumption_keys) and (
+                resumption_keys[next_key] <= covered
+            ):
+                next_key += 1
+            if next_key >= len(resumption_keys):
+                break
+            cursor, next_key = resumption_keys[next_key], next_key + 1
 
-        return self._filter_session_rows(
+        if exhausted_the_windows:
+            # The windows ran out with resumptions still unreached, so this
+            # walk cannot answer. It does not answer SHORT — a transcript
+            # missing rows the count beside it and the purge behind it both
+            # keep is the disagreement this ticket exists to end. Ask the
+            # resolver that has no windows and read the bodies of what it says.
+            logger.warning(
+                "session %s needed more than %s forward windows; resolving it "
+                "through the uncapped exact resolver instead",
+                session_id,
+                self.SESSION_WINDOW_PAGES,
+            )
+            return await self._rows_for_exact_membership(
+                session_id,
+                limit=limit,
+                deleted_filter=deleted_filter,
+                include_markers=include_markers,
+                include_archived=include_archived,
+            )
+
+        resolved = self._filter_session_rows(
             [*all_rows, *resumed_rows, *resumed_rows_alt],
             session_id,
             limit=limit,
             include_markers=include_markers,
             anchor_missing=anchor_missing,
             anchor_key=anchor_key,
+            state_indexes=(8, 9),
         )
+        # The state columns rode along for the view partition; they are not
+        # part of the 8-tuple this method's callers index into.
+        return [tuple(row[:8]) for row in resolved]
+
+    async def _rows_for_exact_membership(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        deleted_filter: str,
+        include_markers: bool,
+        include_archived: bool,
+    ) -> List[tuple]:
+        """The rows of a session whose membership the WINDOWED walk cannot see.
+
+        Not a second membership rule — the same one, read from the resolver
+        that has no window at all, which is the authority the count and the
+        hard purge already use. Reached only when a session was picked up again
+        in more separated places than :data:`SESSION_WINDOW_PAGES` allows for,
+        and it costs a scan from the session's anchor to the end of history,
+        which is why it is the fallback and not the path.
+        """
+        ids = await self._get_complete_session_message_ids(
+            session_id,
+            deleted_filter=deleted_filter,
+            include_markers=include_markers,
+            include_archived=include_archived,
+        )
+        if not ids:
+            return []
+        created_at_order = self._canonical_timestamp_sql("created_at")
+        # In batches, because SQLite documents a 999-variable ceiling and this
+        # fallback is reached by exactly the sessions long enough to pass it —
+        # one resumed in more separated places than the window budget allows
+        # for. The exact-purge path locks its ids in bounded batches for the
+        # same reason.
+        rows: List[tuple] = []
+        for start in range(0, len(ids), self.SESSION_ID_BATCH):
+            batch = ids[start:start + self.SESSION_ID_BATCH]
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(await self.db.fetchall(
+                f"""SELECT id, role, content, metadata, created_at,
+                          rendered_content, model, provider
+                   FROM conversation_history
+                   WHERE agent_id = ? AND id IN ({placeholders})
+                   ORDER BY {created_at_order} ASC, id ASC""",
+                (self.agent_id, *batch),
+            ))
+        # Ordered ACROSS the batches, not within each — the batches are id
+        # ranges and the order this contract is in is canonical.
+        rows.sort(
+            key=lambda row: (
+                coerce_session_timestamp(row[4]) or UNDATABLE_ROW_FALLBACK,
+                int(row[0]),
+            )
+        )
+        # Match the historical newest-first raw-row contract.
+        return list(reversed(rows[:limit]))
 
     async def _get_complete_session_message_ids(
         self,
@@ -2572,26 +2839,32 @@ class AsyncConversationStore:
         row_id = coerce_persistent_message_id(session_id)
 
         if row_id is None:
-            # A canonical session is resolved by the rows that NAME it, and no
-            # further. The grouper also gives it the unlabeled run that follows
-            # it, so this is a strict subset of what the list shows — measured
-            # at 16 conversations across the four live agents. Closing that
-            # needs a forward walk here, and a forward walk under
-            # ``deleted_filter="all"`` lets a HIDDEN row bridge two gaps the
-            # active view splits: measured, an archived row twenty minutes
-            # after this session and twenty before another one merged the two,
-            # and purging this one destroyed the other permanently. The legacy
-            # branch below has always carried that exposure; extending it to
-            # every session is a decision about lifecycle scope across deletion
-            # universes and is #3120's, not this ticket's.
-            query_prefix = ""
-            membership_predicate = (
-                "(c.metadata LIKE ? ESCAPE '\\' "
-                "OR c.metadata LIKE ? ESCAPE '\\')"
+            # A canonical session gets the SAME anchored forward walk a legacy
+            # one does (#3120). The grouper gives an unlabeled row to the
+            # session it falls after, so this session owns the unlabeled run
+            # that follows it, and a purge resolving membership by metadata
+            # alone left those rows behind — live, and reappearing under
+            # whatever session the reader then put them in. The anchor is the
+            # earliest row NAMING this session, read through the same filters
+            # as the candidates.
+            #
+            # The reason this was safe to bring back is above: the walk runs
+            # per VIEW, so a row hidden from one cannot bridge a gap that view
+            # splits. It was measured doing exactly that.
+            query_prefix = (
+                "WITH anchor AS ("
+                "SELECT created_at FROM conversation_history "
+                "WHERE agent_id = ? AND (metadata LIKE ? ESCAPE '\\' "
+                "OR metadata LIKE ? ESCAPE '\\')"
+                f"{anchor_del_clause}{anchor_archive_clause} "
+                f"ORDER BY {self._canonical_timestamp_sql('created_at')} ASC, "
+                "id ASC LIMIT 1"
+                ") "
             )
-            anchor_column = "0, NULL"
-            candidate_source = "conversation_history c"
             params: tuple[Any, ...] = (
+                self.agent_id,
+                spaced_pattern,
+                compact_pattern,
                 self.agent_id,
                 spaced_pattern,
                 compact_pattern,
@@ -2603,26 +2876,6 @@ class AsyncConversationStore:
                 "WHERE id = ? AND agent_id = ?"
                 ") "
             )
-            # LEFT JOIN (not CROSS JOIN): the anchor CTE can be empty, because
-            # a numeric session id can be metadata-only — the client supplied
-            # it explicitly, or the legacy anchor row was already hard-deleted.
-            # An empty anchor must drop only the time-grouping branch, never
-            # the metadata branch, or purge/count would miss rows the display
-            # resolver still finds.
-            candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
-            candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
-            anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
-            membership_predicate = (
-                "(EXISTS (SELECT 1 FROM anchor) "
-                f"AND ({candidate_timestamp} >= {anchor_timestamp} "
-                f"OR {candidate_timestamp} IS NULL "
-                f"OR {anchor_timestamp} IS NULL) "
-                "OR c.metadata LIKE ? ESCAPE '\\' "
-                "OR c.metadata LIKE ? ESCAPE '\\')"
-            )
-            anchor_column = (
-                "(SELECT count(*) FROM anchor), (SELECT created_at FROM anchor)"
-            )
             params = (
                 row_id,
                 self.agent_id,
@@ -2631,12 +2884,34 @@ class AsyncConversationStore:
                 compact_pattern,
             )
 
+        # LEFT JOIN (not CROSS JOIN): the anchor CTE can be empty — a numeric
+        # session id can be metadata-only (the client supplied it explicitly,
+        # or the legacy anchor row was already hard-deleted), and a canonical
+        # one names no row once every row of it is gone. An empty anchor must
+        # drop only the time-grouping branch, never the metadata branch, or
+        # purge/count would miss rows the display resolver still finds.
+        candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
+        candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
+        anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
+        membership_predicate = (
+            "(EXISTS (SELECT 1 FROM anchor) "
+            f"AND ({candidate_timestamp} >= {anchor_timestamp} "
+            f"OR {candidate_timestamp} IS NULL "
+            f"OR {anchor_timestamp} IS NULL) "
+            "OR c.metadata LIKE ? ESCAPE '\\' "
+            "OR c.metadata LIKE ? ESCAPE '\\')"
+        )
+        anchor_column = (
+            "(SELECT count(*) FROM anchor), (SELECT created_at FROM anchor)"
+        )
+
         # Whether the key names a row, read in the SAME statement as the
         # candidates. It decides whether a row naming this session may open the
         # walk (see `_filter_session_rows`), and asking separately would put
         # that decision in a different snapshot from the rows it is about.
         candidates = await self.db.fetchall(
             f"{query_prefix}SELECT c.id, c.metadata, c.created_at, "
+            "c.deleted_at, c.archived_at, "
             f"{anchor_column} "
             f"FROM {candidate_source} WHERE c.agent_id = ? AND "
             f"{membership_predicate}{del_clause}{archive_clause} "
@@ -2650,19 +2925,20 @@ class AsyncConversationStore:
             include_markers=include_markers,
             metadata_index=1,
             created_at_index=2,
+            state_indexes=(3, 4),
             reject_invalid_timestamps=True,
-            anchor_missing=bool(candidates) and not candidates[0][3],
+            anchor_missing=bool(candidates) and not candidates[0][5],
             # The anchor's position, so a deletion filter that hides the row
             # itself still opens the run where the session opens. Its id is
             # ``row_id`` by construction — a canonical key has no anchor row
             # id, and `_filter_session_rows` ignores the pair without one.
             anchor_key=(
                 (
-                    coerce_session_timestamp(candidates[0][4])
+                    coerce_session_timestamp(candidates[0][6])
                     or UNDATABLE_ROW_FALLBACK,
                     row_id,
                 )
-                if candidates and candidates[0][3] and row_id is not None
+                if candidates and candidates[0][5] and row_id is not None
                 else None
             ),
         )
