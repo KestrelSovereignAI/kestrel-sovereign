@@ -2169,6 +2169,7 @@ class AsyncConversationStore:
         metadata_index: int = 3,
         created_at_index: int = 4,
         reject_invalid_timestamps: bool = False,
+        anchor_missing: bool = False,
     ) -> List[tuple]:
         """Apply the canonical time-gap/resumption rules to candidate rows.
 
@@ -2237,6 +2238,15 @@ class AsyncConversationStore:
         # key IS a row id (#2012), so the session begins there and at no other
         # row; a canonical key begins wherever the first row naming it is.
         anchor_row_id = coerce_persistent_message_id(session_id)
+        # ...and when the key names NO row, the rows that name IT open it
+        # instead. A numeric session id can be metadata-only — a client
+        # supplied it, or the legacy anchor was hard-deleted out from under it
+        # — and those rows would otherwise be unreachable by the only key
+        # anyone has for them, which for purge means unpurgeable. This is not
+        # the case the grouper's acceptance rule refuses: there the anchor
+        # EXISTS and the bare integer beside it is a stale echo of a row that
+        # belongs to another session. Here there is nothing to echo.
+        exact_opens_the_run = anchor_missing and anchor_row_id is not None
         # Whether the requested session's run is currently taking rows.
         #
         # It starts CLOSED, which is the difference between "these candidates
@@ -2278,12 +2288,35 @@ class AsyncConversationStore:
             # its first row's id, and no second cluster can start at that row.
             is_resumed_message = canonical_session_id(meta) == session_id_str
 
-            if is_resumed_message or row_id == anchor_row_id:
-                run_open = True
-            elif canonical_session_id(meta) not in (
-                None, session_id_str,
-            ) or meta.get("new_session"):
+            opens_the_run = (
+                is_resumed_message
+                or row_id == anchor_row_id
+                or (
+                    exact_opens_the_run
+                    and meta.get(SESSION_ID_KEY) is not None
+                    and str(meta[SESSION_ID_KEY]) == session_id_str
+                )
+            )
+
+            # A row filed under another canonical id closes the run even when
+            # it is the row the key names: a key whose own row files itself
+            # elsewhere names no session the grouper would show — the list keys
+            # a legacy cluster by its first row only when that row carries no
+            # id of its own — so the honest answer is an empty one, not that
+            # row by itself.
+            #
+            # A ``new_session`` marker closes the run for everyone EXCEPT the
+            # session it opens, which is not a special case but the same rule
+            # read the right way round: a marker starts a session, and this can
+            # be that session's. Nellie has one — a legacy marker carrying the
+            # bare integer of the session before it, anchoring three turns of
+            # its own — and testing the boundary first resolved it to nothing.
+            if canonical_session_id(meta) not in (None, session_id_str) or (
+                not opens_the_run and meta.get("new_session")
+            ):
                 run_open = False
+            elif opens_the_run:
+                run_open = True
             if not run_open:
                 # Deliberately WITHOUT advancing ``last_timestamp``: nothing
                 # else can join this session until the anchor or a resumption
@@ -2406,6 +2439,12 @@ class AsyncConversationStore:
                 (self.agent_id, spaced_pattern, compact_pattern),
             )
 
+        # Whether the key names a row at all. A numeric session id can be
+        # metadata-only — a client supplied it, or the legacy anchor was
+        # hard-deleted — and then the rows naming it are the only thing that
+        # can open the walk (see `_filter_session_rows`).
+        anchor_missing = row_id is not None and start_row is None
+
         # The rows that NAME this session, whatever the distance — a resumption
         # past a time gap, or past the window below. Fetched first because they
         # are what decides where the forward walk has to look next.
@@ -2414,7 +2453,7 @@ class AsyncConversationStore:
                       model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY created_at ASC
+               ORDER BY {created_at_order} ASC, id ASC
                LIMIT ?""",
             (self.agent_id, spaced_pattern, limit)
         )
@@ -2424,12 +2463,20 @@ class AsyncConversationStore:
                       model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY created_at ASC
+               ORDER BY {created_at_order} ASC, id ASC
                LIMIT ?""",
             (self.agent_id, compact_pattern, limit)
         )
 
         # The forward walk, PAGED rather than capped once.
+        #
+        # Every query above and below orders by ``(created_at, id)`` — the
+        # order the walk itself sorts candidates into — and not by the stamp
+        # alone. ``created_at`` is stored to the second, so a LIMIT over a
+        # stamp-only order truncates a tie group at an arbitrary point: three
+        # rows sharing one second returned the LAST of them and dropped the two
+        # before it, which is a hole in the middle of the walk rather than an
+        # end to it.
         #
         # One window from the anchor is the whole story for a conversation that
         # ran to its end, and wrong for one RESUMED past it. The naming rows
@@ -2444,25 +2491,29 @@ class AsyncConversationStore:
         # which closes the run, or a row past the gap, after which every later
         # row is past it too. Either way nothing but a row NAMING this session
         # can join from there, and those are exactly the stamps paged to.
-        resumption_stamps = sorted(
-            stamp
-            for stamp in (
-                coerce_session_timestamp(row[4])
+        # Keyed by ``(stamp, id)``, the order everything else here compares in.
+        # A stamp alone cannot separate a resumption from the window that just
+        # ended on the same second — ``created_at`` is stored to the second, so
+        # that is an ordinary collision, and a strictly-greater STAMP test
+        # skipped such a resumption and left its tail behind.
+        resumption_keys = sorted(
+            (stamp, int(row[0]))
+            for stamp, row in (
+                (coerce_session_timestamp(row[4]), row)
                 for row in (*resumed_rows, *resumed_rows_alt)
             )
             if stamp is not None
         )
+        # An INDEX into that list, never a re-scan of it. Each window consumes
+        # at least one key, which is what makes the loop terminate: a window
+        # whose rows all share one second cannot otherwise advance past itself.
+        next_key = 0
         cursor = start_row[0] if start_row else None
         pages = 0
+        exhausted_the_windows = False
         while cursor is not None:
             if pages >= self.SESSION_WINDOW_PAGES:
-                logger.warning(
-                    "session %s resolution stopped after %s windows with "
-                    "resumptions still unreached; the transcript may be "
-                    "shorter than the session's count",
-                    session_id,
-                    pages,
-                )
+                exhausted_the_windows = True
                 break
             # rendered_content (#1402) is appended at row[5] so existing
             # positional accesses on metadata/created_at don't shift.
@@ -2471,7 +2522,7 @@ class AsyncConversationStore:
                           rendered_content, model, provider
                    FROM conversation_history
                    WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
-                   ORDER BY {created_at_order} ASC
+                   ORDER BY {created_at_order} ASC, id ASC
                    LIMIT ?""",
                 (
                     self.agent_id,
@@ -2488,15 +2539,39 @@ class AsyncConversationStore:
                 session_id,
                 limit=limit,
                 include_markers=include_markers,
+                anchor_missing=anchor_missing,
             )) >= limit:
                 break  # the answer is already as long as it may be
-            covered = coerce_session_timestamp(page[-1][4])
-            cursor = next(
-                (
-                    stamp for stamp in resumption_stamps
-                    if covered is None or stamp > covered
-                ),
-                None,
+            covered = (
+                coerce_session_timestamp(page[-1][4]) or UNDATABLE_ROW_FALLBACK,
+                int(page[-1][0]),
+            )
+            while next_key < len(resumption_keys) and (
+                resumption_keys[next_key] <= covered
+            ):
+                next_key += 1
+            if next_key >= len(resumption_keys):
+                break
+            cursor, next_key = resumption_keys[next_key][0], next_key + 1
+
+        if exhausted_the_windows:
+            # The windows ran out with resumptions still unreached, so this
+            # walk cannot answer. It does not answer SHORT — a transcript
+            # missing rows the count beside it and the purge behind it both
+            # keep is the disagreement this ticket exists to end. Ask the
+            # resolver that has no windows and read the bodies of what it says.
+            logger.warning(
+                "session %s needed more than %s forward windows; resolving it "
+                "through the uncapped exact resolver instead",
+                session_id,
+                self.SESSION_WINDOW_PAGES,
+            )
+            return await self._rows_for_exact_membership(
+                session_id,
+                limit=limit,
+                deleted_filter=deleted_filter,
+                include_markers=include_markers,
+                include_archived=include_archived,
             )
 
         return self._filter_session_rows(
@@ -2504,7 +2579,48 @@ class AsyncConversationStore:
             session_id,
             limit=limit,
             include_markers=include_markers,
+            anchor_missing=anchor_missing,
         )
+
+    async def _rows_for_exact_membership(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        deleted_filter: str,
+        include_markers: bool,
+        include_archived: bool,
+    ) -> List[tuple]:
+        """The rows of a session whose membership the WINDOWED walk cannot see.
+
+        Not a second membership rule — the same one, read from the resolver
+        that has no window at all, which is the authority the count and the
+        hard purge already use. Reached only when a session was picked up again
+        in more separated places than :data:`SESSION_WINDOW_PAGES` allows for,
+        and it costs a scan from the session's anchor to the end of history,
+        which is why it is the fallback and not the path.
+        """
+        ids = await self._get_complete_session_message_ids(
+            session_id,
+            deleted_filter=deleted_filter,
+            include_markers=include_markers,
+            include_archived=include_archived,
+        )
+        if not ids:
+            return []
+        created_at_order = self._canonical_timestamp_sql("created_at")
+        placeholders = ", ".join("?" for _ in ids)
+        rows = await self.db.fetchall(
+            f"""SELECT id, role, content, metadata, created_at,
+                      rendered_content, model, provider
+               FROM conversation_history
+               WHERE agent_id = ? AND id IN ({placeholders})
+               ORDER BY {created_at_order} ASC, id ASC
+               LIMIT ?""",
+            (self.agent_id, *ids, limit),
+        )
+        # Match the historical newest-first raw-row contract.
+        return list(reversed(rows))
 
     async def _get_complete_session_message_ids(
         self,
@@ -2599,8 +2715,13 @@ class AsyncConversationStore:
             "OR c.metadata LIKE ? ESCAPE '\\')"
         )
 
+        # Whether the key names a row, read in the SAME statement as the
+        # candidates. It decides whether a row naming this session may open the
+        # walk (see `_filter_session_rows`), and asking separately would put
+        # that decision in a different snapshot from the rows it is about.
         candidates = await self.db.fetchall(
-            f"{query_prefix}SELECT c.id, c.metadata, c.created_at "
+            f"{query_prefix}SELECT c.id, c.metadata, c.created_at, "
+            "(SELECT count(*) FROM anchor) "
             f"FROM {candidate_source} WHERE c.agent_id = ? AND "
             f"{membership_predicate}{del_clause}{archive_clause} "
             "ORDER BY c.id ASC",
@@ -2614,6 +2735,7 @@ class AsyncConversationStore:
             metadata_index=1,
             created_at_index=2,
             reject_invalid_timestamps=True,
+            anchor_missing=bool(candidates) and not candidates[0][3],
         )
         return sorted({int(row[0]) for row in session_rows})
 

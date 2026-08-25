@@ -452,6 +452,138 @@ class TestTheResolverSide:
         assert await store._get_complete_session_message_ids(UUID_A) == [stamped]
 
     @pytest.mark.asyncio
+    async def test_a_resumption_sharing_the_window_s_last_second_is_reached(
+        self, store
+    ):
+        """``(stamp, id)`` in the cursor AND in the query, for one reason.
+
+        ``created_at`` is stored to the second, so a window ending on the same
+        second as the resumption after it is an ordinary collision rather than
+        a curiosity, and this case is both halves of it. A cursor that advanced
+        on a strictly greater STAMP never opened a window at that resumption.
+        And a window ordered by the stamp ALONE truncates a tie group wherever
+        the engine felt like it — measured on sqlite 3.50, a LIMIT of eight
+        over ten rows returned the last row of the tie and dropped the two
+        before it, which is a hole in the middle of the walk rather than an end
+        to it.
+
+        The naming row survives either way; it comes back from the metadata
+        query whatever the windows do. The unlabeled replies behind it are what
+        is lost, and the count and the purge keep them.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for minute in range(1, 8):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 7, session_id=UUID_A)
+        tail = await _insert(store, 7)
+
+        second_tail = await _insert(store, 7)
+
+        rows = await store._get_session_messages(UUID_A, limit=4)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail, second_tail]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            first, resumed, tail, second_tail,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_running_out_of_windows_answers_from_the_uncapped_resolver(
+        self, store, monkeypatch
+    ):
+        """A bound may stop a strategy. It may not shorten the answer.
+
+        A session picked up again in more separated places than the window
+        budget allows used to return what it had and log — a transcript missing
+        rows the count beside it and the purge behind it both keep, which is
+        the disagreement this ticket exists to end. It falls back to the
+        resolver that has no windows instead.
+        """
+        monkeypatch.setattr(
+            AsyncConversationStore, "SESSION_WINDOW_PAGES", 2, raising=True
+        )
+        expected = []
+        minute = 0
+        for _ in range(3):
+            expected.append(await _insert(store, minute, session_id=UUID_A))
+            expected.append(await _insert(store, minute + 1))  # its unlabeled tail
+            minute += 2
+            for _ in range(21):  # more than one window of another conversation
+                await _insert(store, minute, session_id=UUID_B)
+                minute += 1
+
+        rows = await store._get_session_messages(UUID_A, limit=10)
+        assert sorted(r[0] for r in rows) == sorted(expected)
+        assert await store._get_complete_session_message_ids(UUID_A) == sorted(
+            expected
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_marker_anchors_the_session_it_opens(self, store):
+        """A marker closes the run for everyone except the session it opens.
+
+        Nellie has one: a ``new_session`` marker carrying the bare integer of
+        the session before it, anchoring three turns of its own. The list keys
+        that session by the marker's row id, because a bare integer names a row
+        rather than a session. Testing the boundary before the anchor resolved
+        it to nothing — the marker refused to open the run it exists to start.
+        """
+        await _insert(store, 0, session_id="700")
+        marker = await _insert(
+            store, 1, session_id="700", new_session=True, type="session_marker"
+        )
+        first = await _insert(store, 2)
+        second = await _insert(store, 5)
+
+        rows = await store._get_session_messages(str(marker), limit=50)
+        assert sorted(r[0] for r in rows) == [first, second]
+        assert await store._get_complete_session_message_ids(str(marker)) == [
+            marker, first, second,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_numeric_key_whose_row_files_itself_elsewhere_is_empty(
+        self, store
+    ):
+        """The anchor is where a run starts, not a licence to start one.
+
+        ``list_conversation_sessions`` keys a cluster by its first row's id
+        only when that row carries no canonical id of its own; a row that names
+        a session is listed under THAT name. So a numeric key whose row files
+        itself elsewhere names nothing the list would ever show, and answering
+        with that row alone would be a session no other surface agrees exists.
+        """
+        stamped = await _insert(store, 0, session_id=UUID_A)
+        await _insert(store, 1, session_id=UUID_A)
+
+        assert await store._get_session_messages(str(stamped), limit=50) == []
+        assert await store._get_complete_session_message_ids(str(stamped)) == []
+
+    @pytest.mark.asyncio
+    async def test_a_numeric_session_that_names_no_row_still_resolves(self, store):
+        """A metadata-only numeric key is the one case the exact rule cannot cover.
+
+        A client supplied the id, or the legacy anchor was hard-deleted out
+        from under it. The grouper reads a bare integer as unlabeled, so no row
+        NAMES this session under its acceptance rule and nothing carries the
+        anchor's id — which would leave these rows unreachable by the only key
+        anyone has for them, and for purge that means unpurgeable.
+
+        It is not the case the acceptance rule refuses. There the anchor exists
+        and the bare integer beside it is a stale echo of a row belonging to
+        another session; here there is nothing to echo.
+        """
+        orphan_key = "900001"
+        first = await _insert(store, 0, session_id=orphan_key)
+        second = await _insert(store, 1, session_id=orphan_key)
+        survivor = await _insert(store, 5, session_id=UUID_A)
+
+        assert await store._get_complete_session_message_ids(orphan_key) == [
+            first, second,
+        ]
+        rows = await store._get_session_messages(orphan_key, limit=50)
+        assert sorted(r[0] for r in rows) == [first, second]
+        assert survivor not in [r[0] for r in rows]
+
+    @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):
         """Unchanged behaviour, pinned because the walk now decides it too."""
         first = await _insert(store, 0, session_id=UUID_A)
