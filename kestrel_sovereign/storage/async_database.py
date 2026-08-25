@@ -32,7 +32,6 @@ from .conversation_created_at import (
     noncanonical_predicate,
     repairable_bulk_update,
 )
-from .legacy_session_stamp import stamp_legacy_sessions
 from .session_id_column import backfill_statement
 
 logger = logging.getLogger(__name__)
@@ -1398,16 +1397,6 @@ class AsyncDatabase:
         await self._migrate_conversation_created_at()
 
         await self.ensure_session_projection_schema()
-
-        # #3120: legacy rows write down which session they are in. AFTER the
-        # projection's schema pass, because these writes must bump the change
-        # stamp — the projection then notices and derives from rows that now
-        # say where they belong. Before it, the stamp would not move and a
-        # stored projection would go on describing rows rewritten underneath
-        # it. Once per agent, behind a marker, because "is there anything left"
-        # cannot be asked cheaply: the rows this leaves alone look exactly like
-        # the rows it has not reached.
-        await stamp_legacy_sessions(self)
 
         logger.debug(f"Database schema initialized ({self.backend_type})")
 

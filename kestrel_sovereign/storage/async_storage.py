@@ -42,7 +42,7 @@ from .conversation_created_at import (
     fill_undatable,
     parse_stored_timestamp,
 )
-from .legacy_session_stamp import STAMP_TABLE
+from .legacy_session_stamp import stamp_legacy_sessions
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
@@ -2802,16 +2802,6 @@ class AsyncStorage:
                     # after it instead of falling to 1970.
                     stamps = fill_undatable([row[5] for row in conversations])
 
-                    # The rows below predate #3120's pass, so the claim that
-                    # this agent's legacy rows say where they belong stops
-                    # being true of the history it described. Left standing it
-                    # would refuse every retry and the restored rows would
-                    # never be stamped.
-                    await self.db.execute_commit(
-                        f"DELETE FROM {STAMP_TABLE} WHERE agent_id = ?",
-                        (self.agent_id,),
-                    )
-
                     for (
                         role, content, metadata_json, model, provider,
                         created_at, deleted_at,
@@ -2843,6 +2833,16 @@ class AsyncStorage:
                             )
                         )
                         stats["messages_restored"] += 1
+
+            if stats.get("messages_restored"):
+                # The rows just written are from a backup taken before #3120's
+                # pass, so their legacy ones do not yet say which session they
+                # are in. Run it here rather than leave it to a restart: a
+                # lifecycle op on a restored session would otherwise be
+                # inferring membership from neighbours until one happened.
+                stamped = await stamp_legacy_sessions(self.db, self.agent_id)
+                stats["legacy_rows_stamped"] = stamped["stamped"]
+                stats["legacy_rows_refused"] = stamped["refused"]
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
     

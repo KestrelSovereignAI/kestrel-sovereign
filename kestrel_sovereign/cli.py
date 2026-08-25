@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from kestrel_sovereign import __version__
 from kestrel_sovereign.paths import load_project_env, spawned_agent_env
@@ -647,12 +647,46 @@ def cmd_storage(args) -> int:
     """Dispatch ``kestrel storage`` subcommands."""
     storage_commands = {
         "health": cmd_storage_health,
+        "stamp-sessions": cmd_storage_stamp_sessions,
     }
     handler = storage_commands.get(args.storage_command)
     if handler is None:
-        print("Usage: kestrel storage {health}")
+        print("Usage: kestrel storage {health,stamp-sessions}")
         return 1
     return handler(args)
+
+
+def cmd_storage_stamp_sessions(args) -> int:
+    """Write down which session each legacy conversation row is in (#3120).
+
+    Idempotent: a row that names its session is not a candidate, and a row this
+    refuses is refused again for the same reason. Run it as often as you like.
+    """
+    import asyncio
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.legacy_session_stamp import (
+        stamp_legacy_sessions,
+    )
+
+    async def run() -> Dict[str, int]:
+        db = await AsyncDatabase.sqlite(args.db)
+        try:
+            return await stamp_legacy_sessions(db, args.agent_id)
+        finally:
+            await db.close()
+
+    result = asyncio.run(run())
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(
+            f"{result['stamped']} legacy rows now name their session; "
+            f"{result['refused']} left as they stand (their own claim names a "
+            "different live session, and which is right is not this pass's to "
+            "decide — see the log for each)."
+        )
+    return 0
 
 
 async def _run_auth_login(args) -> int:
@@ -1846,6 +1880,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="GCS prefix used by GCSTarget (default: kestrel/)",
     )
     storage_health_p.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+    stamp_p = storage_sub.add_parser(
+        "stamp-sessions",
+        help="Write down which session each legacy conversation row is in",
+    )
+    stamp_p.add_argument("--db", required=True, help="Path to the agent's SQLite database")
+    stamp_p.add_argument(
+        "--agent-id",
+        default=None,
+        help="Only this agent (default: every agent in the database)",
+    )
+    stamp_p.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON"
     )
 

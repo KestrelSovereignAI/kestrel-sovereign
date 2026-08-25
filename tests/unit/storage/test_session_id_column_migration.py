@@ -28,10 +28,6 @@ import pytest
 
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.legacy_session_stamp import (
-    STAMP_DDL,
-    STAMP_TABLE,
-)
 from kestrel_sovereign.storage.session_grouping import group_messages_into_sessions
 from kestrel_sovereign.storage.session_id_column import (
     SESSION_ID_MAX_LENGTH,
@@ -108,19 +104,6 @@ def _seed_pre_migration_db(path: str) -> None:
                 "VALUES (?, ?, ?, ?)",
                 (AGENT, "user", label, metadata),
             )
-        # This corpus is about ONE question — which metadata values may be
-        # copied into the column — and #3120 asks a different one: which
-        # session a row is IN, which it then writes into the row's metadata so
-        # the column follows. Recording that agent as already stamped keeps the
-        # two apart, rather than asserting one rule against rows the other has
-        # rewritten.
-        conn.execute(STAMP_DDL)
-        conn.execute(
-            f"INSERT INTO {STAMP_TABLE} "
-            "(agent_id, rows_stamped, rows_refused, completed_at) "
-            "VALUES (?, 0, 0, CURRENT_TIMESTAMP)",
-            (AGENT,),
-        )
         conn.commit()
     finally:
         conn.close()

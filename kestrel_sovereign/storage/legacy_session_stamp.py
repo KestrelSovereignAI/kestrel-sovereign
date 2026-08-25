@@ -66,23 +66,6 @@ from .session_id_column import SESSION_ID_KEY, column_session_id
 
 logger = logging.getLogger(__name__)
 
-#: Records that an agent's legacy rows have been stamped.
-#:
-#: A marker rather than a probe of the rows, because "is there anything left to
-#: do" cannot be asked cheaply: the rows this leaves alone — a legacy cluster's
-#: own, a conflicting claim — look exactly like the rows it has not reached
-#: yet, so any probe over them stays true for ever and the work runs on every
-#: request. ``_init_schema`` runs on every ``from_pool()``, which is what made
-#: that the objection that stopped #3061.
-STAMP_TABLE = "conversation_session_stamped"
-
-STAMP_DDL = f"""CREATE TABLE IF NOT EXISTS {STAMP_TABLE} (
-    agent_id TEXT PRIMARY KEY,
-    rows_stamped INTEGER NOT NULL,
-    rows_refused INTEGER NOT NULL,
-    completed_at TIMESTAMP NOT NULL
-)"""
-
 #: How many rows one transaction rewrites.
 STAMP_BATCH = 200
 
@@ -115,15 +98,6 @@ def _null_safe_equality(backend_type: str) -> str:
     on its first post-upgrade boot for any agent that had work to do.
     """
     return "IS NOT DISTINCT FROM ?" if backend_type == "postgres" else "IS ?"
-
-
-def _ignore_conflict(backend_type: str) -> str:
-    """Leave a marker another initializer has already written.
-
-    Two of them plan the same agent, write the same rows through the same
-    compare-and-set, and arrive here together; the second is not an error.
-    """
-    return "ON CONFLICT (agent_id) DO NOTHING"
 
 
 class LegacyStamp(NamedTuple):
@@ -324,168 +298,101 @@ def _placements(rows: Sequence[Sequence[Any]]) -> Dict[Any, Optional[str]]:
     return placed
 
 
-async def _change_stamp(db: Any, agent_id: str) -> Optional[int]:
-    """How many row events the database has counted for this agent.
+async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict[str, int]:
+    """Write down each legacy row's session. Idempotent, and run on demand.
 
-    ``None`` when the ledger is not there to ask — a database old enough to
-    predate the #2959 triggers, where there is nothing to compare and the
-    compare-and-set is the only fence the pass has.
+    **Not a boot migration, and that is the finding this design came out of.**
+    It was one, gated by a per-agent marker, and three separate review findings
+    were the marker's rather than the work's: an agent DID left in a durable
+    table after a privacy purge, a completion record that could not be
+    published atomically against a concurrent restore, and an anti-join over
+    the whole transcript on every ``from_pool()`` to discover which agents
+    still needed it.
+
+    None of them is about stamping rows. They are all about knowing whether
+    stamping has happened — a question this does not need to ask, because
+    running it twice writes nothing the second time: a row that names its
+    session is not a candidate, and a row this refuses is refused again for the
+    same reason. So it is called instead of gated, from the two places that
+    reintroduce legacy rows and from ``kestrel storage stamp-sessions``.
+
+    Each of the list's three views is planned separately — each groups its OWN
+    rows — while a claim is resolved across all of them, because a claim names
+    a ROW and a row lives in exactly one view. Every write re-checks the
+    document its plan was made from, so a row rewritten under an unbounded read
+    is skipped rather than clobbered, and a pass that skipped one is simply run
+    again.
+
+    Returns ``{"stamped", "refused"}``.
     """
-    from .conversation_sessions import CHANGES_TABLE
-
-    if not await db.table_exists(CHANGES_TABLE):
-        return None
-    row = await db.fetchone(
-        f"SELECT COALESCE(SUM(changes), 0) FROM {CHANGES_TABLE} "
-        "WHERE agent_id = ?",
-        (agent_id,),
-    )
-    return int(row[0]) if row and row[0] is not None else 0
-
-
-async def stamp_legacy_sessions(db: Any) -> None:
-    """Write down each legacy row's session, once per agent (#3120).
-
-    Ordered AFTER the projection's schema pass so the change triggers exist:
-    the writes below bump the change stamp, the projection notices, and the
-    next repair derives from rows that now say where they belong. Before it,
-    the stamp would not move and a stored projection would go on describing
-    rows that had been rewritten underneath it.
-
-    Each agent is one gate, one plan and then bounded transactions. The plan is
-    read OUTSIDE them — it is unbounded, and holding a write transaction across
-    an unbounded read is what the projection's own rebuild refuses to do — so
-    every write re-checks the row it is about: ``WHERE metadata = ?`` against
-    the exact document the plan was made from. A row rewritten in between
-    simply is not stamped, and the marker is not written, so the next boot
-    plans again.
-    """
-    if not await db.table_exists("conversation_history"):
-        return
-    async with db.migration_lock(f"create_{STAMP_TABLE}"):
-        if not await db.table_exists(STAMP_TABLE):
-            await db.execute(STAMP_DDL)
-
-    agents = await db.fetchall(
-        f"SELECT DISTINCT agent_id FROM conversation_history c "
-        f"WHERE NOT EXISTS (SELECT 1 FROM {STAMP_TABLE} s "
-        f"WHERE s.agent_id = c.agent_id)",
-        (),
-    )
-    for (agent_id,) in agents:
-        await _stamp_one_agent(db, agent_id)
-
-
-async def _stamp_one_agent(db: Any, agent_id: str) -> None:
-    """Plan and write one agent's legacy rows, then record that it is done."""
-    # Imported here rather than at module scope: ``async_database`` imports
-    # this module, and this imports back through it.
+    # Imported here rather than at module scope: both import back through the
+    # database module this is called from.
     from .async_conversation_store import _rows_affected
 
-    # No lock around any of this. ``migration_lock`` opens a TRANSACTION —
-    # ``BEGIN IMMEDIATE`` on SQLite, a transaction-scoped advisory lock on
-    # PostgreSQL — so holding it here would put the unbounded transcript read
-    # and every "batch" inside one transaction, taking SQLite's writer slot for
-    # the whole pass and making ``STAMP_BATCH`` bound nothing at all.
-    #
-    # Correctness does not need it. Two initializers that plan the same agent
-    # write the same rows; the compare-and-set makes the second a no-op, and
-    # the marker's primary key makes the second insert one.
-    # Where every row stands, across all three views. A claim names a ROW, and
-    # a row lives in exactly one view — so the grouping is per view and this
-    # lookup is not, or a claim pointing out of the view being planned reads as
-    # "names nothing live" and the row is rewritten to whatever it neighbours.
-    #
-    # Each view read ONCE and kept, not read again to plan it: the grouping is
-    # global within a view, so the rows have to be in hand anyway, and reading
-    # them twice doubled both the cost and the peak for no answer that the
-    # first read did not already contain. Measured on a synthetic 100,000-row
-    # agent: one full pass, reads and grouping and writes, is 1.2 seconds.
-    by_view: List[Sequence[Sequence[Any]]] = []
-    placements: Dict[Any, Optional[str]] = {}
-    for where in _VIEWS:
-        view_rows = await db.fetchall(
-            _transcript_in_view(db.backend_type, where), (agent_id,)
-        )
-        by_view.append(view_rows)
-        for row_id, session in _placements(view_rows).items():
-            placements[row_id] = session
+    if not await db.table_exists("conversation_history"):
+        return {"stamped": 0, "refused": 0}
+    if agent_id is None:
+        agents = [
+            row[0]
+            for row in await db.fetchall(
+                "SELECT DISTINCT agent_id FROM conversation_history", ()
+            )
+        ]
+    else:
+        agents = [agent_id]
 
-    # What the database has counted for this agent, so the marker can say
-    # whether the pass saw everything. A row moved between views BETWEEN two of
-    # the reads below appears in neither plan, and without this the marker
-    # would record a completeness that never happened and refuse every retry.
-    before = await _change_stamp(db, agent_id)
+    total = {"stamped": 0, "refused": 0}
+    for agent in agents:
+        # Each view read ONCE and kept: the grouping is global within a view,
+        # so the rows have to be in hand anyway. Measured on a synthetic
+        # 100,000-row agent, a full pass is 1.2 seconds; on the live agents,
+        # twenty milliseconds.
+        by_view: List[Sequence[Sequence[Any]]] = []
+        placements: Dict[Any, Optional[str]] = {}
+        for where in _VIEWS:
+            view_rows = await db.fetchall(
+                _transcript_in_view(db.backend_type, where), (agent,)
+            )
+            by_view.append(view_rows)
+            for row_id, session in _placements(view_rows).items():
+                placements[row_id] = session
 
-    stamped = 0
-    planned = 0
-    conflicts: List[Tuple[int, str, str]] = []
-    # Each of the list's three views separately, because each groups its OWN
-    # rows and an agent whose legacy session is archived or in Trash would
-    # otherwise be recorded complete without those rows being read at all —
-    # and the marker would then refuse every retry, including after a restore.
-    for rows in by_view:
-        plan = plan_stamps(rows, placements)
-        planned += len(plan.stamps)
-        conflicts.extend(plan.conflicts)
-        for start in range(0, len(plan.stamps), STAMP_BATCH):
-            batch = plan.stamps[start:start + STAMP_BATCH]
-            async with db.transaction():
-                for stamp in batch:
-                    affected = await db.execute(
-                        "UPDATE conversation_history "
-                        "SET metadata = ?, session_id = ? "
-                        f"WHERE id = ? AND agent_id = ? AND metadata "
-                        f"{_null_safe_equality(db.backend_type)}",
-                        (
-                            stamp.metadata,
-                            stamp.session_id,
-                            stamp.row_id,
-                            agent_id,
-                            stamp.previous_metadata,
-                        ),
-                    )
-                    stamped += _rows_affected(affected)
+        stamped = 0
+        conflicts: List[Tuple[int, str, str]] = []
+        for rows in by_view:
+            plan = plan_stamps(rows, placements)
+            conflicts.extend(plan.conflicts)
+            for start in range(0, len(plan.stamps), STAMP_BATCH):
+                batch = plan.stamps[start:start + STAMP_BATCH]
+                async with db.transaction():
+                    for stamp in batch:
+                        affected = await db.execute(
+                            "UPDATE conversation_history "
+                            "SET metadata = ?, session_id = ? "
+                            f"WHERE id = ? AND agent_id = ? AND metadata "
+                            f"{_null_safe_equality(db.backend_type)}",
+                            (
+                                stamp.metadata,
+                                stamp.session_id,
+                                stamp.row_id,
+                                agent,
+                                stamp.previous_metadata,
+                            ),
+                        )
+                        stamped += _rows_affected(affected)
 
-    after = await _change_stamp(db, agent_id)
-    if before is not None and after is not None and after - before != stamped:
-        # Something other than this pass touched the agent's rows while it ran.
-        # Each stamp above is exactly one row event, so anything else is a row
-        # this pass may not have seen — and the marker is a claim that it saw
-        # them all. Not written; the next boot reads history as it now stands.
-        logger.info(
-            "%s: history moved under the pass for %s (%s events, %s of them "
-            "ours); the pass will run again (#3120)",
-            STAMP_TABLE, agent_id, after - before, stamped,
-        )
-        return
-
-    if stamped != planned:
-        # A row moved under the plan. The marker is the claim "this agent's
-        # legacy rows say where they belong", and it is not true yet, so it is
-        # not written: the next boot reads the rows as they now stand.
-        logger.info(
-            "%s: stamped %s of %s planned legacy rows for %s; a row was "
-            "rewritten under the plan, so the pass will run again (#3120)",
-            STAMP_TABLE, stamped, planned, agent_id,
-        )
-        return
-
-    for row_id, claimed, grouped in conflicts:
-        logger.warning(
-            "conversation row %s claims session %r and the transcript "
-            "groups it under %r; left as it stands (#3120)",
-            row_id, claimed, grouped,
-        )
-    await db.execute(
-        f"INSERT INTO {STAMP_TABLE} "
-        "(agent_id, rows_stamped, rows_refused, completed_at) "
-        f"VALUES (?, ?, ?, CURRENT_TIMESTAMP) {_ignore_conflict(db.backend_type)}",
-        (agent_id, stamped, len(conflicts)),
-    )
-    if stamped or conflicts:
-        logger.info(
-            "%s: %s legacy rows now name their session for %s, %s left as "
-            "they stand (#3120)",
-            STAMP_TABLE, stamped, agent_id, len(conflicts),
-        )
+        for row_id, claimed, grouped in conflicts:
+            logger.warning(
+                "conversation row %s claims session %r and the transcript "
+                "groups it under %r; left as it stands (#3120)",
+                row_id, claimed, grouped,
+            )
+        if stamped or conflicts:
+            logger.info(
+                "%s legacy rows now name their session for %s, %s left as "
+                "they stand (#3120)",
+                stamped, agent, len(conflicts),
+            )
+        total["stamped"] += stamped
+        total["refused"] += len(conflicts)
+    return total

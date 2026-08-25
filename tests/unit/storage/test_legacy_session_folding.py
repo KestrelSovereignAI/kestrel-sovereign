@@ -107,14 +107,12 @@ def _counting_transcript_passes(monkeypatch):
 
 
 async def _append_unstamped(db, minute):
-    """A row that names no session, written AFTER the database was opened.
+    """A row that names no session, written after the database was opened.
 
-    #3120's migration runs at boot and writes down which session a legacy row
-    is in, so a fixture that seeds one before opening no longer has one to test
-    with. It has not stopped being reachable: the write path derives an
-    implicit session id and returns ``None`` if that derivation raises, so a
-    row can still land unlabeled beside a session — which is precisely the
-    state these cases are about, and now precisely how they build it.
+    Which is how one actually arrives once #3120's pass has run over a
+    history: the write path derives an implicit session id and returns ``None``
+    if that derivation raises, so a row can still land unlabeled beside a
+    session. The frontier these cases are about is what covers it.
     """
     await db.execute(
         "INSERT INTO conversation_history "

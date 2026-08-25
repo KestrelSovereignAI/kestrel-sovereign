@@ -20,10 +20,7 @@ from uuid import uuid4
 import pytest
 
 from kestrel_sovereign.storage import AsyncStorage
-from kestrel_sovereign.storage.legacy_session_stamp import (
-    STAMP_TABLE,
-    stamp_legacy_sessions,
-)
+from kestrel_sovereign.storage.legacy_session_stamp import stamp_legacy_sessions
 
 SESSION = "stamped-session-3120"
 BASE = datetime(2026, 6, 1, 9, 0, 0)
@@ -61,13 +58,10 @@ async def test_the_migration_stamps_a_legacy_row_on_both_backends(db_backend):
         )
         ids.append(row[0])
 
-    # The agent was created before those rows existed, so its marker — if the
-    # boot pass wrote one — describes an empty history. Clear it and run the
-    # pass against the rows as they now stand.
-    await db.execute(
-        f"DELETE FROM {STAMP_TABLE} WHERE agent_id = ?", (agent_id,)
-    )
-    await stamp_legacy_sessions(db)
+    assert await stamp_legacy_sessions(db, agent_id) == {
+        "stamped": 1,
+        "refused": 0,
+    }
 
     stamped = await db.fetchone(
         "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
@@ -75,8 +69,4 @@ async def test_the_migration_stamps_a_legacy_row_on_both_backends(db_backend):
     )
     assert json.loads(stamped[0])["session_id"] == SESSION
     assert stamped[1] == SESSION
-    recorded = await db.fetchone(
-        f"SELECT rows_stamped FROM {STAMP_TABLE} WHERE agent_id = ?", (agent_id,)
-    )
-    assert recorded == (1,)
     await storage.close()

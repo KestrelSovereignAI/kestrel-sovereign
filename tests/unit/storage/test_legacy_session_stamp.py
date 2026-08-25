@@ -22,7 +22,6 @@ import pytest
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_sessions import live_transcript_sql
 from kestrel_sovereign.storage.legacy_session_stamp import (
-    STAMP_TABLE,
     plan_stamps,
     stamp_legacy_sessions,
 )
@@ -280,17 +279,14 @@ class TestWhatItLeavesAlone:
 
 class TestThePass:
     @pytest.mark.asyncio
-    async def test_it_writes_the_rows_and_records_that_it_did(self, tmp_path):
+    async def test_it_writes_the_rows_it_planned(self, tmp_path):
         path = tmp_path / "pass.db"
         _seed(path, [({"session_id": UUID_A}, 0), ({"session_id": "1"}, 5)])
 
         db = await AsyncDatabase.sqlite(str(path))
         try:
-            recorded = await db.fetchall(
-                f"SELECT agent_id, rows_stamped, rows_refused FROM {STAMP_TABLE}",
-                (),
-            )
-            assert recorded == [(AGENT, 1, 0)]
+            assert (await _metadata(db))[2] == ("1", None)
+            assert await stamp_legacy_sessions(db) == {"stamped": 1, "refused": 0}
             # Metadata AND the column, because a reader that consults one and
             # not the other is the shape #3098 was about.
             assert (await _metadata(db))[2] == (UUID_A, UUID_A)
@@ -298,16 +294,32 @@ class TestThePass:
             await db.close()
 
     @pytest.mark.asyncio
-    async def test_every_view_is_planned_before_the_marker_is_written(
-        self, tmp_path
-    ):
-        """Each of the list's three views groups its OWN rows.
+    async def test_a_second_pass_writes_nothing(self, tmp_path):
+        """Idempotent by construction, which is why it needs no marker.
 
-        An agent whose legacy session is archived, or in Trash, would otherwise
-        be recorded complete without those rows being read at all — and the
-        marker then refuses every retry, including after a restore, leaving a
-        lifecycle op to act on part of a session for ever.
+        A row that names its session is not a candidate, and a row this refuses
+        is refused again for the same reason — so "has this run" is a question
+        it never has to ask. Three separate review findings were that question's
+        rather than the work's: an agent DID left in a durable table after a
+        privacy purge, a completion record that could not be published
+        atomically against a concurrent restore, and an anti-join over the whole
+        transcript on every ``from_pool()``.
         """
+        path = tmp_path / "twice.db"
+        _seed(path, [({"session_id": UUID_A}, 0), ({"session_id": "1"}, 5)])
+
+        db = await AsyncDatabase.sqlite(str(path))
+        try:
+            assert await stamp_legacy_sessions(db) == {"stamped": 1, "refused": 0}
+            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0}
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_every_view_is_planned(self, tmp_path):
+        """Each of the list's three views groups its OWN rows, so each is
+        planned; a claim is resolved across all of them, because a claim names
+        a ROW and a row lives in exactly one."""
         path = tmp_path / "views.db"
         _seed(
             path,
@@ -319,48 +331,19 @@ class TestThePass:
             ],
         )
         conn = sqlite3.connect(str(path))
-        conn.execute("UPDATE conversation_history SET archived_at = ? WHERE id IN (3, 4)",
-                     ("2026-06-01 12:00:00",))
+        conn.execute(
+            "UPDATE conversation_history SET archived_at = ? WHERE id IN (3, 4)",
+            ("2026-06-01 12:00:00",),
+        )
         conn.commit()
         conn.close()
 
         db = await AsyncDatabase.sqlite(str(path))
         try:
+            await stamp_legacy_sessions(db)
             observed = await _metadata(db)
             assert observed[2] == (UUID_A, UUID_A), "the active view was not stamped"
             assert observed[4] == (UUID_B, UUID_B), "the archived view was not stamped"
-        finally:
-            await db.close()
-
-    @pytest.mark.asyncio
-    async def test_a_second_pass_writes_nothing(self, tmp_path):
-        """The marker is the gate, and it has to be: the rows this leaves alone
-        look exactly like the rows it has not reached, so any probe over them
-        stays true for ever and the work runs on every ``from_pool()``."""
-        path = tmp_path / "twice.db"
-        _seed(path, [({"session_id": UUID_A}, 0), ({"session_id": "1"}, 5)])
-
-        db = await AsyncDatabase.sqlite(str(path))
-        await db.close()
-
-        db = await AsyncDatabase.sqlite(str(path))
-        try:
-            planned = 0
-            original = db.execute
-
-            async def counting(query, params=(), *args, **kwargs):
-                nonlocal planned
-                if "UPDATE conversation_history" in query:
-                    planned += 1
-                return await original(query, params, *args, **kwargs)
-
-            db.execute = counting
-            await stamp_legacy_sessions(db)
-            assert planned == 0
-            recorded = await db.fetchall(
-                f"SELECT rows_stamped FROM {STAMP_TABLE}", ()
-            )
-            assert recorded == [(1,)]
         finally:
             await db.close()
 
@@ -370,18 +353,10 @@ class TestThePass:
     ):
         """The plan is read outside the write transactions, deliberately — it
         is unbounded. So every write re-checks the document it was made from,
-        and a pass that could not complete does not record that it did."""
+        and a row that moved is skipped rather than overwritten."""
         path = tmp_path / "raced.db"
         _seed(path, [({"session_id": UUID_A}, 0), ({"session_id": "1"}, 5)])
         db = await AsyncDatabase.sqlite(str(path))
-        await db.execute(
-            f"DELETE FROM {STAMP_TABLE} WHERE agent_id = ?", (AGENT,)
-        )
-        await db.execute(
-            "UPDATE conversation_history SET metadata = ?, session_id = NULL "
-            "WHERE id = 2",
-            (json.dumps({"session_id": "1"}),),
-        )
 
         from kestrel_sovereign.storage import legacy_session_stamp
 
@@ -399,8 +374,7 @@ class TestThePass:
 
         monkeypatch.setattr(legacy_session_stamp, "plan_stamps", stale)
         try:
-            await stamp_legacy_sessions(db)
+            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0}
             assert (await _metadata(db))[2] == ("1", None), "the row was clobbered"
-            assert await db.fetchall(f"SELECT 1 FROM {STAMP_TABLE}", ()) == []
         finally:
             await db.close()

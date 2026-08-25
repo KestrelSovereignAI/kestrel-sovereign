@@ -32,7 +32,9 @@ from kestrel_sovereign.storage.providers.base import StorageTier
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 from kestrel_sovereign.storage.conversation_created_at import created_at_bind
-from kestrel_sovereign.storage.legacy_session_stamp import STAMP_TABLE
+from kestrel_sovereign.storage.legacy_session_stamp import (
+    stamp_legacy_sessions,
+)
 from kestrel_sovereign.storage.session_id_column import column_session_id
 
 # Lazy-imported below inside import_agent — identity/__init__ pulls in
@@ -847,17 +849,6 @@ class SovereignStorageAdapter:
                     "DELETE FROM conversation_history WHERE agent_id = ?",
                     (self.agent_id,),
                 )
-                # And the claim that this agent's legacy rows say where they
-                # belong (#3120). The rows arriving below are from a backup
-                # taken before that pass ran; leaving the marker would make it
-                # true of history that is gone and refuse every retry, so the
-                # restored rows would stay unstamped for ever. Inside the same
-                # transaction as the delete: the two are one statement about
-                # the same history.
-                await self.db.execute(
-                    f"DELETE FROM {STAMP_TABLE} WHERE agent_id = ?",
-                    (self.agent_id,),
-                )
                 for msg in sorted(all_conversations, key=lambda m: m.get("id", 0)):
                     metadata_json = json.dumps(msg.get("metadata", {}))
                     # rendered_content (#1402) restored if present; older
@@ -902,6 +893,13 @@ class SovereignStorageAdapter:
                                 session_id,
                             ),
                         )
+
+            # The rows just written are from an export taken before #3120's
+            # pass, so their legacy ones do not yet say which session they are
+            # in. Run it here rather than leave it to a restart: a lifecycle op
+            # on an imported session would otherwise be inferring membership
+            # from neighbours until one happened.
+            await stamp_legacy_sessions(self.db, self.agent_id)
 
             # Asset restoration (#1391) — runs AFTER conversation
             # restore so a restorer failure surfaces against an
