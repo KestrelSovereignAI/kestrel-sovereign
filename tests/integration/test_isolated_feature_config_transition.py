@@ -225,7 +225,7 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
     agent.isolated_runtime_namespace = "tenant/agent"
     configure_hosted_isolated_runtime_lifecycle(
         agent,
-        idle_timeout_seconds=3600,
+        idle_timeouts={"IdleLifecycleFeature": 3600},
         telemetry_observer=snapshots.append,
     )
     monkeypatch.setenv(

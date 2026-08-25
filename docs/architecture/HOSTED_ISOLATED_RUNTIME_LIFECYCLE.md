@@ -42,8 +42,12 @@ a `HostedIsolatedRuntimeLifecyclePolicy` selected from the manager-owned agent
 name, DID, and local configuration before that agent is constructed.
 
 Lifecycle policy is accepted only with an explicit hosted root and namespace.
-The default timeout applies per isolated feature; the immutable override map can
-set a different positive timeout or disable retirement for an ingress producer.
+The default timeout applies per isolated feature only when the child explicitly
+declares `inbound_producer: false`. Missing or malformed producer metadata fails
+resident before the first event, because a quiet polling child cannot prove it
+has an independent wake source. The immutable override map is an explicit
+per-feature operator decision that can opt an ambiguous utility feature into a
+different positive timeout or disable retirement for an ingress producer.
 Standalone agents retain their existing always-resident behavior.
 
 The public lifecycle seam rejects unscoped agents and calls made after isolated

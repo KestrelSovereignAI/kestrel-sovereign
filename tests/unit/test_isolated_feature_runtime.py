@@ -229,6 +229,13 @@ class FakeIsolatedClient:
     async def health(self):
         return True
 
+    @property
+    def capabilities(self):
+        # Most tests model an outbound-only utility feature. Production
+        # children must make the same explicit declaration before the default
+        # hosted idle policy may retire an otherwise metadata-poor child.
+        return {"inbound_producer": False}
+
     async def list_tools(self):
         # Real wire contract: services advertise a JSON-Schema ``input_schema``
         # (kestrel_sdk.isolated_feature.protocol.ToolMetadata), NOT a bare
@@ -953,6 +960,7 @@ async def test_idle_ui_manifest_retains_last_published_contribution(monkeypatch,
         def capabilities(self):
             assert static_dir is not None
             return {
+                "inbound_producer": False,
                 "ui_contributions": {
                     "modules": ["panel.mjs"],
                     "css": [],
@@ -2173,6 +2181,7 @@ async def test_terminal_latch_clears_cancelled_monitor_for_immediate_rearm(
     assert feature._idle_monitor_task is None
     feature._terminal_lifecycle_latched = False
     feature._stopping = False
+    feature._client = FakeIsolatedClient()
     feature._start_idle_monitor()
 
     assert feature._idle_monitor_task is not None
@@ -2300,6 +2309,69 @@ async def test_incomplete_advertised_channel_remains_resident(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_unproven_legacy_inbound_producer_fails_resident_before_first_event(
+    monkeypatch, tmp_path
+):
+    class MetadataPoorProducer(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {"tools": {}}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = MetadataPoorProducer()
+    feature = ProxyFeature(
+        agent, _idle_test_runtime(), client_factory=lambda **_kwargs: client
+    )
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+
+    assert feature._observed_inbound_producer is False
+    assert feature._owns_inbound_producer() is True
+    assert not await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    assert client.stopped is False
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_named_idle_override_explicitly_allows_ambiguous_utility_feature(
+    monkeypatch, tmp_path
+):
+    class MetadataPoorUtility(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {"tools": {}}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeouts={"TestFeature": 3600},
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = MetadataPoorUtility()
+    feature = ProxyFeature(
+        agent, _idle_test_runtime(), client_factory=lambda **_kwargs: client
+    )
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+
+    assert feature._owns_inbound_producer() is False
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    assert client.stopped is True
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_observed_legacy_inbound_producer_latches_resident(monkeypatch, tmp_path):
     class MetadataPoorProducer(FakeIsolatedClient):
         @property
@@ -2414,6 +2486,68 @@ async def test_shutdown_cancels_owned_telemetry_tasks(monkeypatch, tmp_path):
 
     assert not feature._telemetry_observer_tasks
     assert not feature._telemetry_emit_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rate_limited_observer_retries_coalesced_idle_snapshot(
+    monkeypatch, tmp_path
+):
+    snapshots = []
+    ordinary_started = asyncio.Event()
+    cancel_ordinary = asyncio.get_running_loop().create_future()
+
+    async def observe(snapshot):
+        snapshots.append(snapshot)
+        if len(snapshots) == 2:
+            ordinary_started.set()
+            await cancel_ordinary
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=observe,
+    )
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_BASE_SECONDS", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_MAX_SECONDS", 0.02)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    for _ in range(100):
+        if snapshots and not feature._telemetry_emit_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    feature._last_telemetry_emit_monotonic = None
+    feature._schedule_runtime_telemetry()
+    await asyncio.wait_for(ordinary_started.wait(), timeout=1)
+    for _ in range(100):
+        if not feature._telemetry_emit_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    assert feature._telemetry_observer_emit_pending is True
+    assert feature._telemetry_observer_force_pending is True
+
+    cancel_ordinary.cancel()
+    for _ in range(200):
+        if snapshots and snapshots[-1].cleanup_eligible:
+            break
+        await asyncio.sleep(0.01)
+
+    assert snapshots[-1].state == "idle"
+    assert snapshots[-1].cleanup_eligible is True
+    assert feature._telemetry_observer_emit_pending is False
+    assert feature._telemetry_observer_force_pending is False
+    await feature.shutdown()
 
 
 @pytest.mark.asyncio

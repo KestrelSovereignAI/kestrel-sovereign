@@ -422,6 +422,11 @@ _PENDING_LEASE_EXPIRES_AT_KEY = "_isolated_pending_lease_expires_at"
 _EXTERNAL_INGRESS_QUIESCE = "external-ingress-quiesce"
 _EXTERNAL_INGRESS_RESUME = "external-ingress-resume"
 _EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
+# A child with no inbound producer may opt into default idle retirement by
+# declaring this initialize capability as exactly ``False``. Missing, malformed,
+# or true values fail resident because Core cannot infer whether stopping a
+# quiet child would remove its only source of future inbound traffic.
+_INBOUND_PRODUCER_CAPABILITY = "inbound_producer"
 
 # A service-to-host event is a JSON-RPC notification and therefore has no
 # response channel. An opted-in producer may wrap a channel inbound payload in
@@ -6063,6 +6068,7 @@ class ProxyFeature(Feature):
             if isinstance(agent_attributes, dict)
             else {}
         )
+        self._idle_timeout_explicit_override = self.name in feature_idle_timeouts
         self._idle_timeout_seconds = feature_idle_timeouts.get(
             self.name, default_idle_timeout
         )
@@ -6505,12 +6511,18 @@ class ProxyFeature(Feature):
             def consume_observer(completed: asyncio.Future[Any]) -> None:
                 self._telemetry_observer_tasks.discard(completed)
                 if completed.cancelled():
-                    if (
-                        not rate_limited
-                        and not self._terminal_lifecycle_latched
-                        and not self._stopping
-                    ):
+                    pending = self._telemetry_observer_emit_pending
+                    force_pending = self._telemetry_observer_force_pending
+                    self._telemetry_observer_emit_pending = False
+                    self._telemetry_observer_force_pending = False
+                    if self._terminal_lifecycle_latched or self._stopping:
+                        return
+                    if not rate_limited or force_pending:
+                        self._telemetry_emit_pending |= pending
+                        self._telemetry_emit_force_pending = True
                         self._schedule_forced_runtime_telemetry_retry()
+                    elif pending:
+                        self._schedule_runtime_telemetry(force=False)
                     return
                 failed = False
                 try:
@@ -12197,7 +12209,15 @@ class ProxyFeature(Feature):
             capabilities = self._client_capabilities()
             if "channel" in capabilities:
                 return True
-            return self._new_external_ingress_quiesce() is not None
+            if self._new_external_ingress_quiesce() is not None:
+                return True
+            declaration = capabilities.get(_INBOUND_PRODUCER_CAPABILITY)
+            if declaration is False:
+                return False
+            # A named override is an explicit host decision for this feature;
+            # the default policy may retire only a child that positively
+            # declares it has no unmanaged inbound producer.
+            return not self._idle_timeout_explicit_override
         except BaseException:  # noqa: BLE001 - ambiguous producer state fails resident
             return True
 
