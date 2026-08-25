@@ -679,8 +679,22 @@ class ConstitutionMixin:
         except Exception as exc:  # noqa: BLE001 - state failure must fail closed
             self._mark_constitution_state_unavailable(exc)
 
-    def _mark_constitution_state_unavailable(self, exc: Exception) -> None:
-        """Keep cognition blocked when authoritative state cannot be trusted."""
+    def _mark_constitution_state_unavailable(
+        self,
+        exc: Exception,
+        *,
+        cause: str = SafeModeCause.STATE_UNAVAILABLE.value,
+        read_failed: bool = True,
+    ) -> None:
+        """Keep cognition blocked when authoritative state cannot be trusted.
+
+        ``read_failed`` separates the two ways trust is lost. A failed READ
+        leaves the state unknown; a failed WRITE leaves it known but not
+        durable. Recording a write failure as a read outage made health report
+        an outage that never happened, and ``_constitution_state_load_error``
+        is a fact about reading — setting it for a write error is the same
+        confusion one field down.
+        """
         now = self._constitution_now()
         # Read BEFORE this call sets the flag, or it is always true and the
         # scoping below does nothing.
@@ -700,13 +714,13 @@ class ConstitutionMixin:
             or "Constitution runtime state unavailable"
         )
         self._safe_mode_cause = (
-            (self._safe_mode_cause if was_restricted else None)
-            or SafeModeCause.STATE_UNAVAILABLE.value
+            (self._safe_mode_cause if was_restricted else None) or cause
         )
         self._safe_mode_entered_at = (
             getattr(self, "_safe_mode_entered_at", None) or now
         )
-        self._constitution_state_load_error = type(exc).__name__
+        if read_failed:
+            self._constitution_state_load_error = type(exc).__name__
         self._constitution_audit_pending = False
         logging.critical(
             "CONSTITUTION STATE unavailable; remaining in Safe Mode (%s)",
@@ -767,6 +781,13 @@ class ConstitutionMixin:
             # no longer true. Leaving it set reported ``state_not_persisted``
             # for the rest of the process after one transient write error.
             self._constitution_state_persistence_pending = False
+            # The cause has to go with it. Health derives the same warning
+            # from the cause independently, so clearing only the boolean left
+            # the recovered snapshot still claiming it was never written.
+            if self._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value:
+                self._safe_mode_cause = (
+                    SafeModeCause.UNRECORDED.value if self._safe_mode else None
+                )
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
             # The write failed, so whatever this call was recording exists
@@ -777,7 +798,11 @@ class ConstitutionMixin:
             # at all while promising a latch that "clears only with an
             # authorized exit".
             self._constitution_state_persistence_pending = True
-            self._mark_constitution_state_unavailable(exc)
+            self._mark_constitution_state_unavailable(
+                exc,
+                cause=SafeModeCause.STATE_NOT_PERSISTED.value,
+                read_failed=False,
+            )
             return False
 
     async def _record_successful_constitution_audit(

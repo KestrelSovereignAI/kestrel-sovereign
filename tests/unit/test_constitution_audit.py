@@ -1324,3 +1324,59 @@ async def test_a_missing_identity_node_is_not_reported_as_a_read_outage(tmp_path
         assert agent._constitution_state_load_error is None
     finally:
         await storage2.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_is_not_recorded_as_a_read_outage(tmp_path):
+    """Nothing failed to READ, so nothing may say the state was unreadable."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        # A normal-mode checkpoint, with the agent NOT restricted.
+        await agent._record_successful_constitution_audit(source="startup")
+
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+        assert agent._constitution_state_load_error is None, (
+            "a write failure was recorded as a read outage"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_clears_the_not_persisted_cause_too(tmp_path):
+    """Health derives the warning from the cause as well as the flag."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        real_write = agent._constitution_state_store.write
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        await agent._record_successful_constitution_audit(source="startup")
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+
+        agent._constitution_state_store.write = real_write
+        await agent._record_successful_constitution_audit(source="startup")
+
+        assert agent._safe_mode_cause != SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "the recovered snapshot still claimed it was never written"
+        )
+        assert agent._constitution_state_persistence_pending is False
+    finally:
+        await storage.close()

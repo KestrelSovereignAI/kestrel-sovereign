@@ -1888,3 +1888,19 @@ def test_a_recorded_cause_is_not_dropped_when_another_failure_is_present():
 
     assert "cause_unrecorded" in record["failures"]
     assert "state_unavailable" in record["failures"]
+
+
+def test_a_missing_identity_is_not_downgraded_to_an_integrity_claim():
+    """`failure` must rank every cause the list can contain.
+
+    A value absent from the ranking matched nothing and fell through to the
+    fallback, so clients reading the single string — the lifecycle CLI among
+    them — were told the constitution failed when it had not.
+    """
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(_safe_mode_cause="identity_missing")
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert record["failures"] == ["identity_missing"]
+    assert record["failure"] == "identity_missing"

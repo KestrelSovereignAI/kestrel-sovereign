@@ -478,6 +478,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     # something milder than what is actually true.
     _SEVERITY = [
         "integrity_restriction",
+        "identity_missing",
         "bootstrap_incomplete",
         "cause_unrecorded",
         "state_unavailable",
