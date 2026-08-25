@@ -223,3 +223,9 @@ site.staging/
 **/*-dump.sql
 **/*.dump
 **/*.sql.gz
+
+# Scratch commit-message files. Agents (and humans) write a message to a file
+# and pass it to `git commit -F`; the file then sits untracked in the worktree
+# root where the next `git add -A` sweeps it into an unrelated commit. Ignoring
+# the pattern is cheaper than remembering to delete it every time.
+.git-commit-msg*.txt

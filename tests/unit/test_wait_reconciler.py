@@ -837,3 +837,156 @@ async def test_watched_handle_also_binds_its_origin(make_agent):
 
     await rec.reconcile()
     assert dispatcher.signals[0].session_id == "chat-sess-9"
+
+
+# ---------------------------------------------------------------------------
+# Delivery provenance (#3105)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_delivery_carries_no_retry_provenance(make_agent):
+    """A first attempt says so, and claims no prior delivery it never had."""
+    provider = _FakeProvider()
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _CapturingDispatcher()
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    payload = dispatcher.signals[0].payload
+    assert payload["delivery_attempt"] == 1
+    assert payload["delivery_max_attempts"] == MAX_DELIVERY_ATTEMPTS
+    assert payload["delivery_previous_status"] == ""
+    assert payload["delivery_previous_attempt_at"] == ""
+
+
+@pytest.mark.asyncio
+async def test_a_retry_is_distinguishable_from_a_first_delivery(make_agent):
+    """#3105: a retry after a soft-failed dispatch re-describes the SAME
+    terminal transition, so every subject-derived field is identical to the
+    first attempt's. The agent woken by it has to decide whether this is news;
+    with byte-identical payloads it cannot. The wake must carry its own
+    delivery provenance, not only its subject's state."""
+    provider = _FakeProvider()
+    provider.set("h1", Outcome.DONE)
+    quiet = _CapturingDispatcher(
+        status_override=Status.DROPPED_QUIET_HOURS,
+        error_override="inside quiet window",
+    )
+    rec = WaitReconciler(await make_agent(provider, quiet))
+
+    await rec.reconcile()          # attempt 1 enqueued
+    await rec.reconcile()          # harvest soft fail + re-enqueue attempt 2
+
+    first, retry = quiet.signals[0].payload, quiet.signals[1].payload
+    assert first["delivery_attempt"] == 1
+    assert retry["delivery_attempt"] == 2
+    assert retry["delivery_previous_status"] == "dropped_quiet_hours"
+    assert retry["delivery_previous_attempt_at"], (
+        "a retry must say when the attempt it is repeating was made"
+    )
+    # The whole point: the two wakes are no longer indistinguishable.
+    assert first != retry
+    # ...and they differ ONLY in provenance — the subject did not change.
+    provenance = {
+        "delivery_attempt",
+        "delivery_previous_status",
+        "delivery_previous_attempt_at",
+    }
+    assert {k for k in first if first[k] != retry[k]} == provenance
+
+
+@pytest.mark.asyncio
+async def test_poll_payload_cannot_understate_the_attempt_count(make_agent):
+    """Provenance is written AFTER the provider spread, for the same reason
+    ``origin_session_id`` is (#2877): a provider that forwards third-party
+    data must not be able to make a retry read as a first delivery."""
+    provider = _FakeProvider()
+    provider.set(
+        "h1", Outcome.DONE,
+        data={"delivery_attempt": 1, "delivery_previous_status": ""},
+    )
+    quiet = _CapturingDispatcher(
+        status_override=Status.DROPPED_QUIET_HOURS,
+        error_override="inside quiet window",
+    )
+    rec = WaitReconciler(await make_agent(provider, quiet))
+
+    await rec.reconcile()
+    await rec.reconcile()
+
+    retry = quiet.signals[1].payload
+    assert retry["delivery_attempt"] == 2, (
+        "the spread payload's claim must be overwritten, not honored"
+    )
+    assert retry["delivery_previous_status"] == "dropped_quiet_hours"
+
+
+@pytest.mark.asyncio
+async def test_a_corrected_terminal_state_is_news_not_a_retry(make_agent):
+    """Attempts belong to a TRANSITION, not to a handle (#3105 codex P2).
+
+    A provider is allowed to correct a terminal state within one Outcome —
+    talon's ``finished_unknown -> failed`` when the exit sidecar lands late —
+    and that correction re-signals by design. It is the first wake for a new
+    transition, so it must read as attempt 1 with no prior delivery. Counting
+    it as attempt 2 of the superseded transition is the same confusion the
+    provenance exists to remove, one field inward: it labels genuinely new
+    information as a repeat, and it brings the retry cap forward against work
+    that was never retried."""
+    provider = _FakeProvider()
+    provider.set("h1", Outcome.FAILED, data={"status": "finished_unknown"})
+    dispatcher = _CapturingDispatcher()
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    await rec.reconcile()                      # delivered; attempt 1 of token A
+    assert dispatcher.signals[0].payload["delivery_attempt"] == 1
+
+    provider.set("h1", Outcome.FAILED, data={"status": "failed"})
+    await rec.reconcile()                      # token B — a NEW transition
+
+    corrected = dispatcher.signals[1].payload
+    assert corrected["delivery_attempt"] == 1
+    assert corrected["delivery_previous_status"] == ""
+    assert corrected["delivery_previous_attempt_at"] == ""
+    # The counter restarted in the ledger too, so the cap counts THIS
+    # transition's retries rather than the handle's lifetime.
+    row = await rec._store.get("fake", "h1")
+    assert row.last_delivery_attempts == 1
+    assert row.attempts_signaled_target == "failed:failed"
+
+
+@pytest.mark.asyncio
+async def test_retry_reports_when_the_previous_dispatch_was_tried(make_agent):
+    """The previous-attempt stamp is the DISPATCH, not the harvest (#3105
+    codex P2).
+
+    Phase 0 rewrites ``last_delivery_attempt_at`` when it harvests, so that
+    column answers "when did the reconciler last look", not "when did we try".
+    On the live job behind #3105 those were 41 minutes apart: dispatched
+    19:37Z, failed on a 429 at 20:17Z, harvested immediately after. A retry
+    that reports 20:17 as the previous attempt understates how long the
+    transition has been undelivered, which is the one thing the reader is
+    using it to judge."""
+    provider = _FakeProvider()
+    provider.set("h1", Outcome.DONE)
+    quiet = _CapturingDispatcher(
+        status_override=Status.DROPPED_QUIET_HOURS,
+        error_override="inside quiet window",
+    )
+    rec = WaitReconciler(await make_agent(provider, quiet))
+
+    await rec.reconcile()
+    state = await rec._store.get("fake", "h1")
+    dispatched_at = state.pending_signal_enqueued_at
+    assert state.last_attempt_started_at == dispatched_at
+
+    await rec.reconcile()                      # harvest soft fail + retry
+    retry = quiet.signals[1].payload
+    assert retry["delivery_previous_attempt_at"] == str(dispatched_at)
+
+    # The harvest DID move last_delivery_attempt_at — the two columns answer
+    # different questions, and the payload must quote the dispatch one.
+    after = await rec._store.get("fake", "h1")
+    assert after.last_delivery_attempt_at != dispatched_at
