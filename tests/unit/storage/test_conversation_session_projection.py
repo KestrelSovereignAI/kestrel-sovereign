@@ -2458,18 +2458,18 @@ async def test_a_projection_row_is_dropped_when_its_session_stops_existing(seede
     so the row must go rather than linger as the newest "session" in a list
     ordered by ``last_message_at``.
 
-    **Three rows, and the third is #3098's.** B is a marker, a human turn, and
+    **Two rows, and the third is #3117's.** B is a marker, a human turn, and
     the unstamped reply that landed a minute later — which the grouper gives to
     B, because a row filed under nothing stays with the session it fell next
-    to, and which the projection has always counted in B. The purge used to
-    take two: it resolved a canonical session by metadata alone, so it left the
-    inherited row live to reappear under a session of its own. "Every row of a
-    session" is the list's answer or it is nothing.
+    to, and which the projection has always counted in B. The purge takes two:
+    it resolves a canonical session by the rows that NAME it, so the inherited
+    row stays live and reappears under a session of its own. That is the
+    subset #3098 measured and did not close.
     """
     db, store, projection = seeded
     assert await projection.get(UUID_B) is not None
 
-    assert await store.purge_conversation_session(UUID_B) == 3
+    assert await store.purge_conversation_session(UUID_B) == 2
 
     await projection.repair()
     assert await projection.get(UUID_B) is None
