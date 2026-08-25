@@ -1,4 +1,7 @@
-"""Invariant: the inline tool executor re-binds EVERY turn-scoped ContextVar.
+"""Regression: the inline tool executor re-binds ``_current_signal`` (#3112).
+
+Plus a live-context probe over the ContextVars this test publishes. This is
+NOT the completeness invariant — see SCOPE below and #3114.
 
 ``OrchestratorEngineMixin._make_inline_tool_executor`` is the seam where a tool
 runs on a task that is NOT the dispatching turn's task. The codex app-server
@@ -15,16 +18,36 @@ That mistake has been made four separate times in this one function:
 4. ``_current_signal``            (#3112) - the self_followup single-hop guard
    read ``None`` and stopped refusing, permitting an unbounded self-wake chain
 
-A fifth name added to the ``with`` block fixes instance four and nothing else.
-The durable form is this test: assert that the set of turn-scoped ContextVars
-the executor re-binds is COMPLETE, derived at runtime rather than enumerated by
-hand, so transport five fails loudly instead of a guard quietly not guarding.
+SCOPE — read this before trusting a green run.
+
+This test is NOT a completeness assertion, despite what an earlier draft of
+this docstring claimed. It enforces two things:
+
+1. A regression test for instance four specifically: ``_current_signal`` is
+   re-bound, carrying the turn's value, and is NOT manufactured when the turn
+   had none.
+2. A live-context probe: any ContextVar that THIS TEST publishes on the turn
+   and that the executor drops is caught, BY VALUE (so a re-bind carrying the
+   wrong value also fails).
 
 Method: ``contextvars.copy_context()`` enumerates every ContextVar *set* in a
 context. We snapshot what the turn published, dispatch through the real
 executor on a frozen-context task, snapshot again inside the tool, and require
-the second to cover the first BY VALUE (so a re-bind carrying the wrong value
-also fails).
+the second to cover the first.
+
+Why that is short of completeness: ``copy_context()`` only sees vars that are
+actually SET, so the probe's coverage is exactly the set this test's setup
+publishes — currently ``_current_signal`` and ``_part_collector``. Deleting
+the transition-lock or turn/session bind from the executor does NOT fail this
+test; that was verified by mutation. Publishing the other names here would buy
+coverage of today's list and still miss tomorrow's, moving the enumeration
+from the executor into this setup where it is harder to see.
+
+Real completeness has to derive the turn-scoped set from the DECLARATION site
+rather than from whatever a test happens to publish; the four live in four
+different modules with no registry or marker. That is tracked in #3114, which
+also records instances five and six (``_CURRENT_TURN_ID``, ``_CURRENT_CHAIN``)
+as already present in the tree and NOT covered here.
 """
 from __future__ import annotations
 
