@@ -436,12 +436,45 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     entered_at = getattr(agent, "_safe_mode_entered_at", None)
     if isinstance(entered_at, datetime):
         record["entered_at"] = entered_at.isoformat()
+    # Every cause that is true, not the first one an elif chain reaches.
+    # Several can hold at once — an audit can fail AND the store be
+    # unreachable — and the previous chain reported only the store, hiding a
+    # constitutional violation Amendment III requires be reported. It also
+    # made "integrity_restriction" the else branch, so a restriction with no
+    # other explanation was reported to the Sovereign as a violation of their
+    # constitution whether or not anything failed to verify (#2920).
+    failures: list[str] = []
     if audit_pending and not safe_mode:
-        record["failure"] = "startup_audit_required"
-    elif getattr(agent, "_constitution_state_load_error", None):
-        record["failure"] = "state_unavailable"
-    else:
-        record["failure"] = "integrity_restriction"
+        failures.append("startup_audit_required")
+    if getattr(agent, "_constitution_state_load_error", None):
+        failures.append("state_unavailable")
+    if getattr(agent, "_constitution_state_persistence_pending", False):
+        failures.append("state_not_persisted")
+    cause = getattr(agent, "_safe_mode_cause", None)
+    if safe_mode and cause == "integrity":
+        failures.append("integrity_restriction")
+    elif safe_mode and cause == "bootstrap":
+        failures.append("bootstrap_incomplete")
+    elif safe_mode and not failures:
+        # Restricted, with nothing recorded saying why. Named as such rather
+        # than attributed to integrity: an unrecorded cause is not evidence
+        # of a violation.
+        failures.append("cause_unrecorded")
+    record["failures"] = failures
+    # ``failure`` stays for readers that predate the list. It carries the
+    # gravest active cause, so a client reading one string is never told
+    # something milder than what is actually true.
+    _SEVERITY = [
+        "integrity_restriction",
+        "bootstrap_incomplete",
+        "cause_unrecorded",
+        "state_unavailable",
+        "state_not_persisted",
+        "startup_audit_required",
+    ]
+    record["failure"] = next(
+        (f for f in _SEVERITY if f in failures), "integrity_restriction"
+    )
     return record
 
 

@@ -7,6 +7,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
+from enum import Enum
 from datetime import datetime, timezone
 
 from kestrel_sovereign.command_policy import (
@@ -28,6 +29,32 @@ from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
 )
+
+
+class SafeModeCause(str, Enum):
+    """Why cognition is restricted.
+
+    Amendment III makes Safe Mode the response to *integrity* failure, and
+    requires any discrepancy to be reported to the Sovereign — on the stated
+    grounds that "the system cannot be permitted to lie about itself". So the
+    cause has to be recorded rather than inferred: reporting a store outage as
+    an integrity failure tells the Sovereign their constitution was violated
+    when it was not, and that is the lie the amendment exists to prevent.
+    """
+
+    #: The constitution did not verify. The only cause Amendment III names.
+    INTEGRITY = "integrity"
+    #: The governing constitution could not be assembled at startup.
+    BOOTSTRAP = "bootstrap"
+    #: Authoritative runtime state could not be READ. An availability fact.
+    STATE_UNAVAILABLE = "state_unavailable"
+    #: The restriction is held in memory only, because the store could not be
+    #: written. It is real, but it is not durable, and saying otherwise would
+    #: promise a latch that does not survive a restart.
+    STATE_NOT_PERSISTED = "state_not_persisted"
+    #: Restored from a durable record written before causes were recorded.
+    #: Deliberately not INTEGRITY: an unrecorded cause is not evidence of one.
+    UNRECORDED = "unrecorded"
 
 
 class ConstitutionMixin:
@@ -447,6 +474,7 @@ class ConstitutionMixin:
         self._constitution_state_load_error = None
         self._constitution_audit_pending = False
         self._constitution_state_persistence_pending = False
+        self._safe_mode_cause: Optional[str] = None
 
     def _constitution_now(self) -> datetime:
         """Return an aware UTC time, using the injected test clock if present."""
@@ -587,6 +615,12 @@ class ConstitutionMixin:
 
             self._safe_mode = state.safe_mode
             self._safe_mode_reason = state.safe_mode_reason
+            # The durable record predates cause recording, so the cause is not
+            # known. Calling it INTEGRITY would manufacture a constitutional
+            # violation out of a missing field.
+            self._safe_mode_cause = (
+                SafeModeCause.UNRECORDED.value if state.safe_mode else None
+            )
             self._safe_mode_entered_at = state.safe_mode_entered_at
             self._safe_mode_exited_at = state.safe_mode_exited_at
             self._safe_mode_exit_authorization = (
@@ -619,7 +653,8 @@ class ConstitutionMixin:
                 and not self._safe_mode
             ):
                 await self.enter_safe_mode(
-                    "Agent identity node missing during constitutional restore"
+                    "Agent identity node missing during constitutional restore",
+                    cause=SafeModeCause.STATE_UNAVAILABLE.value,
                 )
             if self._safe_mode:
                 logging.critical(
@@ -632,7 +667,15 @@ class ConstitutionMixin:
         """Keep cognition blocked when authoritative state cannot be trusted."""
         now = self._constitution_now()
         self._safe_mode = True
-        self._safe_mode_reason = "Constitution runtime state unavailable"
+        # Does NOT overwrite an existing reason. An integrity finding followed
+        # by a failed state read used to be reported as "state unavailable",
+        # which hid a constitutional violation Amendment III requires be
+        # reported. The availability fact has its own home below; it does not
+        # need this slot, and taking it downgraded the stronger claim.
+        self._safe_mode_reason = (
+            self._safe_mode_reason or "Constitution runtime state unavailable"
+        )
+        self._safe_mode_cause = self._safe_mode_cause or SafeModeCause.STATE_UNAVAILABLE.value
         self._safe_mode_entered_at = (
             getattr(self, "_safe_mode_entered_at", None) or now
         )
@@ -669,6 +712,9 @@ class ConstitutionMixin:
             self._safe_mode_reason = (
                 self._safe_mode_reason
                 or "Constitution runtime state not initialized"
+            )
+            self._safe_mode_cause = (
+                self._safe_mode_cause or SafeModeCause.STATE_NOT_PERSISTED.value
             )
             self._safe_mode_entered_at = (
                 self._safe_mode_entered_at or self._constitution_now()
@@ -789,7 +835,8 @@ class ConstitutionMixin:
             governing = await self._get_governing_constitution()
             if governing.startswith("Error:"):
                 await self.enter_safe_mode(
-                    f"Startup constitution bootstrap failed: {governing}"
+                    f"Startup constitution bootstrap failed: {governing}",
+                    cause=SafeModeCause.BOOTSTRAP.value,
                 )
                 return
         is_valid, message = await self._verify_constitution_integrity()
@@ -1198,12 +1245,24 @@ class ConstitutionMixin:
         logging.info("Spawn mandate constraints verified successfully")
         return True, "Spawn mandate constraints verified"
 
-    async def enter_safe_mode(self, reason: str):
-        """Enter Safe Mode and durably record the security boundary."""
-        async with ConstitutionMixin._constitution_state_guard(self):
-            return await ConstitutionMixin._enter_safe_mode_locked(self, reason)
+    async def enter_safe_mode(
+        self, reason: str, *, cause: str = SafeModeCause.INTEGRITY.value
+    ):
+        """Enter Safe Mode and durably record the security boundary.
 
-    async def _enter_safe_mode_locked(self, reason: str) -> bool:
+        ``cause`` defaults to INTEGRITY because that is what Amendment III
+        names, and every caller that does not say otherwise is reporting a
+        failed verification. Callers restricting cognition for a different
+        reason must say so — the report must not have to guess.
+        """
+        async with ConstitutionMixin._constitution_state_guard(self):
+            return await ConstitutionMixin._enter_safe_mode_locked(
+                self, reason, cause=cause
+            )
+
+    async def _enter_safe_mode_locked(
+        self, reason: str, *, cause: str = SafeModeCause.INTEGRITY.value
+    ) -> bool:
         """Locked implementation of :meth:`enter_safe_mode`."""
         # Record agent consent before entering safe mode
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
@@ -1220,6 +1279,7 @@ class ConstitutionMixin:
         was_already_safe = self._safe_mode
         self._safe_mode = True
         self._safe_mode_reason = reason
+        self._safe_mode_cause = cause
         self._safe_mode_entered_at = (
             (getattr(self, "_safe_mode_entered_at", None) or now)
             if was_already_safe

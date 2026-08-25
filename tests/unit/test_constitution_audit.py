@@ -1015,3 +1015,58 @@ async def test_verifier_fails_closed_on_governing_source_mutation(governing_sour
     ok, msg = await agent._verify_constitution_integrity()
     assert not ok
     assert "modified" in msg
+
+
+@pytest.mark.asyncio
+async def test_a_store_outage_does_not_overwrite_an_integrity_finding(tmp_path):
+    """The clobber that made the previous attempt at this defect fail.
+
+    An integrity failure followed by an unreadable store used to report
+    "Constitution runtime state unavailable" — the availability fact taking
+    the slot the integrity finding was in. Amendment III requires the
+    discrepancy be reported to the Sovereign, and it had been overwritten.
+
+    The availability fact has its own home (``_constitution_state_load_error``)
+    and does not need this slot.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    try:
+        await agent.enter_safe_mode("governing bytes changed")
+        assert agent._safe_mode_cause == SafeModeCause.INTEGRITY.value
+
+        agent._mark_constitution_state_unavailable(RuntimeError("disk is full"))
+
+        assert agent._safe_mode_reason == "governing bytes changed", (
+            "the store outage overwrote the integrity finding"
+        )
+        assert agent._safe_mode_cause == SafeModeCause.INTEGRITY.value
+        # ...and the availability fact is still recorded, in its own field.
+        assert agent._constitution_state_load_error == "RuntimeError"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_store_outage_alone_is_not_recorded_as_an_integrity_cause(tmp_path):
+    """With nothing else wrong, the cause is availability, not integrity."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    try:
+        agent._mark_constitution_state_unavailable(RuntimeError("disk is full"))
+
+        assert agent._safe_mode is True
+        assert agent._safe_mode_cause == SafeModeCause.STATE_UNAVAILABLE.value
+        assert agent._safe_mode_cause != SafeModeCause.INTEGRITY.value
+    finally:
+        await storage.close()
