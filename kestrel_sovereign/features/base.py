@@ -1284,6 +1284,32 @@ class Feature(_SdkFeature):
             return session_id.strip()
         return None
 
+    def _owns_live_turn(self) -> bool:
+        """True when this feature call is running inside the agent's live turn.
+
+        Use this — not ``_turn_session_id()`` truthiness — for any guard that
+        asks "is this agent-authored, in-turn work?". ``_turn_session_id()``
+        answers None for a live turn that simply has no chat session, which is
+        indistinguishable from a caller with no turn at all; a guard built on
+        it refuses legitimate session-less turns and is the reason #3112's
+        first in-turn check was wrong.
+
+        False for an agent that does not implement the accessor. That is
+        deliberately the SAFE direction for a refusal guard: an agent double
+        we cannot interrogate is treated as not-in-turn rather than waved
+        through.
+        """
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return False
+        resolve = getattr(agent, "owns_live_turn", None)
+        if not callable(resolve):
+            return False
+        try:
+            return bool(resolve())
+        except Exception:  # pragma: no cover - defensive; stub agents
+            return False
+
     async def execute_as_subagent(
         self,
         task: str,

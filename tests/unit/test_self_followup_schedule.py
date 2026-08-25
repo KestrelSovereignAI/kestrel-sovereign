@@ -28,6 +28,7 @@ import pytest_asyncio
 from kestrel_sdk.signals import Signal, SignalMode, Status, Visibility
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features.scheduler.constants import (
     MISSED_COGNITION_STATUS,
 )
@@ -59,8 +60,16 @@ SOURCE = cron_source_name(SELF_FOLLOWUP)
 SENTINEL = "verify-PR-3096-CI-then-merge-XYZZY"
 
 
-class _FakeAgent(SleepMixin):
-    """Minimal agent that records the turns a dispatch actually produced."""
+class _FakeAgent(SleepMixin, TurnLifecycleMixin):
+    """Minimal agent that records the turns a dispatch actually produced.
+
+    Inherits the REAL :class:`TurnLifecycleMixin` rather than stubbing turn
+    ownership. ``_owns_live_turn`` is the guard these tests exercise, so a
+    double that simply answered True would assert the thing under test
+    instead of exercising it; with the real mixin, ``owns_live_turn()`` is
+    true only inside ``async with agent._turn_lifecycle()`` and false the
+    instant that block exits, which is the actual production contract.
+    """
 
     did = "did:test:self-followup"
     agent_name = "followup-test"
@@ -71,6 +80,8 @@ class _FakeAgent(SleepMixin):
         self.turn_prompts: list[str] = []
         self.turn_kwargs: list[dict] = []
         self.turn_session_id: str | None = None
+        self._live_turn_id: str | None = None
+        self._active_session_id: str | None = None
 
     async def process_input(self, prompt, **kwargs):
         self.turn_prompts.append(prompt)
@@ -133,17 +144,32 @@ async def _drain(agent):
         await asyncio.gather(*pending, return_exceptions=True)
 
 
-async def _schedule(feature, *, intent=SENTINEL, seconds_ago=5, **kwargs):
-    """Persist a follow-up already due, through the real tool."""
+async def _schedule(
+    feature, *, intent=SENTINEL, seconds_ago=5, in_turn=True, **kwargs
+):
+    """Persist a follow-up already due, through the real tool.
+
+    Runs inside a REAL turn by default, because that is how production
+    reaches this tool: the agent forms the intention during its own
+    cognition turn. ``in_turn=False`` reproduces the out-of-turn caller the
+    provenance guard exists to refuse.
+    """
     run_at = (
         datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
     ).isoformat()
-    return await feature.schedule_add_deadline(
-        run_at=run_at,
-        task_name=SELF_FOLLOWUP,
-        args_json=json.dumps({"intent": intent}),
-        **kwargs,
-    )
+
+    async def _call():
+        return await feature.schedule_add_deadline(
+            run_at=run_at,
+            task_name=SELF_FOLLOWUP,
+            args_json=json.dumps({"intent": intent}),
+            **kwargs,
+        )
+
+    if not in_turn:
+        return await _call()
+    async with feature.agent._turn_lifecycle():
+        return await _call()
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +542,48 @@ def test_every_scheduler_tool_is_classified_read_only_or_mutating(
 
 
 @pytest.mark.asyncio
+async def test_out_of_turn_caller_is_refused(followup_env):
+    """No waking signal and no live turn: the intent is not agent-authored.
+
+    The source registers ``Trust.TRUSTED`` on the stated ground that the
+    intention was authored by this agent inside its own turn. A caller with
+    neither has no such provenance, so accepting would make the registration
+    a lie about the payload.
+    """
+    _agent, feature, _runner, db, _backend = followup_env
+
+    result = await _schedule(feature, in_turn=False)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data.get("refused") == "no_in_turn_origin"
+    rows = await db.fetchall(
+        "SELECT id FROM scheduled_tasks WHERE task_name = ?", (SELF_FOLLOWUP,)
+    )
+    assert not rows, "an out-of-turn caller persisted a TRUSTED wake"
+
+
+@pytest.mark.asyncio
+async def test_session_less_turn_is_accepted(followup_env):
+    """A live turn with no chat window is still agent-authored.
+
+    The guard this replaced asked ``_turn_session_id()`` for truthiness, which
+    answers None for an unattended turn exactly as it does for a caller with
+    no turn at all. That conflation refused legitimate unattended follow-ups
+    — the very case the feature exists for (#3112 review).
+    """
+    agent, feature, _runner, _db, _backend = followup_env
+    agent.turn_session_id = None
+
+    result = await _schedule(feature)
+
+    assert result.status is ToolResultStatus.OK, (
+        "a session-less live turn must not be mistaken for an out-of-turn "
+        "caller"
+    )
+    assert result.data["self_followup"]["session_bound"] is False
+
+
+@pytest.mark.asyncio
 async def test_caller_supplied_origin_session_is_refused(followup_env):
     """Rule 2: the wake's target window is resolved locally, never supplied.
 
@@ -524,13 +592,21 @@ async def test_caller_supplied_origin_session_is_refused(followup_env):
     """
     _agent, feature, _runner, _db, _backend = followup_env
 
-    result = await feature.schedule_add_deadline(
-        run_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-        task_name=SELF_FOLLOWUP,
-        args_json=json.dumps(
-            {"intent": SENTINEL, "origin_session_id": "someone-elses-window"}
-        ),
-    )
+    # Inside a real turn, so the refusal under test is the origin_session_id
+    # rule and not the earlier out-of-turn provenance guard.
+    async with feature.agent._turn_lifecycle():
+        result = await feature.schedule_add_deadline(
+            run_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+            task_name=SELF_FOLLOWUP,
+            args_json=json.dumps(
+                {
+                    "intent": SENTINEL,
+                    "origin_session_id": "someone-elses-window",
+                }
+            ),
+        )
     assert result.status is ToolResultStatus.ERROR
     assert "origin_session_id" in result.error
 
@@ -549,11 +625,16 @@ async def test_unusable_followup_args_are_refused(followup_env, args, expected):
     """An empty or malformed intention would fire a turn with nothing to act on."""
     _agent, feature, _runner, db, _backend = followup_env
 
-    result = await feature.schedule_add_deadline(
-        run_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-        task_name=SELF_FOLLOWUP,
-        args_json=json.dumps(args),
-    )
+    # Inside a real turn: the refusal under test is the malformed-intent
+    # rule, not the earlier out-of-turn provenance guard.
+    async with feature.agent._turn_lifecycle():
+        result = await feature.schedule_add_deadline(
+            run_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+            task_name=SELF_FOLLOWUP,
+            args_json=json.dumps(args),
+        )
     assert result.status is ToolResultStatus.ERROR
     assert expected in result.error.lower() or expected in result.error
     rows = await db.fetchall(
@@ -608,11 +689,12 @@ async def test_delay_seconds_resolves_against_the_database_clock(followup_env):
     _agent, feature, _runner, db, _backend = followup_env
 
     before = datetime.now(timezone.utc)
-    result = await feature.schedule_add_deadline(
-        task_name=SELF_FOLLOWUP,
-        args_json=json.dumps({"intent": SENTINEL}),
-        delay_seconds=1200,
-    )
+    async with feature.agent._turn_lifecycle():
+        result = await feature.schedule_add_deadline(
+            task_name=SELF_FOLLOWUP,
+            args_json=json.dumps({"intent": SENTINEL}),
+            delay_seconds=1200,
+        )
     assert result.status is ToolResultStatus.OK
 
     row = await db.fetchone(
@@ -632,25 +714,28 @@ async def test_deadline_needs_exactly_one_of_run_at_or_delay(followup_env):
     _agent, feature, _runner, _db, _backend = followup_env
     args = json.dumps({"intent": SENTINEL})
 
-    both = await feature.schedule_add_deadline(
-        run_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-        task_name=SELF_FOLLOWUP,
-        args_json=args,
-        delay_seconds=60,
-    )
-    assert both.status is ToolResultStatus.ERROR
-    assert "not both" in both.error
+    async with feature.agent._turn_lifecycle():
+        both = await feature.schedule_add_deadline(
+            run_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+            task_name=SELF_FOLLOWUP,
+            args_json=args,
+            delay_seconds=60,
+        )
+        assert both.status is ToolResultStatus.ERROR
+        assert "not both" in both.error
 
-    neither = await feature.schedule_add_deadline(
-        task_name=SELF_FOLLOWUP, args_json=args
-    )
-    assert neither.status is ToolResultStatus.ERROR
-    assert "delay_seconds" in neither.error
+        neither = await feature.schedule_add_deadline(
+            task_name=SELF_FOLLOWUP, args_json=args
+        )
+        assert neither.status is ToolResultStatus.ERROR
+        assert "delay_seconds" in neither.error
 
-    bad = await feature.schedule_add_deadline(
-        task_name=SELF_FOLLOWUP, args_json=args, delay_seconds=0
-    )
-    assert bad.status is ToolResultStatus.ERROR
+        bad = await feature.schedule_add_deadline(
+            task_name=SELF_FOLLOWUP, args_json=args, delay_seconds=0
+        )
+        assert bad.status is ToolResultStatus.ERROR
 
 
 # ---------------------------------------------------------------------------

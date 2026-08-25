@@ -2563,7 +2563,12 @@ class SchedulerFeature(Feature):
         #    TRUSTED. Refuse: caller-authored intent is a different feature
         #    with a strictly larger blast radius, and refusing it costs
         #    nothing anyone asked for.
-        if current is None and not (self._turn_session_id() or ""):
+        #    Asks ownership of the LIVE turn, not for a session id: a live
+        #    turn with no chat session is still agent-authored, and
+        #    ``_turn_session_id()`` answers None for it exactly as it does
+        #    for a caller with no turn — the same absence-means-two-things
+        #    conflation this branch exists to refuse.
+        if current is None and not self._owns_live_turn():
             return ToolResult.failed(
                 f"'{SELF_FOLLOWUP_TASK_NAME}' carries THIS agent's own "
                 "intention across its own turn boundary, so it may only be "
