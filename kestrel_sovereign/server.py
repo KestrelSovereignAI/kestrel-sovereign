@@ -459,6 +459,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "bootstrap": "bootstrap_incomplete",
         "state_unavailable": "state_unavailable",
         "state_not_persisted": "state_not_persisted",
+        "identity_missing": "identity_missing",
         "unrecorded": "cause_unrecorded",
     }
     cause = getattr(agent, "_safe_mode_cause", None)

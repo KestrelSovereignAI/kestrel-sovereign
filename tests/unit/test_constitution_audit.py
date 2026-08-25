@@ -1208,3 +1208,119 @@ async def test_a_failed_write_marks_the_latch_as_not_durable(tmp_path):
         )
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_buffered_cause_survives_the_restore_that_persists_it(tmp_path):
+    """A pre-initialization entry must not be written with the old row's cause.
+
+    Restoring the prior state overwrites the buffered cause before the
+    pending entry is persisted, so the new restriction landed on disk
+    carrying the previous cause or none — and reported the wrong thing after
+    the next restart.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    db = str(tmp_path / "agent.db")
+
+    # An agent with an existing, non-restricted durable row.
+    storage = AsyncStorage(db)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    await first._initialize_constitution_runtime_state()
+    try:
+        await first._record_successful_constitution_audit(source="startup")
+    finally:
+        await storage.close()
+
+    # A new process restricts cognition BEFORE its store is connected.
+    storage2 = AsyncStorage(db)
+    await storage2.initialize()
+    agent = _DurableConstitutionHarness(storage2, now)
+    try:
+        await agent.enter_safe_mode(
+            "decryption failures",
+            cause=SafeModeCause.STATE_UNAVAILABLE.value,
+        )
+        assert agent._constitution_state_persistence_pending is True
+
+        await agent._initialize_constitution_runtime_state()
+
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert persisted.safe_mode is True
+        assert persisted.safe_mode_cause == SafeModeCause.STATE_UNAVAILABLE.value, (
+            "the buffered cause was replaced by the restored row's"
+        )
+    finally:
+        await storage2.close()
+
+
+@pytest.mark.asyncio
+async def test_a_durable_write_clears_the_not_persisted_warning(tmp_path):
+    """One transient failure must not mark the process forever."""
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        real_write = agent._constitution_state_store.write
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("database is locked")
+        )
+        await agent.enter_safe_mode("governing bytes changed")
+        assert agent._constitution_state_persistence_pending is True
+
+        # The store recovers and a later entry writes through.
+        agent._constitution_state_store.write = real_write
+        await agent.enter_safe_mode("governing bytes changed")
+
+        assert agent._constitution_state_persistence_pending is False, (
+            "a recovered store still reported the latch as non-durable"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_missing_identity_node_is_not_reported_as_a_read_outage(tmp_path):
+    """The state was read successfully; the identity it describes is gone.
+
+    Labelling that STATE_UNAVAILABLE makes health report an outage that did
+    not happen. It is a discrepancy — which Amendment III requires be
+    reported — so it gets its own name rather than a neighbour's.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    db = str(tmp_path / "agent.db")
+
+    # A completed durable row: audited, not awaiting bootstrap.
+    storage = AsyncStorage(db)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    await first._initialize_constitution_runtime_state()
+    try:
+        await first._record_successful_constitution_audit(source="startup")
+    finally:
+        await storage.close()
+
+    # Same row, but the identity node it describes is no longer there.
+    storage2 = AsyncStorage(db)
+    await storage2.initialize()
+    agent = _DurableConstitutionHarness(storage2, now)
+    try:
+        await agent._initialize_constitution_runtime_state(is_new_identity=True)
+
+        assert agent._safe_mode is True
+        assert agent._safe_mode_cause == SafeModeCause.IDENTITY_MISSING.value
+        assert agent._safe_mode_cause != SafeModeCause.STATE_UNAVAILABLE.value
+        # The read itself succeeded, so nothing may claim otherwise.
+        assert agent._constitution_state_load_error is None
+    finally:
+        await storage2.close()

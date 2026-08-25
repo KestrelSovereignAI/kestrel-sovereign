@@ -1867,6 +1867,7 @@ def test_every_recorded_cause_maps_to_its_own_name():
         "bootstrap": "bootstrap_incomplete",
         "state_unavailable": "state_unavailable",
         "state_not_persisted": "state_not_persisted",
+        "identity_missing": "identity_missing",
         "unrecorded": "cause_unrecorded",
     }
     for cause, name in expected.items():

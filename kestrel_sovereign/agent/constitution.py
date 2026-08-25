@@ -52,6 +52,11 @@ class SafeModeCause(str, Enum):
     #: written. It is real, but it is not durable, and saying otherwise would
     #: promise a latch that does not survive a restart.
     STATE_NOT_PERSISTED = "state_not_persisted"
+    #: Durable state read cleanly, but the identity node it describes is
+    #: gone. Not an outage — the read succeeded — and not a hash mismatch
+    #: either. Amendment III requires the discrepancy be reported, so it is
+    #: named rather than folded into a neighbour.
+    IDENTITY_MISSING = "identity_missing"
     #: Restored from a durable record written before causes were recorded.
     #: Deliberately not INTEGRITY: an unrecorded cause is not evidence of one.
     UNRECORDED = "unrecorded"
@@ -569,12 +574,17 @@ class ConstitutionMixin:
         )
         pending_reason = self._safe_mode_reason
         pending_entered_at = self._safe_mode_entered_at
+        # Captured with the rest: restoring the prior row overwrites the
+        # buffered cause before this is persisted, so the new restriction
+        # would be written with the previous row's cause or none at all.
+        pending_cause = vars(self).get("_safe_mode_cause")
 
         async def persist_pending_entry(store) -> None:
             if not pending_entry:
                 return
             self._safe_mode = True
             self._safe_mode_reason = pending_reason
+            self._safe_mode_cause = pending_cause
             self._safe_mode_entered_at = pending_entered_at
             self._safe_mode_exited_at = None
             self._safe_mode_exit_authorization = None
@@ -660,7 +670,7 @@ class ConstitutionMixin:
             ):
                 await self.enter_safe_mode(
                     "Agent identity node missing during constitutional restore",
-                    cause=SafeModeCause.STATE_UNAVAILABLE.value,
+                    cause=SafeModeCause.IDENTITY_MISSING.value,
                 )
             if self._safe_mode:
                 logging.critical(
@@ -753,6 +763,10 @@ class ConstitutionMixin:
                 event_reason=event_reason,
                 event_authorization=event_authorization,
             )
+            # The snapshot is on disk, so whatever earlier failure set this is
+            # no longer true. Leaving it set reported ``state_not_persisted``
+            # for the rest of the process after one transient write error.
+            self._constitution_state_persistence_pending = False
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
             # The write failed, so whatever this call was recording exists
