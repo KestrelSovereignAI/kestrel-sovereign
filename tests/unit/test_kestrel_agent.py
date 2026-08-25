@@ -3884,7 +3884,6 @@ class TestInvocationContextEndToEndThreading:
     def test_process_input_streaming_accepts_positional_model_override(self):
         """Same backwards-compat cover for the streaming entry point."""
         import inspect as _inspect
-        from kestrel_sovereign.agent.streaming import StreamingMixin
         sig = _inspect.signature(StreamingMixin.process_input_streaming)
         params = list(sig.parameters.values())
         assert params[1].name == "user_input"
