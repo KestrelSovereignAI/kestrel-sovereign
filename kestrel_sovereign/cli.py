@@ -669,9 +669,31 @@ def cmd_storage_stamp_sessions(args) -> int:
         stamp_legacy_sessions,
     )
 
+    if bool(args.db) == bool(args.dsn):
+        print(
+            "error: give exactly one of --db (SQLite path) or --dsn "
+            "(PostgreSQL connection string).",
+            file=sys.stderr,
+        )
+        return 2
+    if args.db and not os.path.exists(args.db):
+        # Opening a path that is not there CREATES it, initialises a schema and
+        # reports zero rows stamped — a misspelling would look like success
+        # while the database meant stayed untouched.
+        print(f"error: no database at {args.db}", file=sys.stderr)
+        return 2
+
     async def run() -> Dict[str, int]:
-        db = await AsyncDatabase.sqlite(args.db)
+        db = (
+            await AsyncDatabase.postgres(args.dsn)
+            if args.dsn
+            else await AsyncDatabase.sqlite(args.db)
+        )
         try:
+            if not await db.table_exists("conversation_history"):
+                raise SystemExit(
+                    f"error: {args.dsn or args.db} holds no conversation history"
+                )
             return await stamp_legacy_sessions(db, args.agent_id)
         finally:
             await db.close()
@@ -1886,7 +1908,8 @@ def build_parser() -> argparse.ArgumentParser:
         "stamp-sessions",
         help="Write down which session each legacy conversation row is in",
     )
-    stamp_p.add_argument("--db", required=True, help="Path to the agent's SQLite database")
+    stamp_p.add_argument("--db", help="Path to an existing SQLite database")
+    stamp_p.add_argument("--dsn", help="PostgreSQL connection string")
     stamp_p.add_argument(
         "--agent-id",
         default=None,

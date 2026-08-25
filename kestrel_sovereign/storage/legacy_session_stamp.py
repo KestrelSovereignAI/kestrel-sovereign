@@ -298,6 +298,40 @@ def _placements(rows: Sequence[Sequence[Any]]) -> Dict[Any, Optional[str]]:
     return placed
 
 
+async def _change_stamp(db: Any, agent_id: str) -> Optional[int]:
+    """How many row events the database has counted for this agent.
+
+    ``None`` when the ledger is not there to ask — a database predating the
+    #2959 triggers, where the compare-and-set is the only fence there is.
+    """
+    from .conversation_sessions import CHANGES_TABLE
+
+    if not await db.table_exists(CHANGES_TABLE):
+        return None
+    row = await db.fetchone(
+        f"SELECT COALESCE(SUM(changes), 0) FROM {CHANGES_TABLE} "
+        "WHERE agent_id = ?",
+        (agent_id,),
+    )
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+async def _unchanged(
+    db: Any, agent_id: str, fence: Optional[int], ours: int
+) -> bool:
+    """Whether nothing but this pass has touched the agent's rows.
+
+    Each stamp is exactly one row event, so the ledger should have moved by
+    precisely what this pass has written. Anything else is a lifecycle
+    operation running beside it, and the plan in hand was made from rows it may
+    since have moved.
+    """
+    if fence is None:
+        return True
+    now = await _change_stamp(db, agent_id)
+    return now is None or now - fence == ours
+
+
 async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict[str, int]:
     """Write down each legacy row's session. Idempotent, and run on demand.
 
@@ -357,6 +391,18 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
             for row_id, session in _placements(view_rows).items():
                 placements[row_id] = session
 
+        # What the database has counted for this agent, read after the plan and
+        # checked before the writes.
+        #
+        # The compare-and-set below asks whether the ROW moved, and that is not
+        # the whole question: a candidate's metadata can sit still while the
+        # rows around it — the ones that decide which session it is in — do
+        # not. Measured as a hazard rather than a theory: a purge that removes
+        # a canonical anchor and misses its unlabeled tail would otherwise have
+        # this stamp that tail back INTO the purged session, and a privacy
+        # purge that leaves a row naming what it destroyed is not one.
+        fence = await _change_stamp(db, agent)
+
         stamped = 0
         conflicts: List[Tuple[int, str, str]] = []
         for rows in by_view:
@@ -364,6 +410,13 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
             conflicts.extend(plan.conflicts)
             for start in range(0, len(plan.stamps), STAMP_BATCH):
                 batch = plan.stamps[start:start + STAMP_BATCH]
+                if not await _unchanged(db, agent, fence, stamped):
+                    logger.info(
+                        "history moved under the pass for %s; stopping after "
+                        "%s rows, run it again (#3120)",
+                        agent, stamped,
+                    )
+                    break
                 async with db.transaction():
                     for stamp in batch:
                         affected = await db.execute(

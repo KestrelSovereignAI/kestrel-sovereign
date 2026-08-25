@@ -348,6 +348,39 @@ class TestThePass:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_history_moving_under_the_pass_stops_it(self, tmp_path):
+        """The compare-and-set asks whether the ROW moved. That is not the
+        whole question: a candidate's metadata can sit still while the rows
+        that decide which session it is in do not. A purge removing a canonical
+        anchor and missing its unlabeled tail would otherwise have this stamp
+        that tail back INTO the purged session, and a privacy purge that leaves
+        a row naming what it destroyed is not one.
+        """
+        path = tmp_path / "moved.db"
+        _seed(path, [({"session_id": UUID_A}, 0), ({"session_id": "1"}, 5)])
+        db = await AsyncDatabase.sqlite(str(path))
+
+        from kestrel_sovereign.storage import legacy_session_stamp
+
+        real_stamp = legacy_session_stamp._change_stamp
+        calls = {"n": 0}
+
+        async def moving(database, agent):
+            calls["n"] += 1
+            value = await real_stamp(database, agent)
+            # The second read is the one taken before the writes: report a row
+            # event nothing in this pass produced.
+            return None if value is None else value + (7 if calls["n"] > 1 else 0)
+
+        try:
+            legacy_session_stamp._change_stamp = moving
+            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0}
+            assert (await _metadata(db))[2] == ("1", None)
+        finally:
+            legacy_session_stamp._change_stamp = real_stamp
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_a_row_rewritten_under_the_plan_is_not_clobbered(
         self, tmp_path, monkeypatch
     ):
