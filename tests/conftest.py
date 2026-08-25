@@ -38,6 +38,17 @@ from tests.utils.feedback_bridge import (
 FORCED_EXIT_GRACE_SECONDS = 10.0
 
 
+@pytest.fixture(autouse=True)
+def _isolate_process_wide_rate_limit_state():
+    """Give every test its own SlowAPI bucket while preserving in-test limits."""
+
+    from kestrel_sovereign.rate_limit import limiter
+
+    limiter.reset()
+    yield
+    limiter.reset()
+
+
 def _force_exit_after_plugin_teardown(exitstatus: int) -> None:
     """Kill a pytest process only if orphaned threads outlive plugin teardown.
 
