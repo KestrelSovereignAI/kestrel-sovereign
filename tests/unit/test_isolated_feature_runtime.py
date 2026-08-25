@@ -490,6 +490,51 @@ async def test_idle_stop_failure_seals_and_retains_exact_client_for_retry(
 
 
 @pytest.mark.asyncio
+async def test_idle_monitor_reports_terminal_retirement_failure_not_producer(
+    monkeypatch, tmp_path, caplog
+):
+    class RetryStopClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                raise RuntimeError("private child failure")
+            await super().stop()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=0.01)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = RetryStopClient()
+    feature = ProxyFeature(
+        agent, _idle_test_runtime(), client_factory=lambda **_kwargs: client
+    )
+
+    with caplog.at_level("WARNING"):
+        await feature.initialize()
+        feature._last_used_monotonic -= 1
+        for _ in range(200):
+            if feature._idle_monitor_task is None:
+                break
+            await asyncio.sleep(0.01)
+
+    assert feature._terminal_lifecycle_latched is True
+    assert feature._idle_monitor_task is None
+    assert feature._owns_inbound_producer() is False
+    assert any(
+        "retirement entered terminal cleanup" in message
+        for message in caplog.messages
+    )
+    assert not any(
+        "owns an inbound producer" in message for message in caplog.messages
+    )
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_latch_beats_queued_idle_retirement(monkeypatch, tmp_path):
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -642,7 +687,6 @@ async def test_reinitialize_after_idle_retirement_restores_live_supervision(
     assert feature._idle_retired is False
     assert snapshot.state == "running"
     assert snapshot.active_processes == 1
-    assert snapshot.idle_processes == 0
     assert snapshot.cleanup_eligible is False
     await feature.shutdown()
 
@@ -1013,7 +1057,6 @@ async def test_idle_ui_manifest_retains_last_published_contribution(monkeypatch,
     await feature.shutdown()
     stopped = feature.runtime_telemetry_snapshot()
     assert stopped.state == "stopped"
-    assert stopped.idle_processes == 0
     assert compute_ui_manifest(agent) == []
 
 
@@ -1054,7 +1097,6 @@ async def test_post_connect_wake_telemetry_failure_never_marks_live_child_idle(
     assert feature._idle_retired is False
     snapshot = feature.runtime_telemetry_snapshot()
     assert snapshot.state == "running"
-    assert snapshot.idle_processes == 0
     assert snapshot.cleanup_eligible is False
     assert (await feature.call_isolated_tool("ping", {"message": "retry"}))["success"]
     await feature.shutdown()
@@ -1766,6 +1808,71 @@ async def test_cancelled_idle_reclaim_keeps_wake_serialized(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_failed_idle_reclaim_preserves_durable_reprovision_intent(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    runtime_dir = feature._feature_runtime_dir()
+    venv = runtime_dir / ".venv"
+    (venv / "lib").mkdir(parents=True)
+    (venv / "lib" / "partial").write_text("remove first")
+    (venv / "bin").mkdir()
+    (venv / "bin" / "python").write_text("")
+    feature._venv_path = venv
+    feature._write_provision_manifest_payload({"install_target": "test-pkg"})
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    original_remove = isolated_runtime._remove_directory_contents_at
+
+    def fail_after_partial_sweep(directory_fd, **kwargs):
+        assert isolated_runtime._read_venv_relocation_repair_marker_at(directory_fd)
+        venv_fd = os.open(
+            ".venv",
+            isolated_runtime._directory_open_flags(),
+            dir_fd=directory_fd,
+        )
+        try:
+            lib_fd = os.open(
+                "lib",
+                isolated_runtime._directory_open_flags(),
+                dir_fd=venv_fd,
+            )
+            try:
+                original_remove(lib_fd, allow_owner_marker=False)
+            finally:
+                os.close(lib_fd)
+            os.rmdir("lib", dir_fd=venv_fd)
+        finally:
+            os.close(venv_fd)
+        raise OSError("synthetic partial reclaim failure")
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_remove_directory_contents_at",
+        fail_after_partial_sweep,
+    )
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="cleanup could not complete",
+    ):
+        await feature.reclaim_idle_workspace()
+
+    assert not (venv / "lib").exists()
+    assert feature._provision_manifest_path().exists()
+    assert feature._venv_relocation_repair_pending() is True
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_reclaim_fences_coalesced_disk_refresh_and_preserves_bin_accounting(
     monkeypatch, tmp_path
 ):
@@ -2068,6 +2175,13 @@ async def test_workspace_byte_telemetry_deduplicates_cross_category_hardlinks(
     await feature._refresh_disk_telemetry(refresh_environment=True)
     snapshot = feature.runtime_telemetry_snapshot()
 
+    assert snapshot.environment_bytes == len(b"shared")
+    assert snapshot.downloaded_bytes == 0
+
+    # A state-only disk refresh must still traverse the managed venv to seed
+    # cross-category inode ownership before it measures the uv cache.
+    await feature._refresh_disk_telemetry(refresh_environment=False)
+    snapshot = feature.runtime_telemetry_snapshot()
     assert snapshot.environment_bytes == len(b"shared")
     assert snapshot.downloaded_bytes == 0
 

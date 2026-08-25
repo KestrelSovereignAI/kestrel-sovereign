@@ -86,7 +86,6 @@ class IsolatedRuntimeTelemetrySnapshot:
     state: str
     lifecycle_generation: int
     active_processes: int
-    idle_processes: int
     restart_count: int
     idle_wake_count: int
     last_used_at: datetime | None
@@ -4588,6 +4587,7 @@ def _remove_directory_contents_at(
     directory_fd: int,
     *,
     allow_owner_marker: bool,
+    preserve_names: frozenset[str] = frozenset(),
 ) -> None:
     """Delete one already-open tree without following any directory symlink."""
 
@@ -4603,6 +4603,8 @@ def _remove_directory_contents_at(
         # cleanup. Preserve it throughout the sweep regardless of filesystem
         # enumeration order. Nested markers remain a hard failure above.
         if allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
+            continue
+        if name in preserve_names:
             continue
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
@@ -4691,7 +4693,17 @@ def _remove_isolated_feature_runtime(
                 "Hosted isolated feature cleanup target changed during validation."
             )
         _assert_no_nested_runtime_owners_at(feature_fd, allow_owner_marker=False)
-        _remove_directory_contents_at(feature_fd, allow_owner_marker=False)
+        # Publish durable repair intent before the first destructive mutation.
+        # Keep it until the whole sweep succeeds so a partial reclaim can never
+        # be adopted as a healthy unstamped venv on the next cold wake.
+        _ensure_venv_relocation_repair_marker_at(feature_fd)
+        _remove_directory_contents_at(
+            feature_fd,
+            allow_owner_marker=False,
+            preserve_names=frozenset({_VENV_RELOCATION_REPAIR_MARKER}),
+        )
+        os.unlink(_VENV_RELOCATION_REPAIR_MARKER, dir_fd=feature_fd)
+        os.fsync(feature_fd)
         os.rmdir(feature_component, dir_fd=feature_parent_fd)
         os.fsync(feature_parent_fd)
         return RuntimeNamespaceCleanupOutcome.REMOVED
@@ -6253,10 +6265,6 @@ class ProxyFeature(Feature):
             "state": state,
             "lifecycle_generation": self._reload_gen,
             "active_processes": int(client is not None or uncertain_retirement),
-            # Idle-retired means the exact child has been reaped. ``state`` and
-            # ``cleanup_eligible`` describe the parked feature; process counts
-            # continue to mean actual observed processes.
-            "idle_processes": 0,
             "restart_count": self._health_restart_count,
             "idle_wake_count": self._idle_wake_count,
             "last_used_at": self._last_used_at,
@@ -6392,18 +6400,24 @@ class ProxyFeature(Feature):
             deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
             seen_linked_files: set[tuple[int, int]] = set()
             statuses: list[str] = []
-            if (
-                refresh_environment
-                and venv is not None
+            managed_venv = (
+                venv is not None
                 and venv == runtime_dir / ".venv"
                 and self._bin_path is None
-            ):
-                environment, environment_status = _measure_directory_tree_bytes(
-                    venv,
-                    deadline=deadline,
-                    seen_linked_files=seen_linked_files,
+            )
+            if managed_venv:
+                (
+                    measured_environment,
+                    environment_status,
+                ) = _measure_directory_tree_bytes(
+                    venv, deadline=deadline, seen_linked_files=seen_linked_files
                 )
                 statuses.append(environment_status)
+                environment = (
+                    measured_environment
+                    if refresh_environment
+                    else self._environment_bytes
+                )
             else:
                 environment = self._environment_bytes
             private_measurements = [
@@ -12260,6 +12274,8 @@ class ProxyFeature(Feature):
     def _owns_inbound_producer(self) -> bool:
         """Return whether retiring this child would remove its only wake source."""
 
+        if self._client is None:
+            return False
         if self._hosted_telegram_startup_attested or self._observed_inbound_producer:
             return True
         try:
@@ -12339,6 +12355,13 @@ class ProxyFeature(Feature):
                         expected_last_used=baseline,
                     )
                     if not retired:
+                        if self._terminal_lifecycle_latched or self._stopping:
+                            logger.error(
+                                "Hosted isolated runtime %s stopped idle monitoring "
+                                "because retirement entered terminal cleanup",
+                                self.name,
+                            )
+                            return
                         if self._owns_inbound_producer():
                             logger.warning(
                                 "Hosted isolated runtime %s stopped idle monitoring "

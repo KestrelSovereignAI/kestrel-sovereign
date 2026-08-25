@@ -258,7 +258,6 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
         idle = feature.runtime_telemetry_snapshot()
         assert idle.state == "idle"
         assert idle.active_processes == 0
-        assert idle.idle_processes == 0
         assert idle.cleanup_eligible is True
         assert idle.rss_bytes is None
 
@@ -374,7 +373,6 @@ def main():
             await asyncio.sleep(0.02)
         assert any(snapshot.state == "idle" for snapshot in snapshots)
         assert first_process.returncode is not None
-        assert feature.runtime_telemetry_snapshot().idle_processes == 0
 
         managed_venv = feature._feature_runtime_dir() / ".venv"
         assert managed_venv.is_dir()

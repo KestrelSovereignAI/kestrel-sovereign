@@ -99,7 +99,10 @@ delete a path itself: Core's seam rechecks eligibility and performs secure
 feature-scoped deletion under the same reload lock that serializes a racing
 cold wake. Caller cancellation is reported only after the deletion transaction
 has settled, so it cannot release that lock while a worker still mutates the
-tree. The seam never removes the agent namespace, sibling feature directories,
+tree. Before the first destructive mutation Core durably marks the managed
+environment for forced repair and preserves that marker until deletion fully
+succeeds, so a partial reclaim cannot be adopted as a healthy venv on the next
+wake. The seam never removes the agent namespace, sibling feature directories,
 or an external immutable venv.
 
 `IsolatedRuntimeTelemetrySnapshot` is immutable and deliberately excludes DIDs,
