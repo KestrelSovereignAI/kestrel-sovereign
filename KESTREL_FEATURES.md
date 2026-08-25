@@ -566,7 +566,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `list_permissions` | `!security-list` | `system` |  | 23 | `enabled` |
 | `pending_approvals` | `!security-pending` | `system` |  | 17 | `enabled` |
 | `security_audit` | `!security-audit` | `system` | `limit` | 54 | `enabled` |
-| `security_audit_search` | `!security-audit-search` | `system` | `query`, `tool_name`, `days`, `limit` | 178 | `enabled` |
+| `security_audit_search` |  | `system` | `query`, `tool_name`, `days`, `limit` | 178 | `enabled` |
 | `set_permission` | `!security-set` | `system` | `feature_name`, `tool_name`, `level` | 193 | `enabled` |
 
 ### `skills` (SkillsFeature)
@@ -1066,7 +1066,6 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!schedule update` | `scheduler` | `<task_id> <cron_expression> [timezone_name]` | Update the cron expression of an existing scheduled task |
 | `!security-approve` | `security` | `<request_id> [scope]` | Approve a pending request. scope: 'once', 'session', or 'always'. |
 | `!security-audit` | `security` | `[limit]` | Show recent security audit log |
-| `!security-audit-search` | `security` | `<query> [tool_name] [days] [limit]` | Search your own recorded tool calls for ones matching a description — 'have I already filed/commented/run this?' |
 | `!security-deny` | `security` | `<request_id>` | Deny a pending request |
 | `!security-list` | `security` |  | List all configured security permissions in tree format |
 | `!security-pending` | `security` |  | Show pending approval requests |

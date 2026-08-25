@@ -66,6 +66,9 @@ def fold_searchable(text):
 
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_SURROGATE_PAIR = re.compile(
+    r"\\u(d[89ab][0-9a-fA-F]{2})\\u(d[c-f][0-9a-fA-F]{2})", re.IGNORECASE
+)
 
 
 def _unescape_best_effort(text):
@@ -76,13 +79,24 @@ def _unescape_best_effort(text):
     a truncated summary can end mid-pair and a search must not fail on it.
     """
     def _one(match):
-        return chr(int(match.group(1), 16))
+        code = int(match.group(1), 16)
+        if 0xD800 <= code <= 0xDFFF:
+            # Leave it escaped. A truncated summary can end between an emoji's
+            # two halves, and a lone surrogate handed back to SQLite raises
+            # inside the scalar function — which fails the ENTIRE query, not
+            # just this row, so one cut emoji would break every search
+            # (#3107 review round 5). Pairs are rejoined below.
+            return match.group(0)
+        return chr(code)
 
     decoded = _UNICODE_ESCAPE.sub(_one, text)
-    try:
-        return decoded.encode("utf-16", "surrogatepass").decode("utf-16")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return decoded
+    # Rejoin any surviving well-formed pairs so an intact emoji reads as one
+    # character rather than two escapes.
+    def _pair(match):
+        high, low = int(match.group(1), 16), int(match.group(2), 16)
+        return chr(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
+
+    return _SURROGATE_PAIR.sub(_pair, decoded)
 
 logger = logging.getLogger(__name__)
 
@@ -1057,14 +1071,22 @@ class PermissionStore:
         One builder for both the page and the count so the breadth gate can
         never disagree with what the page would return.
         """
-        def _like(text: str) -> str:
-            # LIKE wildcards in the needle would silently widen the match — a
-            # caller searching for a literal "%" must not get everything.
-            return "%" + (
+        def _escape_like(text: str) -> str:
+            """Neutralise LIKE metacharacters in a literal."""
+            return (
                 text.replace("\\", "\\\\")
                 .replace("%", "\\%")
                 .replace("_", "\\_")
-            ) + "%"
+            )
+
+        def _like_prefix(text: str) -> str:
+            """Match ``text`` and anything suffixed to it, e.g. ``.outcome``."""
+            return _escape_like(text) + "%"
+
+        def _like(text: str) -> str:
+            # LIKE wildcards in the needle would silently widen the match — a
+            # caller searching for a literal "%" must not get everything.
+            return "%" + _escape_like(text) + "%"
 
         # Two problems with matching this column, and one answer to both.
         #
@@ -1105,11 +1127,21 @@ class PermissionStore:
             # work. That is exactly the failure this tool exists to prevent,
             # manufactured by the tool. Prefix match takes the paired
             # ``.outcome`` row with it.
-            "tool_name NOT LIKE ?",
+            # ESCAPE is not optional here: the pattern escapes the literal
+            # underscores in the tool name, and without declaring the escape
+            # character SQLite reads "\\_" as backslash-then-wildcard and the
+            # exclusion silently matches nothing.
+            "tool_name NOT LIKE ? ESCAPE '\\'",
         ]
         folded = _like(fold_searchable(needle))
         params: List[Any] = [
-            folded, folded, SUBAGENT_DISPATCH_ACTION, f"{SEARCH_TOOL_NAME}%",
+            folded, folded, SUBAGENT_DISPATCH_ACTION,
+            # Escaped: SEARCH_TOOL_NAME contains underscores, and an unescaped
+            # LIKE would treat each as "any character" — excluding unrelated
+            # tools such as `security-audit-search-index` and making them
+            # unfindable even with an exact tool_name filter. Same wildcard bug
+            # already fixed for the query, still present in the exclusion.
+            _like_prefix(SEARCH_TOOL_NAME),
         ]
 
         # ...and by NAME, which is what actually covers the case. The

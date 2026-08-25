@@ -944,3 +944,104 @@ async def test_registering_a_feature_marks_its_dispatch_entry(tmp_path):
         "registration is the only place that knows a name is a dispatch "
         "entry; if it does not say so, the exclusion never arms"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review round 5 (#3107)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_security_features_own_dispatch_entry_is_marked(tmp_path):
+    """The fourth instance of the same miss, and the sharpest.
+
+    Round 4 added the registry and a test — but the test registered a STUB
+    feature, and `_register_all_tools` explicitly `continue`s past
+    SecurityFeature. So the one dispatch entry that actually reaches
+    `security_audit_search` was the only one never marked, and the exclusion
+    was armed for every feature except the one that matters.
+
+    The double was the disguise: a stub feature goes through the branch the
+    real one skips."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    class _Other:
+        tool_name = "other_feature"
+
+        def get_tools(self):
+            return []
+
+    class _Agent:
+        def __init__(self, security):
+            self.features = {"SecurityFeature": security, "OtherFeature": _Other()}
+
+    store = PermissionStore(str(tmp_path / "own_entry.db"))
+    await store.initialize()
+
+    security = SecurityFeature.__new__(SecurityFeature)
+    security.permission_store = store
+    # ``tool_name`` is a read-only property deriving snake_case from ``name``,
+    # so the dispatch entry is set by naming the feature — the same way it is
+    # derived in production rather than assigned.
+    security.name = "SecurityFeature"
+    assert security.tool_name == "security_feature"
+    security.agent = _Agent(security)
+    await security._register_all_tools()
+
+    assert "security_feature" in store.dispatch_entries, (
+        "SecurityFeature's tool rows are skipped, but its DISPATCH entry is "
+        "the envelope that reaches this very tool — skipping it leaves the "
+        "exclusion armed for every feature except the one that matters"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_emoji_does_not_break_every_search(store):
+    """Severity note: this is not a missed match, it is a dead tool.
+
+    `summarize_args` can cut a 500-character summary between an emoji's two
+    surrogate escapes. Decoding that half alone yields a lone surrogate, and a
+    lone surrogate returned from a SQLite scalar function raises inside the
+    engine — failing the WHOLE query, so one such row makes every search error
+    out regardless of what it was looking for."""
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary='{"title": "the worker is orphaned", "note": "hi \\ud83d',
+    )
+
+    matches, _ = await store.search_audit_log("worker is orphaned")
+    assert len(matches) == 1, (
+        "a row truncated mid-surrogate must be searchable, not fatal"
+    )
+
+
+def test_a_whole_emoji_still_folds_to_one_character():
+    """The other end: leaving lone surrogates escaped must not stop a COMPLETE
+    pair from rejoining, or every emoji becomes two escapes nobody can match."""
+    from kestrel_sovereign.features.security.permissions import fold_searchable
+
+    assert fold_searchable('{"t": "hi \\ud83d\\ude00"}') == '{"t": "hi 😀"}'.casefold()
+
+
+@pytest.mark.asyncio
+async def test_the_self_exclusion_does_not_swallow_similarly_named_tools(store):
+    """`security_audit_search` contains underscores, and LIKE treats each as
+    "any character" — so the unescaped self-exclusion also hid unrelated tools
+    whose names differ only in those positions. Same wildcard bug already fixed
+    for the query, left standing in the exclusion."""
+    await store.log_decision(
+        feature_name="IndexFeature",
+        tool_name="security-audit-search-index",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary='{"note": "the worker is orphaned"}',
+    )
+
+    matches, _ = await store.search_audit_log("worker is orphaned")
+    assert len(matches) == 1, (
+        "only this tool's own rows are excluded, not every name that matches "
+        "it once underscores are read as wildcards"
+    )

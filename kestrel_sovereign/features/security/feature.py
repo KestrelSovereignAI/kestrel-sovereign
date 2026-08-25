@@ -449,6 +449,16 @@ class SecurityFeature(Feature):
 
         for feature_name, feature in self.agent.features.items():
             if feature_name == "SecurityFeature":
+                # Its tool rows are skipped (it owns the permission tree), but
+                # its DISPATCH ENTRY must still be known: `security_feature` is
+                # the envelope that reaches `security_audit_search`, and a
+                # search that does not exclude it reports its own wrapper as
+                # prior work — permanently, since the row is written on every
+                # invocation (#3107 review round 5). The skip below is about
+                # permissions; this fact is not.
+                own_dispatch = getattr(feature, "tool_name", None)
+                if own_dispatch and not isinstance(own_dispatch, property):
+                    self.permission_store.mark_dispatch_entry(own_dispatch)
                 continue
             await self.register_feature_tools(
                 feature_name,
@@ -1127,7 +1137,14 @@ class SecurityFeature(Feature):
             "description — 'have I already filed/commented/run this?'"
         ),
         category=ToolCategory.SYSTEM,
-        command_prefix="!security-audit-search",
+        # Deliberately NO command_prefix. `AgentTool.parse_command_args` binds
+        # positionally and gives a non-final string parameter exactly one
+        # whitespace token, so `!security-audit-search orphans the worker`
+        # would bind query='orphans', tool_name='the', days='worker' and fail
+        # validation — and quoting does not help, because that parser splits on
+        # whitespace too (#3118). A free-form query cannot survive that
+        # surface. Advertising a command that always fails is worse than
+        # having none; this stays programmatic until #3118 lands.
     )
     async def security_audit_search(
         self,
