@@ -9,7 +9,6 @@ the network, pip, or uv.
 from __future__ import annotations
 
 import json
-import re
 import shlex
 import subprocess
 import sys
@@ -783,14 +782,49 @@ def _voice_manifest(tmp_path):
 #: backend, the interpreter or the quoting elide it — but they still assert it
 #: is THERE, because a command that lost it is an unbounded install. What the
 #: file holds has its own tests below.
-#: Quoted or bare — a rendered path is shell-quoted, and a temp directory with
-#: a space in its name (`TMPDIR=/tmp/build scratch`) makes that the normal case,
-#: not the exotic one. Matching only `\S+` there reads half a path.
-_BOUNDS_ARG = re.compile(r"'?-c'? (?:'([^']*\.txt)'|(\S+\.txt))")
+@pytest.fixture(autouse=True)
+def bounds_dir(tmp_path, monkeypatch):
+    """Where a restore's constraints file lands, so a test can FIND it.
+
+    Nothing here assumes the path is tidy: pytest's own `tmp_path` sits under
+    the host's TMPDIR, so a `/tmp/build scratch` or `/tmp/kestrel o'connor`
+    comes straight through. The point is only that the file is somewhere the
+    test can enumerate instead of somewhere it has to parse a path out of.
+    """
+    directory = tmp_path / "constraints"
+    directory.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(directory))
+    return directory
 
 
-def _elide_bounds(text: str) -> str:
-    return _BOUNDS_ARG.sub("-c <bounds>", text)
+def _bounds_argument(path: Path) -> str:
+    """`-c <path>` as THIS host's shell is handed it.
+
+    Built with production's own quoter rather than a copy of its rules. The
+    quoting is asserted where it is implemented — `_render_command` has cases
+    for a space and for an apostrophe — and a second implementation here can
+    only ever disagree with the first: for `/tmp/build scratch`, and then for
+    `/tmp/kestrel o'connor` immediately after that one is fixed.
+    """
+    quote = (
+        cli_features._powershell_quote if cli_features._is_windows() else shlex.quote
+    )
+    return f"{quote('-c')} {quote(str(path))}"
+
+
+def _published_bounds(text: str, bounds_dir: Path) -> Path:
+    """The one constraints file written for a restore, asserted to be NAMED."""
+    written = list(bounds_dir.glob("kestrel-restore-constraints-*.txt"))
+    assert len(written) == 1, written
+    assert _bounds_argument(written[0]) in text, text
+    return written[0]
+
+
+def _elide_bounds(text: str, bounds_dir: Path) -> str:
+    """*text* with that argument replaced, for tests about the rest of the line."""
+    for written in bounds_dir.glob("kestrel-restore-constraints-*.txt"):
+        text = text.replace(_bounds_argument(written), "-c <bounds>")
+    return text
 
 
 def test_unconstrained_feature_install_swaps_editable_core(monkeypatch):
@@ -846,7 +880,7 @@ def test_sync_constraint_does_not_block_a_compatible_feature(
 
 
 def test_sync_relinks_core_when_an_install_bypasses_the_constraint(
-    monkeypatch, fake_registry, tmp_path, capsys
+    monkeypatch, fake_registry, tmp_path, bounds_dir, capsys
 ):
     """Detection half: an install that ignores the pin still can't leave sync
     reporting success over a replaced core."""
@@ -859,7 +893,7 @@ def test_sync_relinks_core_when_an_install_bypasses_the_constraint(
     # The swap happened, was named, and the checkout was re-linked.
     assert venv.editable[CORE] == CHECKOUT
     assert venv.installed[CORE] == "0.52.0"  # the checkout's build, restored
-    err = _elide_bounds(capsys.readouterr().err)
+    err = _elide_bounds(capsys.readouterr().err, bounds_dir)
     assert "was replaced during the install batch" in err
     assert (
         f"restored: uv pip install --python {shlex.quote(sys.executable)} "
@@ -978,7 +1012,7 @@ def test_sync_pins_core_to_the_declared_pypi_window_without_blocking_it(
 
 
 def test_sync_restores_core_pushed_outside_the_declared_pypi_window(
-    monkeypatch, fake_registry, tmp_path, capsys
+    monkeypatch, fake_registry, tmp_path, bounds_dir, capsys
 ):
     """Detection half for a PyPI-declared core: an install that bypassed the
     window is named and rolled back inside it."""
@@ -994,7 +1028,7 @@ def test_sync_restores_core_pushed_outside_the_declared_pypi_window(
 
     assert rc == 1
     assert venv.installed[CORE] == "0.52.0"  # pulled back into the window
-    err = _elide_bounds(capsys.readouterr().err)
+    err = _elide_bounds(capsys.readouterr().err, bounds_dir)
     assert "was replaced during the install batch" in err
     # The spec is shell-quoted: `>=`/`<` unquoted would make the advertised
     # command a shell redirection rather than an install.
@@ -1005,7 +1039,7 @@ def test_sync_restores_core_pushed_outside_the_declared_pypi_window(
 
 
 def test_sync_does_not_call_a_no_op_reinstall_a_restore(
-    monkeypatch, fake_registry, tmp_path, capsys
+    monkeypatch, fake_registry, tmp_path, bounds_dir, capsys
 ):
     """A repair is judged by re-reading the venv, not by an exit code.
 
@@ -1021,7 +1055,7 @@ def test_sync_does_not_call_a_no_op_reinstall_a_restore(
 
     assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # still swapped — the repair did nothing
-    err = _elide_bounds(capsys.readouterr().err)
+    err = _elide_bounds(capsys.readouterr().err, bounds_dir)
     assert "restored:" not in err
     assert (
         "RESTORE FAILED — run `uv pip install --python "
@@ -1030,7 +1064,7 @@ def test_sync_does_not_call_a_no_op_reinstall_a_restore(
 
 
 def test_sync_recovery_command_names_pip_on_a_host_without_uv(
-    monkeypatch, fake_registry, tmp_path, capsys
+    monkeypatch, fake_registry, tmp_path, bounds_dir, capsys
 ):
     """The hand-run command must be the one that actually ran.
 
@@ -1048,7 +1082,7 @@ def test_sync_recovery_command_names_pip_on_a_host_without_uv(
 
     assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # swapped, and the re-link failed
-    err = _elide_bounds(capsys.readouterr().err)
+    err = _elide_bounds(capsys.readouterr().err, bounds_dir)
     assert (
         f"RESTORE FAILED — run `{shlex.quote(sys.executable)} -m pip install "
         f"-c <bounds> -e {CHECKOUT}` by hand."
@@ -1057,7 +1091,7 @@ def test_sync_recovery_command_names_pip_on_a_host_without_uv(
 
 
 def test_sync_recovery_command_is_runnable_on_windows(
-    monkeypatch, fake_registry, tmp_path, capsys
+    monkeypatch, fake_registry, tmp_path, bounds_dir, capsys
 ):
     """...and quoted for, and labelled with, the shell that host actually has.
 
@@ -1081,7 +1115,7 @@ def test_sync_recovery_command_is_runnable_on_windows(
 
     assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # swapped, and the re-link failed
-    err = _elide_bounds(capsys.readouterr().err)
+    err = _elide_bounds(capsys.readouterr().err, bounds_dir)
     assert (
         "RESTORE FAILED — run `& 'C:\\Program Files\\kestrel\\venv\\python.exe' "
         f"-m pip install -c <bounds> -e {CHECKOUT}` in PowerShell by hand."
@@ -3332,15 +3366,8 @@ def test_the_repair_is_bounded_by_the_manifest_too(monkeypatch, capsys):
 # --- the recovery command carries them too (issue #3109) --------------------
 
 
-def _bounds_file(command: str) -> Path:
-    """The constraints file a rendered restore command names."""
-    match = _BOUNDS_ARG.search(command)
-    assert match, command
-    return Path(match.group(1) or match.group(2))
-
-
 def test_the_printed_recovery_command_carries_the_bounds_the_repair_ran_with(
-    monkeypatch, capsys,
+    monkeypatch, bounds_dir, capsys,
 ):
     """The operator's copy of the repair must be bounded exactly as the repair was.
 
@@ -3369,7 +3396,7 @@ def test_the_printed_recovery_command_carries_the_bounds_the_repair_ran_with(
     outcome = guard.resolve()
 
     assert outcome.repaired is False          # there IS a command to print
-    named = _bounds_file(outcome.command)
+    named = _published_bounds(outcome.command, bounds_dir)
     # It outlives the run: the command names it AFTER the installer returned,
     # so a file deleted on return would leave the operator with a broken paste.
     assert named.exists()
@@ -3409,7 +3436,7 @@ def test_a_host_that_declares_no_windows_gets_the_command_it_always_got(
 
 
 def test_an_interrupted_restore_command_is_bounded_too(
-    monkeypatch, fake_registry, tmp_path, capsys,
+    monkeypatch, fake_registry, tmp_path, bounds_dir, capsys,
 ):
     """The interrupt path prints the same command and must carry the same file.
 
@@ -3434,8 +3461,7 @@ def test_an_interrupted_restore_command_is_bounded_too(
 
     err = capsys.readouterr().err
     assert "NOT RESTORED" in err
-    named = _bounds_file(err)
-    assert named.exists()
+    named = _published_bounds(err, bounds_dir)
     assert "kestrel-feature-voice>=0.4" in named.read_text(encoding="utf-8").split()
 
 
@@ -3559,7 +3585,7 @@ def test_a_published_constraints_file_is_used_as_given_never_rewritten(tmp_path)
 
 
 def test_an_interrupt_while_writing_the_bounds_still_names_the_drift(
-    monkeypatch, tmp_path, capsys,
+    monkeypatch, bounds_dir, capsys,
 ):
     """Writing the bounds BLOCKS, so it is a place a Ctrl-C can land.
 
@@ -3581,8 +3607,6 @@ def test_an_interrupt_while_writing_the_bounds_still_names_the_drift(
             package="kestrel-feature-workflows", pypi=">=0.5.1,<0.6",
         ),
     })
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-
     # ONE Ctrl-C, after the file exists and before it holds anything — a second
     # is the operator insisting, and is documented to pass straight through.
     real_write = cli_features._write_constraint_lines
@@ -3602,8 +3626,8 @@ def test_an_interrupt_while_writing_the_bounds_still_names_the_drift(
     err = capsys.readouterr().err
     assert "INTERRUPTED" in err                  # the drift is still named...
     assert "no repair was attempted" in err
-    assert _bounds_file(err).exists()            # ...and the command is bounded
-    # The abandoned attempt left nothing behind: a file that was never filled
-    # bounds nothing, and a second one beside the real one is a file an
-    # operator could be pointed at.
-    assert len(list(tmp_path.glob("kestrel-restore-constraints-*.txt"))) == 1
+    # ...the command is bounded, and the abandoned attempt left nothing behind:
+    # a file that was never filled bounds nothing, and a second one beside the
+    # real one is a file an operator could be pointed at. `_published_bounds`
+    # asserts there is exactly one.
+    assert _published_bounds(err, bounds_dir).exists()

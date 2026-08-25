@@ -1380,6 +1380,33 @@ def _core_install_shape():
     )
 
 
+@dataclass(frozen=True)
+class RestorePlan:
+    """The install that would put core back: what to run, and how it is bounded.
+
+    A value rather than a tuple because the plan keeps acquiring facts that are
+    not derivable from each other, and each one arrived as another positional
+    every consumer had to remember to carry. One already went missing that way.
+
+    It also means the constraints are looked up ONCE. Asking the guard for them
+    again after the plan is built is a second chance to be interrupted between
+    the two answers, on a path where core is already known to have drifted
+    (issue #3109).
+    """
+
+    pip_args: list
+    reinstall: Optional[str]
+    #: The whole sequence, rendered for this host's shell. Empty when a command
+    #: was WITHHELD — see :attr:`bounds_unwritable`.
+    command: str
+    shell: Optional[str]
+    constraints: list
+    constraint_path: Optional[str]
+    #: The manifest declares windows and no file could be made to carry them,
+    #: so no command was rendered and no install may be performed.
+    bounds_unwritable: bool = False
+
+
 @dataclass
 class CoreGuardOutcome:
     """What the guard found after a batch of installs, and what it did about it.
@@ -1828,15 +1855,15 @@ class CoreInstallGuard:
         replaced = core_install_matches(self._baseline, self.policy)
         if not self.policy.source_is_verifiable:
             return self._unrestorable(drift, replaced, attempted=attempted)
-        _, _, rendered, shell, bounds_unwritable = self._restore_plan()
+        plan = self._restore_plan()
         return CoreGuardOutcome(
             drift=drift,
             replaced=replaced,
             repaired=False,
             attempted=attempted,
-            bounds_unwritable=bounds_unwritable,
-            command=rendered,
-            shell=shell,
+            bounds_unwritable=plan.bounds_unwritable,
+            command=plan.command,
+            shell=plan.shell,
         )
 
     def _report_interrupt(self, *, repairing=False) -> None:
@@ -1944,9 +1971,10 @@ class CoreInstallGuard:
     def _restore_plan(self):
         """The exact install that would put core back — rendered, NOT run.
 
-        Returns ``(pip_args, reinstall, rendered, shell, bounds_unwritable)``,
-        the last saying the rendering was WITHHELD rather than that there was
-        nothing to render.
+        Returns a :class:`RestorePlan` — the argv, the rendering, and the
+        constraints that bound both, so no consumer has to ask for any of it
+        twice. ``bounds_unwritable`` says the rendering was WITHHELD rather
+        than that there was nothing to render.
 
         One derivation with two consumers: :meth:`_repair` runs it, and the
         interrupt path prints it without running anything (issue #2962).
@@ -1993,16 +2021,25 @@ class CoreInstallGuard:
             # Bounds exist and nothing carries them. Rendering the command
             # anyway would hand over the unbounded install this whole path
             # exists to withhold, so render none and let the caller say why.
-            return pip_args, reinstall, "", _render_shell(), True
+            return RestorePlan(
+                pip_args=pip_args,
+                reinstall=reinstall,
+                command="",
+                shell=_render_shell(),
+                constraints=lines,
+                constraint_path=None,
+                bounds_unwritable=True,
+            )
         extra_args = ["-c", constraint_path] if constraint_path else []
-        return (
-            pip_args,
-            reinstall,
-            _render_commands(
+        return RestorePlan(
+            pip_args=pip_args,
+            reinstall=reinstall,
+            command=_render_commands(
                 _install_commands(pip_args, extra_args, reinstall=reinstall)
             ),
-            _render_shell(),
-            False,
+            shell=_render_shell(),
+            constraints=lines,
+            constraint_path=constraint_path,
         )
 
     def _repair(self, drift, replaced, *, timeout=None) -> "CoreGuardOutcome":
@@ -2046,8 +2083,7 @@ class CoreInstallGuard:
         # like the install below it, and the drift is already known by now.
         with self._reporting_interrupts(repairing=False):
             plan = self._restore_plan()
-        pip_args, reinstall, rendered, shell, bounds_unwritable = plan
-        if bounds_unwritable:
+        if plan.bounds_unwritable:
             # The manifest's windows exist and nothing can carry them, so this
             # install cannot be performed as declared. Running it anyway is the
             # unbounded install those windows forbid — committed by the code
@@ -2060,21 +2096,20 @@ class CoreInstallGuard:
                 attempted=False,
                 bounds_unwritable=True,
                 command="",
-                shell=shell,
+                shell=plan.shell,
             )
         # Core is never constrained against itself, here least of all — this
         # install exists to put core back. The rest of the manifest still
         # binds: a repair that resolves a dependency outside another entry's
         # declared window has moved it, and this rechecks only core (#3106).
-        # The SAME file *rendered* just named, so what an operator pastes is
-        # bounded exactly as the automatic attempt was (#3109).
-        constraints, constraint_path = self._restore_constraints()
+        # The plan's OWN file, the one it just rendered, so what an operator
+        # pastes is bounded exactly as the automatic attempt was (#3109).
         try:
             result = self._install(
-                pip_args,
-                constraints=constraints or None,
-                constraint_path=constraint_path,
-                reinstall=reinstall,
+                plan.pip_args,
+                constraints=plan.constraints or None,
+                constraint_path=plan.constraint_path,
+                reinstall=plan.reinstall,
                 timeout=timeout,
                 repairing=True,
             )
@@ -2098,8 +2133,8 @@ class CoreInstallGuard:
             replaced=replaced,
             repaired=repaired,
             unresolved=unresolved,
-            command=rendered,
-            shell=shell,
+            command=plan.command,
+            shell=plan.shell,
             output="" if repaired else (result.stderr or result.stdout or "").strip(),
         )
 
