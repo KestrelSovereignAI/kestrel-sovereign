@@ -1159,10 +1159,16 @@ class SecurityFeature(Feature):
         paired ``<tool>.outcome`` row exists that is what carries the result.
 
         What the disclosure ceiling actually is: ``args_summary`` was masked
-        and truncated to 500 characters by ``summarize_args`` when it was
-        written, and ``GET /api/security/audit`` already returns that same
-        value verbatim. Nothing here widens what was persisted. The masking is
-        a key-name heuristic, so it is a good filter and not a guarantee.
+        and truncated by ``summarize_args`` when it was written, and
+        ``GET /api/security/audit`` already returns that same value verbatim.
+        Nothing here widens what was persisted. The masking is a key-name
+        heuristic, so it is a good filter and not a guarantee.
+
+        The truncation is 500 characters, but was **200** on the
+        ``SecurityHook`` path until that override was removed — so rows written
+        before then are cut shorter, and a search cannot see past whatever cut
+        its own row got. That is why an empty result says so rather than
+        reading as proof.
 
         Args:
             query: What to look for — a repo, an issue number, a title
@@ -1227,6 +1233,12 @@ class SecurityFeature(Feature):
             logger.error(f"security_audit_search failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
+        # The gate must see the full bound, so the QUERY always asks for
+        # MAX_DISCLOSING_MATCHES; the caller's smaller limit is applied after.
+        # Asking the store for `limit` directly would let limit=1 report
+        # "not too broad" for a query matching four hundred rows.
+        matches = matches[:limit_val]
+
         if too_broad:
             # Deliberately no arguments: a query this broad is not a
             # description of one prior action, and returning a page of it would
@@ -1258,9 +1270,12 @@ class SecurityFeature(Feature):
             return ToolResult.ok(
                 confirmation=(
                     f"No recorded tool call matched ({scope_text}).\n"
-                    "This searches the masked, 500-character argument summary, "
-                    "so a distinguishing detail past that cut would not match. "
-                    "Absence here is weak evidence, not proof you never did it."
+                    "This searches the masked argument summary, which is "
+                    "truncated when written — at 500 characters now, and at "
+                    "200 for rows written before that was unified, so an older "
+                    "row is cut shorter than a new one. A distinguishing "
+                    "detail past its own row's cut cannot match. Absence here "
+                    "is weak evidence, not proof you never did it."
                 ),
                 data={
                     "count": 0,

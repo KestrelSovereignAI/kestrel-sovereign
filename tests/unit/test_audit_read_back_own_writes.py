@@ -547,3 +547,260 @@ async def test_an_inner_tool_call_is_still_found_after_a_dispatch(tmp_path):
 
     assert len(matches) == 1
     assert matches[0]["tool"] == "create_github_issue"
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 (#3107)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_lowercase_query_matches_an_accented_capital(store):
+    """SQLite's LOWER folds ASCII only, and the JSON escapes differ in a
+    character it will not touch: "É" is \\u00c9 and "é" is \\u00e9. So matching
+    the escaped form case-insensitively silently fails for every non-English
+    prior write — the case-insensitivity the tool promises stopped at the
+    ASCII boundary without saying so."""
+    from kestrel_sovereign.features.security.args_summary import summarize_args
+
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary=summarize_args({"title": "Échec — the worker is orphaned"}),
+    )
+
+    for query in ("échec", "ÉCHEC", "Échec — the worker"):
+        matches, _ = await store.search_audit_log(query)
+        assert len(matches) == 1, f"{query!r} must match the stored capital form"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_summary_is_still_searchable(store):
+    """`fold_searchable` decodes JSON before folding, and a summary truncated
+    mid-escape is not valid JSON. Falling back to the raw text keeps the row in
+    the corpus; dropping it would silently shrink what the caller believes it
+    searched — the same class of quiet incompleteness this tool exists to
+    remove."""
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary='{"title": "the worker is orphaned", "body": "## Deta...',
+    )
+
+    matches, _ = await store.search_audit_log("worker is orphaned")
+    assert len(matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_approval_gated_path_also_labels_a_dispatch(tmp_path):
+    """Round 2 taught ONE door the rule. `ApprovalQueue` writes audit rows on
+    paths the hook never returns through, and it hard-coded
+    `action="tool_execution"` — including for the ASK level, which is the
+    DEFAULT for the feature-as-subagent dispatcher. So the exclusion added in
+    round 2 missed exactly the case it was added for."""
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from kestrel_sovereign.features.security.permissions import (
+        PermissionLevel,
+        SUBAGENT_DISPATCH_ACTION,
+    )
+
+    store = PermissionStore(str(tmp_path / "asked.db"))
+    await store.initialize()
+    await store.register_tool(
+        "SecurityFeature", "security_feature", PermissionLevel.DENY
+    )
+    queue = ApprovalQueue(permission_store=store)
+
+    phrase = "whether the wrapper orphans the worker"
+    approved, _scope = await queue.request_approval(
+        feature_name="SecurityFeature",
+        tool_name="security_feature",
+        tool_args={"task": f"Search the audit log for {phrase}"},
+        audit_action=SUBAGENT_DISPATCH_ACTION,
+    )
+    assert approved is False  # DENY short-circuits, and still audits
+
+    logged = await store.get_audit_log(10)
+    assert logged and logged[0]["action"] == SUBAGENT_DISPATCH_ACTION, (
+        "the queue must label a dispatch envelope the same way the hook does; "
+        "two writers, one invariant"
+    )
+
+    matches, _ = await store.search_audit_log(phrase)
+    assert matches == []
+
+
+@pytest.mark.asyncio
+async def test_the_deferred_decision_path_also_labels_a_dispatch(tmp_path):
+    """And the OTHER door inside the queue.
+
+    `ApprovalQueue` writes its audit row from two places: an early return for
+    the levels it can decide alone, and `_persist_decision` for everything that
+    reaches a real decision — timeout, cancellation, headless no-approver, or a
+    human answering minutes later on another task. Mutation testing caught that
+    the previous test only covered the first: neutering `_persist_decision`'s
+    label left it passing.
+
+    This drives the headless path, which is the one an unattended agent
+    actually takes."""
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from kestrel_sovereign.features.security.permissions import (
+        PermissionLevel,
+        SUBAGENT_DISPATCH_ACTION,
+    )
+
+    store = PermissionStore(str(tmp_path / "deferred.db"))
+    await store.initialize()
+    await store.register_tool(
+        "SecurityFeature", "security_feature", PermissionLevel.ASK
+    )
+    queue = ApprovalQueue(permission_store=store)
+
+    phrase = "whether the wrapper orphans the worker"
+    approved, scope = await queue.request_approval(
+        feature_name="SecurityFeature",
+        tool_name="security_feature",
+        tool_args={"task": f"Search the audit log for {phrase}"},
+        allow_blocking=False,
+        audit_action=SUBAGENT_DISPATCH_ACTION,
+    )
+    assert approved is False and scope == "no_approver", (
+        "precondition: this must reach _persist_decision, not an early return"
+    )
+
+    logged = await store.get_audit_log(10)
+    assert logged and logged[0]["action"] == SUBAGENT_DISPATCH_ACTION
+    assert logged[0]["decision"] == "no_approver"
+
+    matches, _ = await store.search_audit_log(phrase)
+    assert matches == []
+
+
+@pytest.mark.asyncio
+async def test_the_caller_s_limit_is_honoured_within_the_bound(tmp_path):
+    """The gate needs the full bound to decide, so the query always asks for
+    MAX_DISCLOSING_MATCHES — but the caller's smaller limit must still shrink
+    what is disclosed. Round 2 echoed `limit` in the result and returned
+    everything."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "limit.db"))
+    await store.initialize()
+    for i in range(5):
+        await store.log_decision(
+            feature_name="GitHubFeature",
+            tool_name="create_github_issue",
+            action="tool_execution",
+            decision="auto_mode_allowed",
+            args_summary=f'{{"title": "orphaned worker report {i}"}}',
+        )
+
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="orphaned worker", limit=2)
+    assert result.data["too_broad"] is False
+    assert len(result.data["matches"]) == 2, (
+        "asking for 2 must disclose 2, not the whole bound"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_hook_tells_the_queue_which_kind_of_call_it_was(tmp_path):
+    """End to end through the seam that actually runs in production.
+
+    The previous two tests called `request_approval` directly and passed the
+    label themselves, so neither noticed when the HOOK stopped forwarding it —
+    mutation testing found that gap. This drives `SecurityHook.execute` on
+    PRE_SUBAGENT_CALL at a level that reaches the queue."""
+    import asyncio
+
+    from kestrel_sdk.hooks.base import HookEvent, HookInput
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from kestrel_sovereign.features.security.hooks import SecurityHook
+    from kestrel_sovereign.features.security.permissions import (
+        PermissionLevel,
+        SUBAGENT_DISPATCH_ACTION,
+    )
+
+    store = PermissionStore(str(tmp_path / "hook_to_queue.db"))
+    await store.initialize()
+    await store.register_tool(
+        "SecurityFeature", "security_feature", PermissionLevel.ASK
+    )
+    hook = SecurityHook(store, ApprovalQueue(permission_store=store))
+
+    phrase = "whether the wrapper orphans the worker"
+    # session_id="scheduler" is NON_INTERACTIVE_SESSION_IDS, so the queue
+    # returns a no_approver denial instead of waiting forever for a human —
+    # and that is the unattended path an agent actually runs on.
+    await asyncio.wait_for(hook.execute(HookInput(
+        session_id="scheduler",
+        hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+        tool_name="security_feature",
+        feature_name="SecurityFeature",
+        tool_input={"task": f"Search the audit log for {phrase}"},
+    )), timeout=5.0)
+
+    logged = await store.get_audit_log(10)
+    assert logged, "precondition: the ASK path must have written a row"
+    assert logged[0]["action"] == SUBAGENT_DISPATCH_ACTION, (
+        "the hook knows which event fired; the queue is the one that writes. "
+        "If the fact does not cross that boundary the label is decorative."
+    )
+
+    matches, _ = await store.search_audit_log(phrase)
+    assert matches == []
+
+
+@pytest.mark.asyncio
+async def test_a_decision_answered_later_still_labels_the_dispatch(tmp_path):
+    """The third door: a request that waits for a human and is decided on a
+    different task, minutes later. `_persist_decision` reads the label off the
+    request rather than an argument in scope, so the request has to have
+    carried it — mutation testing showed nothing covered that."""
+    import asyncio
+
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from kestrel_sovereign.features.security.permissions import (
+        PermissionLevel,
+        SUBAGENT_DISPATCH_ACTION,
+    )
+
+    store = PermissionStore(str(tmp_path / "answered.db"))
+    await store.initialize()
+    await store.register_tool(
+        "SecurityFeature", "security_feature", PermissionLevel.ASK
+    )
+    queue = ApprovalQueue(permission_store=store)
+
+    async def approve_later():
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            pending = queue.pending_requests
+            if pending:
+                await queue.submit_decision(pending[0].id, True, "once")
+                return
+        raise AssertionError("the request never reached the queue")
+
+    task = asyncio.create_task(approve_later())
+    phrase = "whether the wrapper orphans the worker"
+    approved, _scope = await queue.request_approval(
+        feature_name="SecurityFeature",
+        tool_name="security_feature",
+        tool_args={"task": f"Search the audit log for {phrase}"},
+        audit_action=SUBAGENT_DISPATCH_ACTION,
+    )
+    await task
+    assert approved is True
+
+    logged = await store.get_audit_log(10)
+    row = next(r for r in logged if r["decision"] == "user_approved")
+    assert row["action"] == SUBAGENT_DISPATCH_ACTION
+
+    matches, _ = await store.search_audit_log(phrase)
+    assert matches == []

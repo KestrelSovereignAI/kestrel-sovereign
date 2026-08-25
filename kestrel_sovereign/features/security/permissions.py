@@ -33,6 +33,35 @@ SEARCH_TOOL_NAME = "security_audit_search"
 #: keep actions.
 SUBAGENT_DISPATCH_ACTION = "subagent_dispatch"
 
+
+def fold_searchable(text):
+    """Decode JSON escaping and casefold, so a query and a stored summary can
+    be compared as the text a human wrote (#3107).
+
+    ``args_summary`` holds ``json.dumps`` output with the default
+    ``ensure_ascii=True``, so "Échec" is persisted as ``\\u00c9chec``. Neither
+    a literal comparison nor SQLite's ASCII-only ``LOWER`` can match that
+    against a query of "échec". Decoding first makes both sides the same kind
+    of thing before either is folded.
+
+    Best-effort by design: a truncated summary is not valid JSON, and a value
+    that cannot be decoded is folded as the raw text it is rather than
+    dropped. Returning nothing for an unparseable row would silently shrink
+    the corpus the caller believes it searched.
+    """
+    if not text:
+        return text
+    decoded = text
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, (dict, list)):
+            decoded = json.dumps(parsed, ensure_ascii=False)
+        elif isinstance(parsed, str):
+            decoded = parsed
+    except (ValueError, TypeError):
+        pass
+    return decoded.casefold()
+
 logger = logging.getLogger(__name__)
 
 
@@ -982,26 +1011,26 @@ class PermissionStore:
                 .replace("_", "\\_")
             ) + "%"
 
-        # ``summarize_args`` persists ``json.dumps(...)`` output, and
-        # json.dumps defaults to ensure_ascii=True — so a title stored from
-        # "Échec — café" is on disk as "\u00c9chec \u2014 caf\u00e9". A LIKE
-        # built from the literal query therefore finds nothing for exactly the
-        # natural-language fragments a caller reaches for. Both real filings
-        # behind #3107 carried an em dash in their titles. Search the escaped
-        # form as well as the literal one; they coincide for pure ASCII, so
-        # this costs a redundant predicate there and nothing else.
-        json_escaped = json.dumps(needle)[1:-1]
-        patterns = [_like(needle)]
-        if json_escaped != needle:
-            patterns.append(_like(json_escaped))
-
-        text_match = " OR ".join(
-            "LOWER(args_summary) LIKE LOWER(?) ESCAPE '\\'" for _ in patterns
-        )
+        # Two problems with matching this column, and one answer to both.
+        #
+        # ``summarize_args`` persists ``json.dumps(...)`` output, and json.dumps
+        # defaults to ensure_ascii=True — so a title stored from "Échec — café"
+        # is on disk as "\u00c9chec \u2014 caf\u00e9". A LIKE built from the
+        # literal query finds nothing for exactly the natural-language
+        # fragments a caller reaches for; both real filings behind #3107
+        # carried an em dash. And SQLite's built-in LOWER folds ASCII only, so
+        # matching the ESCAPED form case-insensitively does not work either:
+        # "É" and "é" escape to \u00c9 and \u00e9, which differ in a
+        # character LOWER will not touch.
+        #
+        # So neither side is compared raw. ``py_fold`` (registered on the
+        # connection) decodes the JSON escaping and casefolds, and both the
+        # column and the needle go through it. Measured at 187 ms for a full
+        # scan of 86,000 rows — this table has no index for LIKE anyway.
         clauses = [
             (
-                f"({text_match} "
-                "OR LOWER(tool_name) LIKE LOWER(?) ESCAPE '\\')"
+                "(py_fold(args_summary) LIKE ? ESCAPE '\\' "
+                "OR py_fold(tool_name) LIKE ? ESCAPE '\\')"
             ),
             # A dispatch is a REQUEST, not an action. ``SecurityHook`` also
             # runs on PRE_SUBAGENT_CALL, so a feature-as-subagent dispatch
@@ -1023,9 +1052,9 @@ class PermissionStore:
             # ``.outcome`` row with it.
             "tool_name NOT LIKE ?",
         ]
+        folded = _like(fold_searchable(needle))
         params: List[Any] = [
-            *patterns, _like(needle), SUBAGENT_DISPATCH_ACTION,
-            f"{SEARCH_TOOL_NAME}%",
+            folded, folded, SUBAGENT_DISPATCH_ACTION, f"{SEARCH_TOOL_NAME}%",
         ]
 
         if tool_name:
@@ -1096,6 +1125,10 @@ class PermissionStore:
 
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+            # The fold has to happen inside the query: SQLite cannot express
+            # it, so Python is registered as a scalar function on this
+            # connection. Deterministic, so SQLite may cache per-value.
+            await db.create_function("py_fold", 1, fold_searchable)
             # id DESC for the same reason get_audit_log uses it: legacy rows
             # carry a space-separated timestamp that sorts incorrectly against
             # the ISO ones (F092), and id ordering is format-agnostic.

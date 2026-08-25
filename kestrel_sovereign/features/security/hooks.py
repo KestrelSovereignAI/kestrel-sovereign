@@ -179,6 +179,13 @@ class SecurityHook(Hook):
                 tool_name=tool_name,
                 tool_args=input.tool_input or {},
                 allow_blocking=allow_blocking,
+                # The queue writes audit rows on paths this hook never
+                # returns through, so it needs the same fact. Without this the
+                # ASK path — which is the DEFAULT for the feature-as-subagent
+                # dispatcher — kept writing "tool_execution" and the exclusion
+                # in security_audit_search missed exactly the case it was
+                # added for (#3107 review round 2 fixed one door, not both).
+                audit_action=audit_action,
             )
 
             if not approved:
@@ -232,14 +239,23 @@ class SecurityHook(Hook):
     def _summarize_args(
         self,
         args: Optional[dict],
-        max_length: int = 200,
+        max_length: Optional[int] = None,
     ) -> Optional[str]:
         """Create a privacy-safe summary of tool arguments.
 
         Thin wrapper over the shared
         :func:`kestrel_sovereign.features.security.args_summary.summarize_args`
         so this path and :class:`ApprovalQueue` produce identical masked rows.
+
+        That sentence used to be false. This wrapper overrode the shared cap
+        with 200 while ``ApprovalQueue`` used the shared 500, so the same tool
+        call was truncated to two different lengths depending on which door it
+        came through — and a read-back over the column could not state one
+        honest bound (#3107 review round 3). The override is gone; passing
+        ``max_length`` explicitly is still allowed for a caller that means it.
         """
+        if max_length is None:
+            return summarize_args(args)
         return summarize_args(args, max_length=max_length)
 
     def _mask_sensitive(self, data: dict) -> dict:
