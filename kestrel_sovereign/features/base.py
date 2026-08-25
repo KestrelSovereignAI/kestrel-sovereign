@@ -1503,13 +1503,30 @@ class Feature(_SdkFeature):
             bind_transition_lock_reentry,
             current_bound_reentry_token,
         )
+        from kestrel_sovereign.signals.context import (
+            bind_current_signal,
+            get_current_signal,
+        )
         transition_reentry_token = current_bound_reentry_token()
         turn_session_binding = capture_turn_session_binding(self.agent)
+        # The waking Signal is the fourth turn-scoped binding this boundary
+        # drops (#3112; the parent-turn twin is in
+        # ``OrchestratorEngineMixin._make_inline_tool_executor``). Guards that
+        # ask "what woke this turn?" — notably the scheduler's single-hop
+        # self_followup refusal — read ``get_current_signal()``; on the codex
+        # app-server route this subagent's inline tools run on a freshly
+        # spawned reader task whose frozen snapshot has no signal, so the
+        # guard's ``is not None`` test short-circuits and the refusal never
+        # fires. Capture on the owning task and re-present. An executor built
+        # off-turn captures ``None``, so this never manufactures a waking
+        # signal where there was none.
+        turn_signal = get_current_signal()
 
         async def _exec(name: str, args: Dict[str, Any]):
             with (
                 bind_transition_lock_reentry(transition_reentry_token),
                 bind_turn_session(turn_session_binding),
+                bind_current_signal(turn_signal),
             ):
                 return await self._execute_subagent_tool(
                     tool_name=name,
