@@ -26,6 +26,7 @@ from .conversation_ids import coerce_persistent_message_id
 from .conversation_created_at import UNDATED_TABLE
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
+    canonical_session_id,
     canonical_timestamp_sql,
     iso_session_timestamp,
     parse_message_metadata,
@@ -2156,6 +2157,8 @@ class AsyncConversationStore:
         metadata_index: int = 3,
         created_at_index: int = 4,
         reject_invalid_timestamps: bool = False,
+        anchor_missing: bool = False,
+        anchor_key: Optional[Tuple[datetime, int]] = None,
     ) -> List[tuple]:
         """Apply the canonical time-gap/resumption rules to candidate rows.
 
@@ -2188,17 +2191,13 @@ class AsyncConversationStore:
             if row_id in seen_ids:
                 continue
             seen_ids.add(row_id)
-            metadata_json = row[metadata_index]
-            meta: dict[str, Any] = {}
-            if metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                except json.JSONDecodeError as error:
-                    logger.warning(
-                        "Failed to parse metadata for message in session %s: %s",
-                        session_id,
-                        error,
-                    )
+            # The module's authored-once answer, not a fourth local copy of it.
+            # This one WAS a local copy and it differed in the way that
+            # matters: a document parsing to something other than an object —
+            # ``"[]"``, a bare string — came back as that value and was then
+            # asked ``.get``, so one legacy row raised AttributeError through
+            # every read, count and purge of the session it fell in.
+            meta: dict[str, Any] = parse_message_metadata(row[metadata_index])
             timestamp = coerce_session_timestamp(row[created_at_index])
             if timestamp is None:
                 # Fail closed only when membership would depend on gap
@@ -2209,7 +2208,7 @@ class AsyncConversationStore:
                 # created_at undeletable through count/guard/purge.
                 if (
                     reject_invalid_timestamps
-                    and meta.get("session_id") != session_id_str
+                    and canonical_session_id(meta) != session_id_str
                 ):
                     raise ConversationSessionTimestampError(
                         "Refusing exact conversation-session resolution because "
@@ -2221,15 +2220,126 @@ class AsyncConversationStore:
             )
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
 
+
         session_rows = []
         last_timestamp: Optional[datetime] = None
         is_first = True
+        # The row a session's run STARTS at, when its key names one. A legacy
+        # key IS a row id (#2012), so the session begins there and at no other
+        # row; a canonical key begins wherever the first row naming it is.
+        anchor_row_id = coerce_persistent_message_id(session_id)
+        # ...and when the key names NO row, the rows that name IT open it
+        # instead. A numeric session id can be metadata-only — a client
+        # supplied it, or the legacy anchor was hard-deleted out from under it
+        # — and those rows would otherwise be unreachable by the only key
+        # anyone has for them, which for purge means unpurgeable. This is not
+        # the case the grouper's acceptance rule refuses: there the anchor
+        # EXISTS and the bare integer beside it is a stale echo of a row that
+        # belongs to another session. Here there is nothing to echo.
+        exact_opens_the_run = anchor_missing and anchor_row_id is not None
+        # Whether the anchor row is among the candidates at all. It may not be:
+        # a session lifecycle op selects one deletion state, and a partially
+        # restored session can have its anchor live while the rows under it are
+        # still in Trash. The session did not stop starting where it starts, so
+        # the run opens at the anchor's POSITION instead — at the first
+        # candidate standing at or after it, which the boundary test below can
+        # still refuse. Only the first: once a boundary closes the run, only
+        # the session's own rows may re-open it.
+        anchor_position_open = (
+            anchor_key is not None
+            and anchor_row_id is not None
+            and not any(candidate[1] == anchor_row_id for candidate in candidates)
+        )
+        if anchor_position_open:
+            # The gap is measured from where the session STARTS, so a hidden
+            # anchor still sets the clock: a candidate standing half an hour
+            # past it is a later conversation whatever else is true of it.
+            last_timestamp = anchor_key[0]
+        # Whether the requested session's run is currently taking rows.
+        #
+        # It starts CLOSED, which is the difference between "these candidates
+        # begin at the session" and "these candidates begin near it". The
+        # candidate query selects a timestamp RANGE, and two rows can share a
+        # second — so the row before the anchor in canonical order arrives
+        # first, and a run that started open would take it out of the session
+        # before this one. The same range is what a metadata ``LIKE`` can widen
+        # by matching this session's id nested inside some other document: that
+        # row is not a member, it must not open the run, and now it cannot.
+        #
+        # A row filed under a DIFFERENT canonical id closes the run, and so
+        # does a ``new_session`` marker — the grouper's other two boundaries.
+        # Closing is not the same as skipping the row: an unlabeled row after
+        # one inherits THAT session, so it must not rejoin this one by merely
+        # falling inside the gap. Only the anchor or a row NAMING this session
+        # opens the run — the latter is a resumption, which the grouper
+        # coalesces back by id, and which is why a boundary must not end the
+        # scan the way it used to.
+        #
+        # Until #3098 the walk had no boundary at all, so a legacy numeric
+        # cluster absorbed a following stamped row. The grouper had to absorb
+        # it too, or deleting the cluster the list showed would have destroyed
+        # the stamped session beside it — and that absorption is what made
+        # Phase A's per-row column disagree with the grouping and drop the
+        # whole conversation from the list.
+        run_open = False
 
-        for timestamp, _row_id, row, meta in candidates:
-            is_resumed_message = meta.get("session_id") == session_id_str
+        for timestamp, row_id, row, meta in candidates:
+            # A row RESUMES this session only under the grouper's own
+            # acceptance rule, which is why this asks `canonical_session_id`
+            # rather than comparing the raw metadata value. A bare integer
+            # there names a row, not a session (#2012), and the grouper reads
+            # such a row as unlabeled — so treating one as a resumption filed
+            # it under a legacy key while the list showed it under the session
+            # it had actually fallen into, and deleting the legacy session
+            # deleted a row displayed elsewhere. It also means a numeric
+            # session cannot be resumed at all, which is the truth: its key is
+            # its first row's id, and no second cluster can start at that row.
+            is_resumed_message = canonical_session_id(meta) == session_id_str
 
-            if not is_first and not is_resumed_message and meta.get("new_session"):
-                break
+            opens_the_run = (
+                is_resumed_message
+                or row_id == anchor_row_id
+                or (
+                    exact_opens_the_run
+                    and meta.get(SESSION_ID_KEY) is not None
+                    and str(meta[SESSION_ID_KEY]) == session_id_str
+                )
+            )
+            # The session's start POSITION, when its anchor row is hidden by
+            # the deletion filter. It is a position and nothing more: the
+            # boundary test below still decides, so a row beginning another
+            # session — a ``new_session`` marker, a row filed under another
+            # canonical id — standing there refuses rather than inherits, and
+            # the gap from the anchor is measured by ``last_timestamp`` above.
+            at_anchor_position = False
+            if anchor_position_open and (timestamp, row_id) >= anchor_key:
+                at_anchor_position = True
+                anchor_position_open = False
+
+            # A row filed under another canonical id closes the run even when
+            # it is the row the key names: a key whose own row files itself
+            # elsewhere names no session the grouper would show — the list keys
+            # a legacy cluster by its first row only when that row carries no
+            # id of its own — so the honest answer is an empty one, not that
+            # row by itself.
+            #
+            # A ``new_session`` marker closes the run for everyone EXCEPT the
+            # session it opens, which is not a special case but the same rule
+            # read the right way round: a marker starts a session, and this can
+            # be that session's. Nellie has one — a legacy marker carrying the
+            # bare integer of the session before it, anchoring three turns of
+            # its own — and testing the boundary first resolved it to nothing.
+            if canonical_session_id(meta) not in (None, session_id_str) or (
+                not opens_the_run and meta.get("new_session")
+            ):
+                run_open = False
+            elif opens_the_run or at_anchor_position:
+                run_open = True
+            if not run_open:
+                # Deliberately WITHOUT advancing ``last_timestamp``: nothing
+                # else can join this session until the anchor or a resumption
+                # opens the run, and both are admitted regardless of the gap.
+                continue
 
             if last_timestamp and not is_resumed_message:
                 gap_minutes = (
@@ -2297,82 +2407,135 @@ class AsyncConversationStore:
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
         archive_clause = "" if include_archived else " AND archived_at IS NULL"
+        # Canonicalize the timestamp prefilter/order: SQLite history mixes
+        # ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and raw TEXT
+        # comparison drops later rows whose stored form sorts below the
+        # anchor's.  The exact purge/count resolver already compares via
+        # julianday; display must see the same membership or hard purge could
+        # destroy rows this path never returned.
+        # ``(created_at, id) >= (cursor)``, spelled as the disjunction both
+        # dialects can index. A stamp-only cursor cannot step past a second
+        # that holds more rows than one window: the same page comes back for
+        # ever, and the loop consumed the resumption key it was paging TO.
+        created_at_predicate = (
+            "("
+            + self._timestamp_predicate("created_at", ">")
+            + " OR ("
+            + self._timestamp_predicate("created_at", ">=")
+            + " AND id >= ?))"
+        )
+        created_at_order = self._canonical_timestamp_sql("created_at")
+        # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the
+        # match to EVERY row (#1729); ESCAPE '\' makes the backslash the escape
+        # char. For an ordinary UUID this is a no-op.
+        esc = _escape_like_session_value(session_id)
+        spaced_pattern = f'%"session_id": "{esc}"%'
+        # JSON formatting varies; both spellings are the same membership claim.
+        compact_pattern = f'%"session_id":"{esc}"%'
 
-        # Try to interpret session_id as a message ID for time-based grouping.
-        # If it isn't (e.g. a UUID-based implicit session_id), skip this path
-        # and fall through to the metadata-based lookup below.
+        # Where a LEGACY session's forward walk begins. A canonical session has
+        # no such walk here, and that is deliberate rather than an omission.
+        #
+        # The grouper gives an unlabeled row to the session it falls after, so a
+        # canonical session owns the unlabeled run following it and resolving it
+        # by metadata alone answers with a strict subset of what the list shows.
+        # Measured across the four live agents: the resolver and the grouper
+        # disagree about 65 conversations before this ticket, 16 after it, and
+        # the last 16 are exactly that subset. Closing them needs a forward walk
+        # for canonical ids too, and a forward walk carries a scope: it was
+        # measured letting an ARCHIVED row bridge two twenty-minute gaps under
+        # `deleted_filter="all"`, so purging one session destroyed another the
+        # active list showed separately. The legacy path has always had that
+        # exposure; giving it to every session is a decision about lifecycle
+        # scope across deletion universes, and it is not this ticket's (#3120).
         all_rows = []
         row_id = coerce_persistent_message_id(session_id)
+        start_row = None
         if row_id is not None:
             # The anchor row itself is looked up regardless of state — we
             # need its timestamp even if it's been soft-deleted, otherwise
             # we can't restore the session that owned it.
             start_row = await self.db.fetchone(
-                "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
+                "SELECT created_at, id FROM conversation_history "
+                "WHERE id = ? AND agent_id = ?",
                 (row_id, self.agent_id)
             )
 
-            # If session_id is a message ID, get messages from that timestamp forward
-            # rendered_content (#1402) appended at row[5] so existing
-            # positional accesses on metadata/created_at don't shift.
-            if start_row:
-                start_time = start_row[0]
-                # Canonicalize the timestamp prefilter/order: SQLite history
-                # mixes ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and
-                # raw TEXT comparison drops later rows whose stored form sorts
-                # below the anchor's.  The exact purge/count resolver already
-                # compares via julianday; display must see the same membership
-                # or hard purge could destroy rows this path never returned.
-                created_at_predicate = self._timestamp_predicate(
-                    "created_at", ">="
-                )
-                created_at_order = self._canonical_timestamp_sql("created_at")
-                all_rows = await self.db.fetchall(
-                    f"""SELECT id, role, content, metadata, created_at,
-                              rendered_content, model, provider
-                       FROM conversation_history
-                       WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
-                       ORDER BY {created_at_order} ASC
-                       LIMIT ?""",
-                    (
-                        self.agent_id,
-                        self._timestamp_query_param(start_time),
-                        limit * 2,  # Fetch extra in case of filtering
-                    ),
-                )
+        # Whether the key names a row at all. A numeric session id can be
+        # metadata-only — a client supplied it, or the legacy anchor was
+        # hard-deleted — and then the rows naming it are the only thing that
+        # can open the walk (see `_filter_session_rows`).
+        anchor_missing = row_id is not None and start_row is None
 
-        # Also get messages that explicitly belong to this session (resumed conversations)
-        # These are messages with session_id in metadata that may come after a time gap.
-        # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the match
-        # to EVERY row (#1729); ESCAPE '\' makes the backslash the escape char. For
-        # an ordinary UUID this is a no-op.
-        esc = _escape_like_session_value(session_id)
+        # Where the session starts, as the pair everything here compares in.
+        # Carried into the walk so a lifecycle op whose deletion filter hides
+        # the anchor — a partially restored session has its anchor live and its
+        # rows in Trash — still opens the run where the session opens.
+        anchor_key = (
+            (
+                coerce_session_timestamp(start_row[0]) or UNDATABLE_ROW_FALLBACK,
+                int(start_row[1]),
+            )
+            if start_row is not None and row_id is not None
+            else None
+        )
+
+        # The rows that NAME this session, whatever the distance — a resumption
+        # past a time gap, or past the window below.
         resumed_rows = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY created_at ASC
+               ORDER BY {created_at_order} ASC, id ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id": "{esc}"%', limit)
+            (self.agent_id, spaced_pattern, limit)
         )
 
-        # Also try without space after colon (JSON formatting varies)
         resumed_rows_alt = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
-               ORDER BY created_at ASC
+               ORDER BY {created_at_order} ASC, id ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id":"{esc}"%', limit)
+            (self.agent_id, compact_pattern, limit)
         )
+
+        # One window forward from the anchor, ordered by ``(created_at, id)``
+        # and cut by ``(created_at, id) >= anchor`` — the order the walk itself
+        # sorts candidates into. ``created_at`` is stored to the second, so a
+        # bound on the stamp alone admits the row BEFORE the anchor and a LIMIT
+        # over it truncates a tie group wherever the engine felt like it:
+        # measured on sqlite 3.50, a LIMIT of eight over ten rows returned the
+        # last row of the tie and dropped the two before it.
+        #
+        # rendered_content (#1402) is appended at row[5] so existing positional
+        # accesses on metadata/created_at don't shift.
+        if start_row is not None:
+            all_rows = await self.db.fetchall(
+                f"""SELECT id, role, content, metadata, created_at,
+                          rendered_content, model, provider
+                   FROM conversation_history
+                   WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
+                   ORDER BY {created_at_order} ASC, id ASC
+                   LIMIT ?""",
+                (
+                    self.agent_id,
+                    self._timestamp_query_param(start_row[0]),
+                    self._timestamp_query_param(start_row[0]),
+                    int(start_row[1]),
+                    limit * 2,  # Fetch extra in case of filtering
+                ),
+            )
 
         return self._filter_session_rows(
             [*all_rows, *resumed_rows, *resumed_rows_alt],
             session_id,
             limit=limit,
             include_markers=include_markers,
+            anchor_missing=anchor_missing,
+            anchor_key=anchor_key,
         )
 
     async def _get_complete_session_message_ids(
@@ -2395,8 +2558,10 @@ class AsyncConversationStore:
         Only fields needed by the shared grouping algorithm are materialized;
         encrypted message bodies remain untouched even for very large sessions.
         """
-        del_clause = self._deleted_filter_clause(deleted_filter).replace(
-            "deleted_at", "c.deleted_at"
+        anchor_del_clause = self._deleted_filter_clause(deleted_filter)
+        del_clause = anchor_del_clause.replace("deleted_at", "c.deleted_at")
+        anchor_archive_clause = (
+            "" if include_archived else " AND archived_at IS NULL"
         )
         archive_clause = (
             "" if include_archived else " AND c.archived_at IS NULL"
@@ -2407,12 +2572,25 @@ class AsyncConversationStore:
         row_id = coerce_persistent_message_id(session_id)
 
         if row_id is None:
+            # A canonical session is resolved by the rows that NAME it, and no
+            # further. The grouper also gives it the unlabeled run that follows
+            # it, so this is a strict subset of what the list shows — measured
+            # at 16 conversations across the four live agents. Closing that
+            # needs a forward walk here, and a forward walk under
+            # ``deleted_filter="all"`` lets a HIDDEN row bridge two gaps the
+            # active view splits: measured, an archived row twenty minutes
+            # after this session and twenty before another one merged the two,
+            # and purging this one destroyed the other permanently. The legacy
+            # branch below has always carried that exposure; extending it to
+            # every session is a decision about lifecycle scope across deletion
+            # universes and is #3120's, not this ticket's.
             query_prefix = ""
-            candidate_source = "conversation_history c"
             membership_predicate = (
                 "(c.metadata LIKE ? ESCAPE '\\' "
                 "OR c.metadata LIKE ? ESCAPE '\\')"
             )
+            anchor_column = "0, NULL"
+            candidate_source = "conversation_history c"
             params: tuple[Any, ...] = (
                 self.agent_id,
                 spaced_pattern,
@@ -2425,11 +2603,12 @@ class AsyncConversationStore:
                 "WHERE id = ? AND agent_id = ?"
                 ") "
             )
-            # LEFT JOIN (not CROSS JOIN): a numeric session id can be
-            # metadata-only — the client supplied it explicitly, or the legacy
-            # anchor row was already hard-deleted.  An empty anchor CTE must
-            # drop only the time-grouping branch, never the metadata branch,
-            # or purge/count would miss rows the display resolver still finds.
+            # LEFT JOIN (not CROSS JOIN): the anchor CTE can be empty, because
+            # a numeric session id can be metadata-only — the client supplied
+            # it explicitly, or the legacy anchor row was already hard-deleted.
+            # An empty anchor must drop only the time-grouping branch, never
+            # the metadata branch, or purge/count would miss rows the display
+            # resolver still finds.
             candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
             candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
             anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
@@ -2441,6 +2620,9 @@ class AsyncConversationStore:
                 "OR c.metadata LIKE ? ESCAPE '\\' "
                 "OR c.metadata LIKE ? ESCAPE '\\')"
             )
+            anchor_column = (
+                "(SELECT count(*) FROM anchor), (SELECT created_at FROM anchor)"
+            )
             params = (
                 row_id,
                 self.agent_id,
@@ -2449,8 +2631,13 @@ class AsyncConversationStore:
                 compact_pattern,
             )
 
+        # Whether the key names a row, read in the SAME statement as the
+        # candidates. It decides whether a row naming this session may open the
+        # walk (see `_filter_session_rows`), and asking separately would put
+        # that decision in a different snapshot from the rows it is about.
         candidates = await self.db.fetchall(
-            f"{query_prefix}SELECT c.id, c.metadata, c.created_at "
+            f"{query_prefix}SELECT c.id, c.metadata, c.created_at, "
+            f"{anchor_column} "
             f"FROM {candidate_source} WHERE c.agent_id = ? AND "
             f"{membership_predicate}{del_clause}{archive_clause} "
             "ORDER BY c.id ASC",
@@ -2464,6 +2651,20 @@ class AsyncConversationStore:
             metadata_index=1,
             created_at_index=2,
             reject_invalid_timestamps=True,
+            anchor_missing=bool(candidates) and not candidates[0][3],
+            # The anchor's position, so a deletion filter that hides the row
+            # itself still opens the run where the session opens. Its id is
+            # ``row_id`` by construction — a canonical key has no anchor row
+            # id, and `_filter_session_rows` ignores the pair without one.
+            anchor_key=(
+                (
+                    coerce_session_timestamp(candidates[0][4])
+                    or UNDATABLE_ROW_FALLBACK,
+                    row_id,
+                )
+                if candidates and candidates[0][3] and row_id is not None
+                else None
+            ),
         )
         return sorted({int(row[0]) for row in session_rows})
 

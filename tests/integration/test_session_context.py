@@ -4,6 +4,8 @@ Tests for session-based conversation context loading.
 When a user selects a conversation from history, the agent should
 load that session's context (not the most recent messages globally).
 """
+import json
+
 import pytest
 import asyncio
 from datetime import datetime, timedelta
@@ -153,7 +155,13 @@ async def test_nonexistent_session_returns_empty(storage_with_sessions):
 
 @pytest.mark.asyncio
 async def test_privacy_feature_passes_session_id(tmp_path):
-    """Verify PrivacyAgent passes session_id through to storage."""
+    """Verify PrivacyAgent passes session_id through to storage.
+
+    The id asked for is the one the messages were actually filed under. It used
+    to be the first row's id, which the write path mints a UUID over — so the
+    request named a session no surface shows, and the answer was whatever a
+    forward time-walk from that row happened to reach (#3098).
+    """
     from kestrel_sovereign.features.privacy.feature import PrivacyAgent
     from kestrel_sovereign.privacy import PrivacyMode
 
@@ -164,9 +172,9 @@ async def test_privacy_feature_passes_session_id(tmp_path):
     # Add some messages
     await storage.add_conversation("user", "Test message 1")
     rows = await storage.db.fetchall(
-        "SELECT id FROM conversation_history ORDER BY id ASC LIMIT 1", ()
+        "SELECT metadata FROM conversation_history ORDER BY id ASC LIMIT 1", ()
     )
-    session_id = str(rows[0][0])
+    session_id = json.loads(rows[0][0])["session_id"]
     await storage.add_conversation("assistant", "Response 1")
 
     # Create PrivacyAgent
@@ -183,15 +191,24 @@ async def test_privacy_feature_passes_session_id(tmp_path):
 async def test_resumed_conversation_includes_messages_with_session_id_metadata(tmp_path):
     """
     Test that resuming an old conversation includes messages sent after a time gap.
-    
+
     Scenario:
     1. Session 1 starts with messages at t=0
     2. Time gap of 2 hours (exceeds 30-min threshold)
     3. User loads session 1 and sends new message (with session_id in metadata)
     4. Loading session 1 again should include BOTH original AND new messages
-    
+
     This tests the "resumed conversation" feature where session_id in metadata
     bridges the time gap that would normally split sessions.
+
+    **The bridging id must be one the grouper accepts (#3098).** It used to be
+    the legacy row-id of the first message, and a bare integer there names a
+    ROW rather than a session (#2012) — the grouper reads such a row as
+    unlabeled, so it put the resumed messages in a NEW conversation two hours
+    later while this resolver put them in the old one. Both, in other words,
+    and deleting either destroyed rows the other was showing. Measured across
+    the four live agents before this changed: the resolver and the grouper
+    disagreed about 65 conversations; after, none.
     """
     import json
     
@@ -207,17 +224,22 @@ async def test_resumed_conversation_includes_messages_with_session_id_metadata(t
          session1_time.strftime('%Y-%m-%d %H:%M:%S'))
     )
     
-    # Get session 1 ID
-    rows = await storage.db.fetchall(
-        "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id ASC LIMIT 1",
-        ("resume-test",)
-    )
-    session1_id = str(rows[0][0])
-    
     await storage.db.execute_commit(
         "INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
         ("resume-test", "assistant", "Original response in session 1", None,
          (session1_time + timedelta(seconds=5)).strftime('%Y-%m-%d %H:%M:%S'))
+    )
+
+    # Session 1's canonical id — a key the grouper files rows under, which a
+    # bare row-id is not. BOTH original rows carry it: a canonical session is
+    # resolved by the rows that name it (#3120), so a row left untagged here
+    # would be one the fixture claims is in the session and the resolver does
+    # not.
+    session1_id = "session-one-resumed"
+    await storage.db.execute_commit(
+        "UPDATE conversation_history SET metadata = ?, session_id = ? "
+        "WHERE agent_id = ?",
+        (json.dumps({"session_id": session1_id}), session1_id, "resume-test"),
     )
     
     # --- TIME GAP OF 2 HOURS ---

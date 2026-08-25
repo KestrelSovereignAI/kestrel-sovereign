@@ -319,14 +319,13 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
 from .session_grouping import (
-    timestamp_predicate,
     SESSION_ORDER,
     SESSION_ORDER_TEXT_COLUMNS,
     canonical_timestamp_sql,
@@ -583,15 +582,6 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: probes below count these rows; two spellings of one membership rule is the
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
-
-#: How far a cluster-reach walk will follow a chain of turns before refusing.
-#:
-#: A legacy cluster extends for as long as consecutive rows stay within
-#: ``SESSION_GAP_MINUTES``, which has no bound in the data — so the walk has one,
-#: and running out is answered by a frontier nothing can be after rather than by
-#: a guess. 512 turns without a half-hour break is well past any real
-#: conversation and is one indexed read.
-CLUSTER_REACH_ROWS = 512
 
 #: "Something is unstamped and nothing can be ordered against it."
 #:
@@ -1236,9 +1226,19 @@ def _anchor(generation: str, *, row: str = "", agents: str = "", where: str = ""
     nothing — one row per row written, and one uuid generated per row of a bulk
     insert.
     """
+    # ``WHERE true`` is not filler. SQLite cannot parse ``INSERT ... SELECT ...
+    # ON CONFLICT`` without one: the upsert clause is ambiguous against a join
+    # on the SELECT, and its answer is to require a WHERE before it. The form
+    # went unnoticed while only PostgreSQL's statement triggers used it —
+    # SQLite has no transition tables and so no per-statement bump — and
+    # raised the moment #3098 asked for the same row for a set of agents on
+    # both engines. PostgreSQL accepts the term and ignores it.
     values = (
         f"VALUES ({row}.agent_id, 0, 0, 0, {generation})" if row
-        else f"SELECT agent_id, 0, 0, 0, {generation} FROM ({agents}) AS kestrel_agents"
+        else (
+            f"SELECT agent_id, 0, 0, 0, {generation} "
+            f"FROM ({agents}) AS kestrel_agents WHERE true"
+        )
     )
     if where:
         # The conditional form has to be a SELECT: SQLite has no way to put a
@@ -1491,14 +1491,94 @@ def _placeholder(kind: str, role: str) -> str:
     return ("fn_" if kind == "function" else "trg_") + role
 
 
-def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
-    """A short digest of the whole mechanism's DDL, names excluded.
+#: Whose source counts as part of the grouping when the grouper imports from it.
+#: Everything else a module-level name can hold — the standard library, a third
+#: party — is represented by its VALUE below if it has a simple one, and
+#: otherwise not at all, because hashing an unrelated library's text would
+#: rebuild every projection on an unrelated upgrade.
+_GROUPING_PACKAGES = frozenset({"kestrel_sovereign", "kestrel_sdk"})
 
-    Names are excluded because they are derived FROM this — the templates carry
-    ``{fn_appended}``-style placeholders and are resolved afterwards, which is
-    what stops the definition from depending on its own digest.
+
+@lru_cache(maxsize=1)
+def _grouping_source() -> str:
+    """The derivation whose ANSWER this projection stores, as text.
+
+    The whole module, not a curated list of the functions that decide a
+    boundary. A curated list is a second place to remember, and this repository
+    has already paid for one — :data:`PROJECTION_METADATA_KEYS` needed a test
+    that reads ``session_grouping``'s own AST to keep it honest, because a key
+    added there and not here is invisible in the worst direction. There is
+    nothing to keep honest about "the module".
+
+    **And what the module IMPORTS, because a boundary can move without its
+    text changing.** ``SESSION_GAP_MINUTES`` decides where every session ends
+    and is defined elsewhere; ``SESSION_ID_KEY`` names the field every session
+    is keyed by and is defined elsewhere. A dependency bump that moved either
+    would leave this file byte-identical, the trigger names unchanged, and
+    every stored projection reporting itself current over boundaries this
+    revision no longer computes. So each module-level name is folded in by its
+    VALUE when it has a simple one, and by its own module's source when it is
+    something of ours — derived from the namespace rather than listed, for the
+    same reason the module is taken whole.
+
+    The cost is that editing a docstring here rebuilds every agent's projection
+    once. That is the direction this module already chooses everywhere else:
+    rebuild needlessly, never miss a change.
     """
-    material = "\n".join((backend_type, *templates)).encode("utf-8")
+    import inspect
+
+    from kestrel_sovereign.storage import session_grouping
+
+    parts = [inspect.getsource(session_grouping)]
+    namespace = vars(session_grouping)
+    for name in sorted(namespace):
+        if name.startswith("__"):
+            continue
+        value = namespace[name]
+        origin = getattr(value, "__module__", None)
+        if (
+            origin
+            and origin != session_grouping.__name__
+            and origin.split(".")[0] in _GROUPING_PACKAGES
+        ):
+            module = inspect.getmodule(value)
+            try:
+                parts.append(inspect.getsource(module))
+                continue
+            except (OSError, TypeError):
+                pass
+        if isinstance(value, (bool, int, float, str, bytes, tuple, frozenset)):
+            parts.append(f"{name}={value!r}")
+    return "\n".join(parts)
+
+
+def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
+    """A short digest of everything the stored answer depends on.
+
+    Two inputs, and the second is not an embellishment of the first.
+
+    The mechanism's DDL, names excluded — excluded because they are derived
+    FROM this, the templates carrying ``{fn_appended}``-style placeholders that
+    are resolved afterwards, which is what stops the definition from depending
+    on its own digest.
+
+    And :func:`_grouping_source`, because the trigger shape is only half of
+    what makes a stored session right. The other half is the function that
+    computed it. :func:`shape_change_invalidation` says the outcome this design
+    exists to make impossible is "the projection reports itself current while
+    holding an answer the grouper would not give" — and a changed GROUPER
+    reaches that outcome by the other road, with every trigger, counter and
+    watermark still perfectly consistent about rows nobody disputes. Measured
+    on Emma's live history at #3098: eight sessions the reader showed and the
+    list did not, after a change to where a session ends, with a projection
+    reporting itself current throughout.
+
+    So the name an object carries is the definition of the answer it maintains,
+    which is what a name probe was always meant to be asking.
+    """
+    material = "\n".join(
+        (backend_type, _grouping_source(), *templates)
+    ).encode("utf-8")
     return hashlib.blake2s(material, digest_size=4).hexdigest()
 
 
@@ -1872,9 +1952,10 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
 def _mechanism(backend_type: str) -> Tuple[Tuple[str, str, str, str], ...]:
     """``(kind, role, name, DDL)`` for the whole mechanism, names resolved.
 
-    Every name ends in :func:`_fingerprint` of the mechanism it belongs to, so
-    the objects installed in a database ARE their definition and a name probe
-    answers the question it was always meant to ask (#2998).
+    Every name ends in :func:`_fingerprint` of the mechanism it belongs to AND
+    of the grouping whose output it maintains, so the objects installed in a
+    database ARE the definition of the answer stored beside them, and a name
+    probe answers the question it was always meant to ask (#2998, #3098).
 
     The fingerprint covers the functions as well as the triggers, and covers all
     of them together. A PostgreSQL trigger's behaviour is its function's body:
@@ -1999,6 +2080,46 @@ def shape_change_invalidation(backend_type: str) -> str:
         # Slot 0 only: it is the one row that carries a generation, and the
         # writers' slots hold the empty string by construction (#3005).
         + " WHERE slot = 0"
+    )
+
+
+def publishing_agent_ledger_seed(backend_type: str) -> str:
+    """SQL giving a ledger row to every agent that could publish without one.
+
+    :func:`shape_change_invalidation` invalidates by rotating the generation a
+    watermark is compared against, which needs a row to rotate. An agent whose
+    projection was built before the triggers existed, or restored without its
+    ledger, has none — it reads back generation ``''`` and stamp ``0``, exactly
+    what a missing ledger reads back as, so the numbers agree and the rotation
+    touches nothing.
+
+    :func:`emptied_cache_invalidation` says the same thing to the watermark and
+    is enough to make ``is_stale()`` answer true. It is NOT enough during a
+    rolling upgrade. An older revision's rebuild may already be running for
+    such an agent, having read history under the old grouping; its publication
+    fence re-reads the GENERATION, still sees ``''``, finds it unchanged, and
+    commits a valid watermark over the invalidation. Both revisions then read
+    two empty generations that agree, and the stale answer is served for as
+    long as nothing else moves.
+
+    So the claim is made where the fence will look. Creating the row is the
+    rotation for an agent that had nothing to rotate, and ``DO NOTHING`` leaves
+    every agent that does have one to :func:`shape_change_invalidation`.
+
+    **Every agent in HISTORY, not only every agent with a watermark.** The
+    agent that most needs the fence is the one whose FIRST rebuild is in
+    flight: it has no watermark yet either, so a seed keyed on the watermark
+    table would step around exactly the repair that is about to publish an
+    answer derived under the old grouping. What decides whether an agent needs
+    a generation is whether a repair could be running for it, and a repair runs
+    for an agent that has rows.
+    """
+    return _anchor(
+        _new_generation(backend_type),
+        agents=(
+            "SELECT agent_id FROM conversation_session_watermarks "
+            "UNION SELECT DISTINCT agent_id FROM conversation_history"
+        ),
     )
 
 
@@ -3453,13 +3574,13 @@ class ConversationSessionProjection:
         )
 
     async def _unstamped_frontier(self) -> Optional[datetime]:
-        """How recently an unstamped live row stands, or ``None`` for none at all.
+        """Where the newest unstamped live row stands, or ``None`` for none.
 
-        A row filed under no ``session_id`` belongs to whichever cluster it falls
-        next to, so a row arriving BESIDE it can take it — and a fold reading
-        sessions by their column would never see that happen. Ordinary appends
-        land after everything and cannot; a row whose id is higher but whose
-        stamp is earlier can, and that is not hypothetical: PostgreSQL's
+        A row filed under no ``session_id`` belongs to whichever cluster it
+        falls next to, so a row arriving BEFORE it can take it — and a fold
+        reading sessions by their column would never see that happen. Ordinary
+        appends land after everything and cannot; a row whose id is higher but
+        whose stamp is earlier can, and that is not hypothetical: PostgreSQL's
         ``NOW()`` is transaction-start time, so an overlapping writer commits a
         later id carrying an earlier timestamp, and an import or restore can
         write anything.
@@ -3469,15 +3590,25 @@ class ConversationSessionProjection:
         09:01 with a higher id stored ``sess-a=2, sess-b=1`` under a watermark
         reporting itself current, where the reader says ``sess-a=1, sess-b=2``.
 
-**Extended by the grouping gap, and by the reach of the
-        cluster the newest unstamped row sits in.** A stamped row
-        arriving within ``SESSION_GAP_MINUTES`` of the newest unstamped one is
-        absorbed into that row's cluster by the grouper — deliberately, because
-        the resolver walks a legacy numeric cluster forward in time and does not
-        stop on id changes (#2019) — while a fold would file it under its own
-        column id. Measured without the extension: the reader says one session
-        of two rows, the projection stored two sessions of one, and called
-        itself current.
+        **The newest unstamped row's own stamp is the whole frontier**, and
+        that is a claim worth stating rather than a bound chosen for comfort.
+        ``group_messages_into_sessions`` is a left-to-right fold, so which
+        session an unstamped row lands in is decided entirely by the rows
+        BEFORE it; a row arriving after it cannot move it. What a later row can
+        do is resume a session by naming it, and coalescing only ever ADDS —
+        which is exactly what a fold does. So a chunk landing after this stamp
+        is one the column can answer alone, and a chunk landing at or before it
+        is one only the transcript can.
+
+        Until #3098 the frontier ran a grouping gap further out, and further
+        still along a walk of the cluster the newest unstamped row sat in,
+        because a legacy cluster ABSORBED following stamped rows and so
+        extended transitively — unstamped at 0, stamped at 20, stamped at 40
+        was one conversation. That absorption is gone: a row filed under its
+        own canonical id now starts its own session, and every live row above
+        this one carries a column, so every one of them is such a row. The
+        cluster therefore ends AT the newest unstamped row, and the walk that
+        looked for its end could only ever have returned that row back.
 
         ``None`` means nothing is unstamped and every chunk lands clear.
 
@@ -3498,81 +3629,7 @@ class ConversationSessionProjection:
         newest = coerce_session_timestamp(row[0])
         if newest is None:
             return _UNDATABLE_FRONTIER
-
-        # ...and out to the END of the cluster that row sits in, because a
-        # legacy cluster ABSORBS stamped rows (#2019) and so extends
-        # transitively: unstamped at 0, stamped at 20, stamped at 40 is one
-        # conversation, each adjacent gap being under the limit. Fencing one gap
-        # past the unstamped row would leave minute 40 outside it and the reader
-        # still puts it inside.
-        #
-        # Walked over history rather than read from the projection, which is
-        # where a cluster's end is written down and is exactly what #3098 makes
-        # unreadable: the absorbed row's column contradicts the grouping, so
-        # `project_transcript` refuses the cluster and never stores the row that
-        # would say where it stops.
-        newest = await self._cluster_reach(row[0], newest)
-        # ``datetime.max`` is a legal stored stamp — the #3009 CHECK admits year
-        # 9999 — and adding to it raises rather than returning a large number.
-        # A frontier nothing can be after is what the sentinel already means.
-        if newest > datetime.max - timedelta(minutes=SESSION_GAP_MINUTES):
-            return _UNDATABLE_FRONTIER
-        # One gap past where the cluster stops, because the grouper splits on
-        # ``gap > gap_minutes`` — strictly greater — so a row landing exactly
-        # that far after the last one is still absorbed.
-        #
-        # NOT SEPARATELY COVERED, and it is worth saying why rather than leaving
-        # a mutant survivor unexplained: reaching the boundary needs a chunk row
-        # between the chain's end and one gap past it, and a projection settled
-        # enough to fold at all needs an earlier fold BEYOND that point — so the
-        # only constructions that touch this comparison are inversions, which
-        # `_folded`'s own monotonicity check escalates first. Both spellings
-        # behave identically on every input a test can build. The rule is the
-        # grouper's, stated the same way it states it.
-        return newest + timedelta(minutes=SESSION_GAP_MINUTES)
-
-    async def _cluster_reach(
-        self, frontier_stamp: Any, newest: datetime
-    ) -> datetime:
-        """Where the cluster containing the newest unstamped row stops.
-
-        Walks forward from it while each step is within ``SESSION_GAP_MINUTES``
-        of the last — the grouper's own rule for staying in a session — and
-        returns the last row it reached. That row plus one gap is the first
-        point at which a new session provably begins.
-
-        **Bounded, and it says so by refusing rather than by stopping early.**
-        The walk reads at most :data:`CLUSTER_REACH_ROWS`; a chain longer than
-        that is an agent talking without a half-hour break for that many turns,
-        and guessing its end would be worse than not folding. Running out
-        returns ``datetime.max``, which every caller already reads as "nothing
-        can be proved to land clear of this".
-        """
-        rows = await self.db.fetchall(
-            f"SELECT {_canonical_key(self.db.backend_type, 'created_at')}, created_at "
-            "FROM conversation_history "
-            f"WHERE agent_id = ? AND {_LIVE} "
-            f"AND {timestamp_predicate(self.db.backend_type, 'created_at', '>=')} "
-            f"{canonical_order(self.db.backend_type)} LIMIT ?",
-            (
-                self.agent_id,
-                timestamp_query_param(self.db.backend_type, frontier_stamp),
-                CLUSTER_REACH_ROWS + 1,
-            ),
-        )
-        reached = newest
-        for index, row in enumerate(rows):
-            stamp = coerce_session_timestamp(row[1])
-            if stamp is None:
-                return datetime.max
-            if stamp <= reached:
-                continue
-            if (stamp - reached) > timedelta(minutes=SESSION_GAP_MINUTES):
-                return reached
-            reached = stamp
-        if len(rows) > CLUSTER_REACH_ROWS:
-            return datetime.max
-        return reached
+        return newest
 
     async def _fold(
         self, rows: Sequence[Sequence[Any]], through: int,

@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
+from kestrel_sovereign.storage.session_id_column import SESSION_ID_KEY
 
 
 def signal_wake_source(metadata: Dict[str, Any]) -> Optional[str]:
@@ -291,6 +292,30 @@ def parse_message_metadata(raw: Any) -> Dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def canonical_session_id(metadata: Dict[str, Any]) -> Optional[str]:
+    """The session key a row files ITSELF under, or ``None`` if it names none.
+
+    A bare-integer ``session_id`` is a mis-filed legacy key (#2012): the list
+    used to hand the UI a row id as a session id and the UI round-tripped it
+    back, so the value names a row rather than a session and the row-id
+    fallback groups more stably. Everything else truthy is the row's own key,
+    rendered with ``str`` so a document that stored a non-string there files
+    itself under one spelling rather than under a value whose equality depends
+    on its Python type.
+
+    Authored here because two readers have to agree on it, and when they did
+    not a conversation disappeared (#3098). This function answers where a
+    session ENDS for :func:`group_messages_into_sessions`, and where the walk
+    STOPS for ``AsyncConversationStore._filter_session_rows``, the resolver
+    that turns one of those session ids back into its rows. Those are the same
+    boundary seen from either side.
+    """
+    sid = metadata.get(SESSION_ID_KEY)
+    if sid and not str(sid).isdigit():
+        return str(sid)
+    return None
+
+
 def group_messages_into_sessions(
     messages: Iterable[Dict[str, Any]],
     gap_minutes: float = SESSION_GAP_MINUTES,
@@ -404,13 +429,7 @@ def group_messages_into_sessions(
         previous = timestamp
 
         is_new_session_marker = bool(meta.get("new_session"))
-        meta_session_id = None
-        sid = meta.get("session_id")
-        # Only treat non-integer values as a canonical UUID. A bare-integer
-        # session_id is a mis-filed legacy key (#2012) where the row-id fallback
-        # groups more stably.
-        if sid and not str(sid).isdigit():
-            meta_session_id = sid
+        meta_session_id = canonical_session_id(meta)
 
         if current is None:
             current = _new_session(msg_id, timestamp, meta_session_id)
@@ -425,19 +444,25 @@ def group_messages_into_sessions(
         # so lifecycle tools would act on a different scope than the list shows
         # (#2019). None ids (unlabeled turns) stay with the current session.
         #
-        # Only split when the CURRENT session already carries a real id (a UUID,
-        # not a legacy row-id fallback). A legacy cluster (numeric anchor) is
-        # resolved by ``_get_session_messages`` via a forward time-walk that
-        # does NOT stop on id changes, so it absorbs a following UUID row; if we
-        # split the list there, deleting the listed legacy session would also
-        # destroy the UUID session the list showed as separate. Keeping them
-        # merged matches what the delete resolver actually touches. Two distinct
-        # UUID sessions DO split — there the resolver matches by metadata
-        # membership, so each delete stays scoped to its own id.
+        # This used to make an exception when the CURRENT session carried a
+        # legacy row-id anchor: such a cluster ABSORBED a following stamped row
+        # instead of splitting, because ``_get_session_messages`` resolved a
+        # numeric id by a forward time-walk that did not stop on id changes, so
+        # a split list would have let deleting the legacy session destroy the
+        # stamped one too. The exception cost more than it bought. Phase A's
+        # column is derived per row from that row's own metadata, so it filed
+        # the absorbed row under the id the grouping denied it; the two
+        # disagreed; and ``project_transcript`` — which may not guess — dropped
+        # the whole conversation from the list (#3098).
+        #
+        # The premise was the resolver's, so the fix is the resolver's:
+        # ``_filter_session_rows`` now ends a session's run at a row filed
+        # under a different canonical id, which is this same boundary read from
+        # the other side. Delete stays scoped to what the list shows without
+        # the grouping having to lie about where the session ended.
         session_changed = (
             meta_session_id is not None
             and current["session_id"] != meta_session_id
-            and not str(current["session_id"]).isdigit()
         )
 
         if gap > gap_minutes or is_new_session_marker or session_changed:
