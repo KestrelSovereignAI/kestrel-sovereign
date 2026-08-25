@@ -2458,7 +2458,7 @@ async def test_a_projection_row_is_dropped_when_its_session_stops_existing(seede
     so the row must go rather than linger as the newest "session" in a list
     ordered by ``last_message_at``.
 
-    **Two rows, and the third is #3117's.** B is a marker, a human turn, and
+    **Two rows, and the third is #3120's.** B is a marker, a human turn, and
     the unstamped reply that landed a minute later — which the grouper gives to
     B, because a row filed under nothing stays with the session it fell next
     to, and which the projection has always counted in B. The purge takes two:

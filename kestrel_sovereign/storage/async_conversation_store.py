@@ -2447,7 +2447,7 @@ class AsyncConversationStore:
         # `deleted_filter="all"`, so purging one session destroyed another the
         # active list showed separately. The legacy path has always had that
         # exposure; giving it to every session is a decision about lifecycle
-        # scope across deletion universes, and it is not this ticket's (#3117).
+        # scope across deletion universes, and it is not this ticket's (#3120).
         all_rows = []
         row_id = coerce_persistent_message_id(session_id)
         start_row = None
@@ -2583,7 +2583,7 @@ class AsyncConversationStore:
             # and purging this one destroyed the other permanently. The legacy
             # branch below has always carried that exposure; extending it to
             # every session is a decision about lifecycle scope across deletion
-            # universes and is #3117's, not this ticket's.
+            # universes and is #3120's, not this ticket's.
             query_prefix = ""
             membership_predicate = (
                 "(c.metadata LIKE ? ESCAPE '\\' "

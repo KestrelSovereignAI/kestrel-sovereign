@@ -7,7 +7,7 @@ session (the live marker anchors it + time-adjacent rows attach), but
 returned 0 → "No active conversation found." The fix: session lifecycle ops
 include the marker (``include_markers=True``), so the anchor is cleared.
 
-The fixture's "foreign" row is not foreign to the READER, and that is #3117.
+The fixture's "foreign" row is not foreign to the READER, and that is #3120.
 The list reports this session with ``message_count: 1``, and that one message
 is the row below — an unlabeled row names no session, so the grouper gives it
 to the one it fell after. Lifecycle here touches only rows TAGGED with the

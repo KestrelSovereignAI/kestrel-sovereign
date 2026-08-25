@@ -255,7 +255,7 @@ class TestTheResolverSide:
 
     @pytest.mark.asyncio
     async def test_a_canonical_session_owns_the_unlabeled_run_after_it(self, store):
-        """#3117, pinned here because #3098 is what measured it.
+        """#3120, pinned here because #3098 is what measured it.
 
         An unlabeled row names no session, so the grouper gives it to the one
         it fell after — including a stamped one. A canonical id resolved by
@@ -287,7 +287,7 @@ class TestTheResolverSide:
 
         rows = await store._get_session_messages(UUID_A, limit=50)
         if [r[0] for r in rows] == [stamped]:
-            pytest.xfail("#3117: a canonical id resolves by metadata alone")
+            pytest.xfail("#3120: a canonical id resolves by metadata alone")
         assert sorted(r[0] for r in rows) == [stamped, inherited]
         assert await store._get_complete_session_message_ids(UUID_A) == [
             stamped, inherited,
