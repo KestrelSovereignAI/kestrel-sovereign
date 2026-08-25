@@ -458,8 +458,9 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "integrity": "integrity_restriction",
         "bootstrap": "bootstrap_incomplete",
         "state_unavailable": "state_unavailable",
-        "state_not_persisted": "state_not_persisted",
+        "state_not_persisted": "restricted_by_unsaved_state",
         "identity_missing": "identity_missing",
+        "memory_unreadable": "memory_unreadable",
         "unrecorded": "cause_unrecorded",
     }
     cause = getattr(agent, "_safe_mode_cause", None)
@@ -480,6 +481,8 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "integrity_restriction",
         "identity_missing",
         "bootstrap_incomplete",
+        "memory_unreadable",
+        "restricted_by_unsaved_state",
         "cause_unrecorded",
         "state_unavailable",
         "state_not_persisted",

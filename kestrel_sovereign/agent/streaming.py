@@ -1019,7 +1019,7 @@ class StreamingMixin:
                 f"The agent cannot process queries due to {restriction}.\n"
                 "Use !safe-mode to check status or !verify-constitution to "
                 "re-verify.\n\n"
-                "Normal operation will resume once integrity is restored."
+                "Normal operation will resume once the restriction is cleared."
             )
             return
 

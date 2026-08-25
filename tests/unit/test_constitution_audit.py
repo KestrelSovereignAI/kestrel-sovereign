@@ -447,6 +447,11 @@ async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
             "a non-integrity restriction was reported as a constitutional "
             "violation"
         )
+        # The remediation line is part of the claim. Saying operation resumes
+        # "once integrity is restored" tells the operator to go fix an
+        # integrity problem that does not exist — and that line escaped two
+        # separate edits unnoticed because nothing asserted it.
+        assert "once integrity is restored" not in chunks[0], chunks[0]
     agent._maybe_audit.assert_awaited_once()
     agent._turn_lifecycle.assert_not_called()
     agent._process_input_streaming_traced_locked.assert_not_called()
@@ -1371,8 +1376,14 @@ async def test_a_failed_write_is_not_recorded_as_a_read_outage(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_recovery_clears_the_not_persisted_cause_too(tmp_path):
-    """Health derives the warning from the cause as well as the flag."""
+async def test_recovery_clears_the_durability_flag_but_keeps_the_cause(tmp_path):
+    """Recovery changes one of the two facts, not both.
+
+    The flag says whether state is durable NOW; the cause says why cognition
+    is restricted, and a write that failed really is that trigger. Erasing it
+    to "unrecorded" on recovery lost the reason across a restart, so health
+    and `!safe-mode` then claimed no cause had been recorded.
+    """
     from kestrel_sovereign.agent.constitution import SafeModeCause
     from kestrel_sovereign.storage import AsyncStorage
 
@@ -1392,10 +1403,12 @@ async def test_recovery_clears_the_not_persisted_cause_too(tmp_path):
         agent._constitution_state_store.write = real_write
         await agent._record_successful_constitution_audit(source="startup")
 
-        assert agent._safe_mode_cause != SafeModeCause.STATE_NOT_PERSISTED.value, (
-            "the recovered snapshot still claimed it was never written"
+        assert agent._constitution_state_persistence_pending is False, (
+            "the durability flag survived a successful write"
         )
-        assert agent._constitution_state_persistence_pending is False
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "the trigger was erased, so nothing records why it is restricted"
+        )
     finally:
         await storage.close()
 
@@ -1424,13 +1437,11 @@ def test_the_safe_mode_command_reports_the_recorded_cause():
 
 
 @pytest.mark.asyncio
-async def test_a_recovered_write_persists_the_replacement_cause(tmp_path):
-    """The row written on recovery must not still say it was never written.
+async def test_a_recovered_write_persists_the_trigger_it_recorded(tmp_path):
+    """The durable row keeps why the agent is restricted.
 
-    Clearing the cause after the snapshot left the stale value in the row
-    just persisted, so a restart before the next write restored
-    ``state_not_persisted`` and health claimed the recovered write had never
-    happened.
+    A restart reads this row, so a cause dropped here is a cause the operator
+    never sees again.
     """
     from kestrel_sovereign.agent.constitution import SafeModeCause
     from kestrel_sovereign.storage import AsyncStorage
@@ -1452,8 +1463,8 @@ async def test_a_recovered_write_persists_the_replacement_cause(tmp_path):
         await agent._record_successful_constitution_audit(source="startup")
 
         persisted = await agent._constitution_state_store.load(agent.agent_id)
-        assert persisted.safe_mode_cause != SafeModeCause.STATE_NOT_PERSISTED.value, (
-            "the recovered row still records that it was never persisted"
+        assert persisted.safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "the durable row lost the trigger, so a restart cannot report it"
         )
     finally:
         await storage.close()
@@ -1481,6 +1492,22 @@ async def test_a_blocked_command_reports_the_recorded_cause():
     assert "could not be decrypted" in reply, reply
     assert "integrity issue" not in reply
     assert "once integrity is restored" not in reply
+
+    # The non-command path carries the remediation suffix; it must not send
+    # the operator after an integrity failure that did not happen either.
+    agent2 = MagicMock()
+    agent2._safe_mode = True
+    agent2._constitution_audit_pending = False
+    agent2._constitution_state_persistence_pending = False
+    agent2._safe_mode_cause = SafeModeCause.MEMORY_UNREADABLE.value
+    agent2._maybe_audit = AsyncMock()
+    agent2._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent2._maybe_refresh_user_byok_resolver = AsyncMock()
+    agent2.process_input = KestrelAgent.process_input.__get__(agent2)
+
+    plain = await agent2.process_input("what is the weather")
+    assert "could not be decrypted" in plain, plain
+    assert "once integrity is restored" not in plain, plain
 
 
 def test_a_non_durable_latch_is_disclosed_to_the_sovereign():
@@ -1530,5 +1557,42 @@ async def test_a_retry_that_also_fails_still_says_not_persisted(tmp_path):
             "a failed retry downgraded the cause to 'not recorded' while the "
             "store was still unwritable"
         )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_the_cause_column_migration_runs_only_when_needed(tmp_path):
+    """A fresh database already has the column; the ALTER is pure cost there.
+
+    On hosted PostgreSQL it takes an ACCESS EXCLUSIVE lock, so agents
+    starting concurrently against one database serialized on it. The metadata
+    is inspected first, and a real migration failure is no longer swallowed
+    by the same except that meant "already present".
+    """
+    from unittest.mock import patch
+
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeStateStore,
+    )
+    from kestrel_sovereign.storage import AsyncStorage
+
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    try:
+        store = ConstitutionRuntimeStateStore(storage._backend)
+        await store.initialize()
+
+        # Second startup against the same database: nothing left to add.
+        store2 = ConstitutionRuntimeStateStore(storage._backend)
+        with patch.object(
+            store2._backend, "execute", wraps=store2._backend.execute
+        ) as spy:
+            await store2.initialize()
+        altered = [
+            c for c in spy.call_args_list
+            if "ADD COLUMN safe_mode_cause" in str(c)
+        ]
+        assert not altered, "an unnecessary ALTER was issued on every startup"
     finally:
         await storage.close()

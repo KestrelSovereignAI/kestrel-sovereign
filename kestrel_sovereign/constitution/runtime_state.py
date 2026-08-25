@@ -127,16 +127,41 @@ class ConstitutionRuntimeStateStore:
         await self._migrate_safe_mode_cause_column()
 
     async def _migrate_safe_mode_cause_column(self) -> None:
-        """Add ``safe_mode_cause`` to a table created before it existed."""
-        try:
-            await self._backend.execute(
-                "ALTER TABLE constitution_runtime_state "
-                "ADD COLUMN safe_mode_cause TEXT"
+        """Add ``safe_mode_cause`` to a table created before it existed.
+
+        The metadata is read first rather than issuing the ALTER and treating
+        every failure as "already there". On a fresh database the CREATE above
+        already includes the column, so the ALTER was pure cost — and on
+        hosted PostgreSQL it takes an ACCESS EXCLUSIVE lock, so agents
+        starting concurrently against one database serialized on it and could
+        block live state writes. Swallowing every exception also hid a real
+        migration failure behind the same silence.
+        """
+        if await self._has_safe_mode_cause_column():
+            return
+        await self._backend.execute(
+            "ALTER TABLE constitution_runtime_state "
+            "ADD COLUMN safe_mode_cause TEXT"
+        )
+
+    async def _has_safe_mode_cause_column(self) -> bool:
+        """Whether the column is already present, per the backend's catalog."""
+        if getattr(self._backend, "backend_type", "sqlite") == "postgres":
+            row = await self._backend.fetch_one(
+                """
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_name = 'constitution_runtime_state'
+                   AND column_name = 'safe_mode_cause'
+                """
             )
-        except Exception:
-            # Already present. Both backends raise rather than no-op, and the
-            # column is the marker — there is no separate ledger to consult.
-            pass
+            return row is not None
+        rows = await self._backend.fetch_all(
+            "PRAGMA table_info(constitution_runtime_state)"
+        )
+        return any(
+            (r[1] if not isinstance(r, dict) else r.get("name")) == "safe_mode_cause"
+            for r in (rows or ())
+        )
 
     async def load(self, agent_id: str) -> Optional[ConstitutionRuntimeState]:
         """Load one agent's state, returning ``None`` for a legacy agent."""

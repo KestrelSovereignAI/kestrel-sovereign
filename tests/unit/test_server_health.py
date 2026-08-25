@@ -1866,8 +1866,12 @@ def test_every_recorded_cause_maps_to_its_own_name():
         "integrity": "integrity_restriction",
         "bootstrap": "bootstrap_incomplete",
         "state_unavailable": "state_unavailable",
-        "state_not_persisted": "state_not_persisted",
+        # The trigger and the live durability fact are different claims and
+        # get different names: this is "restricted because a write failed",
+        # while the flag separately reports whether state is durable now.
+        "state_not_persisted": "restricted_by_unsaved_state",
         "identity_missing": "identity_missing",
+        "memory_unreadable": "memory_unreadable",
         "unrecorded": "cause_unrecorded",
     }
     for cause, name in expected.items():
