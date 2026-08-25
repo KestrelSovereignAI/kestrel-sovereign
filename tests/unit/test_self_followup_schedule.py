@@ -419,6 +419,74 @@ async def test_a_follow_up_turn_cannot_schedule_another_follow_up(followup_env):
 
 
 @pytest.mark.asyncio
+async def test_a_schedule_mutating_tool_cannot_be_a_scheduled_target(
+    followup_env,
+):
+    """Wrapper bypass (#3112 P1).
+
+    Both self_followup bounds key on the name of the row being created:
+    ``_prepare_self_followup_args`` refuses ``schedule_kind != one_shot`` and
+    refuses a hop taken from inside a ``cron.self_followup`` signal. A
+    RECURRING row whose target is ``schedule_add_deadline`` launders both --
+    the wrapper is recurring while each inner row it creates is one-shot, and
+    when the wrapper fires there is no self_followup signal in context, so the
+    hop check sees nothing to refuse. A follow-up can schedule the wrapper
+    too, which chains it. Refusing schedule-mutating tools as targets
+    forecloses the class rather than naming this one instance.
+    """
+    _agent, feature, _runner, db, _backend = followup_env
+
+    result = await feature.schedule_add(
+        cron_expression="@hourly",
+        task_name="schedule_add_deadline",
+        args_json=json.dumps(
+            {
+                "task_name": SELF_FOLLOWUP,
+                "delay_seconds": 60,
+                "args_json": json.dumps({"intent": SENTINEL}),
+            }
+        ),
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data.get("refused") == "schedule_mutating_target"
+    rows = await db.fetchall(
+        "SELECT id FROM scheduled_tasks WHERE task_name = ?",
+        ("schedule_add_deadline",),
+    )
+    assert not rows, "a refused wrapper must not leave a row behind"
+
+
+def test_every_scheduler_tool_is_classified_read_only_or_mutating(
+    followup_env,
+):
+    """The refused set is derived from get_tools(), never enumerated.
+
+    A scheduler tool added later is schedule-mutating BY DEFAULT: it lands in
+    the refused set unless its author consciously adds it to
+    ``READ_ONLY_SCHEDULER_TOOLS``. This asserts the derivation actually walks
+    the live tool list, so tool N+1 cannot silently become a bypass wrapper
+    the way instances one through four of this shape did.
+    """
+    _agent, feature, _runner, _db, _backend = followup_env
+
+    declared = {agent_tool.name for agent_tool in feature.get_tools()}
+    mutating = feature._schedule_mutating_tool_names()
+    read_only = set(feature.READ_ONLY_SCHEDULER_TOOLS)
+
+    assert declared, "scheduler declares no tools -- derivation would be vacuous"
+    assert mutating | (read_only & declared) == declared, (
+        "every declared scheduler tool must be classified; unclassified names "
+        "would fall through the wrapper refusal"
+    )
+    assert not (mutating & read_only), "a tool cannot be both"
+    # The creation tools are the ones the bypass needs; assert by behaviour
+    # of the derivation, not by re-listing what the allowlist already says.
+    for creator in ("schedule_add", "schedule_add_deadline"):
+        assert creator in mutating, f"{creator} must be refused as a target"
+
+
+@pytest.mark.asyncio
 async def test_caller_supplied_origin_session_is_refused(followup_env):
     """Rule 2: the wake's target window is resolved locally, never supplied.
 

@@ -1151,6 +1151,34 @@ class SchedulerFeature(Feature):
 
         raise ValueError(f"Unknown task: {task_name}")
 
+    #: Scheduler tools that only READ schedule state.  Everything this
+    #: feature declares that is not listed here is treated as
+    #: schedule-mutating and refused as a scheduled target.  The set is
+    #: fail-closed on purpose: a new scheduler tool is refused until
+    #: someone deliberately declares it read-only, so tool N+1 cannot
+    #: silently become a bypass wrapper (#3112 P1).
+    READ_ONLY_SCHEDULER_TOOLS: frozenset = frozenset(
+        {
+            "schedule_list",
+            "schedule_history",
+            "schedule_engagement",
+            "schedule_self_followups",
+        }
+    )
+
+    def _schedule_mutating_tool_names(self) -> set:
+        """Return this feature's tools that can create or alter schedules.
+
+        Derived from ``get_tools()`` rather than enumerated, so the refusal
+        cannot drift from what the feature actually exposes.  See
+        ``READ_ONLY_SCHEDULER_TOOLS`` for the fail-closed allowlist.
+        """
+        return {
+            agent_tool.name
+            for agent_tool in self.get_tools()
+            if agent_tool.name not in self.READ_ONLY_SCHEDULER_TOOLS
+        }
+
     def _scheduler_executable_task_names(self) -> set:
         """Return the set of task names the scheduler can actually run.
 
@@ -2652,6 +2680,33 @@ class SchedulerFeature(Feature):
                 return ToolResult.failed("misfire_grace_seconds must be >= 0")
         if idempotency_key is not None and not str(idempotency_key).strip():
             return ToolResult.failed("idempotency_key must not be empty")
+
+        # A schedule whose target is itself a schedule-mutating tool is a
+        # wrapper that launders both self_followup bounds: the wrapper row is
+        # recurring while the inner row it creates is one-shot, and when the
+        # wrapper fires there is no ``cron.self_followup`` signal in context,
+        # so the single-hop check in _prepare_self_followup_args sees nothing
+        # to refuse.  Both guards key on the name of the row being created,
+        # and a rule keyed on a name is a rule a new name walks past.
+        #
+        # Derived, not enumerated: the refused set is every tool this feature
+        # declares MINUS an explicit read-only allowlist.  A scheduler tool
+        # added later is refused by default and its author must consciously
+        # mark it read-only, rather than silently joining the schedulable set.
+        mutating = self._schedule_mutating_tool_names()
+        if task_name in mutating:
+            return ToolResult.failed(
+                f"'{task_name}' mutates schedules and cannot itself be a "
+                f"scheduled task. A schedule whose target creates schedules "
+                f"bypasses the self_followup one-shot and single-hop bounds. "
+                f"Schedule the intended task directly.",
+                data={
+                    "success": False,
+                    "task_name": task_name,
+                    "refused": "schedule_mutating_target",
+                    "schedule_mutating_tools": sorted(mutating),
+                },
+            )
 
         valid_names = self._scheduler_executable_task_names()
         if task_name not in valid_names:
