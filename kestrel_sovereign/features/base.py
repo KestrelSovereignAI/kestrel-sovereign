@@ -1600,8 +1600,8 @@ class Feature(_SdkFeature):
                 return (effective_args_value, result_value)
             return result_value
 
-        tool = tools_by_name.get(tool_name)
-        if tool is None:
+        selected_tool = tools_by_name.get(tool_name)
+        if selected_tool is None:
             return _shape(args, {
                 "success": False,
                 "error": (
@@ -1710,7 +1710,7 @@ class Feature(_SdkFeature):
                 # before the DENY/ASK branch.
 
             try:
-                result = await tool.execute(**effective_args)
+                result = await selected_tool.execute(**effective_args)
             except Exception as e:
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
@@ -1845,7 +1845,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         # Get tools by name for execution
-        tools_by_name = {tool.name: tool for tool in self.get_tools()}
+        tools_by_name = {t.name: t for t in self.get_tools()}
 
         for iteration in range(max_iterations):
             # Warn when approaching iteration limit
