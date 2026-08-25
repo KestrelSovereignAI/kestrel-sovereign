@@ -1877,6 +1877,7 @@ async def test_failed_idle_reclaim_preserves_durable_reprovision_intent(
     assert not (venv / "lib").exists()
     assert feature._provision_manifest_path().exists()
     assert feature._venv_relocation_repair_pending() is True
+    assert feature._venv_repair_reason() == "reclaim"
     # Callable services have no generated console wrapper to expose partial
     # deletion. The durable marker must independently force reinstall.
     feature._bin_path = None

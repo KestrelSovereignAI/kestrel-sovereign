@@ -2745,6 +2745,7 @@ _RUNTIME_OWNER_TEMP_PREFIX = ".kestrel-runtime-owner.tmp-"
 _VENV_RELOCATION_REPAIR_MARKER = ".kestrel-venv-relocation-pending"
 _VENV_RELOCATION_REPAIR_TEMP_PREFIX = ".kestrel-venv-relocation-pending.tmp-"
 _VENV_RELOCATION_REPAIR_PAYLOAD = b"kestrel-venv-relocation-v1\n"
+_VENV_RECLAIM_REPAIR_PAYLOAD = b"kestrel-venv-reclaim-v1\n"
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _ISOLATED_FEATURE_CLASS_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
@@ -3278,7 +3279,7 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
+def _read_venv_relocation_repair_marker_at(directory_fd: int) -> str | None:
     """Validate a durable relocation marker without following path entries."""
 
     marker_fd: Optional[int] = None
@@ -3348,13 +3349,23 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
                 "Hosted isolated feature relocation repair marker changed during "
                 "validation."
             )
-        payload = os.read(marker_fd, len(_VENV_RELOCATION_REPAIR_PAYLOAD) + 1)
-        if payload != _VENV_RELOCATION_REPAIR_PAYLOAD:
+        payload = os.read(
+            marker_fd,
+            max(
+                len(_VENV_RELOCATION_REPAIR_PAYLOAD),
+                len(_VENV_RECLAIM_REPAIR_PAYLOAD),
+            )
+            + 1,
+        )
+        if payload == _VENV_RELOCATION_REPAIR_PAYLOAD:
+            return "relocation"
+        if payload == _VENV_RECLAIM_REPAIR_PAYLOAD:
+            return "reclaim"
+        else:
             raise IsolatedRuntimePreparationError(
                 "Hosted isolated feature relocation repair state is corrupt; "
                 "tenant state was retained."
             )
-        return True
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -3366,10 +3377,16 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
             os.close(marker_fd)
 
 
-def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
+def _ensure_venv_relocation_repair_marker_at(
+    directory_fd: int,
+    *,
+    payload: bytes = _VENV_RELOCATION_REPAIR_PAYLOAD,
+) -> None:
     """Publish repair intent before a feature-directory rename can commit."""
 
-    if _read_venv_relocation_repair_marker_at(directory_fd):
+    expected_kind = "reclaim" if payload == _VENV_RECLAIM_REPAIR_PAYLOAD else "relocation"
+    existing_kind = _read_venv_relocation_repair_marker_at(directory_fd)
+    if existing_kind == expected_kind:
         return
     temporary = (
         f"{_VENV_RELOCATION_REPAIR_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
@@ -3386,26 +3403,34 @@ def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
             _PRIVATE_FILE_MODE,
             dir_fd=directory_fd,
         )
-        _write_all(temporary_fd, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        _write_all(temporary_fd, payload)
         os.fsync(temporary_fd)
         os.close(temporary_fd)
         temporary_fd = None
-        try:
-            os.link(
+        if existing_kind is None:
+            try:
+                os.link(
+                    temporary,
+                    _VENV_RELOCATION_REPAIR_MARKER,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+        else:
+            os.rename(
                 temporary,
                 _VENV_RELOCATION_REPAIR_MARKER,
                 src_dir_fd=directory_fd,
                 dst_dir_fd=directory_fd,
-                follow_symlinks=False,
             )
-        except FileExistsError:
-            pass
         try:
             os.unlink(temporary, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
         os.fsync(directory_fd)
-        if not _read_venv_relocation_repair_marker_at(directory_fd):
+        if _read_venv_relocation_repair_marker_at(directory_fd) != expected_kind:
             raise IsolatedRuntimePreparationError(
                 "Hosted isolated feature relocation repair state could not be "
                 "recorded."
@@ -3419,7 +3444,7 @@ def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
             pass
 
 
-def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
+def _read_venv_relocation_repair_marker_portable(directory: Path) -> str | None:
     """Portable fallback for validating relocation repair intent."""
 
     marker = directory / _VENV_RELOCATION_REPAIR_MARKER
@@ -3476,18 +3501,28 @@ def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
                 "Hosted isolated feature relocation repair marker has an unsafe "
                 "external hard link."
             )
-    if marker.read_bytes() != _VENV_RELOCATION_REPAIR_PAYLOAD:
+    payload = marker.read_bytes()
+    if payload == _VENV_RELOCATION_REPAIR_PAYLOAD:
+        return "relocation"
+    if payload == _VENV_RECLAIM_REPAIR_PAYLOAD:
+        return "reclaim"
+    else:
         raise IsolatedRuntimePreparationError(
             "Hosted isolated feature relocation repair state is corrupt; tenant "
             "state was retained."
         )
-    return True
 
 
-def _ensure_venv_relocation_repair_marker_portable(directory: Path) -> None:
+def _ensure_venv_relocation_repair_marker_portable(
+    directory: Path,
+    *,
+    payload: bytes = _VENV_RELOCATION_REPAIR_PAYLOAD,
+) -> None:
     """Portable fallback for publishing relocation repair intent."""
 
-    if _read_venv_relocation_repair_marker_portable(directory):
+    expected_kind = "reclaim" if payload == _VENV_RECLAIM_REPAIR_PAYLOAD else "relocation"
+    existing_kind = _read_venv_relocation_repair_marker_portable(directory)
+    if existing_kind == expected_kind:
         return
     marker = directory / _VENV_RELOCATION_REPAIR_MARKER
     temporary = directory / (
@@ -3500,19 +3535,22 @@ def _ensure_venv_relocation_repair_marker_portable(directory: Path) -> None:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             _PRIVATE_FILE_MODE,
         )
-        _write_all(descriptor, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        _write_all(descriptor, payload)
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        try:
-            os.link(temporary, marker, follow_symlinks=False)
-        except FileExistsError:
-            pass
+        if existing_kind is None:
+            try:
+                os.link(temporary, marker, follow_symlinks=False)
+            except FileExistsError:
+                pass
+        else:
+            os.replace(temporary, marker)
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
-        if not _read_venv_relocation_repair_marker_portable(directory):
+        if _read_venv_relocation_repair_marker_portable(directory) != expected_kind:
             raise IsolatedRuntimePreparationError(
                 "Hosted isolated feature relocation repair state could not be "
                 "recorded."
@@ -4693,7 +4731,10 @@ def _remove_isolated_feature_runtime(
         # Publish durable repair intent before the first destructive mutation.
         # Keep it until the whole sweep succeeds so a partial reclaim can never
         # be adopted as a healthy unstamped venv on the next cold wake.
-        _ensure_venv_relocation_repair_marker_at(feature_fd)
+        _ensure_venv_relocation_repair_marker_at(
+            feature_fd,
+            payload=_VENV_RECLAIM_REPAIR_PAYLOAD,
+        )
         _remove_directory_contents_at(
             feature_fd,
             allow_owner_marker=False,
@@ -11205,8 +11246,8 @@ class ProxyFeature(Feature):
         assert self._venv_path is not None
         return self._venv_path / ".kestrel_provision.json"
 
-    def _venv_relocation_repair_pending(self) -> bool:
-        """Read durable migration intent from the feature directory."""
+    def _venv_repair_reason(self) -> str | None:
+        """Read durable migration or interrupted-reclaim repair intent."""
 
         if self._isolated_runtime_scope is None:
             return False
@@ -11244,6 +11285,11 @@ class ProxyFeature(Feature):
         finally:
             if directory_fd is not None:
                 os.close(directory_fd)
+
+    def _venv_relocation_repair_pending(self) -> bool:
+        """Return whether any durable venv repair intent remains pending."""
+
+        return self._venv_repair_reason() is not None
 
     def _clear_venv_relocation_repair_marker(self) -> None:
         """Clear migration intent only after launch verification and stamping."""
@@ -11498,7 +11544,7 @@ class ProxyFeature(Feature):
         # An interrupted reclaim is durable proof that any kind of service
         # target needs repair. Callable targets have no wrapper to inspect, so
         # the marker must take precedence over their not-applicable state.
-        if self._venv_relocation_repair_pending():
+        if self._venv_repair_reason() == "reclaim":
             return True
         relocation_proven = (
             self._venv_relocated_this_startup
