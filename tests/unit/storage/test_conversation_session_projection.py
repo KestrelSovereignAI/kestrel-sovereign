@@ -1258,9 +1258,25 @@ def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
         PROJECTION_METADATA_KEYS,
     )
 
+    def _key(node):
+        """The string a lookup's argument names, whether spelled or named.
+
+        A key given as a module constant — ``metadata.get(SESSION_ID_KEY)`` —
+        is the same literal lookup as a quoted one, and resolving it here is
+        what keeps this scan from silently going blind the moment a key is
+        given a name. Anything else (a variable, an expression) is not a
+        literal key and is deliberately not counted.
+        """
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, str) else None
+        if isinstance(node, ast.Name):
+            resolved = getattr(session_grouping, node.id, None)
+            return resolved if isinstance(resolved, str) else None
+        return None
+
     tree = ast.parse(inspect.getsource(session_grouping))
     consulted = {
-        node.args[0].value
+        key
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1269,8 +1285,8 @@ def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id in {"meta", "metadata"}
         and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
+        for key in [_key(node.args[0])]
+        if key is not None
     }
     assert consulted, "found no metadata lookups at all — the scan is broken"
     assert consulted == set(PROJECTION_METADATA_KEYS), (
@@ -2441,6 +2457,14 @@ async def test_a_projection_row_is_dropped_when_its_session_stops_existing(seede
     Purging every row of a session leaves nothing for the projection to describe,
     so the row must go rather than linger as the newest "session" in a list
     ordered by ``last_message_at``.
+
+    **Two rows, and the third is #3120's.** B is a marker, a human turn, and
+    the unstamped reply that landed a minute later — which the grouper gives to
+    B, because a row filed under nothing stays with the session it fell next
+    to, and which the projection has always counted in B. The purge takes two:
+    it resolves a canonical session by the rows that NAME it, so the inherited
+    row stays live and reappears under a session of its own. That is the
+    subset #3098 measured and did not close.
     """
     db, store, projection = seeded
     assert await projection.get(UUID_B) is not None
@@ -3774,4 +3798,208 @@ def test_the_sqlite_migration_rebuilds_because_it_safely_can():
     assert not any("ALTER TABLE" in s for s in statements), (
         "SQLite reparses triggers on rename, against the schema before it "
         "lands, so no ordering of an ALTER-based migration can work here"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_changed_grouping_retires_the_projection(tmp_path, monkeypatch):
+    """The other road to the one outcome this design forbids (#3098).
+
+    :func:`shape_change_invalidation` guards against a projection that reports
+    itself current while holding an answer the grouper would not give, and it
+    guards the road where the TRIGGERS move: widen what counts as a change and
+    every event recorded under the narrower definition was, by the new one,
+    never recorded at all.
+
+    There is a second road, and it was open. Change the GROUPER — where a
+    session ends, what a session's key is — and every trigger, counter and
+    watermark stays perfectly consistent about rows nobody disputes, while the
+    stored answer becomes one this revision would not compute. Measured on
+    Emma's live history: after #3098's boundary change, a plain ``repair()``
+    left eight sessions the reader showed and the list did not, and reported
+    itself current throughout.
+
+    So the fingerprint the mechanism's objects are NAMED for covers the
+    grouping module's source as well as the DDL. A changed grouper renames the
+    triggers, the sweep retires the ones it finds installed, and the path
+    already written for "the shape moved" runs.
+    """
+    from kestrel_sovereign.storage import conversation_sessions
+
+    db, _store, projection = await _open(tmp_path, "grouping.db", CORPUS)
+    try:
+        assert not await projection.is_stale(), "the projection did not settle"
+    finally:
+        await db.close()
+
+    before = {name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")}
+    monkeypatch.setattr(
+        conversation_sessions,
+        "_grouping_source",
+        lambda: "a grouping that ends a session somewhere else",
+    )
+    after = {name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")}
+    assert before.isdisjoint(after), (
+        f"the change-stamp names did not move with the grouping: {before}"
+    )
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "grouping.db"))
+    try:
+        assert await ConversationSessionProjection(db, AGENT).is_stale(), (
+            "a changed grouping left the projection reporting itself current"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_changed_grouping_fences_an_agent_with_no_projection_yet(
+    tmp_path, monkeypatch
+):
+    """The repair that most needs the fence has not written anything yet.
+
+    A seed keyed on the watermark table steps around exactly the dangerous
+    case: an agent whose FIRST rebuild is in flight under an older revision has
+    neither a watermark nor a ledger row, so it would get no new generation,
+    publish its old-grouping answer with generation ``''``, and be compared
+    against a still-missing ledger's ``''`` for ever after.
+
+    What decides whether an agent needs a generation is whether a repair could
+    be running for it, and a repair runs for an agent that has rows.
+    """
+    from kestrel_sovereign.storage import conversation_sessions
+
+    path = str(tmp_path / "no-projection.db")
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        await _seed(db, CORPUS)
+        await db.execute(
+            "DELETE FROM conversation_session_watermarks WHERE agent_id = ?", (AGENT,)
+        )
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+    finally:
+        await db.close()
+
+    monkeypatch.setattr(
+        conversation_sessions,
+        "_grouping_source",
+        lambda: "a grouping that ends a session somewhere else",
+    )
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        seeded = await db.fetchone(
+            "SELECT generation FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot = 0",
+            (AGENT,),
+        )
+        assert seeded is not None, (
+            "an agent with history and no projection got no generation fence"
+        )
+        assert seeded[0], "the seeded generation is the empty string it started from"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_changed_grouping_retires_a_watermark_with_no_ledger(
+    tmp_path, monkeypatch
+):
+    """Rotating the generation retires counters; an agent may have none.
+
+    :func:`shape_change_invalidation` invalidates by making a watermark's
+    generation disagree with the ledger's — which needs a ledger row to
+    disagree with. A projection built before the triggers existed, or restored
+    without its ledger, reads back generation ``''`` and stamp ``0``, and that
+    is exactly what a MISSING ledger reads back as: the numbers agree,
+    ``is_stale()`` answers false, and the rotation touched nothing.
+
+    Survivable while the shape was the trigger DDL. Not now it is the GROUPING
+    too (#3098): a changed grouper makes every stored session suspect, and
+    these are the agents whose projections are oldest.
+    """
+    from kestrel_sovereign.storage import conversation_sessions
+
+    db, _store, projection = await _open(tmp_path, "no-ledger.db", CORPUS)
+    try:
+        # A projection built before the triggers existed, spelled out: no
+        # ledger row, and a watermark carrying what a missing ledger reads back
+        # as. Both halves are needed — deleting the ledger alone leaves the
+        # stored generation disagreeing with the empty string, which is stale
+        # for the ordinary reason and would let this pass without its subject.
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+        await db.execute(
+            "UPDATE conversation_session_watermarks "
+            "SET accounted_generation = '', accounted_stamp = 0, "
+            "accounted_appends = 0 WHERE agent_id = ?",
+            (AGENT,),
+        )
+        assert not await projection.is_stale(), (
+            "the pre-trigger shape did not read as current, so this test "
+            "would pass without the invalidation it is about"
+        )
+    finally:
+        await db.close()
+
+    monkeypatch.setattr(
+        conversation_sessions,
+        "_grouping_source",
+        lambda: "a grouping that ends a session somewhere else",
+    )
+    db = await AsyncDatabase.sqlite(str(tmp_path / "no-ledger.db"))
+    try:
+        assert await ConversationSessionProjection(db, AGENT).is_stale(), (
+            "the generation rotation had no counter row to disagree with"
+        )
+        # And the claim is made where a FENCE will look, not only where
+        # `is_stale` will. An older revision's rebuild already in flight for
+        # this agent re-reads the generation before publishing; with no row it
+        # would read the empty string it started from, find it unchanged, and
+        # commit a valid watermark over the invalidation.
+        seeded = await db.fetchone(
+            "SELECT generation FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot = 0",
+            (AGENT,),
+        )
+        assert seeded is not None, "no ledger row for the fence to re-read"
+        assert seeded[0], "the seeded generation is the empty string it started from"
+    finally:
+        await db.close()
+
+
+def test_the_fingerprint_follows_an_imported_grouping_constant(monkeypatch):
+    """A boundary can move without the grouper's text changing.
+
+    ``SESSION_GAP_MINUTES`` decides where every session ends and is defined in
+    another module; ``SESSION_ID_KEY`` names the field every session is keyed
+    by and is defined in another module. A dependency bump that moved either
+    would leave ``session_grouping.py`` byte-identical, the change-stamp names
+    unchanged, and every stored projection reporting itself current over
+    boundaries this revision no longer computes.
+
+    The cache is cleared around the substitution rather than left primed: this
+    digest is read once per process by design, and a test that poisoned it
+    would hand the next one a fingerprint for a grouping nothing is running.
+    """
+    from kestrel_sovereign.storage import conversation_sessions, session_grouping
+
+    conversation_sessions._grouping_source.cache_clear()
+    try:
+        before = {
+            name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")
+        }
+        monkeypatch.setattr(session_grouping, "SESSION_GAP_MINUTES", 45)
+        conversation_sessions._grouping_source.cache_clear()
+        after = {
+            name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")
+        }
+    finally:
+        monkeypatch.undo()
+        conversation_sessions._grouping_source.cache_clear()
+
+    assert before.isdisjoint(after), (
+        f"the change-stamp names did not move with the grouping gap: {before}"
     )

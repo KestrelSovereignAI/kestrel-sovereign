@@ -430,7 +430,7 @@ def test_upgrade_routes_through_uv_aware_helper(monkeypatch, fake_registry, caps
 
     calls = []
 
-    def fake_install(pip_args, *, constraints=None, reinstall=None, timeout=None):
+    def fake_install(pip_args, *, constraints=None, constraint_path=None, reinstall=None, timeout=None):
         calls.append(pip_args)
         return subprocess.CompletedProcess(
             pip_args, 0, stdout="Successfully installed kestrel-feature-github-0.2.0", stderr=""
