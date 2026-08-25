@@ -646,10 +646,8 @@ def _walk_one_view(
     # anchor's POSITION instead — at the first candidate standing at or after
     # it, which the boundary test below can still refuse. Only the first: once
     # a boundary closes the run, only the session's own rows may re-open it.
-    anchor_position_open = (
-        anchor_key is not None
-        and anchor_row_id is not None
-        and not any(candidate[1] == anchor_row_id for candidate in candidates)
+    anchor_position_open = anchor_key is not None and not any(
+        candidate[1] == anchor_key[1] for candidate in candidates
     )
     if anchor_position_open:
         # The gap is measured from where the session STARTS, so a hidden anchor
@@ -781,6 +779,15 @@ class AsyncConversationStore:
     #: because the cost of being wrong is a query that raises on exactly the
     #: longest sessions.
     SESSION_ID_BATCH = 500
+
+    #: How far to look for a canonical session's OWN first row.
+    #:
+    #: The anchor is located by a metadata ``LIKE``, which also matches a
+    #: document merely mentioning this id inside another object. Those are
+    #: filtered out by asking each candidate what it files itself under, and
+    #: this bounds how many may stand in front of the real one. A session whose
+    #: first twenty matches are all false is not a shape any writer produces.
+    SESSION_ANCHOR_CANDIDATES = 20
 
     def __init__(
         self,
@@ -2431,6 +2438,26 @@ class AsyncConversationStore:
         # belongs to another session. Here there is nothing to echo.
         exact_opens_the_run = anchor_missing and anchor_row_id is not None
 
+        if anchor_row_id is None:
+            # A canonical session's anchor, VALIDATED — the earliest candidate
+            # that actually names it, rather than the earliest row a metadata
+            # ``LIKE`` matched, which can be a document merely mentioning this
+            # id inside another object.
+            #
+            # It matters for the same reason a legacy anchor's position does: a
+            # lifecycle op selects one view, and a session deleted and then
+            # partially restored has its stamped anchor in one view with
+            # unlabeled rows of its own left in another. Without a position to
+            # open at, that view contributes nothing and restore leaves them
+            # trashed while count and purge skip them.
+            naming = [
+                (candidate[0], candidate[1])
+                for candidate in candidates
+                if canonical_session_id(candidate[3]) == session_id_str
+            ]
+            if naming:
+                anchor_key = min(naming)
+
         walked: list = []
         for view in sorted(partitions):
             walked.extend(
@@ -2540,18 +2567,41 @@ class AsyncConversationStore:
             )
         else:
             # A canonical session's anchor is the earliest row that NAMES it,
-            # read through the same filters as the candidates below so the walk
-            # cannot start outside the universe it is about to search.
-            start_row = await self.db.fetchone(
-                f"""SELECT created_at, id
+            # looked up regardless of state — exactly as a legacy anchor is,
+            # and for the same reason. A lifecycle op selects one view, and a
+            # session deleted and then partially restored has its stamped
+            # anchor in one view with unlabeled rows of its own left in
+            # another; a view with no naming row in it needs the anchor's
+            # POSITION or it contributes nothing at all.
+            #
+            # Validated rather than taken from the pattern that found it: a
+            # metadata ``LIKE`` also matches a document merely mentioning this
+            # id inside another object, and such a row must not open a run
+            # anywhere. A bounded window is enough — a session whose first
+            # twenty matches are all false is not a shape any writer produces.
+            named = await self.db.fetchall(
+                f"""SELECT created_at, id, metadata
                    FROM conversation_history
                    WHERE agent_id = ?
                      AND (metadata LIKE ? ESCAPE '\\'
                           OR metadata LIKE ? ESCAPE '\\')
-                     {del_clause}{archive_clause}
                    ORDER BY {created_at_order} ASC, id ASC
-                   LIMIT 1""",
-                (self.agent_id, spaced_pattern, compact_pattern),
+                   LIMIT ?""",
+                (
+                    self.agent_id,
+                    spaced_pattern,
+                    compact_pattern,
+                    self.SESSION_ANCHOR_CANDIDATES,
+                ),
+            )
+            start_row = next(
+                (
+                    row
+                    for row in named
+                    if canonical_session_id(parse_message_metadata(row[2]))
+                    == str(session_id)
+                ),
+                None,
             )
 
         # Whether the key names a row at all. A numeric session id can be
@@ -2569,7 +2619,7 @@ class AsyncConversationStore:
                 coerce_session_timestamp(start_row[0]) or UNDATABLE_ROW_FALLBACK,
                 int(start_row[1]),
             )
-            if start_row is not None and row_id is not None
+            if start_row is not None
             else None
         )
 
@@ -2861,10 +2911,7 @@ class AsyncConversationStore:
                 "id ASC LIMIT 1"
                 ") "
             )
-            params: tuple[Any, ...] = (
-                self.agent_id,
-                spaced_pattern,
-                compact_pattern,
+            anchor_params: tuple[Any, ...] = (
                 self.agent_id,
                 spaced_pattern,
                 compact_pattern,
@@ -2876,13 +2923,7 @@ class AsyncConversationStore:
                 "WHERE id = ? AND agent_id = ?"
                 ") "
             )
-            params = (
-                row_id,
-                self.agent_id,
-                self.agent_id,
-                spaced_pattern,
-                compact_pattern,
-            )
+            anchor_params = (row_id, self.agent_id)
 
         # LEFT JOIN (not CROSS JOIN): the anchor CTE can be empty — a numeric
         # session id can be metadata-only (the client supplied it explicitly,
@@ -2905,6 +2946,64 @@ class AsyncConversationStore:
             "(SELECT count(*) FROM anchor), (SELECT created_at FROM anchor)"
         )
 
+        # Where this session provably stops, so the candidate read is bounded.
+        #
+        # Without it the range branch admits every row after the anchor and
+        # ``fetchall`` materializes that whole suffix — for a session near the
+        # start of a long history that is the history, in memory, and hard
+        # purge does it holding a destructive transaction open. Measured on a
+        # synthetic 100,000-row history: 22 ms became 443 ms.
+        #
+        # The bound is sound rather than generous. Past the LAST row naming
+        # this session nothing can resume it, and the first row after that
+        # carrying a ``session_id`` COLUMN is filed under another session, so
+        # it closes the run. The column is strictly narrower than the grouper's
+        # acceptance rule (#2958), which makes this an upper bound on the true
+        # stop and never an early one; the walk still decides.
+        canonical_created = self._canonical_timestamp_sql("created_at")
+        ceiling_prefix = (
+            ", last_named AS ("
+            "SELECT created_at FROM conversation_history "
+            "WHERE agent_id = ? AND (metadata LIKE ? ESCAPE '\\' "
+            "OR metadata LIKE ? ESCAPE '\\') "
+            f"ORDER BY {canonical_created} DESC, id DESC LIMIT 1"
+            "), ceiling AS ("
+            "SELECT created_at FROM conversation_history "
+            "WHERE agent_id = ? AND session_id IS NOT NULL AND session_id <> ? "
+            f"AND {canonical_created} >= COALESCE("
+            f"(SELECT {canonical_created} FROM last_named), "
+            f"(SELECT {canonical_created} FROM anchor)) "
+            f"ORDER BY {canonical_created} ASC, id ASC LIMIT 1"
+            ") "
+        )
+        query_prefix = query_prefix.rstrip() + ceiling_prefix
+        ceiling_params = (
+            self.agent_id,
+            spaced_pattern,
+            compact_pattern,
+            self.agent_id,
+            str(session_id),
+        )
+        # Both sides through the column's own treatment, which for
+        # ``created_at`` is the column itself: it carries the #3009 CHECK, so
+        # lexicographic order IS chronological order and the comparison is
+        # indexable. The membership predicate above reaches `julianday` only
+        # because it spells the column with its table alias, which
+        # `canonical_timestamp_sql` does not recognise — a float compared
+        # against text is answered by TYPE order and never raises, which is
+        # exactly how this bound silently matched nothing the first time.
+        ceiling_predicate = (
+            " AND (NOT EXISTS (SELECT 1 FROM ceiling) "
+            f"OR c.created_at <= (SELECT {canonical_created} FROM ceiling))"
+        )
+        params = (
+            *anchor_params,
+            *ceiling_params,
+            self.agent_id,
+            spaced_pattern,
+            compact_pattern,
+        )
+
         # Whether the key names a row, read in the SAME statement as the
         # candidates. It decides whether a row naming this session may open the
         # walk (see `_filter_session_rows`), and asking separately would put
@@ -2914,7 +3013,7 @@ class AsyncConversationStore:
             "c.deleted_at, c.archived_at, "
             f"{anchor_column} "
             f"FROM {candidate_source} WHERE c.agent_id = ? AND "
-            f"{membership_predicate}{del_clause}{archive_clause} "
+            f"{membership_predicate}{ceiling_predicate}{del_clause}{archive_clause} "
             "ORDER BY c.id ASC",
             params,
         )

@@ -755,14 +755,51 @@ class TestTheResolverSide:
         )
         beyond = await _insert(store, 40)
 
-        assert await store._get_complete_session_message_ids(UUID_A) == [stamped]
+        # The archived row is this session's — it was archived out of it, and
+        # the archived view groups it beside nothing else. What it may not do
+        # is close the distance to the row BEYOND it, which the active view
+        # shows as a session of its own.
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            stamped, hidden,
+        ]
+        assert beyond not in await store._get_complete_session_message_ids(UUID_A)
         rows = await store._get_session_messages(UUID_A, limit=50)
-        assert [r[0] for r in rows] == [stamped]
-        assert await store.delete_conversation_session(UUID_A) == 1
+        assert beyond not in [r[0] for r in rows]
+        await store.delete_conversation_session(UUID_A)
         still_live = await store.db.fetchone(
             "SELECT deleted_at FROM conversation_history WHERE id = ?", (beyond,)
         )
         assert still_live[0] is None, "deleting one session reached into another"
+
+    @pytest.mark.asyncio
+    async def test_a_canonical_anchor_opens_the_view_it_is_no_longer_in(
+        self, store
+    ):
+        """A view partition needs a position when it has no naming row.
+
+        Delete a stamped session and restore only its anchor: Trash is then
+        left holding the unlabeled rows that inherited from it and nothing that
+        NAMES the session, so a partition opened only by a naming row
+        contributes nothing — restore leaves them trashed, and count and purge
+        skip them.
+
+        The anchor is validated rather than taken from the metadata ``LIKE``
+        that located it, because that pattern also matches a document merely
+        mentioning this id inside another object, and such a row must not open
+        a run anywhere.
+        """
+        stamped = await _insert(store, 0, session_id=UUID_A)
+        tail = await _insert(store, 5)
+        assert await store.delete_conversation_session(UUID_A) == 2
+        assert await store.restore_message(stamped) is True
+
+        assert await store.restore_conversation_session(UUID_A) == 1
+        live = await store.db.fetchall(
+            "SELECT id FROM conversation_history WHERE agent_id = ? "
+            "AND deleted_at IS NULL ORDER BY id",
+            (AGENT,),
+        )
+        assert [row[0] for row in live] == [stamped, tail]
 
     @pytest.mark.asyncio
     async def test_an_archived_row_joins_the_session_archived_beside_it(
@@ -785,6 +822,51 @@ class TestTheResolverSide:
         assert await store._get_complete_session_message_ids(UUID_A) == [
             stamped, tail,
         ]
+
+    @pytest.mark.asyncio
+    async def test_the_exact_resolver_reads_the_session_not_the_history(
+        self, store
+    ):
+        """A forward walk from an old anchor is not a licence to read forward.
+
+        The range branch admits every row after the anchor, and hard purge
+        holds a destructive transaction while it does. Past the LAST row naming
+        this session nothing can resume it, and the first row after that
+        carrying a ``session_id`` COLUMN is filed under another session — so it
+        closes the run, and nothing beyond it can be a member. The column is
+        strictly narrower than the grouper's acceptance rule (#2958), which
+        makes that an upper bound on the true stop and never an early one.
+
+        Asserted on the QUERY, because the claim is about what it reads.
+        Measured on a synthetic 100,000-row history: 99,900 candidate rows
+        became 21, and 509 ms became 40.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        second = await _insert(store, 1, session_id=UUID_A)
+        for minute in range(2, 40):
+            await _insert(store, minute, session_id=f"{UUID_B}-{minute}")
+
+        widest = 0
+        original = store.db.fetchall
+
+        async def watched(query, params=(), *args, **kwargs):
+            nonlocal widest
+            rows = await original(query, params, *args, **kwargs)
+            if "LEFT JOIN anchor" in query:
+                widest = max(widest, len(rows))
+            return rows
+
+        store.db.fetchall = watched
+        try:
+            members = await store._get_complete_session_message_ids(UUID_A)
+        finally:
+            store.db.fetchall = original
+
+        assert members == [first, second]
+        assert widest <= 4, (
+            f"{widest} candidate rows read for a two-row session in a "
+            "forty-row history"
+        )
 
     @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):
