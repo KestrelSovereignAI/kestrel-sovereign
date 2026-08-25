@@ -3433,6 +3433,7 @@ def test_a_host_that_declares_no_windows_gets_the_command_it_always_got(
         f"{shlex.quote(sys.executable)} -e {CHECKOUT}` by hand."
     ) in err
     assert "-c " not in err
+    assert "Note:" not in err          # no windows, so nothing to caveat
 
 
 def test_an_interrupted_restore_command_is_bounded_too(
@@ -3631,3 +3632,40 @@ def test_an_interrupt_while_writing_the_bounds_still_names_the_drift(
     # real one is a file an operator could be pointed at. `_published_bounds`
     # asserts there is exactly one.
     assert _published_bounds(err, bounds_dir).exists()
+
+
+def test_a_bounded_recovery_command_says_when_pasting_it_is_the_wrong_move(
+    monkeypatch, bounds_dir, capsys,
+):
+    """The command is a snapshot, and the operator's next move usually invalidates it.
+
+    A repair refused BY a declared window is the case this whole change is
+    about, and the obvious response to it is to edit that window. The printed
+    command reads the windows as they were — that is what makes it the same
+    operation — so pasting it after the edit fails again, identically, and
+    reads as the command being wrong rather than out of date.
+    """
+    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.feature_reconcile import SourceEntry
+
+    venv = FakeUv()
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    venv.installed_requires[CORE] = ["kestrel-feature-workflows>=0.6.0,<0.7"]
+    venv.package_index["kestrel-feature-workflows"] = ["0.5.2", "0.6.0"]
+    use_fake_uv(monkeypatch, venv)
+    guard = CoreInstallGuard.snapshot({
+        CORE: SourceEntry(package=CORE, pypi=">=0.52,<0.53"),
+        "kestrel-feature-workflows": SourceEntry(
+            package="kestrel-feature-workflows", pypi=">=0.5.1,<0.6",
+        ),
+    })
+
+    instruction = guard.resolve().restore_instruction
+
+    assert "RESTORE FAILED" in instruction
+    # The window that refused it is named, in the same words every other
+    # surface uses for it...
+    assert "kestrel-feature-workflows>=0.5.1,<0.6" in instruction
+    assert "that entry is the one to change" in instruction
+    # ...and the operator is told what to do INSTEAD of pasting, once they have.
+    assert "re-run `kestrel feature sync` rather than pasting it" in instruction

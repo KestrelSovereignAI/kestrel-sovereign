@@ -1443,6 +1443,11 @@ class CoreGuardOutcome:
     # Which shell ``command`` is quoted for, captured with it (see
     # :func:`_render_shell`). ``None`` where the platform has only one answer.
     shell: Optional[str] = None
+    #: The manifest's windows in force for the install this reports, worded
+    #: once by the guard (:meth:`CoreInstallGuard.manifest_bound_note`). Every
+    #: surface that reports a failed restore has to name them (#3106), and the
+    #: printed command is one of those surfaces.
+    bounds_note: str = ""
     output: str = ""  # tail of a failed repair's stderr/stdout
 
     @property
@@ -1501,21 +1506,44 @@ class CoreGuardOutcome:
             # The restore worked. What failed is the resolve after it, so the
             # operator has to fix the conflict FIRST — re-running the command
             # before that changes nothing and reads as the command being wrong.
-            return (
+            sentence = (
                 f"RESTORED, DEPENDENCIES UNRESOLVED — {CORE_DISTRIBUTION} is "
                 "back from its declared source, but the pass that validates "
                 "its dependencies did not complete. Resolve what failed below, "
                 f"then run `{self.command}`{where} by hand."
             )
-        if not self.attempted:
+        elif not self.attempted:
             # Nothing was tried, so nothing failed. Saying RESTORE FAILED here
             # would report an attempt that never happened, and an operator who
             # believes a repair ran is exactly the one who will not run this.
-            return (
+            sentence = (
                 "NOT RESTORED — the install was interrupted, so no repair was "
                 f"attempted. Run `{self.command}`{where} by hand."
             )
-        return f"RESTORE FAILED — run `{self.command}`{where} by hand."
+        else:
+            sentence = f"RESTORE FAILED — run `{self.command}`{where} by hand."
+        # Appended in ONE place. Every branch above hands over a command, and a
+        # caveat added to two of the three is a caveat the third does not have.
+        return sentence + self._bounds_caveat
+
+    @property
+    def _bounds_caveat(self) -> str:
+        """Why pasting may be the wrong move once the manifest bounds this install.
+
+        The command carries the declared windows AS THEY WERE when it ran —
+        that is what makes it the same operation, and it is also what makes it
+        the wrong thing to paste after the operator has done the obvious thing
+        and edited the window that refused it. The file it names still holds
+        the old lines, so the resolve fails again, identically, and reads as
+        the command being wrong (issue #3109).
+        """
+        if not self.bounds_note:
+            return ""
+        return (
+            f" Note: {self.bounds_note} The command above carries those "
+            "windows as they were, so if you change one, re-run `kestrel "
+            "feature sync` rather than pasting it."
+        )
 
     def describe(self) -> str:
         """One operator-readable block: what moved, and what was done about it.
@@ -1619,6 +1647,18 @@ class CoreInstallGuard:
         from kestrel_sovereign.feature_reconcile import CoreInstallShape, CoreSourcePolicy
 
         return cls(CoreSourcePolicy(), CoreInstallShape())
+
+    def _outcome(self, **facts) -> CoreGuardOutcome:
+        """Every outcome this guard produces, carrying what only IT can supply.
+
+        The manifest's windows are one of those. They have to reach every
+        surface that reports a failed restore (#3106), and there are four
+        places an outcome is built here — a note added at three of them is a
+        note the fourth silently does not have, which is how the guidance came
+        to be missing from the printed command in the first place.
+        """
+        facts.setdefault("bounds_note", self.manifest_bound_note() or "")
+        return CoreGuardOutcome(**facts)
 
     def _derive(self, shape) -> list:
         from kestrel_sovereign import feature_reconcile as fr
@@ -1779,7 +1819,7 @@ class CoreInstallGuard:
             if held is not None and held.known
             else "core's install source could not be read"
         )
-        return CoreGuardOutcome(
+        return self._outcome(
             drift=drift,
             replaced=replaced,
             repaired=False,
@@ -1856,7 +1896,7 @@ class CoreInstallGuard:
         if not self.policy.source_is_verifiable:
             return self._unrestorable(drift, replaced, attempted=attempted)
         plan = self._restore_plan()
-        return CoreGuardOutcome(
+        return self._outcome(
             drift=drift,
             replaced=replaced,
             repaired=False,
@@ -2089,7 +2129,7 @@ class CoreInstallGuard:
             # unbounded install those windows forbid — committed by the code
             # that exists to honour them, over a host already off its declared
             # core. REFUSED, and reported as a repair that never ran (#3109).
-            return CoreGuardOutcome(
+            return self._outcome(
                 drift=drift,
                 replaced=replaced,
                 repaired=False,
@@ -2128,7 +2168,7 @@ class CoreInstallGuard:
             # Core is where the policy wants it: that is the state this batch
             # now measures later drift against.
             self.refresh()
-        return CoreGuardOutcome(
+        return self._outcome(
             drift=drift,
             replaced=replaced,
             repaired=repaired,
@@ -2168,7 +2208,7 @@ class CoreInstallGuard:
 
         drift = self._check()
         if drift is None:
-            return CoreGuardOutcome()
+            return self._outcome()
 
         # Distinguish "the batch broke it" from "it never got there": both are
         # failures, but only the first is a swap.
