@@ -529,6 +529,7 @@ class ConstitutionMixin:
             agent_id=self.agent_id,
             safe_mode=self._safe_mode if safe_mode is None else safe_mode,
             safe_mode_reason=self._safe_mode_reason,
+            safe_mode_cause=self._safe_mode_cause,
             safe_mode_entered_at=self._safe_mode_entered_at,
             safe_mode_exited_at=self._safe_mode_exited_at,
             safe_mode_exit_authorization=self._safe_mode_exit_authorization,
@@ -615,12 +616,17 @@ class ConstitutionMixin:
 
             self._safe_mode = state.safe_mode
             self._safe_mode_reason = state.safe_mode_reason
-            # The durable record predates cause recording, so the cause is not
-            # known. Calling it INTEGRITY would manufacture a constitutional
-            # violation out of a missing field.
-            self._safe_mode_cause = (
-                SafeModeCause.UNRECORDED.value if state.safe_mode else None
-            )
+            # UNRECORDED is for rows written before causes were persisted —
+            # a NULL column, not every restart. Labelling a known cause
+            # UNRECORDED after a routine restart loses it from the report;
+            # calling a missing one INTEGRITY manufactures a constitutional
+            # violation out of an absent field. Both are wrong, differently.
+            if not state.safe_mode:
+                self._safe_mode_cause = None
+            else:
+                self._safe_mode_cause = (
+                    state.safe_mode_cause or SafeModeCause.UNRECORDED.value
+                )
             self._safe_mode_entered_at = state.safe_mode_entered_at
             self._safe_mode_exited_at = state.safe_mode_exited_at
             self._safe_mode_exit_authorization = (
@@ -666,16 +672,27 @@ class ConstitutionMixin:
     def _mark_constitution_state_unavailable(self, exc: Exception) -> None:
         """Keep cognition blocked when authoritative state cannot be trusted."""
         now = self._constitution_now()
+        # Read BEFORE this call sets the flag, or it is always true and the
+        # scoping below does nothing.
+        was_restricted = bool(getattr(self, "_safe_mode", False))
         self._safe_mode = True
         # Does NOT overwrite an existing reason. An integrity finding followed
         # by a failed state read used to be reported as "state unavailable",
         # which hid a constitutional violation Amendment III requires be
         # reported. The availability fact has its own home below; it does not
         # need this slot, and taking it downgraded the stronger claim.
+        #
+        # Preserved only while that restriction is still in force. After an
+        # authorized exit the reason and cause linger as history, and carrying
+        # them forward would report an exited violation as a live one.
         self._safe_mode_reason = (
-            self._safe_mode_reason or "Constitution runtime state unavailable"
+            (self._safe_mode_reason if was_restricted else None)
+            or "Constitution runtime state unavailable"
         )
-        self._safe_mode_cause = self._safe_mode_cause or SafeModeCause.STATE_UNAVAILABLE.value
+        self._safe_mode_cause = (
+            (self._safe_mode_cause if was_restricted else None)
+            or SafeModeCause.STATE_UNAVAILABLE.value
+        )
         self._safe_mode_entered_at = (
             getattr(self, "_safe_mode_entered_at", None) or now
         )
@@ -708,13 +725,15 @@ class ConstitutionMixin:
             # connects instead of pretending the write succeeded.
             if "_constitution_state_store" not in vars(self):
                 return vars(self).get("_constitution_state_load_error") is None
+            was_restricted = bool(getattr(self, "_safe_mode", False))
             self._safe_mode = True
             self._safe_mode_reason = (
-                self._safe_mode_reason
+                (self._safe_mode_reason if was_restricted else None)
                 or "Constitution runtime state not initialized"
             )
             self._safe_mode_cause = (
-                self._safe_mode_cause or SafeModeCause.STATE_NOT_PERSISTED.value
+                (self._safe_mode_cause if was_restricted else None)
+                or SafeModeCause.STATE_NOT_PERSISTED.value
             )
             self._safe_mode_entered_at = (
                 self._safe_mode_entered_at or self._constitution_now()
@@ -736,6 +755,14 @@ class ConstitutionMixin:
             )
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
+            # The write failed, so whatever this call was recording exists
+            # only in memory and will not survive a restart. That is a
+            # different fact from the store being unreadable, and only the
+            # latter was being recorded — so a Safe Mode entered during a
+            # disk-full or disconnected write reported no durability warning
+            # at all while promising a latch that "clears only with an
+            # authorized exit".
+            self._constitution_state_persistence_pending = True
             self._mark_constitution_state_unavailable(exc)
             return False
 

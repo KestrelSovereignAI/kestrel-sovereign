@@ -1851,3 +1851,39 @@ def test_an_in_memory_only_latch_is_reported_as_not_durable():
 
     assert "state_not_persisted" in record["failures"]
     assert "integrity_restriction" in record["failures"]
+
+
+def test_every_recorded_cause_maps_to_its_own_name():
+    """A cause the dispatch does not know is not "unrecorded".
+
+    Recognising only integrity and bootstrap reported a recorded
+    state_unavailable cause as cause_unrecorded — a claim about the record
+    rather than about the agent.
+    """
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    expected = {
+        "integrity": "integrity_restriction",
+        "bootstrap": "bootstrap_incomplete",
+        "state_unavailable": "state_unavailable",
+        "state_not_persisted": "state_not_persisted",
+        "unrecorded": "cause_unrecorded",
+    }
+    for cause, name in expected.items():
+        agent = _restricted_agent(_safe_mode_cause=cause)
+        record = _constitution_safe_mode_record("Kite", agent)
+        assert name in record["failures"], f"{cause} -> {record['failures']}"
+
+
+def test_a_recorded_cause_is_not_dropped_when_another_failure_is_present():
+    """The dispatch must not skip the cause because a fault already fired."""
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(
+        _safe_mode_cause="unrecorded",
+        _constitution_state_load_error="DatabaseError",
+    )
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert "cause_unrecorded" in record["failures"]
+    assert "state_unavailable" in record["failures"]

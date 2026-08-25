@@ -450,16 +450,27 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         failures.append("state_unavailable")
     if getattr(agent, "_constitution_state_persistence_pending", False):
         failures.append("state_not_persisted")
+    # Every cause maps to its own name, independently. An elif chain here
+    # dropped a recorded cause whenever another failure was already present,
+    # and recognising only two of them reported the rest as "unrecorded" —
+    # which is a claim about the record, not about the agent.
+    _CAUSE_FAILURES = {
+        "integrity": "integrity_restriction",
+        "bootstrap": "bootstrap_incomplete",
+        "state_unavailable": "state_unavailable",
+        "state_not_persisted": "state_not_persisted",
+        "unrecorded": "cause_unrecorded",
+    }
     cause = getattr(agent, "_safe_mode_cause", None)
-    if safe_mode and cause == "integrity":
-        failures.append("integrity_restriction")
-    elif safe_mode and cause == "bootstrap":
-        failures.append("bootstrap_incomplete")
-    elif safe_mode and not failures:
-        # Restricted, with nothing recorded saying why. Named as such rather
-        # than attributed to integrity: an unrecorded cause is not evidence
-        # of a violation.
-        failures.append("cause_unrecorded")
+    if safe_mode:
+        named = _CAUSE_FAILURES.get(cause)
+        if named is None:
+            # Restricted with nothing recorded saying why. Named as such
+            # rather than attributed to integrity: an absent cause is not
+            # evidence of a violation.
+            named = "cause_unrecorded"
+        if named not in failures:
+            failures.append(named)
     record["failures"] = failures
     # ``failure`` stays for readers that predate the list. It carries the
     # gravest active cause, so a client reading one string is never told

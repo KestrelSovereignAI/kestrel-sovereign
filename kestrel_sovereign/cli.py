@@ -568,8 +568,18 @@ async def _run_shell(agent_dir: Path, args) -> int:
                     print("   Please verify KESTREL_DATA_KEY and restart.")
                     print("   Use !quit to exit.")
                     if hasattr(agent, 'enter_safe_mode'):
+                        # An availability failure, not a failed
+                        # verification: the constitution was never read, so
+                        # nothing about it was found wrong. Recording this as
+                        # INTEGRITY would tell the Sovereign their
+                        # constitution was violated by a missing key (#2920).
+                        from kestrel_sovereign.agent.constitution import (
+                            SafeModeCause,
+                        )
+
                         await agent.enter_safe_mode(
-                            "Repeated encrypted-state decryption failures"
+                            "Repeated encrypted-state decryption failures",
+                            cause=SafeModeCause.STATE_UNAVAILABLE.value,
                         )
 
     except KeyboardInterrupt:

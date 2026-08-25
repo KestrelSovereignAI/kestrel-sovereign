@@ -31,6 +31,10 @@ class ConstitutionRuntimeState:
     # identity whose anchor is missing. Only the former may establish its
     # initial anchor automatically before the mandatory full startup audit.
     bootstrap_pending: bool = False
+    #: Why cognition is restricted, when it is. NULL on rows written before
+    #: causes were recorded — which is not the same as no cause, and must not
+    #: be read as an integrity finding (#2920 defect 3).
+    safe_mode_cause: Optional[str] = None
 
 
 class ConstitutionRuntimeStateStore:
@@ -97,7 +101,8 @@ class ConstitutionRuntimeStateStore:
                     CHECK (interaction_count >= 0),
                 bootstrap_pending {boolean_type} NOT NULL,
                 schema_version INTEGER NOT NULL,
-                updated_at {timestamp_type} NOT NULL
+                updated_at {timestamp_type} NOT NULL,
+                safe_mode_cause TEXT
             );
 
             CREATE TABLE IF NOT EXISTS constitution_runtime_events (
@@ -113,6 +118,25 @@ class ConstitutionRuntimeStateStore:
                 ON constitution_runtime_events(agent_id, id);
             """
         )
+        # Existing installs already have the table, so CREATE IF NOT EXISTS
+        # never adds the column. SCHEMA_VERSION is deliberately NOT bumped:
+        # it is nullable, the row shape stays readable, and ``load`` RAISES on
+        # a version mismatch — which lands in
+        # ``_mark_constitution_state_unavailable`` and would put every
+        # existing agent into Safe Mode on upgrade.
+        await self._migrate_safe_mode_cause_column()
+
+    async def _migrate_safe_mode_cause_column(self) -> None:
+        """Add ``safe_mode_cause`` to a table created before it existed."""
+        try:
+            await self._backend.execute(
+                "ALTER TABLE constitution_runtime_state "
+                "ADD COLUMN safe_mode_cause TEXT"
+            )
+        except Exception:
+            # Already present. Both backends raise rather than no-op, and the
+            # column is the marker — there is no separate ledger to consult.
+            pass
 
     async def load(self, agent_id: str) -> Optional[ConstitutionRuntimeState]:
         """Load one agent's state, returning ``None`` for a legacy agent."""
@@ -122,7 +146,7 @@ class ConstitutionRuntimeStateStore:
                    safe_mode_entered_at, safe_mode_exited_at,
                    safe_mode_exit_authorization, last_successful_audit_at,
                    interaction_count, bootstrap_pending, schema_version,
-                   updated_at
+                   updated_at, safe_mode_cause
               FROM constitution_runtime_state
              WHERE agent_id = ?
             """,
@@ -145,6 +169,7 @@ class ConstitutionRuntimeStateStore:
             interaction_count=max(0, int(row[7])),
             bootstrap_pending=bool(row[8]),
             updated_at=self._timestamp_value(row[10]),
+            safe_mode_cause=row[11],
         )
 
     async def write(
@@ -168,6 +193,7 @@ class ConstitutionRuntimeStateStore:
             self._boolean_param(state.bootstrap_pending),
             self.SCHEMA_VERSION,
             self._timestamp_param(state.updated_at),
+            state.safe_mode_cause,
         )
         async with self._backend.transaction():
             await self._backend.execute(
@@ -177,8 +203,8 @@ class ConstitutionRuntimeStateStore:
                      safe_mode_entered_at, safe_mode_exited_at,
                      safe_mode_exit_authorization, last_successful_audit_at,
                      interaction_count, bootstrap_pending, schema_version,
-                     updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     updated_at, safe_mode_cause)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agent_id) DO UPDATE SET
                     safe_mode = excluded.safe_mode,
                     safe_mode_reason = excluded.safe_mode_reason,
@@ -189,7 +215,8 @@ class ConstitutionRuntimeStateStore:
                     interaction_count = excluded.interaction_count,
                     bootstrap_pending = excluded.bootstrap_pending,
                     schema_version = excluded.schema_version,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    safe_mode_cause = excluded.safe_mode_cause
                 """,
                 values,
             )
