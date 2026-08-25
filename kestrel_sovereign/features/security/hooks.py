@@ -9,7 +9,11 @@ import logging
 from typing import Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
-from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+from kestrel_sovereign.features.security.permissions import (
+    SUBAGENT_DISPATCH_ACTION,
+    PermissionLevel,
+    PermissionStore,
+)
 from kestrel_sovereign.features.security.approval_queue import (
     ApprovalQueue,
     classify_denial,
@@ -100,11 +104,22 @@ class SecurityHook(Hook):
         # Prepare args summary for audit log (truncate for privacy)
         args_summary = self._summarize_args(input.tool_input)
 
+        # This hook runs on PRE_SUBAGENT_CALL as well as PRE_TOOL_USE. Both
+        # used to write "tool_execution", which made a feature-as-subagent
+        # DISPATCH — an envelope carrying the requested task text — look
+        # exactly like a tool that actually ran (#3107). Record which one this
+        # is, so a reader can tell a request from an action.
+        audit_action = (
+            SUBAGENT_DISPATCH_ACTION
+            if input.hook_event_name == HookEvent.PRE_SUBAGENT_CALL.value
+            else "tool_execution"
+        )
+
         if level == PermissionLevel.ALLOW:
             await self.permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
-                action="tool_execution",
+                action=audit_action,
                 decision="auto_allowed",
                 args_summary=args_summary,
             )
@@ -115,7 +130,7 @@ class SecurityHook(Hook):
             await self.permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
-                action="tool_execution",
+                action=audit_action,
                 decision="auto_mode_allowed",
                 user_choice="constitutional_honesty_unflagged",
                 args_summary=args_summary,
@@ -134,7 +149,7 @@ class SecurityHook(Hook):
             await self.permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
-                action="tool_execution",
+                action=audit_action,
                 decision="auto_denied",
                 args_summary=args_summary,
             )

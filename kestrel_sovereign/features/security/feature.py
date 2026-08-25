@@ -1213,42 +1213,35 @@ class SecurityFeature(Feature):
         scope_text = ", ".join(scope)
 
         try:
-            total = await self.permission_store.count_audit_matches(
-                needle, tool_name=tool_name or None, days=days_val,
-            )
-            matches = (
-                await self.permission_store.search_audit_log(
-                    needle,
-                    tool_name=tool_name or None,
-                    days=days_val,
-                    limit=limit_val,
-                )
-                # Not the gate — that is the ``too_broad`` return below, and
-                # mutation testing confirms this condition is not what enforces
-                # it. Its job is to avoid pulling four hundred rows of
-                # arguments into memory only to discard them.
-                if 0 < total <= MAX_DISCLOSING_MATCHES
-                else []
+            # One statement, one snapshot: the store fetches a single row of
+            # headroom past the bound and reports whether it existed. A
+            # separate COUNT could pass while the page query, on its own
+            # connection, saw more rows and returned their arguments anyway.
+            matches, too_broad = await self.permission_store.search_audit_log(
+                needle,
+                tool_name=tool_name or None,
+                days=days_val,
+                limit=MAX_DISCLOSING_MATCHES,
             )
         except Exception as e:
             logger.error(f"security_audit_search failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
-        if total > MAX_DISCLOSING_MATCHES:
+        if too_broad:
             # Deliberately no arguments: a query this broad is not a
             # description of one prior action, and returning a page of it would
             # be the unbounded dump wearing a query parameter.
             return ToolResult.ok(
                 confirmation=(
-                    f"{total} recorded calls matched ({scope_text}) — too "
-                    f"broad to answer with arguments (limit "
-                    f"{MAX_DISCLOSING_MATCHES}).\n"
+                    f"More than {MAX_DISCLOSING_MATCHES} recorded calls "
+                    f"matched ({scope_text}) — too broad to answer with "
+                    "arguments.\n"
                     "Narrow it: add a distinctive phrase from the thing "
                     "itself, a tool_name, or a days window. Nothing was "
                     "returned from the log."
                 ),
                 data={
-                    "count": total,
+                    "count": None,
                     "too_broad": True,
                     "max_disclosing_matches": MAX_DISCLOSING_MATCHES,
                     "query": needle,
@@ -1296,7 +1289,6 @@ class SecurityFeature(Feature):
             confirmation="\n".join(lines),
             data={
                 "count": len(matches),
-                "total_matches": total,
                 "too_broad": False,
                 "query": needle,
                 "tool_name": tool_name or "",

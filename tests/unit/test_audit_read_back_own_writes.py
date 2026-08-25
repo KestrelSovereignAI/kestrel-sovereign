@@ -66,7 +66,7 @@ async def test_a_later_turn_finds_the_filing_it_already_made(store):
     finds the first — which is all that was needed to prevent the duplicate."""
     await _log_filing(store, _FILING_ONE)
 
-    matches = await store.search_audit_log("orphans the worker")
+    matches, _ = await store.search_audit_log("orphans the worker")
 
     assert len(matches) == 1
     assert matches[0]["tool"] == "create_github_issue"
@@ -84,7 +84,7 @@ async def test_the_match_carries_the_arguments_not_just_the_tool_name(store):
         '"Something entirely unrelated about embeddings"}',
     )
 
-    matches = await store.search_audit_log("orphans the worker")
+    matches, _ = await store.search_audit_log("orphans the worker")
 
     assert len(matches) == 1, (
         "two calls to the same tool must be distinguishable by their arguments"
@@ -106,7 +106,7 @@ async def test_a_row_the_query_does_not_describe_stays_invisible(store):
         tool="read_file",
     )
 
-    matches = await store.search_audit_log("orphans the worker")
+    matches, _ = await store.search_audit_log("orphans the worker")
 
     assert len(matches) == 1
     blob = " ".join(m["args_summary"] or "" for m in matches)
@@ -123,14 +123,14 @@ async def test_like_wildcards_in_the_query_cannot_widen_the_match(store):
 
     # "%" would be "match everything" unescaped; escaped it is a literal
     # percent sign, which appears in neither row.
-    assert await store.search_audit_log("%") == []
+    assert (await store.search_audit_log("%"))[0] == []
     # A query that wraps a real term in wildcards must find nothing rather
     # than silently behaving like the bare term.
-    assert await store.search_audit_log("%orphans%") == []
+    assert (await store.search_audit_log("%orphans%"))[0] == []
     # "_" is LIKE's any-single-character. Escaped it is a literal underscore,
     # which BOTH rows contain in "create_github_issue" — so the assertion that
     # proves escaping is that it matches as a character, not as a wildcard.
-    assert len(await store.search_audit_log("_")) == 2
+    assert len((await store.search_audit_log("_"))[0]) == 2
     await store.log_decision(
         feature_name="ShellFeature",
         tool_name="shell",
@@ -139,7 +139,7 @@ async def test_like_wildcards_in_the_query_cannot_widen_the_match(store):
         args_summary='{"command": "ls"}',
     )
     # ...and the row with no underscore anywhere is not swept in by it.
-    underscore_hits = await store.search_audit_log("_")
+    underscore_hits, _ = await store.search_audit_log("_")
     assert all(h["tool"] != "shell" for h in underscore_hits)
 
 
@@ -149,8 +149,8 @@ async def test_an_empty_query_returns_nothing_rather_than_everything(store):
     deliberately is not."""
     await _log_filing(store, _FILING_ONE)
 
-    assert await store.search_audit_log("") == []
-    assert await store.search_audit_log("   ") == []
+    assert (await store.search_audit_log(""))[0] == []
+    assert (await store.search_audit_log("   "))[0] == []
 
 
 @pytest.mark.asyncio
@@ -159,7 +159,7 @@ async def test_search_matches_the_tool_name_too(store):
     knowing any argument."""
     await _log_filing(store, _FILING_ONE)
 
-    matches = await store.search_audit_log("create_github_issue")
+    matches, _ = await store.search_audit_log("create_github_issue")
 
     assert len(matches) == 1
 
@@ -180,7 +180,7 @@ async def test_a_masked_secret_stays_masked_in_the_search_result(store):
         ),
     )
 
-    matches = await store.search_audit_log("orphans the worker")
+    matches, _ = await store.search_audit_log("orphans the worker")
 
     assert len(matches) == 1
     assert "sk-live-SECRET" not in matches[0]["args_summary"]
@@ -192,13 +192,13 @@ async def test_tool_name_and_days_narrow_the_search(store):
     await _log_filing(store, _FILING_ONE)
     await _log_filing(store, _FILING_ONE, tool="add_github_issue_comment")
 
-    only_issues = await store.search_audit_log(
+    only_issues, _ = await store.search_audit_log(
         "orphans the worker", tool_name="create_github_issue"
     )
     assert len(only_issues) == 1
     assert only_issues[0]["tool"] == "create_github_issue"
 
-    recent = await store.search_audit_log("orphans the worker", days=1)
+    recent, _ = await store.search_audit_log("orphans the worker", days=1)
     assert len(recent) == 2, "both rows were written just now"
 
 
@@ -253,11 +253,11 @@ async def test_the_search_does_not_return_its_own_act_of_searching(tmp_path):
         for row in logged
     ), "precondition: the hook must have logged the search with its query"
 
-    assert await store.search_audit_log(query) == [], (
+    assert (await store.search_audit_log(query))[0] == [], (
         "a search must not return itself; otherwise no query can ever come "
         "back empty and every novel search looks like prior work"
     )
-    assert await store.count_audit_matches(query) == 0
+    assert (await store.search_audit_log(query))[1] is False
 
 
 @pytest.mark.asyncio
@@ -282,11 +282,15 @@ async def test_a_query_too_broad_to_be_a_description_returns_no_arguments(
             args_summary=f'{{"title": "issue number {i} about everything"}}',
         )
 
-    total = await store.count_audit_matches("e")
-    assert total > MAX_DISCLOSING_MATCHES
+    _rows, too_broad = await store.search_audit_log(
+        "e", limit=MAX_DISCLOSING_MATCHES,
+    )
+    assert too_broad is True
 
-    narrow = await store.count_audit_matches("issue number 3 about")
-    assert 0 < narrow <= MAX_DISCLOSING_MATCHES, (
+    narrow, narrow_too_broad = await store.search_audit_log(
+        "issue number 3 about", limit=MAX_DISCLOSING_MATCHES,
+    )
+    assert narrow and narrow_too_broad is False, (
         "a real description must still be answerable"
     )
 
@@ -304,7 +308,7 @@ async def test_a_denied_attempt_is_returned_as_denied(store):
         args_summary=_FILING_ONE,
     )
 
-    matches = await store.search_audit_log("orphans the worker")
+    matches, _ = await store.search_audit_log("orphans the worker")
 
     assert len(matches) == 1
     assert matches[0]["decision"] == "auto_denied", (
@@ -344,7 +348,7 @@ async def test_days_window_does_not_drop_legacy_timestamps(tmp_path):
     raw.commit()
     raw.close()
 
-    matches = await store.search_audit_log("orphans the worker", days=1)
+    matches, _ = await store.search_audit_log("orphans the worker", days=1)
 
     assert len(matches) == 1, (
         f"a legacy row stamped {legacy_stamp} is inside a 1-day window and "
@@ -377,8 +381,10 @@ async def test_the_tool_withholds_arguments_for_a_broad_query(tmp_path):
 
     broad = await feature.security_audit_search(query="e")
     assert broad.data["too_broad"] is True
-    assert broad.data["count"] > MAX_DISCLOSING_MATCHES
     assert broad.data["matches"] == []
+    # No exact count either: reporting "412 matched" is itself a small
+    # disclosure about the log, and the caller only needs to know to narrow.
+    assert broad.data["count"] is None
     assert "xyz" not in broad.confirmation, (
         "a query too broad to be a description must disclose no arguments"
     )
@@ -418,7 +424,126 @@ async def test_raising_limit_cannot_defeat_the_breadth_gate(tmp_path):
 
     result = await feature.security_audit_search(query="e", limit=500)
     assert result.data["too_broad"] is True
-    assert result.data["matches"] == []
-    assert result.data.get("limit_requested", MAX_DISCLOSING_MATCHES) <= (
-        MAX_DISCLOSING_MATCHES
+    assert result.data["matches"] == [], (
+        "the store is asked for MAX_DISCLOSING_MATCHES regardless of what the "
+        "caller passed, so limit cannot widen what is disclosed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (#3107)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_natural_language_query_matches_json_escaped_storage(store):
+    """`summarize_args` persists `json.dumps(...)`, which is ASCII-escaped by
+    default, so "Échec — café" is on disk as "\\u00c9chec \\u2014 caf\\u00e9".
+    A LIKE built from the literal query finds nothing — and it fails for
+    exactly the fragments a caller reaches for. BOTH real filings behind this
+    ticket carried an em dash in their titles."""
+    from kestrel_sovereign.features.security.args_summary import summarize_args
+
+    stored = summarize_args(
+        {"title": "Échec — the wrapper orphans the worker", "repo": "x"}
+    )
+    assert "\\u2014" in stored, (
+        "precondition: the em dash must actually be escaped on disk"
+    )
+    assert "—" not in stored
+
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary=stored,
+    )
+
+    for fragment in ("Échec — the wrapper", "Échec", "—"):
+        matches, _ = await store.search_audit_log(fragment)
+        assert len(matches) == 1, (
+            f"a query containing non-ASCII ({fragment!r}) must match the "
+            "escaped form the writer actually persisted"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_dispatch_is_a_request_not_a_prior_action(tmp_path):
+    """`SecurityHook` runs on PRE_SUBAGENT_CALL as well as PRE_TOOL_USE, so a
+    feature-as-subagent dispatch writes a row carrying the whole requested task
+    text. When that dispatch is what reached this very tool, the search phrase
+    is inside it and the enclosing call comes back as prior work.
+
+    The rule is not "special-case my own caller" — it is that a dispatch
+    records what was ASKED FOR and the inner tool rows record what was DONE.
+    Driven through the real hook, on the real event."""
+    from kestrel_sdk.hooks.base import HookEvent, HookInput
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from kestrel_sovereign.features.security.hooks import SecurityHook
+    from kestrel_sovereign.features.security.permissions import (
+        PermissionLevel,
+        SUBAGENT_DISPATCH_ACTION,
+    )
+
+    store = PermissionStore(str(tmp_path / "subagent.db"))
+    await store.initialize()
+    await store.register_tool(
+        "SecurityFeature", "security_feature", PermissionLevel.ALLOW
+    )
+    hook = SecurityHook(store, ApprovalQueue(permission_store=store))
+
+    phrase = "whether the wrapper orphans the worker"
+    await hook.execute(HookInput(
+        session_id="s",
+        hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+        tool_name="security_feature",
+        feature_name="SecurityFeature",
+        tool_input={"task": f"Search the audit log for {phrase}"},
+    ))
+
+    logged = await store.get_audit_log(10)
+    assert any(
+        row["action"] == SUBAGENT_DISPATCH_ACTION
+        and phrase in (row["args_summary"] or "")
+        for row in logged
+    ), "precondition: the dispatch envelope must be recorded, and marked as one"
+
+    matches, _ = await store.search_audit_log(phrase)
+    assert matches == [], (
+        "a dispatch envelope is a request; returning it as prior work makes "
+        "novel work look already done"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_inner_tool_call_is_still_found_after_a_dispatch(tmp_path):
+    """The other end of the same boundary: excluding envelopes must not
+    exclude the work. A dispatch that actually ran its inner tool leaves a
+    `tool_execution` row, and THAT is the prior action."""
+    from kestrel_sovereign.features.security.permissions import (
+        SUBAGENT_DISPATCH_ACTION,
+    )
+
+    store = PermissionStore(str(tmp_path / "inner.db"))
+    await store.initialize()
+    phrase = "orphans the worker"
+    await store.log_decision(
+        feature_name="SecurityFeature",
+        tool_name="security_feature",
+        action=SUBAGENT_DISPATCH_ACTION,
+        decision="auto_mode_allowed",
+        args_summary=f'{{"task": "file an issue about {phrase}"}}',
+    )
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary=f'{{"title": "the wrapper {phrase}"}}',
+    )
+
+    matches, _ = await store.search_audit_log(phrase)
+
+    assert len(matches) == 1
+    assert matches[0]["tool"] == "create_github_issue"

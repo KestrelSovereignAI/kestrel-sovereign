@@ -9,6 +9,7 @@ This module provides SQLite-backed storage for tool permissions with:
 """
 
 import aiosqlite
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -23,6 +24,14 @@ from kestrel_sovereign.audit_time import utc_now_iso
 #: and all, BEFORE the tool body runs. Defined here rather than in the feature
 #: so the exclusion and the ``@tool(name=...)`` cannot drift apart.
 SEARCH_TOOL_NAME = "security_audit_search"
+
+#: ``action`` value for a feature-as-subagent DISPATCH row, as opposed to the
+#: ``tool_execution`` rows its inner tool calls write. ``SecurityHook`` runs on
+#: PRE_SUBAGENT_CALL as well as PRE_TOOL_USE, and until #3107 both wrote
+#: "tool_execution", so a dispatch envelope was indistinguishable from the work
+#: it requested. The distinction is what lets a read-back exclude requests and
+#: keep actions.
+SUBAGENT_DISPATCH_ACTION = "subagent_dispatch"
 
 logger = logging.getLogger(__name__)
 
@@ -952,27 +961,6 @@ class PermissionStore:
             for row in rows
         ]
 
-    async def count_audit_matches(
-        self,
-        query: str,
-        *,
-        tool_name: Optional[str] = None,
-        days: Optional[int] = None,
-    ) -> int:
-        """How many rows :meth:`search_audit_log` would match, unlimited.
-
-        The breadth gate needs the TOTAL, not the page: a query that matches
-        four hundred rows is not a description of one prior action, and
-        answering it with a page of arguments is the unbounded disclosure the
-        query-scoping was supposed to rule out. Returning only the count lets
-        the caller be told "narrow this" without any argument leaving the
-        database.
-        """
-        rows = await self._matching_rows(
-            query, tool_name=tool_name, days=days, limit=None, count_only=True,
-        )
-        return int(rows[0][0]) if rows else 0
-
     def _match_predicate(
         self,
         needle: str,
@@ -985,20 +973,46 @@ class PermissionStore:
         One builder for both the page and the count so the breadth gate can
         never disagree with what the page would return.
         """
-        # LIKE wildcards in the needle would silently widen the match — a
-        # caller searching for a literal "%" must not get everything.
-        escaped = (
-            needle.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
-        pattern = f"%{escaped}%"
+        def _like(text: str) -> str:
+            # LIKE wildcards in the needle would silently widen the match — a
+            # caller searching for a literal "%" must not get everything.
+            return "%" + (
+                text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            ) + "%"
 
+        # ``summarize_args`` persists ``json.dumps(...)`` output, and
+        # json.dumps defaults to ensure_ascii=True — so a title stored from
+        # "Échec — café" is on disk as "\u00c9chec \u2014 caf\u00e9". A LIKE
+        # built from the literal query therefore finds nothing for exactly the
+        # natural-language fragments a caller reaches for. Both real filings
+        # behind #3107 carried an em dash in their titles. Search the escaped
+        # form as well as the literal one; they coincide for pure ASCII, so
+        # this costs a redundant predicate there and nothing else.
+        json_escaped = json.dumps(needle)[1:-1]
+        patterns = [_like(needle)]
+        if json_escaped != needle:
+            patterns.append(_like(json_escaped))
+
+        text_match = " OR ".join(
+            "LOWER(args_summary) LIKE LOWER(?) ESCAPE '\\'" for _ in patterns
+        )
         clauses = [
             (
-                "(LOWER(args_summary) LIKE LOWER(?) ESCAPE '\\' "
+                f"({text_match} "
                 "OR LOWER(tool_name) LIKE LOWER(?) ESCAPE '\\')"
             ),
+            # A dispatch is a REQUEST, not an action. ``SecurityHook`` also
+            # runs on PRE_SUBAGENT_CALL, so a feature-as-subagent dispatch
+            # writes a row carrying the whole task text — including, when the
+            # dispatch is what reached this very tool, the search phrase
+            # itself. Left in, the enclosing call returns as prior work and a
+            # novel search reads as already done. Excluding dispatch envelopes
+            # generally is the honest rule rather than a special case: what a
+            # task ASKED for is not evidence of what was DONE, and the inner
+            # tool rows are what record that.
+            "action <> ?",
             # A search must never return its own act of searching. The security
             # hook writes its PRE_TOOL_USE row — carrying this very query inside
             # ``args_summary`` — BEFORE the tool body runs, so without this the
@@ -1009,7 +1023,10 @@ class PermissionStore:
             # ``.outcome`` row with it.
             "tool_name NOT LIKE ?",
         ]
-        params: List[Any] = [pattern, pattern, f"{SEARCH_TOOL_NAME}%"]
+        params: List[Any] = [
+            *patterns, _like(needle), SUBAGENT_DISPATCH_ACTION,
+            f"{SEARCH_TOOL_NAME}%",
+        ]
 
         if tool_name:
             clauses.append("tool_name = ?")
@@ -1028,35 +1045,6 @@ class PermissionStore:
 
         return " AND ".join(clauses), params
 
-    async def count_audit_matches(
-        self,
-        query: str,
-        *,
-        tool_name: Optional[str] = None,
-        days: Optional[int] = None,
-    ) -> int:
-        """How many rows :meth:`search_audit_log` would match, unlimited.
-
-        The breadth gate needs the TOTAL, not the page. A query matching four
-        hundred rows is not a description of one prior action, and answering it
-        with a page of arguments is the unbounded disclosure that query-scoping
-        was supposed to rule out. Counting lets the caller be told "narrow
-        this" with no argument leaving the database.
-        """
-        needle = (query or "").strip()
-        if not needle:
-            return 0
-        where, params = self._match_predicate(
-            needle, tool_name=tool_name, days=days,
-        )
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                f"SELECT COUNT(*) FROM security_audit_log WHERE {where}",
-                tuple(params),
-            )
-            row = await cursor.fetchone()
-        return int(row[0]) if row else 0
-
     async def search_audit_log(
         self,
         query: str,
@@ -1064,7 +1052,7 @@ class PermissionStore:
         tool_name: Optional[str] = None,
         days: Optional[int] = None,
         limit: int = 20,
-    ) -> List[Dict]:
+    ) -> Tuple[List[Dict], bool]:
         """Return audit rows whose recorded call matches ``query`` (#3107).
 
         The sibling of :meth:`get_audit_log`, and deliberately not a variant of
@@ -1077,8 +1065,12 @@ class PermissionStore:
 
         That difference is what makes returning ``args_summary`` here
         defensible where returning it from an unbounded listing was not, and it
-        holds only while the query is a description. The breadth gate lives in
-        the tool, on :meth:`count_audit_matches`.
+        holds only while the query is a description. ``limit`` is therefore
+        fetched with ONE row of headroom and the caller is told whether that
+        row existed. A separate COUNT could pass at the bound while the page
+        query — on its own connection, so its own SQLite snapshot — saw more
+        rows and returned their arguments anyway. One statement cannot
+        disagree with itself.
 
         **A row is an AUTHORIZATION, not a completion.** The security hook logs
         at ``PRE_TOOL_USE``, so a row records that the call was allowed to run —
@@ -1093,12 +1085,14 @@ class PermissionStore:
         """
         needle = (query or "").strip()
         if not needle:
-            return []
+            return [], False
 
         where, params = self._match_predicate(
             needle, tool_name=tool_name, days=days,
         )
-        params.append(int(limit))
+        # One row of headroom: whether it came back IS the "too broad"
+        # signal, read from the same statement rather than a racing COUNT.
+        params.append(int(limit) + 1)
 
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -1118,6 +1112,9 @@ class PermissionStore:
             )
             rows = await cursor.fetchall()
 
+        has_more = len(rows) > int(limit)
+        rows = rows[: int(limit)]
+
         return [
             {
                 "feature": row["feature_name"],
@@ -1129,7 +1126,7 @@ class PermissionStore:
                 "timestamp": row["created_at"],
             }
             for row in rows
-        ]
+        ], has_more
 
     # ------------------------------------------------------------------
     # Auto-approve allowlist (Sovereign-curated, revocable)
