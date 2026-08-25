@@ -2552,6 +2552,32 @@ class SchedulerFeature(Feature):
                 },
             )
 
+        # 2b. In-turn origin required. ``SourceRegistration`` carries ONE
+        #    static ``trust`` for the whole source — it cannot vary per
+        #    payload — and this source declares ``Trust.TRUSTED`` on the
+        #    stated ground that "the intention is authored by this agent
+        #    inside its own turn". Nothing enforced that. A call arriving with
+        #    neither a waking signal nor a live turn session has no
+        #    agent-authored provenance, so accepting it would let a caller
+        #    hand us an intention that later wakes a full cognition turn at
+        #    TRUSTED. Refuse: caller-authored intent is a different feature
+        #    with a strictly larger blast radius, and refusing it costs
+        #    nothing anyone asked for.
+        if current is None and not (self._turn_session_id() or ""):
+            return ToolResult.failed(
+                f"'{SELF_FOLLOWUP_TASK_NAME}' carries THIS agent's own "
+                "intention across its own turn boundary, so it may only be "
+                "scheduled from inside a live turn. This call has neither a "
+                "waking signal nor a turn session, so its intent is not "
+                "agent-authored and the source's TRUSTED registration would "
+                "be a lie about it.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "no_in_turn_origin",
+                },
+            )
+
         # 3. The intention itself. An empty intent would fire a turn with
         #    nothing to act on, and an unknown key would only be rejected
         #    later by the source schema — after the row looked accepted.
