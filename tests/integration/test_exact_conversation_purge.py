@@ -747,7 +747,6 @@ def test_session_resolution_refuses_a_row_it_cannot_date(anchor_stamp, other_sta
     """
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
-        ConversationSessionTimestampError,
     )
 
     rows = [_row(1, None, anchor_stamp), _row(2, None, other_stamp)]
