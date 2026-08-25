@@ -594,6 +594,7 @@ class WaitReconciler:
         signal = self._build_signal(
             provider, kind, handle, status, attempts,
             origin_session_id=origin_session_id,
+            prior_state=state,
         )
 
         if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
@@ -678,6 +679,7 @@ class WaitReconciler:
         attempts: int,
         *,
         origin_session_id: Optional[str] = None,
+        prior_state: Any = None,
     ) -> Signal:
         """Build a COGNITION signal envelope for a terminal transition.
 
@@ -686,6 +688,13 @@ class WaitReconciler:
         generic ``wait.complete`` source. The provider's WaitStatus.data is
         spread underneath the generic kind/handle/outcome/summary keys so
         kind-specific templates (talon's) still find their fields.
+
+        ``prior_state`` is this handle's ledger row as read at the top of
+        :meth:`_process_handle` — the source of the delivery-provenance keys
+        (#3105). A wake carries its subject's state AND its own: without the
+        attempt count in the payload, a retry after a soft-failed dispatch is
+        byte-identical to a first delivery, and an orchestrator woken 90
+        minutes after a job ended reasonably reads it as news.
 
         ``origin_session_id`` is the session that REGISTERED the work,
         resolved by :func:`_provider_origin_session` from the provider's own
@@ -713,6 +722,8 @@ class WaitReconciler:
         paint a turn into whichever pane happens to be open.
         """
         source = getattr(provider, "signal", None) or "wait.complete"
+        prior_status = getattr(prior_state, "last_delivery_status", None)
+        prior_at = getattr(prior_state, "last_delivery_attempt_at", None)
         payload: Dict[str, Any] = {
             **(status.data or {}),
             "kind": kind,
@@ -720,6 +731,26 @@ class WaitReconciler:
             "outcome": status.outcome.value,
             "summary": status.summary,
             "origin_session_id": origin_session_id or "",
+            # DELIVERY PROVENANCE (#3105). A retry after a soft-failed
+            # dispatch re-describes the same terminal transition, so its
+            # payload is byte-identical to the first attempt's — the reader
+            # cannot tell "this job just finished" from "this wake's third
+            # dispatch". The attempt count already existed here; it went into
+            # ``dedupe_key`` for the DISPATCHER and was withheld from the
+            # AGENT, which is the only party that has to decide whether the
+            # wake is news. These keys are the same fact, addressed to the
+            # reader. Written AFTER the ``status.data`` spread for the same
+            # reason ``origin_session_id`` is: a provider that forwards
+            # third-party data must not be able to understate an attempt
+            # count and make a retry read as a first delivery.
+            "delivery_attempt": attempts,
+            "delivery_max_attempts": MAX_DELIVERY_ATTEMPTS,
+            # Empty on a first attempt; on a retry, how the PREVIOUS dispatch
+            # of this same transition ended and when it was tried.
+            "delivery_previous_status": str(prior_status or "") if attempts > 1 else "",
+            "delivery_previous_attempt_at": (
+                str(prior_at or "") if attempts > 1 else ""
+            ),
         }
         target_agent = (
             getattr(self._agent, "did", None)
