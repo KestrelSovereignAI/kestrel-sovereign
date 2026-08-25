@@ -115,7 +115,10 @@ process. Health restart count is separate from planned idle-wake count, and
 cold child startup timing is separate from warm admission latency. A synchronous
 `runtime_telemetry_snapshot()` returns lifecycle state plus the most recent
 off-loop process sample; callers that require a fresh process sample await
-`sample_runtime_telemetry()`. Core measures its owned venv, mutable workspace,
+`sample_runtime_telemetry()`. Pull-only hosts can also request the bounded disk
+sample explicitly with `sample_runtime_telemetry(refresh_disk=True)`; without
+an observer or that opt-in, disk fields remain unsampled. Core measures its
+owned venv, mutable workspace,
 and provisioning-cache bytes off the event loop with root no-follow descriptor
 traversal plus entry/time budgets;
 all components in one refresh share the same total time deadline. The

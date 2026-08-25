@@ -1815,7 +1815,15 @@ async def test_failed_idle_reclaim_preserves_durable_reprovision_intent(
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
-    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime = InstalledFeatureRuntime(
+        class_name="TestFeature",
+        entry_point="test_pkg.feature:TestFeature",
+        distribution="test-pkg",
+        runtime="isolated-venv",
+        service="test_pkg.service:main",
+        description="Test callable proxy",
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
     await feature.initialize()
     runtime_dir = feature._feature_runtime_dir()
     venv = runtime_dir / ".venv"
@@ -1869,6 +1877,11 @@ async def test_failed_idle_reclaim_preserves_durable_reprovision_intent(
     assert not (venv / "lib").exists()
     assert feature._provision_manifest_path().exists()
     assert feature._venv_relocation_repair_pending() is True
+    # Callable services have no generated console wrapper to expose partial
+    # deletion. The durable marker must independently force reinstall.
+    feature._bin_path = None
+    feature._service_target = None
+    assert feature._provision_status("test-pkg", {}) == (True, True)
     await feature.shutdown()
 
 
@@ -2639,6 +2652,28 @@ async def test_initialize_skips_disk_walk_without_observer(monkeypatch, tmp_path
 
     measured.assert_not_called()
     await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pull_snapshot_can_refresh_disk_without_observer(monkeypatch, tmp_path):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime_dir = feature._prepare_runtime_workspace()
+    feature._venv_path = runtime_dir / ".venv"
+    feature._venv_path.mkdir()
+    (feature._venv_path / "environment.bin").write_bytes(b"environment")
+    (runtime_dir / "data" / "private.bin").write_bytes(b"private")
+    (runtime_dir / "provisioning_cache" / "download.bin").write_bytes(b"download")
+
+    snapshot = await feature.sample_runtime_telemetry(refresh_disk=True)
+
+    assert snapshot.environment_bytes == len(b"environment")
+    assert snapshot.private_writable_bytes == len(b"private")
+    assert snapshot.downloaded_bytes == len(b"download")
+    assert snapshot.disk_telemetry_status == "complete"
 
 
 @pytest.mark.asyncio

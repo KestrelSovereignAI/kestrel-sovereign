@@ -482,9 +482,6 @@ _HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY = "telegram-hosted-ingress-owner-v1"
 # worker owns one other item; the SDK notification reader naturally applies
 # backpressure to the producer before a third item can allocate host memory.
 _MAX_PENDING_NON_CURSOR_INGRESS_EVENTS = 1
-_event_source_client: ContextVar[Any | None] = ContextVar(
-    "isolated_event_source_client", default=None
-)
 # This value is set only around a host-validated Telegram polling callback.
 # It is task-local rather than part of the child's JSON payload so an isolated
 # service cannot promote an arbitrary notification into the cursor-owning
@@ -6364,8 +6361,20 @@ class ProxyFeature(Feature):
             process_count=process_count,
         )
 
-    async def sample_runtime_telemetry(self) -> IsolatedRuntimeTelemetrySnapshot:
-        """Return a fresh path-free snapshot with OS sampling off the event loop."""
+    async def sample_runtime_telemetry(
+        self, *, refresh_disk: bool = False
+    ) -> IsolatedRuntimeTelemetrySnapshot:
+        """Return a fresh path-free snapshot with expensive sampling off-loop.
+
+        Disk traversal remains opt-in for pull-only hosts. Observer-driven
+        telemetry refreshes it separately on its bounded cadence.
+        """
+
+        if refresh_disk:
+            await self._refresh_disk_telemetry(
+                refresh_environment=True,
+                require_observer=False,
+            )
 
         inputs = self._runtime_telemetry_snapshot_inputs()
         snapshot = await asyncio.to_thread(
@@ -6387,10 +6396,11 @@ class ProxyFeature(Feature):
         *,
         refresh_environment: bool = False,
         expected_reclaim_generation: int | None = None,
+        require_observer: bool = True,
     ) -> None:
         """Refresh owned workspace byte counters outside the event loop."""
 
-        if self._telemetry_observer is None:
+        if require_observer and self._telemetry_observer is None:
             return
 
         runtime_dir = self._feature_runtime_dir()
@@ -11485,9 +11495,13 @@ class ProxyFeature(Feature):
             and stamped_path != current_path
         )
         location_state = self._console_script_location_state()
+        # An interrupted reclaim is durable proof that any kind of service
+        # target needs repair. Callable targets have no wrapper to inspect, so
+        # the marker must take precedence over their not-applicable state.
+        if self._venv_relocation_repair_pending():
+            return True
         relocation_proven = (
             self._venv_relocated_this_startup
-            or self._venv_relocation_repair_pending()
             or stamped_relocation
             or location_state == "relocated"
         )
@@ -12968,11 +12982,7 @@ class ProxyFeature(Feature):
                 # replacement has been published.
                 if source_client is not self._client:
                     return
-                emit_telemetry = await self._handle_event_admitted_from_source(
-                    event, source_client
-                )
-            if emit_telemetry:
-                self._schedule_runtime_telemetry()
+                await self._handle_event_admitted(event)
         except _TrafficGateClosedError:
             # A newly published replacement can begin polling while its parent
             # transition's gate is still closed. Its canonical acknowledged
@@ -13316,18 +13326,7 @@ class ProxyFeature(Feature):
                     queue_entry.retired.set()
                     return
 
-    async def _handle_event_admitted_from_source(
-        self, event: Any, source_client: Any
-    ) -> bool:
-        """Run one admitted event with its exact client available to the ack path."""
-
-        token = _event_source_client.set(source_client)
-        try:
-            return await self._handle_event_admitted(event)
-        finally:
-            _event_source_client.reset(token)
-
-    async def _handle_event_admitted(self, event: Any) -> bool:
+    async def _handle_event_admitted(self, event: Any) -> None:
         kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
         payload = _meta_get(event, "payload", event)
         if kind == "feature/event":
@@ -13337,40 +13336,10 @@ class ProxyFeature(Feature):
             event_name = kind
             data = payload
 
-        if event_name in {"channel.inbound", "inbound", "message.inbound"}:
-            inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
-            retry = self._inbound_event_retry_completion(data)
-            cursor_owned_protocol = (
-                acknowledgement is not None
-                and retry is not None
-                and self._authoritative_inbound_channel_type() == "telegram"
-            )
-            admission = await self._route_validated_inbound(
-                inbound,
-                cursor_owned_protocol=cursor_owned_protocol,
-                telegram_terminal_disposition=self._telegram_terminal_disposition(
-                    data, cursor_owned_protocol=cursor_owned_protocol
-                ),
-            )
-            source_client = _event_source_client.get()
-            if (
-                self._inbound_admission_is_durable(admission)
-                and acknowledgement is not None
-                and source_client is not None
-            ):
-                self._record_runtime_activity()
-                self._schedule_event_ingress_acknowledgement(
-                    source_client,
-                    acknowledgement,
-                )
-                return True
-            elif retry is not None and source_client is not None:
-                self._schedule_event_ingress_retry(source_client, retry)
-        elif event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
+        if event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
             await self._route_link_qr(data)
         elif event_name in {"channel.link_cleared", "link_cleared"}:
             await self._route_link_cleared(data)
-        return False
 
     def _split_inbound_event_acknowledgement(
         self, payload: Any
