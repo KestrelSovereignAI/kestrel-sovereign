@@ -566,7 +566,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `list_permissions` | `!security-list` | `system` |  | 23 | `enabled` |
 | `pending_approvals` | `!security-pending` | `system` |  | 17 | `enabled` |
 | `security_audit` | `!security-audit` | `system` | `limit` | 54 | `enabled` |
-| `security_audit_search` | `!security-audit-search` | `system` | `query`, `tool_name`, `days`, `limit` | 174 | `enabled` |
+| `security_audit_search` | `!security-audit-search` | `system` | `query`, `tool_name`, `days`, `limit` | 178 | `enabled` |
 | `set_permission` | `!security-set` | `system` | `feature_name`, `tool_name`, `level` | 193 | `enabled` |
 
 ### `skills` (SkillsFeature)

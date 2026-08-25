@@ -14,11 +14,23 @@ from typing import Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.security.permissions import (
+    SEARCH_TOOL_NAME,
     PermissionLevel,
     PermissionStore,
     assert_sdk_permission_level_parity,
     compose_restrictive_permission,
 )
+
+
+#: Above this many matches, ``security_audit_search`` returns the COUNT and no
+#: arguments. The tool's whole justification for surfacing ``args_summary`` —
+#: which ``security_audit`` deliberately withholds — is that the caller already
+#: described what it wanted. A query matching most of the log is not a
+#: description, and answering it with a page of arguments would rebuild the
+#: unbounded disclosure by another route. This is a disclosure bound, not a
+#: page-size preference, which is why ``limit`` is clamped to it rather than
+#: being allowed to exceed it.
+MAX_DISCLOSING_MATCHES = 25
 
 
 # Per-feature default permission levels for fresh agents (#406).
@@ -1105,7 +1117,7 @@ class SecurityFeature(Feature):
         )
 
     @tool(
-        name="security_audit_search",
+        name=SEARCH_TOOL_NAME,
         description=(
             "Search your own recorded tool calls for ones matching a "
             "description — 'have I already filed/commented/run this?'"
@@ -1130,17 +1142,27 @@ class SecurityFeature(Feature):
 
         This asks the other question. The caller must already describe what it
         is looking for, so what comes back is a match to a description the
-        caller supplied — not whatever happens to be recent. On that footing
-        the recorded arguments are returned.
+        caller supplied — not whatever happens to be recent.
 
-        What that ceiling actually is, stated plainly rather than implied:
-        ``args_summary`` was masked and truncated to 500 characters by
-        ``summarize_args`` when it was written, and the same value is already
-        returned verbatim by ``GET /api/security/audit``. Nothing here widens
-        what was persisted. The masking is a key-name heuristic
-        (``password``/``secret``/``token``/``key``/...), so it is a good filter
-        and not a guarantee: a sensitive value under an innocuous key was never
-        masked at write time and will not be masked now.
+        **That footing only holds while the query is a description.** A query
+        broad enough to match most of the log is not one, and answering it with
+        a page of arguments would rebuild the unbounded disclosure by another
+        route. So the match is counted first: past
+        ``MAX_DISCLOSING_MATCHES`` the count comes back and the arguments do
+        not. Narrowing is the caller's move, and nothing leaves the database
+        in the meantime.
+
+        **A match is an AUTHORIZATION, not a completion.** The security hook
+        logs at ``PRE_TOOL_USE``, so a row says the call was allowed to run —
+        not that its body succeeded. Denied and timed-out attempts are rows
+        too. Read ``decision``; a match is evidence you TRIED, and where a
+        paired ``<tool>.outcome`` row exists that is what carries the result.
+
+        What the disclosure ceiling actually is: ``args_summary`` was masked
+        and truncated to 500 characters by ``summarize_args`` when it was
+        written, and ``GET /api/security/audit`` already returns that same
+        value verbatim. Nothing here widens what was persisted. The masking is
+        a key-name heuristic, so it is a good filter and not a guarantee.
 
         Args:
             query: What to look for — a repo, an issue number, a title
@@ -1148,7 +1170,8 @@ class SecurityFeature(Feature):
                    recorded arguments and the tool name.
             tool_name: Restrict to one tool, e.g. "create_github_issue".
             days: Only consider the last N days.
-            limit: Maximum matches to return, newest first.
+            limit: Maximum matches to return, newest first. It cannot widen
+                   disclosure — the bound is the total-match gate, not this.
         """
         needle = (query or "").strip()
         if not needle:
@@ -1163,6 +1186,14 @@ class SecurityFeature(Feature):
             return ToolResult.failed(f"limit must be an integer, got {limit!r}")
         if limit_val < 1:
             return ToolResult.failed("limit must be >= 1")
+        # No clamp on ``limit``, deliberately. Mutation testing showed one had
+        # no observable effect, and it was right: the disclosure bound is the
+        # TOTAL-match gate below, and ``search_audit_log`` only runs when the
+        # total is already within ``MAX_DISCLOSING_MATCHES``. A caller raising
+        # ``limit`` therefore cannot widen what is disclosed — it can only ask
+        # for a page at least as large as a set that is already bounded. A
+        # clamp here would have read as the thing enforcing the bound while
+        # enforcing nothing, which is worse than its absence.
 
         if days is not None:
             try:
@@ -1174,17 +1205,6 @@ class SecurityFeature(Feature):
         else:
             days_val = None
 
-        try:
-            matches = await self.permission_store.search_audit_log(
-                needle,
-                tool_name=tool_name or None,
-                days=days_val,
-                limit=limit_val,
-            )
-        except Exception as e:
-            logger.error(f"security_audit_search failed: {e}", exc_info=True)
-            return ToolResult.failed(str(e))
-
         scope = [f"query={needle!r}"]
         if tool_name:
             scope.append(f"tool={tool_name}")
@@ -1192,10 +1212,56 @@ class SecurityFeature(Feature):
             scope.append(f"days={days_val}")
         scope_text = ", ".join(scope)
 
+        try:
+            total = await self.permission_store.count_audit_matches(
+                needle, tool_name=tool_name or None, days=days_val,
+            )
+            matches = (
+                await self.permission_store.search_audit_log(
+                    needle,
+                    tool_name=tool_name or None,
+                    days=days_val,
+                    limit=limit_val,
+                )
+                # Not the gate — that is the ``too_broad`` return below, and
+                # mutation testing confirms this condition is not what enforces
+                # it. Its job is to avoid pulling four hundred rows of
+                # arguments into memory only to discard them.
+                if 0 < total <= MAX_DISCLOSING_MATCHES
+                else []
+            )
+        except Exception as e:
+            logger.error(f"security_audit_search failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if total > MAX_DISCLOSING_MATCHES:
+            # Deliberately no arguments: a query this broad is not a
+            # description of one prior action, and returning a page of it would
+            # be the unbounded dump wearing a query parameter.
+            return ToolResult.ok(
+                confirmation=(
+                    f"{total} recorded calls matched ({scope_text}) — too "
+                    f"broad to answer with arguments (limit "
+                    f"{MAX_DISCLOSING_MATCHES}).\n"
+                    "Narrow it: add a distinctive phrase from the thing "
+                    "itself, a tool_name, or a days window. Nothing was "
+                    "returned from the log."
+                ),
+                data={
+                    "count": total,
+                    "too_broad": True,
+                    "max_disclosing_matches": MAX_DISCLOSING_MATCHES,
+                    "query": needle,
+                    "tool_name": tool_name or "",
+                    "days": days_val,
+                    "matches": [],
+                },
+            )
+
         if not matches:
             # An empty result is NOT proof the thing was never done. Say so:
-            # this searches recorded arguments, which are masked and truncated
-            # to 500 characters, so a match past that cut is invisible here.
+            # this searches recorded arguments, masked and truncated to 500
+            # characters, so a match past that cut is invisible here.
             return ToolResult.ok(
                 confirmation=(
                     f"No recorded tool call matched ({scope_text}).\n"
@@ -1205,6 +1271,7 @@ class SecurityFeature(Feature):
                 ),
                 data={
                     "count": 0,
+                    "too_broad": False,
                     "query": needle,
                     "tool_name": tool_name or "",
                     "days": days_val,
@@ -1213,7 +1280,10 @@ class SecurityFeature(Feature):
                 },
             )
 
-        lines = [f"{len(matches)} prior call(s) matched ({scope_text}):\n"]
+        lines = [
+            f"{len(matches)} prior ATTEMPT(s) matched ({scope_text}) — each row "
+            "records that the call was authorized, not that it succeeded:\n"
+        ]
         for entry in matches:
             lines.append(
                 f"  {entry['timestamp']}  {entry['feature']}.{entry['tool']} "
@@ -1226,6 +1296,8 @@ class SecurityFeature(Feature):
             confirmation="\n".join(lines),
             data={
                 "count": len(matches),
+                "total_matches": total,
+                "too_broad": False,
                 "query": needle,
                 "tool_name": tool_name or "",
                 "days": days_val,

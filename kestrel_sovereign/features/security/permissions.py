@@ -14,9 +14,15 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
+
+#: The audit-search tool's own name. Its rows are excluded from every search
+#: (see ``_match_predicate``) because the security hook records the call, query
+#: and all, BEFORE the tool body runs. Defined here rather than in the feature
+#: so the exclusion and the ``@tool(name=...)`` cannot drift apart.
+SEARCH_TOOL_NAME = "security_audit_search"
 
 logger = logging.getLogger(__name__)
 
@@ -946,6 +952,111 @@ class PermissionStore:
             for row in rows
         ]
 
+    async def count_audit_matches(
+        self,
+        query: str,
+        *,
+        tool_name: Optional[str] = None,
+        days: Optional[int] = None,
+    ) -> int:
+        """How many rows :meth:`search_audit_log` would match, unlimited.
+
+        The breadth gate needs the TOTAL, not the page: a query that matches
+        four hundred rows is not a description of one prior action, and
+        answering it with a page of arguments is the unbounded disclosure the
+        query-scoping was supposed to rule out. Returning only the count lets
+        the caller be told "narrow this" without any argument leaving the
+        database.
+        """
+        rows = await self._matching_rows(
+            query, tool_name=tool_name, days=days, limit=None, count_only=True,
+        )
+        return int(rows[0][0]) if rows else 0
+
+    def _match_predicate(
+        self,
+        needle: str,
+        *,
+        tool_name: Optional[str],
+        days: Optional[int],
+    ) -> Tuple[str, List[Any]]:
+        """Build the shared WHERE clause for a match, and its parameters.
+
+        One builder for both the page and the count so the breadth gate can
+        never disagree with what the page would return.
+        """
+        # LIKE wildcards in the needle would silently widen the match — a
+        # caller searching for a literal "%" must not get everything.
+        escaped = (
+            needle.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+
+        clauses = [
+            (
+                "(LOWER(args_summary) LIKE LOWER(?) ESCAPE '\\' "
+                "OR LOWER(tool_name) LIKE LOWER(?) ESCAPE '\\')"
+            ),
+            # A search must never return its own act of searching. The security
+            # hook writes its PRE_TOOL_USE row — carrying this very query inside
+            # ``args_summary`` — BEFORE the tool body runs, so without this the
+            # current invocation always matches itself: the no-match branch is
+            # unreachable in production and a brand-new search reads as prior
+            # work. That is exactly the failure this tool exists to prevent,
+            # manufactured by the tool. Prefix match takes the paired
+            # ``.outcome`` row with it.
+            "tool_name NOT LIKE ?",
+        ]
+        params: List[Any] = [pattern, pattern, f"{SEARCH_TOOL_NAME}%"]
+
+        if tool_name:
+            clauses.append("tool_name = ?")
+            params.append(tool_name)
+
+        if days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+            # created_at is ISO ("...T...+00:00") today, but legacy rows are
+            # space-separated and offset-less (F092). Comparing the two forms as
+            # text is wrong in a way that silently DROPS rows: " " (32) sorts
+            # below "T" (84), so EVERY legacy row on the cutoff's own date
+            # compares below an ISO cutoff regardless of the time it carries.
+            # Normalize both to "YYYY-MM-DD HH:MM:SS" first.
+            clauses.append("substr(replace(created_at, 'T', ' '), 1, 19) >= ?")
+            params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
+
+        return " AND ".join(clauses), params
+
+    async def count_audit_matches(
+        self,
+        query: str,
+        *,
+        tool_name: Optional[str] = None,
+        days: Optional[int] = None,
+    ) -> int:
+        """How many rows :meth:`search_audit_log` would match, unlimited.
+
+        The breadth gate needs the TOTAL, not the page. A query matching four
+        hundred rows is not a description of one prior action, and answering it
+        with a page of arguments is the unbounded disclosure that query-scoping
+        was supposed to rule out. Counting lets the caller be told "narrow
+        this" with no argument leaving the database.
+        """
+        needle = (query or "").strip()
+        if not needle:
+            return 0
+        where, params = self._match_predicate(
+            needle, tool_name=tool_name, days=days,
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"SELECT COUNT(*) FROM security_audit_log WHERE {where}",
+                tuple(params),
+            )
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
     async def search_audit_log(
         self,
         query: str,
@@ -964,15 +1075,15 @@ class PermissionStore:
         and the only handle the caller has on it is a description of the thing
         itself.
 
-        That difference is also what makes returning ``args_summary`` here
-        defensible where returning it from an unbounded listing was not. A
-        caller must already name what it is looking for to see anything, so
-        this discloses matches to a description the caller supplied rather than
-        whatever happens to be recent.
+        That difference is what makes returning ``args_summary`` here
+        defensible where returning it from an unbounded listing was not, and it
+        holds only while the query is a description. The breadth gate lives in
+        the tool, on :meth:`count_audit_matches`.
 
-        ``query`` is matched case-insensitively against the recorded arguments
-        and the tool name. Matching against the tool name too means "did I call
-        create_github_issue today" works without knowing any argument.
+        **A row is an AUTHORIZATION, not a completion.** The security hook logs
+        at ``PRE_TOOL_USE``, so a row records that the call was allowed to run —
+        including ``auto_denied`` and timed-out attempts. Callers must read
+        ``decision`` rather than treating presence as proof the work happened.
 
         Args:
             query: Substring to look for. Must be non-empty after stripping.
@@ -984,32 +1095,9 @@ class PermissionStore:
         if not needle:
             return []
 
-        # LIKE wildcards in the needle would silently widen the match — a
-        # caller searching for a literal "%" must not get everything.
-        escaped = (
-            needle.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
+        where, params = self._match_predicate(
+            needle, tool_name=tool_name, days=days,
         )
-        pattern = f"%{escaped}%"
-
-        clauses = [
-            (
-                "(LOWER(args_summary) LIKE LOWER(?) ESCAPE '\\' "
-                "OR LOWER(tool_name) LIKE LOWER(?) ESCAPE '\\')"
-            )
-        ]
-        params: List[Any] = [pattern, pattern]
-
-        if tool_name:
-            clauses.append("tool_name = ?")
-            params.append(tool_name)
-
-        if days is not None:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
-            clauses.append("created_at >= ?")
-            params.append(cutoff.isoformat())
-
         params.append(int(limit))
 
         async with aiosqlite.connect(self.db_path) as db:
@@ -1022,7 +1110,7 @@ class PermissionStore:
                 SELECT feature_name, tool_name, action, decision,
                        user_choice, args_summary, created_at
                 FROM security_audit_log
-                WHERE {' AND '.join(clauses)}
+                WHERE {where}
                 ORDER BY id DESC
                 LIMIT ?
                 """,

@@ -200,3 +200,225 @@ async def test_tool_name_and_days_narrow_the_search(store):
 
     recent = await store.search_audit_log("orphans the worker", days=1)
     assert len(recent) == 2, "both rows were written just now"
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (#3107)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_search_does_not_return_its_own_act_of_searching(tmp_path):
+    """The defect my first tests could not see, because they called the store
+    directly and production does not.
+
+    `SecurityHook` runs at PRE_TOOL_USE and writes an audit row carrying the
+    tool's arguments — for this tool, the query itself — BEFORE the tool body
+    executes. Without an exclusion, every search matches its own invocation:
+    the no-match branch becomes unreachable in production and a brand-new
+    search reads as prior work. That is exactly the failure this tool exists
+    to prevent, manufactured by the tool.
+
+    Driven through the real hook rather than a stand-in, because the stand-in
+    is what hid it."""
+    from kestrel_sdk.hooks import HookInput
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from kestrel_sovereign.features.security.hooks import SecurityHook
+    from kestrel_sovereign.features.security.permissions import (
+        PermissionLevel,
+        SEARCH_TOOL_NAME,
+    )
+
+    store = PermissionStore(str(tmp_path / "hooked.db"))
+    await store.initialize()
+    await store.register_tool(
+        "SecurityFeature", SEARCH_TOOL_NAME, PermissionLevel.ALLOW
+    )
+    hook = SecurityHook(store, ApprovalQueue(permission_store=store))
+
+    query = "a phrase that appears in no prior filing"
+    await hook.execute(HookInput(
+        session_id="s",
+        hook_event_name="PreToolUse",
+        tool_name=SEARCH_TOOL_NAME,
+        feature_name="SecurityFeature",
+        tool_input={"query": query},
+    ))
+
+    # The hook really did record this call, query and all — the precondition
+    # is real rather than assumed.
+    logged = await store.get_audit_log(10)
+    assert any(
+        row["tool"] == SEARCH_TOOL_NAME and query in (row["args_summary"] or "")
+        for row in logged
+    ), "precondition: the hook must have logged the search with its query"
+
+    assert await store.search_audit_log(query) == [], (
+        "a search must not return itself; otherwise no query can ever come "
+        "back empty and every novel search looks like prior work"
+    )
+    assert await store.count_audit_matches(query) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_query_too_broad_to_be_a_description_returns_no_arguments(
+    tmp_path,
+):
+    """The disclosure bound. Query-scoping only justifies returning arguments
+    while the query describes one prior action; `"e"` describes nothing and
+    would otherwise page out the log."""
+    from kestrel_sovereign.features.security.feature import (
+        MAX_DISCLOSING_MATCHES,
+    )
+
+    store = PermissionStore(str(tmp_path / "broad.db"))
+    await store.initialize()
+    for i in range(MAX_DISCLOSING_MATCHES + 5):
+        await store.log_decision(
+            feature_name="GitHubFeature",
+            tool_name="create_github_issue",
+            action="tool_execution",
+            decision="auto_mode_allowed",
+            args_summary=f'{{"title": "issue number {i} about everything"}}',
+        )
+
+    total = await store.count_audit_matches("e")
+    assert total > MAX_DISCLOSING_MATCHES
+
+    narrow = await store.count_audit_matches("issue number 3 about")
+    assert 0 < narrow <= MAX_DISCLOSING_MATCHES, (
+        "a real description must still be answerable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_denied_attempt_is_returned_as_denied(store):
+    """A row is an AUTHORIZATION, not a completion — the hook logs before the
+    body runs, and it logs refusals too. A caller that reads presence as "the
+    work happened" would suppress a retry it needs."""
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_denied",
+        args_summary=_FILING_ONE,
+    )
+
+    matches = await store.search_audit_log("orphans the worker")
+
+    assert len(matches) == 1
+    assert matches[0]["decision"] == "auto_denied", (
+        "the decision must survive to the caller; a denied attempt is not a "
+        "prior write"
+    )
+
+
+@pytest.mark.asyncio
+async def test_days_window_does_not_drop_legacy_timestamps(tmp_path):
+    """`created_at` is ISO today and space-separated on legacy rows (F092).
+    Compared as text, " " (32) sorts below "T" (84), so an ISO cutoff excludes
+    EVERY legacy row on the cutoff's own date regardless of its time — a
+    filter that silently drops the rows it was asked to include."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    db_path = tmp_path / "legacy_ts.db"
+    store = PermissionStore(str(db_path))
+    await store.initialize()
+
+    # The row must land on the CUTOFF'S OWN DATE for this to bite. " " sorts
+    # below "T" at index 10, so the comparison only goes wrong once the first
+    # ten characters are equal; a row on any later date compares correctly by
+    # its date alone and the bug hides. Put it one hour INSIDE the window,
+    # which is the same calendar date as the cutoff.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    legacy_stamp = (cutoff + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO security_audit_log "
+        "(feature_name, tool_name, action, decision, user_choice, "
+        " args_summary, created_at) VALUES (?,?,?,?,?,?,?)",
+        ("GitHubFeature", "create_github_issue", "tool_execution",
+         "auto_mode_allowed", None, _FILING_ONE, legacy_stamp),
+    )
+    raw.commit()
+    raw.close()
+
+    matches = await store.search_audit_log("orphans the worker", days=1)
+
+    assert len(matches) == 1, (
+        f"a legacy row stamped {legacy_stamp} is inside a 1-day window and "
+        "must not be dropped for wearing the older timestamp format"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_tool_withholds_arguments_for_a_broad_query(tmp_path):
+    """The gate lives in the tool, so it is tested there. Past the bound the
+    caller gets a count and a instruction to narrow — and no arguments."""
+    from kestrel_sovereign.features.security.feature import (
+        MAX_DISCLOSING_MATCHES,
+        SecurityFeature,
+    )
+
+    store = PermissionStore(str(tmp_path / "toolgate.db"))
+    await store.initialize()
+    for i in range(MAX_DISCLOSING_MATCHES + 5):
+        await store.log_decision(
+            feature_name="GitHubFeature",
+            tool_name="create_github_issue",
+            action="tool_execution",
+            decision="auto_mode_allowed",
+            args_summary=f'{{"title": "issue number {i}", "secretish": "xyz"}}',
+        )
+
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    broad = await feature.security_audit_search(query="e")
+    assert broad.data["too_broad"] is True
+    assert broad.data["count"] > MAX_DISCLOSING_MATCHES
+    assert broad.data["matches"] == []
+    assert "xyz" not in broad.confirmation, (
+        "a query too broad to be a description must disclose no arguments"
+    )
+
+    narrow = await feature.security_audit_search(query="issue number 3\"")
+    assert narrow.data["too_broad"] is False
+    assert narrow.data["matches"], "a real description is still answerable"
+
+
+@pytest.mark.asyncio
+async def test_raising_limit_cannot_defeat_the_breadth_gate(tmp_path):
+    """The bound is the TOTAL-match gate, not the page size.
+
+    An earlier draft clamped ``limit`` and called that the bound. Mutation
+    testing showed removing the clamp changed nothing, and it was right: the
+    gate runs on the total before any page is fetched, so a caller raising
+    ``limit`` to 500 still gets a count and no arguments. This pins the
+    property that actually holds, rather than the one that read well."""
+    from kestrel_sovereign.features.security.feature import (
+        MAX_DISCLOSING_MATCHES,
+        SecurityFeature,
+    )
+
+    store = PermissionStore(str(tmp_path / "limitcap.db"))
+    await store.initialize()
+    for i in range(MAX_DISCLOSING_MATCHES + 5):
+        await store.log_decision(
+            feature_name="GitHubFeature",
+            tool_name="create_github_issue",
+            action="tool_execution",
+            decision="auto_mode_allowed",
+            args_summary=f'{{"title": "issue number {i}"}}',
+        )
+
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="e", limit=500)
+    assert result.data["too_broad"] is True
+    assert result.data["matches"] == []
+    assert result.data.get("limit_requested", MAX_DISCLOSING_MATCHES) <= (
+        MAX_DISCLOSING_MATCHES
+    )
