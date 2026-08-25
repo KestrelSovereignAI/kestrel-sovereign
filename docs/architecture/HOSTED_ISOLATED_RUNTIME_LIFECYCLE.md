@@ -109,9 +109,12 @@ generation, restart and activity timestamps, startup/provision timing, and
 best-effort RSS/CPU/FD/process counts. OS metrics degrade to `None`; the process
 PID is pinned to its observed creation time so PID reuse cannot expose another
 process. Health restart count is separate from planned idle-wake count, and
-cold child startup timing is separate from warm admission latency. Core measures
-its owned venv, mutable workspace, and provisioning-cache bytes off the event
-loop with root no-follow descriptor traversal plus entry/time budgets;
+cold child startup timing is separate from warm admission latency. A synchronous
+`runtime_telemetry_snapshot()` returns lifecycle state plus the most recent
+off-loop process sample; callers that require a fresh process sample await
+`sample_runtime_telemetry()`. Core measures its owned venv, mutable workspace,
+and provisioning-cache bytes off the event loop with root no-follow descriptor
+traversal plus entry/time budgets;
 all components in one refresh share the same total time deadline. The
 `disk_telemetry_status` field distinguishes a complete sample, a budget-exceeded
 sample, and an unavailable safe traversal; the first budget exhaustion is also
@@ -120,8 +123,12 @@ byte counters instead of presenting a stale complete sample. Externally
 supplied immutable environments remain
 `None` without making an otherwise complete sample ambiguous. `cache_hit` means
 Core performed no venv mutation, and venv size is cached across wakes unless
-Core actually provisions, upgrades, or reinstalls it. An embedding host may
-merge its own owner-scoped accounting after receiving the snapshot. A failed or
+Core actually provisions, upgrades, or reinstalls it. Environment and download
+fields are categories rather than additive physical-storage totals: hard-linked
+files are charged only to the first category traversed, while clone-based
+filesystems do not expose shared extents through the safe metadata seam. An
+embedding host may merge its own owner-scoped accounting after receiving the
+snapshot. A failed or
 uncertain retirement reports `state="retirement-uncertain"`, remains active for
 capacity accounting, and is never cleanup-eligible. Telemetry and the reclaim
 seam use the same live-evidence predicate. A successful non-terminal recovery

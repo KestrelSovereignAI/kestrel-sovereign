@@ -329,9 +329,16 @@ _TELEMETRY_OBSERVER_EXECUTOR = _BoundedDaemonExecutor(
 
 
 def _measure_directory_tree_bytes(
-    path: Path, *, deadline: float | None = None
+    path: Path,
+    *,
+    deadline: float | None = None,
+    seen_linked_files: set[tuple[int, int]] | None = None,
 ) -> tuple[int | None, str]:
-    """Measure one no-follow tree and preserve why measurement degraded."""
+    """Measure one no-follow tree and preserve why measurement degraded.
+
+    A caller measuring sibling trees may share ``seen_linked_files`` so one
+    hard-linked payload is charged only once across the complete sample.
+    """
 
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
@@ -383,6 +390,11 @@ def _measure_directory_tree_bytes(
                     raise
                 stack.append((child_fd, child_entries))
             elif stat.S_ISREG(metadata.st_mode):
+                if seen_linked_files is not None and metadata.st_nlink > 1:
+                    identity = (int(metadata.st_dev), int(metadata.st_ino))
+                    if identity in seen_linked_files:
+                        continue
+                    seen_linked_files.add(identity)
                 total += int(metadata.st_size)
         return total, "complete"
     except OSError:
@@ -6099,6 +6111,9 @@ class ProxyFeature(Feature):
         self._last_provision_seconds: float | None = None
         self._last_cache_hit: bool | None = None
         self._process_identity: tuple[int, float] | None = None
+        self._last_process_telemetry: tuple[
+            tuple[int, float], int | None, float | None, int | None, int | None
+        ] | None = None
         self._environment_bytes: int | None = None
         self._private_writable_bytes: int | None = None
         self._downloaded_bytes: int | None = None
@@ -6238,7 +6253,10 @@ class ProxyFeature(Feature):
             "state": state,
             "lifecycle_generation": self._reload_gen,
             "active_processes": int(client is not None or uncertain_retirement),
-            "idle_processes": int(idle and not uncertain_retirement),
+            # Idle-retired means the exact child has been reaped. ``state`` and
+            # ``cleanup_eligible`` describe the parked feature; process counts
+            # continue to mean actual observed processes.
+            "idle_processes": 0,
             "restart_count": self._health_restart_count,
             "idle_wake_count": self._idle_wake_count,
             "last_used_at": self._last_used_at,
@@ -6318,11 +6336,43 @@ class ProxyFeature(Feature):
         )
 
     def runtime_telemetry_snapshot(self) -> IsolatedRuntimeTelemetrySnapshot:
-        """Return a path-free, non-mutating snapshot for this exact proxy."""
+        """Return lifecycle state plus the last off-loop OS process sample.
 
-        return self._build_runtime_telemetry_snapshot(
-            *self._runtime_telemetry_snapshot_inputs()
+        This synchronous pull seam never traverses the host process table. Use
+        :meth:`sample_runtime_telemetry` when a caller requires a fresh sample.
+        """
+
+        values, client, process_identity = self._runtime_telemetry_snapshot_inputs()
+        cached = self._last_process_telemetry
+        if client is not None and cached is not None and cached[0] == process_identity:
+            _identity, rss_bytes, cpu_seconds, open_fds, process_count = cached
+        else:
+            rss_bytes = cpu_seconds = open_fds = process_count = None
+        return IsolatedRuntimeTelemetrySnapshot(
+            **values,
+            rss_bytes=rss_bytes,
+            cpu_seconds=cpu_seconds,
+            open_fds=open_fds,
+            process_count=process_count,
         )
+
+    async def sample_runtime_telemetry(self) -> IsolatedRuntimeTelemetrySnapshot:
+        """Return a fresh path-free snapshot with OS sampling off the event loop."""
+
+        inputs = self._runtime_telemetry_snapshot_inputs()
+        snapshot = await asyncio.to_thread(
+            self._build_runtime_telemetry_snapshot, *inputs
+        )
+        process_identity = inputs[2]
+        if process_identity is not None and self._process_identity == process_identity:
+            self._last_process_telemetry = (
+                process_identity,
+                snapshot.rss_bytes,
+                snapshot.cpu_seconds,
+                snapshot.open_fds,
+                snapshot.process_count,
+            )
+        return snapshot
 
     async def _refresh_disk_telemetry(
         self,
@@ -6340,6 +6390,7 @@ class ProxyFeature(Feature):
 
         def measure() -> tuple[int | None, int | None, int | None, str]:
             deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
+            seen_linked_files: set[tuple[int, int]] = set()
             statuses: list[str] = []
             if (
                 refresh_environment
@@ -6348,7 +6399,9 @@ class ProxyFeature(Feature):
                 and self._bin_path is None
             ):
                 environment, environment_status = _measure_directory_tree_bytes(
-                    venv, deadline=deadline
+                    venv,
+                    deadline=deadline,
+                    seen_linked_files=seen_linked_files,
                 )
                 statuses.append(environment_status)
             else:
@@ -6357,6 +6410,7 @@ class ProxyFeature(Feature):
                 _measure_directory_tree_bytes(
                     runtime_dir / component,
                     deadline=deadline,
+                    seen_linked_files=seen_linked_files,
                 )
                 for component in ("work", "home", "tmp", "config", "data", "cache")
             ]
@@ -6370,6 +6424,7 @@ class ProxyFeature(Feature):
             downloaded, downloaded_status = _measure_directory_tree_bytes(
                 runtime_dir / "provisioning_cache",
                 deadline=deadline,
+                seen_linked_files=seen_linked_files,
             )
             statuses.append(downloaded_status)
             status = (
@@ -6476,10 +6531,7 @@ class ProxyFeature(Feature):
             # Snapshot loop-owned lifecycle references before crossing into the
             # worker.  The synchronous builder is deliberately non-mutating,
             # so telemetry can never consume or clear lifecycle task state.
-            inputs = self._runtime_telemetry_snapshot_inputs()
-            snapshot = await asyncio.to_thread(
-                self._build_runtime_telemetry_snapshot, *inputs
-            )
+            snapshot = await self.sample_runtime_telemetry()
             async def invoke_observer() -> None:
                 # A host may supply a normal callable or an async callable. Run
                 # the call itself in a dedicated bounded pool so a slow

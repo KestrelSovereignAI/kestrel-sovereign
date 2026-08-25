@@ -2011,6 +2011,11 @@ async def test_observer_snapshot_sampling_runs_off_event_loop(monkeypatch, tmp_p
     assert captured_threads == [main_thread]
     assert sampled_threads
     assert all(thread_id != main_thread for thread_id in sampled_threads)
+
+    builder = Mock(side_effect=AssertionError("sync pull must not sample processes"))
+    monkeypatch.setattr(feature, "_build_runtime_telemetry_snapshot", builder)
+    assert feature.runtime_telemetry_snapshot().state == "running"
+    builder.assert_not_called()
     await feature.shutdown()
 
 
@@ -2038,6 +2043,33 @@ async def test_workspace_byte_telemetry_reports_owned_known_directories(
     assert snapshot.environment_bytes == len(b"environment")
     assert snapshot.private_writable_bytes == len(b"private")
     assert snapshot.downloaded_bytes == len(b"download")
+
+
+@pytest.mark.asyncio
+async def test_workspace_byte_telemetry_deduplicates_cross_category_hardlinks(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    agent.isolated_runtime_telemetry_observer = lambda _snapshot: None
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime_dir = feature._prepare_runtime_workspace()
+    feature._venv_path = runtime_dir / ".venv"
+    feature._venv_path.mkdir()
+    environment_file = feature._venv_path / "shared.bin"
+    environment_file.write_bytes(b"shared")
+    os.link(
+        environment_file,
+        runtime_dir / "provisioning_cache" / "shared.bin",
+    )
+
+    await feature._refresh_disk_telemetry(refresh_environment=True)
+    snapshot = feature.runtime_telemetry_snapshot()
+
+    assert snapshot.environment_bytes == len(b"shared")
+    assert snapshot.downloaded_bytes == 0
 
 
 @pytest.mark.asyncio
@@ -2081,8 +2113,11 @@ async def test_disk_refresh_uses_one_shared_deadline(monkeypatch, tmp_path):
     feature._venv_path = runtime_dir / ".venv"
     deadlines = []
 
-    def measure(_path, *, deadline=None):
+    seen_sets = []
+
+    def measure(_path, *, deadline=None, seen_linked_files=None):
         deadlines.append(deadline)
+        seen_sets.append(seen_linked_files)
         return 0, "complete"
 
     monkeypatch.setattr(isolated_runtime, "_measure_directory_tree_bytes", measure)
@@ -2091,6 +2126,8 @@ async def test_disk_refresh_uses_one_shared_deadline(monkeypatch, tmp_path):
     assert len(deadlines) == 8
     assert deadlines[0] is not None
     assert len(set(deadlines)) == 1
+    assert seen_sets[0] is not None
+    assert all(seen is seen_sets[0] for seen in seen_sets)
 
 
 @pytest.mark.asyncio
@@ -2109,7 +2146,10 @@ async def test_disk_budget_exhaustion_is_visible_and_logged_once(
     monkeypatch.setattr(
         isolated_runtime,
         "_measure_directory_tree_bytes",
-        lambda _path, *, deadline=None: (None, "budget-exceeded"),
+        lambda _path, *, deadline=None, seen_linked_files=None: (
+            None,
+            "budget-exceeded",
+        ),
     )
     with caplog.at_level("WARNING"):
         await feature._refresh_disk_telemetry(refresh_environment=True)
