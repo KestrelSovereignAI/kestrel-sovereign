@@ -584,6 +584,102 @@ class TestTheResolverSide:
         assert survivor not in [r[0] for r in rows]
 
     @pytest.mark.asyncio
+    async def test_a_full_answer_is_the_first_rows_not_the_reachable_ones(
+        self, store
+    ):
+        """``limit`` members BELOW the covered point, not ``limit`` members.
+
+        The naming rows come back from the metadata query whatever the windows
+        have reached, so counting all of them declared the answer full while an
+        earlier resumption's unlabeled tail was still unread. The transcript
+        was not merely short then — it was WRONG, a later resumption standing
+        where that tail belongs.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for minute in range(1, 7):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 100, session_id=UUID_A)
+        tail = await _insert(store, 101)
+        await _insert(store, 200, session_id=UUID_A)
+
+        rows = await store._get_session_messages(UUID_A, limit=3)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail]
+
+    @pytest.mark.asyncio
+    async def test_a_second_holding_more_rows_than_a_window_is_stepped_past(
+        self, store
+    ):
+        """The SQL cursor carries the id half too, or it cannot advance.
+
+        A stamp-only predicate re-reads the same page for ever when one second
+        holds more rows than a window, and the loop has meanwhile consumed the
+        resumption key it was paging TO — so the naming row came back from the
+        metadata query and its unlabeled tail did not.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        for _ in range(6):
+            await _insert(store, 50, session_id=UUID_B)
+        resumed = await _insert(store, 50, session_id=UUID_A)
+        tail = await _insert(store, 50)
+
+        rows = await store._get_session_messages(UUID_A, limit=3)
+        assert sorted(r[0] for r in rows) == [first, resumed, tail]
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_reads_its_ids_in_batches(
+        self, store, monkeypatch
+    ):
+        """SQLite documents a 999-variable ceiling and this path invites it.
+
+        The fallback is reached by exactly the sessions long enough to pass
+        that limit — one resumed in more separated places than the window
+        budget allows for — so a single ``IN (...)`` would raise on the very
+        case it exists to answer. Batched here at two, so the seam between
+        batches is exercised rather than assumed: the order this contract is in
+        is canonical, and the batches are id ranges.
+        """
+        monkeypatch.setattr(
+            AsyncConversationStore, "SESSION_WINDOW_PAGES", 1, raising=True
+        )
+        monkeypatch.setattr(
+            AsyncConversationStore, "SESSION_ID_BATCH", 2, raising=True
+        )
+        expected = []
+        minute = 0
+        for _ in range(3):
+            expected.append(await _insert(store, minute, session_id=UUID_A))
+            expected.append(await _insert(store, minute + 1))
+            minute += 2
+            for _ in range(9):
+                await _insert(store, minute, session_id=UUID_B)
+                minute += 1
+
+        # The requirement is about the QUERIES, so it is asserted on them:
+        # no id lookup may carry more binds than one batch plus the agent.
+        widest = 0
+        original = store.db.fetchall
+
+        async def watched(query, params=(), *args, **kwargs):
+            nonlocal widest
+            if "id IN (" in query:
+                widest = max(widest, len(params))
+            return await original(query, params, *args, **kwargs)
+
+        store.db.fetchall = watched
+        try:
+            rows = await store._get_session_messages(UUID_A, limit=10)
+        finally:
+            store.db.fetchall = original
+
+        assert 0 < widest <= AsyncConversationStore.SESSION_ID_BATCH + 1, (
+            f"an id lookup carried {widest} binds"
+        )
+        assert sorted(r[0] for r in rows) == sorted(expected)
+        # Newest-first, which is this method's contract, over the whole set
+        # rather than within each batch.
+        assert [r[0] for r in rows] == sorted(expected, reverse=True)
+
+    @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):
         """Unchanged behaviour, pinned because the walk now decides it too."""
         first = await _insert(store, 0, session_id=UUID_A)

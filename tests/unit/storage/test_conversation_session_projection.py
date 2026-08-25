@@ -3968,3 +3968,38 @@ async def test_a_changed_grouping_retires_a_watermark_with_no_ledger(
         assert seeded[0], "the seeded generation is the empty string it started from"
     finally:
         await db.close()
+
+
+def test_the_fingerprint_follows_an_imported_grouping_constant(monkeypatch):
+    """A boundary can move without the grouper's text changing.
+
+    ``SESSION_GAP_MINUTES`` decides where every session ends and is defined in
+    another module; ``SESSION_ID_KEY`` names the field every session is keyed
+    by and is defined in another module. A dependency bump that moved either
+    would leave ``session_grouping.py`` byte-identical, the change-stamp names
+    unchanged, and every stored projection reporting itself current over
+    boundaries this revision no longer computes.
+
+    The cache is cleared around the substitution rather than left primed: this
+    digest is read once per process by design, and a test that poisoned it
+    would hand the next one a fingerprint for a grouping nothing is running.
+    """
+    from kestrel_sovereign.storage import conversation_sessions, session_grouping
+
+    conversation_sessions._grouping_source.cache_clear()
+    try:
+        before = {
+            name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")
+        }
+        monkeypatch.setattr(session_grouping, "SESSION_GAP_MINUTES", 45)
+        conversation_sessions._grouping_source.cache_clear()
+        after = {
+            name for name, _ddl in conversation_sessions.mutation_triggers("sqlite")
+        }
+    finally:
+        monkeypatch.undo()
+        conversation_sessions._grouping_source.cache_clear()
+
+    assert before.isdisjoint(after), (
+        f"the change-stamp names did not move with the grouping gap: {before}"
+    )

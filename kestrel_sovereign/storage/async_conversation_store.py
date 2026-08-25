@@ -616,6 +616,14 @@ class AsyncConversationStore:
     #: beside it and the purge behind it are uncapped and will not agree.
     SESSION_WINDOW_PAGES = 8
 
+    #: How many row ids one ``IN (...)`` may carry.
+    #:
+    #: SQLite documents a 999-variable ceiling and builds differ about whether
+    #: they enforce it; the agent id takes one of those slots. Well under it,
+    #: because the cost of being wrong is a query that raises on exactly the
+    #: longest sessions.
+    SESSION_ID_BATCH = 500
+
     def __init__(
         self,
         db: AsyncDatabase,
@@ -2395,7 +2403,17 @@ class AsyncConversationStore:
         # anchor's.  The exact purge/count resolver already compares via
         # julianday; display must see the same membership or hard purge could
         # destroy rows this path never returned.
-        created_at_predicate = self._timestamp_predicate("created_at", ">=")
+        # ``(created_at, id) >= (cursor)``, spelled as the disjunction both
+        # dialects can index. A stamp-only cursor cannot step past a second
+        # that holds more rows than one window: the same page comes back for
+        # ever, and the loop consumed the resumption key it was paging TO.
+        created_at_predicate = (
+            "("
+            + self._timestamp_predicate("created_at", ">")
+            + " OR ("
+            + self._timestamp_predicate("created_at", ">=")
+            + " AND id >= ?))"
+        )
         created_at_order = self._canonical_timestamp_sql("created_at")
         # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the
         # match to EVERY row (#1729); ESCAPE '\' makes the backslash the escape
@@ -2420,7 +2438,8 @@ class AsyncConversationStore:
             # need its timestamp even if it's been soft-deleted, otherwise
             # we can't restore the session that owned it.
             start_row = await self.db.fetchone(
-                "SELECT created_at FROM conversation_history WHERE id = ? AND agent_id = ?",
+                "SELECT created_at, id FROM conversation_history "
+                "WHERE id = ? AND agent_id = ?",
                 (row_id, self.agent_id)
             )
         else:
@@ -2428,7 +2447,7 @@ class AsyncConversationStore:
             # read through the same filters as the candidates below so the walk
             # cannot start outside the universe it is about to search.
             start_row = await self.db.fetchone(
-                f"""SELECT created_at
+                f"""SELECT created_at, id
                    FROM conversation_history
                    WHERE agent_id = ?
                      AND (metadata LIKE ? ESCAPE '\\'
@@ -2508,7 +2527,7 @@ class AsyncConversationStore:
         # at least one key, which is what makes the loop terminate: a window
         # whose rows all share one second cannot otherwise advance past itself.
         next_key = 0
-        cursor = start_row[0] if start_row else None
+        cursor = (start_row[0], int(start_row[1])) if start_row else None
         pages = 0
         exhausted_the_windows = False
         while cursor is not None:
@@ -2526,7 +2545,9 @@ class AsyncConversationStore:
                    LIMIT ?""",
                 (
                     self.agent_id,
-                    self._timestamp_query_param(cursor),
+                    self._timestamp_query_param(cursor[0]),
+                    self._timestamp_query_param(cursor[0]),
+                    cursor[1],
                     limit * 2,  # Fetch extra in case of filtering
                 ),
             )
@@ -2534,25 +2555,38 @@ class AsyncConversationStore:
             all_rows.extend(page)
             if len(page) < limit * 2:
                 break  # history exhausted
-            if len(self._filter_session_rows(
-                [*all_rows, *resumed_rows, *resumed_rows_alt],
-                session_id,
-                limit=limit,
-                include_markers=include_markers,
-                anchor_missing=anchor_missing,
-            )) >= limit:
-                break  # the answer is already as long as it may be
             covered = (
                 coerce_session_timestamp(page[-1][4]) or UNDATABLE_ROW_FALLBACK,
                 int(page[-1][0]),
             )
+            # ``limit`` members BELOW the covered point, not ``limit`` members.
+            # The naming rows come back from the metadata query whatever the
+            # windows have reached, so counting them all declared the answer
+            # full while an earlier resumption's unlabeled tail was still
+            # unread — and the rows returned were then the wrong ones, later
+            # resumptions standing where that tail belongs.
+            settled = [
+                row for row in self._filter_session_rows(
+                    [*all_rows, *resumed_rows, *resumed_rows_alt],
+                    session_id,
+                    limit=None,
+                    include_markers=include_markers,
+                    anchor_missing=anchor_missing,
+                )
+                if (
+                    coerce_session_timestamp(row[4]) or UNDATABLE_ROW_FALLBACK,
+                    int(row[0]),
+                ) <= covered
+            ]
+            if len(settled) >= limit:
+                break  # the answer is already as long as it may be
             while next_key < len(resumption_keys) and (
                 resumption_keys[next_key] <= covered
             ):
                 next_key += 1
             if next_key >= len(resumption_keys):
                 break
-            cursor, next_key = resumption_keys[next_key][0], next_key + 1
+            cursor, next_key = resumption_keys[next_key], next_key + 1
 
         if exhausted_the_windows:
             # The windows ran out with resumptions still unreached, so this
@@ -2609,18 +2643,33 @@ class AsyncConversationStore:
         if not ids:
             return []
         created_at_order = self._canonical_timestamp_sql("created_at")
-        placeholders = ", ".join("?" for _ in ids)
-        rows = await self.db.fetchall(
-            f"""SELECT id, role, content, metadata, created_at,
-                      rendered_content, model, provider
-               FROM conversation_history
-               WHERE agent_id = ? AND id IN ({placeholders})
-               ORDER BY {created_at_order} ASC, id ASC
-               LIMIT ?""",
-            (self.agent_id, *ids, limit),
+        # In batches, because SQLite documents a 999-variable ceiling and this
+        # fallback is reached by exactly the sessions long enough to pass it —
+        # one resumed in more separated places than the window budget allows
+        # for. The exact-purge path locks its ids in bounded batches for the
+        # same reason.
+        rows: List[tuple] = []
+        for start in range(0, len(ids), self.SESSION_ID_BATCH):
+            batch = ids[start:start + self.SESSION_ID_BATCH]
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(await self.db.fetchall(
+                f"""SELECT id, role, content, metadata, created_at,
+                          rendered_content, model, provider
+                   FROM conversation_history
+                   WHERE agent_id = ? AND id IN ({placeholders})
+                   ORDER BY {created_at_order} ASC, id ASC""",
+                (self.agent_id, *batch),
+            ))
+        # Ordered ACROSS the batches, not within each — the batches are id
+        # ranges and the order this contract is in is canonical.
+        rows.sort(
+            key=lambda row: (
+                coerce_session_timestamp(row[4]) or UNDATABLE_ROW_FALLBACK,
+                int(row[0]),
+            )
         )
         # Match the historical newest-first raw-row contract.
-        return list(reversed(rows))
+        return list(reversed(rows[:limit]))
 
     async def _get_complete_session_message_ids(
         self,

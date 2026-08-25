@@ -1491,9 +1491,17 @@ def _placeholder(kind: str, role: str) -> str:
     return ("fn_" if kind == "function" else "trg_") + role
 
 
+#: Whose source counts as part of the grouping when the grouper imports from it.
+#: Everything else a module-level name can hold — the standard library, a third
+#: party — is represented by its VALUE below if it has a simple one, and
+#: otherwise not at all, because hashing an unrelated library's text would
+#: rebuild every projection on an unrelated upgrade.
+_GROUPING_PACKAGES = frozenset({"kestrel_sovereign", "kestrel_sdk"})
+
+
 @lru_cache(maxsize=1)
 def _grouping_source() -> str:
-    """The text of the derivation whose ANSWER this projection stores.
+    """The derivation whose ANSWER this projection stores, as text.
 
     The whole module, not a curated list of the functions that decide a
     boundary. A curated list is a second place to remember, and this repository
@@ -1502,15 +1510,46 @@ def _grouping_source() -> str:
     added there and not here is invisible in the worst direction. There is
     nothing to keep honest about "the module".
 
-    The cost is that editing a docstring in it rebuilds every agent's
-    projection once. That is the direction this module already chooses
-    everywhere else: rebuild needlessly, never miss a change.
+    **And what the module IMPORTS, because a boundary can move without its
+    text changing.** ``SESSION_GAP_MINUTES`` decides where every session ends
+    and is defined elsewhere; ``SESSION_ID_KEY`` names the field every session
+    is keyed by and is defined elsewhere. A dependency bump that moved either
+    would leave this file byte-identical, the trigger names unchanged, and
+    every stored projection reporting itself current over boundaries this
+    revision no longer computes. So each module-level name is folded in by its
+    VALUE when it has a simple one, and by its own module's source when it is
+    something of ours — derived from the namespace rather than listed, for the
+    same reason the module is taken whole.
+
+    The cost is that editing a docstring here rebuilds every agent's projection
+    once. That is the direction this module already chooses everywhere else:
+    rebuild needlessly, never miss a change.
     """
     import inspect
 
     from kestrel_sovereign.storage import session_grouping
 
-    return inspect.getsource(session_grouping)
+    parts = [inspect.getsource(session_grouping)]
+    namespace = vars(session_grouping)
+    for name in sorted(namespace):
+        if name.startswith("__"):
+            continue
+        value = namespace[name]
+        origin = getattr(value, "__module__", None)
+        if (
+            origin
+            and origin != session_grouping.__name__
+            and origin.split(".")[0] in _GROUPING_PACKAGES
+        ):
+            module = inspect.getmodule(value)
+            try:
+                parts.append(inspect.getsource(module))
+                continue
+            except (OSError, TypeError):
+                pass
+        if isinstance(value, (bool, int, float, str, bytes, tuple, frozenset)):
+            parts.append(f"{name}={value!r}")
+    return "\n".join(parts)
 
 
 def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
