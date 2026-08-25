@@ -12214,6 +12214,11 @@ class ProxyFeature(Feature):
             declaration = capabilities.get(_INBOUND_PRODUCER_CAPABILITY)
             if declaration is False:
                 return False
+            if declaration is True:
+                # A positive child declaration is definitive producer
+                # evidence. A named timeout may resolve ambiguous metadata,
+                # but it must never override the child's own assertion.
+                return True
             # A named override is an explicit host decision for this feature;
             # the default policy may retire only a child that positively
             # declares it has no unmanaged inbound producer.

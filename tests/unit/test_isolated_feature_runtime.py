@@ -2372,6 +2372,40 @@ async def test_named_idle_override_explicitly_allows_ambiguous_utility_feature(
 
 
 @pytest.mark.asyncio
+async def test_named_idle_override_cannot_retire_declared_inbound_producer(
+    monkeypatch, tmp_path
+):
+    class DeclaredProducer(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {"tools": {}, "inbound_producer": True}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeouts={"TestFeature": 3600},
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = DeclaredProducer()
+    feature = ProxyFeature(
+        agent, _idle_test_runtime(), client_factory=lambda **_kwargs: client
+    )
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+
+    assert feature._owns_inbound_producer() is True
+    assert feature._idle_monitor_task is None
+    assert not await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    assert client.stopped is False
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_observed_legacy_inbound_producer_latches_resident(monkeypatch, tmp_path):
     class MetadataPoorProducer(FakeIsolatedClient):
         @property
