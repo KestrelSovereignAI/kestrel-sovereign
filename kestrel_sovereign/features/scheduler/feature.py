@@ -731,6 +731,26 @@ class SchedulerFeature(Feature):
             cron_source_name,
         )
 
+        # Fail closed at EXECUTION as well as creation (#3112 P1 follow-up).
+        # The creation-time refusal in _create_schedule cannot reach rows that
+        # were persisted by an earlier release, when a recurring row targeting
+        # schedule_add_deadline was still valid. Such a legacy wrapper would
+        # otherwise mint a fresh one-shot self_followup row every tick --
+        # unbounded cognition turns from a row nobody can see is dangerous.
+        # Both fallback branches below route to _lookup_and_run_tool, so this
+        # check must precede them.
+        if task_name in self._schedule_mutating_tool_names():
+            logger.warning(
+                "SchedulerFeature: refusing to execute schedule-mutating "
+                "task %r (legacy row; see #3112). Remove or retarget it.",
+                task_name,
+            )
+            return (
+                f"Refused: '{task_name}' mutates schedules and cannot run as "
+                f"a scheduled task. This row predates the creation-time "
+                f"refusal; remove or retarget it."
+            )
+
         dispatcher = getattr(self.agent, "dispatcher", None)
         if dispatcher is None:
             # Fallback for partially-initialized agents (e.g. legacy

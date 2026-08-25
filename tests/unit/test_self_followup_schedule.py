@@ -457,6 +457,35 @@ async def test_a_schedule_mutating_tool_cannot_be_a_scheduled_target(
     assert not rows, "a refused wrapper must not leave a row behind"
 
 
+@pytest.mark.asyncio
+async def test_legacy_wrapper_row_is_refused_at_execution(followup_env):
+    """Creation-time refusal cannot reach rows already on disk (#3112 P1).
+
+    A recurring row targeting ``schedule_add_deadline`` was VALID on main, so
+    an upgraded agent can carry one. ``_create_schedule`` never runs again for
+    it; the runner calls ``_dispatch_scheduled_task`` directly. Without an
+    execution-time check that legacy wrapper mints a fresh one-shot
+    self_followup row every tick -- unbounded turns from a row the new guard
+    silently does not cover. Bypasses the tool and calls dispatch directly,
+    which is exactly what the runner does to a persisted row.
+    """
+    _agent, feature, _runner, _db, _backend = followup_env
+
+    result = await feature._dispatch_scheduled_task(
+        "schedule_add_deadline",
+        {
+            "task_name": SELF_FOLLOWUP,
+            "delay_seconds": 60,
+            "args_json": json.dumps({"intent": SENTINEL}),
+        },
+    )
+
+    text = result[0] if isinstance(result, tuple) else result
+    assert "refused" in str(text).lower(), (
+        "a legacy wrapper row must be refused at execution, not run"
+    )
+
+
 def test_every_scheduler_tool_is_classified_read_only_or_mutating(
     followup_env,
 ):
