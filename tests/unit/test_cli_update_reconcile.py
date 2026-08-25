@@ -78,7 +78,7 @@ def test_reconcile_installs_missing_allowlisted_feature(patched, capsys):
     registry PyPI source."""
     install_calls = []
 
-    def fake_install(pip_args, *, constraints=None, reinstall=None, timeout=None):
+    def fake_install(pip_args, *, constraints=None, constraint_path=None, reinstall=None, timeout=None):
         install_calls.append(pip_args)
         return _ok(stdout="Successfully installed kestrel-feature-voice-0.3.0")
 
@@ -596,7 +596,7 @@ def test_reconcile_names_the_manifest_window_that_refused_an_install(
     )
     monkeypatch.setattr(cli, "_host_manifest_path", lambda ns: manifest)
 
-    def failing_install(pip_args, *, constraints=None, reinstall=None, timeout=None):
+    def failing_install(pip_args, *, constraints=None, constraint_path=None, reinstall=None, timeout=None):
         return subprocess.CompletedProcess(
             ["uv", "pip", "install", *pip_args], 1, stdout="",
             stderr=(

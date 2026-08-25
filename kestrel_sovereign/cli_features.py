@@ -1108,7 +1108,22 @@ def _render_shell() -> Optional[str]:
     return WINDOWS_SHELL if _is_windows() else None
 
 
-def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeout=None):
+def _write_constraint_lines(handle, lines) -> None:
+    """The ONE way a constraints file is written.
+
+    Two callers open it — the guard, so the path it renders is a valid
+    constraints file even when no install ever runs, and the installer, so the
+    file an operator later reads is the one the install used
+    (:meth:`CoreInstallGuard._restore_constraints`). They are writing the same
+    artifact, and a format that differed between them would make the printed
+    command and the performed one disagree about their own argument.
+    """
+    handle.write("\n".join(lines) + "\n")
+
+
+def _extension_install_run(
+    pip_args: list, *, constraints, constraint_path=None, reinstall=None, timeout=None,
+):
     """Install via uv when available, else the interpreter's own pip.
 
     Prefer :meth:`CoreInstallGuard.run` — it decides ``constraints`` for you and
@@ -1156,6 +1171,24 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
     VERSION; ``reinstall`` is what keeps its SOURCE — the two holes are
     different and need both.
 
+    ``constraint_path`` names the file those lines are written to, and that
+    file is NOT deleted on return. The default — a temporary file, removed —
+    is right while the constraints live no longer than the subprocess. A caller
+    that also PRINTS this install as a command for the operator to run by hand
+    needs the opposite: ``-c`` has no inline form, so a rendered command naming
+    no file is an UNBOUNDED install, and pasting it moves exactly the package a
+    declared window had just refused to move (issue #3109). Such a caller
+    creates the file, renders the same path it passes here, and the file
+    outlives the run because the command naming it does. A file later reaped by
+    the system makes that command fail rather than silently run unbounded,
+    which is the direction to fail in.
+
+    Such a caller has already WRITTEN those lines — it has to, because the
+    command it renders may be printed without any install running at all. This
+    rewrites them anyway, with the lines THIS call carries: the file an
+    operator reads afterwards is then always the one the install actually used,
+    rather than whatever was true when the path was first handed out.
+
     ``--no-deps`` is NOT the fix for either: on its own it stops feature
     dependencies resolving at all and hides the version-skew signal rather than
     surfacing it. The pip source switch does use it — but only in a pass that
@@ -1165,13 +1198,22 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
     import tempfile
 
     constraint_file = None
+    # Whether the file is ours to remove. A caller-named path has been
+    # published to the operator inside a rendered command, so deleting it on
+    # return would leave that command naming nothing.
+    disposable = True
     extra_args: list = []
     if constraints:
-        fd, constraint_file = tempfile.mkstemp(
-            prefix="kestrel-constraints-", suffix=".txt",
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(constraints) + "\n")
+        if constraint_path:
+            constraint_file, disposable = str(constraint_path), False
+            handle = open(constraint_file, "w", encoding="utf-8")
+        else:
+            fd, constraint_file = tempfile.mkstemp(
+                prefix="kestrel-constraints-", suffix=".txt",
+            )
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        with handle as fh:
+            _write_constraint_lines(fh, constraints)
         extra_args = ["-c", constraint_file]
 
     try:
@@ -1196,7 +1238,7 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
                 break
         return result
     finally:
-        if constraint_file:
+        if constraint_file and disposable:
             try:
                 os.unlink(constraint_file)
             except OSError:
@@ -1476,6 +1518,9 @@ class CoreInstallGuard:
         # manifest's bounds from core's shape, which is not where they come
         # from (issue #3106).
         self._manifest_bounds: list = []
+        # The one file a restore's bounds are written to, created on first use
+        # and reused for the life of the guard — see :meth:`_restore_constraints`.
+        self._restore_constraint_path: Optional[str] = None
 
     @classmethod
     def snapshot(cls, source_index=None):
@@ -1688,7 +1733,10 @@ class CoreInstallGuard:
             ),
         )
 
-    def _install(self, pip_args, *, constraints, reinstall, timeout, repairing=False):
+    def _install(
+        self, pip_args, *, constraints, reinstall, timeout,
+        constraint_path=None, repairing=False,
+    ):
         """Run the installer — the ONE place a subprocess is started.
 
         Every install this guard performs goes through here (:meth:`run`,
@@ -1711,6 +1759,7 @@ class CoreInstallGuard:
             return cli._extension_install_run(
                 pip_args,
                 constraints=constraints,
+                constraint_path=constraint_path,
                 reinstall=reinstall,
                 timeout=timeout,
             )
@@ -1779,6 +1828,50 @@ class CoreInstallGuard:
         except Exception:  # noqa: BLE001 - see docstring: never mask the interrupt
             return
 
+    def _restore_constraints(self):
+        """The bounds a core restore carries, and the FILE that carries them.
+
+        Returns ``(lines, path)`` — both or neither, from ONE derivation,
+        because the restore is the one install whose command is handed to an
+        operator to run by hand. ``-c`` has no inline form, so a rendered
+        command that names no constraints file is an unbounded install: paste
+        it and it moves the very package a declared window had just refused to
+        move, undoing the protection the repair was refused by (issue #3109).
+        The file the repair reads therefore has to be one the printed command
+        can still name after the run, which is why it is not a temporary.
+
+        Created once per guard and reused. The interrupt path renders the
+        command without running anything, and a repair renders it and then runs
+        it; two files would let those two describe different installs — the
+        failure :meth:`_restore_plan` already documents for the argv, committed
+        one argument along.
+
+        The lines are written HERE, when the file is made, and not left to the
+        installer that later reads it. An interrupt renders this command and
+        runs nothing at all, so a file only filled by a run that never happened
+        would be named by a command that LOOKS bounded and is not — the same
+        unbounded paste, arrived at one path along, and silent because the
+        argument is present.
+
+        Core's own pin is absent, for the reason :meth:`_repair` gives. What is
+        left is the manifest's windows for everything else, and a manifest that
+        declares none leaves nothing to carry and nothing to name — the printed
+        command is then exactly what it was before, an unbounded install on a
+        host that declared no bounds.
+        """
+        if not self._manifest_bounds:
+            return [], None
+        if self._restore_constraint_path is None:
+            import tempfile
+
+            fd, path = tempfile.mkstemp(
+                prefix="kestrel-restore-constraints-", suffix=".txt",
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                _write_constraint_lines(fh, self._manifest_bounds)
+            self._restore_constraint_path = path
+        return list(self._manifest_bounds), self._restore_constraint_path
+
     def _restore_plan(self):
         """The exact install that would put core back — rendered, NOT run.
 
@@ -1789,7 +1882,10 @@ class CoreInstallGuard:
         Deriving it twice is how a printed restore command starts describing a
         different install than the one the guard would actually perform — the
         precise failure :meth:`_repair` already documents for the *rendering*,
-        now true of the argv as well.
+        now true of the argv as well, and of the CONSTRAINTS the install
+        carries (:meth:`_restore_constraints`). An operation is its arguments:
+        one that drops ``-c`` is a different operation from one that keeps it,
+        however identical the rest of the line reads (issue #3109).
         """
         if self.policy.editable:
             checkout = str(Path(self.policy.editable).expanduser())
@@ -1821,10 +1917,14 @@ class CoreInstallGuard:
             reinstall = (
                 None if cli._core_install_shape().from_index else CORE_DISTRIBUTION
             )
+        _, constraint_path = self._restore_constraints()
+        extra_args = ["-c", constraint_path] if constraint_path else []
         return (
             pip_args,
             reinstall,
-            _render_commands(_install_commands(pip_args, reinstall=reinstall)),
+            _render_commands(
+                _install_commands(pip_args, extra_args, reinstall=reinstall)
+            ),
             _render_shell(),
         )
 
@@ -1847,8 +1947,8 @@ class CoreInstallGuard:
         conforms.
 
         ``command`` is rendered from the SAME argv sequence the repair just ran
-        (:func:`_install_commands`) — backend, interpreter, and reinstall
-        scoping included — quoted for THIS host's shell
+        (:func:`_install_commands`) — backend, interpreter, reinstall scoping,
+        and the constraints file included — quoted for THIS host's shell
         (:func:`_render_commands`). An operator only
         sees it when the automatic restore failed, which is precisely when a
         command naming a uv this host lacks — or omitting ``--python`` and so
@@ -1863,15 +1963,18 @@ class CoreInstallGuard:
         it here.
         """
         pip_args, reinstall, rendered, shell = self._restore_plan()
+        # Core is never constrained against itself, here least of all — this
+        # install exists to put core back. The rest of the manifest still
+        # binds: a repair that resolves a dependency outside another entry's
+        # declared window has moved it, and this rechecks only core (#3106).
+        # The SAME file *rendered* just named, so what an operator pastes is
+        # bounded exactly as the automatic attempt was (#3109).
+        constraints, constraint_path = self._restore_constraints()
         try:
             result = self._install(
                 pip_args,
-                # Core is never constrained against itself, here least of all —
-                # this install exists to put core back. The rest of the manifest
-                # still binds: a repair that resolves a dependency outside
-                # another entry's declared window has moved it, and this rechecks
-                # only core (issue #3106).
-                constraints=self._manifest_bounds or None,
+                constraints=constraints or None,
+                constraint_path=constraint_path,
                 reinstall=reinstall,
                 timeout=timeout,
                 repairing=True,

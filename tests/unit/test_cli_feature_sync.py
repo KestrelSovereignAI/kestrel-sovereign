@@ -9,10 +9,12 @@ the network, pip, or uv.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -74,7 +76,7 @@ class _InstallSpy:
         self.returncode = returncode
         self.stderr = stderr
 
-    def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
+    def __call__(self, pip_args, *, constraints=None, constraint_path=None, reinstall=None, timeout=None):
         self.calls.append(list(pip_args))
         self.constraints.append(list(constraints or []))
         self.reinstalls.append(reinstall)
@@ -607,7 +609,7 @@ def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
+        def __call__(self, pip_args, *, constraints=None, constraint_path=None, reinstall=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 1 if not str(pip_args[0]).startswith("git+") else 0
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -646,7 +648,7 @@ def test_sync_git_fallback_finds_a_catalog_row_spelled_differently(
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
+        def __call__(self, pip_args, *, constraints=None, constraint_path=None, reinstall=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 1 if not str(pip_args[0]).startswith("git+") else 0
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -713,7 +715,7 @@ def test_sync_git_fallback_carries_extras(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
+        def __call__(self, pip_args, *, constraints=None, constraint_path=None, reinstall=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 0 if "git+" in str(pip_args[0]) else 1
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -773,6 +775,18 @@ def _voice_manifest(tmp_path):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.4"\n')
     return manifest
+
+
+#: The `-c <file>` a restore command carries once the manifest declares windows
+#: (issue #3109). The path is a fresh temp file per run, so tests about the
+#: backend, the interpreter or the quoting elide it — but they still assert it
+#: is THERE, because a command that lost it is an unbounded install. What the
+#: file holds has its own tests below.
+_BOUNDS_ARG = re.compile(r"'?-c'? '?\S*kestrel-restore-constraints-\w+\.txt'?")
+
+
+def _elide_bounds(text: str) -> str:
+    return _BOUNDS_ARG.sub("-c <bounds>", text)
 
 
 def test_unconstrained_feature_install_swaps_editable_core(monkeypatch):
@@ -841,11 +855,11 @@ def test_sync_relinks_core_when_an_install_bypasses_the_constraint(
     # The swap happened, was named, and the checkout was re-linked.
     assert venv.editable[CORE] == CHECKOUT
     assert venv.installed[CORE] == "0.52.0"  # the checkout's build, restored
-    err = capsys.readouterr().err
+    err = _elide_bounds(capsys.readouterr().err)
     assert "was replaced during the install batch" in err
     assert (
         f"restored: uv pip install --python {shlex.quote(sys.executable)} "
-        f"-e {CHECKOUT}"
+        f"-c <bounds> -e {CHECKOUT}"
     ) in err
 
 
@@ -976,13 +990,13 @@ def test_sync_restores_core_pushed_outside_the_declared_pypi_window(
 
     assert rc == 1
     assert venv.installed[CORE] == "0.52.0"  # pulled back into the window
-    err = capsys.readouterr().err
+    err = _elide_bounds(capsys.readouterr().err)
     assert "was replaced during the install batch" in err
     # The spec is shell-quoted: `>=`/`<` unquoted would make the advertised
     # command a shell redirection rather than an install.
     assert (
         f"restored: uv pip install --python {shlex.quote(sys.executable)} "
-        f"'{CORE}>=0.52,<0.53'"
+        f"-c <bounds> '{CORE}>=0.52,<0.53'"
     ) in err
 
 
@@ -1003,11 +1017,11 @@ def test_sync_does_not_call_a_no_op_reinstall_a_restore(
 
     assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # still swapped — the repair did nothing
-    err = capsys.readouterr().err
+    err = _elide_bounds(capsys.readouterr().err)
     assert "restored:" not in err
     assert (
         "RESTORE FAILED — run `uv pip install --python "
-        f"{shlex.quote(sys.executable)} -e {CHECKOUT}` by hand."
+        f"{shlex.quote(sys.executable)} -c <bounds> -e {CHECKOUT}` by hand."
     ) in err
 
 
@@ -1030,10 +1044,10 @@ def test_sync_recovery_command_names_pip_on_a_host_without_uv(
 
     assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # swapped, and the re-link failed
-    err = capsys.readouterr().err
+    err = _elide_bounds(capsys.readouterr().err)
     assert (
         f"RESTORE FAILED — run `{shlex.quote(sys.executable)} -m pip install "
-        f"-e {CHECKOUT}` by hand."
+        f"-c <bounds> -e {CHECKOUT}` by hand."
     ) in err
     assert "uv pip install" not in err
 
@@ -1063,10 +1077,10 @@ def test_sync_recovery_command_is_runnable_on_windows(
 
     assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # swapped, and the re-link failed
-    err = capsys.readouterr().err
+    err = _elide_bounds(capsys.readouterr().err)
     assert (
         "RESTORE FAILED — run `& 'C:\\Program Files\\kestrel\\venv\\python.exe' "
-        f"-m pip install -e {CHECKOUT}` in PowerShell by hand."
+        f"-m pip install -c <bounds> -e {CHECKOUT}` in PowerShell by hand."
     ) in err
     # The interpreter is invoked, not echoed: a bare quoted path is a string
     # literal to PowerShell, so dropping `&` prints the path and repairs nothing.
@@ -3309,3 +3323,113 @@ def test_the_repair_is_bounded_by_the_manifest_too(monkeypatch, capsys):
     lines = venv.constraint_files[-1].split()
     assert "kestrel-feature-workflows>=0.5.1,<0.6" in lines
     assert not any(line.startswith(CORE) for line in lines)
+
+
+# --- the recovery command carries them too (issue #3109) --------------------
+
+
+def _bounds_file(command: str) -> Path:
+    """The constraints file a rendered restore command names."""
+    match = re.search(r"-c '?(\S*?\.txt)'?(?:\s|$)", command)
+    assert match, command
+    return Path(match.group(1))
+
+
+def test_the_printed_recovery_command_carries_the_bounds_the_repair_ran_with(
+    monkeypatch, capsys,
+):
+    """The operator's copy of the repair must be bounded exactly as the repair was.
+
+    A failed repair prints a command to run by hand, and `-c` has no inline
+    form — so a rendering that drops the constraints file hands the operator an
+    UNBOUNDED install. On a manifest-governed host that is the worst possible
+    paste: the repair was refused BY one of those windows, and the printed
+    "fix" is the same install with that window removed, so running it moves the
+    package the guard had just protected.
+    """
+    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.feature_reconcile import SourceEntry
+
+    venv = FakeUv()
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    venv.installed_requires[CORE] = ["kestrel-feature-workflows>=0.6.0,<0.7"]
+    venv.package_index["kestrel-feature-workflows"] = ["0.5.2", "0.6.0"]
+    use_fake_uv(monkeypatch, venv)
+    guard = CoreInstallGuard.snapshot({
+        CORE: SourceEntry(package=CORE, pypi=">=0.52,<0.53"),
+        "kestrel-feature-workflows": SourceEntry(
+            package="kestrel-feature-workflows", pypi=">=0.5.1,<0.6",
+        ),
+    })
+
+    outcome = guard.resolve()
+
+    assert outcome.repaired is False          # there IS a command to print
+    named = _bounds_file(outcome.command)
+    # It outlives the run: the command names it AFTER the installer returned,
+    # so a file deleted on return would leave the operator with a broken paste.
+    assert named.exists()
+    lines = named.read_text(encoding="utf-8").split()
+    assert "kestrel-feature-workflows>=0.5.1,<0.6" in lines
+    # ...and it is the file the repair ITSELF read, not a second copy that
+    # could drift from it. Printed and performed are one operation.
+    ran = [cmd for cmd in venv.commands if "-c" in cmd]
+    assert ran, venv.commands
+    assert Path(ran[-1][ran[-1].index("-c") + 1]) == named
+
+
+def test_a_host_that_declares_no_windows_gets_the_command_it_always_got(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """Fidelity: nothing to carry means nothing to name.
+
+    The bound travels because the manifest declared one. A host whose manifest
+    declares no version window has none, and inventing a constraints file there
+    would add an argument to a command that does not need it — and a file to
+    the disk of every operator who never asked for one.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')   # declared, no window
+    venv = FakeUv(honours_constraints=False, repair_fails=True)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == CORE_UNSAFE
+    err = capsys.readouterr().err
+    assert (
+        "RESTORE FAILED — run `uv pip install --python "
+        f"{shlex.quote(sys.executable)} -e {CHECKOUT}` by hand."
+    ) in err
+    assert "-c " not in err
+
+
+def test_an_interrupted_restore_command_is_bounded_too(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """The interrupt path prints the same command and must carry the same file.
+
+    Ctrl-C never attempts a repair, so this rendering is the ONLY install the
+    operator will run — the one place an unbounded paste is guaranteed rather
+    than merely likely.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\npypi = ">=0.4"\n'
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
+
+    err = capsys.readouterr().err
+    assert "NOT RESTORED" in err
+    named = _bounds_file(err)
+    assert named.exists()
+    assert "kestrel-feature-voice>=0.4" in named.read_text(encoding="utf-8").split()
