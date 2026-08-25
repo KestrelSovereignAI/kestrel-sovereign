@@ -224,19 +224,22 @@ async def test_resumed_conversation_includes_messages_with_session_id_metadata(t
          session1_time.strftime('%Y-%m-%d %H:%M:%S'))
     )
     
+    await storage.db.execute_commit(
+        "INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("resume-test", "assistant", "Original response in session 1", None,
+         (session1_time + timedelta(seconds=5)).strftime('%Y-%m-%d %H:%M:%S'))
+    )
+
     # Session 1's canonical id — a key the grouper files rows under, which a
-    # bare row-id is not.
+    # bare row-id is not. BOTH original rows carry it: a canonical session is
+    # resolved by the rows that name it (#3120), so a row left untagged here
+    # would be one the fixture claims is in the session and the resolver does
+    # not.
     session1_id = "session-one-resumed"
     await storage.db.execute_commit(
         "UPDATE conversation_history SET metadata = ?, session_id = ? "
         "WHERE agent_id = ?",
         (json.dumps({"session_id": session1_id}), session1_id, "resume-test"),
-    )
-    
-    await storage.db.execute_commit(
-        "INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-        ("resume-test", "assistant", "Original response in session 1", None,
-         (session1_time + timedelta(seconds=5)).strftime('%Y-%m-%d %H:%M:%S'))
     )
     
     # --- TIME GAP OF 2 HOURS ---
