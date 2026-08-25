@@ -1486,8 +1486,8 @@ class CoreGuardOutcome:
                 "NOT RESTORED — the manifest declares version windows that "
                 "could not be written to a constraints file, so there is no "
                 "command that could put core back without risking one of them. "
-                "Fix what stopped that write, then re-run `kestrel feature "
-                "sync`."
+                "Fix what stopped that write, then re-run the command that "
+                "reported this."
             )
         if not self.command:
             # No DECLARED source, so no command to offer — which is not the same
@@ -1536,13 +1536,23 @@ class CoreGuardOutcome:
         and edited the window that refused it. The file it names still holds
         the old lines, so the resolve fails again, identically, and reads as
         the command being wrong (issue #3109).
+
+        It does NOT name the invocation to repeat. This outcome is reported by
+        `feature sync`, `install`, `upgrade`, `update`'s reconcile and the HTTP
+        install endpoint, and the one it would name takes arguments — a manifest
+        path among them. Printing a bare `kestrel feature sync` sends an
+        operator who passed `--manifest` to converge on a DIFFERENT declaration
+        than the one they just edited, and tells an API caller to run a CLI.
+        The fact worth stating is that the line is a snapshot; which command
+        produced it is something the reader knows and this does not.
         """
         if not self.bounds_note:
             return ""
         return (
             f" Note: {self.bounds_note} The command above carries those "
-            "windows as they were, so if you change one, re-run `kestrel "
-            "feature sync` rather than pasting it."
+            "windows as they were when it ran, so once you have changed one, "
+            "re-run the command that reported this rather than pasting the "
+            "line."
         )
 
     def describe(self) -> str:

@@ -3668,4 +3668,9 @@ def test_a_bounded_recovery_command_says_when_pasting_it_is_the_wrong_move(
     assert "kestrel-feature-workflows>=0.5.1,<0.6" in instruction
     assert "that entry is the one to change" in instruction
     # ...and the operator is told what to do INSTEAD of pasting, once they have.
-    assert "re-run `kestrel feature sync` rather than pasting it" in instruction
+    assert "re-run the command that reported this" in instruction
+    # Not a named invocation: this same outcome is reported by `feature
+    # install`, by `update`'s reconcile and over HTTP, and the command it would
+    # name takes a `--manifest` path — so naming it sends an operator who
+    # passed one to converge on a different declaration than they just edited.
+    assert "kestrel feature sync" not in instruction
