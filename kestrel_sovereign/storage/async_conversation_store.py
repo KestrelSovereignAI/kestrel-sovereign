@@ -2178,6 +2178,7 @@ class AsyncConversationStore:
         created_at_index: int = 4,
         reject_invalid_timestamps: bool = False,
         anchor_missing: bool = False,
+        anchor_key: Optional[Tuple[datetime, int]] = None,
     ) -> List[tuple]:
         """Apply the canonical time-gap/resumption rules to candidate rows.
 
@@ -2239,6 +2240,7 @@ class AsyncConversationStore:
             )
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
 
+
         session_rows = []
         last_timestamp: Optional[datetime] = None
         is_first = True
@@ -2255,6 +2257,19 @@ class AsyncConversationStore:
         # EXISTS and the bare integer beside it is a stale echo of a row that
         # belongs to another session. Here there is nothing to echo.
         exact_opens_the_run = anchor_missing and anchor_row_id is not None
+        # Whether the anchor row is among the candidates at all. It may not be:
+        # a session lifecycle op selects one deletion state, and a partially
+        # restored session can have its anchor live while the rows under it are
+        # still in Trash. The session did not stop starting where it starts, so
+        # the run opens at the anchor's POSITION instead — at the first
+        # candidate standing at or after it, which the boundary test below can
+        # still refuse. Only the first: once a boundary closes the run, only
+        # the session's own rows may re-open it.
+        anchor_position_open = (
+            anchor_key is not None
+            and anchor_row_id is not None
+            and not any(candidate[1] == anchor_row_id for candidate in candidates)
+        )
         # Whether the requested session's run is currently taking rows.
         #
         # It starts CLOSED, which is the difference between "these candidates
@@ -2305,6 +2320,9 @@ class AsyncConversationStore:
                     and str(meta[SESSION_ID_KEY]) == session_id_str
                 )
             )
+            if anchor_position_open and (timestamp, row_id) >= anchor_key:
+                opens_the_run = True
+                anchor_position_open = False
 
             # A row filed under another canonical id closes the run even when
             # it is the row the key names: a key whose own row files itself
@@ -2464,9 +2482,40 @@ class AsyncConversationStore:
         # can open the walk (see `_filter_session_rows`).
         anchor_missing = row_id is not None and start_row is None
 
+        # Where the session starts, as the pair everything here compares in.
+        # Carried into the walk so a lifecycle op whose deletion filter hides
+        # the anchor — a partially restored session has its anchor live and its
+        # rows in Trash — still opens the run where the session opens.
+        anchor_key = (
+            (
+                coerce_session_timestamp(start_row[0]) or UNDATABLE_ROW_FALLBACK,
+                int(start_row[1]),
+            )
+            if start_row is not None and row_id is not None
+            else None
+        )
+
+        # Every stamp this session is NAMED at, uncapped and two columns wide.
+        #
+        # These decide where the forward walk looks next, so a cap on them is a
+        # cap on the answer: the first ``limit`` metadata matches can be markers
+        # or documents that merely mention this id, and a real resumption beyond
+        # them then never opened a window — the loop declared the keys exhausted
+        # and returned a short transcript. Cheap because it is two columns of
+        # one session's own rows; the bodies below stay capped.
+        naming_keys = await self.db.fetchall(
+            f"""SELECT created_at, id
+               FROM conversation_history
+               WHERE agent_id = ?
+                 AND (metadata LIKE ? ESCAPE '\\'
+                      OR metadata LIKE ? ESCAPE '\\')
+                 {del_clause}{archive_clause}
+               ORDER BY {created_at_order} ASC, id ASC""",
+            (self.agent_id, spaced_pattern, compact_pattern),
+        )
+
         # The rows that NAME this session, whatever the distance — a resumption
-        # past a time gap, or past the window below. Fetched first because they
-        # are what decides where the forward walk has to look next.
+        # past a time gap, or past the window below.
         resumed_rows = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
@@ -2516,10 +2565,9 @@ class AsyncConversationStore:
         # that is an ordinary collision, and a strictly-greater STAMP test
         # skipped such a resumption and left its tail behind.
         resumption_keys = sorted(
-            (stamp, int(row[0]))
+            (stamp, int(row[1]))
             for stamp, row in (
-                (coerce_session_timestamp(row[4]), row)
-                for row in (*resumed_rows, *resumed_rows_alt)
+                (coerce_session_timestamp(row[0]), row) for row in naming_keys
             )
             if stamp is not None
         )
@@ -2572,6 +2620,7 @@ class AsyncConversationStore:
                     limit=None,
                     include_markers=include_markers,
                     anchor_missing=anchor_missing,
+                    anchor_key=anchor_key,
                 )
                 if (
                     coerce_session_timestamp(row[4]) or UNDATABLE_ROW_FALLBACK,
@@ -2614,6 +2663,7 @@ class AsyncConversationStore:
             limit=limit,
             include_markers=include_markers,
             anchor_missing=anchor_missing,
+            anchor_key=anchor_key,
         )
 
     async def _rows_for_exact_membership(
@@ -2770,7 +2820,7 @@ class AsyncConversationStore:
         # that decision in a different snapshot from the rows it is about.
         candidates = await self.db.fetchall(
             f"{query_prefix}SELECT c.id, c.metadata, c.created_at, "
-            "(SELECT count(*) FROM anchor) "
+            "(SELECT count(*) FROM anchor), (SELECT created_at FROM anchor) "
             f"FROM {candidate_source} WHERE c.agent_id = ? AND "
             f"{membership_predicate}{del_clause}{archive_clause} "
             "ORDER BY c.id ASC",
@@ -2785,6 +2835,19 @@ class AsyncConversationStore:
             created_at_index=2,
             reject_invalid_timestamps=True,
             anchor_missing=bool(candidates) and not candidates[0][3],
+            # The anchor's position, so a deletion filter that hides the row
+            # itself still opens the run where the session opens. Its id is
+            # ``row_id`` by construction — a canonical key has no anchor row
+            # id, and `_filter_session_rows` ignores the pair without one.
+            anchor_key=(
+                (
+                    coerce_session_timestamp(candidates[0][4])
+                    or UNDATABLE_ROW_FALLBACK,
+                    row_id,
+                )
+                if candidates and candidates[0][3] and row_id is not None
+                else None
+            ),
         )
         return sorted({int(row[0]) for row in session_rows})
 

@@ -680,6 +680,59 @@ class TestTheResolverSide:
         assert [r[0] for r in rows] == sorted(expected, reverse=True)
 
     @pytest.mark.asyncio
+    async def test_a_partly_restored_session_still_restores(self, store):
+        """A deletion filter hides rows. It does not move where a session starts.
+
+        Restore selects only trashed rows, so a session whose anchor was
+        restored on its own has an anchor the walk never sees — and a run that
+        can only open AT the anchor row then never opens at all, leaving the
+        rest of the conversation in Trash with nothing able to fetch it. The
+        run opens at the anchor's POSITION instead, which a boundary standing
+        there can still refuse.
+        """
+        anchor = await _insert(store, 0)
+        second = await _insert(store, 5)
+        assert await store.delete_conversation_session(str(anchor)) == 2
+        assert await store.restore_message(anchor) is True
+
+        assert await store.restore_conversation_session(str(anchor)) == 1
+        live = await store.db.fetchall(
+            "SELECT id FROM conversation_history WHERE agent_id = ? "
+            "AND deleted_at IS NULL ORDER BY id",
+            (AGENT,),
+        )
+        assert [row[0] for row in live] == [anchor, second]
+
+    @pytest.mark.asyncio
+    async def test_a_resumption_past_the_capped_metadata_rows_is_paged_to(
+        self, store
+    ):
+        """The keys that decide where to look next are not capped by ``limit``.
+
+        The first ``limit`` metadata matches can be structural markers, or
+        documents that merely mention this id — so a real resumption beyond
+        them was missing from the key list, the loop declared the keys
+        exhausted, and the transcript stopped at the first window while the
+        count and the purge kept going.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        marker = await _insert(
+            store, 1, session_id=UUID_A, new_session=True, type="session_marker"
+        )
+        for minute in range(2, 8):
+            await _insert(store, minute, session_id=UUID_B)
+        resumed = await _insert(store, 100, session_id=UUID_A)
+        tail = await _insert(store, 101)
+
+        rows = await store._get_session_messages(UUID_A, limit=2)
+        assert sorted(r[0] for r in rows) == [first, resumed]
+        # The uncapped resolver keeps the marker (lifecycle ops act on it) and
+        # the tail the display's cap of two leaves off.
+        assert await store._get_complete_session_message_ids(UUID_A) == sorted(
+            [first, marker, resumed, tail]
+        )
+
+    @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):
         """Unchanged behaviour, pinned because the walk now decides it too."""
         first = await _insert(store, 0, session_id=UUID_A)
