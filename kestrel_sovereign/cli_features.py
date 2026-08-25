@@ -1391,6 +1391,12 @@ class CoreGuardOutcome:
     # host cannot load what it just installed. A third sentence, because it is
     # a third fact (issue #3047).
     unresolved: bool = False
+    # The manifest declares windows and they could not be written to a
+    # constraints file, so no command could be rendered that carries them.
+    # Distinct from an empty ``command`` for want of a declared SOURCE: there
+    # is a source here, and the reason nothing is offered is the opposite one
+    # — offering it would be offering an unbounded install (issue #3109).
+    bounds_unwritable: bool = False
     command: Optional[str] = None
     # Which shell ``command`` is quoted for, captured with it (see
     # :func:`_render_shell`). ``None`` where the platform has only one answer.
@@ -1424,6 +1430,18 @@ class CoreGuardOutcome:
         the shell when :attr:`shell` says the quoting is specific to one, since
         a command pasted into the other shell is not the command that ran.
         """
+        if self.bounds_unwritable:
+            # Fail CLOSED. The bounds exist and nothing can carry them, so every
+            # command that could be rendered here is an unbounded install — the
+            # exact paste this reporting exists to stop. What the operator has
+            # to fix first is the write, not core.
+            return (
+                "NOT RESTORED — the manifest declares version windows that "
+                "could not be written to a constraints file, so there is no "
+                "command that could put core back without risking one of them. "
+                "Fix what stopped that write, then re-run `kestrel feature "
+                "sync`."
+            )
         if not self.command:
             # No DECLARED source, so no command to offer — which is not the same
             # thing as "the source is unknown". A core installed from a known git
@@ -1781,12 +1799,13 @@ class CoreInstallGuard:
         replaced = core_install_matches(self._baseline, self.policy)
         if not self.policy.source_is_verifiable:
             return self._unrestorable(drift, replaced, attempted=attempted)
-        _, _, rendered, shell = self._restore_plan()
+        _, _, rendered, shell, bounds_unwritable = self._restore_plan()
         return CoreGuardOutcome(
             drift=drift,
             replaced=replaced,
             repaired=False,
             attempted=attempted,
+            bounds_unwritable=bounds_unwritable,
             command=rendered,
             shell=shell,
         )
@@ -1864,18 +1883,35 @@ class CoreInstallGuard:
         if self._restore_constraint_path is None:
             import tempfile
 
-            fd, path = tempfile.mkstemp(
-                prefix="kestrel-restore-constraints-", suffix=".txt",
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                _write_constraint_lines(fh, self._manifest_bounds)
+            path = None
+            try:
+                fd, path = tempfile.mkstemp(
+                    prefix="kestrel-restore-constraints-", suffix=".txt",
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    _write_constraint_lines(fh, self._manifest_bounds)
+            except OSError:
+                # Lines with no file is the THIRD state, and it has to be
+                # returnable rather than raised. :meth:`_report_interrupt`
+                # swallows every exception so a diagnostic can never replace
+                # the operator's Ctrl-C — which would turn a full disk into a
+                # silently dropped warning about a core that just moved, on the
+                # one path that previously needed no filesystem at all.
+                if path:
+                    try:
+                        os.unlink(path)   # a partial write bounds nothing
+                    except OSError:
+                        pass
+                return list(self._manifest_bounds), None
             self._restore_constraint_path = path
         return list(self._manifest_bounds), self._restore_constraint_path
 
     def _restore_plan(self):
         """The exact install that would put core back — rendered, NOT run.
 
-        Returns ``(pip_args, reinstall, rendered, shell)``.
+        Returns ``(pip_args, reinstall, rendered, shell, bounds_unwritable)``,
+        the last saying the rendering was WITHHELD rather than that there was
+        nothing to render.
 
         One derivation with two consumers: :meth:`_repair` runs it, and the
         interrupt path prints it without running anything (issue #2962).
@@ -1917,7 +1953,12 @@ class CoreInstallGuard:
             reinstall = (
                 None if cli._core_install_shape().from_index else CORE_DISTRIBUTION
             )
-        _, constraint_path = self._restore_constraints()
+        lines, constraint_path = self._restore_constraints()
+        if lines and not constraint_path:
+            # Bounds exist and nothing carries them. Rendering the command
+            # anyway would hand over the unbounded install this whole path
+            # exists to withhold, so render none and let the caller say why.
+            return pip_args, reinstall, "", _render_shell(), True
         extra_args = ["-c", constraint_path] if constraint_path else []
         return (
             pip_args,
@@ -1926,6 +1967,7 @@ class CoreInstallGuard:
                 _install_commands(pip_args, extra_args, reinstall=reinstall)
             ),
             _render_shell(),
+            False,
         )
 
     def _repair(self, *, timeout=None):
@@ -1962,7 +2004,7 @@ class CoreInstallGuard:
         restore command, and the caller still needs to report whatever brought
         it here.
         """
-        pip_args, reinstall, rendered, shell = self._restore_plan()
+        pip_args, reinstall, rendered, shell, _ = self._restore_plan()
         # Core is never constrained against itself, here least of all — this
         # install exists to put core back. The rest of the manifest still
         # binds: a repair that resolves a dependency outside another entry's

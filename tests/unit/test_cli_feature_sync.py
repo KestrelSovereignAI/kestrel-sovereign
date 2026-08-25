@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -3433,3 +3434,57 @@ def test_an_interrupted_restore_command_is_bounded_too(
     named = _bounds_file(err)
     assert named.exists()
     assert "kestrel-feature-voice>=0.4" in named.read_text(encoding="utf-8").split()
+
+
+def test_an_interrupt_still_names_the_drift_when_the_bounds_cannot_be_written(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """A diagnostic that needs the disk must not go silent when the disk says no.
+
+    `_report_interrupt` swallows every exception so a failing diagnostic can
+    never replace the operator's Ctrl-C with a traceback. Making that path
+    write a file therefore puts the WHOLE warning behind that handler: a full
+    or unwritable temp directory drops it, and nobody is told that the killed
+    installer just moved core. Before the bounds travelled, this path touched
+    no filesystem at all — so the report has to survive losing them.
+
+    What it must NOT do is fall back to the unbounded command: the windows are
+    real whether or not a file can hold them.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\npypi = ">=0.4"\n'
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    # Only the RESTORE file fails: the feature install's own constraints file
+    # is a different call with a different prefix, and breaking it too would
+    # test a host that cannot install anything rather than one that cannot
+    # write this one file.
+    real_mkstemp = tempfile.mkstemp
+
+    def no_restore_file(*args, **kwargs):
+        if str(kwargs.get("prefix", "")).startswith("kestrel-restore-constraints-"):
+            raise OSError(28, "No space left on device")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(tempfile, "mkstemp", no_restore_file)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
+
+    err = capsys.readouterr().err
+    # The warning survives...
+    assert "INTERRUPTED" in err
+    assert "is not installed from its declared source" in err or "replaced" in err
+    assert "could not be written to a constraints file" in err
+    # ...and it fails CLOSED: no command at all, rather than one that would
+    # move a declared entry the moment it is pasted.
+    assert "pip install" not in err
+    assert "by hand" not in err
