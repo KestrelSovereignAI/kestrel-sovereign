@@ -2233,24 +2233,39 @@ class AsyncConversationStore:
         session_rows = []
         last_timestamp: Optional[datetime] = None
         is_first = True
-        # Whether the requested session's implicit run is still taking rows.
+        # The row a session's run STARTS at, when its key names one. A legacy
+        # key IS a row id (#2012), so the session begins there and at no other
+        # row; a canonical key begins wherever the first row naming it is.
+        anchor_row_id = coerce_persistent_message_id(session_id)
+        # Whether the requested session's run is currently taking rows.
         #
-        # A row filed under a DIFFERENT canonical id ends it, and ending it is
-        # not the same as skipping the row: an unlabeled row after it inherits
-        # THAT session under ``group_messages_into_sessions``, so it must not
-        # be able to rejoin this one by merely falling inside the gap. Only a
-        # row carrying the requested id re-opens the run — that is a resumption,
-        # and the grouper coalesces those back together by id.
+        # It starts CLOSED, which is the difference between "these candidates
+        # begin at the session" and "these candidates begin near it". The
+        # candidate query selects a timestamp RANGE, and two rows can share a
+        # second — so the row before the anchor in canonical order arrives
+        # first, and a run that started open would take it out of the session
+        # before this one. The same range is what a metadata ``LIKE`` can widen
+        # by matching this session's id nested inside some other document: that
+        # row is not a member, it must not open the run, and now it cannot.
         #
-        # Until #3098 this walk did not stop, so a legacy numeric cluster
-        # absorbed a following stamped row. The grouper had to absorb it too,
-        # or deleting the cluster the list showed would have destroyed the
-        # stamped session beside it — and that absorption is what made Phase
-        # A's per-row column disagree with the grouping and drop the whole
-        # conversation from the list.
-        run_open = True
+        # A row filed under a DIFFERENT canonical id closes the run, and so
+        # does a ``new_session`` marker — the grouper's other two boundaries.
+        # Closing is not the same as skipping the row: an unlabeled row after
+        # one inherits THAT session, so it must not rejoin this one by merely
+        # falling inside the gap. Only the anchor or a row NAMING this session
+        # opens the run — the latter is a resumption, which the grouper
+        # coalesces back by id, and which is why a boundary must not end the
+        # scan the way it used to.
+        #
+        # Until #3098 the walk had no boundary at all, so a legacy numeric
+        # cluster absorbed a following stamped row. The grouper had to absorb
+        # it too, or deleting the cluster the list showed would have destroyed
+        # the stamped session beside it — and that absorption is what made
+        # Phase A's per-row column disagree with the grouping and drop the
+        # whole conversation from the list.
+        run_open = False
 
-        for timestamp, _row_id, row, meta in candidates:
+        for timestamp, row_id, row, meta in candidates:
             # A row RESUMES this session only under the grouper's own
             # acceptance rule, which is why this asks `canonical_session_id`
             # rather than comparing the raw metadata value. A bare integer
@@ -2262,19 +2277,17 @@ class AsyncConversationStore:
             # session cannot be resumed at all, which is the truth: its key is
             # its first row's id, and no second cluster can start at that row.
             is_resumed_message = canonical_session_id(meta) == session_id_str
-            foreign = canonical_session_id(meta) not in (None, session_id_str)
 
-            if not is_first and not is_resumed_message and meta.get("new_session"):
-                break
-
-            if is_resumed_message:
+            if is_resumed_message or row_id == anchor_row_id:
                 run_open = True
-            elif foreign:
+            elif canonical_session_id(meta) not in (
+                None, session_id_str,
+            ) or meta.get("new_session"):
                 run_open = False
             if not run_open:
                 # Deliberately WITHOUT advancing ``last_timestamp``: nothing
-                # else can join this session until a resumption re-opens it,
-                # and a resumption is admitted regardless of the gap.
+                # else can join this session until the anchor or a resumption
+                # opens the run, and both are admitted regardless of the gap.
                 continue
 
             if last_timestamp and not is_resumed_message:

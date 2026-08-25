@@ -2044,8 +2044,8 @@ def shape_change_invalidation(backend_type: str) -> str:
     )
 
 
-def watermark_only_ledger_seed(backend_type: str) -> str:
-    """SQL giving a ledger row to every agent that has a watermark and none.
+def publishing_agent_ledger_seed(backend_type: str) -> str:
+    """SQL giving a ledger row to every agent that could publish without one.
 
     :func:`shape_change_invalidation` invalidates by rotating the generation a
     watermark is compared against, which needs a row to rotate. An agent whose
@@ -2066,10 +2066,21 @@ def watermark_only_ledger_seed(backend_type: str) -> str:
     So the claim is made where the fence will look. Creating the row is the
     rotation for an agent that had nothing to rotate, and ``DO NOTHING`` leaves
     every agent that does have one to :func:`shape_change_invalidation`.
+
+    **Every agent in HISTORY, not only every agent with a watermark.** The
+    agent that most needs the fence is the one whose FIRST rebuild is in
+    flight: it has no watermark yet either, so a seed keyed on the watermark
+    table would step around exactly the repair that is about to publish an
+    answer derived under the old grouping. What decides whether an agent needs
+    a generation is whether a repair could be running for it, and a repair runs
+    for an agent that has rows.
     """
     return _anchor(
         _new_generation(backend_type),
-        agents="SELECT agent_id FROM conversation_session_watermarks",
+        agents=(
+            "SELECT agent_id FROM conversation_session_watermarks "
+            "UNION SELECT DISTINCT agent_id FROM conversation_history"
+        ),
     )
 
 

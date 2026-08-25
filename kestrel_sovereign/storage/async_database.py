@@ -2049,7 +2049,7 @@ class AsyncDatabase:
             mutation_triggers,
             NON_NULL_PROJECTION_COLUMNS,
             emptied_cache_invalidation,
-            watermark_only_ledger_seed,
+            publishing_agent_ledger_seed,
             CHANGES_PRE_SLOT_TABLE,
             CHANGES_SLOT_COLUMN,
             changes_slot_migration,
@@ -2287,16 +2287,18 @@ class AsyncDatabase:
                     # session suspect and those agents are the ones with the
                     # oldest projections.
                     await self._backend.execute(emptied_cache_invalidation())
-                    # And a ledger row for the agents that had none, because
-                    # the two statements above are claims a fence may not
-                    # look at. An older revision's rebuild already running for
-                    # such an agent re-reads the GENERATION before it
-                    # publishes, still sees the empty string, finds it
-                    # unchanged, and commits a valid watermark over the
-                    # invalidation — after which both revisions compare two
-                    # empty generations that agree.
+                    # And a ledger row for every agent that could publish
+                    # without one, because the two statements above are claims
+                    # a fence may not look at. An older revision's rebuild
+                    # already running for such an agent re-reads the
+                    # GENERATION before it publishes, still sees the empty
+                    # string, finds it unchanged, and commits a valid
+                    # watermark over the invalidation — after which both
+                    # revisions compare two empty generations that agree. The
+                    # agent that most needs this is the one whose FIRST
+                    # rebuild is in flight, which has no watermark either.
                     await self._backend.execute(
-                        watermark_only_ledger_seed(self.backend_type)
+                        publishing_agent_ledger_seed(self.backend_type)
                     )
                     logger.info(
                         "change-stamp shape moved; retired the counters for "

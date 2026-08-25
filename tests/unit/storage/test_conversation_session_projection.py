@@ -3853,6 +3853,56 @@ async def test_a_changed_grouping_retires_the_projection(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_changed_grouping_fences_an_agent_with_no_projection_yet(
+    tmp_path, monkeypatch
+):
+    """The repair that most needs the fence has not written anything yet.
+
+    A seed keyed on the watermark table steps around exactly the dangerous
+    case: an agent whose FIRST rebuild is in flight under an older revision has
+    neither a watermark nor a ledger row, so it would get no new generation,
+    publish its old-grouping answer with generation ``''``, and be compared
+    against a still-missing ledger's ``''`` for ever after.
+
+    What decides whether an agent needs a generation is whether a repair could
+    be running for it, and a repair runs for an agent that has rows.
+    """
+    from kestrel_sovereign.storage import conversation_sessions
+
+    path = str(tmp_path / "no-projection.db")
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        await _seed(db, CORPUS)
+        await db.execute(
+            "DELETE FROM conversation_session_watermarks WHERE agent_id = ?", (AGENT,)
+        )
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+    finally:
+        await db.close()
+
+    monkeypatch.setattr(
+        conversation_sessions,
+        "_grouping_source",
+        lambda: "a grouping that ends a session somewhere else",
+    )
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        seeded = await db.fetchone(
+            "SELECT generation FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot = 0",
+            (AGENT,),
+        )
+        assert seeded is not None, (
+            "an agent with history and no projection got no generation fence"
+        )
+        assert seeded[0], "the seeded generation is the empty string it started from"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_a_changed_grouping_retires_a_watermark_with_no_ledger(
     tmp_path, monkeypatch
 ):

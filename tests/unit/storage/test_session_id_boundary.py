@@ -369,6 +369,89 @@ class TestTheResolverSide:
         ]
 
     @pytest.mark.asyncio
+    async def test_the_row_before_the_anchor_in_the_same_second_is_not_taken(
+        self, store
+    ):
+        """The candidate query selects a RANGE; the session starts at a row.
+
+        ``created_at`` is stored to the second, so an unlabeled row and the
+        first row of the next conversation routinely share one — and canonical
+        order breaks that tie by id, which puts the unlabeled row in the
+        session BEFORE this one. A ``>=`` range admits it either way, so a walk
+        that began with its run open took it, and a delete or purge of the
+        canonical session reached into its neighbour.
+        """
+        earlier = await _insert(store, 0)
+        stamped = await _insert(store, 0, session_id=UUID_A)
+        assert earlier < stamped, "the fixture did not build the tie it needs"
+
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert [r[0] for r in rows] == [stamped]
+        assert await store._get_complete_session_message_ids(UUID_A) == [stamped]
+
+    @pytest.mark.asyncio
+    async def test_another_session_s_marker_does_not_end_the_scan(self, store):
+        """A boundary ends the RUN. Ending the scan loses the resumption.
+
+        A ``new_session`` marker for another conversation is a boundary like
+        any other, and the walk used to answer it by stopping outright. That
+        was survivable while a canonical session was resolved by metadata
+        alone; now that it walks forward, a session picked up again after
+        someone else's marker resolved to its first cluster only, while the
+        list, the count and the purge kept both.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        await _insert(store, 5, session_id=UUID_B, new_session=True,
+                      type="session_marker")
+        await _insert(store, 6, session_id=UUID_B)
+        resumed = await _insert(store, 10, session_id=UUID_A)
+
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert sorted(r[0] for r in rows) == [first, resumed]
+        assert await store._get_complete_session_message_ids(UUID_A) == [
+            first, resumed,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_marker_with_no_id_of_its_own_still_ends_the_run(self, store):
+        """``new_session`` is a boundary in its own right, not a foreign id.
+
+        A modern marker mints a UUID, so it is caught by the foreign-id test
+        and this clause never fires for one — which is exactly why it needs its
+        own case. A LEGACY marker predates #2012 and may carry no session id at
+        all; the grouper starts a new session on the flag regardless, and
+        without this the run stayed open and swallowed the marker and the turns
+        that belong to it.
+        """
+        first = await _insert(store, 0, session_id=UUID_A)
+        await _insert(store, 5, new_session=True)
+        await _insert(store, 6)
+
+        rows = await store._get_session_messages(
+            UUID_A, limit=50, include_markers=True
+        )
+        assert [r[0] for r in rows] == [first]
+        assert await store._get_complete_session_message_ids(UUID_A) == [first]
+
+    @pytest.mark.asyncio
+    async def test_a_nested_session_id_is_not_an_anchor(self, store):
+        """The anchor is found by ``LIKE``, and ``LIKE`` cannot read JSON.
+
+        A document mentioning this session's id inside some other object
+        matches the pattern that locates the anchor, which would start the walk
+        before the session does. It is not a member — ``canonical_session_id``
+        reads the TOP level and this row files itself nowhere — so it must not
+        open the run, and the unlabeled row beside it must not come with it.
+        """
+        await _insert(store, 0, tool_result={"session_id": UUID_A})
+        await _insert(store, 1)
+        stamped = await _insert(store, 5, session_id=UUID_A)
+
+        rows = await store._get_session_messages(UUID_A, limit=50)
+        assert [r[0] for r in rows] == [stamped]
+        assert await store._get_complete_session_message_ids(UUID_A) == [stamped]
+
+    @pytest.mark.asyncio
     async def test_two_stamped_sessions_stay_separate(self, store):
         """Unchanged behaviour, pinned because the walk now decides it too."""
         first = await _insert(store, 0, session_id=UUID_A)
