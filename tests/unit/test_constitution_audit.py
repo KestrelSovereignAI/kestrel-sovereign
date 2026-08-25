@@ -403,21 +403,34 @@ async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("safe_mode", "audit_pending", "expected_reason"),
+    ("safe_mode", "audit_pending", "cause", "expected_reason"),
     [
-        (True, False, "integrity failure"),
-        (False, True, "required startup integrity audit"),
+        (True, False, "integrity", "integrity failure"),
+        (False, True, "integrity", "required startup integrity audit"),
+        # The cases the Sovereign was previously told were integrity failures.
+        (True, False, "state_unavailable", "could not be read"),
+        (True, False, "state_not_persisted", "could not be saved"),
+        (True, False, "identity_missing", "missing agent identity record"),
+        (True, False, None, "cause was not recorded"),
     ],
 )
 async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
-    safe_mode, audit_pending, expected_reason
+    safe_mode, audit_pending, cause, expected_reason
 ):
-    """The primary streamed chat path must not bypass restored restriction."""
+    """The primary streamed chat path must not bypass restored restriction.
+
+    It must also not misdescribe it. This is the surface the Sovereign
+    actually reads, and it claimed an integrity failure unconditionally —
+    reporting a constitutional violation for a missing decryption key.
+    """
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
     agent = MagicMock()
     agent._safe_mode = safe_mode
     agent._constitution_audit_pending = audit_pending
+    # Stated, because an unset attribute on a MagicMock is a truthy Mock and
+    # would match no cause at all.
+    agent._safe_mode_cause = cause
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
@@ -428,7 +441,12 @@ async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
 
     assert len(chunks) == 1
     assert "SAFE MODE ACTIVE" in chunks[0]
-    assert expected_reason in chunks[0]
+    assert expected_reason in chunks[0], chunks[0]
+    if cause not in ("integrity", None) and not audit_pending:
+        assert "integrity failure" not in chunks[0], (
+            "a non-integrity restriction was reported as a constitutional "
+            "violation"
+        )
     agent._maybe_audit.assert_awaited_once()
     agent._turn_lifecycle.assert_not_called()
     agent._process_input_streaming_traced_locked.assert_not_called()
@@ -1378,5 +1396,64 @@ async def test_recovery_clears_the_not_persisted_cause_too(tmp_path):
             "the recovered snapshot still claimed it was never written"
         )
         assert agent._constitution_state_persistence_pending is False
+    finally:
+        await storage.close()
+
+
+def test_the_safe_mode_command_reports_the_recorded_cause():
+    """`!safe-mode` is what a Sovereign types to ask why. It must not guess."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.command_handler import CommandHandler
+
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._constitution_audit_pending = False
+    agent._safe_mode_cause = SafeModeCause.STATE_UNAVAILABLE.value
+
+    import inspect as _inspect
+
+    handler = CommandHandler.__new__(CommandHandler)
+    handler.agent = agent
+    reply = CommandHandler._cmd_safe_mode(handler, "")
+    if _inspect.isawaitable(reply):
+        reply = asyncio.run(reply)
+
+    assert "SAFE MODE ACTIVE" in reply
+    assert "could not be read" in reply
+    assert "integrity failure" not in reply
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_write_persists_the_replacement_cause(tmp_path):
+    """The row written on recovery must not still say it was never written.
+
+    Clearing the cause after the snapshot left the stale value in the row
+    just persisted, so a restart before the next write restored
+    ``state_not_persisted`` and health claimed the recovered write had never
+    happened.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        real_write = agent._constitution_state_store.write
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        await agent._record_successful_constitution_audit(source="startup")
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+
+        agent._constitution_state_store.write = real_write
+        await agent._record_successful_constitution_audit(source="startup")
+
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert persisted.safe_mode_cause != SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "the recovered row still records that it was never persisted"
+        )
     finally:
         await storage.close()

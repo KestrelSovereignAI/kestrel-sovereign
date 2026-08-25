@@ -62,6 +62,38 @@ class SafeModeCause(str, Enum):
     UNRECORDED = "unrecorded"
 
 
+#: What to tell the Sovereign, per recorded cause. Amendment III requires the
+#: discrepancy be reported; it does not permit reporting a different one, and
+#: three separate surfaces were each hard-coding "an integrity failure".
+_RESTRICTION_PHRASES = {
+    SafeModeCause.INTEGRITY.value: "an integrity failure",
+    SafeModeCause.BOOTSTRAP.value: "an incomplete constitution bootstrap",
+    SafeModeCause.STATE_UNAVAILABLE.value: (
+        "governance state that could not be read"
+    ),
+    SafeModeCause.STATE_NOT_PERSISTED.value: (
+        "governance state that could not be saved"
+    ),
+    SafeModeCause.IDENTITY_MISSING.value: "a missing agent identity record",
+    SafeModeCause.UNRECORDED.value: "a restriction whose cause was not recorded",
+}
+
+
+def describe_safe_mode_restriction(agent, *, audit_pending: bool = False) -> str:
+    """Phrase the restriction from what was recorded, not from a default.
+
+    A startup audit outranks the stored cause because it describes why
+    cognition is refused right now. Otherwise the recorded cause decides, and
+    an absent one says so rather than borrowing integrity's name.
+    """
+    if audit_pending:
+        return "a required startup integrity audit"
+    cause = getattr(agent, "_safe_mode_cause", None)
+    return _RESTRICTION_PHRASES.get(
+        cause, "a restriction whose cause was not recorded"
+    )
+
+
 class ConstitutionMixin:
     """Mixin class providing constitution verification methods."""
 
@@ -764,6 +796,14 @@ class ConstitutionMixin:
             )
             self._constitution_state_persistence_pending = True
             return False
+        # Decided BEFORE the snapshot is built. Clearing it afterwards left the
+        # stale cause in the row just written, so a restart restored
+        # ``state_not_persisted`` and health claimed the recovered write had
+        # never persisted. The except path re-sets it if this write fails.
+        if self._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value:
+            self._safe_mode_cause = (
+                SafeModeCause.UNRECORDED.value if self._safe_mode else None
+            )
         try:
             await store.write(
                 self._constitution_state_snapshot(
@@ -781,13 +821,6 @@ class ConstitutionMixin:
             # no longer true. Leaving it set reported ``state_not_persisted``
             # for the rest of the process after one transient write error.
             self._constitution_state_persistence_pending = False
-            # The cause has to go with it. Health derives the same warning
-            # from the cause independently, so clearing only the boolean left
-            # the recovered snapshot still claiming it was never written.
-            if self._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value:
-                self._safe_mode_cause = (
-                    SafeModeCause.UNRECORDED.value if self._safe_mode else None
-                )
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
             # The write failed, so whatever this call was recording exists

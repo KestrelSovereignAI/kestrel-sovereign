@@ -5471,10 +5471,12 @@ Expected Duration: {expected_duration}
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
-                restriction = (
-                    "a required startup integrity audit"
-                    if audit_pending
-                    else "an integrity failure"
+                from kestrel_sovereign.agent.constitution import (
+                    describe_safe_mode_restriction,
+                )
+
+                restriction = describe_safe_mode_restriction(
+                    self, audit_pending=audit_pending
                 )
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
