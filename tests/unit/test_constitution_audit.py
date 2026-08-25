@@ -1457,3 +1457,78 @@ async def test_a_recovered_write_persists_the_replacement_cause(tmp_path):
         )
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_command_reports_the_recorded_cause():
+    """The branch an operator hits while trying to diagnose must not misreport."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._constitution_audit_pending = False
+    agent._constitution_state_persistence_pending = False
+    agent._safe_mode_cause = SafeModeCause.MEMORY_UNREADABLE.value
+    agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent._maybe_refresh_user_byok_resolver = AsyncMock()
+    agent.process_input = KestrelAgent.process_input.__get__(agent)
+
+    reply = await agent.process_input("!privacy")
+
+    assert "SAFE MODE ACTIVE" in reply
+    assert "could not be decrypted" in reply, reply
+    assert "integrity issue" not in reply
+    assert "once integrity is restored" not in reply
+
+
+def test_a_non_durable_latch_is_disclosed_to_the_sovereign():
+    """The cause slot keeps the stronger fact; the reader still needs both.
+
+    Entering Safe Mode for an integrity failure and failing to persist it
+    leaves a restriction that will not survive a restart — which health
+    reported and the Sovereign-facing text did not.
+    """
+    from kestrel_sovereign.agent.constitution import (
+        SafeModeCause,
+        describe_safe_mode_restriction,
+    )
+
+    agent = MagicMock()
+    agent._safe_mode_cause = SafeModeCause.INTEGRITY.value
+    agent._constitution_state_persistence_pending = True
+
+    phrase = describe_safe_mode_restriction(agent)
+
+    assert "integrity failure" in phrase
+    assert "will not survive a restart" in phrase
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_also_fails_still_says_not_persisted(tmp_path):
+    """The replacement cause must not be applied by a write that failed."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        await agent._record_successful_constitution_audit(source="startup")
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+
+        # Still unwritable.
+        await agent._record_successful_constitution_audit(source="startup")
+
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "a failed retry downgraded the cause to 'not recorded' while the "
+            "store was still unwritable"
+        )
+    finally:
+        await storage.close()

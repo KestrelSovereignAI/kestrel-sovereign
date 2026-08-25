@@ -57,6 +57,11 @@ class SafeModeCause(str, Enum):
     #: either. Amendment III requires the discrepancy be reported, so it is
     #: named rather than folded into a neighbour.
     IDENTITY_MISSING = "identity_missing"
+    #: Stored conversation memory could not be decrypted. An availability
+    #: failure of the memory, not of governance state and not of the
+    #: constitution — saying "governance state could not be read" would
+    #: misdirect the operator to a store that is answering fine.
+    MEMORY_UNREADABLE = "memory_unreadable"
     #: Restored from a durable record written before causes were recorded.
     #: Deliberately not INTEGRITY: an unrecorded cause is not evidence of one.
     UNRECORDED = "unrecorded"
@@ -75,6 +80,9 @@ _RESTRICTION_PHRASES = {
         "governance state that could not be saved"
     ),
     SafeModeCause.IDENTITY_MISSING.value: "a missing agent identity record",
+    SafeModeCause.MEMORY_UNREADABLE.value: (
+        "stored memory that could not be decrypted"
+    ),
     SafeModeCause.UNRECORDED.value: "a restriction whose cause was not recorded",
 }
 
@@ -89,9 +97,19 @@ def describe_safe_mode_restriction(agent, *, audit_pending: bool = False) -> str
     if audit_pending:
         return "a required startup integrity audit"
     cause = getattr(agent, "_safe_mode_cause", None)
-    return _RESTRICTION_PHRASES.get(
+    phrase = _RESTRICTION_PHRASES.get(
         cause, "a restriction whose cause was not recorded"
     )
+    # A latch held only in memory is a second active fact, and the cause slot
+    # deliberately keeps the stronger one. Health reports both; the Sovereign
+    # was told only the first, and "not durable" is exactly what they need to
+    # know before restarting.
+    if (
+        getattr(agent, "_constitution_state_persistence_pending", False)
+        and cause != SafeModeCause.STATE_NOT_PERSISTED.value
+    ):
+        phrase += " (this restriction could not be saved and will not survive a restart)"
+    return phrase
 
 
 class ConstitutionMixin:
@@ -549,6 +567,8 @@ class ConstitutionMixin:
         last_successful_audit_at: Optional[datetime] = None,
         interaction_count: Optional[int] = None,
         bootstrap_pending: Optional[bool] = None,
+        safe_mode_cause: Optional[str] = None,
+        override_cause: bool = False,
     ):
         """Build the database value from the current in-memory state."""
         from kestrel_sovereign.constitution.runtime_state import (
@@ -566,7 +586,9 @@ class ConstitutionMixin:
             agent_id=self.agent_id,
             safe_mode=self._safe_mode if safe_mode is None else safe_mode,
             safe_mode_reason=self._safe_mode_reason,
-            safe_mode_cause=self._safe_mode_cause,
+            safe_mode_cause=(
+                safe_mode_cause if override_cause else self._safe_mode_cause
+            ),
             safe_mode_entered_at=self._safe_mode_entered_at,
             safe_mode_exited_at=self._safe_mode_exited_at,
             safe_mode_exit_authorization=self._safe_mode_exit_authorization,
@@ -800,8 +822,17 @@ class ConstitutionMixin:
         # stale cause in the row just written, so a restart restored
         # ``state_not_persisted`` and health claimed the recovered write had
         # never persisted. The except path re-sets it if this write fails.
-        if self._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value:
-            self._safe_mode_cause = (
+        # Held, not applied yet. Replacing the cause before the write meant a
+        # retry that ALSO failed came back as UNRECORDED — the marker sees an
+        # already-restricted agent and preserves whatever is there — so the
+        # status said the cause was unknown while the store was still
+        # unwritable.
+        replacement_cause = None
+        has_replacement = (
+            self._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+        )
+        if has_replacement:
+            replacement_cause = (
                 SafeModeCause.UNRECORDED.value if self._safe_mode else None
             )
         try:
@@ -812,6 +843,12 @@ class ConstitutionMixin:
                     last_successful_audit_at=last_successful_audit_at,
                     interaction_count=interaction_count,
                     bootstrap_pending=bootstrap_pending,
+                    # The row carries the replacement, memory keeps the old
+                    # until this write is known to have succeeded. Both halves
+                    # matter: the durable row must not say it was never
+                    # written, and a failed retry must not read as UNRECORDED.
+                    safe_mode_cause=replacement_cause,
+                    override_cause=has_replacement,
                 ),
                 event_type=event_type,
                 event_reason=event_reason,
@@ -821,6 +858,10 @@ class ConstitutionMixin:
             # no longer true. Leaving it set reported ``state_not_persisted``
             # for the rest of the process after one transient write error.
             self._constitution_state_persistence_pending = False
+            # Applied only now that the row is on disk. The snapshot above was
+            # built from the same value, so the durable row and memory agree.
+            if has_replacement:
+                self._safe_mode_cause = replacement_cause
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
             # The write failed, so whatever this call was recording exists
