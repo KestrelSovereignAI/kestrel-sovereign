@@ -8367,13 +8367,14 @@ async def test_supervision_restarts_child_on_wedged_health_probe(tmp_path):
         await feature.initialize()
         client = client_holder["c"]
         # Wait for: first (hanging) probe to time out, then the restart path.
+        snapshot = feature.runtime_telemetry_snapshot()
         for _ in range(200):
             await asyncio.sleep(0.02)
-            if client.starts >= 2:
+            snapshot = feature.runtime_telemetry_snapshot()
+            if client.starts >= 2 and snapshot.restart_count == 1:
                 break
         assert client.stopped is True
         assert client.starts >= 2  # child was restarted after the wedged probe
-        snapshot = feature.runtime_telemetry_snapshot()
         assert snapshot.restart_count == 1
         assert snapshot.idle_wake_count == 0
     finally:
