@@ -1908,3 +1908,37 @@ def test_a_missing_identity_is_not_downgraded_to_an_integrity_claim():
 
     assert record["failures"] == ["identity_missing"]
     assert record["failure"] == "identity_missing"
+
+
+def test_every_cause_has_a_report_path_and_a_phrase():
+    """A cause with nowhere to be reported is how this defect happens again.
+
+    Three tables have to know each one: the health dispatch, the severity
+    ranking behind the compatibility `failure` string, and the Sovereign-facing
+    phrasing. Each of those was, at some point in this fix, missing an entry —
+    and each time the omission surfaced as "cause_unrecorded" or, worse, as a
+    fallback to `integrity_restriction`, telling the operator the constitution
+    had failed when it had not.
+    """
+    import re
+
+    from kestrel_sovereign.agent.constitution import (
+        SafeModeCause,
+        _RESTRICTION_PHRASES,
+    )
+    import kestrel_sovereign.server as server_module
+
+    src = open(server_module.__file__).read()
+    dispatch = dict(
+        re.findall(r'"(\w+)": "(\w+)"', src.split("_CAUSE_FAILURES")[1].split("}")[0])
+    )
+    severity = re.findall(r'"(\w+)"', src.split("_SEVERITY = [")[1].split("]")[0])
+
+    causes = [c.value for c in SafeModeCause]
+    assert [c for c in causes if c not in dispatch] == [], "cause has no health mapping"
+    assert [n for n in dispatch.values() if n not in severity] == [], (
+        "failure name is unranked, so `failure` falls back to integrity"
+    )
+    assert [c for c in causes if c not in _RESTRICTION_PHRASES] == [], (
+        "cause has no Sovereign-facing phrasing"
+    )
