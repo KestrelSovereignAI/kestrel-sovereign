@@ -1045,3 +1045,121 @@ async def test_the_self_exclusion_does_not_swallow_similarly_named_tools(store):
         "only this tool's own rows are excluded, not every name that matches "
         "it once underscores are read as wildcards"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review round 6 (#3107)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_unmasked_secret_is_masked_on_the_way_out(store):
+    """The guarantee has to live on the READ path.
+
+    `summarize_args` masks on the way in, which makes the stored value safe
+    only for rows written by a path that had that masking — `ApprovalQueue`
+    kept an unmasked copy until F252. This tool cannot verify the provenance of
+    tens of thousands of historical rows, so it must not depend on it.
+
+    On Emma's live corpus (15,727 rows with args) there are zero parseable rows
+    carrying an unmasked sensitive key, so this is a defence against a
+    mechanism rather than an observed leak. It is still the right shape: it
+    converts a claim about every historical writer into a property of the one
+    path we control."""
+    await store.log_decision(
+        feature_name="WalletAgent",
+        tool_name="send_payment",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        # Written raw, exactly as a pre-F252 queue row would be.
+        args_summary='{"api_key": "sk-live-LEGACY-LEAK", "memo": "orphaned"}',
+    )
+
+    matches, _ = await store.search_audit_log("orphaned")
+    assert len(matches) == 1
+    raw = matches[0]["args_summary"]
+    assert "sk-live-LEGACY-LEAK" in raw, (
+        "the STORE returns what is stored; masking is the tool's job so the "
+        "operator HTTP surface keeps its existing behaviour"
+    )
+
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    assert "sk-live-LEGACY-LEAK" not in remask_summary(raw)
+    assert "***MASKED***" in remask_summary(raw)
+
+
+@pytest.mark.asyncio
+async def test_the_tool_never_surfaces_an_unmaskable_summary(tmp_path):
+    """A summary too truncated to parse cannot be re-masked field by field,
+    and returning it raw would be the exact hole this closes. Losing a match's
+    detail is the safe failure; leaking a legacy secret is not."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "unmaskable.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="WalletAgent", tool_name="send_payment",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary='{"memo": "orphaned worker", "api_key": "sk-live-CUT',
+    )
+
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="orphaned worker")
+
+    assert result.data["count"] == 1, "it must still be FOUND"
+    assert "sk-live-CUT" not in result.confirmation
+    assert "sk-live-CUT" not in str(result.data)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_attempt_is_not_described_as_authorized(tmp_path):
+    """The headline used to say every match "was authorized" while the row
+    beside it read `auto_denied`. In a tool whose whole purpose is telling an
+    agent what it has already done, that is the failure mode itself."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "refused.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="GitHubFeature", tool_name="create_github_issue",
+        action="tool_execution", decision="auto_denied",
+        args_summary='{"title": "the worker is orphaned"}',
+    )
+
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="worker is orphaned")
+
+    assert "REFUSED" in result.confirmation
+    assert "none of this work ran" in result.confirmation
+    assert result.data["matches"][0]["decision"] == "auto_denied"
+
+
+@pytest.mark.asyncio
+async def test_a_removed_features_dispatch_name_still_filters(tmp_path):
+    """`_dispatch_entries` is rebuilt from CURRENTLY LOADED features, but the
+    audit log outlives the feature list. A feature removed or renamed since its
+    envelope rows were written would drop out of the exclusion and its old
+    REQUESTS would start reading as prior attempts."""
+    db_path = tmp_path / "durable_entries.db"
+
+    boot_one = PermissionStore(str(db_path))
+    await boot_one.initialize()
+    boot_one.mark_dispatch_entry("retired_feature")
+    await boot_one.sync_dispatch_entries()
+    await boot_one.log_decision(
+        feature_name="RetiredFeature", tool_name="retired_feature",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary='{"task": "look into whether the worker is orphaned"}',
+    )
+
+    # A later boot: the feature is gone, so nothing marks it this time.
+    boot_two = PermissionStore(str(db_path))
+    await boot_two.initialize()
+    assert "retired_feature" not in boot_two.dispatch_entries
+
+    matches, _ = await boot_two.search_audit_log("worker is orphaned")
+    assert matches == [], (
+        "the name outlives the feature because the rows do"
+    )

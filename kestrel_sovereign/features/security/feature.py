@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
+from kestrel_sovereign.features.security.args_summary import remask_summary
 from kestrel_sovereign.features.security.permissions import (
     SEARCH_TOOL_NAME,
     PermissionLevel,
@@ -1309,14 +1310,36 @@ class SecurityFeature(Feature):
                 },
             )
 
-        lines = [
-            f"{len(matches)} prior ATTEMPT(s) matched ({scope_text}) — each row "
-            "records that the call was authorized, not that it succeeded:\n"
-        ]
+        # Re-mask on the way out. The stored value is only as safe as the
+        # writer that produced it, and this tool cannot verify the provenance
+        # of rows it did not write — including pre-F252 ApprovalQueue rows,
+        # which kept an unmasked copy. Masking here makes the guarantee a
+        # property of THIS path rather than of every historical writer.
         for entry in matches:
+            entry["args_summary"] = remask_summary(entry.get("args_summary"))
+
+        # Decisions that mean the call was refused or never reached a decider.
+        # A blanket "these were authorized" line contradicts the decision shown
+        # beside it, and tells the model blocked work ran.
+        _NOT_AUTHORIZED = {
+            "auto_denied", "user_denied", "timeout", "user_cancelled",
+            "no_approver",
+        }
+        refused = sum(1 for e in matches if e["decision"] in _NOT_AUTHORIZED)
+        allowed = len(matches) - refused
+        headline = f"{len(matches)} prior attempt(s) matched ({scope_text})"
+        if refused and allowed:
+            headline += f" — {allowed} authorized, {refused} refused"
+        elif refused:
+            headline += f" — all {refused} REFUSED, so none of this work ran"
+        else:
+            headline += " — authorized to run, which is not proof it succeeded"
+        lines = [headline + ". Read `decision` per row:\n"]
+        for entry in matches:
+            marker = "✗" if entry["decision"] in _NOT_AUTHORIZED else "→"
             lines.append(
-                f"  {entry['timestamp']}  {entry['feature']}.{entry['tool']} "
-                f"[{entry['decision']}]"
+                f"  {marker} {entry['timestamp']}  "
+                f"{entry['feature']}.{entry['tool']} [{entry['decision']}]"
             )
             if entry["args_summary"]:
                 lines.append(f"     {entry['args_summary']}")

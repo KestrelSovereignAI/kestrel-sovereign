@@ -53,6 +53,40 @@ def mask_sensitive(data: Any) -> Any:
     return data
 
 
+def remask_summary(summary: Optional[str], max_length: int = 500) -> Optional[str]:
+    """Re-apply masking to an ALREADY-PERSISTED summary, at read time (#3107).
+
+    ``summarize_args`` masks on the way in, which makes the stored value safe
+    only for rows written by a code path that had that masking. It says nothing
+    about rows written by an older version — ``ApprovalQueue`` kept its own
+    UNMASKED copy until F252 — or by any writer a reader has not inspected.
+
+    A read-back tool cannot verify the provenance of 86,000 historical rows, so
+    it should not depend on it. Masking again here moves the guarantee from the
+    write path (many, historical, unknowable) to the read path (one, current,
+    ours), which is the only place it can be made to hold for every row.
+
+    Cheap for the common case: a row already masked re-masks to itself.
+
+    A summary too truncated to parse cannot be re-masked field-by-field, and
+    returning it raw would be the exact hole this closes — so it is reported as
+    unparseable rather than exposed. Losing a match is the safe failure; leaking
+    a legacy secret is not.
+    """
+    if not summary:
+        return summary
+    try:
+        parsed = json.loads(summary)
+    except (ValueError, TypeError):
+        return "(summary truncated beyond re-masking; not shown)"
+    if not isinstance(parsed, (dict, list)):
+        return summary[:max_length]
+    try:
+        return json.dumps(mask_sensitive(parsed), default=str)[:max_length]
+    except (TypeError, ValueError):
+        return "(summary could not be re-masked; not shown)"
+
+
 def summarize_args(args: Optional[dict], max_length: int = 500) -> Optional[str]:
     """Return a masked, truncated JSON summary of ``args`` for the audit log.
 

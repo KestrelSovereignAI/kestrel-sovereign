@@ -395,6 +395,9 @@ class PermissionStore:
         # :meth:`mark_dispatch_entry`. Repopulated on every boot by feature
         # registration, so it is always current without a schema column.
         self._dispatch_entries: set = set()
+        # Marked this boot but not yet persisted — flushed on the next read so
+        # registration stays synchronous and cheap.
+        self._dispatch_entries_dirty: set = set()
         # Global Auto has two tiers backing one effective state:
         #   - _global_auto_session: in-memory, cleared on session reset.
         #   - _global_auto_always:  persisted in security_global_settings,
@@ -435,6 +438,20 @@ class PermissionStore:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(feature_name, tool_name)
+                )
+            """)
+
+            # Names that have ever denoted a feature-as-subagent DISPATCH
+            # entry (#3107). Durable and append-only on purpose: the in-memory
+            # set is rebuilt from CURRENTLY LOADED features, so a feature that
+            # is removed or renamed takes its name out of the exclusion while
+            # its historical envelope rows stay in the table — and text from an
+            # old subagent REQUEST then reads as a prior attempt. The audit log
+            # outlives the feature list, so the filter has to as well.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS security_dispatch_entries (
+                    tool_name TEXT PRIMARY KEY,
+                    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -916,10 +933,35 @@ class PermissionStore:
         """
         if tool_name:
             self._dispatch_entries.add(tool_name)
+            self._dispatch_entries_dirty.add(tool_name)
 
     @property
     def dispatch_entries(self) -> frozenset:
         """Tool names registered as feature-as-subagent dispatch entries."""
+        return frozenset(self._dispatch_entries)
+
+    async def sync_dispatch_entries(self) -> frozenset:
+        """Persist names marked this boot, then return the FULL durable set.
+
+        The union matters, not this boot's list: a feature removed or renamed
+        since the rows were written is absent from the live feature map but its
+        envelope rows are still in the audit log, and an exclusion built only
+        from what is loaded now would stop covering them.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            if self._dispatch_entries_dirty:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO security_dispatch_entries "
+                    "(tool_name) VALUES (?)",
+                    [(name,) for name in sorted(self._dispatch_entries_dirty)],
+                )
+                await db.commit()
+                self._dispatch_entries_dirty.clear()
+            cursor = await db.execute(
+                "SELECT tool_name FROM security_dispatch_entries"
+            )
+            rows = await cursor.fetchall()
+        self._dispatch_entries.update(r[0] for r in rows)
         return frozenset(self._dispatch_entries)
 
     async def register_tool(
@@ -1213,6 +1255,10 @@ class PermissionStore:
         needle = (query or "").strip()
         if not needle:
             return [], False
+
+        # Durable union, not this boot's registrations: an envelope written by
+        # a feature since removed must still be excluded.
+        await self.sync_dispatch_entries()
 
         where, params = self._match_predicate(
             needle, tool_name=tool_name, days=days,
