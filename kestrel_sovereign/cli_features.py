@@ -1121,6 +1121,50 @@ def _write_constraint_lines(handle, lines) -> None:
     handle.write("\n".join(lines) + "\n")
 
 
+def _materialise_constraints(lines, constraint_path=None):
+    """Write *lines* as a constraints file; return ``(path, disposable)``.
+
+    Without *constraint_path* the file is a temporary the caller removes on
+    return, because nothing outside the run can name it.
+
+    With one, the file has already been PUBLISHED inside a rendered recovery
+    command, so it is REPLACED rather than truncated and rewritten. Opening it
+    ``"w"`` empties it first, and a Ctrl-C arriving in that window leaves the
+    printed command naming an empty file — an unbounded install wearing a
+    ``-c``, which is worse than the missing argument this all started as
+    (issue #3109). Staged in the same directory and moved with
+    :func:`os.replace`, the path always names a COMPLETE file: the old lines
+    or the new ones, never neither.
+    """
+    import tempfile
+
+    if constraint_path is None:
+        fd, path = tempfile.mkstemp(prefix="kestrel-constraints-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            _write_constraint_lines(fh, lines)
+        return path, True
+
+    target = str(constraint_path)
+    fd, staged = tempfile.mkstemp(
+        prefix="kestrel-constraints-",
+        suffix=".txt",
+        dir=os.path.dirname(target) or None,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            _write_constraint_lines(fh, lines)
+        os.replace(staged, target)
+    except BaseException:
+        # KeyboardInterrupt included: an abandoned stage file must not be left
+        # beside the one an operator is about to read.
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
+    return target, False
+
+
 def _extension_install_run(
     pip_args: list, *, constraints, constraint_path=None, reinstall=None, timeout=None,
 ):
@@ -1195,8 +1239,6 @@ def _extension_install_run(
     follows one which resolved those dependencies, and fails if they do not
     resolve (:func:`_install_commands`).
     """
-    import tempfile
-
     constraint_file = None
     # Whether the file is ours to remove. A caller-named path has been
     # published to the operator inside a rendered command, so deleting it on
@@ -1204,16 +1246,9 @@ def _extension_install_run(
     disposable = True
     extra_args: list = []
     if constraints:
-        if constraint_path:
-            constraint_file, disposable = str(constraint_path), False
-            handle = open(constraint_file, "w", encoding="utf-8")
-        else:
-            fd, constraint_file = tempfile.mkstemp(
-                prefix="kestrel-constraints-", suffix=".txt",
-            )
-            handle = os.fdopen(fd, "w", encoding="utf-8")
-        with handle as fh:
-            _write_constraint_lines(fh, constraints)
+        constraint_file, disposable = _materialise_constraints(
+            constraints, constraint_path,
+        )
         extra_args = ["-c", constraint_file]
 
     try:
@@ -1970,14 +2005,17 @@ class CoreInstallGuard:
             False,
         )
 
-    def _repair(self, *, timeout=None):
-        """Reinstall core from its declared source.
+    def _repair(self, drift, replaced, *, timeout=None) -> "CoreGuardOutcome":
+        """Reinstall core from its declared source, and report what happened.
 
-        Returns ``(ok, command, shell, result)`` — ``shell`` naming what
-        ``command`` is quoted for, captured here so the label can never describe
-        a different rendering than the one it travels with.
+        Returns the whole :class:`CoreGuardOutcome`, built HERE rather than
+        from a tuple the caller reassembles. The repair keeps growing facts
+        that are not derivable from each other — where core ended up, whether
+        the closing resolve succeeded, whether the bounds could be carried at
+        all — and every one of them arrived as another positional the caller
+        had to remember to pass on. One of them already went missing that way.
 
-        ``ok`` is decided by RE-READING core afterwards, in both directions —
+        ``repaired`` is decided by RE-READING core afterwards, in both directions —
         the installer's exit code is evidence about the installer, not about
         where core ended up. A nonzero exit does not mean core is still wrong:
         a pip repair is two passes (:func:`_install_commands`) and the first
@@ -2000,11 +2038,26 @@ class CoreInstallGuard:
 
         *timeout* bounds the repair's own installer subprocess — see
         :meth:`resolve`. A repair killed by it is reported as an ordinary failed
-        repair (``ok=False``) rather than raised: the operator still needs the
-        restore command, and the caller still needs to report whatever brought
-        it here.
+        repair (``repaired=False``) rather than raised: the operator still needs
+        the restore command, and the caller still needs to report whatever
+        brought it here.
         """
-        pip_args, reinstall, rendered, shell, _ = self._restore_plan()
+        pip_args, reinstall, rendered, shell, bounds_unwritable = self._restore_plan()
+        if bounds_unwritable:
+            # The manifest's windows exist and nothing can carry them, so this
+            # install cannot be performed as declared. Running it anyway is the
+            # unbounded install those windows forbid — committed by the code
+            # that exists to honour them, over a host already off its declared
+            # core. REFUSED, and reported as a repair that never ran (#3109).
+            return CoreGuardOutcome(
+                drift=drift,
+                replaced=replaced,
+                repaired=False,
+                attempted=False,
+                bounds_unwritable=True,
+                command="",
+                shell=shell,
+            )
         # Core is never constrained against itself, here least of all — this
         # install exists to put core back. The rest of the manifest still
         # binds: a repair that resolves a dependency outside another entry's
@@ -2031,12 +2084,20 @@ class CoreInstallGuard:
         # declared source nor able to load — reporting it by core's location
         # alone downgrades the stronger fact to the weaker one.
         unresolved = restored and getattr(result, "resolve_incomplete", False)
-        ok = restored and not unresolved
+        repaired = restored and not unresolved
         if restored:
             # Core is where the policy wants it: that is the state this batch
             # now measures later drift against.
             self.refresh()
-        return ok, rendered, shell, result, unresolved
+        return CoreGuardOutcome(
+            drift=drift,
+            replaced=replaced,
+            repaired=repaired,
+            unresolved=unresolved,
+            command=rendered,
+            shell=shell,
+            output="" if repaired else (result.stderr or result.stdout or "").strip(),
+        )
 
     def resolve(self, *, timeout=None) -> CoreGuardOutcome:
         """Check core against the policy, and repair it if it drifted.
@@ -2077,16 +2138,7 @@ class CoreInstallGuard:
         if not self.policy.source_is_verifiable:
             return self._unrestorable(drift, replaced)
 
-        repaired, rendered, shell, result, unresolved = self._repair(timeout=timeout)
-        return CoreGuardOutcome(
-            drift=drift,
-            replaced=replaced,
-            repaired=repaired,
-            unresolved=unresolved,
-            command=rendered,
-            shell=shell,
-            output="" if repaired else (result.stderr or result.stdout or "").strip(),
-        )
+        return self._repair(drift, replaced, timeout=timeout)
 
     def verify(self) -> int:
         """Assert core survived the batch; repair and report if it did not.

@@ -3488,3 +3488,73 @@ def test_an_interrupt_still_names_the_drift_when_the_bounds_cannot_be_written(
     # move a declared entry the moment it is pasted.
     assert "pip install" not in err
     assert "by hand" not in err
+
+
+def test_a_repair_that_cannot_carry_the_bounds_is_refused_not_attempted(
+    monkeypatch, capsys,
+):
+    """An install that cannot be bounded must not run, not merely go unprinted.
+
+    Withholding the printed command while still performing the install is the
+    same violation with nobody watching: the restore resolves free of the
+    windows the operator declared, over a host that is ALREADY off its declared
+    core. So the repair is refused, and reported as one that never ran.
+    """
+    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.feature_reconcile import SourceEntry
+
+    venv = FakeUv()
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    use_fake_uv(monkeypatch, venv)
+    guard = CoreInstallGuard.snapshot({
+        CORE: SourceEntry(package=CORE, pypi=">=0.52,<0.53"),
+        "kestrel-feature-workflows": SourceEntry(
+            package="kestrel-feature-workflows", pypi=">=0.5.1,<0.6",
+        ),
+    })
+    real_mkstemp = tempfile.mkstemp
+
+    def no_restore_file(*args, **kwargs):
+        if str(kwargs.get("prefix", "")).startswith("kestrel-restore-constraints-"):
+            raise OSError(28, "No space left on device")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(tempfile, "mkstemp", no_restore_file)
+
+    outcome = guard.resolve()
+
+    assert outcome.drift is not None                # the drift is still named
+    assert outcome.repaired is False
+    assert outcome.attempted is False               # ...and nothing was tried
+    assert not venv.commands, venv.commands         # asserted on the venv, not a flag
+    assert outcome.command == ""
+    assert "could not be written to a constraints file" in outcome.restore_instruction
+    # Not the "nothing declares where core belongs" sentence: something does.
+    assert "no declared source" not in outcome.restore_instruction
+
+
+def test_replacing_a_published_constraints_file_never_leaves_it_empty(
+    monkeypatch, tmp_path,
+):
+    """The file a recovery command names is replaced, never truncated.
+
+    An install rewrites the published file with the lines it carries. Opening
+    it `"w"` empties it first, and a Ctrl-C in that window leaves the printed
+    command pointing at an EMPTY constraints file — which reads as bounded and
+    installs unbounded, the failure this whole change is about, arrived at
+    through the fix for it.
+    """
+    target = tmp_path / "bounds.txt"
+    target.write_text("kestrel-feature-workflows>=0.5.1,<0.6\n", encoding="utf-8")
+
+    def interrupted(handle, lines):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_features, "_write_constraint_lines", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli_features._materialise_constraints(["kestrel-feature-voice>=0.4"], target)
+
+    assert target.read_text(encoding="utf-8") == "kestrel-feature-workflows>=0.5.1,<0.6\n"
+    # ...and no half-written stage file is left beside the one being read.
+    assert sorted(q.name for q in tmp_path.iterdir()) == ["bounds.txt"]
