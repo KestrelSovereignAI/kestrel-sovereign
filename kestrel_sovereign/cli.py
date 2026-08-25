@@ -683,32 +683,82 @@ def cmd_storage_stamp_sessions(args) -> int:
         print(f"error: no database at {args.db}", file=sys.stderr)
         return 2
 
-    async def run() -> Dict[str, int]:
+    async def run() -> Optional[Dict[str, int]]:
+        # Looked at BEFORE it is opened. Both constructors run `_init_schema`,
+        # which CREATES `conversation_history` and the rest of the core schema
+        # — so a check made after opening always passes, and a mistyped path or
+        # a DSN naming somebody else's database would be initialised and
+        # reported as a zero-row success.
+        if not await _holds_conversation_history(args.db, args.dsn):
+            print(
+                f"error: {args.dsn or args.db} is not a Kestrel conversation "
+                "database",
+                file=sys.stderr,
+            )
+            return None
         db = (
             await AsyncDatabase.postgres(args.dsn)
             if args.dsn
             else await AsyncDatabase.sqlite(args.db)
         )
         try:
-            if not await db.table_exists("conversation_history"):
-                raise SystemExit(
-                    f"error: {args.dsn or args.db} holds no conversation history"
-                )
             return await stamp_legacy_sessions(db, args.agent_id)
         finally:
             await db.close()
 
     result = asyncio.run(run())
+    if result is None:
+        return 2
     if args.json:
         print(json.dumps(result))
     else:
         print(
             f"{result['stamped']} legacy rows now name their session; "
-            f"{result['refused']} left as they stand (their own claim names a "
-            "different live session, and which is right is not this pass's to "
-            "decide — see the log for each)."
+            f"{result['refused']} left as they stand because their own claim "
+            "names a different live session, and which is right is not this "
+            f"pass's to decide; {result['skipped']} left for another reason "
+            "(an unreadable document, a key the column may not hold). See the "
+            "log for each refusal."
         )
     return 0
+
+
+async def _holds_conversation_history(db_path, dsn) -> bool:
+    """Whether the target already IS a Kestrel conversation database.
+
+    Asked through a connection that creates nothing: ``AsyncDatabase``'s
+    constructors initialise a schema on the way in, which would make the
+    question answer itself.
+    """
+    if dsn:
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        backend = PostgresBackend(dsn=dsn)
+        await backend.connect()
+        try:
+            found = await backend.fetchone(
+                "SELECT to_regclass('conversation_history')", ()
+            )
+            return bool(found and found[0])
+        finally:
+            await backend.close()
+
+    import sqlite3
+
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        return (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                ("conversation_history",),
+            ).fetchone()
+            is not None
+        )
+    finally:
+        connection.close()
 
 
 async def _run_auth_login(args) -> int:

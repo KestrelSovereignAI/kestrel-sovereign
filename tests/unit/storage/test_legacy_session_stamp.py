@@ -286,7 +286,7 @@ class TestThePass:
         db = await AsyncDatabase.sqlite(str(path))
         try:
             assert (await _metadata(db))[2] == ("1", None)
-            assert await stamp_legacy_sessions(db) == {"stamped": 1, "refused": 0}
+            assert await stamp_legacy_sessions(db) == {"stamped": 1, "refused": 0, "skipped": 0}
             # Metadata AND the column, because a reader that consults one and
             # not the other is the shape #3098 was about.
             assert (await _metadata(db))[2] == (UUID_A, UUID_A)
@@ -310,8 +310,8 @@ class TestThePass:
 
         db = await AsyncDatabase.sqlite(str(path))
         try:
-            assert await stamp_legacy_sessions(db) == {"stamped": 1, "refused": 0}
-            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0}
+            assert await stamp_legacy_sessions(db) == {"stamped": 1, "refused": 0, "skipped": 0}
+            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0, "skipped": 0}
         finally:
             await db.close()
 
@@ -374,7 +374,7 @@ class TestThePass:
 
         try:
             legacy_session_stamp._change_stamp = moving
-            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0}
+            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0, "skipped": 0}
             assert (await _metadata(db))[2] == ("1", None)
         finally:
             legacy_session_stamp._change_stamp = real_stamp
@@ -407,7 +407,7 @@ class TestThePass:
 
         monkeypatch.setattr(legacy_session_stamp, "plan_stamps", stale)
         try:
-            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0}
+            assert await stamp_legacy_sessions(db) == {"stamped": 0, "refused": 0, "skipped": 0}
             assert (await _metadata(db))[2] == ("1", None), "the row was clobbered"
         finally:
             await db.close()

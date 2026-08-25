@@ -116,6 +116,10 @@ class StampPlan(NamedTuple):
     #: ``(row_id, claimed, grouped)`` for a claim that conflicts with the
     #: grouping. Reported, never resolved.
     conflicts: List[Tuple[int, str, str]]
+    #: Rows left alone for a reason that is not a conflict — an unreadable
+    #: document, a key the column may not hold. Counted so a run that stamps
+    #: nothing and refuses nothing cannot be read as "there was nothing left".
+    skipped: int = 0
 
 
 def plan_stamps(
@@ -191,6 +195,7 @@ def plan_stamps(
 
     stamps: List[LegacyStamp] = []
     conflicts: List[Tuple[int, str, str]] = []
+    skipped = 0
     for session in grouped:
         key = str(session["session_id"])
         # The key has to have come from a row's METADATA, not from the row-id
@@ -214,6 +219,7 @@ def plan_stamps(
             if claim is not None:
                 target = _claimed_row(claim)
                 if target is None:
+                    skipped += 1
                     continue  # a claim that is not a row id: not ours to read
                 if target in live_ids and known.get(target) != key:
                     conflicts.append((message["id"], str(claim), key))
@@ -221,6 +227,7 @@ def plan_stamps(
             previous = raw[message["id"]]
             document = _document(previous)
             if document is None:
+                skipped += 1
                 continue  # unreadable, and a message is still a message
             document[SESSION_ID_KEY] = key
             written = json.dumps(document)
@@ -229,11 +236,12 @@ def plan_stamps(
                 # duplicate key the three readers resolve differently. Writing
                 # metadata the column may not follow would put the two back
                 # into the disagreement this exists to end.
+                skipped += 1
                 continue
             stamps.append(
                 LegacyStamp(int(message["id"]), key, written, previous)
             )
-    return StampPlan(stamps, conflicts)
+    return StampPlan(stamps, conflicts, skipped)
 
 
 def _claimed_row(claim: Any) -> Optional[int]:
@@ -364,7 +372,7 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
     from .async_conversation_store import _rows_affected
 
     if not await db.table_exists("conversation_history"):
-        return {"stamped": 0, "refused": 0}
+        return {"stamped": 0, "refused": 0, "skipped": 0}
     if agent_id is None:
         agents = [
             row[0]
@@ -375,12 +383,18 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
     else:
         agents = [agent_id]
 
-    total = {"stamped": 0, "refused": 0}
+    total = {"stamped": 0, "refused": 0, "skipped": 0}
     for agent in agents:
         # Each view read ONCE and kept: the grouping is global within a view,
         # so the rows have to be in hand anyway. Measured on a synthetic
         # 100,000-row agent, a full pass is 1.2 seconds; on the live agents,
         # twenty milliseconds.
+        # Taken BEFORE the first read, not after the last. A lifecycle
+        # mutation committing between two of the view queries would otherwise
+        # be part of the baseline — the plan built from rows it had already
+        # moved, and the fence agreeing that nothing happened.
+        fence = await _change_stamp(db, agent)
+
         by_view: List[Sequence[Sequence[Any]]] = []
         placements: Dict[Any, Optional[str]] = {}
         for where in _VIEWS:
@@ -391,48 +405,58 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
             for row_id, session in _placements(view_rows).items():
                 placements[row_id] = session
 
-        # What the database has counted for this agent, read after the plan and
-        # checked before the writes.
-        #
-        # The compare-and-set below asks whether the ROW moved, and that is not
-        # the whole question: a candidate's metadata can sit still while the
-        # rows around it — the ones that decide which session it is in — do
-        # not. Measured as a hazard rather than a theory: a purge that removes
-        # a canonical anchor and misses its unlabeled tail would otherwise have
-        # this stamp that tail back INTO the purged session, and a privacy
-        # purge that leaves a row naming what it destroyed is not one.
-        fence = await _change_stamp(db, agent)
-
         stamped = 0
+        skipped = 0
         conflicts: List[Tuple[int, str, str]] = []
+        moved = False
         for rows in by_view:
+            if moved:
+                break
             plan = plan_stamps(rows, placements)
             conflicts.extend(plan.conflicts)
+            skipped += plan.skipped
             for start in range(0, len(plan.stamps), STAMP_BATCH):
                 batch = plan.stamps[start:start + STAMP_BATCH]
-                if not await _unchanged(db, agent, fence, stamped):
+                # Revalidated INSIDE the transaction, not before it. The
+                # compare-and-set below asks whether the ROW moved, and that is
+                # not the whole question: a candidate's metadata can sit still
+                # while the rows around it — the ones that decide which session
+                # it is in — do not. A purge removing a canonical anchor and
+                # missing its unlabeled tail would otherwise have this stamp
+                # that tail back INTO the purged session, and a privacy purge
+                # that leaves a row naming what it destroyed is not one.
+                # Checked outside, a writer only has to commit in the gap
+                # before ``BEGIN``.
+                landed = 0
+                async with db.transaction():
+                    if await _unchanged(db, agent, fence, stamped):
+                        for stamp in batch:
+                            affected = await db.execute(
+                                "UPDATE conversation_history "
+                                "SET metadata = ?, session_id = ? "
+                                f"WHERE id = ? AND agent_id = ? AND metadata "
+                                f"{_null_safe_equality(db.backend_type)}",
+                                (
+                                    stamp.metadata,
+                                    stamp.session_id,
+                                    stamp.row_id,
+                                    agent,
+                                    stamp.previous_metadata,
+                                ),
+                            )
+                            landed += _rows_affected(affected)
+                    else:
+                        # Nothing written, so nothing to roll back: the check
+                        # is the first thing the transaction does.
+                        moved = True
+                stamped += landed
+                if moved:
                     logger.info(
                         "history moved under the pass for %s; stopping after "
                         "%s rows, run it again (#3120)",
                         agent, stamped,
                     )
                     break
-                async with db.transaction():
-                    for stamp in batch:
-                        affected = await db.execute(
-                            "UPDATE conversation_history "
-                            "SET metadata = ?, session_id = ? "
-                            f"WHERE id = ? AND agent_id = ? AND metadata "
-                            f"{_null_safe_equality(db.backend_type)}",
-                            (
-                                stamp.metadata,
-                                stamp.session_id,
-                                stamp.row_id,
-                                agent,
-                                stamp.previous_metadata,
-                            ),
-                        )
-                        stamped += _rows_affected(affected)
 
         for row_id, claimed, grouped in conflicts:
             logger.warning(
@@ -448,4 +472,5 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
             )
         total["stamped"] += stamped
         total["refused"] += len(conflicts)
+        total["skipped"] += skipped
     return total
