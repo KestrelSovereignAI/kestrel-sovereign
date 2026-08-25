@@ -691,8 +691,8 @@ def cmd_storage_stamp_sessions(args) -> int:
         # reported as a zero-row success.
         if not await _holds_conversation_history(args.db, args.dsn):
             print(
-                f"error: {args.dsn or args.db} is not a Kestrel conversation "
-                "database",
+                f"error: {_target_label(args.db, args.dsn)} is not a Kestrel "
+                "conversation database",
                 file=sys.stderr,
             )
             return None
@@ -720,7 +720,31 @@ def cmd_storage_stamp_sessions(args) -> int:
             "(an unreadable document, a key the column may not hold). See the "
             "log for each refusal."
         )
-    return 0
+        if result["incomplete"]:
+            print(
+                f"{result['incomplete']} agent(s) had rows move under the "
+                "pass, so it did not finish them. Run it again.",
+                file=sys.stderr,
+            )
+    # A pass that lost a race is not a failure and is not a completion either.
+    # Saying so in the exit status is what lets a script notice.
+    return 1 if result["incomplete"] else 0
+
+
+def _target_label(db_path, dsn) -> str:
+    """A DSN without its credentials, or the path as given.
+
+    An error message goes to stderr, into terminal history and CI logs, and a
+    connection string carries a username and password.
+    """
+    if not dsn:
+        return str(db_path)
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(dsn)
+    host = parsed.hostname or "?"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{host}{port}{parsed.path or ''}"
 
 
 async def _holds_conversation_history(db_path, dsn) -> bool:
@@ -736,10 +760,16 @@ async def _holds_conversation_history(db_path, dsn) -> bool:
         backend = PostgresBackend(dsn=dsn)
         await backend.connect()
         try:
-            found = await backend.fetchone(
-                "SELECT to_regclass('conversation_history')", ()
+            found = await backend.fetch_one(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'conversation_history' "
+                "AND column_name IN ('agent_id', 'metadata', 'created_at')",
+                (),
             )
-            return bool(found and found[0])
+            # Three named columns, not merely a table of that name: a
+            # `conversation_history` belonging to something else would
+            # otherwise be opened, and opening runs `_init_schema`.
+            return bool(found and int(found[0]) == 3)
         finally:
             await backend.close()
 
@@ -750,13 +780,16 @@ async def _holds_conversation_history(db_path, dsn) -> bool:
     except sqlite3.OperationalError:
         return False
     try:
-        return (
-            connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                ("conversation_history",),
-            ).fetchone()
-            is not None
-        )
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(conversation_history)"
+            )
+        }
+        # Three named columns, not merely a table of that name: a
+        # `conversation_history` belonging to something else would otherwise be
+        # opened, and opening runs `_init_schema`.
+        return {"agent_id", "metadata", "created_at"} <= columns
     finally:
         connection.close()
 

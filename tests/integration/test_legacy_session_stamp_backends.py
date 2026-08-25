@@ -62,6 +62,7 @@ async def test_the_migration_stamps_a_legacy_row_on_both_backends(db_backend):
         "stamped": 1,
         "refused": 0,
         "skipped": 0,
+        "incomplete": 0,
     }
 
     stamped = await db.fetchone(

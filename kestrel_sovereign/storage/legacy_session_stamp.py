@@ -372,7 +372,7 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
     from .async_conversation_store import _rows_affected
 
     if not await db.table_exists("conversation_history"):
-        return {"stamped": 0, "refused": 0, "skipped": 0}
+        return {"stamped": 0, "refused": 0, "skipped": 0, "incomplete": 0}
     if agent_id is None:
         agents = [
             row[0]
@@ -383,7 +383,7 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
     else:
         agents = [agent_id]
 
-    total = {"stamped": 0, "refused": 0, "skipped": 0}
+    total = {"stamped": 0, "refused": 0, "skipped": 0, "incomplete": 0}
     for agent in agents:
         # Each view read ONCE and kept: the grouping is global within a view,
         # so the rows have to be in hand anyway. Measured on a synthetic
@@ -409,6 +409,7 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
         skipped = 0
         conflicts: List[Tuple[int, str, str]] = []
         moved = False
+        incomplete = False
         for rows in by_view:
             if moved:
                 break
@@ -428,7 +429,16 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
                 # Checked outside, a writer only has to commit in the gap
                 # before ``BEGIN``.
                 landed = 0
-                async with db.transaction():
+                # ``migration_lock`` rather than a bare transaction, so the
+                # fence and the writes are one decision. A bare READ COMMITTED
+                # transaction on PostgreSQL lets an archive or delete commit
+                # between the ledger read and the updates, and SQLite's
+                # deferred BEGIN reads first and then fails its upgrade to the
+                # writer slot outright. The lock takes an advisory lock there
+                # and BEGINs IMMEDIATE here — and a BATCH is exactly the
+                # bounded unit it wants, which the unbounded plan above was
+                # not.
+                async with db.migration_lock(f"stamp_sessions:{agent}"):
                     if await _unchanged(db, agent, fence, stamped):
                         for stamp in batch:
                             affected = await db.execute(
@@ -450,6 +460,12 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
                         # is the first thing the transaction does.
                         moved = True
                 stamped += landed
+                if landed != len(batch):
+                    # A compare-and-set matched nothing: the row moved between
+                    # the plan and the write. Not an error and not a completed
+                    # pass either — the caller is told so it can run again
+                    # rather than read totals as "there is nothing left".
+                    incomplete = True
                 if moved:
                     logger.info(
                         "history moved under the pass for %s; stopping after "
@@ -473,4 +489,5 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
         total["stamped"] += stamped
         total["refused"] += len(conflicts)
         total["skipped"] += skipped
+        total["incomplete"] += int(incomplete or moved)
     return total
