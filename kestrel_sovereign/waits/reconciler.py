@@ -571,7 +571,19 @@ class WaitReconciler:
         if (kind, handle) in self._pending_signal_tasks:
             return
 
-        attempts_so_far = state.last_delivery_attempts if state else 0
+        # Attempts belong to a TRANSITION, not to a handle (#3105). A provider
+        # that corrects a terminal state — talon's supported
+        # ``finished_unknown -> failed`` — starts a NEW transition, and its
+        # first wake is news. Counting it as attempt N+1 of the old one both
+        # brings the retry cap forward against work that was never retried and
+        # makes the payload label new information as a repeat, which is the
+        # exact confusion the provenance below exists to remove.
+        same_transition = bool(
+            state and state.attempts_signaled_target == signaled_token
+        )
+        attempts_so_far = (
+            state.last_delivery_attempts if (state and same_transition) else 0
+        )
         if attempts_so_far >= MAX_DELIVERY_ATTEMPTS:
             # Retry cap reached — lock signaled and surface a synthetic
             # delivery status for operator review.
@@ -594,7 +606,8 @@ class WaitReconciler:
         signal = self._build_signal(
             provider, kind, handle, status, attempts,
             origin_session_id=origin_session_id,
-            prior_state=state,
+            # Only THIS transition's prior attempt is provenance for it.
+            prior_state=state if same_transition else None,
         )
 
         if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
@@ -723,7 +736,11 @@ class WaitReconciler:
         """
         source = getattr(provider, "signal", None) or "wait.complete"
         prior_status = getattr(prior_state, "last_delivery_status", None)
-        prior_at = getattr(prior_state, "last_delivery_attempt_at", None)
+        # ``last_attempt_started_at``, not ``last_delivery_attempt_at``: the
+        # latter is rewritten by Phase 0's harvest, so it answers "when did the
+        # reconciler last look" rather than "when was the previous dispatch
+        # tried". Measured 41 minutes apart on the live #3105 job.
+        prior_at = getattr(prior_state, "last_attempt_started_at", None)
         payload: Dict[str, Any] = {
             **(status.data or {}),
             "kind": kind,

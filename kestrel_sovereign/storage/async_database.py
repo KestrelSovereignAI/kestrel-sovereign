@@ -711,6 +711,15 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     last_delivery_error TEXT,
     last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
     last_delivery_attempt_at TIMESTAMP,
+    -- Attempts belong to a TRANSITION, not to a handle (#3105). A provider
+    -- that corrects a terminal state (talon finished_unknown -> failed) starts
+    -- a new transition whose first wake is news, not attempt N+1 of the old
+    -- one. This records which signaled token the counter is counting.
+    attempts_signaled_target TEXT NOT NULL DEFAULT '',
+    -- When the current attempt was DISPATCHED. last_delivery_attempt_at is
+    -- rewritten at harvest time, so it answers "when did we last look", not
+    -- "when did we try" — a difference measured at 41 minutes live.
+    last_attempt_started_at TIMESTAMP,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
@@ -1188,6 +1197,21 @@ class AsyncDatabase:
         # which is what the reconciler reports for them.
         await self._migrate_add_column(
             "wait_signal_state", "last_surface_status", "TEXT"
+        )
+        # Attempt provenance (#3105), same reasoning as the column above: the
+        # table is CREATE TABLE IF NOT EXISTS, so an existing database never
+        # receives these from the schema. No backfill — the defaults are the
+        # honest legacy answer. An existing row mid-retry has an empty
+        # ``attempts_signaled_target``, so its next detect reads as a new
+        # transition and restarts the counter at 1. That is a one-time, bounded
+        # loss of cap history in the direction of delivering rather than
+        # suppressing, which is the safe direction for a wake.
+        await self._migrate_add_column(
+            "wait_signal_state", "attempts_signaled_target",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        await self._migrate_add_column(
+            "wait_signal_state", "last_attempt_started_at", "TIMESTAMP"
         )
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
