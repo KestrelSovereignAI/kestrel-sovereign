@@ -2386,6 +2386,17 @@ class SchedulerFeature(Feature):
         ``{"intent": "check whether CI on PR 3096 went green, then merge"}``.
         That fires a real turn carrying the intention, and it is refused
         (never silently accepted) if it could not.
+
+        SURFACE LIMITATION (#3112 P2). The ``!schedule deadline`` chat command
+        binds arguments STRICTLY BY POSITION — ``parse_command_args`` does not
+        read ``key=value`` pairs — and ``run_at`` is the first parameter. So
+        ``!schedule deadline delay_seconds=1200 task_name=self_followup``
+        does NOT work: the whole first token lands in ``run_at`` and fails
+        ISO-8601 parsing. The relative-delay form is reachable PROGRAMMATICALLY
+        ONLY (a tool call with named arguments). From the chat command, pass an
+        absolute ``run_at`` positionally instead. This is stated rather than
+        quietly omitted because a docstring that drops an unreachable
+        affordance hides the defect instead of reporting it.
         """
         if not str(task_name).strip():
             return ToolResult.failed("task_name is required")
@@ -2748,8 +2759,11 @@ class SchedulerFeature(Feature):
                             "session_bound": bool(
                                 parsed_args.get("origin_session_id")
                             ),
-                            "delivery": (
-                                "user_visible"
+                            # Routing INTENT at enqueue time. Nothing has been
+                            # delivered yet — the wake has not fired — so this
+                            # must not be phrased as "user_visible" (#3112 P2).
+                            "delivery_intent": (
+                                "session_bound"
                                 if parsed_args.get("origin_session_id")
                                 else "internal_unattended"
                             ),
@@ -3931,9 +3945,21 @@ class SchedulerFeature(Feature):
                 "state": state,
                 "intent": intent,
                 "session_bound": session_bound,
-                "delivery": (
-                    "user_visible" if session_bound else "internal_unattended"
+                # ROUTING INTENT, not observed delivery (#3112 review P2).
+                # This row is read from ``scheduled_tasks``, which stores no
+                # signal id, so the dispatcher's ``surface_record`` — the only
+                # thing that knows whether the wake actually reached a pane
+                # (no_emitter / emit_failed / buffered / rejected) — cannot be
+                # consulted here. Claiming "user_visible" on the strength of a
+                # session id being present would report a blank pane as
+                # delivered, which is the exact silent-success shape this
+                # feature exists to eliminate. Naming it as intent keeps the
+                # projection truthful; wiring the signal id through so real
+                # delivery can be joined is tracked separately.
+                "delivery_intent": (
+                    "session_bound" if session_bound else "internal_unattended"
                 ),
+                "delivery_observed": None,
                 "scheduled_at": scheduled_at or row[3],
                 "due_at": row[4] or row[5],
                 "last_run_at": row[6],

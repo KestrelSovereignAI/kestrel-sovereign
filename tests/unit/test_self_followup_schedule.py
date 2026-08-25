@@ -309,7 +309,8 @@ async def test_follow_up_scheduled_in_a_chat_turn_returns_to_that_window(
 
     created = await _schedule(feature)
     assert created.data["self_followup"]["session_bound"] is True
-    assert created.data["self_followup"]["delivery"] == "user_visible"
+    # Routing intent at enqueue, not observed delivery (#3112 P2).
+    assert created.data["self_followup"]["delivery_intent"] == "session_bound"
 
     captured: list[Signal] = []
     real_dispatch = agent.dispatcher.dispatch_signal
@@ -340,7 +341,7 @@ async def test_unattended_follow_up_stays_internal(followup_env):
 
     created = await _schedule(feature)
     assert created.data["self_followup"]["session_bound"] is False
-    assert created.data["self_followup"]["delivery"] == "internal_unattended"
+    assert created.data["self_followup"]["delivery_intent"] == "internal_unattended"
 
     captured: list[Signal] = []
     real_dispatch = agent.dispatcher.dispatch_signal
@@ -574,7 +575,10 @@ async def test_projection_reports_pending_then_fired(followup_env):
     entry = pending.data["followups"][0]
     assert entry["state"] == "pending"
     assert entry["intent"] == SENTINEL
-    assert entry["delivery"] == "internal_unattended"
+    assert entry["delivery_intent"] == "internal_unattended"
+    # Never claims observed delivery: the projection has no signal id with
+    # which to consult the dispatcher's surface_record (#3112 P2).
+    assert entry["delivery_observed"] is None
 
     await runner._tick()
     await _drain(agent)
