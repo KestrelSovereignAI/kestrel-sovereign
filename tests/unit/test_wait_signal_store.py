@@ -272,3 +272,71 @@ async def test_agent_id_isolation(tmp_path, sqlite_database_factory):
     assert await store_b.list_pending() == []
     # A still sees its own row.
     assert await store_a.get("talon", "job-1") is not None
+
+
+@pytest.mark.asyncio
+async def test_attempt_provenance_columns_migrate_onto_a_legacy_table(
+    tmp_path, sqlite_database_factory,
+):
+    """``wait_signal_state`` is CREATE TABLE IF NOT EXISTS, so a database that
+    predates #3105 never receives the two attempt-provenance columns from the
+    schema — only the idempotent ALTERs put them there. This builds the real
+    pre-#3105 table, including a row mid-retry, and asserts the migration lands
+    without disturbing it.
+
+    The legacy row is the case worth pinning: its three recorded attempts
+    belonged to some transition the old schema could not name, so it migrates
+    to an empty ``attempts_signaled_target``. The next detect therefore reads
+    as a NEW transition and restarts the counter — a bounded, one-time loss of
+    cap history in the direction of delivering a wake rather than suppressing
+    one, which is the safe direction."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy_wait_state.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE wait_signal_state (
+            agent_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            last_signaled_outcome TEXT,
+            last_delivery_status TEXT,
+            last_surface_status TEXT,
+            last_delivery_error TEXT,
+            last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_delivery_attempt_at TIMESTAMP,
+            pending_signal_id TEXT,
+            pending_signaled_target TEXT,
+            pending_signal_enqueued_at TIMESTAMP,
+            watching INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (agent_id, kind, handle)
+        );
+        """
+    )
+    legacy.execute(
+        "INSERT INTO wait_signal_state "
+        "(agent_id, kind, handle, last_delivery_attempts, last_delivery_attempt_at) "
+        "VALUES ('did:legacy', 'talon', 'h-old', 3, '2026-08-01 00:00:00')"
+    )
+    legacy.commit()
+    columns_before = {r[1] for r in legacy.execute(
+        "PRAGMA table_info(wait_signal_state)"
+    )}
+    legacy.close()
+    assert "attempts_signaled_target" not in columns_before
+    assert "last_attempt_started_at" not in columns_before
+
+    database = await sqlite_database_factory(db_path)
+    rows = await database.fetchall(
+        "SELECT last_delivery_attempts, attempts_signaled_target, "
+        "last_attempt_started_at FROM wait_signal_state WHERE handle = ?",
+        ("h-old",),
+    )
+
+    assert len(rows) == 1, "the migration must not drop or duplicate the row"
+    attempts, target, started_at = rows[0][0], rows[0][1], rows[0][2]
+    assert attempts == 3, "an existing attempt count survives the ALTER"
+    assert target == "", "legacy attempts name no transition, so they name none"
+    assert started_at is None, "no dispatch time was ever recorded for it"
