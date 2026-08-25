@@ -12,9 +12,9 @@ import aiosqlite
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.audit_time import utc_now_iso
 
@@ -931,6 +931,103 @@ class PermissionStore:
                 ORDER BY id DESC
                 LIMIT ?
             """, (limit,))
+            rows = await cursor.fetchall()
+
+        return [
+            {
+                "feature": row["feature_name"],
+                "tool": row["tool_name"],
+                "action": row["action"],
+                "decision": row["decision"],
+                "user_choice": row["user_choice"],
+                "args_summary": row["args_summary"],
+                "timestamp": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    async def search_audit_log(
+        self,
+        query: str,
+        *,
+        tool_name: Optional[str] = None,
+        days: Optional[int] = None,
+        limit: int = 20,
+    ) -> List[Dict]:
+        """Return audit rows whose recorded call matches ``query`` (#3107).
+
+        The sibling of :meth:`get_audit_log`, and deliberately not a variant of
+        it. ``get_audit_log`` answers "what happened recently" and is what the
+        operator's ``/api/security/audit`` page renders. This answers a
+        different question — *"have I already done this?"* — which a listing
+        cannot answer at all: the write that matters may be a hundred rows back,
+        and the only handle the caller has on it is a description of the thing
+        itself.
+
+        That difference is also what makes returning ``args_summary`` here
+        defensible where returning it from an unbounded listing was not. A
+        caller must already name what it is looking for to see anything, so
+        this discloses matches to a description the caller supplied rather than
+        whatever happens to be recent.
+
+        ``query`` is matched case-insensitively against the recorded arguments
+        and the tool name. Matching against the tool name too means "did I call
+        create_github_issue today" works without knowing any argument.
+
+        Args:
+            query: Substring to look for. Must be non-empty after stripping.
+            tool_name: Restrict to one tool (exact match).
+            days: Only rows from the last N days.
+            limit: Maximum rows returned, newest first.
+        """
+        needle = (query or "").strip()
+        if not needle:
+            return []
+
+        # LIKE wildcards in the needle would silently widen the match — a
+        # caller searching for a literal "%" must not get everything.
+        escaped = (
+            needle.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+
+        clauses = [
+            (
+                "(LOWER(args_summary) LIKE LOWER(?) ESCAPE '\\' "
+                "OR LOWER(tool_name) LIKE LOWER(?) ESCAPE '\\')"
+            )
+        ]
+        params: List[Any] = [pattern, pattern]
+
+        if tool_name:
+            clauses.append("tool_name = ?")
+            params.append(tool_name)
+
+        if days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+            clauses.append("created_at >= ?")
+            params.append(cutoff.isoformat())
+
+        params.append(int(limit))
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # id DESC for the same reason get_audit_log uses it: legacy rows
+            # carry a space-separated timestamp that sorts incorrectly against
+            # the ISO ones (F092), and id ordering is format-agnostic.
+            cursor = await db.execute(
+                f"""
+                SELECT feature_name, tool_name, action, decision,
+                       user_choice, args_summary, created_at
+                FROM security_audit_log
+                WHERE {' AND '.join(clauses)}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
             rows = await cursor.fetchall()
 
         return [

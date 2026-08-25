@@ -1104,6 +1104,136 @@ class SecurityFeature(Feature):
             },
         )
 
+    @tool(
+        name="security_audit_search",
+        description=(
+            "Search your own recorded tool calls for ones matching a "
+            "description — 'have I already filed/commented/run this?'"
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!security-audit-search",
+    )
+    async def security_audit_search(
+        self,
+        query: str,
+        tool_name: Optional[str] = None,
+        days: Optional[int] = None,
+        limit: int = 20,
+    ) -> ToolResult:
+        """Find prior tool calls of your own that match ``query`` (#3107).
+
+        ``security_audit`` lists what happened recently and deliberately omits
+        the recorded arguments, because dumping every row's arguments into the
+        context is disclosure nobody asked for. That filter also removed the
+        only field that can answer "have I already done this?", so a later turn
+        rediscovered work it had already done and filed the same issue twice.
+
+        This asks the other question. The caller must already describe what it
+        is looking for, so what comes back is a match to a description the
+        caller supplied — not whatever happens to be recent. On that footing
+        the recorded arguments are returned.
+
+        What that ceiling actually is, stated plainly rather than implied:
+        ``args_summary`` was masked and truncated to 500 characters by
+        ``summarize_args`` when it was written, and the same value is already
+        returned verbatim by ``GET /api/security/audit``. Nothing here widens
+        what was persisted. The masking is a key-name heuristic
+        (``password``/``secret``/``token``/``key``/...), so it is a good filter
+        and not a guarantee: a sensitive value under an innocuous key was never
+        masked at write time and will not be masked now.
+
+        Args:
+            query: What to look for — a repo, an issue number, a title
+                   fragment, a command. Matched case-insensitively against the
+                   recorded arguments and the tool name.
+            tool_name: Restrict to one tool, e.g. "create_github_issue".
+            days: Only consider the last N days.
+            limit: Maximum matches to return, newest first.
+        """
+        needle = (query or "").strip()
+        if not needle:
+            return ToolResult.failed(
+                "query must be a non-empty description of what to look for; "
+                "use security_audit for an unfiltered recent listing"
+            )
+
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
+        if days is not None:
+            try:
+                days_val: Optional[int] = int(days)
+            except (TypeError, ValueError):
+                return ToolResult.failed(f"days must be an integer, got {days!r}")
+            if days_val < 1:
+                return ToolResult.failed("days must be >= 1")
+        else:
+            days_val = None
+
+        try:
+            matches = await self.permission_store.search_audit_log(
+                needle,
+                tool_name=tool_name or None,
+                days=days_val,
+                limit=limit_val,
+            )
+        except Exception as e:
+            logger.error(f"security_audit_search failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        scope = [f"query={needle!r}"]
+        if tool_name:
+            scope.append(f"tool={tool_name}")
+        if days_val is not None:
+            scope.append(f"days={days_val}")
+        scope_text = ", ".join(scope)
+
+        if not matches:
+            # An empty result is NOT proof the thing was never done. Say so:
+            # this searches recorded arguments, which are masked and truncated
+            # to 500 characters, so a match past that cut is invisible here.
+            return ToolResult.ok(
+                confirmation=(
+                    f"No recorded tool call matched ({scope_text}).\n"
+                    "This searches the masked, 500-character argument summary, "
+                    "so a distinguishing detail past that cut would not match. "
+                    "Absence here is weak evidence, not proof you never did it."
+                ),
+                data={
+                    "count": 0,
+                    "query": needle,
+                    "tool_name": tool_name or "",
+                    "days": days_val,
+                    "limit_requested": limit_val,
+                    "matches": [],
+                },
+            )
+
+        lines = [f"{len(matches)} prior call(s) matched ({scope_text}):\n"]
+        for entry in matches:
+            lines.append(
+                f"  {entry['timestamp']}  {entry['feature']}.{entry['tool']} "
+                f"[{entry['decision']}]"
+            )
+            if entry["args_summary"]:
+                lines.append(f"     {entry['args_summary']}")
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "count": len(matches),
+                "query": needle,
+                "tool_name": tool_name or "",
+                "days": days_val,
+                "limit_requested": limit_val,
+                "matches": matches,
+            },
+        )
+
     async def _unknown_target(
         self,
         feature_name: str,
