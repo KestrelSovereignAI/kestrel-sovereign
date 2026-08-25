@@ -456,6 +456,46 @@ class TaskManager:
             await self.task_store.save(task)
             await self._notify_status_update(task, final=True)
 
+    def _refuse_command_authored_self_followup(
+        self, skill_id: str, user_input: str
+    ) -> Optional[dict]:
+        """Refuse a chat-typed ``self_followup`` schedule (#3112 P1).
+
+        Returns a failure dict when the command would create a
+        ``self_followup`` row, else ``None``.
+
+        Deliberately does NOT reuse ``parse_command_args``: that binder is
+        strictly positional, so a JSON ``args_json`` containing spaces shreds
+        across later parameters (#3118) and ``task_name`` cannot be trusted to
+        land in ``task_name``. This scans the raw text for the task name
+        instead, which is the one token whose presence is unambiguous no matter
+        where the positional binder puts it. Over-matching here costs a
+        refusal on a command nobody has a reason to type; under-matching would
+        admit the row this guard exists to keep out.
+        """
+        from kestrel_sovereign.signals.sources.self_followup import (
+            TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
+        )
+
+        if not skill_id.startswith("schedule_"):
+            return None
+        if SELF_FOLLOWUP_TASK_NAME not in user_input:
+            return None
+        return {
+            "success": False,
+            "error": (
+                f"'{SELF_FOLLOWUP_TASK_NAME}' cannot be scheduled from a chat "
+                "command. It carries THIS agent's own intention across its own "
+                "turn boundary and its signal source is registered TRUSTED on "
+                "exactly that ground; text typed at the command surface is "
+                "author-by-a-human, so accepting it would wake a full "
+                "cognition turn at a trust level its registration does not "
+                "describe. Ask the agent in chat to schedule its own "
+                "follow-up instead."
+            ),
+            "refused": "command_authored_self_followup",
+        }
+
     async def execute_command(self, user_input: str) -> Optional[dict]:
         """
         Execute a command by routing to the appropriate agent/skill.
@@ -473,6 +513,25 @@ class TaskManager:
             return None
 
         agent_id, skill_id = result
+
+        # #3112 P1: reaching THIS function is the only authorship fact core
+        # has. Both callers (`endpoints/agent.py`, `command_handler.py`) are
+        # chat command surfaces: the text was typed by a human, never composed
+        # by the model. Everything downstream — `execute_skill`, the scheduler
+        # guards — is shared with A2A routing and the in-turn tool loop, so by
+        # the time args reach `_prepare_self_followup_args` that distinction is
+        # gone and every guard there is reduced to inferring it. The chain of
+        # proxies (session-truthiness -> turn-ownership) ran out here.
+        #
+        # `self_followup` exists so the agent can carry ITS OWN intention
+        # across ITS OWN turn boundary at Trust.TRUSTED. A human asking for
+        # later work is a different request with a different trust story, and
+        # `SourceRegistration.trust` is static per source so it cannot be
+        # downgraded per row. Refuse the pairing outright rather than accept
+        # it at a trust level the registration comment does not describe.
+        refusal = self._refuse_command_authored_self_followup(skill_id, user_input)
+        if refusal is not None:
+            return refusal
 
         # Parse command arguments using the tool's parser if available
         args = {}
