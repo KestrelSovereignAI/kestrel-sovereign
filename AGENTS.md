@@ -209,14 +209,30 @@ one-shot cron source that carries one across: it is the only COGNITION entry in
 `CRON_TASKS`, so the deadline fires a *genuine turn* with the intention text
 rendered into its prompt — not a liveness ping, not an echo.
 
-```text
-!schedule deadline delay_seconds=1200 task_name=self_followup \
-  args_json={"intent": "check whether CI on PR 3096 went green, then merge"}
+```python
+# Programmatic call. This is the ONLY form that carries an intent
+# containing spaces -- see the surface limitation below.
+schedule_add_deadline(
+    delay_seconds=1200,
+    task_name="self_followup",
+    args_json='{"intent": "check whether CI on PR 3096 went green, then merge"}',
+)
 ```
 
 Give the deadline exactly one way — `run_at` (absolute, needs an offset) or
 `delay_seconds` (relative, resolved against the scheduler's database clock).
 `args_json` takes only `intent`; the scheduler fills the rest of the payload.
+
+**Surface limitation (#3112).** The `!schedule deadline` chat command cannot
+express this call. `AgentTool.parse_command_args` binds strictly by position and
+never reads `key=value`, so a `key=value` line lands the literal string
+`"delay_seconds=1200"` in `run_at`. Positional form fares no better here:
+`args_json` is declared `str` (not `object`) and is not the final parameter, so a
+JSON payload containing spaces is split on whitespace and smeared across
+`misfire_policy`, `misfire_grace_seconds`, `idempotency_key` and `delay_seconds`
+-- and it parses *without error*. Only a whitespace-free `args_json` survives the
+chat surface, which the `intent` payload never is. Schedule a follow-up
+programmatically until that is fixed.
 
 Two bounds are deliberate and are enforced as **refusals at schedule time**,
 never as a silent downgrade — an accept that produces no turn is worse than an
