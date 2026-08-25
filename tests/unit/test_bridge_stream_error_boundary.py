@@ -17,12 +17,24 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
 
 
 API_KEY = "test-bridge-key"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_shared_rate_limit_bucket():
+    """Keep earlier TestClient traffic from bypassing this endpoint boundary."""
+
+    from kestrel_sovereign.rate_limit import limiter
+
+    limiter.reset()
+    yield
+    limiter.reset()
 
 
 def _boot(process_input_streaming):
