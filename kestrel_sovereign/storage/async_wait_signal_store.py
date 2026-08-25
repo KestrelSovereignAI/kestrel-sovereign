@@ -89,6 +89,13 @@ class WaitSignalState:
     # (#2922). ``None`` on rows written before the column existed and on
     # outcomes that never reached an emit — genuinely unknown, not "fine".
     last_surface_status: Optional[str] = None
+    # Which signaled token ``last_delivery_attempts`` is counting (#3105).
+    # Empty on legacy rows, which reads as "a different transition" and
+    # restarts the counter — the safe direction for a wake.
+    attempts_signaled_target: str = ""
+    # When the current attempt was DISPATCHED, as opposed to
+    # ``last_delivery_attempt_at``, which the harvest rewrites.
+    last_attempt_started_at: Optional[str] = None
 
 
 class WaitSignalStore:
@@ -120,7 +127,8 @@ class WaitSignalStore:
                    last_delivery_error, last_delivery_attempts,
                    last_delivery_attempt_at, pending_signal_id,
                    pending_signaled_target, pending_signal_enqueued_at,
-                   watching, last_surface_status
+                   watching, last_surface_status,
+                   attempts_signaled_target, last_attempt_started_at
             FROM wait_signal_state
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -139,7 +147,8 @@ class WaitSignalStore:
                    last_delivery_error, last_delivery_attempts,
                    last_delivery_attempt_at, pending_signal_id,
                    pending_signaled_target, pending_signal_enqueued_at,
-                   watching, last_surface_status
+                   watching, last_surface_status,
+                   attempts_signaled_target, last_attempt_started_at
             FROM wait_signal_state
             WHERE agent_id = ? AND pending_signal_id IS NOT NULL
             """,
@@ -211,6 +220,8 @@ class WaitSignalStore:
                 pending_signal_enqueued_at = ?,
                 last_delivery_attempts = ?,
                 last_delivery_attempt_at = ?,
+                attempts_signaled_target = ?,
+                last_attempt_started_at = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -219,6 +230,8 @@ class WaitSignalStore:
                 target,
                 attempt_dt,
                 int(attempts),
+                attempt_dt,
+                target,
                 attempt_dt,
                 self._agent_id,
                 kind,
@@ -231,8 +244,10 @@ class WaitSignalStore:
                 INSERT INTO wait_signal_state
                     (agent_id, kind, handle, last_delivery_attempts,
                      last_delivery_attempt_at, pending_signal_id,
-                     pending_signaled_target, pending_signal_enqueued_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     pending_signaled_target, pending_signal_enqueued_at,
+                     attempts_signaled_target, last_attempt_started_at,
+                     updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     self._agent_id,
@@ -241,6 +256,8 @@ class WaitSignalStore:
                     int(attempts),
                     attempt_dt,
                     signal_id,
+                    target,
+                    attempt_dt,
                     target,
                     attempt_dt,
                 ),
@@ -424,7 +441,8 @@ class WaitSignalStore:
                    last_delivery_error, last_delivery_attempts,
                    last_delivery_attempt_at, pending_signal_id,
                    pending_signaled_target, pending_signal_enqueued_at,
-                   watching, last_surface_status
+                   watching, last_surface_status,
+                   attempts_signaled_target, last_attempt_started_at
             FROM wait_signal_state
             WHERE agent_id = ? AND watching = 1
                   AND last_signaled_outcome IS NULL
@@ -452,4 +470,6 @@ class WaitSignalStore:
             pending_signal_enqueued_at=str(r[9]) if r[9] is not None else None,
             watching=int(r[10]) if r[10] is not None else 0,
             last_surface_status=str(r[11]) if r[11] is not None else None,
+            attempts_signaled_target=str(r[12]) if r[12] is not None else "",
+            last_attempt_started_at=str(r[13]) if r[13] is not None else None,
         )
