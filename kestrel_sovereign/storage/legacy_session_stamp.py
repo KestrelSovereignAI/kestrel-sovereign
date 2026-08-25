@@ -144,7 +144,10 @@ class StampPlan(NamedTuple):
     conflicts: List[Tuple[int, str, str]]
 
 
-def plan_stamps(rows: Sequence[Sequence[Any]]) -> StampPlan:
+def plan_stamps(
+    rows: Sequence[Sequence[Any]],
+    placements: Optional[Dict[Any, Optional[str]]] = None,
+) -> StampPlan:
     """Decide, from one agent's live transcript, what may be written down.
 
     ``rows`` are what :func:`live_transcript_sql` selects, read through
@@ -184,7 +187,20 @@ def plan_stamps(rows: Sequence[Sequence[Any]]) -> StampPlan:
     # even now: a row the grouper dropped is still live, and reading "not
     # placed" as "names nothing live" would overwrite a claim rather than
     # report it.
-    live_ids = {row[0] for row in rows}
+    #
+    # ``placements`` carries the same question answered across ALL THREE views.
+    # A claim can point out of the view being planned — an archived row naming
+    # an active one, or the reverse — and asking only this view would read that
+    # as "names nothing" and rewrite the row to whatever it happens to sit
+    # beside here. The grouping stays per view; only the lookup is global,
+    # because a claim names a ROW and a row exists in exactly one of them.
+    if placements is None:
+        placements = {}
+        for row in rows:
+            placements[row[0]] = None
+    known = dict(placements)
+    known.update(session_of)
+    live_ids = set(known)
     # Every key some row NAMES. The guard below asks whether a session's key
     # came from metadata or from the grouper's row-id fallback, and a session
     # opened by a ``new_session`` marker takes its key from that marker — which
@@ -225,7 +241,7 @@ def plan_stamps(rows: Sequence[Sequence[Any]]) -> StampPlan:
                 target = _claimed_row(claim)
                 if target is None:
                     continue  # a claim that is not a row id: not ours to read
-                if target in live_ids and session_of.get(target) != key:
+                if target in live_ids and known.get(target) != key:
                     conflicts.append((message["id"], str(claim), key))
                     continue
             previous = raw[message["id"]]
@@ -289,6 +305,44 @@ def _no_duplicate_keys(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
     return seen
 
 
+def _placements(rows: Sequence[Sequence[Any]]) -> Dict[Any, Optional[str]]:
+    """Which session each of one view's rows is in, markers included."""
+    from .conversation_sessions import _transcript_messages
+
+    messages, _stamped = _transcript_messages(rows)
+    placed: Dict[Any, Optional[str]] = {}
+    for session in coalesce_sessions_by_session_id(
+        group_messages_into_sessions(messages, collect_messages=True)
+    ):
+        for message in session["messages"]:
+            placed[message["id"]] = str(session["session_id"])
+    for row in rows:
+        marker = parse_message_metadata(row[2])
+        if marker.get("new_session"):
+            placed.setdefault(row[0], canonical_session_id(marker) or str(row[0]))
+        placed.setdefault(row[0], None)
+    return placed
+
+
+async def _change_stamp(db: Any, agent_id: str) -> Optional[int]:
+    """How many row events the database has counted for this agent.
+
+    ``None`` when the ledger is not there to ask — a database old enough to
+    predate the #2959 triggers, where there is nothing to compare and the
+    compare-and-set is the only fence the pass has.
+    """
+    from .conversation_sessions import CHANGES_TABLE
+
+    if not await db.table_exists(CHANGES_TABLE):
+        return None
+    row = await db.fetchone(
+        f"SELECT COALESCE(SUM(changes), 0) FROM {CHANGES_TABLE} "
+        "WHERE agent_id = ?",
+        (agent_id,),
+    )
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 async def stamp_legacy_sessions(db: Any) -> None:
     """Write down each legacy row's session, once per agent (#3120).
 
@@ -337,6 +391,32 @@ async def _stamp_one_agent(db: Any, agent_id: str) -> None:
     # Correctness does not need it. Two initializers that plan the same agent
     # write the same rows; the compare-and-set makes the second a no-op, and
     # the marker's primary key makes the second insert one.
+    # Where every row stands, across all three views. A claim names a ROW, and
+    # a row lives in exactly one view — so the grouping is per view and this
+    # lookup is not, or a claim pointing out of the view being planned reads as
+    # "names nothing live" and the row is rewritten to whatever it neighbours.
+    #
+    # Each view read ONCE and kept, not read again to plan it: the grouping is
+    # global within a view, so the rows have to be in hand anyway, and reading
+    # them twice doubled both the cost and the peak for no answer that the
+    # first read did not already contain. Measured on a synthetic 100,000-row
+    # agent: one full pass, reads and grouping and writes, is 1.2 seconds.
+    by_view: List[Sequence[Sequence[Any]]] = []
+    placements: Dict[Any, Optional[str]] = {}
+    for where in _VIEWS:
+        view_rows = await db.fetchall(
+            _transcript_in_view(db.backend_type, where), (agent_id,)
+        )
+        by_view.append(view_rows)
+        for row_id, session in _placements(view_rows).items():
+            placements[row_id] = session
+
+    # What the database has counted for this agent, so the marker can say
+    # whether the pass saw everything. A row moved between views BETWEEN two of
+    # the reads below appears in neither plan, and without this the marker
+    # would record a completeness that never happened and refuse every retry.
+    before = await _change_stamp(db, agent_id)
+
     stamped = 0
     planned = 0
     conflicts: List[Tuple[int, str, str]] = []
@@ -344,11 +424,8 @@ async def _stamp_one_agent(db: Any, agent_id: str) -> None:
     # rows and an agent whose legacy session is archived or in Trash would
     # otherwise be recorded complete without those rows being read at all —
     # and the marker would then refuse every retry, including after a restore.
-    for where in _VIEWS:
-        rows = await db.fetchall(
-            _transcript_in_view(db.backend_type, where), (agent_id,)
-        )
-        plan = plan_stamps(rows)
+    for rows in by_view:
+        plan = plan_stamps(rows, placements)
         planned += len(plan.stamps)
         conflicts.extend(plan.conflicts)
         for start in range(0, len(plan.stamps), STAMP_BATCH):
@@ -369,6 +446,19 @@ async def _stamp_one_agent(db: Any, agent_id: str) -> None:
                         ),
                     )
                     stamped += _rows_affected(affected)
+
+    after = await _change_stamp(db, agent_id)
+    if before is not None and after is not None and after - before != stamped:
+        # Something other than this pass touched the agent's rows while it ran.
+        # Each stamp above is exactly one row event, so anything else is a row
+        # this pass may not have seen — and the marker is a claim that it saw
+        # them all. Not written; the next boot reads history as it now stands.
+        logger.info(
+            "%s: history moved under the pass for %s (%s events, %s of them "
+            "ours); the pass will run again (#3120)",
+            STAMP_TABLE, agent_id, after - before, stamped,
+        )
+        return
 
     if stamped != planned:
         # A row moved under the plan. The marker is the claim "this agent's

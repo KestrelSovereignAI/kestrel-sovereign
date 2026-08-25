@@ -42,6 +42,7 @@ from .conversation_created_at import (
     fill_undatable,
     parse_stored_timestamp,
 )
+from .legacy_session_stamp import STAMP_TABLE
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
@@ -2800,6 +2801,16 @@ class AsyncStorage:
                     # can still borrow forward from the first readable row
                     # after it instead of falling to 1970.
                     stamps = fill_undatable([row[5] for row in conversations])
+
+                    # The rows below predate #3120's pass, so the claim that
+                    # this agent's legacy rows say where they belong stops
+                    # being true of the history it described. Left standing it
+                    # would refuse every retry and the restored rows would
+                    # never be stamped.
+                    await self.db.execute_commit(
+                        f"DELETE FROM {STAMP_TABLE} WHERE agent_id = ?",
+                        (self.agent_id,),
+                    )
 
                     for (
                         role, content, metadata_json, model, provider,

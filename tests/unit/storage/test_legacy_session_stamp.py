@@ -387,8 +387,8 @@ class TestThePass:
 
         real_plan = legacy_session_stamp.plan_stamps
 
-        def stale(rows):
-            plan = real_plan(rows)
+        def stale(rows, placements=None):
+            plan = real_plan(rows, placements)
             return legacy_session_stamp.StampPlan(
                 [
                     stamp._replace(previous_metadata='{"session_id": "stale"}')
