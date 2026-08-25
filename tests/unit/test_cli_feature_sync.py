@@ -783,7 +783,10 @@ def _voice_manifest(tmp_path):
 #: backend, the interpreter or the quoting elide it — but they still assert it
 #: is THERE, because a command that lost it is an unbounded install. What the
 #: file holds has its own tests below.
-_BOUNDS_ARG = re.compile(r"'?-c'? '?\S*kestrel-restore-constraints-\w+\.txt'?")
+#: Quoted or bare — a rendered path is shell-quoted, and a temp directory with
+#: a space in its name (`TMPDIR=/tmp/build scratch`) makes that the normal case,
+#: not the exotic one. Matching only `\S+` there reads half a path.
+_BOUNDS_ARG = re.compile(r"'?-c'? (?:'([^']*\.txt)'|(\S+\.txt))")
 
 
 def _elide_bounds(text: str) -> str:
@@ -3331,9 +3334,9 @@ def test_the_repair_is_bounded_by_the_manifest_too(monkeypatch, capsys):
 
 def _bounds_file(command: str) -> Path:
     """The constraints file a rendered restore command names."""
-    match = re.search(r"-c '?(\S*?\.txt)'?(?:\s|$)", command)
+    match = _BOUNDS_ARG.search(command)
     assert match, command
-    return Path(match.group(1))
+    return Path(match.group(1) or match.group(2))
 
 
 def test_the_printed_recovery_command_carries_the_bounds_the_repair_ran_with(
@@ -3533,28 +3536,74 @@ def test_a_repair_that_cannot_carry_the_bounds_is_refused_not_attempted(
     assert "no declared source" not in outcome.restore_instruction
 
 
-def test_replacing_a_published_constraints_file_never_leaves_it_empty(
-    monkeypatch, tmp_path,
-):
-    """The file a recovery command names is replaced, never truncated.
+def test_a_published_constraints_file_is_used_as_given_never_rewritten(tmp_path):
+    """The guard writes the file its command names; the install only reads it.
 
-    An install rewrites the published file with the lines it carries. Opening
-    it `"w"` empties it first, and a Ctrl-C in that window leaves the printed
-    command pointing at an EMPTY constraints file — which reads as bounded and
-    installs unbounded, the failure this whole change is about, arrived at
-    through the fix for it.
+    A second writer of an artifact the operator is holding a command for can
+    only ever make the two disagree — and, rewriting in place, can empty it
+    outright if an interrupt lands between the truncate and the write, which is
+    an unbounded install wearing a `-c`. Handing the installer lines that
+    DIFFER from the file's is how you see which of them is entitled to write.
     """
     target = tmp_path / "bounds.txt"
-    target.write_text("kestrel-feature-workflows>=0.5.1,<0.6\n", encoding="utf-8")
+    published = "kestrel-feature-workflows>=0.5.1,<0.6\n"
+    target.write_text(published, encoding="utf-8")
 
-    def interrupted(handle, lines):
-        raise KeyboardInterrupt
+    path, disposable = cli_features._constraints_file(
+        ["kestrel-feature-voice>=0.4"], target,
+    )
 
-    monkeypatch.setattr(cli_features, "_write_constraint_lines", interrupted)
+    assert path == str(target)
+    assert disposable is False                   # nor is it deleted on return
+    assert target.read_text(encoding="utf-8") == published
+
+
+def test_an_interrupt_while_writing_the_bounds_still_names_the_drift(
+    monkeypatch, tmp_path, capsys,
+):
+    """Writing the bounds BLOCKS, so it is a place a Ctrl-C can land.
+
+    By the time it runs, core has already been found off its declared source.
+    An interrupt that escapes `resolve()` from there takes the whole report
+    with it: the operator gets their Ctrl-C and not one word about the core the
+    batch just moved. Installing was never the only interruptible step — it was
+    only the only one that used to touch the filesystem.
+    """
+    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.feature_reconcile import SourceEntry
+
+    venv = FakeUv()
+    venv.installed["kestrel-feature-workflows"] = "0.5.2"
+    use_fake_uv(monkeypatch, venv)
+    guard = CoreInstallGuard.snapshot({
+        CORE: SourceEntry(package=CORE, pypi=">=0.52,<0.53"),
+        "kestrel-feature-workflows": SourceEntry(
+            package="kestrel-feature-workflows", pypi=">=0.5.1,<0.6",
+        ),
+    })
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    # ONE Ctrl-C, after the file exists and before it holds anything — a second
+    # is the operator insisting, and is documented to pass straight through.
+    real_write = cli_features._write_constraint_lines
+    interrupted = []
+
+    def interrupt_the_first_write(handle, lines):
+        if not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        return real_write(handle, lines)
+
+    monkeypatch.setattr(cli_features, "_write_constraint_lines", interrupt_the_first_write)
 
     with pytest.raises(KeyboardInterrupt):
-        cli_features._materialise_constraints(["kestrel-feature-voice>=0.4"], target)
+        guard.resolve()
 
-    assert target.read_text(encoding="utf-8") == "kestrel-feature-workflows>=0.5.1,<0.6\n"
-    # ...and no half-written stage file is left beside the one being read.
-    assert sorted(q.name for q in tmp_path.iterdir()) == ["bounds.txt"]
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err                  # the drift is still named...
+    assert "no repair was attempted" in err
+    assert _bounds_file(err).exists()            # ...and the command is bounded
+    # The abandoned attempt left nothing behind: a file that was never filled
+    # bounds nothing, and a second one beside the real one is a file an
+    # operator could be pointed at.
+    assert len(list(tmp_path.glob("kestrel-restore-constraints-*.txt"))) == 1

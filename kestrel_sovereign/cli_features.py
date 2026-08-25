@@ -13,6 +13,7 @@ here through the ``cli`` module object at call time, so existing
 ``patch("kestrel_sovereign.cli.<helper>")`` test seams keep working unchanged.
 """
 import functools
+import contextlib
 import os
 import re
 import shlex
@@ -1111,58 +1112,39 @@ def _render_shell() -> Optional[str]:
 def _write_constraint_lines(handle, lines) -> None:
     """The ONE way a constraints file is written.
 
-    Two callers open it — the guard, so the path it renders is a valid
-    constraints file even when no install ever runs, and the installer, so the
-    file an operator later reads is the one the install used
-    (:meth:`CoreInstallGuard._restore_constraints`). They are writing the same
-    artifact, and a format that differed between them would make the printed
-    command and the performed one disagree about their own argument.
+    Two callers write one — the guard, for the file its rendered recovery
+    command names (:meth:`CoreInstallGuard._restore_constraints`), and this
+    module, for the temporary an ordinary install uses. They never write the
+    SAME file, but they write the same kind of file, and a format that differed
+    between them would make a command rendered by one describe an install
+    performed against the other.
     """
     handle.write("\n".join(lines) + "\n")
 
 
-def _materialise_constraints(lines, constraint_path=None):
-    """Write *lines* as a constraints file; return ``(path, disposable)``.
+def _constraints_file(lines, constraint_path=None):
+    """The file *lines* reach the installer as; ``(path, disposable)``.
 
-    Without *constraint_path* the file is a temporary the caller removes on
-    return, because nothing outside the run can name it.
+    Without *constraint_path* they go to a temporary this run deletes, because
+    nothing outside the run can name it.
 
-    With one, the file has already been PUBLISHED inside a rendered recovery
-    command, so it is REPLACED rather than truncated and rewritten. Opening it
-    ``"w"`` empties it first, and a Ctrl-C arriving in that window leaves the
-    printed command naming an empty file — an unbounded install wearing a
-    ``-c``, which is worse than the missing argument this all started as
-    (issue #3109). Staged in the same directory and moved with
-    :func:`os.replace`, the path always names a COMPLETE file: the old lines
-    or the new ones, never neither.
+    With one, the caller has already WRITTEN them there and PUBLISHED that path
+    inside a rendered recovery command, and it is used exactly as given. One
+    author, deliberately: a second writer of an artifact an operator is about
+    to read can only make it disagree with the command that names it — and,
+    rewriting in place, can empty it outright if an interrupt lands between the
+    truncate and the write, which is an unbounded install wearing a ``-c``
+    (issue #3109). The lines are the same lines either way; what differs is who
+    is entitled to put them there.
     """
     import tempfile
 
-    if constraint_path is None:
-        fd, path = tempfile.mkstemp(prefix="kestrel-constraints-", suffix=".txt")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            _write_constraint_lines(fh, lines)
-        return path, True
-
-    target = str(constraint_path)
-    fd, staged = tempfile.mkstemp(
-        prefix="kestrel-constraints-",
-        suffix=".txt",
-        dir=os.path.dirname(target) or None,
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            _write_constraint_lines(fh, lines)
-        os.replace(staged, target)
-    except BaseException:
-        # KeyboardInterrupt included: an abandoned stage file must not be left
-        # beside the one an operator is about to read.
-        try:
-            os.unlink(staged)
-        except OSError:
-            pass
-        raise
-    return target, False
+    if constraint_path is not None:
+        return str(constraint_path), False
+    fd, path = tempfile.mkstemp(prefix="kestrel-constraints-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        _write_constraint_lines(fh, lines)
+    return path, True
 
 
 def _extension_install_run(
@@ -1228,10 +1210,10 @@ def _extension_install_run(
     which is the direction to fail in.
 
     Such a caller has already WRITTEN those lines — it has to, because the
-    command it renders may be printed without any install running at all. This
-    rewrites them anyway, with the lines THIS call carries: the file an
-    operator reads afterwards is then always the one the install actually used,
-    rather than whatever was true when the path was first handed out.
+    command it renders may be printed without any install running at all — and
+    this uses that file as given rather than writing it a second time. The file
+    an operator reads afterwards is therefore the one the install used, by
+    being the same file, not by two writers agreeing.
 
     ``--no-deps`` is NOT the fix for either: on its own it stops feature
     dependencies resolving at all and hides the version-skew signal rather than
@@ -1246,9 +1228,7 @@ def _extension_install_run(
     disposable = True
     extra_args: list = []
     if constraints:
-        constraint_file, disposable = _materialise_constraints(
-            constraints, constraint_path,
-        )
+        constraint_file, disposable = _constraints_file(constraints, constraint_path)
         extra_args = ["-c", constraint_file]
 
     try:
@@ -1808,7 +1788,7 @@ class CoreInstallGuard:
         that WAS attempted, and telling the operator "no repair was attempted"
         there is the same false report this path exists to prevent.
         """
-        try:
+        with self._reporting_interrupts(repairing=repairing):
             return cli._extension_install_run(
                 pip_args,
                 constraints=constraints,
@@ -1816,6 +1796,20 @@ class CoreInstallGuard:
                 reinstall=reinstall,
                 timeout=timeout,
             )
+
+    @contextlib.contextmanager
+    def _reporting_interrupts(self, *, repairing):
+        """Name any drift a Ctrl-C leaves behind, wherever inside the guard it lands.
+
+        The rule is one rule — an interrupt that unwinds the guard must not
+        take the drift report with it — and it now has more than one place to
+        land. Installing is the obvious one. Materialising the restore's bounds
+        is the other: it writes a file, so it BLOCKS, and a Ctrl-C there used to
+        escape :meth:`resolve` with core already known to have drifted and
+        nothing said about it (issue #3109).
+        """
+        try:
+            yield
         except KeyboardInterrupt:
             self._report_interrupt(repairing=repairing)
             raise
@@ -1925,19 +1919,25 @@ class CoreInstallGuard:
                 )
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     _write_constraint_lines(fh, self._manifest_bounds)
-            except OSError:
-                # Lines with no file is the THIRD state, and it has to be
-                # returnable rather than raised. :meth:`_report_interrupt`
-                # swallows every exception so a diagnostic can never replace
-                # the operator's Ctrl-C — which would turn a full disk into a
-                # silently dropped warning about a core that just moved, on the
-                # one path that previously needed no filesystem at all.
+            except BaseException as exc:
+                # A partial write bounds nothing, and this path is never named
+                # until the write completes — so whatever went wrong, the file
+                # goes. KeyboardInterrupt included: it unwinds through here on
+                # its way to :meth:`_reporting_interrupts`.
                 if path:
                     try:
-                        os.unlink(path)   # a partial write bounds nothing
+                        os.unlink(path)
                     except OSError:
                         pass
-                return list(self._manifest_bounds), None
+                if isinstance(exc, OSError):
+                    # Lines with no file is the THIRD state, and it has to be
+                    # returnable rather than raised. :meth:`_report_interrupt`
+                    # swallows every exception so a diagnostic can never replace
+                    # the operator's Ctrl-C — which would turn a full disk into
+                    # a silently dropped warning about a core that just moved,
+                    # on the one path that needed no filesystem at all before.
+                    return list(self._manifest_bounds), None
+                raise
             self._restore_constraint_path = path
         return list(self._manifest_bounds), self._restore_constraint_path
 
@@ -2042,7 +2042,11 @@ class CoreInstallGuard:
         the restore command, and the caller still needs to report whatever
         brought it here.
         """
-        pip_args, reinstall, rendered, shell, bounds_unwritable = self._restore_plan()
+        # Materialising the bounds writes a file, so it can be interrupted
+        # like the install below it, and the drift is already known by now.
+        with self._reporting_interrupts(repairing=False):
+            plan = self._restore_plan()
+        pip_args, reinstall, rendered, shell, bounds_unwritable = plan
         if bounds_unwritable:
             # The manifest's windows exist and nothing can carry them, so this
             # install cannot be performed as declared. Running it anyway is the
