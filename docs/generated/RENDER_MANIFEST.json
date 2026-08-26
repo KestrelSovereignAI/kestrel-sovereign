@@ -3833,6 +3833,18 @@
       "type": "Developer Note"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/development/DETERMINISTIC_DEV_GATES.md",
+      "privacy": "",
+      "render": "public",
+      "status": "proposed",
+      "title": "Deterministic development gates",
+      "type": "Design"
+    },
+    {
       "existing_code_refs": [
         ".devcontainer/README.md",
         "AGENTS.md",
