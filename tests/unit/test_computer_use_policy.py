@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import itertools
 import shlex
 import shutil
 import string
@@ -239,6 +240,27 @@ def test_the_boolean_guard_is_exactly_the_scanner(cmd):
         ("echo a~b", False),                   # ...only at word start
         ("ls *.py", True),                     # pathname expansion
         ("echo hi", False),
+        # Codex review round 4. Every one of these needs two characters
+        # to exist, so the single-character sweep could not produce them
+        # — which is why the corpus now sweeps pairs too.
+        ("echo {a,b}", True),                  # brace expansion
+        ("echo {1..3}", True),                 # ...and its range form
+        ("echo {a}", False),                   # ...but a brace alone is literal
+        ("echo HOME=~", True),                 # tilde after an assignment
+        ("echo PATH=foo:~", True),             # ...and after its colon
+        ("echo foo:~", False),                 # ...but not without the `=`
+        ("echo [a]", True),                    # a bracket glob that closes
+        ("echo a[b", False),                   # ...but an unclosed `[` is literal
+        ("echo []", False),                    # ...and an empty one never globs
+        ("echo \\ #x", False),                 # an escaped blank keeps the word
+        ("echo hi\\\n", True),                # a trailing line continuation
+        # A newline INSIDE the line is a command separator: bash runs
+        # `b` as its own command, shlex hands `b` to echo as an
+        # argument. The bash differential cannot see this one — bash
+        # exits non-zero running `b`, so the case is skipped there — and
+        # a mutant that stopped refusing it survived until this case
+        # existed.
+        ("echo a\nb", True),
     ],
 )
 def test_exec_ignores_exactly_what_a_shell_would_have_acted_on(cmd, diverges):
@@ -311,6 +333,60 @@ _SWEEP_TEMPLATES = [
     'echo "${c}x"',
 ]
 
+# Single characters are not enough. Round 4 of review found five gaps
+# the single-character sweep structurally could not produce — brace
+# expansion, tilde after an assignment, a bracket glob that closes, an
+# escaped blank before a `#`, a trailing backslash-newline — because
+# every one of them needs two characters to exist. Pairs cost about
+# three seconds of bash and would have produced all five.
+_SWEEP_PAIR_TEMPLATES = ["echo x{a}y{b}z", "echo {a}{b}", "echo {a}x {b}y"]
+
+# Constructs worth naming even though the sweeps generate them, so a
+# reader can see what the boundary covers without running it.
+_NAMED_CONSTRUCTS = [
+    "echo {a,b}", "echo {1..3}", "echo x{a,b}y", "echo {a}", "echo {}",
+    "echo {a,}", "echo a{b}c", "echo HOME=~", "echo PATH=foo:~",
+    "echo a=~/x", "echo ~/x", "echo x~", "echo foo:~", "echo ~x",
+    "echo \\ #x", "echo \\ ~", "echo a\\ #b", "echo hi\\\n",
+    "echo [", "echo a[b", "echo [ab", "echo [a]", "echo a[bc]d",
+    "echo []", "echo a]b", "echo hi \\\n there",
+]
+
+
+def _sweep_corpus():
+    """Every command the differential compares against bash."""
+    for char in string.punctuation + " \t\n\r":
+        for template in _SWEEP_TEMPLATES:
+            yield template.format(c=char)
+    for first, second in itertools.product(string.punctuation, repeat=2):
+        for template in _SWEEP_PAIR_TEMPLATES:
+            yield template.format(a=first, b=second)
+    yield from _NAMED_CONSTRUCTS
+
+
+@pytest.fixture(scope="module")
+def bash_differential():
+    """(cmd, bash_argv, shlex_argv) for the whole corpus, computed once.
+
+    Both the differential and its positive control need it, and running
+    bash over the corpus twice doubled the file's runtime for no extra
+    coverage.
+    """
+    rows = []
+    with tempfile.TemporaryDirectory() as empty:
+        for cmd in _sweep_corpus():
+            if set(cmd) & _EXPANSION_DEPENDS_ON_ENVIRONMENT:
+                continue
+            expected = _bash_word_vector(cmd, empty)
+            if expected is None:
+                continue
+            try:
+                actual = shlex.split(cmd)
+            except ValueError:
+                continue
+            rows.append((cmd, expected, actual))
+    return rows
+
 
 def _bash_word_vector(cmd: str, cwd: str):
     """The argv bash would build for *cmd*, or None if bash refuses it."""
@@ -325,7 +401,9 @@ def _bash_word_vector(cmd: str, cwd: str):
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_the_refusal_agrees_with_bash_across_every_punctuation_character():
+def test_the_refusal_agrees_with_bash_across_every_punctuation_character(
+    bash_differential,
+):
     """#3129: the boundary is measured, not enumerated.
 
     Three consecutive review rounds each found a construct an
@@ -343,35 +421,19 @@ def test_the_refusal_agrees_with_bash_across_every_punctuation_character():
     compare, and a caller who writes an unparseable line is not the
     silent-divergence case this guards.
     """
-    with tempfile.TemporaryDirectory() as empty:
-        disagreements = []
-        for char in string.punctuation + " \t\n\r":
-            if char in _EXPANSION_DEPENDS_ON_ENVIRONMENT:
-                continue
-            for template in _SWEEP_TEMPLATES:
-                cmd = template.format(c=char)
-                expected = _bash_word_vector(cmd, empty)
-                if expected is None:
-                    continue
-                try:
-                    actual = shlex.split(cmd)
-                except ValueError:
-                    continue
-                diverges = actual != expected
-                refused = first_shell_syntax_exec_ignores(cmd) is not None
-                if diverges != refused:
-                    disagreements.append(
-                        f"{cmd!r}: bash={expected!r} shlex={actual!r} "
-                        f"{'refused' if refused else 'allowed'}"
-                    )
-
-        assert disagreements == [], (
-            "the refusal disagrees with bash:\n  " + "\n  ".join(disagreements)
-        )
+    disagreements = [
+        f"{cmd!r}: bash={expected!r} shlex={actual!r} "
+        f"{'refused' if first_shell_syntax_exec_ignores(cmd) else 'allowed'}"
+        for cmd, expected, actual in bash_differential
+        if (actual != expected) != (first_shell_syntax_exec_ignores(cmd) is not None)
+    ]
+    assert disagreements == [], (
+        "the refusal disagrees with bash:\n  " + "\n  ".join(disagreements)
+    )
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_the_sweep_would_notice_a_gap():
+def test_the_sweep_would_notice_a_gap(bash_differential):
     """A positive control for the differential above.
 
     A sweep that compares two things can pass by comparing nothing —
@@ -379,23 +441,17 @@ def test_the_sweep_would_notice_a_gap():
     rejected all of them, the assertion would be empty and green. This
     pins that the corpus does contain both answers.
     """
-    with tempfile.TemporaryDirectory() as empty:
-        outcomes = set()
-        for char in string.punctuation:
-            if char in _EXPANSION_DEPENDS_ON_ENVIRONMENT:
-                continue
-            for template in _SWEEP_TEMPLATES:
-                cmd = template.format(c=char)
-                expected = _bash_word_vector(cmd, empty)
-                if expected is None:
-                    continue
-                try:
-                    outcomes.add(shlex.split(cmd) != expected)
-                except ValueError:
-                    continue
-        assert outcomes == {True, False}, (
-            f"the sweep no longer exercises both answers: {outcomes}"
-        )
+    outcomes = {actual != expected for _cmd, expected, actual in bash_differential}
+    assert outcomes == {True, False}, (
+        f"the sweep no longer exercises both answers: {outcomes}"
+    )
+    # A collapse detector, not an exact count: the corpus is filtered
+    # (bash rejects some generated lines, and glob/tilde cases are
+    # excluded by name), so the number moves when templates change. It
+    # should never fall to a handful.
+    assert len(bash_differential) > 1000, (
+        f"the corpus shrank to {len(bash_differential)} commands"
+    )
 
 
 @pytest.mark.parametrize(

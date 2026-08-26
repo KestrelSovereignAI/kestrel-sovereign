@@ -275,12 +275,19 @@ class ShellSyntax:
 
 
 def _quote_context(cmd: str):
-    """Yield ``(index, char, context, escaped)`` for each character.
+    """Yield ``(index, char, context, escaped, word)`` for each character.
 
     ``context`` is ``"bare"``, ``"single"`` or ``"double"``; ``escaped``
-    says a backslash the shell honours precedes this character. Quote
-    marks that open or close a region are not yielded — they are
-    structure, not content.
+    says a backslash the shell honours precedes this character; ``word``
+    numbers the shell word this character belongs to. Quote marks that
+    open or close a region are not yielded — they are structure, not
+    content.
+
+    Word identity is lexical, not textual. ``echo \\ #x`` is two words,
+    not three: the escaped blank is part of the second one, so the ``#``
+    does not begin a word and does not begin a comment. Reading the raw
+    preceding character instead called it a boundary and refused a
+    command bash and ``shlex`` agree on (codex review round 4).
 
     The two questions this module asks both need to know where they are
     in a string, and they disagree about what to do when they get
@@ -289,6 +296,7 @@ def _quote_context(cmd: str):
     if not isinstance(cmd, str):
         return
     in_single = in_double = False
+    word = 0
     i = 0
     while i < len(cmd):
         c = cmd[i]
@@ -296,18 +304,34 @@ def _quote_context(cmd: str):
             if c == "'":
                 in_single = False
             else:
-                yield (i, c, "single", False)
+                yield (i, c, "single", False, word)
             i += 1
             continue
         if in_double:
             if c == "\\" and i + 1 < len(cmd):
-                yield (i + 1, cmd[i + 1], "double", True)
+                yield (i + 1, cmd[i + 1], "double", True, word)
                 i += 2
                 continue
             if c == '"':
                 in_double = False
             else:
-                yield (i, c, "double", False)
+                yield (i, c, "double", False, word)
+            i += 1
+            continue
+        if c in " \t\n\r" :
+            # An unescaped, unquoted blank ends the word. Runs of blanks
+            # may leave a word number unused, which costs nothing: the
+            # numbering exists to group characters, not to count words.
+            # Suppressing that was a guard no behaviour depended on —
+            # it survived mutation, and a 3079-case differential against
+            # bash found no input that could tell the difference.
+            #
+            # A carriage return is a word character to bash, so it does
+            # not split here; the divergence it causes is reported on
+            # its own.
+            if c in " \t\n":
+                word += 1
+            yield (i, c, "bare", False, word)
             i += 1
             continue
         if c == "'":
@@ -319,10 +343,10 @@ def _quote_context(cmd: str):
             i += 1
             continue
         if c == "\\" and i + 1 < len(cmd):
-            yield (i + 1, cmd[i + 1], "bare", True)
+            yield (i + 1, cmd[i + 1], "bare", True, word)
             i += 2
             continue
-        yield (i, c, "bare", False)
+        yield (i, c, "bare", False, word)
         i += 1
 
 
@@ -334,11 +358,6 @@ def _dollar_expands(cmd: str, index: int, *, may_open_quote: bool) -> bool:
     if nxt in "\"'":
         return may_open_quote
     return nxt in _DOLLAR_EXPANSION_STARTERS
-
-
-def _starts_a_word(cmd: str, index: int) -> bool:
-    """True iff *index* begins a word — nothing before it, or blank."""
-    return index == 0 or cmd[index - 1] in " \t\n\r"
 
 
 def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
@@ -354,7 +373,7 @@ def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
     Globs and tilde compose no second command, and adding them would
     put the codex bridge in front of the operator for ``ls *.py``.
     """
-    for index, char, context, escaped in _quote_context(cmd):
+    for index, char, context, escaped, _word in _quote_context(cmd):
         if escaped or context == "single":
             continue
         if context == "double" and char not in "$`":
@@ -378,12 +397,12 @@ def first_shell_syntax_exec_ignores(cmd: str) -> ShellSyntax | None:
     this is the question that decides whether the command that runs is
     the command that was written (#3129).
 
-    Every rule below was measured against bash rather than reasoned
-    about, by sweeping each punctuation character through ten positions
-    and comparing ``shlex.split`` to the word vector bash builds. That
-    sweep is a test — the first three rounds of review on this ticket
-    each found a construct an enumeration had missed, so the boundary
-    is checked rather than asserted.
+    Every rule was measured against bash rather than reasoned about, by
+    sweeping punctuation characters and known constructs through a
+    corpus of templates and comparing ``shlex.split`` to the word
+    vector bash builds. That sweep is a test — four rounds of review on
+    this ticket each found a construct an enumeration had missed, so
+    the boundary is checked rather than asserted.
 
     Refused, because the argv differs:
 
@@ -391,35 +410,51 @@ def first_shell_syntax_exec_ignores(cmd: str) -> ShellSyntax | None:
     - a ``$`` that expands, including bash's ``$[...]`` and the
       quote-opening ``$"..."`` / ``$'...'`` forms;
     - a ``#`` beginning a word — the rest of the line is a comment;
-    - a ``~`` beginning a word — home-directory expansion;
-    - ``*``, ``?`` and ``[`` — pathname expansion, where what the argv
-      becomes depends on the directory rather than the string;
+    - a ``~`` where bash expands one: beginning a word, after an ``=``,
+      or after a ``:`` in a word that already carries an ``=``;
+    - ``*`` and ``?``, and a ``[`` that closes as a bracket expression
+      — pathname expansion, where the argv depends on the directory;
+    - a ``{`` that closes as a brace expansion with a ``,`` or ``..``
+      inside it, which multiplies one word into several;
     - a backslash that bash removes and ``shlex`` keeps: ``\$`` and
       ``\```` inside double quotes, and a line continuation anywhere;
     - a trailing carriage return, which bash keeps inside the last word
       and ``shlex`` discards as whitespace.
 
-    Trailing spaces, tabs and newlines are not constructs: bash and
-    ``shlex`` both discard them.
+    Trailing spaces, tabs and newlines are not constructs — bash and
+    ``shlex`` both discard them — but a trailing BACKSLASH-newline is,
+    and trimming the line before scanning hid it (codex round 4).
     """
     if not isinstance(cmd, str):
         return None
-    # Only the trailing blanks bash also discards. A trailing carriage
-    # return is NOT one of them: bash keeps it inside the last word,
-    # ``shlex`` treats it as whitespace and drops it. Measured.
-    trimmed = cmd.rstrip(" \t\n")
-    for index, char, context, escaped in _quote_context(trimmed):
+    entries = list(_quote_context(cmd))
+    words: dict[int, str] = {}
+    for index, char, context, _escaped, word in entries:
+        if context != "bare" or char not in " \t\n\r":
+            words[word] = words.get(word, "") + char
+    seen_in_word: dict[int, str] = {}
+    for position, (index, char, context, escaped, word) in enumerate(entries):
         if context == "single":
+            seen_in_word[word] = seen_in_word.get(word, "") + char
             continue
+
         if escaped:
             # bash drops the backslash; shlex keeps it for these, so the
             # word that reaches the program differs. A backslash before
             # a carriage return is not a continuation — both keep it.
             if (context == "double" and char in "$`") or char == "\n":
                 return ShellSyntax(index, char, "escape")
+            seen_in_word[word] = seen_in_word.get(word, "") + char
             continue
+        starts_word = not seen_in_word.get(word)
+        preceding = seen_in_word.get(word, "")
+        if context != "bare" or char not in " \t\n\r":
+            # Blanks are separators, not word content — recording them
+            # would make the next character look like it followed
+            # something, and no character would ever start a word.
+            seen_in_word[word] = preceding + char
         if char == "$":
-            if _dollar_expands(trimmed, index, may_open_quote=context == "bare"):
+            if _dollar_expands(cmd, index, may_open_quote=context == "bare"):
                 return ShellSyntax(index, char, "expansion")
             continue
         if context == "double":
@@ -428,12 +463,66 @@ def first_shell_syntax_exec_ignores(cmd: str) -> ShellSyntax | None:
             continue
         if char == "`":
             return ShellSyntax(index, char, "expansion")
+        if char in " \t\n":
+            # Trailing blanks are not a construct: bash and shlex both
+            # discard them. Anything further in is (a bare newline
+            # separates commands).
+            if char == "\n" and cmd[index:].strip(" \t\n") == "":
+                continue
+            if char == "\n":
+                return ShellSyntax(index, char, "control")
+            continue
         if char in _SHELL_CONTROL_CHARS:
             return ShellSyntax(index, char, "control")
-        if char in _GLOB_CHARS:
+        if char in "*?":
             return ShellSyntax(index, char, "glob")
-        if char in "#~" and _starts_a_word(trimmed, index):
-            return ShellSyntax(
-                index, char, "comment" if char == "#" else "tilde"
-            )
+        if char == "[" and _closes_bracket_expression(words.get(word, ""), preceding):
+            return ShellSyntax(index, char, "glob")
+        if char == "{" and _closes_brace_expansion(words.get(word, ""), preceding):
+            return ShellSyntax(index, char, "brace")
+        if char == "#" and starts_word:
+            return ShellSyntax(index, char, "comment")
+        if char == "~" and _tilde_expands(words.get(word, ""), preceding, starts_word):
+            return ShellSyntax(index, char, "tilde")
     return None
+
+
+def _closes_bracket_expression(word: str, preceding: str) -> bool:
+    """True iff the ``[`` after *preceding* closes as a glob bracket.
+
+    A bare ``[`` is only pathname expansion when the word later closes
+    it around at least one character: bash passes ``a[b`` and ``[]``
+    through untouched, so refusing them would break commands that
+    already worked (codex review round 4).
+    """
+    rest = word[len(preceding) + 1 :]
+    return "]" in rest[1:]
+
+
+def _closes_brace_expansion(word: str, preceding: str) -> bool:
+    """True iff the ``{`` after *preceding* closes as a brace expansion.
+
+    bash needs a ``,`` or a ``..`` inside the braces to expand: ``{a}``
+    and ``{}`` are literal, ``{a,}`` and ``{a..b}`` are not.
+    """
+    rest = word[len(preceding) + 1 :]
+    close = rest.find("}")
+    if close < 0:
+        return False
+    inside = rest[:close]
+    return "," in inside or ".." in inside
+
+
+def _tilde_expands(word: str, preceding: str, starts_word: bool) -> bool:
+    """True iff bash expands the ``~`` after *preceding* in *word*.
+
+    Measured: a word-initial ``~`` expands, so does one after an ``=``,
+    and so does one after a ``:`` in a word that already carries an
+    ``=`` (``PATH=foo:~``). A ``:`` alone does not — ``foo:~`` is
+    literal — and neither does ``x~``.
+    """
+    if starts_word:
+        return True
+    if preceding.endswith("="):
+        return True
+    return preceding.endswith(":") and "=" in preceding
