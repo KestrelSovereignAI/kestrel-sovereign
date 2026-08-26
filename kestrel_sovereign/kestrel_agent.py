@@ -5464,23 +5464,35 @@ Expected Duration: {expected_duration}
             command = prefixed_command_token(user_input)
             if command is not None:
                 if command not in SAFE_MODE_COMMANDS:
+                    from kestrel_sovereign.agent.constitution import (
+                        describe_safe_mode_restriction,
+                    )
+
+                    # A blocked COMMAND was told "integrity issue" whatever
+                    # the cause, so the branch an operator hits while trying
+                    # to diagnose was the one still misreporting it.
+                    blocked_by = describe_safe_mode_restriction(
+                        self, audit_pending=audit_pending
+                    )
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
-                        "The agent has detected an integrity issue and is operating in restricted mode.\\n"
+                        f"The agent is operating in restricted mode due to {blocked_by}.\\n"
                         "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
-                        "Please contact your administrator to resolve the integrity issue."
+                        "Please contact your administrator to resolve it."
                     )
             else:
-                restriction = (
-                    "a required startup integrity audit"
-                    if audit_pending
-                    else "an integrity failure"
+                from kestrel_sovereign.agent.constitution import (
+                    describe_safe_mode_restriction,
+                )
+
+                restriction = describe_safe_mode_restriction(
+                    self, audit_pending=audit_pending
                 )
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
                     f"The agent cannot process queries due to {restriction}.\\n"
                     "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
-                    "Normal operation will resume once integrity is restored."
+                    "Normal operation will resume once the restriction is cleared."
                 )
 
         # Everything below this point CAN touch conversation history
