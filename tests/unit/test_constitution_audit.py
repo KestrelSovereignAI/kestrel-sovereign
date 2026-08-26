@@ -1570,8 +1570,6 @@ async def test_the_cause_column_migration_runs_only_when_needed(tmp_path):
     is inspected first, and a real migration failure is no longer swallowed
     by the same except that meant "already present".
     """
-    from unittest.mock import patch
-
     from kestrel_sovereign.constitution.runtime_state import (
         ConstitutionRuntimeStateStore,
     )
