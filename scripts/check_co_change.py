@@ -276,6 +276,11 @@ class FileIndex:
     refs: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     import_bindings: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     definitions: set[str] = field(default_factory=set)
+    # ``from mod import shared`` binds a MODULE-LEVEL name. Checking the bare
+    # name against every definition in the file left this true when a
+    # module-level function was deleted and a same-named METHOD survived, so the
+    # import consumer was never reported.
+    module_definitions: set[str] = field(default_factory=set)
     aliases: dict[str, set[str]] = field(default_factory=dict)
     imported_modules: set[str] = field(default_factory=set)
 
@@ -283,6 +288,10 @@ class FileIndex:
 def _build_index(tree: ast.AST) -> FileIndex:
     index = FileIndex()
     counted: set[int] = set()
+
+    for node in getattr(tree, "body", ()):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            index.module_definitions.add(node.name)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -308,9 +317,9 @@ def _build_index(tree: ast.AST) -> FileIndex:
                 # `sites` was empty and the gate called that clean. Kept apart
                 # from `refs` because a body change does not touch an import,
                 # and counting it there made every import an unreviewed site.
-                index.import_bindings.setdefault(entry.name, []).append(
-                    (node.lineno, node.lineno)
-                )
+                start = getattr(entry, "lineno", node.lineno) or node.lineno
+                end = getattr(entry, "end_lineno", start) or start
+                index.import_bindings.setdefault(entry.name, []).append((start, end))
             if node.module:
                 index.imported_modules.add(node.module)
                 index.imported_modules.add(node.module.rsplit(".", 1)[-1])
@@ -610,6 +619,7 @@ def collect(
     literals: set[str] = set()
 
     unparseable: list[str] = []
+    unsearchable: list[str] = []
     for path, lines in new_map.items():
         if not path.endswith(".py"):
             continue
@@ -687,6 +697,12 @@ def collect(
             (index := index_for(path)) is not None and defines(index, name)
             for path in defining_paths
         )
+        # The import question is narrower than the positive control's: does the
+        # MODULE-LEVEL name still exist where it was defined?
+        module_level_now = any(
+            (index := index_for(path)) is not None and name in index.module_definitions
+            for path in defining_paths
+        )
         defined_before = any(
             (tree := _parse(source, path)) is not None
             and defines(_build_index(tree), name)
@@ -710,7 +726,7 @@ def collect(
                     name,
                     kind=kind,
                     local_names=local_names,
-                    include_imports=not defined_now,
+                    include_imports=not module_level_now,
                 )
             )
 
@@ -726,13 +742,20 @@ def collect(
             tree = _parse(source, path)
             if tree is None:
                 continue
+            # Only recover from files where the new-side scan found NO touched
+            # site. The recovery exists for a call that no longer exists; when a
+            # touched site is already present in this file the old coordinate is
+            # the same logical call before it shifted, and appending it counted
+            # one caller twice ("modified 2 of 3" for two callers).
+            if any(o.path == path for o in touched):
+                continue
             old_index = _build_index(tree)
             for start, end in call_sites(
                 old_index,
                 name,
                 kind=kind,
                 local_names=local_names,
-                include_imports=not defined_now,
+                include_imports=not module_level_now,
             ):
                 if any(
                     line in old_map.get(path, ()) for line in range(start, end + 1)
@@ -754,13 +777,25 @@ def collect(
         # survives both escaping and implicit concatenation at a separator.
         runs = re.findall(r"[A-Za-z0-9]+", value)
         longest = max(runs, key=len, default="")
-        candidates = _candidate_files(value, fixed=True)
+        # A control character cannot be passed to a subprocess: this repository
+        # has 26 NUL-bearing constants, including
+        # ``_SCHEDULER_BOOTSTRAP_LOCK_SCOPE = "\0scheduler-bootstrap"``, and the
+        # raw value reached ``git grep`` as argv and killed the whole gate with
+        # ``ValueError: embedded null byte``. Search by the word run instead;
+        # the AST still decides equality, so precision is unchanged.
+        argv_safe = not any(ord(ch) < 32 for ch in value)
+        candidates = _candidate_files(value, fixed=True) if argv_safe else set()
+        if not argv_safe and not longest:
+            # Nothing searchable and nothing to say about it — but say that,
+            # rather than silently dropping the literal.
+            unsearchable.append(value)
+            continue
         # Widen only on a run distinctive enough to stay cheap. `"__init__"`
         # widens to `init`, which matches most of the tree: indexing that
         # candidate set took the gate from 0.8s to 16s. A short run buys a rare
         # case at a cost paid on every single run, which is the wrong trade for
         # a gate that runs per iteration.
-        if len(longest) >= MIN_WIDENED_RUN and longest != value:
+        if longest and (not argv_safe or (len(longest) >= MIN_WIDENED_RUN and longest != value)):
             candidates |= _candidate_files(longest, fixed=True)
 
         sites: list[Occurrence] = []
@@ -791,6 +826,8 @@ def collect(
         if touched and untouched:
             findings.append(Finding("literal", value, touched, untouched))
 
+    if unsearchable:
+        structural.extend((f'"{value!r}"', 0) for value in sorted(unsearchable))
     return findings, structural, unparseable
 
 
@@ -905,8 +942,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.base:
-        diff_spec = [f"{args.base}...HEAD"]
+        # Diff from the merge base to the WORKING TREE, not to HEAD. Every scan
+        # below (candidates, trees, indexes) reads the working tree, so a map
+        # describing `base...HEAD` mixed two revisions: an unstaged edit that
+        # removed the only untouched caller made it vanish from the scan while
+        # still present in HEAD, and the run printed clean.
         old_ref = _git("merge-base", args.base, "HEAD").strip() or args.base
+        diff_spec = [old_ref]
     else:
         diff_spec = ["HEAD"]
         old_ref = "HEAD"

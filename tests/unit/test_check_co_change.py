@@ -935,3 +935,113 @@ def test_a_call_removed_by_the_diff_counts_as_touched(repo: Path) -> None:
         f"the removed call was not counted: {finding.changed}"
     )
     assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 5)]
+
+
+# --------------------------------------------------------------------------
+# Codex review round 6 — two P1s and three P2s
+# --------------------------------------------------------------------------
+
+def test_a_nul_bearing_literal_does_not_kill_the_gate(repo: Path) -> None:
+    """This repository has 26 NUL-bearing string constants.
+
+    One is ``_SCHEDULER_BOOTSTRAP_LOCK_SCOPE = "\\0scheduler-bootstrap"`` in
+    ``features/scheduler/runner.py``. The raw value reached ``git grep`` as argv
+    and raised ``ValueError: embedded null byte``, taking down the whole
+    advisory run rather than producing output.
+    """
+    (repo / "a.py").write_text(
+        'SCOPE = "\\0scheduler-bootstrap"\nOTHER = "\\0scheduler-bootstrap"\n'
+    )
+    _commit(repo)
+    (repo / "a.py").write_text(
+        'SCOPE = "\\0renamed-bootstrap"\nOTHER = "\\0scheduler-bootstrap"\n'
+    )
+
+    finding = _named(_findings(repo), "\x00scheduler-bootstrap")  # must not raise
+    assert len(finding.changed) == 1
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 2)]
+
+
+def test_import_consumer_surfaced_when_a_same_named_method_survives(
+    repo: Path,
+) -> None:
+    """``from mod import shared`` binds a MODULE-LEVEL name.
+
+    Checking the bare name against every definition in the file left it true
+    when the module-level function was deleted and a same-named method
+    survived — so the import consumer, which now raises ImportError, was
+    silently omitted.
+    """
+    (repo / "mod.py").write_text(
+        "def shared(x):\n    return x\n\n\nclass C:\n    def shared(self):\n        return 1\n"
+    )
+    (repo / "user.py").write_text("from mod import shared\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("class C:\n    def shared(self):\n        return 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1)}
+
+
+def test_a_parenthesized_import_alias_records_its_own_line(repo: Path) -> None:
+    """``ImportFrom.lineno`` is the opening line, not the alias's."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import (\n    shared,\n)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def renamed(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 2)}, (
+        "the alias was recorded at the import's opening line"
+    )
+
+
+def test_a_shifted_call_is_not_counted_twice(repo: Path) -> None:
+    """Editing a call that also moves it recorded new AND old coordinates."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(2)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    y = 0\n    return shared(1, y)\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    total = len(finding.changed) + len(finding.unchanged)
+    assert total == 2, (
+        f"one logical caller counted twice: changed={finding.changed} "
+        f"unchanged={finding.unchanged}"
+    )
+    assert "modified 1 of 2" in checker.render([finding])
+
+
+def test_base_mode_diffs_against_the_working_tree_not_head(
+    repo: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--base`` mapped ``base...HEAD`` while every scan read the working tree.
+
+    An unstaged edit that removed the only untouched caller made it vanish from
+    the scan while it still existed in HEAD, so the branch check printed clean.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo, "base")
+    _run(repo, "branch", "base-ref")
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    _commit(repo, "change on branch")
+    # Unstaged: a NEW caller appears only in the working tree.
+    (repo / "c.py").write_text("from mod import shared\n\n\ndef h():\n    return shared(3)\n")
+    _run(repo, "add", "c.py")
+
+    # Through main(), because the defect is in which spec main CHOOSES —
+    # calling changed_line_map directly would pass with main still broken.
+    assert checker.main(["--base", "base-ref"]) == 0
+    output = capsys.readouterr().out
+    # c.py's call is a TOUCHED site, so it shows in the count rather than the
+    # unchanged listing. Mapping `base...HEAD` misses it entirely and the line
+    # reads "definition changed; 2 call sites untouched" instead.
+    assert "modified 1 of 2 call sites" in output, (
+        "base mode ignored a working-tree change while scanning the working "
+        f"tree; got:\n{output}"
+    )
