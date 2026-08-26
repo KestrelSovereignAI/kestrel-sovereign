@@ -517,7 +517,10 @@ async def test_idle_monitor_reports_terminal_retirement_failure_not_producer(
         await feature.initialize()
         feature._last_used_monotonic -= 1
         for _ in range(200):
-            if feature._idle_monitor_task is None:
+            if any(
+                "retirement entered terminal cleanup" in message
+                for message in caplog.messages
+            ):
                 break
             await asyncio.sleep(0.01)
 

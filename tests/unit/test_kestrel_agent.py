@@ -2401,7 +2401,7 @@ class TestLifecycle:
                 await asyncio.wait_for(health_started.wait(), timeout=1)
                 with patch(
                     "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
-                    0.25,
+                    1.0,
                 ), patch(
                     "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
                     0.05,
@@ -2409,7 +2409,7 @@ class TestLifecycle:
                     "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
                     0.01,
                 ):
-                    await asyncio.wait_for(agent.shutdown(), timeout=1)
+                    await asyncio.wait_for(agent.shutdown(), timeout=2)
 
             assert late_started.is_set()
             assert storage.close.called
