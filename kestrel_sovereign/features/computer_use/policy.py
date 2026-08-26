@@ -244,7 +244,7 @@ _SHELL_CONTROL_CHARS = frozenset(";&|`$()<>\n\r")
 # ``$`` a quote is far more often the end of a string (``echo "$"``)
 # than ANSI-C quoting, and that case is the one callers actually write.
 _DOLLAR_EXPANSION_STARTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_{(@*#?-$!"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_{[(@*#?-$!"
 )
 
 
@@ -360,27 +360,3 @@ def first_shell_syntax_exec_ignores(cmd: str) -> tuple[int, str] | None:
     as a missing file — so they are outside what this refuses.
     """
     return _scan_unquoted(cmd, _SHELL_CONTROL_CHARS, dollar_must_expand=True)
-
-
-def token_binary_name(token: str) -> str:
-    """Basename of the binary *token* would name, punctuation stripped.
-
-    ``shlex`` leaves a control character welded to a neighbouring word:
-    ``echo hi; rm`` yields a clean ``rm``, but ``(sudo`` and ``` `sudo ```
-    keep theirs. A deny-list lookup on the raw token would miss those,
-    which is the whole population that matters when the question is
-    "does a shell run something denied anywhere in this line?".
-    """
-    return Path(token.strip("".join(_SHELL_CONTROL_CHARS))).name
-
-
-def first_unquoted_expansion(cmd: str) -> tuple[int, str] | None:
-    """First unquoted ``$``-expansion or backtick substitution.
-
-    A command carrying one of these cannot be vetted by reading its
-    tokens: ``cat $SECRET`` and ``echo `sudo -n true`` name a path and
-    a binary that only exist after the shell has run. The refusal uses
-    this to decide whether it may hand back a shell wrapper, since a
-    wrapper for such a command would run something no gate had seen.
-    """
-    return _scan_unquoted(cmd, frozenset("$`"), dollar_must_expand=True)

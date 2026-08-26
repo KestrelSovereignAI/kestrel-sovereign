@@ -60,9 +60,7 @@ from .policy import (
     PathPolicy,
     evaluate_argv_paths,
     first_shell_syntax_exec_ignores,
-    first_unquoted_expansion,
     split_command,
-    token_binary_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +88,6 @@ _SHELL_CONTROL_MEANINGS = {
 def shell_syntax_refusal(
     command: str,
     argv: List[str],
-    denied_binaries: Iterable[str],
 ) -> Optional[tuple[str, str]]:
     """Explain why ``command`` cannot run as written, or ``None``.
 
@@ -109,16 +106,22 @@ def shell_syntax_refusal(
     stop describing what runs, since only ``bash`` would be vetted for
     a line that can invoke anything.
 
-    **The remedy is bounded by the same declaration as the refusal.**
-    A wrapper is only offered when every token has already been vetted
-    by the gates that ran before this one — so not when a deny-listed
-    binary rides in a non-head position, where ``BinaryPolicy`` never
-    looked, and not when an expansion or a command substitution means
-    the tokens do not name what would run. Otherwise the refusal would
-    convert commands that could not execute at all into commands that
-    execute after one approval, which is a worse defect than the one
-    being fixed (codex review round 1, P1: the suggestion this printed
-    for ``cat <deny_paths file> | tr A-Z a-z`` read the file).
+    **No shell form is offered back, deliberately.** Two review rounds
+    were spent trying to bound one — suppress it when a token names a
+    deny-listed binary, suppress it when an expansion hides what runs —
+    and each round found another spelling that slipped through, because
+    every one of those checks reads ``shlex`` tokens and ``shlex`` is
+    not a shell. ``cat </home/me/.ssh/id_rsa | head`` hands the path
+    policy the literal token ``</home/...``, which resolves to nothing;
+    ``echo hi;sudo -n true`` hands the deny-list ``hi;sudo``, which is
+    not ``sudo``. Deciding what bash would run needs a shell parser,
+    not a token scan, so this says what it cannot do instead of
+    composing a command no gate could vet.
+
+    Those same two blind spots are live on the paths that DO hand a raw
+    string to a real shell — the codex bridge, and ``bash -lc`` called
+    directly. That is #3130, and it is why this refusal declines to add
+    traffic to them.
     """
     found = first_shell_syntax_exec_ignores(command)
     if found is None:
@@ -133,47 +136,14 @@ def shell_syntax_refusal(
         if argv and argv[0] != char
         else ""
     )
-    explanation = (
-        f"shell does not run a shell: the command is tokenized and executed "
-        f"directly, so the {char!r} at position {index} cannot {meaning}"
-        f"{handed_to}. Nothing ran."
-    )
-
-    # ``BinaryPolicy`` vets ``argv[0]``. In a compound, the binary that
-    # matters can be any word — so every token is asked, and the answer
-    # only ever narrows an already-certain refusal, which is why
-    # over-matching here costs nothing.
-    denied = set(denied_binaries)
-    blocked = next(
-        (
-            name
-            for name in (token_binary_name(token) for token in argv)
-            if name in denied
-        ),
-        None,
-    )
-    if blocked is not None:
-        return (
-            f"deny:{blocked}",
-            f"{explanation} A shell would run {blocked!r} here, which is "
-            f"deny-listed — never, even with approval — so there is no form "
-            f"of this command this tool will run.",
-        )
-
-    expansion = first_unquoted_expansion(command)
-    if expansion is not None:
-        return (
-            f"unvettable_expansion:{expansion[1]}",
-            f"{explanation} The {expansion[1]!r} at position {expansion[0]} "
-            f"means the path and binary policies cannot see what would "
-            f"actually run, so no shell form of this command is offered. "
-            f"Write out the value you meant and send that instead.",
-        )
-
     return (
         f"shell_syntax:{char}",
-        f"{explanation} To use shell syntax, hand the line to a shell "
-        f"yourself: bash -lc {shlex.quote(command)}",
+        f"shell does not run a shell: the command is tokenized and executed "
+        f"directly, so the {char!r} at position {index} cannot {meaning}"
+        f"{handed_to}. Nothing ran. This tool runs one program with "
+        f"arguments; it cannot check what a shell would make of this line, "
+        f"so it will not turn it into one. Send a command that needs no "
+        f"shell syntax.",
     )
 
 
@@ -629,9 +599,7 @@ class ComputerUseFeature(Feature):
             # so the operator is never asked to approve a line that is not
             # the line that would run.
             if isinstance(argv, str):
-                refusal = shell_syntax_refusal(
-                    argv, split_command(argv), self._binary_policy.deny
-                )
+                refusal = shell_syntax_refusal(argv, split_command(argv))
                 if refusal is not None:
                     rule, message = refusal
                     payload["rule"] = rule
@@ -1079,7 +1047,7 @@ class ComputerUseFeature(Feature):
             "directly — there is NO shell, so `|`, `>`, `<`, `&`, `;`, "
             "`$VAR` and backticks are not interpreted and a command "
             "containing them is refused rather than run without them. "
-            "For shell syntax, invoke a shell: bash -lc '<line>'. "
+            "Send a command that needs no shell syntax. "
             "Deny-listed binaries hard-refuse; auto-approved binaries "
             "run without a prompt; everything else routes through the "
             "ApprovalQueue."
@@ -1114,7 +1082,9 @@ class ComputerUseFeature(Feature):
         pipe, redirect or command separator would arrive at the binary
         as a literal argument. Rather than run a command the caller did
         not write, one containing an unquoted control character is
-        refused with the ``bash -lc`` form that does work.
+        refused. No shell form is offered back: deciding what a shell
+        would run needs a shell parser, and the gates here read
+        ``shlex`` tokens.
 
         Args:
             command: The command to run; tokenized with shlex and

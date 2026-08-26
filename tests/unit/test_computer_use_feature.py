@@ -376,15 +376,23 @@ async def test_shell_refuses_a_pipe_rather_than_running_it_unfiltered(workspace:
 
 
 @pytest.mark.asyncio
-async def test_the_shape_the_refusal_names_actually_works(workspace: Path):
-    """A remedy printed in an error message is code, and needs a test.
+async def test_the_refusal_offers_no_command_that_would_run(workspace: Path):
+    """codex review rounds 1 and 2 — the remedy kept leaking.
 
-    The refusal tells the caller to hand the line to a shell. This runs
-    exactly the command the refusal printed, and asserts the pipeline
-    took effect — ``HELLO``, not the ``hello`` an unfiltered run would
-    have produced. If the suggestion ever stops working, or stops being
-    a runnable command, this fails.
+    The refusal used to print a ``bash -lc`` form of the caller's line.
+    Two rounds were spent bounding it: suppress it when a token names a
+    deny-listed binary, suppress it when an expansion hides what runs.
+    Each round found another spelling that slipped through, because
+    every one of those checks reads ``shlex`` tokens and ``shlex`` is
+    not a shell. ``cat </deny_paths/file | head`` hands the path policy
+    the literal token ``</deny_paths/file``, which resolves to nothing.
+
+    So the refusal offers nothing runnable at all. The mechanism was
+    the bug, not the individual holes — and the same blind spots on the
+    paths that do reach a real shell are filed as #3130.
     """
+    import shlex
+
     queue = FakeApprovalQueue(decision=(True, "once"))
     agent = FakeAgent(
         privacy=PrivacyConfig(computer_access=True),
@@ -393,19 +401,23 @@ async def test_the_shape_the_refusal_names_actually_works(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    target = workspace / "ok.txt"
+    secret = workspace / "secret" / "leak.txt"
 
-    refusal = await feature.shell(command=f"cat {target} | tr a-z A-Z", timeout=5)
-    assert refusal.status is not ToolResultStatus.OK
-    _, _, suggested = refusal.error.partition("hand the line to a shell yourself: ")
-    assert suggested.startswith("bash -lc "), refusal.error
-
-    envelope = await feature.shell(command=suggested, timeout=10)
-    assert envelope.status is ToolResultStatus.OK, envelope.error
-    assert envelope.data["stdout"].strip() == "HELLO", (
-        "the suggested form must actually pipe — 'hello' means the "
-        "pipeline was dropped again"
-    )
+    for command in (
+        f"cat {workspace / 'ok.txt'} | tr a-z A-Z",
+        f"cat <{secret} | head",
+        "echo hi;rm -rf /tmp/x",
+        "cat $HOME/.ssh/id_rsa | head",
+    ):
+        envelope = await feature.shell(command=command, timeout=5)
+        assert envelope.status is not ToolResultStatus.OK, command
+        error = envelope.error
+        assert "bash" not in error and "-lc" not in error, error
+        assert shlex.quote(command) not in error, (
+            "the caller's line must not come back in a runnable form"
+        )
+        assert command not in error, error
+    assert queue.calls == []
 
 
 @pytest.mark.asyncio
@@ -439,66 +451,6 @@ async def test_a_denied_path_in_a_compound_is_still_reported_as_the_denial(works
     assert "bash -lc" not in envelope.error, (
         "a denied command must not be handed a form that would run it"
     )
-    assert queue.calls == []
-
-
-@pytest.mark.asyncio
-async def test_a_denied_binary_anywhere_in_the_compound_gets_no_wrapper(workspace: Path):
-    """``BinaryPolicy`` vets ``argv[0]``; in a compound the binary that
-    matters can be any word.
-
-    ``echo hi | rm -rf /tmp/x`` cannot run today — ``rm`` is one of
-    ``echo``'s arguments. Handing back a shell wrapper would make it
-    run, on one approval, for a binary the deny-list says never. Every
-    token is asked, and because the command is refused either way,
-    over-matching costs nothing.
-    """
-    queue = FakeApprovalQueue(decision=(True, "once"))
-    agent = FakeAgent(
-        privacy=PrivacyConfig(computer_access=True),
-        grants={"shell_execution_sandboxed", "shell_execution_host"},
-        queue=queue,
-    )
-    feature = await _make_feature(workspace, agent=agent)
-    await feature.initialize()
-
-    envelope = await feature.shell(command="echo hi | rm -rf /tmp/x", timeout=5)
-
-    assert envelope.status is not ToolResultStatus.OK
-    assert "\'rm\'" in envelope.error and "deny-listed" in envelope.error, envelope.error
-    assert "bash -lc" not in envelope.error
-    assert queue.calls == []
-
-    # The same word welded to a substitution character: shlex leaves the
-    # backtick on the token, and a deny-list lookup on the raw token
-    # would miss it.
-    welded = await feature.shell(command="echo `rm -rf /tmp/x`", timeout=5)
-    assert "\'rm\'" in welded.error, welded.error
-    assert "bash -lc" not in welded.error
-
-
-@pytest.mark.asyncio
-async def test_an_expansion_gets_no_wrapper_because_no_gate_can_read_it(workspace: Path):
-    """``cat $SECRET`` names a path that does not exist until a shell runs.
-
-    The path policy vets the tokens it can see, and an expansion is a
-    token it cannot. Offering a wrapper here would run something no
-    gate had looked at, so the refusal says so instead of suggesting.
-    """
-    queue = FakeApprovalQueue(decision=(True, "once"))
-    agent = FakeAgent(
-        privacy=PrivacyConfig(computer_access=True),
-        grants={"shell_execution_sandboxed", "shell_execution_host"},
-        queue=queue,
-    )
-    feature = await _make_feature(workspace, agent=agent)
-    await feature.initialize()
-
-    envelope = await feature.shell(command="cat $HOME/.ssh/id_rsa | head", timeout=5)
-
-    assert envelope.status is not ToolResultStatus.OK
-    assert "cannot see what would" in envelope.error, envelope.error
-    assert "bash -lc" not in envelope.error
     assert queue.calls == []
 
 

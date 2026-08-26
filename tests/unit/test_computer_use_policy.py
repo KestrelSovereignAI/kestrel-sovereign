@@ -10,9 +10,7 @@ from kestrel_sovereign.features.computer_use.policy import (
     PathPolicy,
     command_contains_unquoted_shell_control,
     first_shell_syntax_exec_ignores,
-    first_unquoted_expansion,
     first_unquoted_shell_control,
-    token_binary_name,
     split_command,
 )
 
@@ -211,6 +209,10 @@ def test_the_boolean_guard_is_exactly_the_scanner(cmd):
         ("ls > /tmp/x", True),
         # shlex splits on a bare CR; bash keeps it inside the word.
         ("echo a\rb", True),
+        # bash's legacy arithmetic form: `echo $[1+1]` prints 2. Found by
+        # codex review round 2 — the starter set had `{` and `(` but not
+        # `[`, so this divergence was silent, which is the exact defect.
+        ("echo $[1+1]", True),
     ],
 )
 def test_exec_ignores_exactly_what_a_shell_would_have_acted_on(cmd, diverges):
@@ -249,50 +251,6 @@ def test_the_refusal_never_reaches_further_than_the_compound_guard(cmd):
     """
     if first_shell_syntax_exec_ignores(cmd) is not None:
         assert command_contains_unquoted_shell_control(cmd) is True
-
-
-@pytest.mark.parametrize(
-    "cmd,expected",
-    [
-        ("echo $HOME", (5, "$")),
-        ("echo `whoami`", (5, "`")),
-        ("echo $(whoami)", (5, "$")),
-        # A literal dollar names nothing, so there is nothing a gate
-        # could fail to see.
-        ("echo price$", None),
-        ("cat a.txt | tr a-z A-Z", None),
-    ],
-)
-def test_first_unquoted_expansion_finds_what_no_gate_can_read(cmd, expected):
-    """An expansion is the reason a refusal may not hand back a wrapper.
-
-    ``cat $SECRET`` and ``echo `sudo -n true`` name a path and a binary
-    that only exist once a shell has run, so the path and binary
-    policies vetted something else entirely.
-    """
-    assert first_unquoted_expansion(cmd) == expected
-
-
-@pytest.mark.parametrize(
-    "token,expected",
-    [
-        ("rm", "rm"),
-        ("/usr/bin/rm", "rm"),
-        ("`rm", "rm"),
-        ("(sudo", "sudo"),
-        ("rm`", "rm"),
-        (";rm;", "rm"),
-        ("harmless", "harmless"),
-    ],
-)
-def test_token_binary_name_sees_through_welded_punctuation(token, expected):
-    """``shlex`` leaves a control character welded to its neighbour.
-
-    ``echo `rm -rf /`` tokenizes to ``['echo', '`rm', '-rf', '/`']``,
-    so a deny-list lookup on the raw token misses the one word that
-    decides whether a shell wrapper may be offered.
-    """
-    assert token_binary_name(token) == expected
 
 
 def test_compound_guard_handles_non_string():
