@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,10 +59,69 @@ from .policy import (
     Decision,
     PathPolicy,
     evaluate_argv_paths,
+    first_unquoted_shell_control,
     split_command,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# What a shell would have done with each control character. The refusal
+# names the behaviour the caller was counting on, not just the character
+# they typed: "the '|' cannot pipe one command's output into the next"
+# tells them what they lost, where "invalid character" does not.
+_SHELL_CONTROL_MEANINGS = {
+    "|": "pipe one command's output into the next",
+    "&": "background this command, or join it to another",
+    ";": "run a second command after this one",
+    "<": "redirect a file into the command's input",
+    ">": "redirect the command's output into a file",
+    "`": "substitute another command's output",
+    "$": "expand a variable, or substitute another command's output",
+    "(": "group commands in a subshell",
+    ")": "group commands in a subshell",
+    "\n": "run a second command on the next line",
+    "\r": "run a second command on the next line",
+}
+
+
+def unsupported_shell_syntax_error(command: str, argv: List[str]) -> Optional[str]:
+    """Explain why ``command`` cannot be run as written, or ``None``.
+
+    ``shell`` tokenizes with ``shlex`` and execs the argv vector — there
+    is no shell in the path, so a control character is not a control
+    character, it is an ordinary argument. ``ls | head -20`` runs ``ls``
+    with three extra arguments, prints everything, and exits 0: the
+    bound the caller asked for is discarded and nothing says so (#3129,
+    measured at 128 live calls).
+
+    Refusing is the only option that does not execute a different
+    command than the one written. The alternative — routing the string
+    through ``bash -lc`` here — would make the deny-list's unit
+    (``argv[0]``) stop describing what runs, since only ``bash`` would
+    be vetted for a line that can invoke anything. So the caller is told
+    to reach for the shell themselves, where ``bash`` is the binary the
+    policy sees and the operator approves.
+    """
+    found = first_unquoted_shell_control(command)
+    if found is None:
+        return None
+    index, char = found
+    meaning = _SHELL_CONTROL_MEANINGS.get(char, "change how the command is run")
+    # When the control character IS the first token there is no binary it
+    # would have been handed to, so that clause would name the character
+    # as its own recipient.
+    handed_to = (
+        f" — it would be passed to {Path(argv[0]).name!r} as a literal argument"
+        if argv and argv[0] != char
+        else ""
+    )
+    return (
+        f"shell does not run a shell: the command is tokenized and executed "
+        f"directly, so the {char!r} at position {index} cannot {meaning}"
+        f"{handed_to}. Nothing ran. To use shell syntax, hand the line to a "
+        f"shell yourself: bash -lc {shlex.quote(command)}"
+    )
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
@@ -941,15 +1001,20 @@ class ComputerUseFeature(Feature):
     @tool(
         name="shell",
         description=(
-            "Run a shell command. Deny-listed binaries hard-refuse; "
-            "auto-approved binaries run without a prompt; everything "
-            "else routes through the ApprovalQueue."
+            "Run a command. The command is tokenized and executed "
+            "directly — there is NO shell, so `|`, `>`, `<`, `&`, `;`, "
+            "`$VAR` and backticks are not interpreted and a command "
+            "containing them is refused rather than run without them. "
+            "For shell syntax, invoke a shell: bash -lc '<line>'. "
+            "Deny-listed binaries hard-refuse; auto-approved binaries "
+            "run without a prompt; everything else routes through the "
+            "ApprovalQueue."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
     )
     async def shell(self, command: str, timeout: int | str = 60) -> ToolResult:
-        """Run a shell command after policy + (conditional) approval.
+        """Run a command after policy + (conditional) approval.
 
         Approval semantics (#1694):
 
@@ -959,18 +1024,31 @@ class ComputerUseFeature(Feature):
         - Anything else → routes through ApprovalQueue (operator or
           scoped auto-approve rule decides).
 
-        The compound-command guard (raw string with unquoted ``;``,
-        ``&&``, backticks, ``$(...)``, redirects, newline) downgrades
-        ALLOW to REQUIRE_APPROVAL so an allow-listed first token can't
-        bless a piggy-backed second command.
+        ``BinaryPolicy``'s compound-command guard downgrades ALLOW to
+        REQUIRE_APPROVAL when a raw string carries an unquoted control
+        character, so an allow-listed first token cannot bless a
+        piggy-backed second command. It no longer fires on this path —
+        #3129 refuses such a string before the gates run, which is the
+        stronger answer where nothing would have executed the second
+        command anyway. The guard stays load-bearing for the codex
+        bridge, whose flat ``command`` string IS run by a real shell.
+
+        Shell syntax is NOT available (#3129). The command is tokenized
+        with ``shlex`` and the argv vector is executed directly, so a
+        pipe, redirect or command separator would arrive at the binary
+        as a literal argument. Rather than run a command the caller did
+        not write, one containing an unquoted control character is
+        refused with the ``bash -lc`` form that does work.
 
         Args:
-            command: The shell command to run; tokenized with shlex.
+            command: The command to run; tokenized with shlex and
+                executed directly, without a shell.
             timeout: Wall-clock seconds before the process is killed. Coerced
                 to int at the boundary; a non-numeric value is rejected.
 
         Returns:
-            ToolResult.ok when the command exits 0; PARTIAL when the
+            ToolResult.ok when the command exits 0; ERROR when the
+            command uses shell syntax this tool cannot honour; PARTIAL when the
             command ran but exited non-zero or timed out (the LLM
             should NOT claim success — but the shell did run, which
             matters for audit and for follow-up steps that read
@@ -980,6 +1058,16 @@ class ComputerUseFeature(Feature):
         argv = split_command(command)
         if not argv:
             return ToolResult.failed(error="empty command")
+
+        # #3129: the argv vector is what runs. A control character in the
+        # raw string never becomes one, so a command that asks for a pipe,
+        # a redirect or a second command gets none of them and still exits
+        # 0. Refuse before any gate, before any approval: the operator
+        # must not be asked to approve a line that is not the line that
+        # would run.
+        unsupported = unsupported_shell_syntax_error(command, argv)
+        if unsupported is not None:
+            return ToolResult.failed(error=unsupported)
 
         # The LLM may pass ``timeout`` as a string (e.g. "60"); the backend
         # does numeric comparisons on it (asyncio.wait_for's ``<= 0`` check),

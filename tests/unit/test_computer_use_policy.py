@@ -9,6 +9,7 @@ from kestrel_sovereign.features.computer_use.policy import (
     Decision,
     PathPolicy,
     command_contains_unquoted_shell_control,
+    first_unquoted_shell_control,
     split_command,
 )
 
@@ -136,6 +137,54 @@ def test_compound_guard_clean_commands(cmd):
 def test_compound_guard_flags_unquoted_metacharacters(cmd, trigger):
     assert command_contains_unquoted_shell_control(cmd) is True, (
         f"expected {trigger!r} to flag: {cmd!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        ("ls | grep secret", (3, "|")),
+        ("git status; rm -rf /tmp/x", (10, ";")),
+        # The FIRST one, not any one: an inert quoted ``;`` sits before
+        # the live ``|``, and reporting the quoted one would name a
+        # character the caller is allowed to keep.
+        ("""echo '; x' | wc -l""", (11, "|")),
+        ('echo "$HOME"', (6, "$")),
+        ("echo hi", None),
+    ],
+)
+def test_first_unquoted_shell_control_reports_where_and_which(cmd, expected):
+    """#3129 needs the character, not just its existence.
+
+    ``ComputerUseFeature.shell`` refuses a command it cannot honour and
+    has to say which character it could not honour — a caller told only
+    "no" cannot tell which part of what they wrote was the problem.
+    """
+    assert first_unquoted_shell_control(cmd) == expected
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo hi",
+        'echo "; rm -rf /"',
+        "ls | grep secret",
+        "git status && rm -rf /tmp/x",
+        "echo `whoami`",
+        None,
+        ["ls", "-la"],
+    ],
+)
+def test_the_boolean_guard_is_exactly_the_scanner(cmd):
+    """The compound-command guard is now a wrapper over the scanner.
+
+    #1694's downgrade and #3129's refusal must never disagree about
+    what counts as a shell control character: two answers to one
+    question is how a command gets refused on one path and queued on
+    another.
+    """
+    assert command_contains_unquoted_shell_control(cmd) is (
+        first_unquoted_shell_control(cmd) is not None
     )
 
 

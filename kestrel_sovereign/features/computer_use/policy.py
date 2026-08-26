@@ -235,9 +235,9 @@ def evaluate_argv_paths(
 _SHELL_CONTROL_CHARS = frozenset(";&|`$()<>\n\r")
 
 
-def command_contains_unquoted_shell_control(cmd: str) -> bool:
-    """Return True iff ``cmd`` has a shell control character outside
-    a quoted region.
+def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
+    """Return ``(index, char)`` of the first unquoted shell control
+    character in ``cmd``, or ``None`` when there is none.
 
     Catches: ``;``, ``&``/``&&``, ``|``/``||``, backticks, ``$(...)``,
     ``$VAR`` substitution, redirects ``<``/``>``, newlines.
@@ -247,9 +247,17 @@ def command_contains_unquoted_shell_control(cmd: str) -> bool:
 
     Defense in depth, not exhaustive parsing. The QUEUE remains the
     real authoritative gate for anything we downgrade.
+
+    Two callers need two different things from one scan, so the scan
+    reports *which* character it found rather than only *that* it did:
+    :func:`command_contains_unquoted_shell_control` needs the boolean
+    (an allow-listed first token cannot vouch for a compound), and
+    ``ComputerUseFeature.shell`` needs to name the character in its
+    refusal, because a caller who is told only "no" cannot tell which
+    part of what they wrote was not going to be honoured.
     """
     if not isinstance(cmd, str):
-        return False
+        return None
     # Inside double quotes the shell still expands ``$VAR`` and runs
     # ``$(...)`` / backticks. Only single-quoted regions truly disable
     # those — so we treat ``$`` and backticks as risky regardless of
@@ -275,7 +283,7 @@ def command_contains_unquoted_shell_control(cmd: str) -> bool:
                 i += 1
                 continue
             if c in DQ_ACTIVE_CHARS:
-                return True
+                return (i, c)
             i += 1
             continue
         if c == "'":
@@ -292,6 +300,13 @@ def command_contains_unquoted_shell_control(cmd: str) -> bool:
             i += 2
             continue
         if c in _SHELL_CONTROL_CHARS:
-            return True
+            return (i, c)
         i += 1
-    return False
+    return None
+
+
+def command_contains_unquoted_shell_control(cmd: str) -> bool:
+    """Return True iff ``cmd`` has a shell control character outside a
+    quoted region — see :func:`first_unquoted_shell_control`.
+    """
+    return first_unquoted_shell_control(cmd) is not None

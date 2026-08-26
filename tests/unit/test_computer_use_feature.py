@@ -299,12 +299,20 @@ def test_default_denied_binaries_reserved_for_unrecoverable():
 
 
 @pytest.mark.asyncio
-async def test_shell_compound_command_with_allow_listed_head_queues(workspace: Path):
-    """#1694 codex review P1: an allow-listed first token can't bless
-    a piggy-backed second command. Direct shell path must downgrade
-    ALLOW → REQUIRE_APPROVAL when the raw command carries an unquoted
-    shell control char so the queue (and operator) sees the full
-    compound, not just the allow-listed head."""
+async def test_shell_compound_command_with_allow_listed_head_is_refused(workspace: Path):
+    """#1694 asked that an allow-listed first token not bless a
+    piggy-backed second command, and answered it by routing the
+    compound to the queue. #3129 answers it harder: the second command
+    was never going to run — ``shlex`` hands ``echo`` the tokens
+    ``hi;`` and ``true`` — so queueing it asked the operator to approve
+    a line that does not exist. The compound is refused instead, and
+    the queue is not consulted at all.
+
+    ``BinaryPolicy``'s ALLOW → REQUIRE_APPROVAL downgrade is unchanged
+    and still covered by test_computer_use_policy.py; it remains the
+    live guard for the codex bridge, where a flat ``command`` string is
+    run by a real shell.
+    """
     queue = FakeApprovalQueue(decision=(True, "once"))
     agent = FakeAgent(
         privacy=PrivacyConfig(computer_access=True),
@@ -313,13 +321,112 @@ async def test_shell_compound_command_with_allow_listed_head_queues(workspace: P
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    # ``echo`` is on the fixture's auto-approve list, but the ``;``
-    # composes a second command — the queue must be reached.
     envelope = await feature.shell(command="echo hi; true", timeout=5)
-    assert envelope.status is ToolResultStatus.OK
-    assert len(queue.calls) == 1, (
-        "compound command must reach the queue even with allow-listed head"
+    assert envelope.status is not ToolResultStatus.OK
+    assert "\';\'" in envelope.error
+    assert queue.calls == [], (
+        "the operator must not be asked to approve a command that would "
+        "not be the command that runs"
     )
+
+
+@pytest.mark.asyncio
+async def test_shell_refuses_a_pipe_rather_than_running_it_unfiltered(workspace: Path):
+    """#3129: the bound the caller asked for must not be silently dropped.
+
+    ``cat ok.txt | tr a-z A-Z`` tokenizes to ``cat`` with four extra
+    arguments. Before this, that ran, printed the unfiltered file and
+    exited 0 — 128 live calls did exactly that. The refusal has to name
+    the character, because a caller told only "no" cannot tell which
+    part of what they wrote was not going to be honoured.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    target = workspace / "ok.txt"
+
+    # Positive control FIRST: without the pipe this exact command runs.
+    # Otherwise the refusal below could be any unrelated failure and the
+    # test would still pass.
+    ran = await feature.shell(command=f"cat {target}", timeout=5)
+    assert ran.status is ToolResultStatus.OK
+    assert ran.data["stdout"] == "hello"
+
+    envelope = await feature.shell(command=f"cat {target} | tr a-z A-Z", timeout=5)
+    assert envelope.status is not ToolResultStatus.OK
+    assert "\'|\'" in envelope.error, envelope.error
+    # Assert against the explanation, not the whole message: the message
+    # ends with the suggested command, which quotes the caller's own line
+    # back — and pytest's tmp_path carries this test's own name, so a
+    # loose ``"cat" in error`` passes on the path alone. Both of these
+    # survived a mutant that deleted what they were meant to pin.
+    explanation, _, _ = envelope.error.partition(" To use shell syntax,")
+    assert "passed to \'cat\' as a literal argument" in explanation, envelope.error
+    assert "cannot pipe one command\'s output into the next" in explanation, (
+        "naming the character is not enough — the refusal has to say what "
+        "the caller was counting on it to do"
+    )
+    assert len(queue.calls) == 1, "only the positive control should have reached the queue"
+
+
+@pytest.mark.asyncio
+async def test_the_shape_the_refusal_names_actually_works(workspace: Path):
+    """A remedy printed in an error message is code, and needs a test.
+
+    The refusal tells the caller to hand the line to a shell. This runs
+    exactly the command the refusal printed, and asserts the pipeline
+    took effect — ``HELLO``, not the ``hello`` an unfiltered run would
+    have produced. If the suggestion ever stops working, or stops being
+    a runnable command, this fails.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    target = workspace / "ok.txt"
+
+    refusal = await feature.shell(command=f"cat {target} | tr a-z A-Z", timeout=5)
+    assert refusal.status is not ToolResultStatus.OK
+    _, _, suggested = refusal.error.partition("hand the line to a shell yourself: ")
+    assert suggested.startswith("bash -lc "), refusal.error
+
+    envelope = await feature.shell(command=suggested, timeout=10)
+    assert envelope.status is ToolResultStatus.OK, envelope.error
+    assert envelope.data["stdout"].strip() == "HELLO", (
+        "the suggested form must actually pipe — 'hello' means the "
+        "pipeline was dropped again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_runs_a_quoted_metacharacter(workspace: Path):
+    """Over-refusal is its own defect: a quoted ``|`` is inert to a
+    shell, so it is an ordinary argument here too and must still run.
+
+    ``echo`` is the fixture's allow-listed binary, so this also pins
+    that the refusal check does not disturb the ALLOW fast path.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    envelope = await feature.shell(command="echo \'a|b\'", timeout=5)
+    assert envelope.status is ToolResultStatus.OK, envelope.error
+    assert envelope.data["stdout"].strip() == "a|b"
+    assert queue.calls == [], "allow-listed binary must still bypass the queue"
 
 
 @pytest.mark.asyncio
