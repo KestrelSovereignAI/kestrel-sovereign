@@ -310,3 +310,84 @@ async def test_inline_executor_wiring_carries_scheduler_execution_scope():
         "effect -- for the worked example, a merge running twice (#3112)."
     )
     assert getattr(seen, "idempotency_key", None) == "occ:key:wiring"
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_wiring_carries_scheduler_execution_scope():
+    """Instance SIX: the SUBAGENT boundary, one reader task further out.
+
+    ``Feature._make_feature_inline_tool_executor`` is the SECOND cross-task
+    seam. The parent executor (instance five) re-presents the scheduler
+    execution scope; the subagent executor did not. So a ``self_followup``
+    turn that delegates to a subagent whose inline tool is effectful stamps
+    NO idempotency key -- the merge-runs-twice casualty, reached through
+    delegation rather than directly.
+
+    This drives the REAL ``_make_feature_inline_tool_executor`` on the frozen
+    reader topology, so it fails if the capture, the bind, or the ``with``
+    clause is dropped. Mutation-verified: reverting the capture to ``None``
+    turns this red and leaves every other test in the file green.
+    """
+    from kestrel_sovereign.features.base import Feature
+    from kestrel_sovereign.features.scheduler.runner import (
+        _SchedulerExecutionScope,
+        _current_execution,
+        get_current_scheduler_execution,
+    )
+
+    seen: dict = {}
+
+    class _ScopeReadingTool:
+        name = "some_tool"
+
+        async def execute(self, **kwargs):
+            seen["scope"] = get_current_scheduler_execution()
+            seen["signal"] = get_current_signal()
+            return {"ok": True}
+
+    class _ScopeSubagentFeature(Feature):
+        """Real ``Feature``; ``__init__`` deliberately bypassed (see the
+        nested-reentry test in tests/unit/test_privacy_graph_boundary.py --
+        no ``hooks_manager`` means the PRE_TOOL_USE gate is skipped, which is
+        orthogonal to the binding seam under test)."""
+
+        def __init__(self):
+            self.agent = SimpleNamespace(hooks_manager=None)
+            self.name = "scope_feature"
+            self._tools = [_ScopeReadingTool()]
+
+        async def initialize(self):  # abstract
+            pass
+
+        @property
+        def tool_description(self) -> str:  # abstract
+            return "Reads the scheduler execution scope."
+
+        def get_tools(self):
+            return self._tools
+
+    execution = SimpleNamespace(id="exec-subagent-1", idempotency_key="occ:key:subagent")
+    scope = _SchedulerExecutionScope(execution=execution)
+
+    feature = _ScopeSubagentFeature()
+    harness = _CodexReaderHarness()
+    # Reader spawned BEFORE the scope is published: frozen pre-turn snapshot.
+    await harness.ensure_started()
+
+    token = _current_execution.set(scope)
+    try:
+        with part_collector():
+            executor = feature._make_feature_inline_tool_executor()
+            await harness.dispatch(executor, "some_tool", {})
+    finally:
+        _current_execution.reset(token)
+    await harness.stop()
+
+    assert seen.get("scope") is not None, (
+        "get_current_scheduler_execution() returned None inside a SUBAGENT "
+        "inline tool: the subagent boundary dropped the scheduler execution "
+        "scope the parent boundary carries, so an effectful delegated tool "
+        "omits its stable idempotency key and a retried occurrence repeats "
+        "the effect -- a merge running twice, via delegation (#3112)."
+    )
+    assert getattr(seen["scope"], "idempotency_key", None) == "occ:key:subagent"

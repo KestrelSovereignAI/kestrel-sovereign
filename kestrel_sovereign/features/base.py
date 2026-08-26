@@ -1547,12 +1547,30 @@ class Feature(_SdkFeature):
         # off-turn captures ``None``, so this never manufactures a waking
         # signal where there was none.
         turn_signal = get_current_signal()
+        # SIXTH instance, and the twin of the fifth: the parent-turn boundary
+        # in ``OrchestratorEngineMixin._make_inline_tool_executor`` re-presents
+        # the scheduler execution scope, and this subagent boundary did not.
+        # A ``self_followup`` turn that delegates to a subagent whose inline
+        # tool is isolated/effectful therefore stamps NO idempotency key, and
+        # an occurrence retried after lease/finalization uncertainty repeats
+        # the effect -- the "merge PR N once CI settles" example merging twice,
+        # one reader-task boundary further out.
+        #
+        # Imported here rather than at module scope: features/base.py must not
+        # take a hard import dependency on an optional feature package.
+        from kestrel_sovereign.features.scheduler.runner import (
+            bind_scheduler_execution_scope,
+            capture_scheduler_execution_scope,
+        )
+
+        turn_scheduler_scope = capture_scheduler_execution_scope()
 
         async def _exec(name: str, args: Dict[str, Any]):
             with (
                 bind_transition_lock_reentry(transition_reentry_token),
                 bind_turn_session(turn_session_binding),
                 bind_current_signal(turn_signal),
+                bind_scheduler_execution_scope(turn_scheduler_scope),
             ):
                 return await self._execute_subagent_tool(
                     tool_name=name,
