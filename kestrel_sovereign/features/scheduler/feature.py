@@ -767,6 +767,43 @@ class SchedulerFeature(Feature):
                 ),
             )
 
+        # Fail closed at FIRE time as well as creation (#3112 gate-4 P1).
+        # The creation-time refusal in _create_schedule is evaluated once,
+        # against the mode in force when the row was written. Privacy mode is
+        # mutable: a follow-up queued under full storage, followed by a
+        # transition to EPHEMERAL / ISOLATED / DEIDENTIFIED before the
+        # deadline, leaves a row whose persisted intent is conversation-derived
+        # text the current mode forbids -- and firing it reads that text back
+        # out of the raw scheduler database and into a cognition turn. A guard
+        # that runs only at creation is a guard against the state at creation,
+        # not against the state at use.
+        #
+        # Placed BEFORE the dispatcher/mode fallbacks below for the same reason
+        # the schedule-mutating refusal above is: both fallbacks route to
+        # _lookup_and_run_tool, which reads the same persisted intent, so a
+        # guard placed after them is a guard with two ways around it.
+        if task_name == SELF_FOLLOWUP_TASK_NAME:
+            from kestrel_sovereign.features.storage_access import (
+                hides_persisted_user_content,
+            )
+
+            if hides_persisted_user_content(self.agent):
+                logger.warning(
+                    "SchedulerFeature: refusing to fire %r -- privacy mode "
+                    "changed to a volatile mode after the row was queued "
+                    "(#3112 gate-4). The persisted intent is not read back "
+                    "into a turn.",
+                    task_name,
+                )
+                return ScheduledTaskOutcome(
+                    status="failed",
+                    result_text=(
+                        f"refused: {task_name} was queued under a durable "
+                        "privacy mode, but the current mode forbids reading "
+                        "persisted conversation content back into a turn"
+                    ),
+                )
+
         dispatcher = getattr(self.agent, "dispatcher", None)
         if dispatcher is None:
             # Fallback for partially-initialized agents (e.g. legacy
