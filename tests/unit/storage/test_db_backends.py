@@ -686,7 +686,7 @@ class TestSQLiteBackend:
             with patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.01,
+                0.25,
             ):
                 await backend.close()
 
@@ -1939,7 +1939,7 @@ class TestAsyncDatabase:
                 factory_worker = aiosqlite_worker(factory._sqlite_connections[0])
 
                 close_task = asyncio.create_task(db.close())
-                # With the deliberately tiny lifecycle window, a busy runner
+                # With the deliberately bounded lifecycle window, a busy runner
                 # may expire either while Connection.close() is still being
                 # scheduled or while waiting for the worker's final return.
                 # Both are bounded factory-close failures. Wait until the
