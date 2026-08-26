@@ -210,7 +210,13 @@ def _candidate_files(pattern: str, *, fixed: bool) -> set[str]:
     ``git grep`` decides nothing here: it narrows the tree so the AST pass has a
     small set to parse. Every candidate is then verified semantically.
     """
-    output = _git("grep", "-l", "-F" if fixed else "-E", "--", pattern, "*.py")
+    # ``--untracked`` because round 4 taught changed_line_map about untracked
+    # files and left this half behind: a new file entered the changed map but
+    # was never searched, so its occurrence could not be counted as touched and
+    # the gate reported clean. A boundary has two ends.
+    output = _git(
+        "grep", "-l", "--untracked", "-F" if fixed else "-E", "--", pattern, "*.py"
+    )
     return {line for line in output.splitlines() if line}
 
 
@@ -268,6 +274,7 @@ class FileIndex:
     strings: dict[str, list[int]] = field(default_factory=dict)
     calls: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     refs: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    import_bindings: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     definitions: set[str] = field(default_factory=set)
     aliases: dict[str, set[str]] = field(default_factory=dict)
     imported_modules: set[str] = field(default_factory=set)
@@ -295,6 +302,15 @@ def _build_index(tree: ast.AST) -> FileIndex:
             for entry in node.names:
                 index.aliases.setdefault(entry.name, set()).add(entry.asname or entry.name)
                 index.imported_modules.add(entry.name)
+                # The binding depends on the name EXISTING, not on what it
+                # does. Renaming or deleting the definition makes importing
+                # this file raise ImportError — and with no call anywhere,
+                # `sites` was empty and the gate called that clean. Kept apart
+                # from `refs` because a body change does not touch an import,
+                # and counting it there made every import an unreviewed site.
+                index.import_bindings.setdefault(entry.name, []).append(
+                    (node.lineno, node.lineno)
+                )
             if node.module:
                 index.imported_modules.add(node.module)
                 index.imported_modules.add(node.module.rsplit(".", 1)[-1])
@@ -330,6 +346,15 @@ def untracked_python_files() -> set[str]:
     return {line for line in output.splitlines() if line}
 
 
+def _files_matching_all(*patterns: str) -> set[str]:
+    """Files matching EVERY pattern — a cheap conjunction the AST then judges."""
+    args = ["grep", "-l", "--untracked", "--all-match", "-E"]
+    for pattern in patterns:
+        args += ["-e", pattern]
+    output = _git(*args, "--", "*.py")
+    return {line for line in output.splitlines() if line}
+
+
 def _word_pattern(word: str) -> str:
     """POSIX ERE matching ``word`` as a whole identifier."""
     return rf"(^|[^[:alnum:]_]){re.escape(word)}([^[:alnum:]_]|$)"
@@ -353,14 +378,15 @@ def alias_closure(name: str, *, max_rounds: int = 3) -> set[str]:
         discovered: set[str] = set()
         for current in names:
             # Only a RENAMING import can introduce a name the plain prefilter
-            # misses, so look for `import <current> as ...` specifically rather
-            # than every file mentioning the name. Searching the broad pattern
-            # here parsed the whole candidate set a second time and took the
-            # gate from 0.8s to 13s on an iteration-sized diff.
-            renaming = (
-                rf"import.*[^[:alnum:]_]{re.escape(current)}[[:space:]]+as[[:space:]]"
-            )
-            for path in _candidate_files(renaming, fixed=False):
+            # misses. Requiring `import <current> as` on ONE line missed Black's
+            # parenthesized form entirely, which is how this repository formats
+            # long import lists. Ask instead for files mentioning both the name
+            # and an `as` anywhere, then let the AST decide — that stays cheap
+            # (the broad name-only pattern took the gate from 0.8s to 13s) and
+            # is not line-oriented.
+            for path in _files_matching_all(
+                _word_pattern(current), r"[^[:alnum:]_]as[^[:alnum:]_]"
+            ):
                 index = index_for(path)
                 if index is None:
                     continue
@@ -374,7 +400,12 @@ def alias_closure(name: str, *, max_rounds: int = 3) -> set[str]:
 
 
 def call_sites(
-    index: FileIndex, name: str, *, kind: str, local_names: set[str] | None = None
+    index: FileIndex,
+    name: str,
+    *,
+    kind: str,
+    local_names: set[str] | None = None,
+    include_imports: bool = False,
 ) -> list[tuple[int, int]]:
     """(start, end) spans where ``name`` is genuinely *used*, per the AST.
 
@@ -397,6 +428,8 @@ def call_sites(
     for local in local_names or {name}:
         spans.extend(index.calls.get(local, ()))
         spans.extend(index.refs.get(local, ()))
+        if include_imports:
+            spans.extend(index.import_bindings.get(local, ()))
     return spans
 
 
@@ -629,9 +662,16 @@ def collect(
     structural: list[tuple[str, int]] = []
 
     for name, (kind, defining_paths) in sorted(symbols.items()):
-        scope = scope_for(name, kind, defining_paths)
         # Follow re-export bridges: a caller may only ever mention the alias.
         local_names = alias_closure(name)
+        scope = scope_for(name, kind, defining_paths)
+        if scope is not None:
+            # The closure can discover a name the scope has never heard of. A
+            # private helper re-exported as `h` is reached by a module that
+            # imports `h`, not `_helper` and not the defining module, so the
+            # intersection removed exactly the caller the closure just found.
+            for alias in local_names - {name}:
+                scope = scope | import_sites(alias)
         candidates: set[str] = set()
         for local in local_names:
             candidates |= _candidate_files(_word_pattern(local), fixed=False)
@@ -666,7 +706,11 @@ def collect(
             sites.extend(
                 Occurrence(path, start, end)
                 for start, end in call_sites(
-                    index, name, kind=kind, local_names=local_names
+                    index,
+                    name,
+                    kind=kind,
+                    local_names=local_names,
+                    include_imports=not defined_now,
                 )
             )
 
@@ -674,6 +718,27 @@ def collect(
             structural.append((name, len(sites)))
             continue
         touched, untouched = _split(sites, new_map)
+
+        # A call REMOVED by the diff is gone from the working tree, so the scan
+        # above cannot see it and the report understates both counts — the same
+        # blind spot already fixed for removed literals.
+        for path, source in old_sources.items():
+            tree = _parse(source, path)
+            if tree is None:
+                continue
+            old_index = _build_index(tree)
+            for start, end in call_sites(
+                old_index,
+                name,
+                kind=kind,
+                local_names=local_names,
+                include_imports=not defined_now,
+            ):
+                if any(
+                    line in old_map.get(path, ()) for line in range(start, end + 1)
+                ) and not any(o.path == path and o.line == start for o in touched):
+                    touched.append(Occurrence(path, start, end))
+
         # `touched and untouched` discarded the gate's whole motivating case:
         # change a shared function's body, leave every caller alone, and it
         # reported CLEAN. The changed *definition* is what puts the callers in

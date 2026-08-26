@@ -626,7 +626,10 @@ def test_renaming_a_definition_surfaces_callers_of_the_old_name(repo: Path) -> N
     (repo / "mod.py").write_text("def renamed(x):\n    return x\n")
 
     finding = _named(_findings(repo), "shared")
-    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+    # The import binding on line 1 is a site too: after the rename, importing
+    # a.py raises ImportError. That is a dependency on the NAME existing, which
+    # a body change would not touch and a rename breaks outright.
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 1), ("a.py", 5)}
 
 
 def test_deleting_a_definition_surfaces_callers_of_the_old_name(repo: Path) -> None:
@@ -636,7 +639,7 @@ def test_deleting_a_definition_surfaces_callers_of_the_old_name(repo: Path) -> N
     (repo / "mod.py").write_text("def kept():\n    return 1\n")
 
     finding = _named(_findings(repo), "shared")
-    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 1), ("a.py", 5)}
 
 
 def test_a_first_class_reference_is_a_dependent_site(repo: Path) -> None:
@@ -837,3 +840,98 @@ def test_an_untracked_new_file_is_analysed(repo: Path) -> None:
 
     finding = _named(_findings(repo), "shared")
     assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+# --------------------------------------------------------------------------
+# Codex review round 5 — three P1s and two P2s, all false-cleans
+# --------------------------------------------------------------------------
+
+def test_a_black_formatted_alias_import_is_discovered(repo: Path) -> None:
+    """``from mod import (\\n    shared as alias,\\n)`` is how this repo formats.
+
+    The aliasing prefilter required ``import`` and ``shared as`` on ONE line, so
+    the parenthesized form was never seen and the closure never learned ``alias``.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mod import (\n    shared as alias,\n)\n")
+    (repo / "user.py").write_text("from bridge import alias\n\n\ndef f():\n    return alias(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_an_untracked_files_occurrence_is_searched_not_only_mapped(repo: Path) -> None:
+    """Round 4 taught changed_line_map about untracked files and stopped there.
+
+    ``git grep`` skips untracked files by default, so the new file entered the
+    changed map but was never searched: its occurrence could not become
+    ``touched``, and the gate reported clean. A boundary has two ends.
+    """
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    _commit(repo)
+    (repo / "newfile.py").write_text('B = "tool_execution"\n')  # never staged
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.changed] == [("newfile.py", 1)]
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 1)]
+
+
+def test_an_import_only_dependency_on_a_renamed_definition_is_surfaced(
+    repo: Path,
+) -> None:
+    """No call anywhere — but importing the file now raises ImportError."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import shared\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def renamed(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1)}
+
+
+def test_an_import_binding_is_not_a_site_for_a_body_change(repo: Path) -> None:
+    """The other direction: a body change does not touch an import.
+
+    Counting import bindings unconditionally made every import an unreviewed
+    site and inflated eleven existing tests. The binding depends on the name
+    existing, not on what it does.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 5)}, (
+        "the import binding was counted as a site for a body-only change"
+    )
+
+
+def test_scope_follows_importers_of_a_discovered_alias(repo: Path) -> None:
+    """The closure can find a name the scope has never heard of."""
+    (repo / "mine.py").write_text("def _helper(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mine import _helper as h\n")
+    (repo / "user.py").write_text("from bridge import h\n\n\ndef f():\n    return h(2)\n")
+    _commit(repo)
+    (repo / "mine.py").write_text("def _helper(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_call_removed_by_the_diff_counts_as_touched(repo: Path) -> None:
+    """A deleted call is absent from the working tree, so the scan cannot see it."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(2)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return 0\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert [(o.path, o.line) for o in finding.changed] == [("a.py", 5)], (
+        f"the removed call was not counted: {finding.changed}"
+    )
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 5)]
