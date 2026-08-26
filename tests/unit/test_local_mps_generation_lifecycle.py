@@ -58,7 +58,12 @@ subprocess.Popen(
     close_fds=True,
 )
 deadline = time.monotonic() + 3
-while not Path(payload["child_pid"]).exists():
+while True:
+    try:
+        if int(Path(payload["child_pid"]).read_text(encoding="utf-8")) > 0:
+            break
+    except (FileNotFoundError, ValueError):
+        pass
     if time.monotonic() >= deadline:
         raise RuntimeError("descendant did not report its pid")
     time.sleep(0.01)
@@ -121,11 +126,17 @@ def _configure_real_process_tree(
     return parent_pid_path, child_pid_path, late_marker
 
 
-async def _wait_for_path(path: Path, timeout: float = 3.0) -> None:
+async def _wait_for_pid_file(path: Path, timeout: float = 3.0) -> int:
     deadline = asyncio.get_running_loop().time() + timeout
-    while not path.exists():
+    while True:
+        try:
+            process_id = int(path.read_text(encoding="utf-8"))
+            if process_id > 0:
+                return process_id
+        except (FileNotFoundError, ValueError):
+            pass
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(f"Timed out waiting for {path}")
+            raise AssertionError(f"Timed out waiting for a complete PID in {path}")
         await asyncio.sleep(0.01)
 
 
@@ -282,10 +293,8 @@ async def test_real_success_kills_surviving_descendant_before_cleanup(
             ),
             timeout=4.0,
         )
-        await _wait_for_path(parent_pid_path)
-        await _wait_for_path(child_pid_path)
-        group_id = int(parent_pid_path.read_text(encoding="utf-8"))
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        group_id = await _wait_for_pid_file(parent_pid_path)
+        child_pid = await _wait_for_pid_file(child_pid_path)
 
         assert result.state is GenerationState.COMPLETED
         assert not list(adapter.working_dir.glob(".generation-*"))
@@ -331,10 +340,8 @@ async def test_real_timeout_kills_stubborn_descendant_before_cleanup(
             ),
             timeout=4.0,
         )
-        await _wait_for_path(parent_pid_path)
-        await _wait_for_path(child_pid_path)
-        group_id = int(parent_pid_path.read_text(encoding="utf-8"))
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        group_id = await _wait_for_pid_file(parent_pid_path)
+        child_pid = await _wait_for_pid_file(child_pid_path)
 
         assert result.state is GenerationState.FAILED
         assert result.error == "Generation timed out (0.2s)"
@@ -380,10 +387,8 @@ async def test_real_repeated_cancellation_kills_descendant_before_cleanup(
         )
     )
     try:
-        await _wait_for_path(parent_pid_path)
-        await _wait_for_path(child_pid_path)
-        group_id = int(parent_pid_path.read_text(encoding="utf-8"))
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        group_id = await _wait_for_pid_file(parent_pid_path)
+        child_pid = await _wait_for_pid_file(child_pid_path)
         task.cancel("first cancellation")
         await asyncio.sleep(0.01)
         task.cancel("repeated cancellation")
