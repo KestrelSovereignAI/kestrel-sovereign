@@ -68,6 +68,12 @@ MIN_LITERAL_LEN = 4
 # than an invariant. The count stays visible; only the listing is capped.
 MAX_SITES_LISTED = 10
 
+# A name used more times than this cannot be reviewed site-by-site — running
+# ``--base main`` over a whole branch reported ``execute`` at 2323 call sites and
+# ``initialize`` at 1354. Those are counted and named in a footer, never dropped
+# silently: a hidden cap reads as "covered everything".
+MAX_TOTAL_SITES = 100
+
 # Literals that are punctuation, formatting, or otherwise carry no invariant.
 _NOISE_LITERAL = re.compile(r"^[\s\W_]*$|^%[sdrf]$|^\{\}$")
 
@@ -169,25 +175,172 @@ def _parse(source: str, filename: str) -> ast.AST | None:
         return None
 
 
-def modified_symbols(source: str, path: str, changed_lines: set[int]) -> set[str]:
-    """Names of defs in ``source`` whose body overlaps ``changed_lines``.
+def _candidate_files(pattern: str, *, fixed: bool) -> set[str]:
+    """Files that mention the text at all — a cheap prefilter, never the answer.
+
+    ``git grep`` decides nothing here: it narrows the tree so the AST pass has a
+    small set to parse. Every candidate is then verified semantically.
+    """
+    output = _git("grep", "-l", "-F" if fixed else "-E", "--", pattern, "*.py")
+    return {line for line in output.splitlines() if line}
+
+
+_TREES: dict[tuple[str, str], ast.AST | None] = {}
+
+
+def _tree_for(path: str, ref: str = "") -> ast.AST | None:
+    """Parse ``path`` once per run. ``ref`` empty means the working tree."""
+    key = (path, ref)
+    if key not in _TREES:
+        if ref:
+            source = _git("show", f"{ref}:{path}")
+        else:
+            try:
+                source = (PROJECT_ROOT / path).read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                source = ""
+        _TREES[key] = _parse(source, path) if source else None
+    return _TREES[key]
+
+
+def _name_line(node: ast.AST) -> int:
+    """The line the *name* is on, not where the expression started.
+
+    For ``obj.method(...)`` spanning lines, ``Attribute.lineno`` points at
+    ``obj``; the name the reader is looking for is at the end.
+    """
+    if isinstance(node, ast.Attribute):
+        return getattr(node, "end_lineno", node.lineno) or node.lineno
+    return node.lineno
+
+
+def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[int]:
+    """Lines where ``name`` is genuinely *used*, per the AST.
+
+    A textual search cannot tell a call from a string that contains one. This
+    repository's tests embed Python source as string literals constantly, so
+    ``TEXT = "helper(1)"`` was being reported as an unchanged call site of
+    ``helper``. Only real syntax nodes count here.
+
+    Classes are matched on any reference, not only calls: a class edited in
+    place may never be instantiated in the diff's view, and demanding ``Name(``
+    made an ordinary ``class Worker:`` edit look like a broken detector.
+    """
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id == name) or (
+                isinstance(func, ast.Attribute) and func.attr == name
+            ):
+                lines.append(_name_line(func))
+        elif kind == "class":
+            if isinstance(node, ast.Name) and node.id == name:
+                lines.append(node.lineno)
+            elif isinstance(node, ast.Attribute) and node.attr == name:
+                lines.append(_name_line(node))
+    return lines
+
+
+def literal_sites(tree: ast.AST, value: str) -> list[int]:
+    """Lines holding a string constant *equal to* ``value``.
+
+    ``git grep -F "config"`` matches ``base_config``, comments, and every longer
+    string containing it — 8,241 hits in this repository against a handful of
+    real constants. Equality on an AST constant is the actual question.
+    """
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value == value
+    ]
+
+
+def defines(tree: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.name == name
+        for node in ast.walk(tree)
+    )
+
+
+def import_sites(name: str) -> set[str]:
+    """Files that import ``name`` by name, per the AST."""
+    pattern = rf"(^|[^[:alnum:]_]){re.escape(name)}([^[:alnum:]_]|$)"
+    found: set[str] = set()
+    for path in _candidate_files(pattern, fixed=False):
+        tree = _tree_for(path)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and any(
+                alias.name == name or alias.asname == name for alias in node.names
+            ):
+                found.add(path)
+                break
+    return found
+
+
+def scope_for(name: str, kind: str, defining_paths: set[str]) -> set[str] | None:
+    """Paths a symbol's uses may live in, or None for repo-wide.
+
+    Dogfooding reported ``_commit`` as having 33 call sites: every test module
+    defines its own private ``_commit``, and they are unrelated functions that
+    merely share a name. A leading underscore means module-private, so its real
+    uses are its own module plus whatever imports it by name.
+
+    This applies to **module-level functions only**. A private *method* is
+    reached as ``queue._dispatch()`` from modules that import ``Queue``, never
+    ``_dispatch`` — scoping those to importers of the method name would drop
+    exactly the external callers this gate exists to surface.
+    """
+    if kind != "function" or not name.startswith("_"):
+        return None
+    return defining_paths | import_sites(name)
+
+
+def modified_symbols(
+    source: str, path: str, changed_lines: set[int]
+) -> dict[str, str]:
+    """Defs in ``source`` whose body overlaps ``changed_lines``, mapped to kind.
 
     The *definition* is what matters, not the call: changing a function's body
-    is what puts its callers in question.
+    is what puts its callers in question. Kind separates a module-level
+    function from a method, which scope differently.
     """
     tree = _parse(source, path)
     if tree is None:
-        return set()
-    names: set[str] = set()
+        return {}
+
+    methods: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.add(id(child))
+
+    found: dict[str, str] = {}
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        end = getattr(node, "end_lineno", node.lineno) or node.lineno
         if node.name in _SKIP_NAMES:
             continue
-        if any(node.lineno <= line <= end for line in changed_lines):
-            names.add(node.name)
-    return names
+        end = getattr(node, "end_lineno", node.lineno) or node.lineno
+        if not any(node.lineno <= line <= end for line in changed_lines):
+            continue
+        if isinstance(node, ast.ClassDef):
+            kind = "class"
+        elif id(node) in methods:
+            kind = "method"
+        else:
+            kind = "function"
+        # A method definition outranks a same-named module function: it is the
+        # weaker scope, and picking the stronger one would hide call sites.
+        if found.get(node.name) != "method":
+            found[node.name] = kind
+    return found
 
 
 def literals_on(source: str, path: str, changed_lines: set[int]) -> set[str]:
@@ -206,84 +359,16 @@ def literals_on(source: str, path: str, changed_lines: set[int]) -> set[str]:
         if len(value) < MIN_LITERAL_LEN or _NOISE_LITERAL.match(value):
             continue
         # An invariant carried in a literal is identifier-shaped —
-        # ``"tool_execution"``, ``"subagent_dispatch"``, ``"auto_allowed"``.
-        # Anything with whitespace is prose or a format fragment; this gate's
-        # own report strings were being surfaced against unrelated modules that
-        # happened to print the same words.
+        # "tool_execution", "subagent_dispatch", "auto_allowed". Anything with
+        # whitespace is prose or a format fragment.
         if any(character.isspace() for character in value):
             continue
-        # And it must carry an actual word: ``"*.py"`` is a pathspec, ``"%s/%s"``
-        # a format. Requiring one alphanumeric run of MIN_LITERAL_LEN keeps
-        # ``tool_execution`` and drops both.
+        # And it must carry an actual word: "*.py" is a pathspec, "%s/%s" a
+        # format. One alphanumeric run of MIN_LITERAL_LEN keeps the real ones.
         if not re.search(rf"[A-Za-z0-9]{{{MIN_LITERAL_LEN},}}", value):
             continue
         found.add(value)
     return found
-
-
-def symbol_pattern(name: str) -> str:
-    """A call-site pattern in POSIX ERE.
-
-    ``git grep -E`` does NOT support ``\\b`` or ``\\s`` — it accepts them and
-    matches nothing, exiting 0. Character classes are the portable form.
-    """
-    return rf"(^|[^[:alnum:]_]){re.escape(name)}[[:space:]]*\("
-
-
-def import_sites(name: str) -> set[str]:
-    """Files that explicitly import ``name``.
-
-    A module-private helper is only shared with modules that import it by name.
-    """
-    pattern = (
-        rf"^[[:space:]]*(from|import)[[:space:]].*[^[:alnum:]_]"
-        rf"{re.escape(name)}([^[:alnum:]_]|$)"
-    )
-    return {o.path for o in _grep(pattern, fixed=False)}
-
-
-def scope_for(name: str, defining_paths: set[str]) -> set[str] | None:
-    """Paths a symbol's call sites may legitimately live in, or None for repo-wide.
-
-    Dogfooding this gate on its own diff reported ``_commit`` as having 33 call
-    sites: every test module in the repo defines its own private ``_commit``
-    helper, and they are unrelated functions that merely share a name. Treating
-    a leading-underscore name as global manufactures dozens of false siblings —
-    precisely the noise that teaches people to suppress the gate.
-
-    By Python convention a leading underscore means module-private, so its real
-    call sites are its own module plus whatever imports it by name.
-    """
-    if not name.startswith("_"):
-        return None
-    return defining_paths | import_sites(name)
-
-
-def _grep(pattern: str, *, fixed: bool) -> list[Occurrence]:
-    output = _git("grep", "-n", "-F" if fixed else "-E", "--", pattern, "*.py")
-    found: list[Occurrence] = []
-    for line in output.splitlines():
-        parts = line.split(":", 2)
-        if len(parts) >= 3 and parts[1].isdigit():
-            found.append(Occurrence(parts[0], int(parts[1])))
-    return found
-
-
-def _is_definition(occurrence: Occurrence, name: str, blobs: dict[str, list[str]]) -> bool:
-    lines = blobs.get(occurrence.path)
-    if lines is None:
-        try:
-            lines = (PROJECT_ROOT / occurrence.path).read_text(
-                encoding="utf-8"
-            ).splitlines()
-        except (OSError, ValueError):
-            lines = []
-        blobs[occurrence.path] = lines
-    if not 0 < occurrence.line <= len(lines):
-        return False
-    return bool(
-        re.match(rf"\s*(async\s+def|def|class)\s+{re.escape(name)}\b", lines[occurrence.line - 1])
-    )
 
 
 def _split(
@@ -301,10 +386,11 @@ def collect(
     new_map: dict[str, set[int]],
     old_map: dict[str, set[int]],
     old_ref: str,
-) -> list[Finding]:
-    symbols: dict[str, set[str]] = defaultdict(set)
+) -> tuple[list[Finding], list[tuple[str, int]]]:
+    """Return (findings, structural) — structural names are counted, not listed."""
+    _TREES.clear()
+    symbols: dict[str, tuple[str, set[str]]] = {}
     literals: set[str] = set()
-    blobs: dict[str, list[str]] = {}
 
     for path, lines in new_map.items():
         if not path.endswith(".py"):
@@ -313,55 +399,94 @@ def collect(
             source = (PROJECT_ROOT / path).read_text(encoding="utf-8")
         except (OSError, ValueError):
             continue
-        blobs[path] = source.splitlines()
-        for name in modified_symbols(source, path, lines):
-            symbols[name].add(path)
+        for name, kind in modified_symbols(source, path, lines).items():
+            existing_kind, paths = symbols.get(name, (kind, set()))
+            symbols[name] = (
+                "method" if "method" in (existing_kind, kind) else kind,
+                paths | {path},
+            )
         literals |= literals_on(source, path, lines)
 
     # Removed literals: renaming one of N sites leaves the others under the OLD
     # name, which never appears on the new side at all.
+    old_sources: dict[str, str] = {}
     for path, lines in old_map.items():
         if not path.endswith(".py"):
             continue
         source = _git("show", f"{old_ref}:{path}")
         if source:
+            old_sources[path] = source
             literals |= literals_on(source, path, lines)
 
     findings: list[Finding] = []
+    structural: list[tuple[str, int]] = []
 
-    for name, defining_paths in sorted(symbols.items()):
-        sites = _grep(symbol_pattern(name), fixed=False)
-        if not sites:
-            raise DetectorBroken(
-                f"no occurrence of {name!r} found, but its definition was just "
-                f"parsed from the diff — the search pattern is not matching."
-            )
-        scope = scope_for(name, defining_paths)
+    for name, (kind, defining_paths) in sorted(symbols.items()):
+        scope = scope_for(name, kind, defining_paths)
+        pattern = rf"(^|[^[:alnum:]_]){re.escape(name)}([^[:alnum:]_]|$)"
+        candidates = _candidate_files(pattern, fixed=False)
         if scope is not None:
-            sites = [o for o in sites if o.path in scope]
-        calls = [o for o in sites if not _is_definition(o, name, blobs)]
-        touched, untouched = _split(calls, new_map)
+            candidates &= scope
+
+        # Positive control: the definition we just parsed must be findable.
+        # Asserting on *call* sites instead would abort on any symbol that is
+        # simply never called — which is how an ordinary `class Worker:` edit
+        # took the whole gate down.
+        if not any(
+            (tree := _tree_for(path)) is not None and defines(tree, name)
+            for path in defining_paths
+        ):
+            raise DetectorBroken(
+                f"the definition of {name!r} was parsed from the diff but cannot "
+                f"be found again in {sorted(defining_paths)} — the AST pass is broken."
+            )
+
+        sites: list[Occurrence] = []
+        for path in sorted(candidates):
+            tree = _tree_for(path)
+            if tree is None:
+                continue
+            sites.extend(
+                Occurrence(path, line) for line in call_sites(tree, name, kind=kind)
+            )
+
+        if len(sites) > MAX_TOTAL_SITES:
+            structural.append((name, len(sites)))
+            continue
+        touched, untouched = _split(sites, new_map)
         if touched and untouched:
             findings.append(Finding("symbol", name, touched, untouched))
 
     for value in sorted(literals):
-        sites = _grep(value, fixed=True)
+        sites: list[Occurrence] = []
+        for path in sorted(_candidate_files(value, fixed=True)):
+            tree = _tree_for(path)
+            if tree is None:
+                continue
+            sites.extend(Occurrence(path, line) for line in literal_sites(tree, value))
+
         touched, untouched = _split(sites, new_map)
-        # A removed literal has no touched site on the new side; its whole point
-        # is the siblings still carrying the old name.
-        if untouched and (touched or value not in _new_side_literals(new_map, blobs)):
+
+        # A literal REMOVED at a site is gone from the new tree entirely, so the
+        # grep above cannot see it and the report read "modified 0 of 2" where
+        # the contract promises "modified 1 of 3". Count it from the old blob.
+        for path, source in old_sources.items():
+            tree = _parse(source, path)
+            if tree is None:
+                continue
+            for line in literal_sites(tree, value):
+                if line in old_map.get(path, ()) and not any(
+                    o.path == path and o.line == line for o in touched
+                ):
+                    touched.append(Occurrence(path, line))
+
+        if len(touched) + len(untouched) > MAX_TOTAL_SITES:
+            structural.append((f'"{value}"', len(touched) + len(untouched)))
+            continue
+        if touched and untouched:
             findings.append(Finding("literal", value, touched, untouched))
 
-    return findings
-
-
-def _new_side_literals(new_map: dict[str, set[int]], blobs: dict[str, list[str]]) -> set[str]:
-    """Literals present on the new side, used to tell added from removed."""
-    present: set[str] = set()
-    for path, lines in new_map.items():
-        if path.endswith(".py") and path in blobs:
-            present |= literals_on("\n".join(blobs[path]), path, lines)
-    return present
+    return findings, structural
 
 
 def rank_unchanged(
@@ -389,9 +514,23 @@ def rank_unchanged(
     return sorted(unchanged, key=key)
 
 
-def render(findings: list[Finding], origin: set[str] | None = None) -> str:
+def _structural_footer(structural: list[tuple[str, int]]) -> str:
+    listed = ", ".join(f"{name} ({count})" for name, count in structural)
+    return (
+        "  not reviewed site-by-site (used too widely to be an invariant): "
+        f"{listed}"
+    )
+
+
+def render(
+    findings: list[Finding],
+    origin: set[str] | None = None,
+    structural: list[tuple[str, int]] | None = None,
+) -> str:
+    structural = structural or []
     if not findings:
-        return "co-change: every site sharing a changed symbol or literal was touched."
+        clean = "co-change: every site sharing a changed symbol or literal was touched."
+        return f"{clean}\n{_structural_footer(structural)}" if structural else clean
 
     out = [
         "co-change: the diff shares a symbol or literal with sites it did not touch.",
@@ -414,6 +553,9 @@ def render(findings: list[Finding], origin: set[str] | None = None) -> str:
         if extra > 0:
             listing += f", +{extra} more"
         out.append(f"  {'':<{width}}  unchanged: {listing}")
+    if structural:
+        out.append("")
+        out.append(_structural_footer(structural))
     return "\n".join(out)
 
 
@@ -442,10 +584,10 @@ def main(argv: list[str] | None = None) -> int:
         print("co-change: no changed lines to analyse.")
         return 0
 
-    findings = collect(new_map, old_map, old_ref)
+    findings, structural = collect(new_map, old_map, old_ref)
     # The files the diff touches are the frame of reference for ranking, even
     # for a literal whose every occurrence is elsewhere (the removed-name case).
-    print(render(findings, origin=set(new_map) | set(old_map)))
+    print(render(findings, origin=set(new_map) | set(old_map), structural=structural))
     return 1 if (findings and args.strict) else 0
 
 

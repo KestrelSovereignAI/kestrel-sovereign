@@ -46,7 +46,14 @@ def _commit(repo: Path, message: str = "baseline") -> None:
 
 def _findings(repo: Path) -> list[checker.Finding]:
     new_map, old_map = checker.changed_line_map(["HEAD"])
-    return checker.collect(new_map, old_map, "HEAD")
+    findings, _structural = checker.collect(new_map, old_map, "HEAD")
+    return findings
+
+
+def _structural(repo: Path) -> list[tuple[str, int]]:
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    _, structural = checker.collect(new_map, old_map, "HEAD")
+    return structural
 
 
 def _named(findings: list[checker.Finding], name: str) -> checker.Finding:
@@ -60,26 +67,28 @@ def _named(findings: list[checker.Finding], name: str) -> checker.Finding:
 # that made every symbol lookup silently return nothing.
 # --------------------------------------------------------------------------
 
-def test_symbol_pattern_matches_call_sites_under_real_git_grep(repo: Path) -> None:
-    """``git grep -E`` must find call sites with the generated pattern.
+def test_candidate_prefilter_finds_the_file_under_real_git_grep(repo: Path) -> None:
+    """The ``git grep`` prefilter must actually match, through a real invocation.
 
-    The first implementation used ``\\bname\\s*\\(``. ``git grep -E`` accepts it,
-    matches NOTHING, and exits 0 — so the gate reported "every site was touched"
-    for every diff. Asserting through a real ``git grep`` is the only way to
-    catch it; a Python ``re`` test would pass on the broken pattern.
+    An earlier implementation searched with ``\\bname\\s*\\(``. ``git grep -E``
+    accepts those escapes, matches NOTHING, and exits 0 — so the gate reported
+    "every site was touched" for every diff. Asserting through a real ``git
+    grep`` is the only way to catch it; a Python ``re`` test passes on the
+    broken pattern. grep no longer decides what counts, but if it returns no
+    candidate files the AST pass never runs and the result is the same silence.
     """
     (repo / "mod.py").write_text(
         "def helper(x):\n    return x\n\n\ndef caller():\n    return helper(1)\n"
     )
     _commit(repo)
 
+    pattern = r"(^|[^[:alnum:]_])helper([^[:alnum:]_]|$)"
     result = subprocess.run(
-        ["git", "grep", "-n", "-E", "--", checker.symbol_pattern("helper"), "*.py"],
+        ["git", "grep", "-l", "-E", "--", pattern, "*.py"],
         cwd=repo, capture_output=True, text=True, check=False,
     )
-    assert "mod.py:6" in result.stdout, (
-        f"pattern {checker.symbol_pattern('helper')!r} did not match the call site; "
-        f"git grep said {result.stdout!r}"
+    assert "mod.py" in result.stdout, (
+        f"prefilter {pattern!r} matched nothing; git grep said {result.stdout!r}"
     )
 
 
@@ -91,7 +100,7 @@ def test_detector_broken_raises_when_a_known_symbol_finds_nothing(
     _commit(repo)
     (repo / "mod.py").write_text("def helper(x):\n    return x + 1\n")
 
-    monkeypatch.setattr(checker, "symbol_pattern", lambda name: "ZZ_NEVER_MATCHES_ZZ")
+    monkeypatch.setattr(checker, "defines", lambda tree, name: False)
     with pytest.raises(checker.DetectorBroken, match="helper"):
         _findings(repo)
 
@@ -334,3 +343,141 @@ def test_identifier_shaped_literals_are_still_surfaced(repo: Path) -> None:
     (repo / "mod.py").write_text('A = "subagent_dispatch"\nB = "tool_execution"\n')
 
     assert "tool_execution" in [f.name for f in _findings(repo)]
+
+
+# --------------------------------------------------------------------------
+# Codex review round 1 — five P2s, one per test
+# --------------------------------------------------------------------------
+
+def test_editing_a_class_body_does_not_abort_the_gate(repo: Path) -> None:
+    """An ordinary ``class Worker:`` edit took the whole check down.
+
+    ``modified_symbols`` reported the ClassDef, the search demanded ``Worker(``,
+    an uninstantiated class matched nothing, and DetectorBroken aborted every
+    remaining finding. The positive control now asserts the *definition* is
+    findable, which does not depend on the symbol being used at all.
+    """
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 1\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 2\n")
+
+    assert _findings(repo) == []  # must not raise
+
+
+def test_class_references_count_as_sites_not_only_instantiations(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        "class Worker:\n    def run(self):\n        return 1\n\n\nw = Worker()\n"
+    )
+    (repo / "other.py").write_text("from mod import Worker\n\n\ndef f(x: Worker):\n    return x\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Worker:\n    def run(self):\n        return 2\n\n\nw = Worker\n"
+    )
+
+    finding = _named(_findings(repo), "Worker")
+    assert ("other.py", 4) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_private_method_keeps_external_callers(repo: Path) -> None:
+    """``queue._dispatch()`` is reached by importing Queue, never ``_dispatch``.
+
+    Scoping every underscore name to its module plus importers-of-that-name
+    dropped exactly the external callers this gate exists to surface.
+    """
+    (repo / "mod.py").write_text(
+        "class Queue:\n"
+        "    def _dispatch(self, x):\n"
+        "        return x\n"
+        "\n"
+        "    def go(self):\n"
+        "        return self._dispatch(1)\n"
+    )
+    (repo / "user.py").write_text(
+        "from mod import Queue\n\n\ndef run(q: Queue):\n    return q._dispatch(2)\n"
+    )
+    _commit(repo)
+    text = (repo / "mod.py").read_text()
+    text = text.replace("    def _dispatch(self, x):\n        return x",
+                        "    def _dispatch(self, x):\n        return x + 1")
+    text = text.replace("return self._dispatch(1)", "return self._dispatch(11)")
+    (repo / "mod.py").write_text(text)
+
+    finding = _named(_findings(repo), "_dispatch")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}, (
+        "external caller of a private method was scoped away"
+    )
+
+
+def test_literal_matching_is_exact_not_substring(repo: Path) -> None:
+    """``git grep -F "config"`` matches ``base_config`` — 8,241 hits repo-wide."""
+    (repo / "mod.py").write_text(
+        'A = "config_alpha"\n'
+        'B = "config_alpha"\n'
+        'base_config_alpha = 1\n'
+        'C = "prefix_config_alpha_suffix"\n'
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "config_beta"\n'
+        'B = "config_alpha"\n'
+        'base_config_alpha = 1\n'
+        'C = "prefix_config_alpha_suffix"\n'
+    )
+
+    finding = _named(_findings(repo), "config_alpha")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("mod.py", 2)}, (
+        "an identifier or a longer string was counted as an occurrence"
+    )
+
+
+def test_a_call_inside_a_string_literal_is_not_a_call_site(repo: Path) -> None:
+    """This repository's tests embed Python source as strings constantly."""
+    (repo / "mod.py").write_text(
+        "def helper(x):\n    return x\n\n\ndef caller():\n    return helper(1)\n"
+    )
+    (repo / "snippet.py").write_text('SOURCE = "helper(1)"\n# helper() in a comment\n')
+    _commit(repo)
+    text = (repo / "mod.py").read_text().replace(
+        "def helper(x):\n    return x", "def helper(x):\n    return x + 1"
+    ).replace("return helper(1)", "return helper(11)")
+    (repo / "mod.py").write_text(text)
+
+    findings = _findings(repo)
+    if findings:
+        paths = {o.path for o in _named(findings, "helper").unchanged}
+        assert "snippet.py" not in paths, "a string/comment was reported as a call site"
+
+
+def test_removed_literal_counts_the_site_it_was_removed_from(repo: Path) -> None:
+    """The contract promises ``modified 1 of 3``; grep on the new tree saw 0 of 2."""
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\n'
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\nC = "tool_execution"\n'
+    )
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 1, f"removed site not counted: {finding.changed}"
+    assert len(finding.changed) + len(finding.unchanged) == 3
+    assert "modified 1 of 3 occurrences" in checker.render([finding])
+
+
+def test_structural_names_are_named_in_a_footer_not_silently_dropped(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hidden cap reads as 'covered everything'."""
+    monkeypatch.setattr(checker, "MAX_TOTAL_SITES", 2)
+    body = "def shared(x):\n    return x\n"
+    calls = "".join(f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(4))
+    (repo / "mod.py").write_text(body + calls)
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        body.replace("return x", "return x + 1") + calls.replace("shared(0)", "shared(9)")
+    )
+
+    structural = _structural(repo)
+    assert ("shared", 4) in structural
+    footer = checker.render([], structural=structural)
+    assert "shared (4)" in footer and "not reviewed site-by-site" in footer
