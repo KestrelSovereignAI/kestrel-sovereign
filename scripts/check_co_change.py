@@ -74,6 +74,12 @@ MAX_SITES_LISTED = 10
 # silently: a hidden cap reads as "covered everything".
 MAX_TOTAL_SITES = 100
 
+# A constant's source spelling need not contain its value (``"tool\x5fexecution"``,
+# or ``"tool_" "execution"`` concatenated), so the fixed-text prefilter can miss a
+# sibling. Searching the value's longest alphanumeric run recovers those, but only
+# a distinctive run is worth the extra files to index.
+MIN_WIDENED_RUN = 8
+
 # Literals that are punctuation, formatting, or otherwise carry no invariant.
 _NOISE_LITERAL = re.compile(r"^[\s\W_]*$|^%[sdrf]$|^\{\}$")
 
@@ -137,7 +143,9 @@ def _git(*args: str) -> str:
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def changed_line_map(diff_spec: list[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+def changed_line_map(
+    diff_spec: list[str], *, include_untracked: bool = True
+) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     """Return (new-side, old-side) maps of file -> changed line numbers.
 
     ``-U0`` keeps hunk ranges tight; wider context would claim untouched
@@ -175,7 +183,18 @@ def changed_line_map(diff_spec: list[str]) -> tuple[dict[str, set[int]], dict[st
             count = 1 if new_count is None else int(new_count)
             for offset in range(count):
                 new_map[new_path].add(int(new_start) + offset)
-    return new_map, old_map
+    if include_untracked:
+        # `git diff` never mentions an untracked file, so a brand-new module —
+        # every line of it new — was invisible and the gate reported clean on
+        # it. Treat an untracked Python file as wholly changed.
+        for path in untracked_python_files():
+            try:
+                count = len((PROJECT_ROOT / path).read_text(encoding="utf-8").splitlines())
+            except (OSError, ValueError):
+                continue
+            new_map[path] = set(range(1, count + 1))
+
+    return dict(new_map), dict(old_map)
 
 
 def _parse(source: str, filename: str) -> ast.AST | None:
@@ -234,20 +253,129 @@ def _name_line(node: ast.AST) -> int:
     if isinstance(node, ast.Attribute):
         return getattr(node, "end_lineno", node.lineno) or node.lineno
     return node.lineno
+_INDEXES: dict[tuple[str, str], FileIndex | None] = {}
 
 
-def import_aliases(tree: ast.AST, name: str) -> set[str]:
-    """Local names bound to ``name`` by ``from x import name as alias``."""
-    bound = {name}
+@dataclass
+class FileIndex:
+    """Everything this gate asks of one file, collected in a single AST walk.
+
+    Walking per question was O(files x questions): the literal pass alone made
+    3113 walks over 9.1M nodes and took 14 of the run's 20 seconds. Every lookup
+    below is now a dict hit against one walk per file.
+    """
+
+    strings: dict[str, list[int]] = field(default_factory=dict)
+    calls: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    refs: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    definitions: set[str] = field(default_factory=set)
+    aliases: dict[str, set[str]] = field(default_factory=dict)
+    imported_modules: set[str] = field(default_factory=set)
+
+
+def _build_index(tree: ast.AST) -> FileIndex:
+    index = FileIndex()
+    counted: set[int] = set()
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            index.strings.setdefault(node.value, []).append(node.lineno)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            index.definitions.add(node.name)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            end = getattr(node, "end_lineno", node.lineno) or node.lineno
+            if isinstance(func, ast.Name):
+                counted.add(id(func))
+                index.calls.setdefault(func.id, []).append((_name_line(func), end))
+            elif isinstance(func, ast.Attribute):
+                counted.add(id(func))
+                index.calls.setdefault(func.attr, []).append((_name_line(func), end))
+        elif isinstance(node, ast.ImportFrom):
             for entry in node.names:
-                if entry.name == name and entry.asname:
-                    bound.add(entry.asname)
-    return bound
+                index.aliases.setdefault(entry.name, set()).add(entry.asname or entry.name)
+                index.imported_modules.add(entry.name)
+            if node.module:
+                index.imported_modules.add(node.module)
+                index.imported_modules.add(node.module.rsplit(".", 1)[-1])
+        elif isinstance(node, ast.Import):
+            for entry in node.names:
+                index.imported_modules.add(entry.name)
+                index.imported_modules.add(entry.name.rsplit(".", 1)[-1])
+
+    # Bare references, excluding the callee nodes already recorded as calls, so
+    # ``Worker()`` is one use rather than two.
+    for node in ast.walk(tree):
+        if id(node) in counted:
+            continue
+        if isinstance(node, ast.Name):
+            index.refs.setdefault(node.id, []).append((node.lineno, node.lineno))
+        elif isinstance(node, ast.Attribute):
+            line = _name_line(node)
+            index.refs.setdefault(node.attr, []).append((line, line))
+    return index
 
 
-def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[tuple[int, int]]:
+def index_for(path: str, ref: str = "") -> FileIndex | None:
+    key = (path, ref)
+    if key not in _INDEXES:
+        tree = _tree_for(path, ref)
+        _INDEXES[key] = _build_index(tree) if tree is not None else None
+    return _INDEXES[key]
+
+
+def untracked_python_files() -> set[str]:
+    """Python files git does not track yet — invisible to ``git diff``."""
+    output = _git("ls-files", "--others", "--exclude-standard", "--", "*.py")
+    return {line for line in output.splitlines() if line}
+
+
+def _word_pattern(word: str) -> str:
+    """POSIX ERE matching ``word`` as a whole identifier."""
+    return rf"(^|[^[:alnum:]_]){re.escape(word)}([^[:alnum:]_]|$)"
+
+
+def alias_closure(name: str, *, max_rounds: int = 3) -> set[str]:
+    """Every local name that ultimately refers to ``name``, through re-exports.
+
+    A bridge module doing ``from mod import shared as alias`` and a downstream
+    ``from bridge import alias; alias()`` means the caller's file never contains
+    the string ``shared`` at all — so a prefilter on the original name excluded
+    it and the dependency reported clean. Resolving one hop was not enough
+    because the binding that reaches the caller is the bridge's, not the
+    definition's.
+
+    Bounded rounds: re-export chains are short, and an unbounded walk over a
+    large tree is not worth the tail.
+    """
+    names = {name}
+    for _ in range(max_rounds):
+        discovered: set[str] = set()
+        for current in names:
+            # Only a RENAMING import can introduce a name the plain prefilter
+            # misses, so look for `import <current> as ...` specifically rather
+            # than every file mentioning the name. Searching the broad pattern
+            # here parsed the whole candidate set a second time and took the
+            # gate from 0.8s to 13s on an iteration-sized diff.
+            renaming = (
+                rf"import.*[^[:alnum:]_]{re.escape(current)}[[:space:]]+as[[:space:]]"
+            )
+            for path in _candidate_files(renaming, fixed=False):
+                index = index_for(path)
+                if index is None:
+                    continue
+                for bound in index.aliases.get(current, ()):
+                    if bound not in names:
+                        discovered.add(bound)
+        if not discovered:
+            break
+        names |= discovered
+    return names
+
+
+def call_sites(
+    index: FileIndex, name: str, *, kind: str, local_names: set[str] | None = None
+) -> list[tuple[int, int]]:
     """(start, end) spans where ``name`` is genuinely *used*, per the AST.
 
     A textual search cannot tell a call from a string that contains one. This
@@ -264,52 +392,26 @@ def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[tuple[int, int]]:
     The span covers the whole call expression, so changing only an argument on a
     later line still marks the site as touched.
     """
-    local_names = import_aliases(tree, name)
+    del kind  # every kind counts bare references now
     spans: list[tuple[int, int]] = []
-    counted: set[int] = set()
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            if (isinstance(func, ast.Name) and func.id in local_names) or (
-                isinstance(func, ast.Attribute) and func.attr == name
-            ):
-                # Claim the callee node so the class-reference branch below does
-                # not count `Worker()` a second time when walk reaches its Name.
-                counted.add(id(func))
-                spans.append(
-                    (_name_line(func), getattr(node, "end_lineno", node.lineno) or node.lineno)
-                )
-        elif id(node) not in counted:
-            if isinstance(node, ast.Name) and node.id in local_names:
-                spans.append((node.lineno, node.lineno))
-            elif isinstance(node, ast.Attribute) and node.attr == name:
-                spans.append((_name_line(node), _name_line(node)))
+    for local in local_names or {name}:
+        spans.extend(index.calls.get(local, ()))
+        spans.extend(index.refs.get(local, ()))
     return spans
 
 
-def literal_sites(tree: ast.AST, value: str) -> list[int]:
+def literal_sites(index: FileIndex, value: str) -> list[int]:
     """Lines holding a string constant *equal to* ``value``.
 
     ``git grep -F "config"`` matches ``base_config``, comments, and every longer
     string containing it — 8,241 hits in this repository against a handful of
     real constants. Equality on an AST constant is the actual question.
     """
-    return [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and node.value == value
-    ]
+    return list(index.strings.get(value, ()))
 
 
-def defines(tree: ast.AST, name: str) -> bool:
-    return any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        and node.name == name
-        for node in ast.walk(tree)
-    )
+def defines(index: FileIndex, name: str) -> bool:
+    return name in index.definitions
 
 
 def import_sites(name: str) -> set[str]:
@@ -336,25 +438,27 @@ def module_importers(defining_paths: set[str]) -> set[str]:
     file that imports ``cli``, not the name. Scoping on the *name*'s importers
     alone excluded those real callers.
     """
+    modules: set[str] = set()
+    for path in defining_paths:
+        candidate = Path(path)
+        # `pkg/__init__.py` IS the package: its importable name is the parent
+        # directory, and searching for `__init__` finds nothing real.
+        modules.add(candidate.parent.name if candidate.stem == "__init__" else candidate.stem)
+
     found: set[str] = set()
-    for module in {Path(path).stem for path in defining_paths}:
-        pattern = rf"(^|[^[:alnum:]_.]){re.escape(module)}([^[:alnum:]_]|$)"
+    for module in modules:
+        # The boundary must NOT exclude a preceding dot: `import pkg.cli as c`
+        # is exactly the shape being looked for, and excluding `.` discarded
+        # the file before the dotted-name check below could ever see it.
+        pattern = _word_pattern(module)
         for path in _candidate_files(pattern, fixed=False):
-            tree = _tree_for(path)
-            if tree is None:
+            index = index_for(path)
+            if index is None:
                 continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import) and any(
-                    entry.name == module or entry.name.endswith(f".{module}")
-                    for entry in node.names
-                ):
-                    found.add(path)
-                    break
-                if isinstance(node, ast.ImportFrom) and any(
-                    entry.name == module for entry in node.names
-                ):
-                    found.add(path)
-                    break
+            if module in index.imported_modules or any(
+                mod.endswith(f".{module}") for mod in index.imported_modules
+            ):
+                found.add(path)
     return found
 
 
@@ -468,6 +572,7 @@ def collect(
     Python files that could not be analysed at all.
     """
     _TREES.clear()
+    _INDEXES.clear()
     symbols: dict[str, tuple[str, set[str]]] = {}
     literals: set[str] = set()
 
@@ -525,8 +630,11 @@ def collect(
 
     for name, (kind, defining_paths) in sorted(symbols.items()):
         scope = scope_for(name, kind, defining_paths)
-        pattern = rf"(^|[^[:alnum:]_]){re.escape(name)}([^[:alnum:]_]|$)"
-        candidates = _candidate_files(pattern, fixed=False)
+        # Follow re-export bridges: a caller may only ever mention the alias.
+        local_names = alias_closure(name)
+        candidates: set[str] = set()
+        for local in local_names:
+            candidates |= _candidate_files(_word_pattern(local), fixed=False)
         if scope is not None:
             candidates &= scope
 
@@ -536,11 +644,12 @@ def collect(
         # took the whole gate down. A renamed or deleted symbol lives only on
         # the old side, so look there too before declaring the pass broken.
         defined_now = any(
-            (tree := _tree_for(path)) is not None and defines(tree, name)
+            (index := index_for(path)) is not None and defines(index, name)
             for path in defining_paths
         )
         defined_before = any(
-            (tree := _parse(source, path)) is not None and defines(tree, name)
+            (tree := _parse(source, path)) is not None
+            and defines(_build_index(tree), name)
             for path, source in old_sources.items()
         )
         if not (defined_now or defined_before):
@@ -551,12 +660,14 @@ def collect(
 
         sites: list[Occurrence] = []
         for path in sorted(candidates):
-            tree = _tree_for(path)
-            if tree is None:
+            index = index_for(path)
+            if index is None:
                 continue
             sites.extend(
                 Occurrence(path, start, end)
-                for start, end in call_sites(tree, name, kind=kind)
+                for start, end in call_sites(
+                    index, name, kind=kind, local_names=local_names
+                )
             )
 
         if len(sites) > MAX_TOTAL_SITES:
@@ -571,12 +682,28 @@ def collect(
             findings.append(Finding("symbol", name, touched, untouched))
 
     for value in sorted(literals):
+        # `"tool\x5fexecution"` and `"tool_" "execution"` are equal to
+        # `"tool_execution"` at runtime but do not contain it in source, so a
+        # fixed-text prefilter dropped those files before the AST equality check
+        # could see them. Also search the value's longest word run, which
+        # survives both escaping and implicit concatenation at a separator.
+        runs = re.findall(r"[A-Za-z0-9]+", value)
+        longest = max(runs, key=len, default="")
+        candidates = _candidate_files(value, fixed=True)
+        # Widen only on a run distinctive enough to stay cheap. `"__init__"`
+        # widens to `init`, which matches most of the tree: indexing that
+        # candidate set took the gate from 0.8s to 16s. A short run buys a rare
+        # case at a cost paid on every single run, which is the wrong trade for
+        # a gate that runs per iteration.
+        if len(longest) >= MIN_WIDENED_RUN and longest != value:
+            candidates |= _candidate_files(longest, fixed=True)
+
         sites: list[Occurrence] = []
-        for path in sorted(_candidate_files(value, fixed=True)):
-            tree = _tree_for(path)
-            if tree is None:
+        for path in sorted(candidates):
+            index = index_for(path)
+            if index is None:
                 continue
-            sites.extend(Occurrence(path, line) for line in literal_sites(tree, value))
+            sites.extend(Occurrence(path, line) for line in literal_sites(index, value))
 
         touched, untouched = _split(sites, new_map)
 
@@ -587,7 +714,7 @@ def collect(
             tree = _parse(source, path)
             if tree is None:
                 continue
-            for line in literal_sites(tree, value):
+            for line in literal_sites(_build_index(tree), value):
                 if line in old_map.get(path, ()) and not any(
                     o.path == path and o.line == line for o in touched
                 ):
@@ -719,7 +846,7 @@ def main(argv: list[str] | None = None) -> int:
         diff_spec = ["HEAD"]
         old_ref = "HEAD"
 
-    new_map, old_map = changed_line_map(diff_spec)
+    new_map, old_map = changed_line_map(diff_spec, include_untracked=not args.base)
     if not new_map and not old_map:
         print("co-change: no changed lines to analyse.")
         return 0

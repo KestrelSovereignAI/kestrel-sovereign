@@ -699,3 +699,141 @@ def test_a_decorator_only_change_still_changes_the_definition(repo: Path) -> Non
 
     finding = _named(_findings(repo), "shared")
     assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+# --------------------------------------------------------------------------
+# Codex review round 4 — one P1 and three P2s
+# --------------------------------------------------------------------------
+
+def test_a_re_exported_alias_reaches_the_downstream_caller(repo: Path) -> None:
+    """The caller's file never contains the original name at all.
+
+    ``bridge.py`` does ``from mod import shared as alias``; ``user.py`` does
+    ``from bridge import alias`` and calls ``alias()``. A prefilter on ``shared``
+    excludes user.py entirely, so a body change reported clean. One hop is not
+    enough — the binding that reaches the caller is the bridge's.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mod import shared as alias\n")
+    (repo / "user.py").write_text("from bridge import alias\n\n\ndef f():\n    return alias(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_dotted_module_import_is_still_an_import(repo: Path) -> None:
+    """``import pkg.cli as c`` — the prefilter excluded a preceding dot."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "cli.py").write_text("def _helper():\n    return 1\n")
+    (repo / "user.py").write_text("import pkg.cli as c\n\n\ndef f():\n    return c._helper()\n")
+    _commit(repo)
+    (repo / "pkg" / "cli.py").write_text("def _helper():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 5)}
+
+
+def test_a_package_initializer_resolves_to_the_package_name(repo: Path) -> None:
+    """``pkg/__init__.py`` has stem ``__init__``; nothing imports ``__init__``."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("def _helper():\n    return 1\n")
+    (repo / "user.py").write_text("import pkg\n\n\ndef f():\n    return pkg._helper()\n")
+    _commit(repo)
+    (repo / "pkg" / "__init__.py").write_text("def _helper():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 5)}
+
+
+def test_a_constant_equal_but_spelled_differently_is_found(repo: Path) -> None:
+    """``"tool\\x5fexecution"`` and ``"tool_" "execution"`` equal the value at runtime."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "b.py").write_text('B = "tool\\x5fexecution"\n')
+    (repo / "c.py").write_text('C = ("tool_" "execution")\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert {o.path for o in finding.unchanged} == {"b.py", "c.py"}
+
+
+def test_widening_is_skipped_for_an_undistinctive_run(repo: Path) -> None:
+    """A short run matches most of the tree; the cost is paid on every run.
+
+    ``"__init__"`` widens to ``init``. Indexing that candidate set took the gate
+    from under a second to sixteen. Only a distinctive run earns the extra files.
+    """
+    assert checker.MIN_WIDENED_RUN >= 8
+    (repo / "a.py").write_text('A = "__init__"\nB = "__init__"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "renamed_marker"\nB = "__init__"\n')
+
+    # Still correct via the exact prefilter — widening is an addition, not the
+    # only path to a sibling.
+    finding = _named(_findings(repo), "__init__")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 2)}
+
+
+# --------------------------------------------------------------------------
+# Gaps found by surviving mutants — each guard's ONLY load-bearing case
+# --------------------------------------------------------------------------
+
+def test_a_symbol_defined_in_a_new_file_passes_the_positive_control(repo: Path) -> None:
+    """The positive control has two halves; only this case needs the first.
+
+    A mutant that broke the working-tree half survived, because every existing
+    test defines its symbol in a file the diff also changed — so the old-blob
+    half answered instead. A file added by the diff has no old-side entry at
+    all, which is the one shape that depends on the working-tree lookup.
+    """
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")  # must not raise DetectorBroken
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_a_private_helper_re_exported_through_a_bridge_keeps_its_caller(
+    repo: Path,
+) -> None:
+    """Scoping needs the NAME's importers, not only the module's.
+
+    A mutant dropping ``import_sites`` survived: for a direct
+    ``from mine import _helper`` the caller also imports the module, so
+    ``module_importers`` answered. Through a bridge it does not — ``user.py``
+    imports ``bridge``, never ``mine`` — and only the name lookup keeps it.
+    """
+    (repo / "mine.py").write_text("def _helper(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mine import _helper\n")
+    (repo / "user.py").write_text("from bridge import _helper\n\n\ndef f():\n    return _helper(2)\n")
+    _commit(repo)
+    (repo / "mine.py").write_text("def _helper(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}, (
+        "a private helper's caller was scoped away because it imports the bridge, "
+        "not the defining module"
+    )
+
+
+def test_an_untracked_new_file_is_analysed(repo: Path) -> None:
+    """``git diff`` never mentions an untracked file.
+
+    Found by a surviving mutant: the test meant to cover a new file's symbol
+    could not, because a file created and not staged is absent from
+    ``git diff HEAD`` entirely — so a brand-new module was invisible and the
+    gate reported clean on it.
+    """
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")  # never staged
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert "mod.py" in new_map, "an untracked Python file was not analysed at all"
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
