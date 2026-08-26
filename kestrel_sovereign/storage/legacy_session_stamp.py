@@ -365,7 +365,17 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
     is skipped rather than clobbered, and a pass that skipped one is simply run
     again.
 
-    Returns ``{"stamped", "refused"}``.
+    **Concurrency is DETECTED, not prevented, and that is the system's
+    design.** No write path maintains the session projection either
+    (``conversation_sessions``' module docstring says why at length: the first
+    attempt made every writer responsible for it and two review rounds found
+    two P1s inside that obligation). Serializing this pass against ordinary
+    archive, delete and purge would put the same obligation on every one of
+    them. So the agent's change stamp is read before the first view and checked
+    inside each batch's lock; a lifecycle write landing beside the pass leaves
+    ``incomplete`` set, and running it again is the answer.
+
+    Returns ``{"stamped", "refused", "skipped", "incomplete"}``.
     """
     # Imported here rather than at module scope: both import back through the
     # database module this is called from.
@@ -473,6 +483,17 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
                         agent, stamped,
                     )
                     break
+
+        if not incomplete and not moved and not await _unchanged(
+            db, agent, fence, stamped
+        ):
+            # Checked once more even when nothing was planned. The batch loop
+            # is where the fence otherwise lives, and a pass with no stamps
+            # never enters it — so a candidate unarchived between the active
+            # and archived queries, appearing in neither snapshot, left the
+            # ledger moved, the row unstamped and the totals reading like a
+            # finished pass.
+            incomplete = True
 
         for row_id, claimed, grouped in conflicts:
             logger.warning(

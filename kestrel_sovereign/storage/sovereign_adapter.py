@@ -899,7 +899,18 @@ class SovereignStorageAdapter:
             # in. Run it here rather than leave it to a restart: a lifecycle op
             # on an imported session would otherwise be inferring membership
             # from neighbours until one happened.
-            await stamp_legacy_sessions(self.db, self.agent_id)
+            stamped = await stamp_legacy_sessions(self.db, self.agent_id)
+            if stamped["incomplete"]:
+                # Said out loud rather than swallowed: a lifecycle write landed
+                # beside the pass, so some imported rows still do not name
+                # their session and a lifecycle op on them is back to inferring
+                # membership from neighbours until it is run again.
+                logger.warning(
+                    "import_agent: %s legacy rows still do not name their "
+                    "session for %s; run `kestrel storage stamp-sessions` "
+                    "(#3120)",
+                    stamped["incomplete"], self.agent_id,
+                )
 
             # Asset restoration (#1391) — runs AFTER conversation
             # restore so a restorer failure surfaces against an

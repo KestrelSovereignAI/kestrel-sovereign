@@ -760,10 +760,16 @@ async def _holds_conversation_history(db_path, dsn) -> bool:
         backend = PostgresBackend(dsn=dsn)
         await backend.connect()
         try:
+            # Through ``to_regclass`` and ``pg_attribute``, which resolve the
+            # relation an unqualified statement will actually reach.
+            # ``information_schema.columns`` aggregates every schema on the
+            # search path and beyond it, so a same-named table elsewhere can
+            # make a wrong target pass or a right one fail.
             found = await backend.fetch_one(
-                "SELECT count(*) FROM information_schema.columns "
-                "WHERE table_name = 'conversation_history' "
-                "AND column_name IN ('agent_id', 'metadata', 'created_at')",
+                "SELECT count(*) FROM pg_attribute "
+                "WHERE attrelid = to_regclass('conversation_history') "
+                "AND attname IN ('agent_id', 'metadata', 'created_at') "
+                "AND NOT attisdropped",
                 (),
             )
             # Three named columns, not merely a table of that name: a

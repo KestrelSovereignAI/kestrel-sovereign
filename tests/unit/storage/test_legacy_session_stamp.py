@@ -388,6 +388,39 @@ class TestThePass:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_a_pass_with_nothing_to_plan_still_checks_the_fence(
+        self, tmp_path
+    ):
+        """The batch loop is where the fence lives, and a pass with no stamps
+        never enters it. A candidate unarchived between the active and the
+        archived query appears in neither snapshot: the ledger moves, the row
+        stays unstamped, and the totals would otherwise read like a finished
+        pass.
+        """
+        path = tmp_path / "nothing.db"
+        _seed(path, [({"session_id": UUID_A}, 0)])
+        db = await AsyncDatabase.sqlite(str(path))
+
+        from kestrel_sovereign.storage import legacy_session_stamp
+
+        real_stamp = legacy_session_stamp._change_stamp
+        calls = {"n": 0}
+
+        async def moving(database, agent):
+            calls["n"] += 1
+            value = await real_stamp(database, agent)
+            return None if value is None else value + (7 if calls["n"] > 1 else 0)
+
+        try:
+            legacy_session_stamp._change_stamp = moving
+            result = await stamp_legacy_sessions(db)
+            assert result["stamped"] == 0
+            assert result["incomplete"] == 1
+        finally:
+            legacy_session_stamp._change_stamp = real_stamp
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_a_row_rewritten_under_the_plan_is_not_clobbered(
         self, tmp_path, monkeypatch
     ):

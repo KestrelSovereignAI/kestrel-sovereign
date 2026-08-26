@@ -2843,6 +2843,17 @@ class AsyncStorage:
                 stamped = await stamp_legacy_sessions(self.db, self.agent_id)
                 stats["legacy_rows_stamped"] = stamped["stamped"]
                 stats["legacy_rows_refused"] = stamped["refused"]
+                stats["legacy_rows_incomplete"] = stamped["incomplete"]
+                if stamped["incomplete"]:
+                    # Reported rather than swallowed: a lifecycle write landed
+                    # beside the pass, so some restored rows still do not name
+                    # their session.
+                    logger.warning(
+                        "restore: %s legacy rows still do not name their "
+                        "session for %s; run `kestrel storage stamp-sessions` "
+                        "(#3120)",
+                        stamped["incomplete"], self.agent_id,
+                    )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
     
