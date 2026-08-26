@@ -106,6 +106,22 @@ def _counting_transcript_passes(monkeypatch):
     return passes
 
 
+async def _append_unstamped(db, minute):
+    """A row that names no session, written after the database was opened.
+
+    Which is how one actually arrives once #3120's pass has run over a
+    history: the write path derives an implicit session id and returns ``None``
+    if that derivation raises, so a row can still land unlabeled beside a
+    session. The frontier these cases are about is what covers it.
+    """
+    await db.execute(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at, session_id) "
+        "VALUES (?, 'user', 'new turn', '{}', ?, NULL)",
+        (AGENT, _stamp(minute)),
+    )
+
+
 async def _append(db, session_id, minute):
     await db.execute(
         "INSERT INTO conversation_history "
@@ -220,11 +236,12 @@ class TestWhatTheInvariantBuys:
         precisely because no test here could construct an inversion.
         """
         path = tmp_path / "inversion.db"
-        _seed(path, [("sess-a", 0), (None, 2)])
+        _seed(path, [("sess-a", 0)])
 
         passes = _counting_transcript_passes(monkeypatch)
         db = await AsyncDatabase.sqlite(str(path))
         try:
+            await _append_unstamped(db, 2)
             projection = ConversationSessionProjection(db, AGENT)
             await projection.repair()
             await _append(db, "sess-z", 2000)
@@ -262,11 +279,12 @@ class TestWhatTheInvariantBuys:
         per-session guard was tried here and had nothing left to catch.
         """
         path = tmp_path / "straddle.db"
-        _seed(path, [("sess-a", 0), ("sess-a", 1), (None, 2)])
+        _seed(path, [("sess-a", 0), ("sess-a", 1)])
 
         passes = _counting_transcript_passes(monkeypatch)
         db = await AsyncDatabase.sqlite(str(path))
         try:
+            await _append_unstamped(db, 2)
             projection = ConversationSessionProjection(db, AGENT)
             await projection.repair()
             assert passes == [AGENT], "the unstamped row was folded, not escalated"
@@ -394,11 +412,12 @@ class TestTheFrontierIsExact:
         the boundary stamp itself is inside the fence.
         """
         path = tmp_path / "tie.db"
-        _seed(path, [("sess-a", 0), (None, 2)])
+        _seed(path, [("sess-a", 0)])
 
         passes = _counting_transcript_passes(monkeypatch)
         db = await AsyncDatabase.sqlite(str(path))
         try:
+            await _append_unstamped(db, 2)
             projection = ConversationSessionProjection(db, AGENT)
             await projection.repair()
             await _append(db, "sess-z", 2000)

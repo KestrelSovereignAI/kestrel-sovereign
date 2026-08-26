@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-25
-**Scope:** 2355 tracked files (1589 `.py`, 344 `.md`, 422 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-26
+**Scope:** 2360 tracked files (1593 `.py`, 345 `.md`, 422 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1284,6 +1284,8 @@ Repo entry points and standard project files.
   - `def encrypt_string(content, fernet, agent_did, purpose)`; `def decrypt_string(content, metadata, fernet, agent_did, …)`
 - **kestrel_sovereign/storage/legacy_fact_migration.py** — Bounded, restart-safe import of the one verified legacy fact shape.
   - `class LegacyFactMigrationError`; `class LegacyFactCandidate`; `class MigrationPlan`; `class MigrationResult`; `class MigrationSourceReview`; `class LegacyGraphFactMigration`
+- **kestrel_sovereign/storage/legacy_session_stamp.py** — Write down which session a legacy row is in, once (#3120).
+  - `class LegacyStamp`; `class StampPlan`; `def plan_stamps(rows, placements)`; `async def stamp_legacy_sessions(db, agent_id)`
 - **kestrel_sovereign/storage/lexical_memory_index.py** — Privacy-preserving exact-token candidate index for conversation memory.
   - `class LexicalIndexHealth`; `class LexicalIndexReplacement`; `class LexicalIndexReplacementResult`; `class ConversationLexicalIndex`
 - **kestrel_sovereign/storage/memory_answerability.py** — Bounded second-stage answerability filtering for conversation memory.
@@ -1873,6 +1875,7 @@ Repo entry points and standard project files.
 - **docs/design/launch/mark/png/kestrel_mark_64.png** — —
 - **docs/design/launch/mark/png/kestrel_mark_64_white.png** — —
 - **docs/development/BIG_BRAIN.md** — Big Brain — Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria
+- **docs/development/DETERMINISTIC_DEV_GATES.md** — Deterministic development gates — > Detection is `grep` and AST.
 - **docs/development/DEVCONTAINER_QUICKSTART.md** — Dev Container Quick Start — Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
 - **docs/development/README.md** — Development Documentation — Developer notes, experiments, and technical development guides.
 - **docs/development/SCOUT_PLAN_CODE.md** — Scout-Plan-Code: Agentic Development Workflow — **Date:** November 30, 2025 **Status:** Proposed **Integration:** A2A Protocol, Feedback System, Task Manager
@@ -2220,6 +2223,8 @@ Repo entry points and standard project files.
   - `def stub_agent()`; `def scrub_github_tokens(monkeypatch)`; `async def test_create_issue_returns_ok_against_stub_github(stub_agent)`; `async def test_create_issue_bypasses_shell_subprocess(stub_agent)`
 - **tests/integration/test_key_management.py** — Integration Tests for API Key Management System.
   - `async def temp_db()`; `def data_key()`; `async def key_storage(temp_db, data_key)`; `class TestServiceKeyStorage`; `class TestKeyResolutionService`; `class TestKeyManagementFeature`; `class TestKnownProviders`; `class TestMasterKeyNotConfigured`; `…`
+- **tests/integration/test_legacy_session_stamp_backends.py** — #3120's migration, run against a real PostgreSQL as well as SQLite.
+  - `async def test_the_migration_stamps_a_legacy_row_on_both_backends(db_backend)`
 - **tests/integration/test_lighthouse_rest_e2e.py** — —
   - `async def client()`; `class TestUploadDownload`; `class TestCARUpload`; `class TestAccountQueries`; `class TestDealStatus`; `class TestClientLifecycle`; `class TestLighthouseProvider`
 - **tests/integration/test_lighthouse_sync.py** — Unit tests for Lighthouse sync target — state persistence for ephemeral environments.
@@ -2388,7 +2393,9 @@ Repo entry points and standard project files.
 - **tests/unit/storage/test_legacy_fact_migration.py** — Contract tests for the narrow #2752 legacy graph-fact migration.
   - `def test_durable_utc_timestamp_parameter_has_an_explicit_backend_contract(backend_type, expected_type)`; `def test_durable_utc_timestamp_parameter_rejects_ambiguous_instants(value)`; `async def test_bookkeeping_schema_is_common_transactional_ddl_for_postgres()`; `async def test_migration_bookkeeping_uses_typed_timestamps_on_real_disposable_postgres()`; `async def test_plan_is_content_safe_and_never_trusts_properties_owner(tmp_path)`; `async def test_migrates_idempotently_across_restart_and_rolls_back_without_legacy_delete(tmp_path)`; `async def test_rejects_malformed_unsupported_and_shared_nodes_without_promotion(tmp_path)`; `async def test_feature_projection_invalidator_observes_only_accepted_assertions(tmp_path)`; `…`
 - **tests/unit/storage/test_legacy_session_folding.py** — #3061: a session's fold is trusted per session, not per agent.
-  - `class TestTheAcceptance`; `class TestWhatTheInvariantBuys`; `async def test_a_stamped_row_absorbed_into_a_legacy_cluster_still_lists(tmp_path)`; `class TestTheFrontiersEdges`; `async def test_a_legacy_cluster_reaching_past_the_gap_is_fenced(tmp_path)`; `async def test_a_chain_longer_than_the_walk_refuses_rather_than_guesses(tmp_path, monkeypatch)`
+  - `class TestTheAcceptance`; `class TestWhatTheInvariantBuys`; `async def test_a_stamped_row_beside_a_legacy_cluster_still_lists(tmp_path)`; `class TestTheFrontierIsExact`; `async def test_a_stamped_chain_no_longer_extends_the_fence(tmp_path)`
+- **tests/unit/storage/test_legacy_session_stamp.py** — #3120: a legacy row writes down which session it is in.
+  - `class TestWhatItWritesDown`; `class TestWhatItLeavesAlone`; `class TestThePass`
 - **tests/unit/storage/test_semantic_migration_lock.py** — The semantic migrations must agree on their marker table and their lock.
   - `async def test_marker_table_schema_does_not_depend_on_which_migration_runs_first(migration)`; `async def test_separate_connections_racing_one_file_both_complete(tmp_path)`; `async def test_migrations_remain_idempotent_under_the_shared_lock()`
 - **tests/unit/storage/test_semantic_recall_derivative_exclusion.py** — Exact, content-independent retraction of semantic-recall derivatives.
@@ -2397,6 +2404,8 @@ Repo entry points and standard project files.
   - `async def test_semantic_recall_is_tenant_bound_and_privacy_denial_never_calls_inner(tmp_path)`; `async def test_semantic_recall_discovers_only_current_valid_eligible_rows_and_exact_window(tmp_path)`; `async def test_semantic_recall_readiness_and_hydration_are_fenced_and_batch_provenance(tmp_path, monkeypatch)`; `async def test_semantic_recall_hydration_rechecks_maintenance_after_provenance_io(tmp_path, monkeypatch)`; `async def test_semantic_recall_requires_current_complete_matching_maintenance(tmp_path, status)`
 - **tests/unit/storage/test_semantic_vector_projection.py** — Durable assertion-vector projection contracts (#2830).
   - `async def test_projection_is_assertion_revision_linked_and_canonically_fenced(tmp_path)`; `async def test_physical_erasure_rebuilds_unrelated_survivor_after_restart(tmp_path)`; `async def test_projection_never_crosses_tenant_boundary(tmp_path)`; `async def test_same_generation_partial_page_never_becomes_recall_ready(tmp_path)`; `async def test_profile_dimension_drift_and_timeout_fail_without_advancing(tmp_path)`; `async def test_remote_destination_rejects_private_content_before_embedder(tmp_path)`; `async def test_remote_requires_public_visibility_and_public_privacy(tmp_path)`; `async def test_raw_callable_cannot_claim_a_fake_local_destination(tmp_path)`; `…`
+- **tests/unit/storage/test_session_id_boundary.py** — #3098: where a session ends, read from both sides.
+  - `async def store()`; `class TestTheGroupingSide`; `class TestTheResolverSide`
 - **tests/unit/storage/test_session_id_column_migration.py** — #2958: ``conversation_history.session_id`` becomes an indexed column.
   - `async def test_backfill_lifts_only_stampable_session_ids(tmp_path)`; `async def test_a_boot_against_only_unparseable_metadata_still_completes(tmp_path)`; `async def test_backfilled_column_never_disagrees_with_session_grouping(tmp_path)`; `async def test_legacy_database_gains_the_column_and_its_index(tmp_path)`; `async def test_fresh_database_gains_the_column_and_its_index(tmp_path)`; `async def test_migration_is_idempotent_across_boots(tmp_path)`; `async def test_write_path_stamps_the_column(tmp_path)`; `async def test_write_path_stamps_the_derived_implicit_session(tmp_path)`; `…`
 - **tests/unit/storage/test_session_id_contract.py** — #2958: one session-id rule, three renderings, no drift.
@@ -2590,7 +2599,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_ci_redefinition_gate.py** — The F811 gate in ``.github/workflows/ci.yml``.
   - `def repo(tmp_path)`; `class GateRun`; `class TestChangedSet`; `class TestUnresolvableBase`; `class TestFindingFailsTheStep`; `def pinned_ruff()`; `class TestRuffActuallyCatchesTheDefect`; `class TestEndToEnd`; `…`
 - **tests/unit/test_ci_wait_provider.py** — Tests for the ``ci:`` Waitable provider (#2729).
-  - `def test_parse_ci_handle_ok()`; `def test_parse_ci_handle_rejects_malformed(bad)`; `def test_check_verdict_none_when_no_checks()`; `def test_check_verdict_pending_on_incomplete_run()`; `def test_check_verdict_pending_on_combined_pending()`; `def test_check_verdict_success()`; `def test_check_verdict_failure_from_conclusion()`; `def test_check_verdict_failure_from_legacy_status()`; `…`
+  - `def test_parse_ci_handle_ok()`; `def test_parse_ci_handle_rejects_malformed(bad)`; `def test_check_verdict_unknown_when_rollup_not_read()`; `def test_check_verdict_none_when_rollup_read_and_empty()`; `def test_check_verdict_pending_on_incomplete_run()`; `def test_check_verdict_ignores_combined_pending_with_zero_statuses()`; `def test_check_verdict_honors_combined_pending_with_real_statuses()`; `def test_check_verdict_success()`; `…`
 - **tests/unit/test_ci_workflow_permissions.py** — ``publish.yml`` must grant at least what ``ci.yml`` asks for.
   - `def test_ci_is_actually_called_by_publish()`; `def test_every_nested_workflow_is_within_its_callers_ceiling()`; `def test_every_requested_scope_is_within_the_ceiling()`; `def test_known_escalations_are_still_declared(job_name, scope, level)`; `def test_ceiling_is_declared_on_the_calling_job_not_inherited()`
 - **tests/unit/test_claim_extraction_precision.py** — Action items and decisions must be commitments, not conversation (#2852).
@@ -3494,7 +3503,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_service_key_insert_only.py** — Unit tests for insert-only ServiceKeyStorage.store_key (F196).
   - `async def db(tmp_path)`; `async def storage(db)`; `class TestStoreKeyInsertOnly`; `class TestKeyFeatureEnforcement`
 - **tests/unit/test_session_grouping.py** — Unit tests for the shared session-boundary algorithm (#2019).
-  - `def test_quick_succession_is_one_session()`; `def test_time_gap_splits_sessions()`; `def test_new_session_marker_splits_and_is_not_counted()`; `def test_session_id_change_splits_even_within_gap()`; `def test_legacy_then_uuid_stays_merged_to_match_resolver()`; `def test_unlabeled_turn_stays_with_current_session()`; `def test_legacy_cluster_without_metadata_falls_back_to_row_id()`; `def test_integer_session_id_is_treated_as_legacy_not_canonical()`; `…`
+  - `def test_quick_succession_is_one_session()`; `def test_time_gap_splits_sessions()`; `def test_new_session_marker_splits_and_is_not_counted()`; `def test_session_id_change_splits_even_within_gap()`; `def test_legacy_then_uuid_splits_because_the_resolver_stops_there()`; `def test_unlabeled_turn_stays_with_current_session()`; `def test_legacy_cluster_without_metadata_falls_back_to_row_id()`; `def test_integer_session_id_is_treated_as_legacy_not_canonical()`; `…`
 - **tests/unit/test_session_id_canonicalization.py** — End-to-end storage tests for canonical session identity (#2012).
   - `async def store()`; `async def test_canonicalize_maps_integer_marker_rowid_to_uuid(store)`; `async def test_canonicalize_leaves_non_marker_integer_alone(store)`; `async def test_add_conversation_relinks_integer_echo_to_uuid(store)`; `async def test_resolve_session_id_canonicalizes_explicit_integer(store)`; `async def test_continued_turns_load_under_canonical_uuid(store)`; `async def test_new_session_marker_mints_fresh_uuid_not_inherited(store)`; `async def test_canonicalize_skips_inherited_marker(store)`; `…`
 - **tests/unit/test_session_id_in_hooks.py** — Verify session_id is correctly threaded to hook calls during tool dispatch (#885).
