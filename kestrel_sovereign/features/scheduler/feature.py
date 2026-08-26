@@ -2568,14 +2568,26 @@ class SchedulerFeature(Feature):
         #    ``_turn_session_id()`` answers None for it exactly as it does
         #    for a caller with no turn — the same absence-means-two-things
         #    conflation this branch exists to refuse.
-        if current is None and not self._owns_live_turn():
+        #    Unconditional on purpose (#3112 gate-2 P1): the earlier form was
+        #    ``current is None and not self._owns_live_turn()``, which made
+        #    provenance UNREACHABLE whenever any signal was in context.
+        #    ``SignalDispatcher`` sets the current-signal ContextVar for
+        #    ACTION and ARTIFACT handlers too, and a detached task keeps a
+        #    COPIED value after dispatch — so a stale callback outside any
+        #    live turn satisfied ``current is not None`` and skipped the
+        #    check entirely. Presence of a signal is not authorship. The two
+        #    questions were sharing one test: ``current`` answers "what woke
+        #    us, and does that make this a second hop?", ``_owns_live_turn()``
+        #    answers "is this agent-authored, in-turn work?".
+        if not self._owns_live_turn():
             return ToolResult.failed(
                 f"'{SELF_FOLLOWUP_TASK_NAME}' carries THIS agent's own "
                 "intention across its own turn boundary, so it may only be "
-                "scheduled from inside a live turn. This call has neither a "
-                "waking signal nor a turn session, so its intent is not "
-                "agent-authored and the source's TRUSTED registration would "
-                "be a lie about it.",
+                "scheduled from inside a live turn. This call does not own a "
+                "live turn, so its intent is not agent-authored and the "
+                "source's TRUSTED registration would be a lie about it. "
+                "A signal in context is not authorship: ACTION and ARTIFACT "
+                "handlers and detached tasks carry one too.",
                 data={
                     "success": False,
                     "task_name": SELF_FOLLOWUP_TASK_NAME,
