@@ -711,6 +711,15 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     last_delivery_error TEXT,
     last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
     last_delivery_attempt_at TIMESTAMP,
+    -- Attempts belong to a TRANSITION, not to a handle (#3105). A provider
+    -- that corrects a terminal state (talon finished_unknown -> failed) starts
+    -- a new transition whose first wake is news, not attempt N+1 of the old
+    -- one. This records which signaled token the counter is counting.
+    attempts_signaled_target TEXT NOT NULL DEFAULT '',
+    -- When the current attempt was DISPATCHED. last_delivery_attempt_at is
+    -- rewritten at harvest time, so it answers "when did we last look", not
+    -- "when did we try" — a difference measured at 41 minutes live.
+    last_attempt_started_at TIMESTAMP,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
@@ -1188,6 +1197,21 @@ class AsyncDatabase:
         # which is what the reconciler reports for them.
         await self._migrate_add_column(
             "wait_signal_state", "last_surface_status", "TEXT"
+        )
+        # Attempt provenance (#3105), same reasoning as the column above: the
+        # table is CREATE TABLE IF NOT EXISTS, so an existing database never
+        # receives these from the schema. No backfill — the defaults are the
+        # honest legacy answer. An existing row mid-retry has an empty
+        # ``attempts_signaled_target``, so its next detect reads as a new
+        # transition and restarts the counter at 1. That is a one-time, bounded
+        # loss of cap history in the direction of delivering rather than
+        # suppressing, which is the safe direction for a wake.
+        await self._migrate_add_column(
+            "wait_signal_state", "attempts_signaled_target",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        await self._migrate_add_column(
+            "wait_signal_state", "last_attempt_started_at", "TIMESTAMP"
         )
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
@@ -2049,6 +2073,7 @@ class AsyncDatabase:
             mutation_triggers,
             NON_NULL_PROJECTION_COLUMNS,
             emptied_cache_invalidation,
+            publishing_agent_ledger_seed,
             CHANGES_PRE_SLOT_TABLE,
             CHANGES_SLOT_COLUMN,
             changes_slot_migration,
@@ -2272,9 +2297,37 @@ class AsyncDatabase:
                     retired = await self._backend.execute(
                         shape_change_invalidation(self.backend_type)
                     )
+                    # And the watermarks, for the same reason the emptied-cache
+                    # path above runs both: rotating the generation retires the
+                    # counters a watermark is compared against, but only where
+                    # a counter row EXISTS. An agent whose projection was built
+                    # before the triggers were installed, or restored without
+                    # its ledger, reads back generation '' and stamp 0 — which
+                    # is exactly what a missing ledger reads back as, so the
+                    # numbers go on agreeing and the rotation touches nothing.
+                    # That hole was survivable while the shape was the trigger
+                    # DDL; it is not now the shape includes the GROUPING
+                    # (#3098), because a grouping change makes every stored
+                    # session suspect and those agents are the ones with the
+                    # oldest projections.
+                    await self._backend.execute(emptied_cache_invalidation())
+                    # And a ledger row for every agent that could publish
+                    # without one, because the two statements above are claims
+                    # a fence may not look at. An older revision's rebuild
+                    # already running for such an agent re-reads the
+                    # GENERATION before it publishes, still sees the empty
+                    # string, finds it unchanged, and commits a valid
+                    # watermark over the invalidation — after which both
+                    # revisions compare two empty generations that agree. The
+                    # agent that most needs this is the one whose FIRST
+                    # rebuild is in flight, which has no watermark either.
+                    await self._backend.execute(
+                        publishing_agent_ledger_seed(self.backend_type)
+                    )
                     logger.info(
                         "change-stamp shape moved; retired the counters for "
-                        "%s agent(s), which will rebuild (#2998)",
+                        "%s agent(s) and every watermark, which will rebuild "
+                        "(#2998, #3098)",
                         retired,
                     )
 
@@ -2613,10 +2666,21 @@ class AsyncDatabase:
         # index at once. The ALTER is serialized by its own migration lock; a
         # bare CREATE INDEX after it is not, and two boots racing there is a
         # failed request rather than a skipped index.
+        # ``created_at, id`` trail the pair so the projection can seek the newest
+        # UNSTAMPED row rather than sort them: with ``(agent_id, session_id)``
+        # alone SQLite answers that with ``USE TEMP B-TREE FOR ORDER BY`` over
+        # every NULL row of the agent's, inside the repair's write transaction,
+        # once per chunk — O(legacy rows) per append on exactly the histories
+        # #3061 exists to make cheap. ``id`` follows because the probe orders by
+        # the canonical pair: SQLite appends the rowid to every index and would
+        # be satisfied without it, PostgreSQL would sort the whole tie group at
+        # the newest second before taking one row. It leaves the
+        # ``session_id = ?`` lookups this index was added for seeking exactly as
+        # before.
         await self.ensure_index(
             "idx_conversation_agent_session",
             "conversation_history",
-            "agent_id, session_id",
+            "agent_id, session_id, created_at, id",
         )
 
     async def _migrate_conversation_created_at(self) -> None:

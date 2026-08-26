@@ -403,21 +403,34 @@ async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("safe_mode", "audit_pending", "expected_reason"),
+    ("safe_mode", "audit_pending", "cause", "expected_reason"),
     [
-        (True, False, "integrity failure"),
-        (False, True, "required startup integrity audit"),
+        (True, False, "integrity", "integrity failure"),
+        (False, True, "integrity", "required startup integrity audit"),
+        # The cases the Sovereign was previously told were integrity failures.
+        (True, False, "state_unavailable", "could not be read"),
+        (True, False, "state_not_persisted", "could not be saved"),
+        (True, False, "identity_missing", "missing agent identity record"),
+        (True, False, None, "cause was not recorded"),
     ],
 )
 async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
-    safe_mode, audit_pending, expected_reason
+    safe_mode, audit_pending, cause, expected_reason
 ):
-    """The primary streamed chat path must not bypass restored restriction."""
+    """The primary streamed chat path must not bypass restored restriction.
+
+    It must also not misdescribe it. This is the surface the Sovereign
+    actually reads, and it claimed an integrity failure unconditionally —
+    reporting a constitutional violation for a missing decryption key.
+    """
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
     agent = MagicMock()
     agent._safe_mode = safe_mode
     agent._constitution_audit_pending = audit_pending
+    # Stated, because an unset attribute on a MagicMock is a truthy Mock and
+    # would match no cause at all.
+    agent._safe_mode_cause = cause
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
@@ -428,7 +441,17 @@ async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
 
     assert len(chunks) == 1
     assert "SAFE MODE ACTIVE" in chunks[0]
-    assert expected_reason in chunks[0]
+    assert expected_reason in chunks[0], chunks[0]
+    if cause not in ("integrity", None) and not audit_pending:
+        assert "integrity failure" not in chunks[0], (
+            "a non-integrity restriction was reported as a constitutional "
+            "violation"
+        )
+        # The remediation line is part of the claim. Saying operation resumes
+        # "once integrity is restored" tells the operator to go fix an
+        # integrity problem that does not exist — and that line escaped two
+        # separate edits unnoticed because nothing asserted it.
+        assert "once integrity is restored" not in chunks[0], chunks[0]
     agent._maybe_audit.assert_awaited_once()
     agent._turn_lifecycle.assert_not_called()
     agent._process_input_streaming_traced_locked.assert_not_called()
@@ -1015,3 +1038,559 @@ async def test_verifier_fails_closed_on_governing_source_mutation(governing_sour
     ok, msg = await agent._verify_constitution_integrity()
     assert not ok
     assert "modified" in msg
+
+
+@pytest.mark.asyncio
+async def test_a_store_outage_does_not_overwrite_an_integrity_finding(tmp_path):
+    """The clobber that made the previous attempt at this defect fail.
+
+    An integrity failure followed by an unreadable store used to report
+    "Constitution runtime state unavailable" — the availability fact taking
+    the slot the integrity finding was in. Amendment III requires the
+    discrepancy be reported to the Sovereign, and it had been overwritten.
+
+    The availability fact has its own home (``_constitution_state_load_error``)
+    and does not need this slot.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    try:
+        await agent.enter_safe_mode("governing bytes changed")
+        assert agent._safe_mode_cause == SafeModeCause.INTEGRITY.value
+
+        agent._mark_constitution_state_unavailable(RuntimeError("disk is full"))
+
+        assert agent._safe_mode_reason == "governing bytes changed", (
+            "the store outage overwrote the integrity finding"
+        )
+        assert agent._safe_mode_cause == SafeModeCause.INTEGRITY.value
+        # ...and the availability fact is still recorded, in its own field.
+        assert agent._constitution_state_load_error == "RuntimeError"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_store_outage_alone_is_not_recorded_as_an_integrity_cause(tmp_path):
+    """With nothing else wrong, the cause is availability, not integrity."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    try:
+        agent._mark_constitution_state_unavailable(RuntimeError("disk is full"))
+
+        assert agent._safe_mode is True
+        assert agent._safe_mode_cause == SafeModeCause.STATE_UNAVAILABLE.value
+        assert agent._safe_mode_cause != SafeModeCause.INTEGRITY.value
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_cause_survives_a_restart(tmp_path):
+    """Persisted, not re-derived. A restart must not lose why.
+
+    Without a stored cause every restored Safe Mode read as UNRECORDED, so a
+    known integrity finding became "cause unrecorded" after a routine
+    restart — the report losing the very thing Amendment III requires be
+    reported.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    db = str(tmp_path / "agent.db")
+
+    storage = AsyncStorage(db)
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        await agent.enter_safe_mode("governing bytes changed")
+        assert agent._safe_mode_cause == SafeModeCause.INTEGRITY.value
+    finally:
+        await storage.close()
+
+    # A second process, same database.
+    storage2 = AsyncStorage(db)
+    await storage2.initialize()
+    restored = _DurableConstitutionHarness(storage2, now)
+    try:
+        await restored._initialize_constitution_runtime_state()
+        assert restored._safe_mode is True
+        assert restored._safe_mode_cause == SafeModeCause.INTEGRITY.value, (
+            "the cause did not survive the restart"
+        )
+    finally:
+        await storage2.close()
+
+
+@pytest.mark.asyncio
+async def test_a_row_written_before_causes_existed_reads_as_unrecorded(tmp_path):
+    """A NULL column is not an integrity finding."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    db = str(tmp_path / "agent.db")
+
+    storage = AsyncStorage(db)
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        await agent.enter_safe_mode("governing bytes changed")
+        # Blank the column the way a pre-#2920 row has it.
+        await storage.db.execute(
+            "UPDATE constitution_runtime_state SET safe_mode_cause = NULL"
+        )
+    finally:
+        await storage.close()
+
+    storage2 = AsyncStorage(db)
+    await storage2.initialize()
+    restored = _DurableConstitutionHarness(storage2, now)
+    try:
+        await restored._initialize_constitution_runtime_state()
+        assert restored._safe_mode is True
+        assert restored._safe_mode_cause == SafeModeCause.UNRECORDED.value
+    finally:
+        await storage2.close()
+
+
+@pytest.mark.asyncio
+async def test_an_exited_restrictions_cause_is_not_revived_by_a_later_outage(tmp_path):
+    """History must not be reported as a live violation.
+
+    After an authorized exit the reason and cause linger. A later failed
+    write used to carry them forward, reporting an integrity violation that
+    had already been verified and cleared.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    try:
+        await agent.enter_safe_mode("governing bytes changed")
+        # The exit itself is exercised elsewhere; this is the state it leaves.
+        agent._safe_mode = False
+
+        agent._mark_constitution_state_unavailable(RuntimeError("disk is full"))
+
+        assert agent._safe_mode_cause == SafeModeCause.STATE_UNAVAILABLE.value, (
+            "an exited integrity finding was revived as a live cause"
+        )
+        assert agent._safe_mode_reason == "Constitution runtime state unavailable"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_marks_the_latch_as_not_durable(tmp_path):
+    """A Safe Mode that could not be written down is not durable.
+
+    Only a MISSING store was treated as not-persisted. When ``store.write``
+    itself raised — a full disk, a dropped connection — the restriction
+    existed in memory alone and would vanish on restart, while the report
+    said nothing and the durability promise ("clears only with an authorized
+    exit") stood.
+    """
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        assert agent._constitution_state_persistence_pending is False
+
+        # The store is present and the write fails — the case the old guard
+        # could not distinguish from a healthy one.
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("database is locked")
+        )
+        persisted = await agent.enter_safe_mode("governing bytes changed")
+
+        assert persisted is False
+        assert agent._safe_mode is True
+        assert agent._constitution_state_persistence_pending is True, (
+            "an in-memory-only restriction was reported as durable"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_buffered_cause_survives_the_restore_that_persists_it(tmp_path):
+    """A pre-initialization entry must not be written with the old row's cause.
+
+    Restoring the prior state overwrites the buffered cause before the
+    pending entry is persisted, so the new restriction landed on disk
+    carrying the previous cause or none — and reported the wrong thing after
+    the next restart.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    db = str(tmp_path / "agent.db")
+
+    # An agent with an existing, non-restricted durable row.
+    storage = AsyncStorage(db)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    await first._initialize_constitution_runtime_state()
+    try:
+        await first._record_successful_constitution_audit(source="startup")
+    finally:
+        await storage.close()
+
+    # A new process restricts cognition BEFORE its store is connected.
+    storage2 = AsyncStorage(db)
+    await storage2.initialize()
+    agent = _DurableConstitutionHarness(storage2, now)
+    try:
+        await agent.enter_safe_mode(
+            "decryption failures",
+            cause=SafeModeCause.STATE_UNAVAILABLE.value,
+        )
+        assert agent._constitution_state_persistence_pending is True
+
+        await agent._initialize_constitution_runtime_state()
+
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert persisted.safe_mode is True
+        assert persisted.safe_mode_cause == SafeModeCause.STATE_UNAVAILABLE.value, (
+            "the buffered cause was replaced by the restored row's"
+        )
+    finally:
+        await storage2.close()
+
+
+@pytest.mark.asyncio
+async def test_a_durable_write_clears_the_not_persisted_warning(tmp_path):
+    """One transient failure must not mark the process forever."""
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        real_write = agent._constitution_state_store.write
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("database is locked")
+        )
+        await agent.enter_safe_mode("governing bytes changed")
+        assert agent._constitution_state_persistence_pending is True
+
+        # The store recovers and a later entry writes through.
+        agent._constitution_state_store.write = real_write
+        await agent.enter_safe_mode("governing bytes changed")
+
+        assert agent._constitution_state_persistence_pending is False, (
+            "a recovered store still reported the latch as non-durable"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_missing_identity_node_is_not_reported_as_a_read_outage(tmp_path):
+    """The state was read successfully; the identity it describes is gone.
+
+    Labelling that STATE_UNAVAILABLE makes health report an outage that did
+    not happen. It is a discrepancy — which Amendment III requires be
+    reported — so it gets its own name rather than a neighbour's.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    db = str(tmp_path / "agent.db")
+
+    # A completed durable row: audited, not awaiting bootstrap.
+    storage = AsyncStorage(db)
+    await storage.initialize()
+    first = _DurableConstitutionHarness(storage, now)
+    await first._initialize_constitution_runtime_state()
+    try:
+        await first._record_successful_constitution_audit(source="startup")
+    finally:
+        await storage.close()
+
+    # Same row, but the identity node it describes is no longer there.
+    storage2 = AsyncStorage(db)
+    await storage2.initialize()
+    agent = _DurableConstitutionHarness(storage2, now)
+    try:
+        await agent._initialize_constitution_runtime_state(is_new_identity=True)
+
+        assert agent._safe_mode is True
+        assert agent._safe_mode_cause == SafeModeCause.IDENTITY_MISSING.value
+        assert agent._safe_mode_cause != SafeModeCause.STATE_UNAVAILABLE.value
+        # The read itself succeeded, so nothing may claim otherwise.
+        assert agent._constitution_state_load_error is None
+    finally:
+        await storage2.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_is_not_recorded_as_a_read_outage(tmp_path):
+    """Nothing failed to READ, so nothing may say the state was unreadable."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        # A normal-mode checkpoint, with the agent NOT restricted.
+        await agent._record_successful_constitution_audit(source="startup")
+
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+        assert agent._constitution_state_load_error is None, (
+            "a write failure was recorded as a read outage"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_clears_the_durability_flag_but_keeps_the_cause(tmp_path):
+    """Recovery changes one of the two facts, not both.
+
+    The flag says whether state is durable NOW; the cause says why cognition
+    is restricted, and a write that failed really is that trigger. Erasing it
+    to "unrecorded" on recovery lost the reason across a restart, so health
+    and `!safe-mode` then claimed no cause had been recorded.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        real_write = agent._constitution_state_store.write
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        await agent._record_successful_constitution_audit(source="startup")
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+
+        agent._constitution_state_store.write = real_write
+        await agent._record_successful_constitution_audit(source="startup")
+
+        assert agent._constitution_state_persistence_pending is False, (
+            "the durability flag survived a successful write"
+        )
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "the trigger was erased, so nothing records why it is restricted"
+        )
+    finally:
+        await storage.close()
+
+
+def test_the_safe_mode_command_reports_the_recorded_cause():
+    """`!safe-mode` is what a Sovereign types to ask why. It must not guess."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.command_handler import CommandHandler
+
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._constitution_audit_pending = False
+    agent._safe_mode_cause = SafeModeCause.STATE_UNAVAILABLE.value
+
+    import inspect as _inspect
+
+    handler = CommandHandler.__new__(CommandHandler)
+    handler.agent = agent
+    reply = CommandHandler._cmd_safe_mode(handler, "")
+    if _inspect.isawaitable(reply):
+        reply = asyncio.run(reply)
+
+    assert "SAFE MODE ACTIVE" in reply
+    assert "could not be read" in reply
+    assert "integrity failure" not in reply
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_write_persists_the_trigger_it_recorded(tmp_path):
+    """The durable row keeps why the agent is restricted.
+
+    A restart reads this row, so a cause dropped here is a cause the operator
+    never sees again.
+    """
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        real_write = agent._constitution_state_store.write
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        await agent._record_successful_constitution_audit(source="startup")
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+
+        agent._constitution_state_store.write = real_write
+        await agent._record_successful_constitution_audit(source="startup")
+
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert persisted.safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "the durable row lost the trigger, so a restart cannot report it"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_command_reports_the_recorded_cause():
+    """The branch an operator hits while trying to diagnose must not misreport."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._constitution_audit_pending = False
+    agent._constitution_state_persistence_pending = False
+    agent._safe_mode_cause = SafeModeCause.MEMORY_UNREADABLE.value
+    agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent._maybe_refresh_user_byok_resolver = AsyncMock()
+    agent.process_input = KestrelAgent.process_input.__get__(agent)
+
+    reply = await agent.process_input("!privacy")
+
+    assert "SAFE MODE ACTIVE" in reply
+    assert "could not be decrypted" in reply, reply
+    assert "integrity issue" not in reply
+    assert "once integrity is restored" not in reply
+
+    # The non-command path carries the remediation suffix; it must not send
+    # the operator after an integrity failure that did not happen either.
+    agent2 = MagicMock()
+    agent2._safe_mode = True
+    agent2._constitution_audit_pending = False
+    agent2._constitution_state_persistence_pending = False
+    agent2._safe_mode_cause = SafeModeCause.MEMORY_UNREADABLE.value
+    agent2._maybe_audit = AsyncMock()
+    agent2._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent2._maybe_refresh_user_byok_resolver = AsyncMock()
+    agent2.process_input = KestrelAgent.process_input.__get__(agent2)
+
+    plain = await agent2.process_input("what is the weather")
+    assert "could not be decrypted" in plain, plain
+    assert "once integrity is restored" not in plain, plain
+
+
+def test_a_non_durable_latch_is_disclosed_to_the_sovereign():
+    """The cause slot keeps the stronger fact; the reader still needs both.
+
+    Entering Safe Mode for an integrity failure and failing to persist it
+    leaves a restriction that will not survive a restart — which health
+    reported and the Sovereign-facing text did not.
+    """
+    from kestrel_sovereign.agent.constitution import (
+        SafeModeCause,
+        describe_safe_mode_restriction,
+    )
+
+    agent = MagicMock()
+    agent._safe_mode_cause = SafeModeCause.INTEGRITY.value
+    agent._constitution_state_persistence_pending = True
+
+    phrase = describe_safe_mode_restriction(agent)
+
+    assert "integrity failure" in phrase
+    assert "will not survive a restart" in phrase
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_also_fails_still_says_not_persisted(tmp_path):
+    """The replacement cause must not be applied by a write that failed."""
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+    await agent._initialize_constitution_runtime_state()
+    try:
+        agent._constitution_state_store.write = AsyncMock(
+            side_effect=RuntimeError("disk is full")
+        )
+        await agent._record_successful_constitution_audit(source="startup")
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value
+
+        # Still unwritable.
+        await agent._record_successful_constitution_audit(source="startup")
+
+        assert agent._safe_mode_cause == SafeModeCause.STATE_NOT_PERSISTED.value, (
+            "a failed retry downgraded the cause to 'not recorded' while the "
+            "store was still unwritable"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_the_cause_column_migration_runs_only_when_needed(tmp_path):
+    """A fresh database already has the column; the ALTER is pure cost there.
+
+    On hosted PostgreSQL it takes an ACCESS EXCLUSIVE lock, so agents
+    starting concurrently against one database serialized on it. The metadata
+    is inspected first, and a real migration failure is no longer swallowed
+    by the same except that meant "already present".
+    """
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeStateStore,
+    )
+    from kestrel_sovereign.storage import AsyncStorage
+
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    try:
+        store = ConstitutionRuntimeStateStore(storage._backend)
+        await store.initialize()
+
+        # Second startup against the same database: nothing left to add.
+        store2 = ConstitutionRuntimeStateStore(storage._backend)
+        with patch.object(
+            store2._backend, "execute", wraps=store2._backend.execute
+        ) as spy:
+            await store2.initialize()
+        altered = [
+            c for c in spy.call_args_list
+            if "ADD COLUMN safe_mode_cause" in str(c)
+        ]
+        assert not altered, "an unnecessary ALTER was issued on every startup"
+    finally:
+        await storage.close()

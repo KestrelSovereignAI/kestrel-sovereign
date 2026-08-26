@@ -65,11 +65,13 @@ class TestTokenCounter:
 
         assert counter.count_messages([]) == 0
 
-    def test_get_context_limit_undiscovered_model(self):
+    def test_get_context_limit_undiscovered_model(self, kestrel_toml_catalog):
         """Test getting context limit for model in catalog uses catalog value."""
+        kestrel_toml_catalog("context_limits_override", {"gpt-4": 8192})
+
         counter = get_token_counter("gpt-4")
         limit = counter.get_context_limit()
-        assert limit == 8192  # From model_catalog.toml context_limits
+        assert limit == 8192  # From the catalog's context_limits_override
 
     def test_get_context_limit_unknown_model(self):
         """Test getting context limit for unknown model returns default."""
@@ -92,7 +94,7 @@ class TestTokenCounter:
         assert counter.fits_in_context(short_text)
         assert counter.fits_in_context(short_text, reserved_tokens=8000)
 
-    def test_route_qualified_preserves_slashed_model_id(self):
+    def test_route_qualified_preserves_slashed_model_id(self, kestrel_toml_catalog):
         """Codex round-7 P2: route-qualified with slash-containing model.
 
         For OpenRouter/HF-style ids like ``meta-llama/Llama-...`` or
@@ -104,6 +106,12 @@ class TestTokenCounter:
         cache/catalog key.
         """
         from kestrel_sovereign.agent.token_counter import TokenCounter
+
+        kestrel_toml_catalog(
+            "context_limits_override",
+            {"meta-llama/Llama-3.1-8B-Instruct": 128000},
+        )
+
         tc = TokenCounter("openrouter:default/meta-llama/Llama-3.1-8B-Instruct")
         # The TOML catalog has this entry at 128000. The regression
         # bug would yield DEFAULT_CONTEXT_LIMIT (32768) because the
@@ -353,17 +361,20 @@ class TestContextManagerIntegration:
         assert second["model"] == "claude-3-5-sonnet"
 
     @pytest.mark.asyncio
-    async def test_route_qualified_model_drives_budget_cap(self):
+    async def test_route_qualified_model_drives_budget_cap(self, kestrel_toml_catalog):
         """ContextManager prefers route-qualified model for budget sizing.
 
         When the active route is openai:plan, the budget must size
         against the per-turn cap (~20K) rather than the model's full
-        context window. The cap comes from model_catalog.toml's
-        ``[context_limits_override]`` entry for ``openai:plan`` and
-        is selected via the longest-substring match rule in
-        ``ModelCatalogService.get_context_limit``.
+        context window. The cap comes from the catalog's
+        ``[route_context_caps]`` entry for ``openai:plan``, which the
+        fixture writes into this test's own project directory rather
+        than borrowing whatever ``kestrel.toml`` the machine happens to
+        carry.
         """
         from kestrel_sovereign.agent.context_manager import ContextManager
+
+        kestrel_toml_catalog("route_context_caps", {"openai:plan": 20480})
 
         mock_storage = MagicMock()
         mock_llm_service = MagicMock()

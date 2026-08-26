@@ -180,8 +180,24 @@ async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
 
         # Manual unarchive clears the sole state column. Decay evidence stays
         # metadata-only and does not wedge a later consolidation pass.
+        #
+        # By the session's KEY, which is what a session lifecycle op takes. A
+        # row id is a session key only for a legacy cluster whose first row
+        # carries no id of its own (#2012), and these rows carry one — the
+        # write path mints it, overwriting the ``session_id`` this test put in
+        # ``base_metadata``, so neither that string nor a row id names the
+        # session these messages are actually in. Answering a key that names
+        # nothing invents a session no other surface shows (#3098).
+        decay_session_id = json.loads(
+            (
+                await storage.db.fetchone(
+                    "SELECT metadata FROM conversation_history WHERE id = ?",
+                    (unused_id,),
+                )
+            )[0]
+        )["session_id"]
         assert await storage.conversation.unarchive_conversation_session(
-            str(unused_id)
+            decay_session_id
         ) == 1
         normal = await storage.conversation.get_conversation_history(limit=10)
         assert unused_id in {row["id"] for row in normal}

@@ -321,7 +321,9 @@ import os
 import re
 from datetime import datetime
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 
 from .session_grouping import (
     SESSION_ORDER,
@@ -580,6 +582,22 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: probes below count these rows; two spellings of one membership rule is the
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
+
+#: "Something is unstamped and nothing can be ordered against it."
+#:
+#: An unstamped row whose ``created_at`` will not parse cannot be placed before
+#: or after anything, so no chunk can be proved to land clear of it.
+#: ``datetime.max`` says that through the same comparison every other frontier
+#: uses, rather than a second branch.
+#:
+#: **NOT COVERED BY A TEST, and it cannot be while #3009 stands.** ``created_at``
+#: carries a CHECK admitting exactly what ``coerce_session_timestamp`` can read,
+#: and the boot migration repairs anything a database already held — so a row
+#: this branch is about is repaired before any projection opens the database. It
+#: stays because what it guards is the difference between an escalation and a
+#: projection that disagrees with the reader, and because the constraint it
+#: leans on is one line in another module.
+_UNDATABLE_FRONTIER = datetime.max
 
 
 def active_history_predicate() -> str:
@@ -1208,9 +1226,19 @@ def _anchor(generation: str, *, row: str = "", agents: str = "", where: str = ""
     nothing — one row per row written, and one uuid generated per row of a bulk
     insert.
     """
+    # ``WHERE true`` is not filler. SQLite cannot parse ``INSERT ... SELECT ...
+    # ON CONFLICT`` without one: the upsert clause is ambiguous against a join
+    # on the SELECT, and its answer is to require a WHERE before it. The form
+    # went unnoticed while only PostgreSQL's statement triggers used it —
+    # SQLite has no transition tables and so no per-statement bump — and
+    # raised the moment #3098 asked for the same row for a set of agents on
+    # both engines. PostgreSQL accepts the term and ignores it.
     values = (
         f"VALUES ({row}.agent_id, 0, 0, 0, {generation})" if row
-        else f"SELECT agent_id, 0, 0, 0, {generation} FROM ({agents}) AS kestrel_agents"
+        else (
+            f"SELECT agent_id, 0, 0, 0, {generation} "
+            f"FROM ({agents}) AS kestrel_agents WHERE true"
+        )
     )
     if where:
         # The conditional form has to be a SELECT: SQLite has no way to put a
@@ -1463,14 +1491,94 @@ def _placeholder(kind: str, role: str) -> str:
     return ("fn_" if kind == "function" else "trg_") + role
 
 
-def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
-    """A short digest of the whole mechanism's DDL, names excluded.
+#: Whose source counts as part of the grouping when the grouper imports from it.
+#: Everything else a module-level name can hold — the standard library, a third
+#: party — is represented by its VALUE below if it has a simple one, and
+#: otherwise not at all, because hashing an unrelated library's text would
+#: rebuild every projection on an unrelated upgrade.
+_GROUPING_PACKAGES = frozenset({"kestrel_sovereign", "kestrel_sdk"})
 
-    Names are excluded because they are derived FROM this — the templates carry
-    ``{fn_appended}``-style placeholders and are resolved afterwards, which is
-    what stops the definition from depending on its own digest.
+
+@lru_cache(maxsize=1)
+def _grouping_source() -> str:
+    """The derivation whose ANSWER this projection stores, as text.
+
+    The whole module, not a curated list of the functions that decide a
+    boundary. A curated list is a second place to remember, and this repository
+    has already paid for one — :data:`PROJECTION_METADATA_KEYS` needed a test
+    that reads ``session_grouping``'s own AST to keep it honest, because a key
+    added there and not here is invisible in the worst direction. There is
+    nothing to keep honest about "the module".
+
+    **And what the module IMPORTS, because a boundary can move without its
+    text changing.** ``SESSION_GAP_MINUTES`` decides where every session ends
+    and is defined elsewhere; ``SESSION_ID_KEY`` names the field every session
+    is keyed by and is defined elsewhere. A dependency bump that moved either
+    would leave this file byte-identical, the trigger names unchanged, and
+    every stored projection reporting itself current over boundaries this
+    revision no longer computes. So each module-level name is folded in by its
+    VALUE when it has a simple one, and by its own module's source when it is
+    something of ours — derived from the namespace rather than listed, for the
+    same reason the module is taken whole.
+
+    The cost is that editing a docstring here rebuilds every agent's projection
+    once. That is the direction this module already chooses everywhere else:
+    rebuild needlessly, never miss a change.
     """
-    material = "\n".join((backend_type, *templates)).encode("utf-8")
+    import inspect
+
+    from kestrel_sovereign.storage import session_grouping
+
+    parts = [inspect.getsource(session_grouping)]
+    namespace = vars(session_grouping)
+    for name in sorted(namespace):
+        if name.startswith("__"):
+            continue
+        value = namespace[name]
+        origin = getattr(value, "__module__", None)
+        if (
+            origin
+            and origin != session_grouping.__name__
+            and origin.split(".")[0] in _GROUPING_PACKAGES
+        ):
+            module = inspect.getmodule(value)
+            try:
+                parts.append(inspect.getsource(module))
+                continue
+            except (OSError, TypeError):
+                pass
+        if isinstance(value, (bool, int, float, str, bytes, tuple, frozenset)):
+            parts.append(f"{name}={value!r}")
+    return "\n".join(parts)
+
+
+def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
+    """A short digest of everything the stored answer depends on.
+
+    Two inputs, and the second is not an embellishment of the first.
+
+    The mechanism's DDL, names excluded — excluded because they are derived
+    FROM this, the templates carrying ``{fn_appended}``-style placeholders that
+    are resolved afterwards, which is what stops the definition from depending
+    on its own digest.
+
+    And :func:`_grouping_source`, because the trigger shape is only half of
+    what makes a stored session right. The other half is the function that
+    computed it. :func:`shape_change_invalidation` says the outcome this design
+    exists to make impossible is "the projection reports itself current while
+    holding an answer the grouper would not give" — and a changed GROUPER
+    reaches that outcome by the other road, with every trigger, counter and
+    watermark still perfectly consistent about rows nobody disputes. Measured
+    on Emma's live history at #3098: eight sessions the reader showed and the
+    list did not, after a change to where a session ends, with a projection
+    reporting itself current throughout.
+
+    So the name an object carries is the definition of the answer it maintains,
+    which is what a name probe was always meant to be asking.
+    """
+    material = "\n".join(
+        (backend_type, _grouping_source(), *templates)
+    ).encode("utf-8")
     return hashlib.blake2s(material, digest_size=4).hexdigest()
 
 
@@ -1844,9 +1952,10 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
 def _mechanism(backend_type: str) -> Tuple[Tuple[str, str, str, str], ...]:
     """``(kind, role, name, DDL)`` for the whole mechanism, names resolved.
 
-    Every name ends in :func:`_fingerprint` of the mechanism it belongs to, so
-    the objects installed in a database ARE their definition and a name probe
-    answers the question it was always meant to ask (#2998).
+    Every name ends in :func:`_fingerprint` of the mechanism it belongs to AND
+    of the grouping whose output it maintains, so the objects installed in a
+    database ARE the definition of the answer stored beside them, and a name
+    probe answers the question it was always meant to ask (#2998, #3098).
 
     The fingerprint covers the functions as well as the triggers, and covers all
     of them together. A PostgreSQL trigger's behaviour is its function's body:
@@ -1971,6 +2080,46 @@ def shape_change_invalidation(backend_type: str) -> str:
         # Slot 0 only: it is the one row that carries a generation, and the
         # writers' slots hold the empty string by construction (#3005).
         + " WHERE slot = 0"
+    )
+
+
+def publishing_agent_ledger_seed(backend_type: str) -> str:
+    """SQL giving a ledger row to every agent that could publish without one.
+
+    :func:`shape_change_invalidation` invalidates by rotating the generation a
+    watermark is compared against, which needs a row to rotate. An agent whose
+    projection was built before the triggers existed, or restored without its
+    ledger, has none — it reads back generation ``''`` and stamp ``0``, exactly
+    what a missing ledger reads back as, so the numbers agree and the rotation
+    touches nothing.
+
+    :func:`emptied_cache_invalidation` says the same thing to the watermark and
+    is enough to make ``is_stale()`` answer true. It is NOT enough during a
+    rolling upgrade. An older revision's rebuild may already be running for
+    such an agent, having read history under the old grouping; its publication
+    fence re-reads the GENERATION, still sees ``''``, finds it unchanged, and
+    commits a valid watermark over the invalidation. Both revisions then read
+    two empty generations that agree, and the stale answer is served for as
+    long as nothing else moves.
+
+    So the claim is made where the fence will look. Creating the row is the
+    rotation for an agent that had nothing to rotate, and ``DO NOTHING`` leaves
+    every agent that does have one to :func:`shape_change_invalidation`.
+
+    **Every agent in HISTORY, not only every agent with a watermark.** The
+    agent that most needs the fence is the one whose FIRST rebuild is in
+    flight: it has no watermark yet either, so a seed keyed on the watermark
+    table would step around exactly the repair that is about to publish an
+    answer derived under the old grouping. What decides whether an agent needs
+    a generation is whether a repair could be running for it, and a repair runs
+    for an agent that has rows.
+    """
+    return _anchor(
+        _new_generation(backend_type),
+        agents=(
+            "SELECT agent_id FROM conversation_session_watermarks "
+            "UNION SELECT DISTINCT agent_id FROM conversation_history"
+        ),
     )
 
 
@@ -2391,11 +2540,10 @@ def project_transcript(
         # 473 of Emma's 1,522 live rows carry no session id at all.
         #
         # Storing them is sound because the two derivations cannot meet over
-        # one. A key outside the column's charset is a key no row's column can
-        # hold, so every row of that session is unstamped, so
-        # `_has_unstamped_rows()` is true and every step takes the transcript
-        # pass — the chunked fold, which is keyed on the column and could not
-        # maintain such a row, never runs while one can exist. Leaving that
+        # one. A key the column cannot hold is a key no row's column can hold,
+        # so every row of that session is unstamped, so any chunk reaching one
+        # escalates (#3061) — the chunked fold, which is keyed on the column and
+        # could not maintain such a row, never stores one. Leaving that
         # state cannot be reached by appends alone (removing an unstamped row is
         # a delete, an archive or a rewrite), so `_plan` answers REBUILT and the
         # discard clears anything left behind.
@@ -2914,8 +3062,7 @@ class ConversationSessionProjection:
                 plan = await self._plan(accounted, observed)
                 if plan is None:
                     return _Step(CURRENT, 0, True)
-                if not await self._has_unstamped_rows():
-                    return await self._chunk(plan)
+                return await self._chunk(plan)
         except Exception as exc:
             # The signal is raised inside the step's transaction so that the
             # rollback is the abort: nothing the chunk wrote stands, and the
@@ -3149,7 +3296,7 @@ class ConversationSessionProjection:
         through = (
             plan.target if len(rows) < self.chunk_rows else int(rows[-1][0])
         )
-        written = await self._fold(rows, through)
+        written = await self._fold(rows, through, await self._unstamped_frontier())
         await self._record(
             SessionWatermark(
                 plan.generation, True, plan.stamp, plan.appends, through,
@@ -3426,37 +3573,93 @@ class ConversationSessionProjection:
             or 0
         )
 
-    async def _has_unstamped_rows(self) -> bool:
-        """Whether any live row of this agent's is filed under no session id.
+    async def _unstamped_frontier(self) -> Optional[datetime]:
+        """Where the newest unstamped live row stands, or ``None`` for none.
 
-        Seeded by Phase A's ``(agent_id, session_id)`` index and stopped at the
-        first hit, so the ordinary answer costs one seek. It is not free in the
-        pathological case — an agent holding many unstamped rows that are all
-        soft-deleted or archived pays a heap visit per candidate — but that is an
-        agent already on the transcript derivation, whose repair reads its whole
-        live history anyway.
+        A row filed under no ``session_id`` belongs to whichever cluster it
+        falls next to, so a row arriving BEFORE it can take it — and a fold
+        reading sessions by their column would never see that happen. Ordinary
+        appends land after everything and cannot; a row whose id is higher but
+        whose stamp is earlier can, and that is not hypothetical: PostgreSQL's
+        ``NOW()`` is transaction-start time, so an overlapping writer commits a
+        later id carrying an earlier timestamp, and an import or restore can
+        write anything.
 
-        This chooses between the two derivations: with no unstamped rows a
-        session's own rows are the whole of its story, and with any of them
-        attribution has to be read off the transcript (see the module docstring).
+        Measured against the fold without this: ``sess-a`` at 09:00 with an
+        unstamped row at 09:02 stored as ``sess-a=2``; appending ``sess-b`` at
+        09:01 with a higher id stored ``sess-a=2, sess-b=1`` under a watermark
+        reporting itself current, where the reader says ``sess-a=1, sess-b=2``.
+
+        **The newest unstamped row's own stamp is the whole frontier**, and
+        that is a claim worth stating rather than a bound chosen for comfort.
+        ``group_messages_into_sessions`` is a left-to-right fold, so which
+        session an unstamped row lands in is decided entirely by the rows
+        BEFORE it; a row arriving after it cannot move it. What a later row can
+        do is resume a session by naming it, and coalescing only ever ADDS —
+        which is exactly what a fold does. So a chunk landing after this stamp
+        is one the column can answer alone, and a chunk landing at or before it
+        is one only the transcript can.
+
+        Until #3098 the frontier ran a grouping gap further out, and further
+        still along a walk of the cluster the newest unstamped row sat in,
+        because a legacy cluster ABSORBED following stamped rows and so
+        extended transitively — unstamped at 0, stamped at 20, stamped at 40
+        was one conversation. That absorption is gone: a row filed under its
+        own canonical id now starts its own session, and every live row above
+        this one carries a column, so every one of them is such a row. The
+        cluster therefore ends AT the newest unstamped row, and the walk that
+        looked for its end could only ever have returned that row back.
+
+        ``None`` means nothing is unstamped and every chunk lands clear.
+
+        One row, seeked rather than counted. ``COUNT(*)`` alongside ``MAX`` made
+        the engine visit every unstamped row of the agent's to answer, inside
+        the repair's write transaction, once per chunk — which is O(legacy rows)
+        per append on exactly the histories this exists to make cheap. Absence
+        is read off the empty result instead.
         """
         row = await self.db.fetchone(
-            "SELECT 1 FROM conversation_history "
+            "SELECT created_at FROM conversation_history "
             f"WHERE agent_id = ? AND session_id IS NULL AND {_LIVE} "
-            "LIMIT 1",
+            f"{canonical_order(self.db.backend_type, descending=True)} LIMIT 1",
             (self.agent_id,),
         )
-        return row is not None
+        if not row:
+            return None
+        newest = coerce_session_timestamp(row[0])
+        if newest is None:
+            return _UNDATABLE_FRONTIER
+        return newest
 
     async def _fold(
-        self, rows: Sequence[Sequence[Any]], through: int
+        self, rows: Sequence[Sequence[Any]], through: int,
+        frontier: Optional[datetime],
     ) -> int:
         """Fold one chunk's rows into the sessions they belong to.
 
-        Only ever reached with no unstamped live rows in play (see
-        :meth:`_step`), which is what makes a row's column the whole story of
-        where it belongs — so the chunk can be partitioned by that column without
-        consulting anything else, and each partition grouped on its own.
+        A row's column is the whole story of where it belongs for every session
+        this stores, and that is an INVARIANT the escalation below maintains
+        rather than a precondition someone else checks: a chunk holding a row
+        with no ``session_id`` refuses to fold at all, so a walk that reaches
+        ``through`` without escalating has accounted for every live row at or
+        below it. A session first seen above ``through`` therefore already has a
+        stored row describing whatever lies beneath, and folding only ever adds
+        this chunk's rows to it.
+
+        That replaces ``_has_unstamped_rows()`` (#3061), which asked whether the
+        AGENT held any unstamped row and sent the whole step to the transcript
+        if so. Legacy rows are not a transient upgrade state — they are what old
+        history looks like for ever — so one of them made EVERY repair re-derive
+        the agent's entire live history, on the read path #2960 put it on.
+        Measured, SQLite, one session in three legacy, ``list_session_page(50)``
+        straight after an appended row: 18.0 ms at 1,500 live rows against
+        3.4 ms now, and 133.0 ms against 6.3 ms at 15,000. Flat rather than
+        linear, and no row of history is rewritten to get there.
+
+        A per-session guard was tried first and removed: a fold only ever ADDS
+        a chunk's rows to what is already stored, so given the invariant above
+        there is nothing left for it to catch. It survived its own mutant, which
+        is what that always means.
 
         The rows handed here are the rows the chunk read. Nothing re-reads a
         session's history: that is the difference between a walk costing one pass
@@ -3469,11 +3672,33 @@ class ConversationSessionProjection:
         — but a deterministic order costs nothing and means an unforeseen overlap
         is contention rather than a lock cycle.
         """
+        # Nothing here may land among — or beside — rows only the transcript can
+        # attribute.
+        # The check above catches an unstamped row INSIDE the chunk; this one
+        # catches the chunk landing beside one already accounted for, which no
+        # column read can see happen. Asked of the chunk rather than of each
+        # session because it is a question about where these rows fall, and a
+        # per-session form of it was tried, survived its own mutant, and was
+        # removed — it could not catch this because a session's own boundaries
+        # say nothing about a row arriving beside it.
+        if frontier is not None:
+            for row in rows:
+                landed = coerce_session_timestamp(row[_CREATED_AT])
+                if landed is None or landed <= frontier:
+                    raise _NeedsTranscript(row[0])
+
         by_session: Dict[str, List[Sequence[Any]]] = {}
         for row in rows:
             session_id = row[4]
             if session_id is None:
-                continue
+                # **The chunk cannot file this row, so it cannot fold at all.**
+                # Skipping it was the shape before #3061 and it was only safe
+                # because `_step` had already refused to reach here with any
+                # unstamped row anywhere. With the guard now per session, a
+                # skipped row is a session that exists in history and in NO
+                # projection — measured, six legacy rows and an empty list.
+                # Absence is not the permitted direction for a conversation.
+                raise _NeedsTranscript(row[0])
             by_session.setdefault(str(session_id), []).append(row)
 
         written = 0

@@ -84,6 +84,28 @@ pypi = ">=0.3,<0.4"
 name = "github"
 editable = "/Volumes/data2/projects/kestrel-feature-github"
 
+# --- Host-scoped enablement -------------------------------------------------
+#
+# Everything above is about which packages stay INSTALLED. Which host features
+# then RUN is a separate question, and it has a default: a host feature (the
+# `kestrel_sovereign.host_features` entry-point group) runs once installed —
+# including one installed long after this file was written.
+#
+# Uncomment to invert that. Only host features this manifest names with an
+# enabled host-scoped entry run, so a newly installed host-feature package
+# cannot start without an edit here that says so:
+#
+#     [host_features]
+#     default_enabled = false
+#
+# A host-scoped entry is an ordinary `[[feature]]` marked `host_scoped = true`
+# (or `scope = "host"`); its `enabled` value wins over that default either way,
+# which is how you run a chosen subset. The fleet observability entry below is
+# an example of a package that provides one.
+#
+# Per-agent features are not affected: those are enabled per agent in
+# `multi_agent.toml`.
+
 # Fleet observability host feature. Consumes the identity→tenant resolver from
 # host config key `observability_tenant_resolver` (issue #2444). Pin to the
 # v0.4 seam contract that introduced the per-request resolver hook. There is no

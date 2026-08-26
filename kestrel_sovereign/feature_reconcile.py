@@ -514,6 +514,41 @@ def core_install_constraints(
     return []
 
 
+def manifest_version_constraints(source_index: Dict[str, "SourceEntry"]) -> List[str]:
+    """One constraint line per declared VERSION window in the manifest.
+
+    The manifest is the declaration of what the venv must be, so every install a
+    sync performs is bounded by ALL of it — not only by core's pin. Without
+    this, remediating one entry moves another outside the window the operator
+    declared for it: on a live host, installing ``kestrel-feature-features``
+    upgraded ``kestrel-feature-workflows`` past its declared ``<0.6``, reconcile
+    put it back, and the run reported success over a package that still could
+    not load (issue #3106).
+
+    CORE is excluded. It has its own line from :func:`core_install_constraints`,
+    which encodes a SOURCE policy this cannot express — and ``install_core`` is
+    the operator deliberately moving core, which must never be constrained
+    against itself.
+
+    Extras are stripped: a constraints file cannot carry them, and the entry's
+    extras are already on the install spec where they belong. A declared-but-
+    empty spec and an editable entry have no version to constrain and so
+    contribute no line, the same rule core's own constraint follows — a bare
+    package name would constrain nothing and read as a pin in every message
+    that quotes it.
+    """
+    lines: List[str] = []
+    for package, entry in (source_index or {}).items():
+        name = canonical_package(package)
+        if name == CORE_DISTRIBUTION:
+            continue
+        spec = getattr(entry, "pypi", None)
+        if not spec or not spec_is_valid(spec):
+            continue
+        lines.append(f"{name}{spec}")
+    return lines
+
+
 def version_is_valid(version: Optional[str]) -> bool:
     """Is *version* a parseable PEP 440 version?
 

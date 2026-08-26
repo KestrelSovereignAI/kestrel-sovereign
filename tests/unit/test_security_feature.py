@@ -863,7 +863,6 @@ class TestSecurityHook:
         """Drift guard: the SchedulerFeature tags ticks with a session id that
         MUST be in NON_INTERACTIVE_SESSION_IDS, or the #2111 wedge returns. Pins
         both ends so renaming one without the other fails here, not in prod."""
-        from pathlib import Path
         import kestrel_sovereign.features.scheduler.feature as sched
         from kestrel_sovereign.features.security.hooks import (
             NON_INTERACTIVE_SESSION_IDS,
