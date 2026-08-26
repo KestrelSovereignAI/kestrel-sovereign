@@ -2647,6 +2647,14 @@ class TestAsyncDatabase:
                 await asyncio.gather(close_task, return_exceptions=True)
             if db.connection_retirement_pending:
                 await db.finalize_retired_sqla_factory()
+            # The 30 ms deadline above belongs to the deliberately blocked
+            # factory worker. Restore the production-sized window before
+            # closing the independent primary backend under xdist load.
+            monkeypatch.setattr(
+                sqlite_backend_module,
+                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                1.0,
+            )
             if db.backend.is_connected:
                 await db.close()
             worker.join(timeout=1.0)
@@ -2683,7 +2691,7 @@ class TestAsyncDatabase:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.01,
+                0.25,
             ):
                 factory = make_session_factory(db)
                 # Keep the SQLAlchemy connection checked out.  Engine disposal
@@ -2816,7 +2824,7 @@ class TestAsyncDatabase:
         monkeypatch.setattr(
             sqlite_backend_module,
             "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-            0.05,
+            0.25,
         )
         storage = AsyncStorage(str(tmp_path / "storage-retained-worker.db"))
         await storage.initialize()
