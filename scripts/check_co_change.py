@@ -271,7 +271,7 @@ class FileIndex:
     below is now a dict hit against one walk per file.
     """
 
-    strings: dict[str, list[int]] = field(default_factory=dict)
+    strings: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     calls: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     refs: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     import_bindings: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
@@ -295,7 +295,8 @@ def _build_index(tree: ast.AST) -> FileIndex:
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            index.strings.setdefault(node.value, []).append(node.lineno)
+            end = getattr(node, "end_lineno", node.lineno) or node.lineno
+            index.strings.setdefault(node.value, []).append((node.lineno, end))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             index.definitions.add(node.name)
         elif isinstance(node, ast.Call):
@@ -442,14 +443,14 @@ def call_sites(
     return spans
 
 
-def literal_sites(index: FileIndex, value: str) -> list[int]:
+def literal_sites(index: FileIndex, value: str) -> list[tuple[int, int]]:
     """Lines holding a string constant *equal to* ``value``.
 
     ``git grep -F "config"`` matches ``base_config``, comments, and every longer
     string containing it — 8,241 hits in this repository against a handful of
     real constants. Equality on an AST constant is the actual question.
     """
-    return list(index.strings.get(value, ()))
+    return list(index.strings.get(value, ()))  # (start, end) spans
 
 
 def defines(index: FileIndex, name: str) -> bool:
@@ -699,7 +700,10 @@ def collect(
         )
         # The import question is narrower than the positive control's: does the
         # MODULE-LEVEL name still exist where it was defined?
-        module_level_now = any(
+        # ALL, not ANY: symbols are merged by bare name, so a surviving
+        # `shared` in m2.py was suppressing the import check for a deleted
+        # `shared` in m1.py, and `from m1 import shared` went unreported.
+        module_level_now = all(
             (index := index_for(path)) is not None and name in index.module_definitions
             for path in defining_paths
         )
@@ -742,25 +746,21 @@ def collect(
             tree = _parse(source, path)
             if tree is None:
                 continue
-            # Only recover from files where the new-side scan found NO touched
-            # site. The recovery exists for a call that no longer exists; when a
-            # touched site is already present in this file the old coordinate is
-            # the same logical call before it shifted, and appending it counted
-            # one caller twice ("modified 2 of 3" for two callers).
-            if any(o.path == path for o in touched):
-                continue
             old_index = _build_index(tree)
-            for start, end in call_sites(
-                old_index,
-                name,
-                kind=kind,
-                local_names=local_names,
-                include_imports=not module_level_now,
-            ):
-                if any(
-                    line in old_map.get(path, ()) for line in range(start, end + 1)
-                ) and not any(o.path == path and o.line == start for o in touched):
-                    touched.append(Occurrence(path, start, end))
+            old_changed = [
+                (start, end)
+                for start, end in call_sites(
+                    old_index,
+                    name,
+                    kind=kind,
+                    local_names=local_names,
+                    include_imports=not module_level_now,
+                )
+                if any(line in old_map.get(path, ()) for line in range(start, end + 1))
+            ]
+            already = sum(1 for o in touched if o.path == path)
+            for start, end in old_changed[already:]:
+                touched.append(Occurrence(path, start, end))
 
         # `touched and untouched` discarded the gate's whole motivating case:
         # change a shared function's body, leave every caller alone, and it
@@ -803,7 +803,10 @@ def collect(
             index = index_for(path)
             if index is None:
                 continue
-            sites.extend(Occurrence(path, line) for line in literal_sites(index, value))
+            sites.extend(
+                Occurrence(path, start, end)
+                for start, end in literal_sites(index, value)
+            )
 
         touched, untouched = _split(sites, new_map)
 
@@ -814,11 +817,14 @@ def collect(
             tree = _parse(source, path)
             if tree is None:
                 continue
-            for line in literal_sites(_build_index(tree), value):
-                if line in old_map.get(path, ()) and not any(
-                    o.path == path and o.line == line for o in touched
-                ):
-                    touched.append(Occurrence(path, line))
+            old_changed = [
+                (start, end)
+                for start, end in literal_sites(_build_index(tree), value)
+                if any(line in old_map.get(path, ()) for line in range(start, end + 1))
+            ]
+            already = sum(1 for o in touched if o.path == path)
+            for start, end in old_changed[already:]:
+                touched.append(Occurrence(path, start, end))
 
         if len(touched) + len(untouched) > MAX_TOTAL_SITES:
             structural.append((f'"{value}"', len(touched) + len(untouched)))
@@ -953,7 +959,10 @@ def main(argv: list[str] | None = None) -> int:
         diff_spec = ["HEAD"]
         old_ref = "HEAD"
 
-    new_map, old_map = changed_line_map(diff_spec, include_untracked=not args.base)
+    # Untracked files belong in BOTH modes now: round 6 changed --base to diff
+    # the merge base against the working tree, so excluding them here recreated
+    # exactly the mixed-revision false clean that change was made to fix.
+    new_map, old_map = changed_line_map(diff_spec, include_untracked=True)
     if not new_map and not old_map:
         print("co-change: no changed lines to analyse.")
         return 0

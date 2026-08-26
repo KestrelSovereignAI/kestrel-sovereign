@@ -1045,3 +1045,95 @@ def test_base_mode_diffs_against_the_working_tree_not_head(
         "base mode ignored a working-tree change while scanning the working "
         f"tree; got:\n{output}"
     )
+
+
+# --------------------------------------------------------------------------
+# Codex review round 7 — two of these are defects introduced by round 6
+# --------------------------------------------------------------------------
+
+def test_a_multiline_literal_is_touched_by_a_change_to_its_continuation(
+    repo: Path,
+) -> None:
+    """``literals_on`` selected on end_lineno; the index stored only the opening line."""
+    (repo / "a.py").write_text('A = ("tool_"\n     "execution")\n')
+    (repo / "b.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = ("tool_"\n     "dispatch")\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 1, (
+        f"the continuation-line change did not mark the literal touched: {finding.changed}"
+    )
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 1)]
+
+
+def test_a_surviving_same_name_elsewhere_does_not_suppress_the_import_check(
+    repo: Path,
+) -> None:
+    """Symbols merge by bare name, so ANY was letting m2 answer for m1.
+
+    Deleting ``shared`` from m1.py while m2.py still defines its own ``shared``
+    left ``module_level_now`` true, and ``from m1 import shared`` — which now
+    raises ImportError — went unreported.
+    """
+    (repo / "m1.py").write_text("def shared(x):\n    return x\n")
+    (repo / "m2.py").write_text("def shared(x):\n    return x\n")
+    (repo / "u.py").write_text("from m1 import shared\n")
+    _commit(repo)
+    (repo / "m1.py").write_text("def other(x):\n    return x\n")
+    (repo / "m2.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("u.py", 1) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_deleted_call_is_recovered_even_when_the_file_has_an_edited_one(
+    repo: Path,
+) -> None:
+    """Round 6 fixed double-counting with a file-wide skip, which was too coarse.
+
+    One call edited and a second deleted in the same file: the edited call put
+    the path in ``touched`` and the skip then suppressed recovery of the deleted
+    one, reporting ``modified 1 of 2`` where three sites exist.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(1)\n"
+        "\n\ndef g():\n    return shared(2)\n"
+    )
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef h():\n    return shared(3)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(11)\n"
+        "\n\ndef g():\n    return 0\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    total = len(finding.changed) + len(finding.unchanged)
+    assert (len(finding.changed), total) == (2, 3), (
+        f"changed={finding.changed} unchanged={finding.unchanged}"
+    )
+    assert "modified 2 of 3" in checker.render([finding])
+
+
+def test_base_mode_includes_untracked_files(
+    repo: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Round 6 pointed --base at the working tree and kept excluding untracked.
+
+    The scans read untracked files either way, so the map and the scan described
+    different revisions again — the exact false clean round 6 set out to fix.
+    """
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    _commit(repo, "base")
+    _run(repo, "branch", "base-ref")
+    (repo / "mod.py").write_text('M = "tool_execution"\n')
+    _commit(repo, "on branch")
+    (repo / "newfile.py").write_text('N = "tool_execution"\n')  # never staged
+
+    assert checker.main(["--base", "base-ref"]) == 0
+    output = capsys.readouterr().out
+    # newfile.py is a CHANGED site, so it shows in the count. Excluding it reads
+    # "modified 1 of 3" with two unchanged.
+    assert "modified 2 of 3 occurrences" in output, output
