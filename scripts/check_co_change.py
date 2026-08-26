@@ -98,6 +98,16 @@ class DetectorBroken(RuntimeError):
 class Occurrence:
     path: str
     line: int
+    end_line: int | None = None
+
+    @property
+    def span(self) -> range:
+        """Every line the use occupies.
+
+        A multiline call whose *argument* changed is a changed call site, but
+        only the callee-name line was ever compared, so it read as untouched.
+        """
+        return range(self.line, (self.end_line or self.line) + 1)
 
 
 @dataclass
@@ -214,8 +224,19 @@ def _name_line(node: ast.AST) -> int:
     return node.lineno
 
 
-def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[int]:
-    """Lines where ``name`` is genuinely *used*, per the AST.
+def import_aliases(tree: ast.AST, name: str) -> set[str]:
+    """Local names bound to ``name`` by ``from x import name as alias``."""
+    bound = {name}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for entry in node.names:
+                if entry.name == name and entry.asname:
+                    bound.add(entry.asname)
+    return bound
+
+
+def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[tuple[int, int]]:
+    """(start, end) spans where ``name`` is genuinely *used*, per the AST.
 
     A textual search cannot tell a call from a string that contains one. This
     repository's tests embed Python source as string literals constantly, so
@@ -225,21 +246,32 @@ def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[int]:
     Classes are matched on any reference, not only calls: a class edited in
     place may never be instantiated in the diff's view, and demanding ``Name(``
     made an ordinary ``class Worker:`` edit look like a broken detector.
+
+    The span covers the whole call expression, so changing only an argument on a
+    later line still marks the site as touched.
     """
-    lines: list[int] = []
+    local_names = import_aliases(tree, name)
+    spans: list[tuple[int, int]] = []
+    counted: set[int] = set()
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             func = node.func
-            if (isinstance(func, ast.Name) and func.id == name) or (
+            if (isinstance(func, ast.Name) and func.id in local_names) or (
                 isinstance(func, ast.Attribute) and func.attr == name
             ):
-                lines.append(_name_line(func))
-        elif kind == "class":
-            if isinstance(node, ast.Name) and node.id == name:
-                lines.append(node.lineno)
+                # Claim the callee node so the class-reference branch below does
+                # not count `Worker()` a second time when walk reaches its Name.
+                counted.add(id(func))
+                spans.append(
+                    (_name_line(func), getattr(node, "end_lineno", node.lineno) or node.lineno)
+                )
+        elif kind == "class" and id(node) not in counted:
+            if isinstance(node, ast.Name) and node.id in local_names:
+                spans.append((node.lineno, node.lineno))
             elif isinstance(node, ast.Attribute) and node.attr == name:
-                lines.append(_name_line(node))
-    return lines
+                spans.append((_name_line(node), _name_line(node)))
+    return spans
 
 
 def literal_sites(tree: ast.AST, value: str) -> list[int]:
@@ -376,9 +408,9 @@ def _split(
 ) -> tuple[list[Occurrence], list[Occurrence]]:
     touched, untouched = [], []
     for occurrence in occurrences:
-        (touched if occurrence.line in changed.get(occurrence.path, ()) else untouched).append(
-            occurrence
-        )
+        lines = changed.get(occurrence.path, ())
+        hit = any(line in lines for line in occurrence.span)
+        (touched if hit else untouched).append(occurrence)
     return touched, untouched
 
 
@@ -386,18 +418,30 @@ def collect(
     new_map: dict[str, set[int]],
     old_map: dict[str, set[int]],
     old_ref: str,
-) -> tuple[list[Finding], list[tuple[str, int]]]:
-    """Return (findings, structural) — structural names are counted, not listed."""
+) -> tuple[list[Finding], list[tuple[str, int]], list[str]]:
+    """Return (findings, structural, unparseable).
+
+    ``structural`` names are counted but not listed; ``unparseable`` are changed
+    Python files that could not be analysed at all.
+    """
     _TREES.clear()
     symbols: dict[str, tuple[str, set[str]]] = {}
     literals: set[str] = set()
 
+    unparseable: list[str] = []
     for path, lines in new_map.items():
         if not path.endswith(".py"):
             continue
         try:
             source = (PROJECT_ROOT / path).read_text(encoding="utf-8")
         except (OSError, ValueError):
+            continue
+        # A changed file that will not parse yields no symbols and no literals,
+        # which renders as "every site was touched". On a local iteration gate a
+        # half-written file is normal; silently converting it to a clean bill of
+        # health is not.
+        if _parse(source, path) is None:
+            unparseable.append(path)
             continue
         for name, kind in modified_symbols(source, path, lines).items():
             existing_kind, paths = symbols.get(name, (kind, set()))
@@ -417,6 +461,19 @@ def collect(
         if source:
             old_sources[path] = source
             literals |= literals_on(source, path, lines)
+            # A body edit made entirely of DELETED lines contributes nothing to
+            # the new-side map, so the function never entered `symbols` and its
+            # callers were never questioned. The definition still exists in the
+            # new tree; only the evidence that it changed lives on the old side.
+            for name, kind in modified_symbols(source, path, lines).items():
+                tree = _tree_for(path)
+                if tree is None or not defines(tree, name):
+                    continue
+                existing_kind, paths = symbols.get(name, (kind, set()))
+                symbols[name] = (
+                    "method" if "method" in (existing_kind, kind) else kind,
+                    paths | {path},
+                )
 
     findings: list[Finding] = []
     structural: list[tuple[str, int]] = []
@@ -447,14 +504,19 @@ def collect(
             if tree is None:
                 continue
             sites.extend(
-                Occurrence(path, line) for line in call_sites(tree, name, kind=kind)
+                Occurrence(path, start, end)
+                for start, end in call_sites(tree, name, kind=kind)
             )
 
         if len(sites) > MAX_TOTAL_SITES:
             structural.append((name, len(sites)))
             continue
         touched, untouched = _split(sites, new_map)
-        if touched and untouched:
+        # `touched and untouched` discarded the gate's whole motivating case:
+        # change a shared function's body, leave every caller alone, and it
+        # reported CLEAN. The changed *definition* is what puts the callers in
+        # question — whether any call expression also moved is beside the point.
+        if untouched:
             findings.append(Finding("symbol", name, touched, untouched))
 
     for value in sorted(literals):
@@ -486,7 +548,7 @@ def collect(
         if touched and untouched:
             findings.append(Finding("literal", value, touched, untouched))
 
-    return findings, structural
+    return findings, structural, unparseable
 
 
 def rank_unchanged(
@@ -522,15 +584,33 @@ def _structural_footer(structural: list[tuple[str, int]]) -> str:
     )
 
 
+def _unparseable_footer(unparseable: list[str]) -> str:
+    return (
+        "  NOT ANALYSED — these changed files could not be parsed, so nothing "
+        "about them was checked: " + ", ".join(sorted(unparseable))
+    )
+
+
 def render(
     findings: list[Finding],
     origin: set[str] | None = None,
     structural: list[tuple[str, int]] | None = None,
+    unparseable: list[str] | None = None,
 ) -> str:
     structural = structural or []
+    unparseable = unparseable or []
     if not findings:
-        clean = "co-change: every site sharing a changed symbol or literal was touched."
-        return f"{clean}\n{_structural_footer(structural)}" if structural else clean
+        # "Every site was touched" is a claim about coverage, and it is false
+        # when a symbol was skipped for being too widely used or a file could
+        # not be parsed at all. Say what was and was not looked at.
+        if structural or unparseable:
+            out = ["co-change: no reviewable co-occurrence found, but coverage was incomplete."]
+            if structural:
+                out.append(_structural_footer(structural))
+            if unparseable:
+                out.append(_unparseable_footer(unparseable))
+            return "\n".join(out)
+        return "co-change: every site sharing a changed symbol or literal was touched."
 
     out = [
         "co-change: the diff shares a symbol or literal with sites it did not touch.",
@@ -542,10 +622,16 @@ def render(
     for finding in findings:
         total = len(finding.changed) + len(finding.unchanged)
         noun = "call site" if finding.kind == "symbol" else "occurrence"
-        out.append(
-            f"  {_label(finding):<{width}}  modified {len(finding.changed)} of "
-            f"{total} {noun}{'s' if total != 1 else ''}"
-        )
+        if finding.kind == "symbol" and not finding.changed:
+            # The definition changed and no call site did. That is the gate's
+            # motivating case, not an empty result — say so plainly.
+            headline = f"definition changed; {total} {noun}{'s' if total != 1 else ''} untouched"
+        else:
+            headline = (
+                f"modified {len(finding.changed)} of {total} "
+                f"{noun}{'s' if total != 1 else ''}"
+            )
+        out.append(f"  {_label(finding):<{width}}  {headline}")
         ordered = rank_unchanged(finding.unchanged, finding.changed, origin or set())
         shown = ordered[:MAX_SITES_LISTED]
         listing = ", ".join(f"{o.path}:{o.line}" for o in shown)
@@ -553,9 +639,12 @@ def render(
         if extra > 0:
             listing += f", +{extra} more"
         out.append(f"  {'':<{width}}  unchanged: {listing}")
-    if structural:
+    if structural or unparseable:
         out.append("")
-        out.append(_structural_footer(structural))
+        if structural:
+            out.append(_structural_footer(structural))
+        if unparseable:
+            out.append(_unparseable_footer(unparseable))
     return "\n".join(out)
 
 
@@ -584,11 +673,21 @@ def main(argv: list[str] | None = None) -> int:
         print("co-change: no changed lines to analyse.")
         return 0
 
-    findings, structural = collect(new_map, old_map, old_ref)
+    findings, structural, unparseable = collect(new_map, old_map, old_ref)
     # The files the diff touches are the frame of reference for ranking, even
     # for a literal whose every occurrence is elsewhere (the removed-name case).
-    print(render(findings, origin=set(new_map) | set(old_map), structural=structural))
-    return 1 if (findings and args.strict) else 0
+    print(
+        render(
+            findings,
+            origin=set(new_map) | set(old_map),
+            structural=structural,
+            unparseable=unparseable,
+        )
+    )
+    # --strict must not pass on incomplete coverage: a symbol skipped for being
+    # too widely used, or a file that would not parse, is an unanswered question
+    # exactly like a listed one.
+    return 1 if (args.strict and (findings or structural or unparseable)) else 0
 
 
 if __name__ == "__main__":

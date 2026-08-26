@@ -46,14 +46,20 @@ def _commit(repo: Path, message: str = "baseline") -> None:
 
 def _findings(repo: Path) -> list[checker.Finding]:
     new_map, old_map = checker.changed_line_map(["HEAD"])
-    findings, _structural = checker.collect(new_map, old_map, "HEAD")
+    findings, _, __ = checker.collect(new_map, old_map, "HEAD")
     return findings
 
 
 def _structural(repo: Path) -> list[tuple[str, int]]:
     new_map, old_map = checker.changed_line_map(["HEAD"])
-    _, structural = checker.collect(new_map, old_map, "HEAD")
+    _, structural, _unparseable = checker.collect(new_map, old_map, "HEAD")
     return structural
+
+
+def _unparseable(repo: Path) -> list[str]:
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    _, __, unparseable = checker.collect(new_map, old_map, "HEAD")
+    return unparseable
 
 
 def _named(findings: list[checker.Finding], name: str) -> checker.Finding:
@@ -185,26 +191,27 @@ def test_changed_definition_line_is_not_counted_as_a_touched_call_site(
 ) -> None:
     """A signature change puts the ``def`` line itself in the changed set.
 
-    Counting it as a *call* site manufactures a finding out of nothing: the
-    definition becomes the "1 of 2 modified" and the only real call site is
-    reported as an unreviewed sibling. Every symbol whose signature changes
-    would surface a phantom.
+    Counting it as a *call* site would report the definition as the site that
+    was updated, hiding that no actual caller was visited.
+
+    This test previously asserted ``findings == []`` for this shape and passed.
+    That assertion was wrong: it enshrined the false-clean that codex round 2
+    found as a P1 — a changed definition with untouched callers is precisely
+    what this gate exists to report, not an empty result.
     """
     (repo / "mod.py").write_text(
         "def shared(x):\n    return x\n\n\ndef caller():\n    return shared(1)\n"
     )
     _commit(repo)
-    # Change the SIGNATURE, so line 1 is a changed line, and leave the one
-    # real call site alone.
     (repo / "mod.py").write_text(
         "def shared(x, y=None):\n    return x\n\n\ndef caller():\n    return shared(1)\n"
     )
 
-    findings = _findings(repo)
-    assert findings == [], (
-        "the changed `def` line was counted as a touched call site, inventing a "
-        f"finding whose only real site is unchanged: {findings}"
+    finding = _named(_findings(repo), "shared")
+    assert finding.changed == [], (
+        f"the changed `def` line was counted as a touched call site: {finding.changed}"
     )
+    assert {(o.path, o.line) for o in finding.unchanged} == {("mod.py", 6)}
 
 
 # --------------------------------------------------------------------------
@@ -481,3 +488,121 @@ def test_structural_names_are_named_in_a_footer_not_silently_dropped(
     assert ("shared", 4) in structural
     footer = checker.render([], structural=structural)
     assert "shared (4)" in footer and "not reviewed site-by-site" in footer
+
+
+# --------------------------------------------------------------------------
+# Codex review round 2 — one P1 and six P2s
+# --------------------------------------------------------------------------
+
+def test_body_only_change_surfaces_every_caller(repo: Path) -> None:
+    """THE motivating case, and it reported clean.
+
+    Change a shared function's implementation, leave every call expression
+    alone, and ``touched and untouched`` discarded the symbol entirely — the
+    gate answered "every site sharing a changed symbol was touched" to the one
+    question it exists to ask. This is the round-7 ``fold_searchable`` shape.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(2)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert finding.changed == []
+    assert {o.path for o in finding.unchanged} == {"a.py", "b.py"}
+    assert "definition changed; 2 call sites untouched" in checker.render([finding])
+
+
+def test_deletion_only_body_edit_still_surfaces_callers(repo: Path) -> None:
+    """A hunk of pure deletions contributes no new-side line at all."""
+    (repo / "mod.py").write_text("def shared(x):\n    y = 1\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_import_alias_resolves_to_the_changed_symbol(repo: Path) -> None:
+    """``from mod import shared as alias`` then ``alias()`` is a call to shared."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "b.py").write_text(
+        "from mod import shared as alias\n\n\ndef g():\n    return alias(2)\n"
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("b.py", 5)}
+
+
+def test_a_multiline_call_is_touched_by_a_change_to_its_arguments(repo: Path) -> None:
+    """Only the callee-name line was compared, so an argument edit read untouched."""
+    (repo / "mod.py").write_text("def shared(x, y):\n    return x\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(\n        1,\n        2,\n    )\n"
+    )
+    (repo / "b.py").write_text("from mod import shared\n\n\ndef g():\n    return shared(3, 4)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x, y):\n    return x + y\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\ndef f():\n    return shared(\n        1,\n        99,\n    )\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    assert [o.path for o in finding.changed] == ["a.py"], (
+        f"multiline call not marked touched by its argument change: {finding.changed}"
+    )
+    assert [o.path for o in finding.unchanged] == ["b.py"]
+
+
+def test_a_constructor_call_counts_once_not_twice(repo: Path) -> None:
+    """``ast.walk`` visits the Call and then its Name child; both matched."""
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 1\n")
+    (repo / "a.py").write_text("from mod import Worker\n\n\nw = Worker()\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("class Worker:\n    def run(self):\n        return 2\n")
+
+    finding = _named(_findings(repo), "Worker")
+    assert len(finding.unchanged) == 1, (
+        f"constructor counted more than once: {[(o.path, o.line) for o in finding.unchanged]}"
+    )
+
+
+def test_structural_results_do_not_report_clean(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symbol skipped for being too widely used is an unanswered question."""
+    monkeypatch.setattr(checker, "MAX_TOTAL_SITES", 1)
+    (repo / "mod.py").write_text(
+        "def shared(x):\n    return x\n\n\ndef a():\n    return shared(1)\n"
+        "\n\ndef b():\n    return shared(2)\n"
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "def shared(x):\n    return x + 1\n\n\ndef a():\n    return shared(1)\n"
+        "\n\ndef b():\n    return shared(2)\n"
+    )
+
+    structural = _structural(repo)
+    assert structural, "symbol was not classified structural"
+    report = checker.render([], structural=structural)
+    assert "every site" not in report, f"structural result claimed clean: {report}"
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unparseable_changed_file_is_surfaced_not_swallowed(repo: Path) -> None:
+    """A half-written file yielded no symbols and rendered as a clean bill of health."""
+    (repo / "mod.py").write_text('A = "tool_execution"\nB = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\ndef broken(\n'
+    )
+
+    assert _unparseable(repo) == ["mod.py"]
+    report = checker.render([], unparseable=_unparseable(repo))
+    assert "every site" not in report
+    assert "NOT ANALYSED" in report
+    assert checker.main(["--strict"]) == 1
