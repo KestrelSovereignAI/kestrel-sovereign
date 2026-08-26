@@ -19,23 +19,20 @@ under test is the shape production builds.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from kestrel_sdk.signals import CausationFrame, Signal, SignalMode
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.privacy import PrivacyConfig
-from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 from kestrel_sovereign.signals.sources.self_followup import (
     TASK_NAME as SELF_FOLLOWUP,
 )
 
-from tests.unit.test_self_followup_schedule import (  # noqa: F401
+from tests.unit.test_self_followup_schedule import (
     SENTINEL,
     SOURCE,
     _schedule,
-    followup_env,
 )
 
 TARGET = "did:test:self-followup"

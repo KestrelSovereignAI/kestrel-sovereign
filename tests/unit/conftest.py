@@ -46,6 +46,7 @@ Tests that deliberately exercise path resolution opt out with
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sovereign import paths
 from kestrel_sovereign.agent import token_counter
@@ -208,3 +209,115 @@ def kestrel_toml_catalog(request, monkeypatch):
         monkeypatch.setattr(token_counter, "_catalog_service", None)
 
     return publish
+
+
+# ---------------------------------------------------------------------------
+# self_followup test environment (#3101 / #3128)
+#
+# Lives here rather than in test_self_followup_schedule.py because a second
+# test module needs it, and importing a fixture by name makes ruff read every
+# test signature that takes it as an F811 redefinition of the import. The
+# suppression for that is one noqa per test signature -- a list that grows an
+# entry every time a test in either file uses the fixture. pytest discovers a
+# conftest fixture with no import at all, so nothing shadows and nothing
+# enumerates.
+#
+# The heavy scheduler/dispatcher imports are deliberately INSIDE the fixture
+# body: this conftest is loaded for the whole unit suite, and a module-scope
+# import here would pull the scheduler stack into every unit test's collection.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def followup_env(tmp_path):
+    """Real dispatcher + real scheduler runner + real SQLite, wired together."""
+    import asyncio
+
+    from kestrel_sovereign.agent.sleep import SleepMixin
+    from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+    from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.signals.sources.scheduler import (
+        build_cron_registrations,
+    )
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    class _FakeAgent(SleepMixin, TurnLifecycleMixin):
+        """Minimal agent that records the turns a dispatch actually produced.
+
+        Inherits the REAL :class:`TurnLifecycleMixin` rather than stubbing turn
+        ownership. ``_owns_live_turn`` is the guard these tests exercise, so a
+        double that simply answered True would assert the thing under test
+        instead of exercising it; with the real mixin, ``owns_live_turn()`` is
+        true only inside ``async with agent._turn_lifecycle()`` and false the
+        instant that block exits, which is the actual production contract.
+        """
+
+        did = "did:test:self-followup"
+        agent_name = "followup-test"
+
+        def __init__(self):
+            self.background_tasks = []
+            self.sleep_hooks = []
+            self.turn_prompts: list[str] = []
+            self.turn_kwargs: list[dict] = []
+            self.turn_session_id: str | None = None
+            self._live_turn_id: str | None = None
+            self._active_session_id: str | None = None
+
+        async def process_input(self, prompt, **kwargs):
+            self.turn_prompts.append(prompt)
+            self.turn_kwargs.append(kwargs)
+            return "follow-up handled"
+
+        def get_turn_bound_session_id(self):
+            return self.turn_session_id
+
+        def _track_background_task(self, coro, *, name):
+            task = asyncio.create_task(coro, name=name)
+            self.background_tasks.append(task)
+            return task
+
+    backend = SQLiteBackend(str(tmp_path / "self_followup.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+
+    registry = SourceRegistry()
+    agent = _FakeAgent()
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    agent.dispatcher = dispatcher
+    agent.signal_registry = registry
+
+    async def _lookup(name, args):  # no cron tool is exercised here
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(tool_lookup=_lookup):
+        registry.register(registration)
+
+    db = AsyncDatabase(backend)
+    feature = SchedulerFeature(agent)
+    feature._db = db
+    feature._agent_id = agent.did
+
+    runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
+    await runner._ensure_tables()
+
+    yield agent, feature, runner, db, backend
+
+    pending = [t for t in agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    await backend.close()

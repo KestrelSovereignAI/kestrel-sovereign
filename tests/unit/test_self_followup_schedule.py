@@ -27,24 +27,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import pytest_asyncio
 from kestrel_sdk.signals import Signal, SignalMode, Status, Visibility
 from kestrel_sdk.tools.result import ToolResultStatus
-from kestrel_sovereign.agent.sleep import SleepMixin
-from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features.scheduler.constants import (
     MISSED_COGNITION_STATUS,
 )
-from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
-from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
-from kestrel_sovereign.signals import (
-    OrderedLockManager,
-    SignalDispatcher,
-    SignalLogStore,
-    SourceRegistry,
-)
 from kestrel_sovereign.signals.sources.scheduler import (
-    build_cron_registrations,
     cron_source_name,
 )
 from kestrel_sovereign.signals.sources.self_followup import (
@@ -53,92 +41,12 @@ from kestrel_sovereign.signals.sources.self_followup import (
     SelfFollowupIntentError,
     normalize_intent,
 )
-from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.db import SQLiteBackend
 
 SOURCE = cron_source_name(SELF_FOLLOWUP)
 
 # A distinctive string so "the intention reached the turn" is a real
 # observation about prompt content, not an argument-identity coincidence.
 SENTINEL = "verify-PR-3096-CI-then-merge-XYZZY"
-
-
-class _FakeAgent(SleepMixin, TurnLifecycleMixin):
-    """Minimal agent that records the turns a dispatch actually produced.
-
-    Inherits the REAL :class:`TurnLifecycleMixin` rather than stubbing turn
-    ownership. ``_owns_live_turn`` is the guard these tests exercise, so a
-    double that simply answered True would assert the thing under test
-    instead of exercising it; with the real mixin, ``owns_live_turn()`` is
-    true only inside ``async with agent._turn_lifecycle()`` and false the
-    instant that block exits, which is the actual production contract.
-    """
-
-    did = "did:test:self-followup"
-    agent_name = "followup-test"
-
-    def __init__(self):
-        self.background_tasks = []
-        self.sleep_hooks = []
-        self.turn_prompts: list[str] = []
-        self.turn_kwargs: list[dict] = []
-        self.turn_session_id: str | None = None
-        self._live_turn_id: str | None = None
-        self._active_session_id: str | None = None
-
-    async def process_input(self, prompt, **kwargs):
-        self.turn_prompts.append(prompt)
-        self.turn_kwargs.append(kwargs)
-        return "follow-up handled"
-
-    def get_turn_bound_session_id(self):
-        return self.turn_session_id
-
-    def _track_background_task(self, coro, *, name):
-        task = asyncio.create_task(coro, name=name)
-        self.background_tasks.append(task)
-        return task
-
-
-@pytest_asyncio.fixture
-async def followup_env(tmp_path):
-    """Real dispatcher + real scheduler runner + real SQLite, wired together."""
-    backend = SQLiteBackend(str(tmp_path / "self_followup.db"))
-    await backend.connect()
-    store = SignalLogStore(backend)
-    await store.initialize()
-
-    registry = SourceRegistry()
-    agent = _FakeAgent()
-    dispatcher = SignalDispatcher(
-        agent=agent,
-        registry=registry,
-        lock_manager=OrderedLockManager(),
-        store=store,
-    )
-    agent.dispatcher = dispatcher
-    agent.signal_registry = registry
-
-    async def _lookup(name, args):  # no cron tool is exercised here
-        raise AssertionError(f"unexpected tool lookup for {name}")
-
-    for registration in build_cron_registrations(tool_lookup=_lookup):
-        registry.register(registration)
-
-    db = AsyncDatabase(backend)
-    feature = SchedulerFeature(agent)
-    feature._db = db
-    feature._agent_id = agent.did
-
-    runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
-    await runner._ensure_tables()
-
-    yield agent, feature, runner, db, backend
-
-    pending = [t for t in agent.background_tasks if not t.done()]
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-    await backend.close()
 
 
 async def _drain(agent):
