@@ -159,3 +159,52 @@ async def test_non_scheduler_command_mentioning_task_name_is_untouched(monkeypat
     await mgr.execute_command(f"!memory search {SELF_FOLLOWUP_TASK_NAME}")
 
     assert reached["skill_id"] == "memory_search"
+
+
+@pytest.mark.asyncio
+async def test_task_name_inside_another_arguments_value_is_not_refused(
+    monkeypatch,
+):
+    """Exact token, not substring (#3112 gate-2 P2).
+
+    A SCHEDULER command that merely mentions the task name inside another
+    argument's value was refused by the original substring scan. It cannot
+    create a ``self_followup`` row -- to do that the name must bind to the
+    ``task_name`` parameter, which requires its own whitespace-delimited
+    token -- so refusing it protected nothing and blocked a legitimate
+    schedule.
+
+    Distinct from ``test_non_scheduler_command_mentioning_task_name...``:
+    that one escapes via the ``schedule_`` skill-prefix check, so it passes
+    with the substring bug still present. This one is a ``schedule_add``
+    and can only pass on the token fix.
+    """
+    mgr = TaskManager.__new__(TaskManager)
+    mgr._agents = {}
+    mgr.task_store = _StubTaskStore()
+    mgr.hooks_manager = None
+
+    monkeypatch.setattr(
+        TaskManager,
+        "get_agent_for_command",
+        lambda self, user_input: ("scheduler", "schedule_add"),
+        raising=False,
+    )
+
+    reached = {}
+
+    async def _record(self, agent_id, skill_id, args, sync=True, session_id=None):
+        reached["skill_id"] = skill_id
+        raise RuntimeError("stop here: routing was allowed through, which is the assertion")
+
+    monkeypatch.setattr(TaskManager, "execute_skill", _record, raising=False)
+
+    await mgr.execute_command(
+        '!schedule add @hourly github_pr_watch '
+        f'{{"repo":"owner/{SELF_FOLLOWUP_TASK_NAME}","pr":1}}'
+    )
+
+    assert reached["skill_id"] == "schedule_add", (
+        "a scheduler command that only mentions the task name inside another "
+        "value cannot create the row, so it must not be refused"
+    )

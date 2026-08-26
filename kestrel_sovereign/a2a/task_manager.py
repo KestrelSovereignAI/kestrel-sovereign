@@ -469,9 +469,11 @@ class TaskManager:
         across later parameters (#3118) and ``task_name`` cannot be trusted to
         land in ``task_name``. This scans the raw text for the task name
         instead, which is the one token whose presence is unambiguous no matter
-        where the positional binder puts it. Over-matching here costs a
-        refusal on a command nobody has a reason to type; under-matching would
-        admit the row this guard exists to keep out.
+        where the positional binder puts it -- but matched as an exact TOKEN
+        rather than a substring, because over-matching was not in fact free:
+        it refused unrelated schedules that merely mentioned the name inside
+        another argument's value. Under-matching would admit the row this
+        guard exists to keep out.
         """
         from kestrel_sovereign.signals.sources.self_followup import (
             TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
@@ -479,7 +481,23 @@ class TaskManager:
 
         if not skill_id.startswith("schedule_"):
             return None
-        if SELF_FOLLOWUP_TASK_NAME not in user_input:
+        # Exact-TOKEN, not substring (#3112 gate-2 P2). A bare substring scan
+        # refused unrelated schedules that merely mention the name inside
+        # another value -- e.g.
+        #   !schedule add @hourly github_pr_watch {"repo":"owner/self_followup"}
+        # Tokenizing keeps the #3118 robustness the substring scan was chosen
+        # for -- we still never trust the positional binder to put task_name in
+        # task_name -- while dropping the over-refusal: to create the row, the
+        # name must bind to the task_name PARAMETER, which means it has to
+        # appear as its own whitespace-delimited token (or as an explicit
+        # task_name=<name>). Embedded in a larger JSON token it cannot bind,
+        # so refusing it protected nothing and cost a legitimate schedule.
+        tokens = user_input.split()
+        if not any(
+            token == SELF_FOLLOWUP_TASK_NAME
+            or token == f"task_name={SELF_FOLLOWUP_TASK_NAME}"
+            for token in tokens
+        ):
             return None
         return {
             "success": False,
