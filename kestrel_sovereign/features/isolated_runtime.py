@@ -3291,7 +3291,7 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> str | None:
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            return False
+            return None
         if (
             not stat.S_ISREG(metadata.st_mode)
             or (os.name == "posix" and metadata.st_uid != os.geteuid())
@@ -3326,7 +3326,7 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> str | None:
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                return False
+                return None
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_nlink != 1
@@ -3451,7 +3451,7 @@ def _read_venv_relocation_repair_marker_portable(directory: Path) -> str | None:
     try:
         metadata = marker.stat(follow_symlinks=False)
     except FileNotFoundError:
-        return False
+        return None
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
@@ -3484,7 +3484,7 @@ def _read_venv_relocation_repair_marker_portable(directory: Path) -> str | None:
         try:
             metadata = marker.stat(follow_symlinks=False)
         except FileNotFoundError:
-            return False
+            return None
         if (
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
@@ -4578,6 +4578,60 @@ def prepare_isolated_runtime_namespace(
         os.close(root_fd)
 
 
+def _open_cleanup_directory_at(
+    root_fd: int,
+    components: tuple[str, ...],
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> int:
+    """Open one descendant with constant descriptor use and no path following."""
+
+    current_fd = os.dup(root_fd)
+    try:
+        for component in components:
+            metadata = os.stat(
+                component,
+                dir_fd=current_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime cleanup encountered an "
+                    "unsafe path entry."
+                )
+            child_fd = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=current_fd,
+            )
+            try:
+                if not _same_file_identity(metadata, os.fstat(child_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime cleanup target changed "
+                        "during validation."
+                    )
+            except BaseException:
+                os.close(child_fd)
+                raise
+            os.close(current_fd)
+            current_fd = child_fd
+        if expected_identity is not None:
+            opened = os.fstat(current_fd)
+            if (int(opened.st_dev), int(opened.st_ino)) != expected_identity:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime cleanup target changed "
+                    "during validation."
+                )
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _cleanup_directory_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
 def _assert_no_nested_runtime_owners_at(
     directory_fd: int,
     *,
@@ -4588,34 +4642,47 @@ def _assert_no_nested_runtime_owners_at(
     Multi-component namespaces are valid, but allocated namespace leaves must
     remain prefix-free. This descriptor-relative preflight prevents deleting
     any sibling content before discovering that a descendant is independently
-    bound to an agent. The deletion walk repeats the check to fail closed if a
-    marker appears between preflight and mutation.
+    bound to an agent. The work list stores names and inode identities rather
+    than open descriptors, so tenant-controlled depth cannot exhaust Python's
+    recursion limit or the host descriptor table.
     """
 
-    with os.scandir(directory_fd) as entries:
-        names = [entry.name for entry in entries]
-    if not allow_owner_marker and _RUNTIME_OWNER_MARKER in names:
-        raise IsolatedRuntimeNamespaceError(
-            "Hosted isolated feature runtime cleanup found a nested ownership "
-            "marker; allocated namespaces must not contain one another."
+    root_identity = _cleanup_directory_identity(os.fstat(directory_fd))
+    pending: list[tuple[tuple[str, ...], tuple[int, int], bool]] = [
+        ((), root_identity, allow_owner_marker)
+    ]
+    while pending:
+        components, expected_identity, permits_owner_marker = pending.pop()
+        current_fd = _open_cleanup_directory_at(
+            directory_fd,
+            components,
+            expected_identity=expected_identity,
         )
-    for name in names:
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(metadata.st_mode):
-            continue
-        child_fd = os.open(name, _directory_open_flags(), dir_fd=directory_fd)
         try:
-            if not _same_file_identity(metadata, os.fstat(child_fd)):
+            with os.scandir(current_fd) as entries:
+                names = [entry.name for entry in entries]
+            if not permits_owner_marker and _RUNTIME_OWNER_MARKER in names:
                 raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup target changed "
-                    "during nested-owner validation."
+                    "Hosted isolated feature runtime cleanup found a nested "
+                    "ownership marker; allocated namespaces must not contain "
+                    "one another."
                 )
-            _assert_no_nested_runtime_owners_at(
-                child_fd,
-                allow_owner_marker=False,
-            )
+            for name in names:
+                metadata = os.stat(
+                    name,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(metadata.st_mode):
+                    pending.append(
+                        (
+                            (*components, name),
+                            _cleanup_directory_identity(metadata),
+                            False,
+                        )
+                    )
         finally:
-            os.close(child_fd)
+            os.close(current_fd)
 
 
 def _remove_directory_contents_at(
@@ -4624,43 +4691,109 @@ def _remove_directory_contents_at(
     allow_owner_marker: bool,
     preserve_names: frozenset[str] = frozenset(),
 ) -> None:
-    """Delete one already-open tree without following any directory symlink."""
+    """Delete one already-open tree without recursion or following symlinks."""
 
-    with os.scandir(directory_fd) as entries:
-        names = [entry.name for entry in entries]
-    if not allow_owner_marker and _RUNTIME_OWNER_MARKER in names:
-        raise IsolatedRuntimeNamespaceError(
-            "Hosted isolated feature runtime cleanup found a nested ownership "
-            "marker; allocated namespaces must not contain one another."
-        )
-    for name in names:
-        # The top-level marker is the custody proof needed to retry a partial
-        # cleanup. Preserve it throughout the sweep regardless of filesystem
-        # enumeration order. Nested markers remain a hard failure above.
-        if allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
-            continue
-        if name in preserve_names:
-            continue
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(metadata.st_mode):
-            child_fd = os.open(name, _directory_open_flags(), dir_fd=directory_fd)
+    root_identity = _cleanup_directory_identity(os.fstat(directory_fd))
+    # ``False`` entries visit a directory; ``True`` entries remove it after all
+    # descendants. Relative component tuples let every visit reopen from the
+    # custody-bound root with constant descriptor use, including trees deeper
+    # than Python's recursion or the process descriptor limit.
+    pending: list[tuple[tuple[str, ...], tuple[int, int], bool]] = [
+        ((), root_identity, False)
+    ]
+    while pending:
+        components, expected_identity, remove_after_children = pending.pop()
+        if remove_after_children:
+            parent_components = components[:-1]
+            name = components[-1]
+            parent_fd = _open_cleanup_directory_at(
+                directory_fd,
+                parent_components,
+            )
+            child_fd: int | None = None
             try:
-                if not _same_file_identity(metadata, os.fstat(child_fd)):
+                metadata = os.stat(
+                    name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or _cleanup_directory_identity(metadata) != expected_identity
+                ):
                     raise IsolatedRuntimeNamespaceError(
                         "Hosted isolated feature runtime cleanup target changed "
-                        "during validation."
+                        "during removal."
                     )
-                _remove_directory_contents_at(
-                    child_fd,
-                    allow_owner_marker=False,
+                child_fd = os.open(
+                    name,
+                    _directory_open_flags(),
+                    dir_fd=parent_fd,
                 )
+                if (
+                    _cleanup_directory_identity(os.fstat(child_fd))
+                    != expected_identity
+                ):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime cleanup target changed "
+                        "during removal."
+                    )
+                os.rmdir(name, dir_fd=parent_fd)
             finally:
-                os.close(child_fd)
-            os.rmdir(name, dir_fd=directory_fd)
-        else:
-            # Symlinks and special files are removed as directory entries; they
-            # are never opened or traversed.
-            os.unlink(name, dir_fd=directory_fd)
+                if child_fd is not None:
+                    os.close(child_fd)
+                os.close(parent_fd)
+            continue
+
+        current_fd = _open_cleanup_directory_at(
+            directory_fd,
+            components,
+            expected_identity=expected_identity,
+        )
+        try:
+            with os.scandir(current_fd) as entries:
+                names = [entry.name for entry in entries]
+            permits_owner_marker = allow_owner_marker and not components
+            if not permits_owner_marker and _RUNTIME_OWNER_MARKER in names:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime cleanup found a nested "
+                    "ownership marker; allocated namespaces must not contain "
+                    "one another."
+                )
+            child_directories: list[
+                tuple[tuple[str, ...], tuple[int, int], bool]
+            ] = []
+            for name in names:
+                # The top-level marker is custody proof for retrying a partial
+                # cleanup. Preserve it throughout the sweep. Nested markers
+                # remain a hard failure above.
+                if permits_owner_marker and name == _RUNTIME_OWNER_MARKER:
+                    continue
+                if not components and name in preserve_names:
+                    continue
+                metadata = os.stat(
+                    name,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(metadata.st_mode):
+                    child_components = (*components, name)
+                    identity = _cleanup_directory_identity(metadata)
+                    child_directories.append((child_components, identity, False))
+                    child_directories.append((child_components, identity, True))
+                else:
+                    # Symlinks and special files are removed as entries; they
+                    # are never opened or traversed.
+                    os.unlink(name, dir_fd=current_fd)
+            # Push each post-order removal before its visit so LIFO processing
+            # completes every subtree before removing its directory.
+            for index in range(0, len(child_directories), 2):
+                visit = child_directories[index]
+                remove = child_directories[index + 1]
+                pending.append(remove)
+                pending.append(visit)
+        finally:
+            os.close(current_fd)
 
 
 def _remove_isolated_feature_runtime(
@@ -4747,6 +4880,11 @@ def _remove_isolated_feature_runtime(
         return RuntimeNamespaceCleanupOutcome.REMOVED
     except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
         raise
+    except (RecursionError, MemoryError) as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature cleanup could not complete; runtime state "
+            "was retained."
+        ) from exc
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -4894,6 +5032,11 @@ def remove_isolated_runtime_namespace(
         return RuntimeNamespaceCleanupOutcome.REMOVED
     except IsolatedRuntimeNamespaceError:
         raise
+    except (RecursionError, MemoryError) as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature runtime cleanup could not complete; tenant "
+            "state was retained."
+        ) from exc
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -5085,6 +5228,11 @@ def remove_released_legacy_runtime_root(
         return RuntimeNamespaceCleanupOutcome.REMOVED
     except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
         raise
+    except (RecursionError, MemoryError) as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted released runtime cleanup could not complete; tenant state "
+            "was retained."
+        ) from exc
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -11250,7 +11398,7 @@ class ProxyFeature(Feature):
         """Read durable migration or interrupted-reclaim repair intent."""
 
         if self._isolated_runtime_scope is None:
-            return False
+            return None
         runtime_dir = self._feature_runtime_dir()
         if not _secure_dirfd_supported():  # pragma: no cover - portable policy
             try:

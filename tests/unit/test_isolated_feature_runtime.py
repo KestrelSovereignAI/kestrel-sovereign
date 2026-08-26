@@ -7676,6 +7676,54 @@ def test_cleanup_refuses_nested_owned_namespace_without_deleting_either(tmp_path
     ) is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
 
 
+@pytest.mark.skipif(os.name != "posix", reason="secure cleanup is POSIX-only")
+def test_cleanup_handles_tree_deeper_than_python_recursion_limit(tmp_path):
+    scope = resolve_isolated_runtime_namespace(tmp_path / "runtime", "tenant")
+    owner = "did:test:deep-cleanup"
+    isolated_runtime.prepare_isolated_runtime_namespace(
+        scope,
+        owner,
+        relative_directories=(("state",),),
+    )
+    current_fd = os.open(
+        scope.path / "state",
+        isolated_runtime._directory_open_flags(),
+    )
+    stack_depth = len(traceback.extract_stack())
+    recursion_limit = max(stack_depth + 40, 80)
+    try:
+        for _index in range(recursion_limit + 20):
+            os.mkdir("nested", mode=0o700, dir_fd=current_fd)
+            child_fd = os.open(
+                "nested",
+                isolated_runtime._directory_open_flags(),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = child_fd
+        payload_fd = os.open(
+            "payload",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=current_fd,
+        )
+        os.close(payload_fd)
+    finally:
+        os.close(current_fd)
+
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(recursion_limit)
+    try:
+        assert (
+            isolated_runtime.remove_isolated_runtime_namespace(scope, owner)
+            is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+        )
+    finally:
+        sys.setrecursionlimit(original_limit)
+
+    assert not scope.path.exists()
+
+
 def test_runtime_cleanup_primitive_reports_exact_absent_and_unhosted_custody(
     tmp_path,
 ):
@@ -7720,6 +7768,10 @@ def test_relocation_repair_marker_recovers_only_its_interrupted_temp_link(tmp_pa
     runtime_dir.mkdir(mode=0o700)
     directory_fd = os.open(runtime_dir, isolated_runtime._directory_open_flags())
     try:
+        assert (
+            isolated_runtime._read_venv_relocation_repair_marker_at(directory_fd)
+            is None
+        )
         isolated_runtime._ensure_venv_relocation_repair_marker_at(directory_fd)
         marker = runtime_dir / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
         interrupted = runtime_dir / (
@@ -7738,6 +7790,38 @@ def test_relocation_repair_marker_recovers_only_its_interrupted_temp_link(tmp_pa
         assert external.is_file()
     finally:
         os.close(directory_fd)
+
+
+def test_venv_repair_pending_tracks_real_marker_transition(tmp_path):
+    agent = _hosted_postgres_agent(
+        tmp_path / "hosted-runtime",
+        "tenant/agent",
+    )
+    feature = ProxyFeature(
+        agent,
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    runtime_dir = feature._prepare_runtime_workspace()
+
+    assert feature._venv_repair_reason() is None
+    assert feature._venv_relocation_repair_pending() is False
+
+    if isolated_runtime._secure_dirfd_supported():
+        directory_fd = os.open(
+            runtime_dir,
+            isolated_runtime._directory_open_flags(),
+        )
+        try:
+            isolated_runtime._ensure_venv_relocation_repair_marker_at(directory_fd)
+        finally:
+            os.close(directory_fd)
+    else:  # pragma: no cover - portable fallback
+        marker = runtime_dir / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
+        marker.write_bytes(isolated_runtime._VENV_RELOCATION_REPAIR_PAYLOAD)
+
+    assert feature._venv_repair_reason() == "relocation"
+    assert feature._venv_relocation_repair_pending() is True
 
 
 @pytest.mark.skipif(os.name != "posix", reason="repair marker uses POSIX dirfds")
@@ -7798,6 +7882,10 @@ def test_windows_portable_metadata_accepts_synthesized_permission_modes(
 
     runtime_dir = tmp_path / "feature-runtime"
     runtime_dir.mkdir()
+    assert (
+        isolated_runtime._read_venv_relocation_repair_marker_portable(runtime_dir)
+        is None
+    )
     marker = runtime_dir / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
     marker.write_bytes(isolated_runtime._VENV_RELOCATION_REPAIR_PAYLOAD)
     real_path_stat = Path.stat
