@@ -235,26 +235,38 @@ def evaluate_argv_paths(
 _SHELL_CONTROL_CHARS = frozenset(";&|`$()<>\n\r")
 
 
-def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
-    """Return ``(index, char)`` of the first unquoted shell control
-    character in ``cmd``, or ``None`` when there is none.
+# A ``$`` only begins an expansion when the next character can start a
+# parameter, command or arithmetic substitution. Measured against bash,
+# not assumed: ``foo$:bar``, ``foo$,bar``, ``foo$.bar``, ``foo$/bar``,
+# ``price$`` and ``echo "$"`` all reach the program with the ``$``
+# intact, so ``shlex`` and a real shell build the same argument vector
+# for them. Quotes are deliberately absent from this set — after a
+# ``$`` a quote is far more often the end of a string (``echo "$"``)
+# than ANSI-C quoting, and that case is the one callers actually write.
+_DOLLAR_EXPANSION_STARTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_{(@*#?-$!"
+)
 
-    Catches: ``;``, ``&``/``&&``, ``|``/``||``, backticks, ``$(...)``,
-    ``$VAR`` substitution, redirects ``<``/``>``, newlines.
-    Misses: process substitution ``<(...)`` (covered by ``<``/``(``),
-    here-docs (covered by ``<``). Anything inside ``'...'``/``"..."``
-    is ignored — quoted control characters are inert to the shell.
 
-    Defense in depth, not exhaustive parsing. The QUEUE remains the
-    real authoritative gate for anything we downgrade.
+def _scan_unquoted(
+    cmd: str,
+    chars: frozenset,
+    *,
+    dollar_must_expand: bool,
+) -> tuple[int, str] | None:
+    """Return ``(index, char)`` of the first character of *chars* that
+    appears outside a quoted region, or ``None``.
 
-    Two callers need two different things from one scan, so the scan
-    reports *which* character it found rather than only *that* it did:
-    :func:`command_contains_unquoted_shell_control` needs the boolean
-    (an allow-listed first token cannot vouch for a compound), and
-    ``ComputerUseFeature.shell`` needs to name the character in its
-    refusal, because a caller who is told only "no" cannot tell which
-    part of what they wrote was not going to be honoured.
+    Anything inside ``'...'``/``"..."`` is ignored — quoted control
+    characters are inert to the shell — except that ``$`` and backticks
+    stay live inside double quotes, where the shell still expands them.
+
+    ``dollar_must_expand`` distinguishes the two questions the callers
+    ask. "Could this string be more than it looks?" wants every ``$``
+    (over-reporting is free: the answer only routes a command to the
+    approval queue). "Will exec build a different argument vector than
+    a shell would?" wants only a ``$`` that actually expands, because
+    over-reporting there refuses a command that was going to work.
     """
     if not isinstance(cmd, str):
         return None
@@ -282,8 +294,9 @@ def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
                 in_double = False
                 i += 1
                 continue
-            if c in DQ_ACTIVE_CHARS:
-                return (i, c)
+            if c in DQ_ACTIVE_CHARS and c in chars:
+                if c != "$" or not dollar_must_expand or _dollar_expands(cmd, i):
+                    return (i, c)
             i += 1
             continue
         if c == "'":
@@ -299,10 +312,28 @@ def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
             # which still neutralizes its shell-control meaning. Skip.
             i += 2
             continue
-        if c in _SHELL_CONTROL_CHARS:
-            return (i, c)
+        if c in chars:
+            if c != "$" or not dollar_must_expand or _dollar_expands(cmd, i):
+                return (i, c)
         i += 1
     return None
+
+
+def _dollar_expands(cmd: str, index: int) -> bool:
+    """True iff the ``$`` at *index* begins a shell expansion."""
+    nxt = cmd[index + 1 : index + 2]
+    return bool(nxt) and nxt in _DOLLAR_EXPANSION_STARTERS
+
+
+def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
+    """First unquoted shell control character, counting every ``$``.
+
+    This is the compound-command guard's question (#1694): an
+    allow-listed first token cannot vouch for a string that might
+    compose a second command, so a suspicious ``$`` is worth an
+    approval prompt even when it would have been literal.
+    """
+    return _scan_unquoted(cmd, _SHELL_CONTROL_CHARS, dollar_must_expand=False)
 
 
 def command_contains_unquoted_shell_control(cmd: str) -> bool:
@@ -310,3 +341,46 @@ def command_contains_unquoted_shell_control(cmd: str) -> bool:
     quoted region — see :func:`first_unquoted_shell_control`.
     """
     return first_unquoted_shell_control(cmd) is not None
+
+
+def first_shell_syntax_exec_ignores(cmd: str) -> tuple[int, str] | None:
+    """First character a shell would act on that ``exec`` will not.
+
+    The tool tokenizes with ``shlex`` and executes the argv vector, so
+    this is the question that decides whether the command that runs is
+    the command that was written (#3129). A ``$`` counts only when it
+    actually expands: ``rg foo$ file`` and ``echo "$"`` reach the
+    program identically either way, and refusing them would break
+    commands that were never broken.
+
+    Known misses, stated rather than implied: glob and brace expansion
+    (``*.py``, ``{a,b}``) and ANSI-C quoting (``$'...'``) also differ
+    between a shell and ``exec``. They are not silent the way a dropped
+    pipe is — the unexpanded word reaches the program, which reports it
+    as a missing file — so they are outside what this refuses.
+    """
+    return _scan_unquoted(cmd, _SHELL_CONTROL_CHARS, dollar_must_expand=True)
+
+
+def token_binary_name(token: str) -> str:
+    """Basename of the binary *token* would name, punctuation stripped.
+
+    ``shlex`` leaves a control character welded to a neighbouring word:
+    ``echo hi; rm`` yields a clean ``rm``, but ``(sudo`` and ``` `sudo ```
+    keep theirs. A deny-list lookup on the raw token would miss those,
+    which is the whole population that matters when the question is
+    "does a shell run something denied anywhere in this line?".
+    """
+    return Path(token.strip("".join(_SHELL_CONTROL_CHARS))).name
+
+
+def first_unquoted_expansion(cmd: str) -> tuple[int, str] | None:
+    """First unquoted ``$``-expansion or backtick substitution.
+
+    A command carrying one of these cannot be vetted by reading its
+    tokens: ``cat $SECRET`` and ``echo `sudo -n true`` name a path and
+    a binary that only exist after the shell has run. The refusal uses
+    this to decide whether it may hand back a shell wrapper, since a
+    wrapper for such a command would run something no gate had seen.
+    """
+    return _scan_unquoted(cmd, frozenset("$`"), dollar_must_expand=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -405,6 +406,162 @@ async def test_the_shape_the_refusal_names_actually_works(workspace: Path):
         "the suggested form must actually pipe — 'hello' means the "
         "pipeline was dropped again"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_denied_path_in_a_compound_is_still_reported_as_the_denial(workspace: Path):
+    """codex review round 1, P1 — a regression this fix introduced.
+
+    The refusal originally ran at the tool boundary, before any gate.
+    So ``cat <deny_paths file> | tr A-Z a-z`` stopped being a deny-list
+    hit and became a shape complaint that handed back a runnable
+    ``bash -lc`` line — and running that line printed the file. A hard
+    deny turned into "denied, and here is how", with no audit row for
+    the denial.
+
+    The check now sits inside the gate sequence, after both deny-lists
+    and before the queue.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    secret = workspace / "secret" / "leak.txt"
+
+    envelope = await feature.shell(command=f"cat {secret} | tr a-z A-Z", timeout=5)
+
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("path_policy:deny"), envelope.error
+    assert "bash -lc" not in envelope.error, (
+        "a denied command must not be handed a form that would run it"
+    )
+    assert queue.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_denied_binary_anywhere_in_the_compound_gets_no_wrapper(workspace: Path):
+    """``BinaryPolicy`` vets ``argv[0]``; in a compound the binary that
+    matters can be any word.
+
+    ``echo hi | rm -rf /tmp/x`` cannot run today — ``rm`` is one of
+    ``echo``'s arguments. Handing back a shell wrapper would make it
+    run, on one approval, for a binary the deny-list says never. Every
+    token is asked, and because the command is refused either way,
+    over-matching costs nothing.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+
+    envelope = await feature.shell(command="echo hi | rm -rf /tmp/x", timeout=5)
+
+    assert envelope.status is not ToolResultStatus.OK
+    assert "\'rm\'" in envelope.error and "deny-listed" in envelope.error, envelope.error
+    assert "bash -lc" not in envelope.error
+    assert queue.calls == []
+
+    # The same word welded to a substitution character: shlex leaves the
+    # backtick on the token, and a deny-list lookup on the raw token
+    # would miss it.
+    welded = await feature.shell(command="echo `rm -rf /tmp/x`", timeout=5)
+    assert "\'rm\'" in welded.error, welded.error
+    assert "bash -lc" not in welded.error
+
+
+@pytest.mark.asyncio
+async def test_an_expansion_gets_no_wrapper_because_no_gate_can_read_it(workspace: Path):
+    """``cat $SECRET`` names a path that does not exist until a shell runs.
+
+    The path policy vets the tokens it can see, and an expansion is a
+    token it cannot. Offering a wrapper here would run something no
+    gate had looked at, so the refusal says so instead of suggesting.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+
+    envelope = await feature.shell(command="cat $HOME/.ssh/id_rsa | head", timeout=5)
+
+    assert envelope.status is not ToolResultStatus.OK
+    assert "cannot see what would" in envelope.error, envelope.error
+    assert "bash -lc" not in envelope.error
+    assert queue.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_literal_dollar_is_not_shell_syntax(workspace: Path):
+    """codex review round 1, P2 — the refusal over-reached.
+
+    A ``$`` only expands when the next character can begin one.
+    Measured against bash: ``price$``, ``foo$:bar`` and ``echo "$"``
+    all reach the program with the ``$`` intact, so ``shlex`` and a
+    real shell build the same argument vector and there is nothing to
+    refuse. #1694's compound guard still flags every ``$`` — over-
+    reporting there only routes a command to the queue, which is free.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+
+    envelope = await feature.shell(command="echo price$", timeout=5)
+    assert envelope.status is ToolResultStatus.OK, envelope.error
+    assert envelope.data["stdout"].strip() == "price$"
+
+    from kestrel_sovereign.features.computer_use.policy import (
+        command_contains_unquoted_shell_control,
+    )
+
+    assert command_contains_unquoted_shell_control("echo price$") is True, (
+        "the compound guard must keep its wider reading"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_command_is_audited(workspace: Path):
+    """Every refusal in this gate sequence writes an audit row.
+
+    That log is how the defect was found at all — 128 calls counted on
+    the live surface — and it is how anyone checks whether the refusal
+    is firing in production. A refusal that leaves no row is invisible.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+
+    await feature.shell(command=f"cat {workspace / 'ok.txt'} | tr a-z A-Z", timeout=5)
+
+    rows = [
+        json.loads(line)
+        for line in (workspace / "audit.jsonl").read_text().splitlines()
+    ]
+    refusals = [r for r in rows if r["outcome"] == "denied"]
+    assert len(refusals) == 1, rows
+    assert refusals[0]["args"]["rule"] == "shell_syntax:|"
+    assert refusals[0]["allowed_by"][-1] == "denied:shell_syntax"
 
 
 @pytest.mark.asyncio

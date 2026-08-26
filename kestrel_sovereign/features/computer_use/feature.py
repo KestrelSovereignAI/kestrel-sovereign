@@ -36,7 +36,7 @@ import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from kestrel_sovereign.constitution.hierarchy import (
     DANGEROUS_CAPABILITIES,
@@ -59,8 +59,10 @@ from .policy import (
     Decision,
     PathPolicy,
     evaluate_argv_paths,
-    first_unquoted_shell_control,
+    first_shell_syntax_exec_ignores,
+    first_unquoted_expansion,
     split_command,
+    token_binary_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,8 +87,14 @@ _SHELL_CONTROL_MEANINGS = {
 }
 
 
-def unsupported_shell_syntax_error(command: str, argv: List[str]) -> Optional[str]:
-    """Explain why ``command`` cannot be run as written, or ``None``.
+def shell_syntax_refusal(
+    command: str,
+    argv: List[str],
+    denied_binaries: Iterable[str],
+) -> Optional[tuple[str, str]]:
+    """Explain why ``command`` cannot run as written, or ``None``.
+
+    Returns ``(audit_rule, message)``.
 
     ``shell`` tokenizes with ``shlex`` and execs the argv vector — there
     is no shell in the path, so a control character is not a control
@@ -96,14 +104,23 @@ def unsupported_shell_syntax_error(command: str, argv: List[str]) -> Optional[st
     measured at 128 live calls).
 
     Refusing is the only option that does not execute a different
-    command than the one written. The alternative — routing the string
-    through ``bash -lc`` here — would make the deny-list's unit
-    (``argv[0]``) stop describing what runs, since only ``bash`` would
-    be vetted for a line that can invoke anything. So the caller is told
-    to reach for the shell themselves, where ``bash`` is the binary the
-    policy sees and the operator approves.
+    command than the one written. Routing the string through ``bash
+    -lc`` here instead would make the deny-list's unit (``argv[0]``)
+    stop describing what runs, since only ``bash`` would be vetted for
+    a line that can invoke anything.
+
+    **The remedy is bounded by the same declaration as the refusal.**
+    A wrapper is only offered when every token has already been vetted
+    by the gates that ran before this one — so not when a deny-listed
+    binary rides in a non-head position, where ``BinaryPolicy`` never
+    looked, and not when an expansion or a command substitution means
+    the tokens do not name what would run. Otherwise the refusal would
+    convert commands that could not execute at all into commands that
+    execute after one approval, which is a worse defect than the one
+    being fixed (codex review round 1, P1: the suggestion this printed
+    for ``cat <deny_paths file> | tr A-Z a-z`` read the file).
     """
-    found = first_unquoted_shell_control(command)
+    found = first_shell_syntax_exec_ignores(command)
     if found is None:
         return None
     index, char = found
@@ -116,11 +133,47 @@ def unsupported_shell_syntax_error(command: str, argv: List[str]) -> Optional[st
         if argv and argv[0] != char
         else ""
     )
-    return (
+    explanation = (
         f"shell does not run a shell: the command is tokenized and executed "
         f"directly, so the {char!r} at position {index} cannot {meaning}"
-        f"{handed_to}. Nothing ran. To use shell syntax, hand the line to a "
-        f"shell yourself: bash -lc {shlex.quote(command)}"
+        f"{handed_to}. Nothing ran."
+    )
+
+    # ``BinaryPolicy`` vets ``argv[0]``. In a compound, the binary that
+    # matters can be any word — so every token is asked, and the answer
+    # only ever narrows an already-certain refusal, which is why
+    # over-matching here costs nothing.
+    denied = set(denied_binaries)
+    blocked = next(
+        (
+            name
+            for name in (token_binary_name(token) for token in argv)
+            if name in denied
+        ),
+        None,
+    )
+    if blocked is not None:
+        return (
+            f"deny:{blocked}",
+            f"{explanation} A shell would run {blocked!r} here, which is "
+            f"deny-listed — never, even with approval — so there is no form "
+            f"of this command this tool will run.",
+        )
+
+    expansion = first_unquoted_expansion(command)
+    if expansion is not None:
+        return (
+            f"unvettable_expansion:{expansion[1]}",
+            f"{explanation} The {expansion[1]!r} at position {expansion[0]} "
+            f"means the path and binary policies cannot see what would "
+            f"actually run, so no shell form of this command is offered. "
+            f"Write out the value you meant and send that instead.",
+        )
+
+    return (
+        f"shell_syntax:{char}",
+        f"{explanation} To use shell syntax, hand the line to a shell "
+        f"yourself: bash -lc {shlex.quote(command)}",
     )
 
 
@@ -565,6 +618,27 @@ class ComputerUseFeature(Feature):
                 )
             if argv_path.decision is Decision.REQUIRE_APPROVAL:
                 require_approval = True
+
+            # 4.4 Shell syntax (#3129). The argv vector is what runs, so a
+            # control character in a raw command string never becomes one:
+            # the command that executes is not the command that was
+            # written, and it exits 0 saying nothing. Refuse here rather
+            # than at the tool boundary — AFTER the deny-lists have had
+            # their say, so a denied path or binary is still reported as
+            # the denial it is (and audited as one), and BEFORE the queue,
+            # so the operator is never asked to approve a line that is not
+            # the line that would run.
+            if isinstance(argv, str):
+                refusal = shell_syntax_refusal(
+                    argv, split_command(argv), self._binary_policy.deny
+                )
+                if refusal is not None:
+                    rule, message = refusal
+                    payload["rule"] = rule
+                    await self._audit_denied(
+                        tool_name, payload, allowed_by + ["denied:shell_syntax"]
+                    )
+                    return _GateOutcome(False, allowed_by, message)
         else:
             require_approval = False
 
@@ -1027,11 +1101,13 @@ class ComputerUseFeature(Feature):
         ``BinaryPolicy``'s compound-command guard downgrades ALLOW to
         REQUIRE_APPROVAL when a raw string carries an unquoted control
         character, so an allow-listed first token cannot bless a
-        piggy-backed second command. It no longer fires on this path —
-        #3129 refuses such a string before the gates run, which is the
-        stronger answer where nothing would have executed the second
-        command anyway. The guard stays load-bearing for the codex
-        bridge, whose flat ``command`` string IS run by a real shell.
+        piggy-backed second command. It no longer decides anything on
+        this path — #3129 refuses such a string in the same gate
+        sequence, after the deny-lists and before the queue, which is
+        the stronger answer where nothing would have executed the
+        second command anyway. The guard stays load-bearing for the
+        codex bridge, whose flat ``command`` string IS run by a real
+        shell.
 
         Shell syntax is NOT available (#3129). The command is tokenized
         with ``shlex`` and the argv vector is executed directly, so a
@@ -1058,16 +1134,6 @@ class ComputerUseFeature(Feature):
         argv = split_command(command)
         if not argv:
             return ToolResult.failed(error="empty command")
-
-        # #3129: the argv vector is what runs. A control character in the
-        # raw string never becomes one, so a command that asks for a pipe,
-        # a redirect or a second command gets none of them and still exits
-        # 0. Refuse before any gate, before any approval: the operator
-        # must not be asked to approve a line that is not the line that
-        # would run.
-        unsupported = unsupported_shell_syntax_error(command, argv)
-        if unsupported is not None:
-            return ToolResult.failed(error=unsupported)
 
         # The LLM may pass ``timeout`` as a string (e.g. "60"); the backend
         # does numeric comparisons on it (asyncio.wait_for's ``<= 0`` check),
