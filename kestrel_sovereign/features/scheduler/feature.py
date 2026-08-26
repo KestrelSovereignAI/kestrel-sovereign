@@ -2540,6 +2540,31 @@ class SchedulerFeature(Feature):
 
         source_name = cron_source_name(SELF_FOLLOWUP_TASK_NAME)
 
+        # 0. Volatile privacy modes forbid durable user content. The intent is
+        #    free-form agent text derived from the conversation, and it is
+        #    written to scheduled_tasks.args_json through the RAW persistent
+        #    database -- the signal-log redactor does not reach that column.
+        #    EPHEMERAL / ISOLATED / DEIDENTIFIED all promise that conversation
+        #    content does not outlive the session, so persisting an intention
+        #    here breaks the promise the mode makes. Refuse rather than write
+        #    it and hope (#3112 gate-3 P1).
+        from kestrel_sovereign.features.storage_access import (
+            hides_persisted_user_content,
+        )
+
+        if hides_persisted_user_content(self.agent):
+            return ToolResult.failed(
+                "Cannot schedule a follow-up in a volatile privacy mode: the "
+                "intent is conversation-derived text and would be written "
+                "durably to scheduled_tasks.args_json, which this mode "
+                "forbids. Report what remains in this turn instead.",
+                data={
+                    "success": False,
+                    "task_name": SELF_FOLLOWUP_TASK_NAME,
+                    "refused": "volatile_privacy_mode",
+                },
+            )
+
         # 1. One shot only. A recurring self-followup is an unbounded standing
         #    order to spend on turns; the agent asked for a single deferred
         #    intention, so make it say so.
@@ -2555,16 +2580,47 @@ class SchedulerFeature(Feature):
         # 2. Single hop. A persisted row starts a fresh causation chain, so the
         #    registry's allow_self_loops=False cannot see this; refuse here or
         #    a follow-up could queue a follow-up without bound (#3101 Q3).
+        #    The live source alone is not enough: a follow-up that starts a
+        #    causally linked turn (send an A2A task; the a2a.task_complete
+        #    wake arrives later) produces a turn whose CURRENT source differs
+        #    but whose causation_chain still carries cron.self_followup. A
+        #    bare equality test permits that descendant to queue another
+        #    follow-up, and _dispatch_scheduled_task builds the next signal
+        #    with a FRESH chain, so the dispatcher's allow_self_loops=False
+        #    cycle check cannot see the ancestry either. Walk the ancestor
+        #    frames as well: self_followup -> A2A completion -> self_followup
+        #    is the advertised bound being evaded one hop out of sight
+        #    (#3112 gate-3 P1).
         current = get_current_signal()
-        if current is not None and getattr(current, "source", "") == source_name:
+        chain_sources = {
+            getattr(frame, "source", "")
+            for frame in getattr(current, "causation_chain", ()) or ()
+        }
+        live_source = getattr(current, "source", "") if current is not None else ""
+        if current is not None and (
+            live_source == source_name or source_name in chain_sources
+        ):
+            via_ancestor = live_source != source_name
             return ToolResult.failed(
                 "A follow-up turn may not schedule another follow-up "
-                "(single-hop bound). Do what you can in this turn and report "
-                "what remains, so the next chat turn can queue it.",
+                "(single-hop bound)"
+                + (
+                    f" -- this turn descends from '{source_name}' via "
+                    f"'{live_source}', so the chain is already one hop deep."
+                    if via_ancestor
+                    else "."
+                )
+                + " Do what you can in this turn and report what remains, so "
+                "the next chat turn can queue it.",
                 data={
                     "success": False,
                     "task_name": SELF_FOLLOWUP_TASK_NAME,
-                    "refused": "self_followup_chain",
+                    "refused": (
+                        "self_followup_chain_ancestor"
+                        if via_ancestor
+                        else "self_followup_chain"
+                    ),
+                    "live_source": live_source,
                 },
             )
 
