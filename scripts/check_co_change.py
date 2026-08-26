@@ -213,6 +213,18 @@ def _tree_for(path: str, ref: str = "") -> ast.AST | None:
     return _TREES[key]
 
 
+def _def_start(node: ast.AST) -> int:
+    """The first line that belongs to a definition, decorators included.
+
+    ``FunctionDef.lineno`` points at the ``def``, so a diff that edits only
+    ``@decorator`` fell outside the span and the function never registered as
+    changed — its callers went unasked and the gate reported clean.
+    """
+    lines = [node.lineno]
+    lines += [d.lineno for d in getattr(node, "decorator_list", [])]
+    return min(lines)
+
+
 def _name_line(node: ast.AST) -> int:
     """The line the *name* is on, not where the expression started.
 
@@ -243,9 +255,11 @@ def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[tuple[int, int]]:
     ``TEXT = "helper(1)"`` was being reported as an unchanged call site of
     ``helper``. Only real syntax nodes count here.
 
-    Classes are matched on any reference, not only calls: a class edited in
-    place may never be instantiated in the diff's view, and demanding ``Name(``
-    made an ordinary ``class Worker:`` edit look like a broken detector.
+    A bare reference counts too, not only a call. ``map(shared, items)``, a
+    callback handed to a registry, and ``obj.status`` for an ``@property`` are
+    all real dependencies that are never the callee of an ``ast.Call``; treating
+    only calls as uses let a body-only edit report clean. The same is true of a
+    class edited in place but never instantiated in the diff's view.
 
     The span covers the whole call expression, so changing only an argument on a
     later line still marks the site as touched.
@@ -266,7 +280,7 @@ def call_sites(tree: ast.AST, name: str, *, kind: str) -> list[tuple[int, int]]:
                 spans.append(
                     (_name_line(func), getattr(node, "end_lineno", node.lineno) or node.lineno)
                 )
-        elif kind == "class" and id(node) not in counted:
+        elif id(node) not in counted:
             if isinstance(node, ast.Name) and node.id in local_names:
                 spans.append((node.lineno, node.lineno))
             elif isinstance(node, ast.Attribute) and node.attr == name:
@@ -315,6 +329,35 @@ def import_sites(name: str) -> set[str]:
     return found
 
 
+def module_importers(defining_paths: set[str]) -> set[str]:
+    """Files that import one of the modules in ``defining_paths``.
+
+    A private module function is often reached as ``cli._get_project_dir()`` by a
+    file that imports ``cli``, not the name. Scoping on the *name*'s importers
+    alone excluded those real callers.
+    """
+    found: set[str] = set()
+    for module in {Path(path).stem for path in defining_paths}:
+        pattern = rf"(^|[^[:alnum:]_.]){re.escape(module)}([^[:alnum:]_]|$)"
+        for path in _candidate_files(pattern, fixed=False):
+            tree = _tree_for(path)
+            if tree is None:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import) and any(
+                    entry.name == module or entry.name.endswith(f".{module}")
+                    for entry in node.names
+                ):
+                    found.add(path)
+                    break
+                if isinstance(node, ast.ImportFrom) and any(
+                    entry.name == module for entry in node.names
+                ):
+                    found.add(path)
+                    break
+    return found
+
+
 def scope_for(name: str, kind: str, defining_paths: set[str]) -> set[str] | None:
     """Paths a symbol's uses may live in, or None for repo-wide.
 
@@ -330,7 +373,7 @@ def scope_for(name: str, kind: str, defining_paths: set[str]) -> set[str] | None
     """
     if kind != "function" or not name.startswith("_"):
         return None
-    return defining_paths | import_sites(name)
+    return defining_paths | import_sites(name) | module_importers(defining_paths)
 
 
 def modified_symbols(
@@ -360,7 +403,7 @@ def modified_symbols(
         if node.name in _SKIP_NAMES:
             continue
         end = getattr(node, "end_lineno", node.lineno) or node.lineno
-        if not any(node.lineno <= line <= end for line in changed_lines):
+        if not any(_def_start(node) <= line <= end for line in changed_lines):
             continue
         if isinstance(node, ast.ClassDef):
             kind = "class"
@@ -466,9 +509,11 @@ def collect(
             # callers were never questioned. The definition still exists in the
             # new tree; only the evidence that it changed lives on the old side.
             for name, kind in modified_symbols(source, path, lines).items():
-                tree = _tree_for(path)
-                if tree is None or not defines(tree, name):
-                    continue
+                # Do NOT require the working tree to still define this name. A
+                # DELETED or RENAMED definition is exactly the case that leaves
+                # callers stranded under the old name, and requiring the new
+                # tree to define it dropped every one of them — a false clean
+                # introduced by the previous round's own fix.
                 existing_kind, paths = symbols.get(name, (kind, set()))
                 symbols[name] = (
                     "method" if "method" in (existing_kind, kind) else kind,
@@ -488,11 +533,17 @@ def collect(
         # Positive control: the definition we just parsed must be findable.
         # Asserting on *call* sites instead would abort on any symbol that is
         # simply never called — which is how an ordinary `class Worker:` edit
-        # took the whole gate down.
-        if not any(
+        # took the whole gate down. A renamed or deleted symbol lives only on
+        # the old side, so look there too before declaring the pass broken.
+        defined_now = any(
             (tree := _tree_for(path)) is not None and defines(tree, name)
             for path in defining_paths
-        ):
+        )
+        defined_before = any(
+            (tree := _parse(source, path)) is not None and defines(tree, name)
+            for path, source in old_sources.items()
+        )
+        if not (defined_now or defined_before):
             raise DetectorBroken(
                 f"the definition of {name!r} was parsed from the diff but cannot "
                 f"be found again in {sorted(defining_paths)} — the AST pass is broken."

@@ -606,3 +606,96 @@ def test_an_unparseable_changed_file_is_surfaced_not_swallowed(repo: Path) -> No
     assert "every site" not in report
     assert "NOT ANALYSED" in report
     assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Codex review round 3 — one P1 and three P2s, all false-clean paths
+# --------------------------------------------------------------------------
+
+def test_renaming_a_definition_surfaces_callers_of_the_old_name(repo: Path) -> None:
+    """The stranded-caller case, and it reported clean.
+
+    Round 2 added old-side symbol discovery but guarded it on the *working
+    tree* still defining the name. A renamed or deleted definition fails that
+    guard by construction — so the one shape that always strands callers was
+    the one always dropped. The defect was inside the previous round's fix.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def renamed(x):\n    return x\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_deleting_a_definition_surfaces_callers_of_the_old_name(repo: Path) -> None:
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n\n\ndef kept():\n    return 1\n")
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def kept():\n    return 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_a_first_class_reference_is_a_dependent_site(repo: Path) -> None:
+    """``map(shared, items)`` is never the callee of an ``ast.Call``."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "a.py").write_text(
+        "from mod import shared\n\n\nitems = [1]\nresult = list(map(shared, items))\n"
+    )
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
+
+
+def test_a_property_access_is_a_dependent_site(repo: Path) -> None:
+    """``obj.status`` for an ``@property`` is a use with no call node."""
+    (repo / "mod.py").write_text(
+        "class Thing:\n"
+        "    @property\n"
+        "    def status(self):\n"
+        "        return 1\n"
+    )
+    (repo / "a.py").write_text("from mod import Thing\n\n\ndef f(t: Thing):\n    return t.status\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Thing:\n"
+        "    @property\n"
+        "    def status(self):\n"
+        "        return 2\n"
+    )
+
+    finding = _named(_findings(repo), "status")
+    assert ("a.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_private_function_reached_through_its_module_is_kept(repo: Path) -> None:
+    """``import cli`` then ``cli._get_project_dir()`` imports the MODULE, not the name."""
+    (repo / "cli.py").write_text("def _get_project_dir():\n    return 1\n")
+    (repo / "cli_features.py").write_text(
+        "import cli\n\n\ndef f():\n    return cli._get_project_dir()\n"
+    )
+    _commit(repo)
+    (repo / "cli.py").write_text("def _get_project_dir():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_get_project_dir")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("cli_features.py", 5)}
+
+
+def test_a_decorator_only_change_still_changes_the_definition(repo: Path) -> None:
+    """``FunctionDef.lineno`` is the ``def`` line; decorators sit above it."""
+    (repo / "mod.py").write_text(
+        "import functools\n\n\n@functools.cache\ndef shared(x):\n    return x\n"
+    )
+    (repo / "a.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "import functools\n\n\n@functools.lru_cache\ndef shared(x):\n    return x\n"
+    )
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("a.py", 5)}
