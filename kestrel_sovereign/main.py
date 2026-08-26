@@ -249,8 +249,19 @@ async def main():
                     print("   Use !quit to exit.")
                     # Trigger safe mode in agent
                     if hasattr(agent, 'enter_safe_mode'):
+                        # An availability failure of stored MEMORY — not a
+                        # failed verification, and not governance state
+                        # either. The constitution was never read, so nothing
+                        # about it was found wrong, and the runtime-state
+                        # store is answering fine; pointing the operator at
+                        # either would send them to the wrong place (#2920).
+                        from kestrel_sovereign.agent.constitution import (
+                            SafeModeCause,
+                        )
+
                         await agent.enter_safe_mode(
-                            "Repeated encrypted-state decryption failures"
+                            "Repeated encrypted-state decryption failures",
+                            cause=SafeModeCause.MEMORY_UNREADABLE.value,
                         )
 
     except KeyboardInterrupt:

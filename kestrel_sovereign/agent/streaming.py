@@ -1007,17 +1007,19 @@ class StreamingMixin:
             getattr(self, "_constitution_audit_pending", False) is True
         )
         if (safe_mode or audit_pending) and not user_input.startswith("!"):
-            restriction = (
-                "a required startup integrity audit"
-                if audit_pending
-                else "an integrity failure"
+            from kestrel_sovereign.agent.constitution import (
+                describe_safe_mode_restriction,
+            )
+
+            restriction = describe_safe_mode_restriction(
+                self, audit_pending=audit_pending
             )
             yield (
                 "🚨 SAFE MODE ACTIVE\n\n"
                 f"The agent cannot process queries due to {restriction}.\n"
                 "Use !safe-mode to check status or !verify-constitution to "
                 "re-verify.\n\n"
-                "Normal operation will resume once integrity is restored."
+                "Normal operation will resume once the restriction is cleared."
             )
             return
 
