@@ -42,6 +42,7 @@ from .conversation_created_at import (
     fill_undatable,
     parse_stored_timestamp,
 )
+from .legacy_session_stamp import stamp_legacy_sessions
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
@@ -2832,6 +2833,27 @@ class AsyncStorage:
                             )
                         )
                         stats["messages_restored"] += 1
+
+            if stats.get("messages_restored"):
+                # The rows just written are from a backup taken before #3120's
+                # pass, so their legacy ones do not yet say which session they
+                # are in. Run it here rather than leave it to a restart: a
+                # lifecycle op on a restored session would otherwise be
+                # inferring membership from neighbours until one happened.
+                stamped = await stamp_legacy_sessions(self.db, self.agent_id)
+                stats["legacy_rows_stamped"] = stamped["stamped"]
+                stats["legacy_rows_refused"] = stamped["refused"]
+                stats["legacy_rows_incomplete"] = stamped["incomplete"]
+                if stamped["incomplete"]:
+                    # Reported rather than swallowed: a lifecycle write landed
+                    # beside the pass, so some restored rows still do not name
+                    # their session.
+                    logger.warning(
+                        "restore: %s legacy rows still do not name their "
+                        "session for %s; run `kestrel storage stamp-sessions` "
+                        "(#3120)",
+                        stamped["incomplete"], self.agent_id,
+                    )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
     
