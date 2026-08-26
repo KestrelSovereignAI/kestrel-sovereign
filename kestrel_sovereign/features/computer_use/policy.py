@@ -240,63 +240,74 @@ _SHELL_CONTROL_CHARS = frozenset(";&|`$()<>\n\r")
 # not assumed: ``foo$:bar``, ``foo$,bar``, ``foo$.bar``, ``foo$/bar``,
 # ``price$`` and ``echo "$"`` all reach the program with the ``$``
 # intact, so ``shlex`` and a real shell build the same argument vector
-# for them. Quotes are deliberately absent from this set — after a
-# ``$`` a quote is far more often the end of a string (``echo "$"``)
-# than ANSI-C quoting, and that case is the one callers actually write.
+# for them.
+#
+# Quotes are in the set but only apply outside a quoted region: bare
+# ``$"..."`` is bash's localization form and ``$'...'`` is ANSI-C
+# quoting, both of which change the word — while inside double quotes a
+# ``$`` before the closing ``"`` is the literal in ``echo "$"``. The
+# caller passes ``dollar_may_open_quote`` to say which it is looking at.
 _DOLLAR_EXPANSION_STARTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_{[(@*#?-$!"
 )
 
+# Pathname expansion. Whether these change the word depends on what is
+# on disk, so the string alone does not determine the argv — which is
+# reason enough to refuse rather than guess (``echo *`` prints the
+# directory or a literal ``*``, both with status 0).
+_GLOB_CHARS = frozenset("*?[")
 
-def _scan_unquoted(
-    cmd: str,
-    chars: frozenset,
-    *,
-    dollar_must_expand: bool,
-) -> tuple[int, str] | None:
-    """Return ``(index, char)`` of the first character of *chars* that
-    appears outside a quoted region, or ``None``.
 
-    Anything inside ``'...'``/``"..."`` is ignored — quoted control
-    characters are inert to the shell — except that ``$`` and backticks
-    stay live inside double quotes, where the shell still expands them.
+@dataclass(frozen=True)
+class ShellSyntax:
+    r"""A construct a shell would act on that ``exec`` will not.
 
-    ``dollar_must_expand`` distinguishes the two questions the callers
-    ask. "Could this string be more than it looks?" wants every ``$``
-    (over-reporting is free: the answer only routes a command to the
-    approval queue). "Will exec build a different argument vector than
-    a shell would?" wants only a ``$`` that actually expands, because
-    over-reporting there refuses a command that was going to work.
+    ``kind`` exists because the character alone does not explain the
+    divergence. A bare ``$`` expands; a ``\$`` inside double quotes does
+    the opposite — bash removes the backslash and ``shlex`` keeps it —
+    and a refusal that said "cannot expand a variable" for the second
+    would be telling the caller something untrue about their own line.
+    """
+
+    index: int
+    char: str
+    kind: str  # control | expansion | comment | tilde | glob | escape
+
+
+def _quote_context(cmd: str):
+    """Yield ``(index, char, context, escaped)`` for each character.
+
+    ``context`` is ``"bare"``, ``"single"`` or ``"double"``; ``escaped``
+    says a backslash the shell honours precedes this character. Quote
+    marks that open or close a region are not yielded — they are
+    structure, not content.
+
+    The two questions this module asks both need to know where they are
+    in a string, and they disagree about what to do when they get
+    there, so the walk is shared and the judgement is not.
     """
     if not isinstance(cmd, str):
-        return None
-    # Inside double quotes the shell still expands ``$VAR`` and runs
-    # ``$(...)`` / backticks. Only single-quoted regions truly disable
-    # those — so we treat ``$`` and backticks as risky regardless of
-    # double-quote context.
-    DQ_ACTIVE_CHARS = frozenset("$`")
-    in_single = False
-    in_double = False
+        return
+    in_single = in_double = False
     i = 0
     while i < len(cmd):
         c = cmd[i]
         if in_single:
             if c == "'":
                 in_single = False
+            else:
+                yield (i, c, "single", False)
             i += 1
             continue
         if in_double:
             if c == "\\" and i + 1 < len(cmd):
-                # Skip an escaped char inside double quotes.
+                yield (i + 1, cmd[i + 1], "double", True)
                 i += 2
                 continue
             if c == '"':
                 in_double = False
-                i += 1
-                continue
-            if c in DQ_ACTIVE_CHARS and c in chars:
-                if c != "$" or not dollar_must_expand or _dollar_expands(cmd, i):
-                    return (i, c)
+            else:
+                yield (i, c, "double", False)
             i += 1
             continue
         if c == "'":
@@ -308,21 +319,26 @@ def _scan_unquoted(
             i += 1
             continue
         if c == "\\" and i + 1 < len(cmd):
-            # Outside quotes, a backslash escapes the next character —
-            # which still neutralizes its shell-control meaning. Skip.
+            yield (i + 1, cmd[i + 1], "bare", True)
             i += 2
             continue
-        if c in chars:
-            if c != "$" or not dollar_must_expand or _dollar_expands(cmd, i):
-                return (i, c)
+        yield (i, c, "bare", False)
         i += 1
-    return None
 
 
-def _dollar_expands(cmd: str, index: int) -> bool:
+def _dollar_expands(cmd: str, index: int, *, may_open_quote: bool) -> bool:
     """True iff the ``$`` at *index* begins a shell expansion."""
     nxt = cmd[index + 1 : index + 2]
-    return bool(nxt) and nxt in _DOLLAR_EXPANSION_STARTERS
+    if not nxt:
+        return False
+    if nxt in "\"'":
+        return may_open_quote
+    return nxt in _DOLLAR_EXPANSION_STARTERS
+
+
+def _starts_a_word(cmd: str, index: int) -> bool:
+    """True iff *index* begins a word — nothing before it, or blank."""
+    return index == 0 or cmd[index - 1] in " \t\n\r"
 
 
 def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
@@ -331,9 +347,21 @@ def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
     This is the compound-command guard's question (#1694): an
     allow-listed first token cannot vouch for a string that might
     compose a second command, so a suspicious ``$`` is worth an
-    approval prompt even when it would have been literal.
+    approval prompt even when it would have been literal. Reading too
+    much here is free — the answer only routes a command to the queue.
+
+    Deliberately NOT widened alongside :func:`first_shell_syntax_exec_ignores`.
+    Globs and tilde compose no second command, and adding them would
+    put the codex bridge in front of the operator for ``ls *.py``.
     """
-    return _scan_unquoted(cmd, _SHELL_CONTROL_CHARS, dollar_must_expand=False)
+    for index, char, context, escaped in _quote_context(cmd):
+        if escaped or context == "single":
+            continue
+        if context == "double" and char not in "$`":
+            continue
+        if char in _SHELL_CONTROL_CHARS:
+            return (index, char)
+    return None
 
 
 def command_contains_unquoted_shell_control(cmd: str) -> bool:
@@ -343,20 +371,69 @@ def command_contains_unquoted_shell_control(cmd: str) -> bool:
     return first_unquoted_shell_control(cmd) is not None
 
 
-def first_shell_syntax_exec_ignores(cmd: str) -> tuple[int, str] | None:
-    """First character a shell would act on that ``exec`` will not.
+def first_shell_syntax_exec_ignores(cmd: str) -> ShellSyntax | None:
+    r"""First construct a shell would act on that ``exec`` will not.
 
     The tool tokenizes with ``shlex`` and executes the argv vector, so
     this is the question that decides whether the command that runs is
-    the command that was written (#3129). A ``$`` counts only when it
-    actually expands: ``rg foo$ file`` and ``echo "$"`` reach the
-    program identically either way, and refusing them would break
-    commands that were never broken.
+    the command that was written (#3129).
 
-    Known misses, stated rather than implied: glob and brace expansion
-    (``*.py``, ``{a,b}``) and ANSI-C quoting (``$'...'``) also differ
-    between a shell and ``exec``. They are not silent the way a dropped
-    pipe is — the unexpanded word reaches the program, which reports it
-    as a missing file — so they are outside what this refuses.
+    Every rule below was measured against bash rather than reasoned
+    about, by sweeping each punctuation character through ten positions
+    and comparing ``shlex.split`` to the word vector bash builds. That
+    sweep is a test — the first three rounds of review on this ticket
+    each found a construct an enumeration had missed, so the boundary
+    is checked rather than asserted.
+
+    Refused, because the argv differs:
+
+    - the control characters that compose or redirect commands;
+    - a ``$`` that expands, including bash's ``$[...]`` and the
+      quote-opening ``$"..."`` / ``$'...'`` forms;
+    - a ``#`` beginning a word — the rest of the line is a comment;
+    - a ``~`` beginning a word — home-directory expansion;
+    - ``*``, ``?`` and ``[`` — pathname expansion, where what the argv
+      becomes depends on the directory rather than the string;
+    - a backslash that bash removes and ``shlex`` keeps: ``\$`` and
+      ``\```` inside double quotes, and a line continuation anywhere;
+    - a trailing carriage return, which bash keeps inside the last word
+      and ``shlex`` discards as whitespace.
+
+    Trailing spaces, tabs and newlines are not constructs: bash and
+    ``shlex`` both discard them.
     """
-    return _scan_unquoted(cmd, _SHELL_CONTROL_CHARS, dollar_must_expand=True)
+    if not isinstance(cmd, str):
+        return None
+    # Only the trailing blanks bash also discards. A trailing carriage
+    # return is NOT one of them: bash keeps it inside the last word,
+    # ``shlex`` treats it as whitespace and drops it. Measured.
+    trimmed = cmd.rstrip(" \t\n")
+    for index, char, context, escaped in _quote_context(trimmed):
+        if context == "single":
+            continue
+        if escaped:
+            # bash drops the backslash; shlex keeps it for these, so the
+            # word that reaches the program differs. A backslash before
+            # a carriage return is not a continuation — both keep it.
+            if (context == "double" and char in "$`") or char == "\n":
+                return ShellSyntax(index, char, "escape")
+            continue
+        if char == "$":
+            if _dollar_expands(trimmed, index, may_open_quote=context == "bare"):
+                return ShellSyntax(index, char, "expansion")
+            continue
+        if context == "double":
+            if char == "`":
+                return ShellSyntax(index, char, "expansion")
+            continue
+        if char == "`":
+            return ShellSyntax(index, char, "expansion")
+        if char in _SHELL_CONTROL_CHARS:
+            return ShellSyntax(index, char, "control")
+        if char in _GLOB_CHARS:
+            return ShellSyntax(index, char, "glob")
+        if char in "#~" and _starts_a_word(trimmed, index):
+            return ShellSyntax(
+                index, char, "comment" if char == "#" else "tilde"
+            )
+    return None

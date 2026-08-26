@@ -2,6 +2,12 @@
 
 from pathlib import Path
 
+import shlex
+import shutil
+import string
+import subprocess
+import tempfile
+
 import pytest
 
 from kestrel_sovereign.features.computer_use.policy import (
@@ -213,6 +219,26 @@ def test_the_boolean_guard_is_exactly_the_scanner(cmd):
         # codex review round 2 — the starter set had `{` and `(` but not
         # `[`, so this divergence was silent, which is the exact defect.
         ("echo $[1+1]", True),
+        # ...and inside double quotes, where the glob rule does not
+        # apply and only the dollar starter set can catch it. Without
+        # this case, dropping `[` from that set changes nothing any
+        # test can see.
+        ('echo "$[1+1]"', True),
+        # Codex review round 3, named rather than left to the sweep:
+        # each of these ran and reported success with a different argv.
+        ("echo hi # ignored", True),          # the rest is a comment
+        ("echo a#b", False),                  # ...but only at word start
+        ('echo "a\\$HOME"', True),            # bash drops the backslash
+        ('echo "a\\`x"', True),
+        ('echo $"hello"', True),              # localization opens a quote
+        ("echo a\\\nb", True),                # line continuation
+        ("echo a\\\rb", False),               # ...but a CR is not one
+        ("echo hi\n", False),                 # trailing newline is nothing
+        ("echo hi\r", True),                  # a trailing CR is a word char
+        ("echo ~", True),                      # home expansion
+        ("echo a~b", False),                   # ...only at word start
+        ("ls *.py", True),                     # pathname expansion
+        ("echo hi", False),
     ],
 )
 def test_exec_ignores_exactly_what_a_shell_would_have_acted_on(cmd, diverges):
@@ -227,30 +253,164 @@ def test_exec_ignores_exactly_what_a_shell_would_have_acted_on(cmd, diverges):
 
 
 @pytest.mark.parametrize(
-    "cmd",
+    "cmd,refused,flagged",
     [
-        "rg foo$ file",
-        'echo "$"',
-        "echo price$",
-        "cat a.txt | tr a-z A-Z",
-        "echo $HOME",
-        "echo hi; true",
-        "echo hi",
-        'echo "; rm -rf /"',
+        # Both: a control character composes a command AND changes the argv.
+        ("echo hi; true", True, True),
+        ("cat a.txt | tr a-z A-Z", True, True),
+        ("echo $HOME", True, True),
+        # Refusal only: these change the argv but compose nothing. The
+        # guard is deliberately not widened to them — it gates the codex
+        # bridge, where a real shell runs the line, and flagging `ls
+        # *.py` there would put the operator in front of every glob.
+        ("ls *.py", True, False),
+        ("echo hi # note", True, False),
+        ("echo ~", True, False),
+        # Guard only: a literal `$` composes nothing and changes nothing,
+        # but reading it as suspicious costs only an approval prompt,
+        # while refusing it would break a command that worked.
+        ("rg foo$ file", False, True),
+        ('echo "$"', False, True),
+        # Neither.
+        ("echo hi", False, False),
+        ('echo "; rm -rf /"', False, False),
     ],
 )
-def test_the_refusal_never_reaches_further_than_the_compound_guard(cmd):
-    """Two predicates, one containment: anything the refusal refuses,
-    the compound guard also flags.
+def test_the_two_predicates_answer_two_questions(cmd, refused, flagged):
+    """They overlap on control characters and diverge on purpose.
 
-    They answer different questions — "would this run differently?"
-    versus "could this be more than it looks?" — and the second must
-    stay the wider one. If the refusal ever exceeded it, a command
-    would be refused outright that the guard was content to send to
-    the operator, and the two would be arguing.
+    An earlier version of this test asserted containment — anything
+    refused is also flagged — and it passed only because its cases
+    happened to contain no counterexample. Globs, comments and tilde
+    broke it the moment they were added, and a mutation run is what
+    surfaced the stale claim. The real relationship is that each
+    predicate reads what its own consequence justifies: over-reading
+    costs an approval prompt on one side and a broken command on the
+    other.
     """
-    if first_shell_syntax_exec_ignores(cmd) is not None:
-        assert command_contains_unquoted_shell_control(cmd) is True
+    assert (first_shell_syntax_exec_ignores(cmd) is not None) is refused
+    assert command_contains_unquoted_shell_control(cmd) is flagged
+# Pathname and tilde expansion turn on what is on disk and who the user
+# is, so a string alone does not determine the argv. The refusal covers
+# them deliberately, and the differential below cannot judge them: in an
+# empty directory bash leaves them literal and agrees with shlex, which
+# would read as a false positive. Named here rather than silently
+# skipped, so the exclusion is a decision someone can argue with.
+_EXPANSION_DEPENDS_ON_ENVIRONMENT = set("*?[~")
+
+_SWEEP_TEMPLATES = [
+    "echo a{c}b",
+    "echo {c}",
+    "echo a {c} b",
+    "echo {c}b",
+    "echo 'a{c}b'",
+    'echo "a{c}b"',
+    "echo a\\{c}b",
+    'echo "a\\{c}b"',
+    "echo ${c}x",
+    'echo "${c}x"',
+]
+
+
+def _bash_word_vector(cmd: str, cwd: str):
+    """The argv bash would build for *cmd*, or None if bash refuses it."""
+    result = subprocess.run(
+        ["bash", "-c", 'printf "%s\\0" ' + cmd],
+        capture_output=True,
+        cwd=cwd,
+    )
+    if result.returncode:
+        return None
+    return result.stdout.decode(errors="replace").split("\0")[:-1]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_refusal_agrees_with_bash_across_every_punctuation_character():
+    """#3129: the boundary is measured, not enumerated.
+
+    Three consecutive review rounds each found a construct an
+    enumeration had missed — `$[1+1]`, a shell comment, `$"..."`, an
+    escaped `\$` inside double quotes, a line continuation — and every
+    one of them was the ticket's own defect in a narrower spelling: a
+    command that runs as a different argv and reports success.
+
+    So the predicate is checked against the thing it models. Every
+    ASCII punctuation character is swept through ten positions, and
+    `shlex.split` is compared to the word vector bash actually builds.
+    The predicate must say "this diverges" exactly when it does.
+
+    Commands bash itself rejects are skipped: there is no argv to
+    compare, and a caller who writes an unparseable line is not the
+    silent-divergence case this guards.
+    """
+    with tempfile.TemporaryDirectory() as empty:
+        disagreements = []
+        for char in string.punctuation + " \t\n\r":
+            if char in _EXPANSION_DEPENDS_ON_ENVIRONMENT:
+                continue
+            for template in _SWEEP_TEMPLATES:
+                cmd = template.format(c=char)
+                expected = _bash_word_vector(cmd, empty)
+                if expected is None:
+                    continue
+                try:
+                    actual = shlex.split(cmd)
+                except ValueError:
+                    continue
+                diverges = actual != expected
+                refused = first_shell_syntax_exec_ignores(cmd) is not None
+                if diverges != refused:
+                    disagreements.append(
+                        f"{cmd!r}: bash={expected!r} shlex={actual!r} "
+                        f"{'refused' if refused else 'allowed'}"
+                    )
+
+        assert disagreements == [], (
+            "the refusal disagrees with bash:\n  " + "\n  ".join(disagreements)
+        )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_sweep_would_notice_a_gap():
+    """A positive control for the differential above.
+
+    A sweep that compares two things can pass by comparing nothing —
+    if the templates stopped producing divergent commands, or bash
+    rejected all of them, the assertion would be empty and green. This
+    pins that the corpus does contain both answers.
+    """
+    with tempfile.TemporaryDirectory() as empty:
+        outcomes = set()
+        for char in string.punctuation:
+            if char in _EXPANSION_DEPENDS_ON_ENVIRONMENT:
+                continue
+            for template in _SWEEP_TEMPLATES:
+                cmd = template.format(c=char)
+                expected = _bash_word_vector(cmd, empty)
+                if expected is None:
+                    continue
+                try:
+                    outcomes.add(shlex.split(cmd) != expected)
+                except ValueError:
+                    continue
+        assert outcomes == {True, False}, (
+            f"the sweep no longer exercises both answers: {outcomes}"
+        )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    ["ls *.py", "cat ~/notes.txt", "ls a?b", "ls [ab]c"],
+)
+def test_expansion_that_depends_on_the_directory_is_refused(cmd):
+    """The differential cannot judge these, so they are pinned directly.
+
+    Whether ``ls *.py`` reaches ``ls`` as one word or forty depends on
+    the directory, not the string. "It might be the same" is not a
+    reason to run it — the whole defect is a command whose argv is not
+    the one that was written.
+    """
+    assert first_shell_syntax_exec_ignores(cmd) is not None
 
 
 def test_compound_guard_handles_non_string():

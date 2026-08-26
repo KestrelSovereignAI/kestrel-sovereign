@@ -66,10 +66,10 @@ from .policy import (
 logger = logging.getLogger(__name__)
 
 
-# What a shell would have done with each control character. The refusal
-# names the behaviour the caller was counting on, not just the character
-# they typed: "the '|' cannot pipe one command's output into the next"
-# tells them what they lost, where "invalid character" does not.
+# What a shell would have done, phrased so the refusal names the
+# behaviour the caller was counting on rather than the character they
+# typed: "the '|' cannot pipe one command's output into the next" tells
+# them what they lost, where "invalid character" does not.
 _SHELL_CONTROL_MEANINGS = {
     "|": "pipe one command's output into the next",
     "&": "background this command, or join it to another",
@@ -81,8 +81,22 @@ _SHELL_CONTROL_MEANINGS = {
     "(": "group commands in a subshell",
     ")": "group commands in a subshell",
     "\n": "run a second command on the next line",
-    "\r": "run a second command on the next line",
+    "\r": "keep this character inside the word",
 }
+
+# ...and for the constructs where the character alone would mislead. An
+# escaped ``$`` is the opposite of an expansion: bash removes the
+# backslash, this does not, so "cannot expand a variable" would be a
+# false explanation of the caller's own line.
+_SHELL_SYNTAX_MEANINGS = {
+    "comment": "start a comment hiding the rest of the line",
+    "tilde": "expand to a home directory",
+    "glob": "expand to the filenames it matches",
+}
+
+# A control character that has no printable form still has to be
+# nameable in an audit row and readable in a refusal.
+_UNPRINTABLE_NAMES = {"\n": "newline", "\r": "carriage-return", "\t": "tab"}
 
 
 def shell_syntax_refusal(
@@ -126,24 +140,41 @@ def shell_syntax_refusal(
     found = first_shell_syntax_exec_ignores(command)
     if found is None:
         return None
-    index, char = found
-    meaning = _SHELL_CONTROL_MEANINGS.get(char, "change how the command is run")
-    # When the control character IS the first token there is no binary it
-    # would have been handed to, so that clause would name the character
-    # as its own recipient.
-    handed_to = (
-        f" — it would be passed to {Path(argv[0]).name!r} as a literal argument"
-        if argv and argv[0] != char
-        else ""
+    index, char = found.index, found.char
+    named = _UNPRINTABLE_NAMES.get(char) or repr(char)
+    preamble = (
+        "shell does not run a shell: the command is tokenized and executed "
+        "directly, so"
     )
+    if found.kind == "escape":
+        # Naming the escaped character here would say the opposite of
+        # what happens: the backslash is what a shell removes.
+        what = (
+            f"{preamble} the backslash before the {named} at position "
+            f"{index} stays in the argument, where a shell would drop it"
+        )
+    else:
+        meaning = _SHELL_SYNTAX_MEANINGS.get(
+            found.kind
+        ) or _SHELL_CONTROL_MEANINGS.get(char, "change how the command is run")
+        # When the character IS the first token there is no binary it
+        # would have been handed to, so that clause would name the
+        # character as its own recipient.
+        handed_to = (
+            f" — it would be passed to {Path(argv[0]).name!r} as a literal "
+            f"argument"
+            if argv and argv[0] != char
+            else ""
+        )
+        what = (
+            f"{preamble} the {named} at position {index} cannot {meaning}"
+            f"{handed_to}"
+        )
     return (
-        f"shell_syntax:{char}",
-        f"shell does not run a shell: the command is tokenized and executed "
-        f"directly, so the {char!r} at position {index} cannot {meaning}"
-        f"{handed_to}. Nothing ran. This tool runs one program with "
-        f"arguments; it cannot check what a shell would make of this line, "
-        f"so it will not turn it into one. Send a command that needs no "
-        f"shell syntax.",
+        f"shell_syntax:{found.kind}:{_UNPRINTABLE_NAMES.get(char, char)}",
+        f"{what}. Nothing ran. This tool runs one program with arguments; "
+        f"it cannot check what a shell would make of this line, so it will "
+        f"not turn it into one. Send a command that needs no shell syntax.",
     )
 
 

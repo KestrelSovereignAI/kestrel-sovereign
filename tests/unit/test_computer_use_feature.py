@@ -488,6 +488,51 @@ async def test_a_literal_dollar_is_not_shell_syntax(workspace: Path):
 
 
 @pytest.mark.asyncio
+async def test_the_refusal_explains_each_kind_in_its_own_terms(workspace: Path):
+    """codex review round 3: one phrasing cannot cover every construct.
+
+    An escaped ``$`` inside double quotes is the *opposite* of an
+    expansion — bash removes the backslash and this does not — so
+    "cannot expand a variable" would tell the caller something untrue
+    about their own line. Each kind gets its own sentence, and the
+    audit rule carries the kind so the log can be counted by cause.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+
+    cases = {
+        "echo hi | wc -l": "pipe one command's output into the next",
+        "echo hi # note": "start a comment hiding the rest of the line",
+        "echo ~": "expand to a home directory",
+        "echo *.py": "expand to the filenames it matches",
+        'echo "a\\$HOME"': "the backslash before the \'$\' at position 8 stays",
+    }
+    for command, phrase in cases.items():
+        envelope = await feature.shell(command=command, timeout=5)
+        assert envelope.status is not ToolResultStatus.OK, command
+        assert phrase in envelope.error, (command, envelope.error)
+
+    rows = [
+        json.loads(line)
+        for line in (workspace / "audit.jsonl").read_text().splitlines()
+    ]
+    kinds = [r["args"]["rule"] for r in rows if r["outcome"] == "denied"]
+    assert kinds == [
+        "shell_syntax:control:|",
+        "shell_syntax:comment:#",
+        "shell_syntax:tilde:~",
+        "shell_syntax:glob:*",
+        "shell_syntax:escape:$",
+    ], kinds
+
+
+@pytest.mark.asyncio
 async def test_a_refused_command_is_audited(workspace: Path):
     """Every refusal in this gate sequence writes an audit row.
 
@@ -512,7 +557,7 @@ async def test_a_refused_command_is_audited(workspace: Path):
     ]
     refusals = [r for r in rows if r["outcome"] == "denied"]
     assert len(refusals) == 1, rows
-    assert refusals[0]["args"]["rule"] == "shell_syntax:|"
+    assert refusals[0]["args"]["rule"] == "shell_syntax:control:|"
     assert refusals[0]["allowed_by"][-1] == "denied:shell_syntax"
 
 
