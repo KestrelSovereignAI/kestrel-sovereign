@@ -1271,7 +1271,19 @@ class SecurityFeature(Feature):
         # MAX_DISCLOSING_MATCHES; the caller's smaller limit is applied after.
         # Asking the store for `limit` directly would let limit=1 report
         # "not too broad" for a query matching four hundred rows.
+        #
+        # Count the AUTHORIZATION SPLIT before slicing, and say how many were
+        # omitted. Slicing first meant 20 recent denials plus one older
+        # authorized call reported "none authorized" — the false conclusion
+        # that triggers exactly the duplicate work this tool exists to prevent.
+        # The default limit of 20 sits inside the 25-row bound, so this is
+        # reachable without the caller doing anything unusual.
+        bounded_total = len(matches)
+        bounded_authorized = sum(
+            1 for e in matches if e["decision"] in _AUTHORIZED_DECISIONS
+        )
         matches = matches[:limit_val]
+        omitted = bounded_total - len(matches)
 
         if too_broad:
             # Deliberately no arguments: a query this broad is not a
@@ -1338,11 +1350,11 @@ class SecurityFeature(Feature):
         # `filing_failed` and a `refused-*` family; a refusal list had missed
         # three of them (#3107 review round 7). Inverted, an unrecognised
         # decision is reported as not-an-authorization, which is the safe read.
-        refused = sum(
-            1 for e in matches if e["decision"] not in _AUTHORIZED_DECISIONS
-        )
-        allowed = len(matches) - refused
-        headline = f"{len(matches)} prior attempt(s) matched ({scope_text})"
+        allowed = bounded_authorized
+        refused = bounded_total - allowed
+        headline = f"{bounded_total} prior attempt(s) matched ({scope_text})"
+        if omitted:
+            headline += f" (showing {len(matches)}, {omitted} older not shown)"
         if refused and allowed:
             headline += (
                 f" — {allowed} authorized, {refused} NOT authorized "
@@ -1369,7 +1381,9 @@ class SecurityFeature(Feature):
         return ToolResult.ok(
             confirmation="\n".join(lines),
             data={
-                "count": len(matches),
+                "count": bounded_total,
+                "shown": len(matches),
+                "omitted": omitted,
                 "too_broad": False,
                 "query": needle,
                 "tool_name": tool_name or "",

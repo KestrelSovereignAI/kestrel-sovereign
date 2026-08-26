@@ -9,6 +9,7 @@ This module provides SQLite-backed storage for tool permissions with:
 """
 
 import aiosqlite
+import asyncio
 import json
 import logging
 import re
@@ -38,7 +39,22 @@ SEARCH_TOOL_NAME = "security_audit_search"
 SUBAGENT_DISPATCH_ACTION = "subagent_dispatch"
 
 
-def fold_searchable(text):
+def fold_query(text):
+    """Canonicalise a QUERY for matching: decode escapes, casefold. No masking.
+
+    Split from :func:`fold_stored_summary` because the two answer different
+    questions and sharing one function was a defect (#3107 review round 8). The
+    stored summary is redacted before it becomes searchable; a query must not
+    be, or an ordinary search for ``monkey``, ``password reset`` or ``API key
+    rotation`` folds to the empty string, becomes the LIKE pattern ``%%``, and
+    matches every row in the table.
+    """
+    if not text:
+        return text
+    return _decode_escapes(text).casefold()
+
+
+def fold_stored_summary(text):
     """Decode JSON escaping and casefold, so a query and a stored summary can
     be compared as the text a human wrote (#3107).
 
@@ -61,13 +77,15 @@ def fold_searchable(text):
     try:
         parsed = json.loads(text)
     except (ValueError, TypeError):
-        # Truncated past parsing. Decode what escapes we can so a non-ASCII
-        # fragment still matches, and drop it if it names a sensitive key —
-        # an unparseable row cannot be masked field-by-field, so it must not
-        # be searchable field-by-field either.
-        if _NAMES_SENSITIVE_KEY.search(text):
+        # Truncated past parsing. An unparseable row cannot be masked
+        # field-by-field, so it must not be searchable field-by-field either —
+        # but the test for "names a sensitive key" has to look at KEY
+        # POSITIONS. Scanning the whole serialized text meant a benign value
+        # like "orphaned keyboard worker" contained "key" and silently left the
+        # corpus, which defeats the long summaries this fallback exists for.
+        if _SENSITIVE_JSON_KEY.search(text):
             return ""
-        return _unescape_best_effort(text).casefold()
+        return _decode_escapes(text).casefold()
 
     if isinstance(parsed, (dict, list)):
         # MASK BEFORE FOLDING. Masking only on the way out closes the display
@@ -110,17 +128,27 @@ def _flatten_json(value):
 #: A row too truncated to parse cannot be masked field-by-field. If it names a
 #: sensitive key at all, it is dropped from the searchable projection entirely
 #: rather than matched raw — losing a match is the safe failure.
-_NAMES_SENSITIVE_KEY = re.compile(
-    "|".join(re.escape(s) for s in SENSITIVE_KEY_SUBSTRINGS), re.IGNORECASE
+#: A sensitive name in KEY POSITION — `"...key...":` — rather than anywhere in
+#: the text. The value side is data and may legitimately contain these words.
+_SENSITIVE_JSON_KEY = re.compile(
+    r'"[^"]*(?:%s)[^"]*"\s*:' % "|".join(
+        re.escape(s) for s in SENSITIVE_KEY_SUBSTRINGS
+    ),
+    re.IGNORECASE,
 )
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_JSON_ESCAPES = {
+    '"': '"', "\\": "\\", "/": "/",
+    "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+}
+_STANDARD_ESCAPE = re.compile(r'\\(["\\/bfnrt])')
 _SURROGATE_PAIR = re.compile(
     r"\\u(d[89ab][0-9a-fA-F]{2})\\u(d[c-f][0-9a-fA-F]{2})", re.IGNORECASE
 )
 
 
-def _unescape_best_effort(text):
+def _decode_escapes(text):
     """Decode ``\\uXXXX`` escapes in text that is not valid JSON.
 
     Surrogate pairs are joined so an emoji stored as two escapes reads as one
@@ -139,13 +167,21 @@ def _unescape_best_effort(text):
         return chr(code)
 
     decoded = _UNICODE_ESCAPE.sub(_one, text)
-    # Rejoin any surviving well-formed pairs so an intact emoji reads as one
+
+    # Rejoin surviving well-formed pairs so an intact emoji reads as one
     # character rather than two escapes.
     def _pair(match):
         high, low = int(match.group(1), 16), int(match.group(2), 16)
         return chr(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
 
-    return _SURROGATE_PAIR.sub(_pair, decoded)
+    decoded = _SURROGATE_PAIR.sub(_pair, decoded)
+
+    # ...and the STANDARD escapes json.dumps introduces. Decoding only
+    # \uXXXX left a fragment containing a quote, newline or backslash stored
+    # escaped while the natural query carries the decoded character, so the
+    # search reported a false absence — and the result text promised that only
+    # detail past the truncation point was invisible.
+    return _STANDARD_ESCAPE.sub(lambda m: _JSON_ESCAPES[m.group(1)], decoded)
 
 logger = logging.getLogger(__name__)
 
@@ -983,6 +1019,20 @@ class PermissionStore:
         if tool_name:
             self._dispatch_entries.add(tool_name)
             self._dispatch_entries_dirty.add(tool_name)
+            # Durability cannot wait for the first search. A feature that
+            # writes envelope rows, is then removed, and whose process restarts
+            # before anyone searches would lose the name entirely — and its
+            # historical REQUESTS would start reading as prior actions, which
+            # is the failure this table exists to prevent. Flushed on a task so
+            # registration stays synchronous; the read path still syncs, so a
+            # lost task degrades to the old behaviour rather than an error.
+            try:
+                asyncio.get_running_loop().create_task(
+                    self.sync_dispatch_entries()
+                )
+            except RuntimeError:
+                # No loop (sync construction in a test): the read path flushes.
+                pass
 
     @property
     def dispatch_entries(self) -> frozenset:
@@ -1224,7 +1274,7 @@ class PermissionStore:
             # exclusion silently matches nothing.
             "tool_name NOT LIKE ? ESCAPE '\\'",
         ]
-        folded = _like(fold_searchable(needle))
+        folded = _like(fold_query(needle))
         params: List[Any] = [
             folded, folded, SUBAGENT_DISPATCH_ACTION,
             # Escaped: SEARCH_TOOL_NAME contains underscores, and an unescaped
@@ -1321,7 +1371,7 @@ class PermissionStore:
             # The fold has to happen inside the query: SQLite cannot express
             # it, so Python is registered as a scalar function on this
             # connection. Deterministic, so SQLite may cache per-value.
-            await db.create_function("py_fold", 1, fold_searchable)
+            await db.create_function("py_fold", 1, fold_stored_summary)
             # id DESC for the same reason get_audit_log uses it: legacy rows
             # carry a space-separated timestamp that sorts incorrectly against
             # the ISO ones (F092), and id ordering is format-agnostic.

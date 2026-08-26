@@ -581,7 +581,7 @@ async def test_a_lowercase_query_matches_an_accented_capital(store):
 
 @pytest.mark.asyncio
 async def test_a_truncated_summary_is_still_searchable(store):
-    """`fold_searchable` decodes JSON before folding, and a summary truncated
+    """`fold_stored_summary` decodes JSON before folding, and a summary truncated
     mid-escape is not valid JSON. Falling back to the raw text keeps the row in
     the corpus; dropping it would silently shrink what the caller believes it
     searched — the same class of quiet incompleteness this tool exists to
@@ -1024,12 +1024,12 @@ async def test_a_truncated_emoji_does_not_break_every_search(store):
 def test_a_whole_emoji_still_folds_to_one_character():
     """The other end: leaving lone surrogates escaped must not stop a COMPLETE
     pair from rejoining, or every emoji becomes two escapes nobody can match."""
-    from kestrel_sovereign.features.security.permissions import fold_searchable
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
 
     # The projection is decoded keys and values, not re-serialized JSON — so
     # the assertion is that the emoji survives as ONE character in it, not that
     # the JSON round-trips.
-    folded = fold_searchable('{"t": "hi \\ud83d\\ude00"}')
+    folded = fold_stored_summary('{"t": "hi \\ud83d\\ude00"}')
     assert "😀" in folded
     assert "\\ud83d" not in folded
 
@@ -1132,8 +1132,8 @@ async def test_an_unmaskable_row_naming_a_secret_is_not_searchable(tmp_path):
 
     # And the oracle is closed at the source: the query never reaches the raw
     # value, so hit/no-hit cannot be used to walk it out.
-    from kestrel_sovereign.features.security.permissions import fold_searchable
-    assert fold_searchable(
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+    assert fold_stored_summary(
         '{"memo": "orphaned worker", "api_key": "sk-live-CUT'
     ) == ""
 
@@ -1257,3 +1257,125 @@ async def test_a_legacy_secret_cannot_be_walked_out_by_hit_or_miss(store):
             f"searching {probe!r} must not confirm it; a hit/no-hit answer is "
             "a read of the value even when the row renders masked"
         )
+
+
+# ---------------------------------------------------------------------------
+# Review round 8 (#3107)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_query_containing_key_still_searches(store):
+    """The defect my round-7 fix created, and the ninth of its kind.
+
+    Round 7 gave `fold_searchable` a stored-summary rule — drop anything naming
+    a sensitive key — and the QUERY went through the same function. So `monkey`
+    folded to the empty string, `_like("")` became `%%`, and the search matched
+    every row in the table: a broken result AND a disclosure of unrelated
+    summaries.
+
+    I changed a shared function without asking who else called it. That is the
+    step I had written down that morning and did not take."""
+    from kestrel_sovereign.features.security.permissions import fold_query
+
+    await _log_filing(store, _FILING_ONE)
+
+    for query in ("monkey", "password reset", "API key rotation"):
+        assert fold_query(query), f"{query!r} must not fold away"
+        matches, _ = await store.search_audit_log(query)
+        assert matches == [], (
+            f"{query!r} matches nothing here — it must return nothing, not "
+            "everything"
+        )
+
+    # Scoping the key-detection regex to KEY POSITIONS already saves the plain
+    # cases above, which is why re-conflating the two functions survived a
+    # first mutation pass. The split is still load-bearing, and this is where:
+    # a query that itself looks like a JSON key position folds away under the
+    # stored-summary rule and becomes "%%".
+    hostile = 'what did I do with "api_key": rotation'
+    from kestrel_sovereign.features.security.permissions import (
+        fold_stored_summary,
+    )
+    assert fold_stored_summary(hostile) == "", (
+        "precondition: the summary rule DOES fold this away — that is correct "
+        "for a stored row and wrong for a query"
+    )
+    assert fold_query(hostile), "the query rule must not"
+    matches, _ = await store.search_audit_log(hostile)
+    assert matches == [], "and the search must return nothing, not everything"
+
+
+@pytest.mark.asyncio
+async def test_a_benign_value_containing_key_stays_searchable(store):
+    """Sensitive-key detection has to look at KEY POSITIONS. Scanning the whole
+    serialized text meant `{"title": "orphaned keyboard worker"}` contained
+    `key` and silently left the corpus — defeating the long truncated summaries
+    the fallback exists to support."""
+    await store.log_decision(
+        feature_name="GitHubFeature",
+        tool_name="create_github_issue",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary='{"title": "orphaned keyboard worker", "body": "## Det',
+    )
+
+    matches, _ = await store.search_audit_log("orphaned keyboard worker")
+    assert len(matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_fragment_with_quotes_still_matches(store):
+    """Decoding only `\\uXXXX` left a pre-cut fragment containing a quote,
+    newline or backslash stored escaped while the natural query carries the
+    decoded character — a false absence, in a tool whose empty result promises
+    only that detail *past* the cut is invisible."""
+    await store.log_decision(
+        feature_name="ComputeFeature",
+        tool_name="run_script",
+        action="tool_execution",
+        decision="auto_mode_allowed",
+        args_summary='{"cmd": "say \\"hello worker\\"", "body": "## Det',
+    )
+
+    matches, _ = await store.search_audit_log('say "hello worker"')
+    assert len(matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_authorization_split_counts_rows_the_limit_hides(tmp_path):
+    """Slicing before counting produced a false 'none authorized'.
+
+    20 recent denials plus one older authorized call, with the default limit of
+    20 — which sits INSIDE the 25-row bound, so no unusual input is needed. The
+    older authorized row was sliced away before the split was computed, so the
+    tool reported that nothing had been authorized and invited exactly the
+    duplicate work it exists to prevent."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "sliced.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="GitHubFeature", tool_name="create_github_issue",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary='{"title": "orphaned worker THE REAL ONE"}',
+    )
+    for i in range(20):
+        await store.log_decision(
+            feature_name="GitHubFeature", tool_name="create_github_issue",
+            action="tool_execution", decision="auto_denied",
+            args_summary=f'{{"title": "orphaned worker denied {i}"}}',
+        )
+
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="orphaned worker")
+
+    assert result.data["count"] == 21
+    assert result.data["shown"] == 20
+    assert result.data["omitted"] == 1
+    assert "1 older not shown" in result.confirmation
+    assert "authorized" in result.confirmation
+    assert "none of the" not in result.confirmation, (
+        "one authorized call exists; saying none did is the false conclusion"
+    )
