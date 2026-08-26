@@ -1686,13 +1686,15 @@ def test_bounded_observer_executor_fails_closed_on_partial_worker_start(
 
     monkeypatch.setattr(threading.Thread, "start", fail_second_start)
 
+    failed = executor.submit(lambda: None)
     with pytest.raises(RuntimeError, match="worker start failure"):
-        executor.submit(lambda: None)
+        failed.result()
 
-    assert executor._shutdown is True
-    assert len(executor._threads) == 1
-    executor._threads[0].join(timeout=1)
-    assert executor._threads[0].is_alive() is False
+    assert executor._shutdown is False
+    assert executor._threads == []
+    recovered = executor.submit(lambda: "recovered")
+    assert recovered.result(timeout=1) == "recovered"
+    executor.shutdown()
 
 
 @pytest.mark.asyncio
@@ -2227,7 +2229,7 @@ async def test_idle_monitor_retries_after_one_retirement_error(monkeypatch, tmp_
 
 @pytest.mark.asyncio
 async def test_replacement_publication_rearms_monitor_after_baseexception(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
     class FatalMonitorError(BaseException):
         pass
@@ -2244,13 +2246,18 @@ async def test_replacement_publication_rearms_monitor_after_baseexception(
 
     monkeypatch.setattr(feature, "_retire_idle_generation", fatal_retire)
     await feature.initialize()
+    failed_monitor = feature._idle_monitor_task
+    assert failed_monitor is not None
     feature._last_used_monotonic -= 1
     for _ in range(200):
-        task = feature._idle_monitor_task
-        if task is None or task.done():
+        if failed_monitor.done():
             break
         await asyncio.sleep(0.01)
-    assert feature._idle_monitor_task is None or feature._idle_monitor_task.done()
+    assert failed_monitor.done()
+    with pytest.raises(FatalMonitorError, match="synthetic infrastructure failure"):
+        failed_monitor.result()
+    assert feature._idle_monitor_task is None
+    assert "idle monitor terminated for TestFeature" in caplog.text
 
     monkeypatch.setattr(feature, "_retire_idle_generation", original_retire)
     await feature.reload()
@@ -2422,10 +2429,14 @@ async def test_disk_refresh_uses_one_shared_deadline(monkeypatch, tmp_path):
     deadlines = []
 
     seen_sets = []
+    parent_fds = []
 
-    def measure(_path, *, deadline=None, seen_linked_files=None):
+    def measure(
+        _path, *, parent_fd=None, deadline=None, seen_linked_files=None
+    ):
         deadlines.append(deadline)
         seen_sets.append(seen_linked_files)
+        parent_fds.append(parent_fd)
         return 0, "complete"
 
     monkeypatch.setattr(isolated_runtime, "_measure_directory_tree_bytes", measure)
@@ -2436,6 +2447,8 @@ async def test_disk_refresh_uses_one_shared_deadline(monkeypatch, tmp_path):
     assert len(set(deadlines)) == 1
     assert seen_sets[0] is not None
     assert all(seen is seen_sets[0] for seen in seen_sets)
+    assert parent_fds[0] is not None
+    assert all(parent_fd == parent_fds[0] for parent_fd in parent_fds)
 
 
 @pytest.mark.asyncio
@@ -2454,7 +2467,7 @@ async def test_disk_budget_exhaustion_is_visible_and_logged_once(
     monkeypatch.setattr(
         isolated_runtime,
         "_measure_directory_tree_bytes",
-        lambda _path, *, deadline=None, seen_linked_files=None: (
+        lambda _path, *, parent_fd=None, deadline=None, seen_linked_files=None: (
             None,
             "budget-exceeded",
         ),
@@ -2855,6 +2868,47 @@ async def test_pull_snapshot_can_refresh_disk_without_observer(monkeypatch, tmp_
     assert snapshot.private_writable_bytes == len(b"private")
     assert snapshot.downloaded_bytes == len(b"download")
     assert snapshot.disk_telemetry_status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_hosted_disk_telemetry_rejects_symlinked_feature_parent(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime_dir = feature._prepare_runtime_workspace()
+    feature._venv_path = runtime_dir / ".venv"
+    feature._venv_path.mkdir()
+    (runtime_dir / "data" / "private.bin").write_bytes(b"owned")
+
+    feature_parent = runtime_dir.parent
+    retained_parent = feature_parent.with_name("retained-feature-venvs")
+    feature_parent.rename(retained_parent)
+    external_parent = tmp_path / "external-feature-venvs"
+    external_runtime = external_parent / feature._runtime_directory_name
+    for component in (
+        ".venv",
+        "work",
+        "home",
+        "tmp",
+        "config",
+        "data",
+        "cache",
+        "provisioning_cache",
+    ):
+        (external_runtime / component).mkdir(parents=True, exist_ok=True)
+    (external_runtime / "data" / "other-tenant.bin").write_bytes(b"other-tenant")
+    feature_parent.symlink_to(external_parent, target_is_directory=True)
+
+    snapshot = await feature.sample_runtime_telemetry(refresh_disk=True)
+
+    assert snapshot.environment_bytes is None
+    assert snapshot.private_writable_bytes is None
+    assert snapshot.downloaded_bytes is None
+    assert snapshot.disk_telemetry_status == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -17982,6 +18036,38 @@ async def test_host_ingress_waits_for_config_transition_before_delivery(
                     await task
                 except asyncio.CancelledError:
                     pass
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_idle_wake_terminal_revocation_is_not_retryable(
+    monkeypatch, tmp_path
+):
+    client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+
+    async def terminal_wake():
+        raise isolated_runtime._TerminalLifecyclePermitRevoked(
+            "synthetic terminal race"
+        )
+
+    feature._client = None
+    feature._idle_retired = True
+    monkeypatch.setattr(feature, "_wake_idle_runtime", terminal_wake)
+    try:
+        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
+            await feature.call_host_ingress(
+                "telegram-webhook",
+                {"update_id": 8},
+            )
+        assert client.ingress_calls == []
+    finally:
+        feature._client = client
+        feature._idle_retired = False
         await feature.shutdown()
 
 

@@ -33,6 +33,8 @@ from kestrel_sovereign.features.bridge.feature import BridgeFeature
 from kestrel_sovereign.features.webhooks.models import WebhookAuthType, WebhookConfig
 from kestrel_sovereign.features.webhooks.receiver import WebhookReceiver
 
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
+
 
 API_KEY = "test-route-gate-key"
 

@@ -38,9 +38,9 @@ from tests.utils.feedback_bridge import (
 FORCED_EXIT_GRACE_SECONDS = 10.0
 
 
-@pytest.fixture(autouse=True)
-def _isolate_process_wide_rate_limit_state():
-    """Give every test its own SlowAPI bucket while preserving in-test limits."""
+@pytest.fixture
+def isolated_process_rate_limiter():
+    """Give an opted-in HTTP test its own process-global SlowAPI bucket."""
 
     from kestrel_sovereign.rate_limit import limiter
 

@@ -2401,7 +2401,7 @@ class TestLifecycle:
                 await asyncio.wait_for(health_started.wait(), timeout=1)
                 with patch(
                     "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
-                    1.0,
+                    0.25,
                 ), patch(
                     "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
                     0.05,
@@ -2409,7 +2409,7 @@ class TestLifecycle:
                     "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
                     0.01,
                 ):
-                    await asyncio.wait_for(agent.shutdown(), timeout=2)
+                    await asyncio.wait_for(agent.shutdown(), timeout=1)
 
             assert late_started.is_set()
             assert storage.close.called
@@ -2612,11 +2612,11 @@ class TestLifecycle:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.50,
+                0.20,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
-                1.50,
+                0.50,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
@@ -2680,7 +2680,7 @@ class TestLifecycle:
 
                 release_worker.set()
                 allow_factory_disposal.set()
-                await asyncio.wait_for(shutdown_task, timeout=2.5)
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
                 assert not worker.is_alive()
         finally:
             release_worker.set()
@@ -2751,11 +2751,11 @@ class TestLifecycle:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.50,
+                0.12,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
-                1.50,
+                0.50,
             ), patch(
                 "kestrel_sovereign.kestrel_agent."
                 "KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
@@ -2791,7 +2791,7 @@ class TestLifecycle:
                 assert not shutdown_task.done()
 
                 release_worker.set()
-                await asyncio.wait_for(shutdown_task, timeout=2.5)
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
                 assert not factory_worker.is_alive()
                 assert not primary_worker.is_alive()
         finally:

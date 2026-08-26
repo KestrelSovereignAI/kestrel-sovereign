@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 
 from kestrel_sovereign.auth import AuthMethod, CallerRole
 
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
+
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers (same pattern as test_endpoint_contract_suite.py)

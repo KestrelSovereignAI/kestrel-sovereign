@@ -1931,7 +1931,7 @@ class TestAsyncDatabase:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.25,
+                0.01,
             ):
                 factory = make_session_factory(db)
                 async with factory.read_session() as session:
@@ -1939,7 +1939,7 @@ class TestAsyncDatabase:
                 factory_worker = aiosqlite_worker(factory._sqlite_connections[0])
 
                 close_task = asyncio.create_task(db.close())
-                # With the deliberately bounded lifecycle window, a busy runner
+                # With the deliberately tiny lifecycle window, a busy runner
                 # may expire either while Connection.close() is still being
                 # scheduled or while waiting for the worker's final return.
                 # Both are bounded factory-close failures. Wait until the
@@ -2647,14 +2647,6 @@ class TestAsyncDatabase:
                 await asyncio.gather(close_task, return_exceptions=True)
             if db.connection_retirement_pending:
                 await db.finalize_retired_sqla_factory()
-            # The 30 ms deadline above belongs to the deliberately blocked
-            # factory worker. Restore the production-sized window before
-            # closing the independent primary backend under xdist load.
-            monkeypatch.setattr(
-                sqlite_backend_module,
-                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                1.0,
-            )
             if db.backend.is_connected:
                 await db.close()
             worker.join(timeout=1.0)
@@ -2691,7 +2683,7 @@ class TestAsyncDatabase:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.25,
+                0.01,
             ):
                 factory = make_session_factory(db)
                 # Keep the SQLAlchemy connection checked out.  Engine disposal
@@ -2824,7 +2816,7 @@ class TestAsyncDatabase:
         monkeypatch.setattr(
             sqlite_backend_module,
             "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-            0.25,
+            0.05,
         )
         storage = AsyncStorage(str(tmp_path / "storage-retained-worker.db"))
         await storage.initialize()

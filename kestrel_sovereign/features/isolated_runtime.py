@@ -256,16 +256,19 @@ class _BoundedDaemonExecutor(Executor):
                     thread.start()
                     started.append(thread)
             except BaseException:
-                # Never publish a permanently partial pool. Started workers
-                # are daemon-only; wake as many as the bounded queue can
-                # signal. Any remainder can only stay harmlessly parked.
-                self._shutdown = True
-                self._threads.extend(started)
+                # No callback has been queued before the first successful
+                # startup, so every partially started worker is under our
+                # control and can be synchronously retired.  Do not poison the
+                # process-global executor after a transient thread-pressure
+                # failure: a later submission must be able to retry startup.
                 for _thread in started:
-                    try:
-                        self._work.put_nowait(self._STOP)
-                    except Full:
-                        break
+                    # The queue may be narrower than the worker count. These
+                    # workers have never received user work, so waiting for
+                    # each controlled sentinel to be consumed is bounded by
+                    # this module's own worker loop rather than host code.
+                    self._work.put(self._STOP)
+                for thread in started:
+                    thread.join()
                 raise
             self._threads.extend(started)
 
@@ -287,7 +290,11 @@ class _BoundedDaemonExecutor(Executor):
 
     def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
         future: Future[Any] = Future()
-        self._start_workers()
+        try:
+            self._start_workers()
+        except BaseException as exc:  # noqa: BLE001 - Future owns startup outcome
+            future.set_exception(exc)
+            return future
         with self._lock:
             if self._shutdown:
                 future.set_exception(RuntimeError("telemetry observer executor stopped"))
@@ -343,8 +350,9 @@ _TELEMETRY_OBSERVER_EXECUTOR = _BoundedDaemonExecutor(
 
 
 def _measure_directory_tree_bytes(
-    path: Path,
+    path: str | Path,
     *,
+    parent_fd: int | None = None,
     deadline: float | None = None,
     seen_linked_files: set[tuple[int, int]] | None = None,
 ) -> tuple[int | None, str]:
@@ -370,7 +378,7 @@ def _measure_directory_tree_bytes(
     if deadline is None:
         deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
     try:
-        root_fd = os.open(path, flags)
+        root_fd = os.open(path, flags, dir_fd=parent_fd)
         try:
             root_entries = os.scandir(root_fd)
         except BaseException:
@@ -4842,6 +4850,66 @@ def _remove_directory_contents_at(
         os.close(current_fd)
 
 
+def _open_existing_hosted_feature_runtime(
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+    feature_component: str,
+) -> int:
+    """Open one existing feature directory through its verified owner scope.
+
+    The returned descriptor is independent of the custody chain and must be
+    closed by the caller. No component is created and no symlink is followed.
+    """
+
+    if type(owner) is not str or not owner:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature access requires an agent identity."
+        )
+    if _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(feature_component) is None:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature access component is invalid."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - non-POSIX policy
+        raise IsolatedRuntimePreparationError(
+            "Secure hosted feature access is unavailable on this platform."
+        )
+
+    descriptors: list[int] = []
+    try:
+        current_fd = os.open(scope.root, _directory_open_flags())
+        descriptors.append(current_fd)
+        lexical_root = os.stat(scope.root, follow_symlinks=False)
+        if not _same_file_identity(lexical_root, os.fstat(current_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature access root changed during validation."
+            )
+        _validate_operator_root_metadata(os.fstat(current_fd))
+        for component in scope.namespace.parts:
+            current_fd = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=current_fd,
+            )
+            descriptors.append(current_fd)
+        _read_existing_runtime_owner(current_fd, owner)
+        current_fd = os.open(
+            "feature_venvs",
+            _directory_open_flags(),
+            dir_fd=current_fd,
+        )
+        descriptors.append(current_fd)
+        current_fd = os.open(
+            feature_component,
+            _directory_open_flags(),
+            dir_fd=current_fd,
+        )
+        descriptors.append(current_fd)
+        return os.dup(current_fd)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _remove_isolated_feature_runtime(
     scope: IsolatedRuntimeNamespace,
     owner: str,
@@ -6643,56 +6711,86 @@ class ProxyFeature(Feature):
 
         runtime_dir = self._feature_runtime_dir()
         venv = self._venv_path
+        hosted_scope = self._isolated_runtime_scope
+        runtime_owner = (
+            _agent_runtime_owner(self.agent) if hosted_scope is not None else None
+        )
 
         def measure() -> tuple[int | None, int | None, int | None, str]:
             deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
             seen_linked_files: set[tuple[int, int]] = set()
             statuses: list[str] = []
+            runtime_fd: int | None = None
+            if hosted_scope is not None:
+                assert runtime_owner is not None
+                try:
+                    runtime_fd = _open_existing_hosted_feature_runtime(
+                        hosted_scope,
+                        runtime_owner,
+                        self._runtime_directory_name,
+                    )
+                except (
+                    OSError,
+                    IsolatedRuntimeNamespaceError,
+                    IsolatedRuntimePreparationError,
+                ):
+                    return None, None, None, "unavailable"
+
+            def measure_component(component: str) -> tuple[int | None, str]:
+                return _measure_directory_tree_bytes(
+                    component if runtime_fd is not None else runtime_dir / component,
+                    parent_fd=runtime_fd,
+                    deadline=deadline,
+                    seen_linked_files=seen_linked_files,
+                )
+
             managed_venv = (
                 venv is not None
                 and venv == runtime_dir / ".venv"
                 and self._bin_path is None
             )
-            if managed_venv and refresh_environment:
-                (
-                    measured_environment,
-                    environment_status,
-                ) = _measure_directory_tree_bytes(
-                    venv, deadline=deadline, seen_linked_files=seen_linked_files
+            try:
+                if managed_venv and refresh_environment:
+                    measured_environment, environment_status = measure_component(
+                        ".venv"
+                    )
+                    statuses.append(environment_status)
+                    environment = measured_environment
+                else:
+                    environment = self._environment_bytes
+                private_measurements = [
+                    measure_component(component)
+                    for component in (
+                        "work",
+                        "home",
+                        "tmp",
+                        "config",
+                        "data",
+                        "cache",
+                    )
+                ]
+                private_sizes = [size for size, _status in private_measurements]
+                statuses.extend(status for _size, status in private_measurements)
+                private = (
+                    sum(size for size in private_sizes if size is not None)
+                    if all(size is not None for size in private_sizes)
+                    else None
                 )
-                statuses.append(environment_status)
-                environment = measured_environment
-            else:
-                environment = self._environment_bytes
-            private_measurements = [
-                _measure_directory_tree_bytes(
-                    runtime_dir / component,
-                    deadline=deadline,
-                    seen_linked_files=seen_linked_files,
+                downloaded, downloaded_status = measure_component(
+                    "provisioning_cache"
                 )
-                for component in ("work", "home", "tmp", "config", "data", "cache")
-            ]
-            private_sizes = [size for size, _status in private_measurements]
-            statuses.extend(status for _size, status in private_measurements)
-            private = (
-                sum(size for size in private_sizes if size is not None)
-                if all(size is not None for size in private_sizes)
-                else None
-            )
-            downloaded, downloaded_status = _measure_directory_tree_bytes(
-                runtime_dir / "provisioning_cache",
-                deadline=deadline,
-                seen_linked_files=seen_linked_files,
-            )
-            statuses.append(downloaded_status)
-            status = (
-                "budget-exceeded"
-                if "budget-exceeded" in statuses
-                else "unavailable"
-                if "unavailable" in statuses
-                else "complete"
-            )
-            return environment, private, downloaded, status
+                statuses.append(downloaded_status)
+                status = (
+                    "budget-exceeded"
+                    if "budget-exceeded" in statuses
+                    else "unavailable"
+                    if "unavailable" in statuses
+                    else "complete"
+                )
+                return environment, private, downloaded, status
+            finally:
+                if runtime_fd is not None:
+                    os.close(runtime_fd)
 
         async with self._telemetry_disk_lock:
             if (
@@ -8837,7 +8935,7 @@ class ProxyFeature(Feature):
         if self._idle_retired and not self._terminal_lifecycle_latched:
             try:
                 await self._wake_idle_runtime()
-            except IsolatedRuntimePreparationError:
+            except (IsolatedRuntimePreparationError, _TerminalLifecyclePermitRevoked):
                 # An unstartable child may be unstartable *because* its active
                 # config is bad. Re-evaluate under the lifecycle lock: terminal
                 # repair remains permitted, and a still-clientless idle feature
@@ -10835,7 +10933,7 @@ class ProxyFeature(Feature):
                     return
                 if wake_idle:
                     await self._wake_idle_runtime()
-        except _TrafficGateTerminalError:
+        except (_TrafficGateTerminalError, _TerminalLifecyclePermitRevoked):
             outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_TERMINAL)
         except asyncio.CancelledError:
             # The public caller shields this worker, so a cancellation here is
@@ -11019,7 +11117,7 @@ class ProxyFeature(Feature):
                 if wake_idle:
                     experienced_wake = True
                     await self._wake_idle_runtime()
-        except _TrafficGateTerminalError:
+        except (_TrafficGateTerminalError, _TerminalLifecyclePermitRevoked):
             if context is not None:
                 # Scheduled work must surface terminal admission as an
                 # exception so SchedulerRunner records a failed occurrence.
@@ -12672,6 +12770,13 @@ class ProxyFeature(Feature):
                     await asyncio.sleep(min(self._idle_timeout_seconds, 1.0))
         except asyncio.CancelledError:
             raise
+        except BaseException:  # noqa: BLE001 - infrastructure death is observable
+            logger.exception(
+                "Hosted isolated runtime idle monitor terminated for %s; "
+                "a later child publication will re-arm it",
+                self.name,
+            )
+            raise
         finally:
             if self._idle_monitor_task is asyncio.current_task():
                 self._idle_monitor_task = None
@@ -12752,6 +12857,10 @@ class ProxyFeature(Feature):
         try:
             await _await_task_until_complete(task, preserve_cancellation=False)
         except asyncio.CancelledError:
+            raise
+        except _TerminalLifecyclePermitRevoked:
+            # Callers map terminal permit revocation to their own stable public
+            # boundary.  Do not erase it into a retryable preparation failure.
             raise
         except BaseException as exc:
             raise IsolatedRuntimePreparationError(

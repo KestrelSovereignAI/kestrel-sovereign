@@ -17,12 +17,14 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
 
 
 API_KEY = "test-bridge-key"
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 
 def _boot(process_input_streaming):
