@@ -241,8 +241,8 @@ def _sdk_contract_requirement(raw_requirements, *, extras):
     return requirement
 
 
-def test_sdk_036_release_cascade_contract_is_declared():
-    """Core and its observability extra must declare the v0.36 SDK line.
+def test_sdk_037_release_cascade_contract_is_declared():
+    """Core and its observability extra must declare the v0.37 SDK line.
 
     This deliberately does not inspect sibling worktrees: their compatible
     Frinz/observability releases are an external release prerequisite, while
@@ -268,7 +268,7 @@ def test_sdk_036_release_cascade_contract_is_declared():
 
 
 def test_sdk_037_release_cascade_contract_is_locked():
-    """The resolved lock must carry the same v0.36 line before Core ships."""
+    """The resolved lock must carry the same v0.37 line before Core ships."""
 
     root = _locked_root_package(_lock())
     locked_contracts = {

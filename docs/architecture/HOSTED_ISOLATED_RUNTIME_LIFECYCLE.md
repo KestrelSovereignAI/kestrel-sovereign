@@ -105,6 +105,13 @@ succeeds, so a partial reclaim cannot be adopted as a healthy venv on the next
 wake. The seam never removes the agent namespace, sibling feature directories,
 or an external immutable venv.
 
+Core 0.53.5 introduces a distinct interrupted-reclaim marker payload. A host
+must finish or retry any pending reclaim with Core 0.53.5 or newer before
+downgrading: older Core releases do not recognize that payload and will retain
+the affected feature directory rather than start from potentially partial
+state. This fail-closed version-skew behavior does not affect directories whose
+reclaim completed and removed the marker.
+
 `IsolatedRuntimeTelemetrySnapshot` is immutable and deliberately excludes DIDs,
 tenant identifiers, paths, commands, environment variables, configuration, and
 credentials. It reports feature/distribution identity, lifecycle state and

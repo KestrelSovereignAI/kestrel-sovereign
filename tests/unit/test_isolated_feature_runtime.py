@@ -1667,6 +1667,84 @@ def test_bounded_observer_executor_shutdown_cancels_full_queue_without_blocking(
     active.result(timeout=1)
 
 
+def test_bounded_observer_executor_fails_closed_on_partial_worker_start(
+    monkeypatch,
+):
+    executor = isolated_runtime._BoundedDaemonExecutor(
+        max_workers=2,
+        queue_capacity=2,
+    )
+    original_start = threading.Thread.start
+    starts = 0
+
+    def fail_second_start(thread):
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            raise RuntimeError("synthetic worker start failure")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+
+    with pytest.raises(RuntimeError, match="worker start failure"):
+        executor.submit(lambda: None)
+
+    assert executor._shutdown is True
+    assert len(executor._threads) == 1
+    executor._threads[0].join(timeout=1)
+    assert executor._threads[0].is_alive() is False
+
+
+@pytest.mark.asyncio
+async def test_queued_observer_future_becomes_terminal_at_delivery_deadline(
+    monkeypatch, tmp_path
+):
+    executor = isolated_runtime._BoundedDaemonExecutor(
+        max_workers=1,
+        queue_capacity=2,
+    )
+    running = threading.Event()
+    release = threading.Event()
+
+    def block():
+        running.set()
+        assert release.wait(timeout=2)
+
+    active = executor.submit(block)
+    assert running.wait(timeout=1)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_EXECUTOR", executor)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_BASE_SECONDS", 1.0)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=lambda _snapshot: None,
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    for _ in range(200):
+        if not feature._telemetry_observer_tasks and feature._telemetry_retry_task:
+            break
+        await asyncio.sleep(0.01)
+
+    with executor._work.mutex:
+        queued_items = list(executor._work.queue)
+    assert len(queued_items) == 1
+    queued_future = queued_items[0][0]
+    assert queued_future.cancelled()
+    assert feature._telemetry_retry_task is not None
+
+    await feature.shutdown()
+    release.set()
+    active.result(timeout=1)
+    executor.shutdown()
+
+
 def test_bounded_observer_executor_serializes_submit_against_shutdown(monkeypatch):
     executor = isolated_runtime._BoundedDaemonExecutor(
         max_workers=1,
@@ -2039,6 +2117,58 @@ async def test_monitor_ordering_never_closes_gate_over_admitted_work(
 
 
 @pytest.mark.asyncio
+async def test_first_inbound_event_fences_idle_retirement_before_detached_route(
+    monkeypatch, tmp_path
+):
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = FakeIsolatedClient()
+    feature = ProxyFeature(
+        agent,
+        _idle_test_runtime(),
+        client_factory=lambda **_kwargs: client,
+    )
+    await feature.initialize()
+    feature._last_used_monotonic -= 7200
+    expected_generation = feature._activity_generation
+    expected_last_used = feature._last_used_monotonic
+    original_close_if_idle = feature._traffic_gate.close_if_idle
+
+    async def delayed_close_if_idle():
+        close_started.set()
+        await release_close.wait()
+        return await original_close_if_idle()
+
+    monkeypatch.setattr(
+        feature._traffic_gate,
+        "close_if_idle",
+        delayed_close_if_idle,
+    )
+    retirement = asyncio.create_task(
+        feature._retire_idle_generation(
+            expected_activity_generation=expected_generation,
+            expected_last_used=expected_last_used,
+        )
+    )
+    await close_started.wait()
+    await feature._handle_event(
+        {"type": "channel.inbound", "payload": {}},
+        source_client=client,
+    )
+    release_close.set()
+
+    assert await retirement is False
+    assert feature._client is client
+    assert feature._activity_generation == expected_generation + 1
+    assert feature._observed_inbound_producer is True
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_idle_retirement_refuses_registered_inbound_channel(
     monkeypatch, tmp_path
 ):
@@ -2092,6 +2222,40 @@ async def test_idle_monitor_retries_after_one_retirement_error(monkeypatch, tmp_
     await asyncio.wait_for(survived.wait(), timeout=1)
 
     assert attempts == 2
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_replacement_publication_rearms_monitor_after_baseexception(
+    monkeypatch, tmp_path
+):
+    class FatalMonitorError(BaseException):
+        pass
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=0.01)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    original_retire = feature._retire_idle_generation
+
+    async def fatal_retire(**_kwargs):
+        raise FatalMonitorError("synthetic infrastructure failure")
+
+    monkeypatch.setattr(feature, "_retire_idle_generation", fatal_retire)
+    await feature.initialize()
+    feature._last_used_monotonic -= 1
+    for _ in range(200):
+        task = feature._idle_monitor_task
+        if task is None or task.done():
+            break
+        await asyncio.sleep(0.01)
+    assert feature._idle_monitor_task is None or feature._idle_monitor_task.done()
+
+    monkeypatch.setattr(feature, "_retire_idle_generation", original_retire)
+    await feature.reload()
+    assert feature._idle_monitor_task is not None
+    assert not feature._idle_monitor_task.done()
     await feature.shutdown()
 
 
@@ -2195,12 +2359,25 @@ async def test_workspace_byte_telemetry_deduplicates_cross_category_hardlinks(
     assert snapshot.environment_bytes == len(b"shared")
     assert snapshot.downloaded_bytes == 0
 
-    # A state-only disk refresh must still traverse the managed venv to seed
-    # cross-category inode ownership before it measures the uv cache.
+    measured_paths = []
+    original_measure = isolated_runtime._measure_directory_tree_bytes
+
+    def record_measure(path, **kwargs):
+        measured_paths.append(path)
+        return original_measure(path, **kwargs)
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_measure_directory_tree_bytes",
+        record_measure,
+    )
+    # A state-only refresh preserves the last environment count without
+    # spending the shared disk budget on an unchanged managed venv.
     await feature._refresh_disk_telemetry(refresh_environment=False)
     snapshot = feature.runtime_telemetry_snapshot()
     assert snapshot.environment_bytes == len(b"shared")
-    assert snapshot.downloaded_bytes == 0
+    assert snapshot.downloaded_bytes == len(b"shared")
+    assert feature._venv_path not in measured_paths
 
 
 @pytest.mark.asyncio
@@ -2677,6 +2854,37 @@ async def test_pull_snapshot_can_refresh_disk_without_observer(monkeypatch, tmp_
     assert snapshot.environment_bytes == len(b"environment")
     assert snapshot.private_writable_bytes == len(b"private")
     assert snapshot.downloaded_bytes == len(b"download")
+    assert snapshot.disk_telemetry_status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_pull_snapshot_preserves_authoritative_post_reclaim_zeroes(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    feature._workspace_reclaim_generation = 1
+    feature._workspace_reclaimed = True
+    feature._environment_bytes = 0
+    feature._private_writable_bytes = 0
+    feature._downloaded_bytes = 0
+    feature._disk_telemetry_status = "complete"
+    measured = Mock(side_effect=AssertionError("reclaimed workspace must not be walked"))
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_measure_directory_tree_bytes",
+        measured,
+    )
+
+    snapshot = await feature.sample_runtime_telemetry(refresh_disk=True)
+
+    measured.assert_not_called()
+    assert snapshot.environment_bytes == 0
+    assert snapshot.private_writable_bytes == 0
+    assert snapshot.downloaded_bytes == 0
     assert snapshot.disk_telemetry_status == "complete"
 
 
@@ -7680,7 +7888,9 @@ def test_cleanup_refuses_nested_owned_namespace_without_deleting_either(tmp_path
 
 
 @pytest.mark.skipif(os.name != "posix", reason="secure cleanup is POSIX-only")
-def test_cleanup_handles_tree_deeper_than_python_recursion_limit(tmp_path):
+def test_cleanup_handles_tree_deeper_than_python_recursion_limit(
+    monkeypatch, tmp_path
+):
     scope = resolve_isolated_runtime_namespace(tmp_path / "runtime", "tenant")
     owner = "did:test:deep-cleanup"
     isolated_runtime.prepare_isolated_runtime_namespace(
@@ -7694,8 +7904,9 @@ def test_cleanup_handles_tree_deeper_than_python_recursion_limit(tmp_path):
     )
     stack_depth = len(traceback.extract_stack())
     recursion_limit = max(stack_depth + 40, 80)
+    chain_depth = recursion_limit + 20
     try:
-        for _index in range(recursion_limit + 20):
+        for _index in range(chain_depth):
             os.mkdir("nested", mode=0o700, dir_fd=current_fd)
             child_fd = os.open(
                 "nested",
@@ -7715,6 +7926,22 @@ def test_cleanup_handles_tree_deeper_than_python_recursion_limit(tmp_path):
         os.close(current_fd)
 
     original_limit = sys.getrecursionlimit()
+    original_open_child = isolated_runtime._open_cleanup_child_at
+    original_open_parent = isolated_runtime._open_cleanup_parent_at
+    traversal_calls = 0
+
+    def count_open_child(*args, **kwargs):
+        nonlocal traversal_calls
+        traversal_calls += 1
+        return original_open_child(*args, **kwargs)
+
+    def count_open_parent(*args, **kwargs):
+        nonlocal traversal_calls
+        traversal_calls += 1
+        return original_open_parent(*args, **kwargs)
+
+    monkeypatch.setattr(isolated_runtime, "_open_cleanup_child_at", count_open_child)
+    monkeypatch.setattr(isolated_runtime, "_open_cleanup_parent_at", count_open_parent)
     sys.setrecursionlimit(recursion_limit)
     try:
         assert (
@@ -7725,6 +7952,7 @@ def test_cleanup_handles_tree_deeper_than_python_recursion_limit(tmp_path):
         sys.setrecursionlimit(original_limit)
 
     assert not scope.path.exists()
+    assert traversal_calls < chain_depth * 6
 
 
 def test_runtime_cleanup_primitive_reports_exact_absent_and_unhosted_custody(

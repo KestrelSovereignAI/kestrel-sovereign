@@ -245,14 +245,29 @@ class _BoundedDaemonExecutor(Executor):
         with self._lock:
             if self._threads or self._shutdown:
                 return
-            for index in range(self._max_workers):
-                thread = threading.Thread(
-                    target=self._worker,
-                    name=f"kestrel-telemetry-observer-{index}",
-                    daemon=True,
-                )
-                self._threads.append(thread)
-                thread.start()
+            started: list[threading.Thread] = []
+            try:
+                for index in range(self._max_workers):
+                    thread = threading.Thread(
+                        target=self._worker,
+                        name=f"kestrel-telemetry-observer-{index}",
+                        daemon=True,
+                    )
+                    thread.start()
+                    started.append(thread)
+            except BaseException:
+                # Never publish a permanently partial pool. Started workers
+                # are daemon-only; wake as many as the bounded queue can
+                # signal. Any remainder can only stay harmlessly parked.
+                self._shutdown = True
+                self._threads.extend(started)
+                for _thread in started:
+                    try:
+                        self._work.put_nowait(self._STOP)
+                    except Full:
+                        break
+                raise
+            self._threads.extend(started)
 
     def _worker(self) -> None:
         while True:
@@ -4578,58 +4593,92 @@ def prepare_isolated_runtime_namespace(
         os.close(root_fd)
 
 
-def _open_cleanup_directory_at(
-    root_fd: int,
-    components: tuple[str, ...],
-    *,
-    expected_identity: tuple[int, int] | None = None,
-) -> int:
-    """Open one descendant with constant descriptor use and no path following."""
+def _cleanup_directory_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return int(metadata.st_dev), int(metadata.st_ino)
 
-    current_fd = os.dup(root_fd)
+
+def _open_cleanup_child_at(
+    parent_fd: int,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> int:
+    """Open one previously observed child without following a replaced entry."""
+
+    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or _cleanup_directory_identity(metadata) != expected_identity
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup target changed during "
+            "validation."
+        )
+    child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
     try:
-        for component in components:
-            metadata = os.stat(
-                component,
-                dir_fd=current_fd,
-                follow_symlinks=False,
+        if _cleanup_directory_identity(os.fstat(child_fd)) != expected_identity:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup target changed during "
+                "validation."
             )
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup encountered an "
-                    "unsafe path entry."
-                )
-            child_fd = os.open(
-                component,
-                _directory_open_flags(),
-                dir_fd=current_fd,
-            )
-            try:
-                if not _same_file_identity(metadata, os.fstat(child_fd)):
-                    raise IsolatedRuntimeNamespaceError(
-                        "Hosted isolated feature runtime cleanup target changed "
-                        "during validation."
-                    )
-            except BaseException:
-                os.close(child_fd)
-                raise
-            os.close(current_fd)
-            current_fd = child_fd
-        if expected_identity is not None:
-            opened = os.fstat(current_fd)
-            if (int(opened.st_dev), int(opened.st_ino)) != expected_identity:
-                raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup target changed "
-                    "during validation."
-                )
-        return current_fd
+        return child_fd
     except BaseException:
-        os.close(current_fd)
+        os.close(child_fd)
         raise
 
 
-def _cleanup_directory_identity(metadata: os.stat_result) -> tuple[int, int]:
-    return int(metadata.st_dev), int(metadata.st_ino)
+def _open_cleanup_parent_at(
+    child_fd: int,
+    expected_identity: tuple[int, int],
+) -> int:
+    """Ascend one verified inode edge without retaining an unbounded fd stack."""
+
+    metadata = os.stat("..", dir_fd=child_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or _cleanup_directory_identity(metadata) != expected_identity
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup parent changed during "
+            "validation."
+        )
+    parent_fd = os.open("..", _directory_open_flags(), dir_fd=child_fd)
+    try:
+        if _cleanup_directory_identity(os.fstat(parent_fd)) != expected_identity:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup parent changed during "
+                "validation."
+            )
+        return parent_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _cleanup_child_directories_at(
+    directory_fd: int,
+    *,
+    allow_owner_marker: bool,
+) -> list[tuple[str, tuple[int, int]]]:
+    """Snapshot child-directory identities after checking namespace custody."""
+
+    children: list[tuple[str, tuple[int, int]]] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            name = entry.name
+            if not allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime cleanup found a nested "
+                    "ownership marker; allocated namespaces must not contain "
+                    "one another."
+                )
+            metadata = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(metadata.st_mode):
+                children.append((name, _cleanup_directory_identity(metadata)))
+    return children
 
 
 def _assert_no_nested_runtime_owners_at(
@@ -4642,47 +4691,64 @@ def _assert_no_nested_runtime_owners_at(
     Multi-component namespaces are valid, but allocated namespace leaves must
     remain prefix-free. This descriptor-relative preflight prevents deleting
     any sibling content before discovering that a descendant is independently
-    bound to an agent. The work list stores names and inode identities rather
-    than open descriptors, so tenant-controlled depth cannot exhaust Python's
-    recursion limit or the host descriptor table.
+    bound to an agent. The iterative walk ascends through verified ``..`` inode
+    edges, retaining only names/identities for ancestors. Tenant-controlled
+    depth is therefore linear in time and memory without retaining an
+    unbounded descriptor stack or using Python recursion.
     """
 
-    root_identity = _cleanup_directory_identity(os.fstat(directory_fd))
-    pending: list[tuple[tuple[str, ...], tuple[int, int], bool]] = [
-        ((), root_identity, allow_owner_marker)
-    ]
-    while pending:
-        components, expected_identity, permits_owner_marker = pending.pop()
-        current_fd = _open_cleanup_directory_at(
-            directory_fd,
-            components,
-            expected_identity=expected_identity,
-        )
-        try:
-            with os.scandir(current_fd) as entries:
-                names = [entry.name for entry in entries]
-            if not permits_owner_marker and _RUNTIME_OWNER_MARKER in names:
+    current_fd = os.dup(directory_fd)
+    current_identity = _cleanup_directory_identity(os.fstat(current_fd))
+    current_name: str | None = None
+    children = _cleanup_child_directories_at(
+        current_fd,
+        allow_owner_marker=allow_owner_marker,
+    )
+    ancestors: list[
+        tuple[tuple[int, int], str | None, list[tuple[str, tuple[int, int]]]]
+    ] = []
+    try:
+        while True:
+            if children:
+                child_name, child_identity = children.pop()
+                child_fd = _open_cleanup_child_at(
+                    current_fd,
+                    child_name,
+                    child_identity,
+                )
+                ancestors.append((current_identity, current_name, children))
+                os.close(current_fd)
+                current_fd = child_fd
+                current_identity = child_identity
+                current_name = child_name
+                children = _cleanup_child_directories_at(
+                    current_fd,
+                    allow_owner_marker=False,
+                )
+                continue
+            if not ancestors:
+                return
+            parent_identity, parent_name, remaining_children = ancestors.pop()
+            parent_fd = _open_cleanup_parent_at(current_fd, parent_identity)
+            assert current_name is not None
+            metadata = os.stat(
+                current_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if _cleanup_directory_identity(metadata) != current_identity:
+                os.close(parent_fd)
                 raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup found a nested "
-                    "ownership marker; allocated namespaces must not contain "
-                    "one another."
+                    "Hosted isolated feature runtime cleanup target changed "
+                    "during nested-owner validation."
                 )
-            for name in names:
-                metadata = os.stat(
-                    name,
-                    dir_fd=current_fd,
-                    follow_symlinks=False,
-                )
-                if stat.S_ISDIR(metadata.st_mode):
-                    pending.append(
-                        (
-                            (*components, name),
-                            _cleanup_directory_identity(metadata),
-                            False,
-                        )
-                    )
-        finally:
             os.close(current_fd)
+            current_fd = parent_fd
+            current_identity = parent_identity
+            current_name = parent_name
+            children = remaining_children
+    finally:
+        os.close(current_fd)
 
 
 def _remove_directory_contents_at(
@@ -4693,107 +4759,87 @@ def _remove_directory_contents_at(
 ) -> None:
     """Delete one already-open tree without recursion or following symlinks."""
 
-    root_identity = _cleanup_directory_identity(os.fstat(directory_fd))
-    # ``False`` entries visit a directory; ``True`` entries remove it after all
-    # descendants. Relative component tuples let every visit reopen from the
-    # custody-bound root with constant descriptor use, including trees deeper
-    # than Python's recursion or the process descriptor limit.
-    pending: list[tuple[tuple[str, ...], tuple[int, int], bool]] = [
-        ((), root_identity, False)
-    ]
-    while pending:
-        components, expected_identity, remove_after_children = pending.pop()
-        if remove_after_children:
-            parent_components = components[:-1]
-            name = components[-1]
-            parent_fd = _open_cleanup_directory_at(
-                directory_fd,
-                parent_components,
-            )
-            child_fd: int | None = None
-            try:
-                metadata = os.stat(
-                    name,
-                    dir_fd=parent_fd,
-                    follow_symlinks=False,
+    current_fd = os.dup(directory_fd)
+    current_identity = _cleanup_directory_identity(os.fstat(current_fd))
+    current_name: str | None = None
+    ancestors: list[tuple[tuple[int, int], str | None]] = []
+    custody_checked: set[tuple[int, int]] = set()
+    try:
+        while True:
+            permits_owner_marker = allow_owner_marker and not ancestors
+            if current_identity not in custody_checked:
+                _cleanup_child_directories_at(
+                    current_fd,
+                    allow_owner_marker=permits_owner_marker,
                 )
-                if (
-                    not stat.S_ISDIR(metadata.st_mode)
-                    or _cleanup_directory_identity(metadata) != expected_identity
-                ):
-                    raise IsolatedRuntimeNamespaceError(
-                        "Hosted isolated feature runtime cleanup target changed "
-                        "during removal."
-                    )
-                child_fd = os.open(
-                    name,
-                    _directory_open_flags(),
-                    dir_fd=parent_fd,
-                )
-                if (
-                    _cleanup_directory_identity(os.fstat(child_fd))
-                    != expected_identity
-                ):
-                    raise IsolatedRuntimeNamespaceError(
-                        "Hosted isolated feature runtime cleanup target changed "
-                        "during removal."
-                    )
-                os.rmdir(name, dir_fd=parent_fd)
-            finally:
-                if child_fd is not None:
-                    os.close(child_fd)
-                os.close(parent_fd)
-            continue
+                custody_checked.add(current_identity)
 
-        current_fd = _open_cleanup_directory_at(
-            directory_fd,
-            components,
-            expected_identity=expected_identity,
-        )
-        try:
+            child: tuple[str, tuple[int, int]] | None = None
             with os.scandir(current_fd) as entries:
-                names = [entry.name for entry in entries]
-            permits_owner_marker = allow_owner_marker and not components
-            if not permits_owner_marker and _RUNTIME_OWNER_MARKER in names:
-                raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup found a nested "
-                    "ownership marker; allocated namespaces must not contain "
-                    "one another."
-                )
-            child_directories: list[
-                tuple[tuple[str, ...], tuple[int, int], bool]
-            ] = []
-            for name in names:
-                # The top-level marker is custody proof for retrying a partial
-                # cleanup. Preserve it throughout the sweep. Nested markers
-                # remain a hard failure above.
-                if permits_owner_marker and name == _RUNTIME_OWNER_MARKER:
-                    continue
-                if not components and name in preserve_names:
-                    continue
-                metadata = os.stat(
-                    name,
-                    dir_fd=current_fd,
-                    follow_symlinks=False,
-                )
-                if stat.S_ISDIR(metadata.st_mode):
-                    child_components = (*components, name)
-                    identity = _cleanup_directory_identity(metadata)
-                    child_directories.append((child_components, identity, False))
-                    child_directories.append((child_components, identity, True))
-                else:
+                for entry in entries:
+                    name = entry.name
+                    if permits_owner_marker and name == _RUNTIME_OWNER_MARKER:
+                        continue
+                    if not permits_owner_marker and name == _RUNTIME_OWNER_MARKER:
+                        raise IsolatedRuntimeNamespaceError(
+                            "Hosted isolated feature runtime cleanup found a "
+                            "nested ownership marker; allocated namespaces must "
+                            "not contain one another."
+                        )
+                    if not ancestors and name in preserve_names:
+                        continue
+                    metadata = os.stat(
+                        name,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        child = (name, _cleanup_directory_identity(metadata))
+                        break
                     # Symlinks and special files are removed as entries; they
                     # are never opened or traversed.
                     os.unlink(name, dir_fd=current_fd)
-            # Push each post-order removal before its visit so LIFO processing
-            # completes every subtree before removing its directory.
-            for index in range(0, len(child_directories), 2):
-                visit = child_directories[index]
-                remove = child_directories[index + 1]
-                pending.append(remove)
-                pending.append(visit)
-        finally:
+
+            if child is not None:
+                child_name, child_identity = child
+                child_fd = _open_cleanup_child_at(
+                    current_fd,
+                    child_name,
+                    child_identity,
+                )
+                ancestors.append((current_identity, current_name))
+                os.close(current_fd)
+                current_fd = child_fd
+                current_identity = child_identity
+                current_name = child_name
+                continue
+
+            if not ancestors:
+                return
+            parent_identity, parent_name = ancestors.pop()
+            parent_fd = _open_cleanup_parent_at(current_fd, parent_identity)
+            assert current_name is not None
+            metadata = os.stat(
+                current_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or _cleanup_directory_identity(metadata) != current_identity
+            ):
+                os.close(parent_fd)
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime cleanup target changed "
+                    "during removal."
+                )
+            os.rmdir(current_name, dir_fd=parent_fd)
             os.close(current_fd)
+            current_fd = parent_fd
+            current_identity = parent_identity
+            current_name = parent_name
+    finally:
+        os.close(current_fd)
 
 
 def _remove_isolated_feature_runtime(
@@ -6318,6 +6364,7 @@ class ProxyFeature(Feature):
         self._disk_telemetry_status: str | None = None
         self._disk_budget_warning_emitted = False
         self._workspace_reclaim_generation = 0
+        self._workspace_reclaimed = False
         self._last_telemetry_emit_monotonic: float | None = None
         self._telemetry_observer_tasks: set[asyncio.Future[Any]] = set()
         self._telemetry_emit_tasks: set[asyncio.Task[None]] = set()
@@ -6560,8 +6607,10 @@ class ProxyFeature(Feature):
         """
 
         if refresh_disk:
+            expected_reclaim_generation = self._workspace_reclaim_generation
             await self._refresh_disk_telemetry(
                 refresh_environment=True,
+                expected_reclaim_generation=expected_reclaim_generation,
                 require_observer=False,
             )
 
@@ -6604,7 +6653,7 @@ class ProxyFeature(Feature):
                 and venv == runtime_dir / ".venv"
                 and self._bin_path is None
             )
-            if managed_venv:
+            if managed_venv and refresh_environment:
                 (
                     measured_environment,
                     environment_status,
@@ -6612,11 +6661,7 @@ class ProxyFeature(Feature):
                     venv, deadline=deadline, seen_linked_files=seen_linked_files
                 )
                 statuses.append(environment_status)
-                environment = (
-                    measured_environment
-                    if refresh_environment
-                    else self._environment_bytes
-                )
+                environment = measured_environment
             else:
                 environment = self._environment_bytes
             private_measurements = [
@@ -6654,6 +6699,11 @@ class ProxyFeature(Feature):
                 expected_reclaim_generation is not None
                 and expected_reclaim_generation != self._workspace_reclaim_generation
             ):
+                return
+            if self._workspace_reclaimed:
+                # Successful reclaim has authoritative zero accounting. A
+                # pull sample must not reinterpret the intentionally absent
+                # directories as an unavailable measurement.
                 return
             (
                 self._environment_bytes,
@@ -6754,11 +6804,28 @@ class ProxyFeature(Feature):
                 # process-global worker or queue slot.
                 assert isinstance(self._telemetry_observer_agent_lock, asyncio.Lock)
                 async with self._telemetry_observer_agent_lock:
-                    result = await asyncio.get_running_loop().run_in_executor(
-                        _TELEMETRY_OBSERVER_EXECUTOR,
+                    callback = _TELEMETRY_OBSERVER_EXECUTOR.submit(
                         observer,
                         snapshot,
                     )
+                    wrapped = asyncio.wrap_future(callback)
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.shield(wrapped),
+                            timeout=_TELEMETRY_OBSERVER_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        if callback.cancel():
+                            # A callback queued behind hostile workers must
+                            # become terminal at its delivery deadline. This
+                            # releases the per-agent lock so forced telemetry
+                            # can retry instead of coalescing forever behind a
+                            # Future that no worker can reach.
+                            raise
+                        # A callback which already entered user code cannot be
+                        # killed safely. Retain its task and per-agent lock so
+                        # one tenant cannot occupy every global worker.
+                        result = await asyncio.shield(wrapped)
                     if inspect.isawaitable(result):
                         await result
 
@@ -7676,6 +7743,10 @@ class ProxyFeature(Feature):
         # initialize, reload, supervisor recovery, and idle wake.
         self._idle_retired = False
         self._idle_resume_event.set()
+        # A replacement publication is the recovery boundary for an idle
+        # monitor that terminated unexpectedly in the prior generation. The
+        # helper is idempotent while the existing monitor remains live.
+        self._start_idle_monitor()
         try:
             await self._register_event_handler(client)
         except BaseException as exc:
@@ -11303,6 +11374,7 @@ class ProxyFeature(Feature):
                     prefix + ("provisioning_cache",),
                 ),
             )
+            self._workspace_reclaimed = False
             return runtime_dir
         # The storage parent belongs to the standalone operator and may be the
         # process CWD. Never chmod it when it already exists. Core's dedicated
@@ -11345,6 +11417,7 @@ class ProxyFeature(Feature):
                     "Standalone isolated feature runtime workspace could not be "
                     "prepared."
                 ) from exc
+        self._workspace_reclaimed = False
         return runtime_dir
 
     def _hosted_provisioning_cache_dir(self) -> Path:
@@ -12463,8 +12536,19 @@ class ProxyFeature(Feature):
                 )
             return
         task = self._idle_monitor_task
-        if task is not None and not task.done():
-            return
+        if task is not None:
+            if not task.done():
+                return
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except BaseException:  # noqa: BLE001 - infrastructure is re-armed
+                logger.warning(
+                    "Hosted isolated runtime idle monitor terminated for %s; "
+                    "re-arming after child publication",
+                    self.name,
+                )
         coro = self._monitor_idle_runtime()
         name = f"isolated-feature-idle:{self.name}"
         tracker = getattr(self.agent, "_track_background_task", None)
@@ -12732,6 +12816,7 @@ class ProxyFeature(Feature):
                     self._runtime_directory_name,
                 )
                 self._workspace_reclaim_generation += 1
+                self._workspace_reclaimed = True
                 self._telemetry_disk_refresh_pending = False
                 self._telemetry_environment_refresh_pending = False
                 self._environment_bytes = (
@@ -13166,6 +13251,11 @@ class ProxyFeature(Feature):
                 # legacy producer omits capability metadata. Once observed,
                 # fail resident: this child has no out-of-process wake source.
                 self._observed_inbound_producer = True
+                # Record admission intent before the detached routing task can
+                # lose a retirement race. There is no await between this write
+                # and the retirement generation/deadline recheck, so a first
+                # inbound event cannot be made stale by closing the idle gate.
+                self._record_runtime_activity()
             await self._schedule_event_ingress_routing(event, source_client)
             return
         try:
@@ -13341,7 +13431,6 @@ class ProxyFeature(Feature):
                     return
                 if self._inbound_admission_is_durable(admission):
                     if acknowledgement is not None:
-                        self._record_runtime_activity()
                         self._schedule_event_ingress_acknowledgement(
                             source_client, acknowledgement
                         )
