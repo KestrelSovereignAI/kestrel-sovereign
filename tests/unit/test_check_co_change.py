@@ -1137,3 +1137,80 @@ def test_base_mode_includes_untracked_files(
     # newfile.py is a CHANGED site, so it shows in the count. Excluding it reads
     # "modified 1 of 3" with two unchanged.
     assert "modified 2 of 3 occurrences" in output, output
+
+
+# --------------------------------------------------------------------------
+# Codex review round 8 — three P2s, no P1s
+# --------------------------------------------------------------------------
+
+def test_a_re_export_alias_renamed_by_the_diff_still_reaches_its_caller(
+    repo: Path,
+) -> None:
+    """The closure read only the working tree, where the old alias is gone.
+
+    ``bridge.py`` changes ``as alias`` to ``as alias2``; the downstream
+    ``from bridge import alias; alias()`` then mentions neither ``shared`` nor
+    ``alias2``, so nothing considered it. Fourth instance in this file of the
+    same class — the old side holds the only evidence.
+    """
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mod import shared as alias\n")
+    (repo / "user.py").write_text("from bridge import alias\n\n\ndef f():\n    return alias(1)\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def shared(x):\n    return x + 1\n")
+    (repo / "bridge.py").write_text("from mod import shared as alias2\n")
+
+    finding = _named(_findings(repo), "shared")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_private_re_export_reached_through_the_bridge_module_is_kept(
+    repo: Path,
+) -> None:
+    """``import bridge; bridge.h()`` imports the MODULE, never the alias."""
+    (repo / "mine.py").write_text("def _helper(x):\n    return x\n")
+    (repo / "bridge.py").write_text("from mine import _helper as h\n")
+    (repo / "user.py").write_text("import bridge\n\n\ndef f():\n    return bridge.h(2)\n")
+    _commit(repo)
+    (repo / "mine.py").write_text("def _helper(x):\n    return x + 1\n")
+
+    finding = _named(_findings(repo), "_helper")
+    assert ("user.py", 5) in {(o.path, o.line) for o in finding.unchanged}
+
+
+def test_a_filename_containing_a_space_is_mapped(repo: Path) -> None:
+    """Git appends a tab separator for paths with spaces.
+
+    Slicing ``--- a/`` kept the tab, so the later read targeted a path that does
+    not exist and the change was silently skipped — a clean report for a file
+    never looked at.
+    """
+    (repo / "space name.py").write_text('A = "tool_execution"\n')
+    (repo / "b.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "space name.py").write_text('A = "subagent_dispatch"\n')
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert "space name.py" in new_map, f"path not decoded: {sorted(new_map)}"
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 1)]
+
+
+def test_a_c_quoted_filename_is_decoded(repo: Path) -> None:
+    """Git C-quotes a path containing non-ASCII, bypassing prefix checks."""
+    (repo / "café.py").write_text('A = "tool_execution"\n')
+    (repo / "b.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "café.py").write_text('A = "subagent_dispatch"\n')
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    # Assert the EXACT decoded name, and that it names a file that exists.
+    # An earlier version asserted `any("caf" in path ...)`, which the undecoded
+    # `"caf\303\251.py"` also satisfies — so the test passed with the bug in
+    # place and a mutant survived. The decode is only useful if the mapped key
+    # can actually be opened, which is what the later file read needs.
+    assert "café.py" in new_map, f"quoted path not decoded: {sorted(new_map)}"
+    assert (repo / "café.py").exists()
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 1)]

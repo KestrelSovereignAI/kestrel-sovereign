@@ -159,17 +159,11 @@ def changed_line_map(
     new_path: str | None = None
     old_path: str | None = None
     for line in diff.splitlines():
-        if line.startswith("--- a/"):
-            old_path = line[6:]
+        if line.startswith("--- "):
+            old_path = _patch_path(line)
             continue
-        if line.startswith("--- /dev/null"):
-            old_path = None
-            continue
-        if line.startswith("+++ b/"):
-            new_path = line[6:]
-            continue
-        if line.startswith("+++ /dev/null"):
-            new_path = None
+        if line.startswith("+++ "):
+            new_path = _patch_path(line)
             continue
         match = _HUNK.match(line)
         if not match:
@@ -195,6 +189,36 @@ def changed_line_map(
             new_map[path] = set(range(1, count + 1))
 
     return dict(new_map), dict(old_map)
+
+
+def _patch_path(raw: str) -> str | None:
+    """Decode a path out of a ``git diff`` header line.
+
+    Git appends a tab separator when a path contains spaces, and QUOTES the
+    whole path (C-style, with escapes) when it contains tabs or non-ASCII. A
+    plain prefix slice kept the tab and missed the quoting entirely, so the
+    later file read targeted a path that does not exist and the change was
+    silently skipped — a clean report for a file that was never looked at.
+    """
+    body = raw.split(" ", 1)[1] if " " in raw else raw
+    if body.startswith('"'):
+        # C-quoted, and git quotes the WHOLE `a/path`, not just the name. The
+        # escapes are OCTAL bytes of the UTF-8 encoding (`caf\303\251.py`), so
+        # decoding them as Python text escapes yields latin-1 mojibake — the
+        # round-trip through bytes is what recovers the real filename.
+        try:
+            decoded = ast.literal_eval(body)
+        except (ValueError, SyntaxError):
+            return None
+        try:
+            body = decoded.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            body = decoded
+    else:
+        body = body.split("\t", 1)[0]
+    if body == "/dev/null":
+        return None
+    return body[2:] if body[:2] in ("a/", "b/") else body
 
 
 def _parse(source: str, filename: str) -> ast.AST | None:
@@ -370,7 +394,9 @@ def _word_pattern(word: str) -> str:
     return rf"(^|[^[:alnum:]_]){re.escape(word)}([^[:alnum:]_]|$)"
 
 
-def alias_closure(name: str, *, max_rounds: int = 3) -> set[str]:
+def alias_closure(
+    name: str, *, max_rounds: int = 3, old_sources: dict[str, str] | None = None
+) -> set[str]:
     """Every local name that ultimately refers to ``name``, through re-exports.
 
     A bridge module doing ``from mod import shared as alias`` and a downstream
@@ -384,6 +410,17 @@ def alias_closure(name: str, *, max_rounds: int = 3) -> set[str]:
     large tree is not worth the tail.
     """
     names = {name}
+    # Seed from the OLD side too. A bridge whose `as alias` was renamed to
+    # `as alias2` no longer mentions `alias` anywhere in the working tree, so a
+    # downstream `from bridge import alias; alias()` contains neither the
+    # original name nor the new one and was never considered.
+    for path, source in (old_sources or {}).items():
+        tree = _parse(source, path)
+        if tree is None:
+            continue
+        for bound in _build_index(tree).aliases.get(name, ()):
+            names.add(bound)
+
     for _ in range(max_rounds):
         discovered: set[str] = set()
         for current in names:
@@ -674,7 +711,7 @@ def collect(
 
     for name, (kind, defining_paths) in sorted(symbols.items()):
         # Follow re-export bridges: a caller may only ever mention the alias.
-        local_names = alias_closure(name)
+        local_names = alias_closure(name, old_sources=old_sources)
         scope = scope_for(name, kind, defining_paths)
         if scope is not None:
             # The closure can discover a name the scope has never heard of. A
@@ -682,7 +719,10 @@ def collect(
             # imports `h`, not `_helper` and not the defining module, so the
             # intersection removed exactly the caller the closure just found.
             for alias in local_names - {name}:
-                scope = scope | import_sites(alias)
+                binders = import_sites(alias)
+                # ...and the modules that BIND the alias, since a consumer may
+                # reach it as `bridge.h()` having imported `bridge`, never `h`.
+                scope = scope | binders | module_importers(binders)
         candidates: set[str] = set()
         for local in local_names:
             candidates |= _candidate_files(_word_pattern(local), fixed=False)
