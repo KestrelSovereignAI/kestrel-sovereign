@@ -686,7 +686,7 @@ class TestSQLiteBackend:
             with patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.25,
+                0.01,
             ):
                 await backend.close()
 
@@ -1931,7 +1931,7 @@ class TestAsyncDatabase:
             ) as workers, patch(
                 "kestrel_sovereign.storage.db.sqlite."
                 "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-                0.01,
+                0.25,
             ):
                 factory = make_session_factory(db)
                 async with factory.read_session() as session:
