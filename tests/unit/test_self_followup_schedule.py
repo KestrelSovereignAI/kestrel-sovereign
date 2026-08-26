@@ -842,3 +842,56 @@ def test_normalize_intent_caps_length():
     cleaned = normalize_intent("x" * (MAX_INTENT_CHARS + 500))
     assert len(cleaned) <= MAX_INTENT_CHARS + len("...(truncated)")
     assert cleaned.endswith("...(truncated)")
+
+
+@pytest.mark.asyncio
+async def test_a_stale_signal_outside_a_live_turn_cannot_author_a_follow_up(
+    followup_env,
+):
+    """Provenance is turn ownership, not signal presence (#3112 gate-2 P1).
+
+    ``SignalDispatcher`` sets the current-signal ContextVar for ACTION and
+    ARTIFACT handlers too, and a detached task keeps a COPIED value after
+    dispatch. The first form of this guard read
+    ``current is None and not self._owns_live_turn()``, so ANY signal in
+    context skipped the provenance check entirely -- letting a stale
+    callback outside any live turn persist caller-authored text that later
+    wakes a full cognition turn at ``Trust.TRUSTED``.
+
+    The signal here is deliberately a NON-self_followup source, so the
+    single-hop check at step 2 does not fire: this test would pass for the
+    wrong reason if the chain guard caught it instead of the provenance
+    guard. Asserting on ``refused`` rather than on error text is what makes
+    that distinction observable.
+    """
+    _agent, feature, _runner, db, _backend = followup_env
+
+    from kestrel_sovereign.signals.context import (
+        reset_current_signal,
+        set_current_signal,
+    )
+
+    stale = Signal(
+        source="cron.backup_snapshot",
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent="did:test:self-followup",
+    )
+    token = set_current_signal(stale)
+    try:
+        result = await _schedule(
+            feature, intent="caller-authored, not mine", in_turn=False
+        )
+    finally:
+        reset_current_signal(token)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data.get("refused") == "no_in_turn_origin", (
+        "a signal in context must not stand in for turn ownership -- "
+        f"got {result.data.get('refused')!r}"
+    )
+    rows = await db.fetchall(
+        "SELECT id FROM scheduled_tasks WHERE task_name = ?", (SELF_FOLLOWUP,)
+    )
+    assert not rows, "a refused follow-up must not leave a row behind"
