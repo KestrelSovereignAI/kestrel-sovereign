@@ -745,10 +745,26 @@ class SchedulerFeature(Feature):
                 "task %r (legacy row; see #3112). Remove or retarget it.",
                 task_name,
             )
-            return (
-                f"Refused: '{task_name}' mutates schedules and cannot run as "
-                f"a scheduled task. This row predates the creation-time "
-                f"refusal; remove or retarget it."
+            # Structured, not a plain string (#3112 gate-2 P2). A str return
+            # is classified "success" by SchedulerRunner._normalise_result, so
+            # a legacy row refusing on every tick would be logged as a healthy
+            # execution forever -- the exact "an accept that produces no turn
+            # is worse than an explicit refusal" failure this feature's
+            # docstring forbids, inverted into a refusal reported as an accept.
+            #
+            # status="failed" rather than ScheduledTaskOutcome.blocked: blocked
+            # is reserved for permission-gate denials that pause and can be
+            # resumed once the operator changes policy. Nothing an operator
+            # toggles makes this row legal again -- it must be removed or
+            # retargeted -- so pause_schedule stays False and the row keeps
+            # failing visibly rather than going quiet.
+            return ScheduledTaskOutcome(
+                status="failed",
+                result_text=(
+                    f"Refused: '{task_name}' mutates schedules and cannot run "
+                    f"as a scheduled task. This row predates the creation-time "
+                    f"refusal; remove or retarget it."
+                ),
             )
 
         dispatcher = getattr(self.agent, "dispatcher", None)

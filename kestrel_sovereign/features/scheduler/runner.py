@@ -8,6 +8,7 @@ process death leaves a lease which another runner may recover after expiry.
 """
 
 import asyncio
+import contextlib
 import contextvars
 import hashlib
 import hmac
@@ -434,6 +435,42 @@ def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
     if scope is None or not scope.active:
         return None
     return scope.execution
+
+
+def capture_scheduler_execution_scope() -> Optional[_SchedulerExecutionScope]:
+    """Capture the raw active execution scope for re-binding on another task.
+
+    Returns the SCOPE, not the execution, deliberately: the scope carries the
+    revocation flag the runner flips when a lease is lost, so a re-bound copy
+    keeps observing revocation instead of pinning a stale-but-valid-looking
+    identity. Capturing ``execution`` alone would hand a task an idempotency
+    key that outlives the claim it belongs to.
+    """
+
+    return _current_execution.get()
+
+
+@contextlib.contextmanager
+def bind_scheduler_execution_scope(scope: Optional[_SchedulerExecutionScope]):
+    """Re-present a captured execution scope on the current task (#3112).
+
+    The codex app-server dispatches each inline tool on a reader-spawned task
+    carrying a frozen pre-turn ContextVar snapshot, so a scheduled turn's tools
+    read ``None`` from ``get_current_scheduler_execution()`` and omit their
+    stable idempotency key. An occurrence retried after lease/finalization
+    uncertainty could then repeat an irreversible effect -- a merge running
+    twice.
+
+    Exposed as a binder rather than another hand-rolled set/reset pair so the
+    next transport re-binds by calling this, instead of by remembering that
+    this ContextVar exists.
+    """
+
+    token = _current_execution.set(scope)
+    try:
+        yield
+    finally:
+        _current_execution.reset(token)
 
 
 @dataclass

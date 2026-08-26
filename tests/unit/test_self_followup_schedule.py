@@ -20,6 +20,7 @@ is worse than an explicit refusal:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -887,6 +888,137 @@ def test_normalize_intent_defuses_markdown_fences():
     before, _, after = rendered.partition("```")
     _, _, tail = after.partition("```")
     assert guidance in (before + tail).lower()
+
+
+def test_inline_executor_carries_scheduler_execution_scope():
+    """Instance FIVE: the scheduler execution scope (#3112 gate-2 P1).
+
+    A ``self_followup`` turn runs inside a scheduler execution. An isolated or
+    effectful tool reads ``get_current_scheduler_execution()`` to stamp its
+    stable idempotency key. The codex app-server dispatches inline tools on a
+    reader-spawned task carrying a frozen pre-turn snapshot, so that read
+    returns ``None`` and the key is omitted -- and an occurrence retried after
+    lease/finalization uncertainty repeats the effect. For a feature whose
+    worked example is "merge PR N once CI settles", that is a merge twice.
+
+    Runs the capture on one task and the bind on ANOTHER, because a
+    same-task test passes whether or not the binder exists -- ContextVars
+    already propagate down a single task. The cross-task hop is the defect.
+    """
+    from kestrel_sovereign.features.scheduler.runner import (
+        _SchedulerExecutionScope,
+        bind_scheduler_execution_scope,
+        capture_scheduler_execution_scope,
+        get_current_scheduler_execution,
+        _current_execution,
+    )
+
+    execution = SimpleNamespace(id="exec-1", idempotency_key="occ:key:1")
+    scope = _SchedulerExecutionScope(execution=execution)
+
+    async def _drive():
+        token = _current_execution.set(scope)
+        try:
+            captured = capture_scheduler_execution_scope()
+            assert captured is not None
+
+            seen: dict = {}
+
+            async def _reader_task():
+                # Frozen pre-turn snapshot: no scope of its own.
+                seen["before"] = get_current_scheduler_execution()
+                with bind_scheduler_execution_scope(captured):
+                    seen["during"] = get_current_scheduler_execution()
+                seen["after"] = get_current_scheduler_execution()
+
+            # asyncio.create_task copies the CURRENT context, so drive the
+            # reader from a context that never saw the scope -- the real
+            # app-server topology, where the reader predates the turn.
+            done = asyncio.Event()
+            result: dict = {}
+
+            def _spawn():
+                async def _wrapped():
+                    try:
+                        await _reader_task()
+                    except BaseException as exc:  # pragma: no cover
+                        result["error"] = exc
+                    finally:
+                        done.set()
+
+                return asyncio.ensure_future(_wrapped())
+
+            empty_ctx = contextvars.Context()
+            task = empty_ctx.run(_spawn)
+            await done.wait()
+            await task
+            if "error" in result:
+                raise result["error"]
+            return seen
+        finally:
+            _current_execution.reset(token)
+
+    seen = asyncio.run(_drive())
+
+    assert seen["before"] is None, (
+        "the reader task must start without the turn's scope, or this test "
+        "would pass without the binder"
+    )
+    assert seen["during"] is execution, (
+        "the inline executor must re-present the scheduler execution so an "
+        "effectful tool can stamp its idempotency key"
+    )
+    assert seen["after"] is None, "the binder must not leak past its block"
+
+
+def test_scheduler_execution_scope_capture_preserves_revocation():
+    """A re-bound scope must keep observing revocation (#3112 gate-2 P1).
+
+    The binder carries the SCOPE, not the execution: the runner flips the
+    scope's active flag when a lease is lost. Capturing ``execution`` alone
+    would hand a task an idempotency key that outlives the claim it belongs
+    to -- a stale key is worse than no key, because it looks authoritative.
+    """
+    from kestrel_sovereign.features.scheduler.runner import (
+        _SchedulerExecutionScope,
+        bind_scheduler_execution_scope,
+        get_current_scheduler_execution,
+    )
+
+    execution = SimpleNamespace(id="exec-2", idempotency_key="occ:key:2")
+    scope = _SchedulerExecutionScope(execution=execution)
+
+    with bind_scheduler_execution_scope(scope):
+        assert get_current_scheduler_execution() is execution
+        scope.active = False
+        assert get_current_scheduler_execution() is None, (
+            "a revoked scope must stop yielding an execution identity"
+        )
+
+
+def test_legacy_schedule_mutating_refusal_is_structured():
+    """A legacy wrapper refusal must not be recorded as a success (#3112 P2).
+
+    A recurring row persisted by an earlier release can still target a
+    schedule-mutating tool. The runtime refusal correctly blocks it, but a
+    plain-string return is classified ``success`` by ``_normalise_result`` --
+    so the row stays enabled and every refusal is logged as a healthy run.
+    """
+    from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+
+    task = SimpleNamespace(id="sched-legacy", schedule_kind="cron")
+    outcome = ScheduledTaskOutcome(
+        status="failed",
+        result_text="Refused: 'schedule_add_deadline' mutates schedules",
+    )
+    status, text, _, pause = SchedulerRunner._normalise_result(outcome, task)
+
+    assert status == "failed", "a legacy refusal must not record success"
+    assert "Refused:" in text
+    # Not paused: no operator policy change makes this row legal again, so it
+    # must keep failing visibly rather than going quiet.
+    assert pause is False
 
 
 def test_normalise_result_records_refusing_tool_result_as_failed():

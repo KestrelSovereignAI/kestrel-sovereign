@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from types import SimpleNamespace
 
 import pytest
 
@@ -107,6 +108,19 @@ class _Agent(OrchestratorEngineMixin):
         # Record the semantic read the self_followup guard performs, so a
         # regression reads as "the guard saw None", not just a name diff.
         self.seen["__get_current_signal__"] = get_current_signal()
+        # Instance five: the semantic read an effectful tool performs to stamp
+        # its stable idempotency key (#3112 gate-2 P1). Imported lazily so this
+        # test module does not hard-depend on an optional feature package.
+        try:
+            from kestrel_sovereign.features.scheduler.runner import (
+                get_current_scheduler_execution,
+            )
+        except Exception:  # pragma: no cover - feature package absent
+            self.seen["__get_current_scheduler_execution__"] = None
+        else:
+            self.seen["__get_current_scheduler_execution__"] = (
+                get_current_scheduler_execution()
+            )
         return {"ok": True}
 
 
@@ -246,3 +260,53 @@ async def test_off_turn_executor_carries_no_signal():
     await harness.stop()
 
     assert agent.seen.get("__get_current_signal__") is None
+
+
+@pytest.mark.asyncio
+async def test_inline_executor_wiring_carries_scheduler_execution_scope():
+    """Instance FIVE, through the REAL executor (#3112 gate-2 P1).
+
+    ``test_inline_executor_carries_scheduler_execution_scope`` in
+    tests/unit/test_self_followup_schedule.py proves the capture/bind
+    MECHANISM by calling the two helpers directly on a hand-spawned task.
+    That is necessary but not sufficient: reverting
+    ``turn_scheduler_scope = capture_scheduler_execution_scope()`` to
+    ``None`` in ``_make_inline_tool_executor`` leaves it green, because it
+    never touches the executor. A mechanism test that survives deleting the
+    wiring certifies something adjacent to what it claims.
+
+    This one dispatches through the real ``_make_inline_tool_executor`` on the
+    frozen-context reader topology, so the assertion fails if the capture, the
+    bind, or the ``with`` clause is dropped.
+    """
+    from kestrel_sovereign.features.scheduler.runner import (
+        _SchedulerExecutionScope,
+        _current_execution,
+        get_current_scheduler_execution,
+    )
+
+    execution = SimpleNamespace(id="exec-wiring-1", idempotency_key="occ:key:wiring")
+    scope = _SchedulerExecutionScope(execution=execution)
+
+    agent = _Agent()
+    harness = _CodexReaderHarness()
+    # Reader spawned BEFORE the scope is published: frozen pre-turn snapshot.
+    await harness.ensure_started()
+
+    token = _current_execution.set(scope)
+    try:
+        with part_collector():
+            executor = agent._make_inline_tool_executor("session-scheduler-scope")
+            await harness.dispatch(executor, "some_tool", {})
+    finally:
+        _current_execution.reset(token)
+    await harness.stop()
+
+    seen = agent.seen.get("__get_current_scheduler_execution__")
+    assert seen is not None, (
+        "get_current_scheduler_execution() returned None inside an inline "
+        "tool: an effectful tool omits its stable idempotency key, so an "
+        "occurrence retried after lease/finalization uncertainty repeats the "
+        "effect -- for the worked example, a merge running twice (#3112)."
+    )
+    assert getattr(seen, "idempotency_key", None) == "occ:key:wiring"
