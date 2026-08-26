@@ -152,13 +152,14 @@ registry and no lookup API that can select another agent's telemetry. Observer
 delivery is advisory: failures are logged, OS sampling runs in the default
 worker pool, and synchronous host observers run in a separate bounded daemon
 executor so they cannot starve venv or lifecycle work or hold process exit.
-Submissions are serialized per agent before entering that shared pool, so one
-tenant can occupy at most one worker or queued slot. The pool remains a bounded
-advisory resource: enough distinct tenants with wedged observers can saturate
-it, at which point other tenants degrade to retrying telemetry rather than
-losing lifecycle progress or growing an unbounded queue. A forced lifecycle
-snapshot rejected by a saturated pool or failed during snapshot construction
-is retried with bounded exponential backoff until delivery or terminal
+Submissions are serialized per agent before entering that shared pool, and a
+cancelled queued delivery is physically discarded before the agent can submit
+its retry, so one tenant can occupy at most one worker or queued slot. The pool
+remains a bounded advisory resource: enough distinct tenants with wedged
+observers can saturate it, at which point other tenants degrade to retrying
+telemetry rather than losing lifecycle progress or growing an unbounded queue.
+A forced lifecycle snapshot rejected by a saturated pool or failed during
+snapshot construction is retried with bounded exponential backoff until delivery or terminal
 lifecycle cancellation.
 Hot-path
 emissions are rate-limited and scheduled through the agent background-task

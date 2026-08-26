@@ -288,6 +288,34 @@ class _BoundedDaemonExecutor(Executor):
             finally:
                 self._work.task_done()
 
+    def _discard_cancelled_work_locked(self) -> None:
+        """Physically reclaim queue slots whose Futures were cancelled.
+
+        ``Future.cancel()`` does not remove the corresponding tuple from a
+        ``Queue``.  Delivery-deadline retries would otherwise let one agent
+        retain a fresh dead slot on every attempt while all workers are busy.
+        Submitters are serialized by ``_lock``; workers may concurrently drain
+        retained items, which only creates additional capacity.
+        """
+
+        retained: list[object] = []
+        while True:
+            try:
+                item = self._work.get_nowait()
+            except Empty:
+                break
+            try:
+                if item is self._STOP:
+                    retained.append(item)
+                    continue
+                future, _fn, _args, _kwargs = item
+                if not future.cancelled():
+                    retained.append(item)
+            finally:
+                self._work.task_done()
+        for item in retained:
+            self._work.put_nowait(item)
+
     def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
         future: Future[Any] = Future()
         try:
@@ -299,6 +327,7 @@ class _BoundedDaemonExecutor(Executor):
             if self._shutdown:
                 future.set_exception(RuntimeError("telemetry observer executor stopped"))
                 return future
+            self._discard_cancelled_work_locked()
             try:
                 self._work.put_nowait((future, fn, args, kwargs))
             except Full:
@@ -4989,7 +5018,17 @@ def _remove_isolated_feature_runtime(
         )
         os.unlink(_VENV_RELOCATION_REPAIR_MARKER, dir_fd=feature_fd)
         os.fsync(feature_fd)
-        os.rmdir(feature_component, dir_fd=feature_parent_fd)
+        try:
+            os.rmdir(feature_component, dir_fd=feature_parent_fd)
+        except OSError:
+            # The directory is still linked, so restore durable repair intent
+            # before reporting a failed final commit. A later cold wake must
+            # never adopt the partially swept runtime as healthy.
+            _ensure_venv_relocation_repair_marker_at(
+                feature_fd,
+                payload=_VENV_RECLAIM_REPAIR_PAYLOAD,
+            )
+            raise
         os.fsync(feature_parent_fd)
         return RuntimeNamespaceCleanupOutcome.REMOVED
     except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
@@ -7837,8 +7876,9 @@ class ProxyFeature(Feature):
             register_channel_bridge=register_channel_bridge,
             channel_config=effective_config,
         )
-        # Publishing a new generation is the single construction boundary for
-        # initialize, reload, supervisor recovery, and idle wake.
+        # Publishing a new generation is the construction boundary for
+        # initialize, reload, replacement recovery, and idle wake. An in-place
+        # health restart reuses the existing facade and re-arms separately.
         self._idle_retired = False
         self._idle_resume_event.set()
         # A replacement publication is the recovery boundary for an idle
@@ -10438,8 +10478,8 @@ class ProxyFeature(Feature):
     def _assert_child_start_allowed(self) -> None:
         """Refuse normal child-lifecycle work after terminal cleanup starts."""
 
-        if self._terminal_lifecycle_latched:
-            raise RuntimeError(
+        if self._terminal_lifecycle_latched or self._stopping:
+            raise _TerminalLifecyclePermitRevoked(
                 f"Cannot continue isolated feature {self.name}: terminal lifecycle "
                 "is latched; explicit initialize is required"
             )
@@ -11869,6 +11909,7 @@ class ProxyFeature(Feature):
             self._venv_relocated_this_startup
             or stamped_relocation
             or location_state == "relocated"
+            or self._venv_relocation_repair_pending()
         )
         # A missing or unclassifiable console wrapper is never fresh, even when
         # every manifest field is current. Only ``--reinstall`` is sufficient
@@ -12641,12 +12682,9 @@ class ProxyFeature(Feature):
                 task.result()
             except asyncio.CancelledError:
                 pass
-            except BaseException:  # noqa: BLE001 - infrastructure is re-armed
-                logger.warning(
-                    "Hosted isolated runtime idle monitor terminated for %s; "
-                    "re-arming after child publication",
-                    self.name,
-                )
+            except BaseException:  # noqa: BLE001 - failure logged at monitor boundary
+                pass
+            self._idle_monitor_task = None
         coro = self._monitor_idle_runtime()
         name = f"isolated-feature-idle:{self.name}"
         tracker = getattr(self.agent, "_track_background_task", None)
@@ -13220,6 +13258,12 @@ class ProxyFeature(Feature):
                             )
                             self._health_restart_count += 1
                             self._reload_gen += 1
+                            # A fatal monitor failure clears its task reference
+                            # in ``finally``. Health recovery restarts this same
+                            # facade in place, so it must explicitly restore
+                            # retirement monitoring without waiting for a new
+                            # client publication.
+                            self._start_idle_monitor()
                             self._schedule_runtime_telemetry(force=True)
                             backoff = 1.0
                         except _FacadeLifecycleOperationTimedOut:

@@ -1697,6 +1697,35 @@ def test_bounded_observer_executor_fails_closed_on_partial_worker_start(
     executor.shutdown()
 
 
+def test_bounded_observer_executor_reclaims_cancelled_queue_slots_before_retry():
+    executor = isolated_runtime._BoundedDaemonExecutor(
+        max_workers=1,
+        queue_capacity=2,
+    )
+    running = threading.Event()
+    release = threading.Event()
+
+    def block():
+        running.set()
+        assert release.wait(timeout=2)
+
+    active = executor.submit(block)
+    assert running.wait(timeout=1)
+    queued = executor.submit(lambda: "stale")
+    for attempt in range(12):
+        assert queued.cancel() is True
+        queued = executor.submit(lambda attempt=attempt: attempt)
+        with executor._work.mutex:
+            retained = list(executor._work.queue)
+        assert len(retained) == 1
+        assert retained[0][0] is queued
+
+    release.set()
+    active.result(timeout=1)
+    assert queued.result(timeout=1) == 11
+    executor.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_queued_observer_future_becomes_terminal_at_delivery_deadline(
     monkeypatch, tmp_path
@@ -1887,6 +1916,43 @@ async def test_cancelled_idle_reclaim_keeps_wake_serialized(monkeypatch, tmp_pat
         await reclaim
     assert (await wake)["success"] is True
     assert runtime_dir.is_dir()
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_final_reclaim_rmdir_republishes_durable_repair_intent(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    runtime_dir = feature._feature_runtime_dir()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+
+    real_rmdir = os.rmdir
+
+    def fail_feature_commit(path, *args, **kwargs):
+        if path == feature._runtime_directory_name and kwargs.get("dir_fd") is not None:
+            raise OSError(errno.EBUSY, "synthetic final reclaim commit failure")
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(isolated_runtime.os, "rmdir", fail_feature_commit)
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="cleanup could not complete",
+    ):
+        await feature.reclaim_idle_workspace()
+
+    marker = runtime_dir / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
+    assert marker.read_bytes() == isolated_runtime._VENV_RECLAIM_REPAIR_PAYLOAD
+    assert feature._venv_repair_reason() == "reclaim"
     await feature.shutdown()
 
 
@@ -5145,6 +5211,43 @@ def _stamp_current_fake_venv(feature: ProxyFeature, monkeypatch) -> Path:
     return python
 
 
+@pytest.mark.skipif(os.name != "posix", reason="repair marker uses POSIX dirfds")
+def test_relocation_marker_forces_reinstall_when_other_evidence_looks_current(
+    monkeypatch, tmp_path
+):
+    agent = _hosted_postgres_agent(
+        tmp_path / "runtime",
+        "agent-marker-only-relocation",
+        did="did:test:marker-only-relocation",
+    )
+    feature = ProxyFeature(
+        agent,
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    _stamp_current_fake_venv(feature, monkeypatch)
+    console = isolated_runtime._console_script_path(
+        feature._venv_path,
+        feature.runtime.service,
+    )
+    console.write_text("#!/usr/bin/env python\n")
+    runtime_fd = os.open(
+        feature._feature_runtime_dir(),
+        isolated_runtime._directory_open_flags(),
+    )
+    try:
+        isolated_runtime._ensure_venv_relocation_repair_marker_at(runtime_fd)
+    finally:
+        os.close(runtime_fd)
+
+    manifest = feature._read_provision_manifest()
+    assert feature._console_script_location_state() == "current"
+    assert manifest["venv_path"] == str(feature._venv_path.resolve())
+    assert feature._location_requires_forced_reinstall(manifest) is True
+
+
 def _runtime_with_declared_venv(venv: str) -> InstalledFeatureRuntime:
     runtime = _isolated_runtime()
     return InstalledFeatureRuntime(
@@ -8117,18 +8220,27 @@ def test_relocation_marker_publisher_refuses_missing_post_link_witness(
     runtime_dir = tmp_path / "feature-runtime"
     runtime_dir.mkdir(mode=0o700)
     directory_fd = os.open(runtime_dir, isolated_runtime._directory_open_flags())
-    reads = iter((False, False))
+    reads = iter((None, None))
+    links = []
+    real_link = os.link
+
+    def record_link(*args, **kwargs):
+        links.append((args, kwargs))
+        return real_link(*args, **kwargs)
+
     monkeypatch.setattr(
         isolated_runtime,
         "_read_venv_relocation_repair_marker_at",
         lambda _fd: next(reads),
     )
+    monkeypatch.setattr(isolated_runtime.os, "link", record_link)
     try:
         with pytest.raises(
             IsolatedRuntimePreparationError,
             match="could not be recorded",
         ):
             isolated_runtime._ensure_venv_relocation_repair_marker_at(directory_fd)
+        assert len(links) == 1
     finally:
         os.close(directory_fd)
 
@@ -18050,22 +18162,38 @@ async def test_host_ingress_idle_wake_terminal_revocation_is_not_retryable(
         monkeypatch, tmp_path, lambda **_: client
     )
 
-    async def terminal_wake():
-        raise isolated_runtime._TerminalLifecyclePermitRevoked(
-            "synthetic terminal race"
-        )
-
     feature._client = None
     feature._idle_retired = True
-    monkeypatch.setattr(feature, "_wake_idle_runtime", terminal_wake)
+    wake_entered = asyncio.Event()
+    original_wake = feature._wake_idle_runtime
+
+    async def observe_real_wake():
+        wake_entered.set()
+        await original_wake()
+
+    monkeypatch.setattr(feature, "_wake_idle_runtime", observe_real_wake)
+    ingress = None
     try:
-        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
-            await feature.call_host_ingress(
+        await feature._reload_lock.acquire()
+        ingress = asyncio.create_task(
+            feature.call_host_ingress(
                 "telegram-webhook",
                 {"update_id": 8},
             )
+        )
+        await asyncio.wait_for(wake_entered.wait(), timeout=1)
+        assert ingress.done() is False
+        feature._latch_terminal_lifecycle()
+        feature._reload_lock.release()
+        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
+            await ingress
         assert client.ingress_calls == []
     finally:
+        if feature._reload_lock.locked():
+            feature._reload_lock.release()
+        if ingress is not None and not ingress.done():
+            ingress.cancel()
+            await asyncio.gather(ingress, return_exceptions=True)
         feature._client = client
         feature._idle_retired = False
         await feature.shutdown()
@@ -20310,13 +20438,20 @@ async def test_supervisor_restarts_after_child_cancelled_health_probe(monkeypatc
     client = ChildCancelledHealthClient()
     feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
     feature._client = client
+    start_idle_monitor = Mock()
+    monkeypatch.setattr(feature, "_start_idle_monitor", start_idle_monitor)
     supervisor = asyncio.create_task(feature._supervise())
     feature._supervision_task = supervisor
     try:
         await asyncio.wait_for(first_health.wait(), timeout=1)
         await asyncio.wait_for(restarted.wait(), timeout=1)
+        for _ in range(100):
+            if start_idle_monitor.called:
+                break
+            await real_sleep(0)
         assert client.stop_calls == 1
         assert client.start_calls == 1
+        start_idle_monitor.assert_called_once_with()
         assert feature._traffic_gate.sealed is False
     finally:
         feature._stopping = True
