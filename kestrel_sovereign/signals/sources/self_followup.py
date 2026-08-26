@@ -32,6 +32,7 @@ spend.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict
@@ -69,6 +70,11 @@ _CONTROL_CHARS = frozenset(
     chr(c) for c in range(0x20) if chr(c) not in "\n\t"
 ) | {chr(0x7F)}
 
+# Three-or-more backticks: the run length that can close the prompt
+# template's fixed fence. Matched greedily so a longer run is defused whole
+# rather than leaving a residual fence behind.
+_FENCE_RUN = re.compile(r"`{3,}")
+
 
 class SelfFollowupIntentError(ValueError):
     """The intent text is missing or unusable."""
@@ -90,6 +96,24 @@ def normalize_intent(value: Any) -> str:
         raise SelfFollowupIntentError(
             "intent must be a non-empty description of the follow-up work"
         )
+    # Neutralize Markdown fences (#3112 gate-2 P2). The prompt template wraps
+    # this text in a FIXED three-backtick block. A run of three or more
+    # backticks in the intent closes that block early; the template's own
+    # closing delimiter then OPENS a second one, which puts the single-hop
+    # guidance inside a code block and lets part of the intent render outside
+    # the boundary it is advertised as sitting inside. On a feature whose
+    # subject is a trust boundary, caller text escaping its rendered boundary
+    # is the defect, not a cosmetic one.
+    #
+    # Neutralized here rather than by computing a longer fence in the template
+    # because the template is a static file and the payload contract is a
+    # closed key set -- there is nowhere to carry a per-payload delimiter. The
+    # substitution is visible in the rendered text rather than silent: an
+    # agent that wrote a fence sees that it was defused, instead of seeing its
+    # note mysteriously reformatted.
+    cleaned = _FENCE_RUN.sub(
+        lambda m: "'" * len(m.group(0)) + " (fence defused)", cleaned
+    )
     if len(cleaned) > MAX_INTENT_CHARS:
         cleaned = cleaned[:MAX_INTENT_CHARS] + "...(truncated)"
     return cleaned
