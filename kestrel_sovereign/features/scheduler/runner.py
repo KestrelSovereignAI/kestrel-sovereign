@@ -3333,6 +3333,32 @@ class SchedulerRunner:
                 logger.warning("Task %s returned non-numeric outcome signal %r; dropping", task.id, raw[1])
                 signal = None
             return "success", text, signal, False
+        # A ToolResult carrying an ERROR status is a REFUSAL, not a success
+        # (#3112 gate-2 P2). Every scheduled feature tool returns a
+        # ToolResult, which matches neither branch above and fell through to
+        # the catch-all -- so a tool that refused on every fire was recorded
+        # as succeeding on every fire, and its error text was buried inside a
+        # dataclass repr. The runner's own `except Exception` handler does not
+        # cover this: it catches RAISED failures, and a RETURNED refusal never
+        # raises.
+        #
+        # Detected structurally (a `status` whose value is the error string)
+        # rather than by importing ToolResult, so this stays independent of
+        # the SDK import graph and also covers the SDK's own status enum
+        # changing shape. Duck-typed on purpose: the runner deliberately
+        # tolerates legacy executor doubles that are not real ToolResults.
+        status_attr = getattr(raw, "status", None)
+        status_value = getattr(status_attr, "value", status_attr)
+        if isinstance(status_value, str) and status_value.lower() == "error":
+            detail = getattr(raw, "error", None) or getattr(
+                raw, "confirmation", None
+            )
+            return (
+                "failed",
+                str(detail) if detail else str(raw),
+                None,
+                False,
+            )
         return "success", raw if isinstance(raw, str) else (str(raw) if raw is not None else None), None, False
 
     async def _finalize(

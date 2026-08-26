@@ -23,6 +23,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -886,6 +887,49 @@ def test_normalize_intent_defuses_markdown_fences():
     before, _, after = rendered.partition("```")
     _, _, tail = after.partition("```")
     assert guidance in (before + tail).lower()
+
+
+def test_normalise_result_records_refusing_tool_result_as_failed():
+    """A RETURNED refusal is not a success (#3112 gate-2 P2).
+
+    Every scheduled feature tool returns a ``ToolResult``. It matches neither
+    the ``ScheduledTaskOutcome`` branch nor the 2-tuple branch, so it fell
+    through to the catch-all that hard-codes ``"success"`` -- meaning a tool
+    that refused on every fire was recorded as succeeding on every fire, with
+    its error text buried in a dataclass repr.
+
+    The runner's ``except Exception`` handler does not cover this: it catches
+    RAISED failures, and a returned refusal never raises. That is why this
+    asserts on ``_normalise_result`` directly rather than on a run that throws.
+    """
+    from kestrel_sdk.tools.result import ToolResult
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+
+    task = SimpleNamespace(id="sched-1", schedule_kind="cron")
+
+    status, text, signal, pause = SchedulerRunner._normalise_result(
+        ToolResult.failed("refused: schedule_mutating_target"), task
+    )
+    assert status == "failed", "a refusing ToolResult must not record success"
+    assert "refused: schedule_mutating_target" in text
+    assert "ToolResult(" not in text, "error text must not be a dataclass repr"
+    assert signal is None
+    # ``pause_schedule`` stays False: ScheduledTaskOutcome reserves pausing for
+    # ``blocked``, and widening it here would violate that invariant. The row
+    # still re-fires -- honestly recorded as failing rather than as succeeding.
+    assert pause is False
+
+    # A successful ToolResult must be untouched, or this "fix" would recategorize
+    # every healthy scheduled run as a failure.
+    ok_status, _, _, ok_pause = SchedulerRunner._normalise_result(
+        ToolResult.ok("done"), task
+    )
+    assert ok_status == "success"
+    assert ok_pause is False
+
+    # Plain strings and 2-tuples keep their legacy meaning.
+    assert SchedulerRunner._normalise_result("plain text", task)[0] == "success"
+    assert SchedulerRunner._normalise_result(("text", 0.5), task)[0] == "success"
 
 
 def test_normalize_intent_caps_length():
