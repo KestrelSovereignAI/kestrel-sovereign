@@ -353,6 +353,14 @@ async def test_idle_retirement_cold_starts_exactly_one_new_generation(
     assert snapshot.last_used_at is not None
     assert not hasattr(snapshot, "command")
     assert not hasattr(snapshot, "environment")
+    # Observer delivery is intentionally off-loop and best-effort. Under the
+    # full xdist load the worker can settle after the lifecycle assertions, so
+    # synchronize with the public observation instead of assuming immediate
+    # executor service.
+    for _ in range(200):
+        if snapshots:
+            break
+        await asyncio.sleep(0.01)
     assert {item.feature for item in snapshots} == {"TestFeature"}
     await feature.shutdown()
 
