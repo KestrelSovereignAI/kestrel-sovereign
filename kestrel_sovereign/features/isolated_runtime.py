@@ -6683,6 +6683,7 @@ class ProxyFeature(Feature):
                 and not uncertain_retirement
                 and not self._terminal_lifecycle_latched
                 and not self._stopping
+                and not self._immutable_venv_override_is_inside_workspace()
             ),
             "disk_telemetry_status": self._disk_telemetry_status,
         }
@@ -6812,7 +6813,6 @@ class ProxyFeature(Feature):
             return
 
         runtime_dir = self._feature_runtime_dir()
-        venv = self._venv_path
         hosted_scope = self._isolated_runtime_scope
         runtime_owner = (
             _agent_runtime_owner(self.agent) if hosted_scope is not None else None
@@ -6846,10 +6846,8 @@ class ProxyFeature(Feature):
                     seen_linked_files=seen_linked_files,
                 )
 
-            managed_venv = (
-                venv is not None
-                and venv == runtime_dir / ".venv"
-                and self._bin_path is None
+            managed_venv = self._runtime_venv_is_core_managed(
+                runtime_dir=runtime_dir
             )
             try:
                 if managed_venv and refresh_environment:
@@ -11527,6 +11525,32 @@ class ProxyFeature(Feature):
             or self.runtime.venv
         )
 
+    def _runtime_venv_is_core_managed(
+        self,
+        *,
+        runtime_dir: Path | None = None,
+    ) -> bool:
+        """Return whether Core owns provisioning and removal of this venv."""
+
+        selected_runtime = (
+            self._feature_runtime_dir() if runtime_dir is None else runtime_dir
+        )
+        return (
+            self._venv_path is not None
+            and self._venv_path == selected_runtime / ".venv"
+            and self._bin_path is None
+            and not self._venv_is_overridden()
+        )
+
+    def _immutable_venv_override_is_inside_workspace(self) -> bool:
+        """Refuse to advertise deletion of an operator-owned contained venv."""
+
+        if self._hosted_immutable_venv_setting() is None or self._venv_path is None:
+            return False
+        runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
+        selected_venv = Path(os.path.abspath(self._venv_path))
+        return selected_venv == runtime_dir or runtime_dir in selected_venv.parents
+
     def _process_venv_is_overridden(self) -> bool:
         """Whether this host selected a process-wide immutable venv artifact."""
 
@@ -13036,6 +13060,7 @@ class ProxyFeature(Feature):
                     or not self._idle_retired
                     or self._client is not None
                     or self._retirement_is_uncertain()
+                    or self._immutable_venv_override_is_inside_workspace()
                 ):
                     raise IsolatedRuntimePreparationError(
                         "Hosted isolated feature workspace is not idle and reclaimable."
@@ -13062,9 +13087,7 @@ class ProxyFeature(Feature):
                 self._telemetry_disk_refresh_pending = False
                 self._telemetry_environment_refresh_pending = False
                 self._environment_bytes = (
-                    0
-                    if self._bin_path is None and not self._venv_is_overridden()
-                    else None
+                    0 if self._runtime_venv_is_core_managed() else None
                 )
                 self._private_writable_bytes = 0
                 self._downloaded_bytes = 0

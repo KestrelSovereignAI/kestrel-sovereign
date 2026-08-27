@@ -1007,6 +1007,41 @@ async def test_reclaim_and_telemetry_share_live_retirement_evidence(
 
 
 @pytest.mark.asyncio
+async def test_contained_immutable_venv_override_is_never_cleanup_eligible(
+    monkeypatch, tmp_path
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime_dir = feature._prepare_runtime_workspace()
+    immutable_venv = runtime_dir / ".venv"
+    _write_prebuilt_venv_shape(immutable_venv)
+    monkeypatch.setenv(
+        "KESTREL_FEATURE_TESTFEATURE_VENV",
+        str(immutable_venv),
+    )
+    feature._venv_path = immutable_venv.resolve()
+    feature._bin_path = None
+    feature._idle_retired = True
+    feature._client = None
+
+    snapshot = await feature.sample_runtime_telemetry(refresh_disk=True)
+
+    assert snapshot.state == "idle"
+    assert snapshot.cleanup_eligible is False
+    assert snapshot.environment_bytes is None
+    assert feature._runtime_venv_is_core_managed() is False
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="not idle and reclaimable",
+    ):
+        await feature.reclaim_idle_workspace()
+    assert immutable_venv.is_dir()
+    assert isolated_runtime._venv_python(immutable_venv).is_file()
+
+
+@pytest.mark.asyncio
 async def test_idle_ui_manifest_retains_last_published_contribution(monkeypatch, tmp_path):
     static_dir = None
 
@@ -1637,6 +1672,8 @@ async def test_inflight_sync_emit_coalesces_idle_cleanup_snapshot(monkeypatch, t
 
 @pytest.mark.asyncio
 async def test_sync_observer_never_blocks_initialize_or_event_loop(monkeypatch, tmp_path):
+    loop_thread = threading.get_ident()
+    observer_threads = []
     observer_started = threading.Event()
     observer_finished = threading.Event()
     release_observer = threading.Event()
@@ -1644,6 +1681,7 @@ async def test_sync_observer_never_blocks_initialize_or_event_loop(monkeypatch, 
     heartbeat_done = asyncio.Event()
 
     def observe(_snapshot):
+        observer_threads.append(threading.get_ident())
         observer_started.set()
         assert release_observer.wait(timeout=2)
         observer_finished.set()
@@ -1673,6 +1711,8 @@ async def test_sync_observer_never_blocks_initialize_or_event_loop(monkeypatch, 
     await asyncio.wait_for(heartbeat_done.wait(), timeout=1)
 
     assert heartbeat_ticks == 5
+    assert observer_threads
+    assert all(thread != loop_thread for thread in observer_threads)
     assert not observer_finished.is_set()
     release_observer.set()
     assert await asyncio.to_thread(observer_finished.wait, 1)
@@ -1710,6 +1750,7 @@ async def test_sync_observer_never_occupies_lifecycle_default_executor(
             break
         await asyncio.sleep(0.01)
     assert observer_started.is_set()
+    assert isolated_runtime._TELEMETRY_OBSERVER_EXECUTOR._threads
     assert all(
         thread.daemon
         for thread in isolated_runtime._TELEMETRY_OBSERVER_EXECUTOR._threads

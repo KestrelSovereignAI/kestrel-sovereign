@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import signal
 import sys
 from unittest.mock import Mock
@@ -24,6 +25,15 @@ from kestrel_sovereign.features.isolated_runtime import (
 
 
 _TEST_AGENT_DID = "did:test:isolated-integration"
+
+
+def _package_index_is_explicitly_disabled() -> bool:
+    """Return whether the runner declared package resolution unavailable."""
+
+    return any(
+        os.environ.get(name, "").strip().casefold() in {"1", "true", "yes", "on"}
+        for name in ("UV_OFFLINE", "UV_NO_INDEX", "PIP_NO_INDEX")
+    )
 
 
 def _config_node_id(feature_name: str) -> str:
@@ -289,6 +299,10 @@ async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    _package_index_is_explicitly_disabled(),
+    reason="managed-venv integration requires the SDK package index",
+)
 async def test_hosted_idle_monitor_reclaims_and_reprovisions_real_managed_venv(
     tmp_path,
 ):
