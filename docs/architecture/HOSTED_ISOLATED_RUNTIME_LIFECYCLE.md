@@ -111,6 +111,11 @@ does not own. This remains true when `BIN` is also configured; Core bases the
 decision on the separately validated `VENV` artifact rather than the launch
 path selected by `BIN`. Operators must relocate that immutable venv outside the
 agent-scoped workspace before Core can reclaim the workspace.
+If a cold wake cannot revalidate the configured immutable venv, Core retains
+the last validated artifact and marks custody unproven. Cleanup remains
+ineligible, and reclamation returns a distinct setting-only custody diagnostic,
+until a later successful runtime-path resolution republishes the complete
+launch and custody state.
 
 Core 0.53.5 introduces a distinct interrupted-reclaim marker payload. A host
 must finish or retry any pending reclaim with Core 0.53.5 or newer before

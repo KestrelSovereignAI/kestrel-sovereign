@@ -6583,6 +6583,7 @@ class ProxyFeature(Feature):
         # Retain the separately validated immutable VENV for custody checks.
         self._validated_hosted_immutable_venv_path: Optional[Path] = None
         self._validated_hosted_immutable_venv_setting: Optional[str] = None
+        self._hosted_immutable_venv_custody_unproven = False
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
         # child construction must execute that target rather than re-following
@@ -6695,6 +6696,7 @@ class ProxyFeature(Feature):
                 and not uncertain_retirement
                 and not self._terminal_lifecycle_latched
                 and not self._stopping
+                and not self._immutable_venv_custody_is_unproven()
                 and not self._immutable_venv_override_is_inside_workspace()
             ),
             "disk_telemetry_status": self._disk_telemetry_status,
@@ -11434,71 +11436,105 @@ class ProxyFeature(Feature):
             logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
-        # A new resolution invalidates any prior enable cycle's console pin.
-        self._validated_hosted_console_path = None
-        self._validated_hosted_immutable_venv_path = None
-        self._validated_hosted_immutable_venv_setting = None
+        hosted = self._runtime_is_hosted()
+        selected_setting = (
+            self._hosted_immutable_venv_setting() if hosted else None
+        )
         validated_hosted_overrides: Optional[
             _ValidatedHostedPrebuiltOverrides
         ] = None
-        if self._runtime_is_hosted():
-            # Revalidate here as well as at construction: tests, embedders, and
-            # long-lived hosts can mutate ``os.environ`` between discovery and
-            # enable.  A late process-wide path must never acquire provisioning
-            # authority merely because the ProxyFeature already exists.
-            validated_hosted_overrides = _validate_hosted_process_prebuilt_overrides(
-                self.name,
-                runtime_venv=self.runtime.venv,
-            )
-            self._validated_hosted_immutable_venv_path = (
-                validated_hosted_overrides.venv_path
-            )
-            self._validated_hosted_immutable_venv_setting = (
-                validated_hosted_overrides.venv_setting
-            )
-        bin_override = os.environ.get(_env_key(self.name, "BIN"))
-        if bin_override:
-            # BIN is authoritative for this launch attempt. Do not reflect or
-            # forward unused service metadata to the child factory.
-            self._service_target = None
-            if (
-                validated_hosted_overrides is not None
-                and validated_hosted_overrides.bin_path is not None
-            ):
-                return (
-                    self._default_venv_path(),
-                    validated_hosted_overrides.bin_path,
+        try:
+            if hosted:
+                # Revalidate here as well as at construction: tests, embedders,
+                # and long-lived hosts can mutate ``os.environ`` between
+                # discovery and enable. A late process-wide path must never
+                # acquire provisioning authority merely because the
+                # ProxyFeature already exists.
+                validated_hosted_overrides = (
+                    _validate_hosted_process_prebuilt_overrides(
+                        self.name,
+                        runtime_venv=self.runtime.venv,
+                    )
                 )
-            return (
-                self._default_venv_path(),
-                Path(bin_override).expanduser().resolve(),
-            )
 
-        # Revalidate at the launch-path mutation boundary. In particular, a
-        # BIN override removed after discovery must not expose missing or
-        # malformed service metadata to `_service_command`.
-        self._service_target = _validated_isolated_service_target(
-            self.runtime.service
+            bin_override = os.environ.get(_env_key(self.name, "BIN"))
+            if bin_override:
+                # BIN is authoritative for this launch attempt. Do not reflect
+                # or forward unused service metadata to the child factory.
+                service_target = None
+                resolved_venv = self._default_venv_path()
+                resolved_bin = (
+                    validated_hosted_overrides.bin_path
+                    if validated_hosted_overrides is not None
+                    and validated_hosted_overrides.bin_path is not None
+                    else Path(bin_override).expanduser().resolve()
+                )
+            else:
+                # A BIN override removed after discovery must not expose
+                # missing or malformed service metadata to `_service_command`.
+                service_target = _validated_isolated_service_target(
+                    self.runtime.service
+                )
+                venv_override = os.environ.get(_env_key(self.name, "VENV"))
+                if venv_override:
+                    resolved_venv = (
+                        validated_hosted_overrides.venv_path
+                        if validated_hosted_overrides is not None
+                        and validated_hosted_overrides.venv_path is not None
+                        else Path(venv_override).expanduser().resolve()
+                    )
+                elif self.runtime.venv:
+                    resolved_venv = (
+                        validated_hosted_overrides.venv_path
+                        if validated_hosted_overrides is not None
+                        and validated_hosted_overrides.venv_path is not None
+                        else Path(self.runtime.venv).expanduser().resolve()
+                    )
+                else:
+                    resolved_venv = self._default_venv_path()
+                resolved_bin = None
+        except Exception:
+            if selected_setting is not None:
+                # A failed cold re-resolution proves nothing about custody.
+                # Retain the last validated artifact but fail closed even when
+                # there was no prior successful resolution.
+                (
+                    self._validated_hosted_immutable_venv_setting,
+                    self._hosted_immutable_venv_custody_unproven,
+                ) = (selected_setting, True)
+            raise
+
+        validated_venv_path = (
+            validated_hosted_overrides.venv_path
+            if validated_hosted_overrides is not None
+            else None
         )
-
-        venv_override = os.environ.get(_env_key(self.name, "VENV"))
-        if venv_override:
-            if (
-                validated_hosted_overrides is not None
-                and validated_hosted_overrides.venv_path is not None
-            ):
-                return validated_hosted_overrides.venv_path, None
-            return Path(venv_override).expanduser().resolve(), None
-
-        if self.runtime.venv:
-            if (
-                validated_hosted_overrides is not None
-                and validated_hosted_overrides.venv_path is not None
-            ):
-                return validated_hosted_overrides.venv_path, None
-            return Path(self.runtime.venv).expanduser().resolve(), None
-
-        return self._default_venv_path(), None
+        validated_venv_setting = (
+            validated_hosted_overrides.venv_setting
+            if validated_hosted_overrides is not None
+            else None
+        )
+        # Publish only after every validation and computation succeeds. There
+        # is no await between these stores, and production callers hold the
+        # reload lock, so reclaim cannot observe a mixed launch/custody state.
+        (
+            self._service_target,
+            self._venv_path,
+            self._bin_path,
+            self._validated_hosted_immutable_venv_path,
+            self._validated_hosted_immutable_venv_setting,
+            self._hosted_immutable_venv_custody_unproven,
+            self._validated_hosted_console_path,
+        ) = (
+            service_target,
+            resolved_venv,
+            resolved_bin,
+            validated_venv_path,
+            validated_venv_setting,
+            False,
+            None,
+        )
+        return resolved_venv, resolved_bin
 
     def _runtime_is_hosted(self) -> bool:
         return (
@@ -11571,6 +11607,11 @@ class ProxyFeature(Feature):
         runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
         selected_venv = Path(os.path.abspath(selected_override))
         return selected_venv == runtime_dir or runtime_dir in selected_venv.parents
+
+    def _immutable_venv_custody_is_unproven(self) -> bool:
+        """Whether failed hosted resolution makes workspace custody unknown."""
+
+        return self._hosted_immutable_venv_custody_unproven
 
     def _process_venv_is_overridden(self) -> bool:
         """Whether this host selected a process-wide immutable venv artifact."""
@@ -13084,6 +13125,14 @@ class ProxyFeature(Feature):
                 ):
                     raise IsolatedRuntimePreparationError(
                         "Hosted isolated feature workspace is not idle and reclaimable."
+                    )
+                if self._immutable_venv_custody_is_unproven():
+                    setting = self._validated_hosted_immutable_venv_setting
+                    assert setting is not None
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature immutable venv custody selected by "
+                        f"{setting} could not be proven; the workspace cannot be "
+                        "reclaimed."
                     )
                 if self._immutable_venv_override_is_inside_workspace():
                     setting = self._validated_hosted_immutable_venv_setting

@@ -6,6 +6,7 @@ import errno
 import gc
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1077,6 +1078,87 @@ async def test_external_immutable_venv_with_bin_does_not_block_workspace_reclaim
     assert external_venv.is_dir()
     assert external_python.is_file()
     assert external_bin.is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ("process-env", "runtime-metadata"))
+async def test_failed_idle_wake_revalidation_keeps_immutable_venv_custody(
+    monkeypatch, tmp_path, selection
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    probe = ProxyFeature(
+        agent,
+        _idle_test_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    runtime_dir = probe._prepare_runtime_workspace()
+    immutable_venv = runtime_dir / ".venv"
+    immutable_python = _write_prebuilt_venv_shape(immutable_venv)
+
+    if selection == "process-env":
+        setting = "KESTREL_FEATURE_TESTFEATURE_VENV"
+        monkeypatch.setenv(setting, str(immutable_venv))
+        feature = probe
+    else:
+        setting = "runtime.venv"
+        runtime = _idle_test_runtime()
+        feature = ProxyFeature(
+            agent,
+            InstalledFeatureRuntime(
+                class_name=runtime.class_name,
+                entry_point=runtime.entry_point,
+                distribution=runtime.distribution,
+                runtime=runtime.runtime,
+                service=runtime.service,
+                project=runtime.project,
+                description=runtime.description,
+                venv=str(immutable_venv),
+            ),
+            client_factory=FakeIsolatedClient,
+        )
+        feature._prepare_runtime_workspace()
+
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._idle_retired = True
+    feature._client = None
+    assert feature.runtime_telemetry_snapshot().cleanup_eligible is False
+    validated_path = feature._validated_hosted_immutable_venv_path
+
+    real_unsafe = isolated_runtime._hosted_immutable_metadata_is_unsafe
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_hosted_immutable_metadata_is_unsafe",
+        lambda _metadata: True,
+    )
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="could not be prepared after idle retirement",
+    ):
+        await feature._wake_idle_runtime()
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_hosted_immutable_metadata_is_unsafe",
+        real_unsafe,
+    )
+
+    snapshot = feature.runtime_telemetry_snapshot()
+    assert snapshot.state == "idle"
+    assert snapshot.cleanup_eligible is False
+    assert feature._hosted_immutable_venv_custody_unproven is True
+    assert feature._validated_hosted_immutable_venv_path == validated_path
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match=f"custody selected by {re.escape(setting)} could not be proven",
+    ) as raised:
+        await feature.reclaim_idle_workspace()
+    assert str(tmp_path) not in str(raised.value)
+    assert immutable_venv.is_dir()
+    assert immutable_python.is_file()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    assert feature._hosted_immutable_venv_custody_unproven is False
+    assert feature.runtime_telemetry_snapshot().cleanup_eligible is False
 
 
 @pytest.mark.asyncio
