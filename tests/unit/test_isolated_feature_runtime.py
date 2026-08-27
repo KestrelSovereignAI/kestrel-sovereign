@@ -1460,6 +1460,119 @@ def test_telemetry_observer_submission_lock_is_agent_scoped(monkeypatch, tmp_pat
 
     assert first._telemetry_observer_agent_lock is sibling._telemetry_observer_agent_lock
     assert first._telemetry_observer_agent_lock is not other._telemetry_observer_agent_lock
+    assert (
+        first._telemetry_observer_agent_admission
+        is sibling._telemetry_observer_agent_admission
+    )
+    assert (
+        first._telemetry_observer_agent_admission
+        is not other._telemetry_observer_agent_admission
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_cancellation_keeps_sync_observer_admission_until_settlement(
+    monkeypatch, tmp_path
+):
+    executor = isolated_runtime._BoundedDaemonExecutor(
+        max_workers=2,
+        queue_capacity=2,
+    )
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_EXECUTOR", executor)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_BASE_SECONDS", 1.0)
+    release = threading.Event()
+    first_started = threading.Event()
+    first_finished = threading.Event()
+    same_agent_calls = 0
+    calls_lock = threading.Lock()
+
+    def blocking_observer(_snapshot):
+        nonlocal same_agent_calls
+        with calls_lock:
+            same_agent_calls += 1
+        first_started.set()
+        try:
+            assert release.wait(timeout=2)
+        finally:
+            first_finished.set()
+
+    first_agent = Mock(did=_TEST_AGENT_DID, features={})
+    first_agent.storage_path = str(tmp_path / "first" / "kestrel_prime.db")
+    (tmp_path / "first-runtime").mkdir()
+    _configure_idle_lifecycle(
+        first_agent,
+        tmp_path / "first-runtime",
+        idle_timeout_seconds=3600,
+        telemetry_observer=blocking_observer,
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setenv("KESTREL_FEATURE_SIBLINGFEATURE_BIN", "/bin/test-service")
+    first = ProxyFeature(
+        first_agent,
+        _idle_test_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    sibling_runtime = InstalledFeatureRuntime(
+        class_name="SiblingFeature",
+        entry_point="test_pkg.feature:SiblingFeature",
+        distribution="sibling-pkg",
+        runtime="isolated-venv",
+        service="sibling_service",
+    )
+    sibling = ProxyFeature(
+        first_agent,
+        sibling_runtime,
+        client_factory=FakeIsolatedClient,
+    )
+
+    other_snapshots = []
+    other_agent = Mock(did="did:key:zOtherTenant", features={})
+    other_agent.storage_path = str(tmp_path / "other" / "kestrel_prime.db")
+    (tmp_path / "other-runtime").mkdir()
+    _configure_idle_lifecycle(
+        other_agent,
+        tmp_path / "other-runtime",
+        idle_timeout_seconds=3600,
+        telemetry_observer=other_snapshots.append,
+    )
+    other = ProxyFeature(
+        other_agent,
+        _idle_test_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+
+    first_emit = asyncio.create_task(first._emit_runtime_telemetry())
+    try:
+        assert await asyncio.to_thread(first_started.wait, 1)
+        first._latch_terminal_lifecycle()
+        await asyncio.wait_for(first_emit, timeout=1)
+
+        await sibling._emit_runtime_telemetry()
+        await asyncio.sleep(0.05)
+        assert same_agent_calls == 1
+
+        await other._emit_runtime_telemetry()
+        for _ in range(100):
+            if other_snapshots:
+                break
+            await asyncio.sleep(0.01)
+        assert len(other_snapshots) == 1
+
+        release.set()
+        assert await asyncio.to_thread(first_finished.wait, 1)
+        await sibling._emit_runtime_telemetry()
+        for _ in range(100):
+            if same_agent_calls == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert same_agent_calls == 2
+    finally:
+        sibling._latch_terminal_lifecycle()
+        other._latch_terminal_lifecycle()
+        release.set()
+        await asyncio.gather(first_emit, return_exceptions=True)
+        executor.shutdown()
 
 
 @pytest.mark.asyncio

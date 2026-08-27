@@ -372,6 +372,43 @@ class _BoundedDaemonExecutor(Executor):
             future.cancel()
 
 
+class _AgentTelemetryObserverAdmission:
+    """Keep one agent's synchronous observer submission tied to settlement."""
+
+    def __init__(self) -> None:
+        # Executor submission can return an already-settled Future; its done
+        # callback then runs synchronously from ``add_done_callback`` below.
+        self._lock = threading.RLock()
+        self._active: Future[Any] | None = None
+
+    def submit(
+        self,
+        executor: _BoundedDaemonExecutor,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        with self._lock:
+            active = self._active
+            if active is not None and not active.done():
+                refused: Future[Any] = Future()
+                refused.set_exception(
+                    RuntimeError("telemetry observer agent submission already active")
+                )
+                return refused
+            callback = executor.submit(fn, *args, **kwargs)
+            self._active = callback
+
+            def release(completed: Future[Any]) -> None:
+                with self._lock:
+                    if self._active is completed:
+                        self._active = None
+
+            callback.add_done_callback(release)
+            return callback
+
+
 _TELEMETRY_OBSERVER_EXECUTOR = _BoundedDaemonExecutor(
     max_workers=4,
     queue_capacity=8,
@@ -6450,6 +6487,22 @@ class ProxyFeature(Feature):
                 agent_attributes["_isolated_runtime_telemetry_observer_lock"] = (
                     self._telemetry_observer_agent_lock
                 )
+        self._telemetry_observer_agent_admission = (
+            agent_attributes.get("_isolated_runtime_telemetry_observer_admission")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        if self._telemetry_observer is not None and not isinstance(
+            self._telemetry_observer_agent_admission,
+            _AgentTelemetryObserverAdmission,
+        ):
+            self._telemetry_observer_agent_admission = (
+                _AgentTelemetryObserverAdmission()
+            )
+            if isinstance(agent_attributes, dict):
+                agent_attributes["_isolated_runtime_telemetry_observer_admission"] = (
+                    self._telemetry_observer_agent_admission
+                )
         self._idle_monitor_task: asyncio.Task[None] | None = None
         self._idle_retired = False
         self._activity_generation = 0
@@ -6941,11 +6994,26 @@ class ProxyFeature(Feature):
                 # process-global worker or queue slot.
                 assert isinstance(self._telemetry_observer_agent_lock, asyncio.Lock)
                 async with self._telemetry_observer_agent_lock:
-                    callback = _TELEMETRY_OBSERVER_EXECUTOR.submit(
+                    assert isinstance(
+                        self._telemetry_observer_agent_admission,
+                        _AgentTelemetryObserverAdmission,
+                    )
+                    callback = self._telemetry_observer_agent_admission.submit(
+                        _TELEMETRY_OBSERVER_EXECUTOR,
                         observer,
                         snapshot,
                     )
                     wrapped = asyncio.wrap_future(callback)
+
+                    def consume_wrapped(completed: asyncio.Future[Any]) -> None:
+                        if completed.cancelled():
+                            return
+                        try:
+                            completed.exception()
+                        except BaseException:  # noqa: BLE001 - advisory outcome
+                            pass
+
+                    wrapped.add_done_callback(consume_wrapped)
                     try:
                         result = await asyncio.wait_for(
                             asyncio.shield(wrapped),
