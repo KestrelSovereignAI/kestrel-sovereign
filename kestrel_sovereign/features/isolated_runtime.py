@@ -3475,7 +3475,9 @@ def _ensure_venv_relocation_repair_marker_at(
 
     expected_kind = "reclaim" if payload == _VENV_RECLAIM_REPAIR_PAYLOAD else "relocation"
     existing_kind = _read_venv_relocation_repair_marker_at(directory_fd)
-    if existing_kind == expected_kind:
+    if existing_kind == expected_kind or (
+        existing_kind == "reclaim" and expected_kind == "relocation"
+    ):
         return
     temporary = (
         f"{_VENV_RELOCATION_REPAIR_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
@@ -3611,7 +3613,9 @@ def _ensure_venv_relocation_repair_marker_portable(
 
     expected_kind = "reclaim" if payload == _VENV_RECLAIM_REPAIR_PAYLOAD else "relocation"
     existing_kind = _read_venv_relocation_repair_marker_portable(directory)
-    if existing_kind == expected_kind:
+    if existing_kind == expected_kind or (
+        existing_kind == "reclaim" and expected_kind == "relocation"
+    ):
         return
     marker = directory / _VENV_RELOCATION_REPAIR_MARKER
     temporary = directory / (
@@ -4772,16 +4776,16 @@ def _assert_no_nested_runtime_owners_at(
     """
 
     current_fd = os.dup(directory_fd)
-    current_identity = _cleanup_directory_identity(os.fstat(current_fd))
-    current_name: str | None = None
-    children = _cleanup_child_directories_at(
-        current_fd,
-        allow_owner_marker=allow_owner_marker,
-    )
-    ancestors: list[
-        tuple[tuple[int, int], str | None, list[tuple[str, tuple[int, int]]]]
-    ] = []
     try:
+        current_identity = _cleanup_directory_identity(os.fstat(current_fd))
+        current_name: str | None = None
+        children = _cleanup_child_directories_at(
+            current_fd,
+            allow_owner_marker=allow_owner_marker,
+        )
+        ancestors: list[
+            tuple[tuple[int, int], str | None, list[tuple[str, tuple[int, int]]]]
+        ] = []
         while True:
             if children:
                 child_name, child_identity = children.pop()
@@ -4837,11 +4841,11 @@ def _remove_directory_contents_at(
     """Delete one already-open tree without recursion or following symlinks."""
 
     current_fd = os.dup(directory_fd)
-    current_identity = _cleanup_directory_identity(os.fstat(current_fd))
-    current_name: str | None = None
-    ancestors: list[tuple[tuple[int, int], str | None]] = []
-    custody_checked: set[tuple[int, int]] = set()
     try:
+        current_identity = _cleanup_directory_identity(os.fstat(current_fd))
+        current_name: str | None = None
+        ancestors: list[tuple[tuple[int, int], str | None]] = []
+        custody_checked: set[tuple[int, int]] = set()
         while True:
             permits_owner_marker = allow_owner_marker and not ancestors
             if current_identity not in custody_checked:
@@ -6874,10 +6878,15 @@ class ProxyFeature(Feature):
                     if all(size is not None for size in private_sizes)
                     else None
                 )
-                downloaded, downloaded_status = measure_component(
-                    "provisioning_cache"
-                )
-                statuses.append(downloaded_status)
+                if hosted_scope is None:
+                    # Standalone workspaces have no provisioning cache. Its
+                    # truthful owned size is zero, not an unavailable path.
+                    downloaded = 0
+                else:
+                    downloaded, downloaded_status = measure_component(
+                        "provisioning_cache"
+                    )
+                    statuses.append(downloaded_status)
                 status = (
                     "budget-exceeded"
                     if "budget-exceeded" in statuses
@@ -7025,6 +7034,13 @@ class ProxyFeature(Feature):
                             asyncio.shield(wrapped),
                             timeout=_TELEMETRY_OBSERVER_TIMEOUT,
                         )
+                    except asyncio.CancelledError:
+                        # Terminal cleanup owns this asyncio task. Cancel a
+                        # callback that has not entered host code so the
+                        # bounded executor discards it instead of invoking an
+                        # observer after the proxy has shut down.
+                        callback.cancel()
+                        raise
                     except asyncio.TimeoutError:
                         if callback.cancel():
                             # A callback queued behind hostile workers must
@@ -10677,18 +10693,23 @@ class ProxyFeature(Feature):
         """
 
         client = self._client
-        if client is None:
-            return None
-        capabilities = self._host_ingress_capabilities()
-        if capabilities is None or not {
-            _EXTERNAL_INGRESS_QUIESCE,
-            _EXTERNAL_INGRESS_RESUME,
-        }.issubset(capabilities.names):
+        if client is None or not self._has_negotiated_external_ingress_lifecycle():
             return None
         return _ExternalIngressQuiesce(
             client=client,
             transition_id=secrets.token_urlsafe(_EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES),
         )
+
+    def _has_negotiated_external_ingress_lifecycle(self) -> bool:
+        """Return capability support without minting transition state."""
+
+        if self._client is None:
+            return False
+        capabilities = self._host_ingress_capabilities()
+        return capabilities is not None and {
+            _EXTERNAL_INGRESS_QUIESCE,
+            _EXTERNAL_INGRESS_RESUME,
+        }.issubset(capabilities.names)
 
     @staticmethod
     def _is_external_ingress_lifecycle_ack(value: Any, *, state: str) -> bool:
@@ -12784,7 +12805,7 @@ class ProxyFeature(Feature):
             capabilities = self._client_capabilities()
             if "channel" in capabilities:
                 return True
-            if self._new_external_ingress_quiesce() is not None:
+            if self._has_negotiated_external_ingress_lifecycle():
                 return True
             declaration = self._inbound_producer_declaration(capabilities)
             if declaration is False:
@@ -12826,7 +12847,7 @@ class ProxyFeature(Feature):
             capabilities = self._client_capabilities()
             if "channel" in capabilities:
                 return False
-            if self._new_external_ingress_quiesce() is not None:
+            if self._has_negotiated_external_ingress_lifecycle():
                 return False
             return self._inbound_producer_declaration(capabilities) is None
         except BaseException:  # noqa: BLE001 - diagnostic uncertainty is ambiguity

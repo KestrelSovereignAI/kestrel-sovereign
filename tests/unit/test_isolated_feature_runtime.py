@@ -1639,21 +1639,20 @@ async def test_inflight_sync_emit_coalesces_idle_cleanup_snapshot(monkeypatch, t
 async def test_sync_observer_never_blocks_initialize_or_event_loop(monkeypatch, tmp_path):
     observer_started = threading.Event()
     observer_finished = threading.Event()
-    heartbeat_gaps = []
+    release_observer = threading.Event()
+    heartbeat_ticks = 0
     heartbeat_done = asyncio.Event()
 
     def observe(_snapshot):
         observer_started.set()
-        time.sleep(0.2)
+        assert release_observer.wait(timeout=2)
         observer_finished.set()
 
     async def heartbeat():
-        previous = asyncio.get_running_loop().time()
+        nonlocal heartbeat_ticks
         for _ in range(5):
-            await asyncio.sleep(0.01)
-            current = asyncio.get_running_loop().time()
-            heartbeat_gaps.append(current - previous)
-            previous = current
+            await asyncio.sleep(0)
+            heartbeat_ticks += 1
         heartbeat_done.set()
 
     agent = Mock(did=_TEST_AGENT_DID, features={})
@@ -1669,14 +1668,13 @@ async def test_sync_observer_never_blocks_initialize_or_event_loop(monkeypatch, 
     feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
 
     heartbeat_task = asyncio.create_task(heartbeat())
-    started = asyncio.get_running_loop().time()
     await feature.initialize()
-    initialize_seconds = asyncio.get_running_loop().time() - started
+    assert await asyncio.to_thread(observer_started.wait, 1)
     await asyncio.wait_for(heartbeat_done.wait(), timeout=1)
 
-    assert initialize_seconds < 0.1
-    assert max(heartbeat_gaps) < 0.1
-    assert await asyncio.to_thread(observer_started.wait, 1)
+    assert heartbeat_ticks == 5
+    assert not observer_finished.is_set()
+    release_observer.set()
     assert await asyncio.to_thread(observer_finished.wait, 1)
     await heartbeat_task
     await feature.shutdown()
@@ -1844,6 +1842,65 @@ def test_bounded_observer_executor_reclaims_cancelled_queue_slots_before_retry()
     release.set()
     active.result(timeout=1)
     assert queued.result(timeout=1) == 11
+    executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_latch_cancels_queued_observer_before_host_invocation(
+    monkeypatch, tmp_path
+):
+    executor = isolated_runtime._BoundedDaemonExecutor(
+        max_workers=1,
+        queue_capacity=2,
+    )
+    running = threading.Event()
+    release = threading.Event()
+    observer_called = threading.Event()
+
+    def block():
+        running.set()
+        assert release.wait(timeout=2)
+
+    active = executor.submit(block)
+    assert running.wait(timeout=1)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_EXECUTOR", executor)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 2.0)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=lambda _snapshot: observer_called.set(),
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    await feature.initialize()
+    queued_future = None
+    for _ in range(200):
+        with executor._work.mutex:
+            queued_items = list(executor._work.queue)
+        if queued_items:
+            queued_future = queued_items[0][0]
+            break
+        await asyncio.sleep(0.01)
+    assert queued_future is not None
+    assert not queued_future.done()
+
+    feature._latch_terminal_lifecycle()
+    for _ in range(100):
+        if queued_future.cancelled() and not feature._telemetry_observer_tasks:
+            break
+        await asyncio.sleep(0.01)
+
+    assert queued_future.cancelled()
+    assert not feature._telemetry_observer_tasks
+    release.set()
+    active.result(timeout=1)
+    await asyncio.sleep(0.05)
+    assert not observer_called.is_set()
+    await feature.shutdown()
     executor.shutdown()
 
 
@@ -2146,6 +2203,37 @@ def test_nested_owner_walker_closes_ascend_parent_fd_when_stat_fails(
                     root_fd,
                     allow_owner_marker=False,
                 )
+            assert len(os.listdir("/dev/fd")) == baseline
+    finally:
+        os.close(root_fd)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/dev/fd").is_dir(),
+    reason="descriptor-count regression requires POSIX /dev/fd",
+)
+@pytest.mark.parametrize(
+    "walker",
+    (
+        isolated_runtime._assert_no_nested_runtime_owners_at,
+        isolated_runtime._remove_directory_contents_at,
+    ),
+)
+def test_cleanup_walkers_close_root_fd_when_initial_custody_check_fails(
+    tmp_path, walker
+):
+    root = tmp_path / walker.__name__
+    root.mkdir()
+    (root / isolated_runtime._RUNTIME_OWNER_MARKER).write_text("nested-owner")
+    root_fd = os.open(root, isolated_runtime._directory_open_flags())
+    try:
+        baseline = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            with pytest.raises(
+                IsolatedRuntimeNamespaceError,
+                match="nested ownership marker",
+            ):
+                walker(root_fd, allow_owner_marker=False)
             assert len(os.listdir("/dev/fd")) == baseline
     finally:
         os.close(root_fd)
@@ -3032,7 +3120,10 @@ async def test_observed_legacy_inbound_producer_latches_resident(monkeypatch, tm
     class MetadataPoorProducer(FakeIsolatedClient):
         @property
         def capabilities(self):
-            return {"tools": {}}
+            # Model a legacy/misdeclared child whose observed behavior must
+            # override its negative producer declaration. Ambiguous metadata
+            # would remain resident even if the observation latch regressed.
+            return {"tools": {}, "inbound_producer": False}
 
     agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -3094,6 +3185,46 @@ def test_disk_telemetry_rejects_root_symlink_and_entry_overflow(
     )
 
 
+def test_disk_telemetry_enforces_depth_budget(monkeypatch, tmp_path):
+    bounded = tmp_path / "bounded-depth"
+    (bounded / "level-one" / "level-two").mkdir(parents=True)
+    (bounded / "level-one" / "level-two" / "payload").write_bytes(b"owned")
+
+    monkeypatch.setattr(isolated_runtime, "_DISK_TELEMETRY_DEPTH_BUDGET", 2)
+
+    assert isolated_runtime._measure_directory_tree_bytes(bounded) == (
+        None,
+        "budget-exceeded",
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_telemetry_rejects_reused_pid_identity(monkeypatch):
+    pid = 4242
+    observed = Mock()
+    observed.create_time.return_value = 222.0
+    observed.children.return_value = []
+    observed.memory_info.return_value = SimpleNamespace(rss=1024)
+    observed.cpu_times.return_value = SimpleNamespace(user=1.0, system=2.0)
+    observed.num_fds.return_value = 3
+    monkeypatch.setattr(isolated_runtime.psutil, "Process", lambda _pid: observed)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = SimpleNamespace(
+        process=SimpleNamespace(pid=pid, returncode=None)
+    )
+    feature._process_identity = (pid, 111.0)
+
+    snapshot = await feature.sample_runtime_telemetry()
+
+    observed.create_time.assert_called_once_with()
+    assert snapshot.rss_bytes is None
+    assert snapshot.cpu_seconds is None
+    assert snapshot.open_fds is None
+    assert snapshot.process_count is None
+
+
 @pytest.mark.asyncio
 async def test_initialize_skips_disk_walk_without_observer(monkeypatch, tmp_path):
     agent = Mock(did=_TEST_AGENT_DID, features={})
@@ -3128,6 +3259,28 @@ async def test_pull_snapshot_can_refresh_disk_without_observer(monkeypatch, tmp_
     assert snapshot.environment_bytes == len(b"environment")
     assert snapshot.private_writable_bytes == len(b"private")
     assert snapshot.downloaded_bytes == len(b"download")
+    assert snapshot.disk_telemetry_status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_standalone_disk_telemetry_reports_absent_provisioning_cache_as_zero(
+    tmp_path,
+):
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime_dir = feature._prepare_runtime_workspace()
+    feature._venv_path = runtime_dir / ".venv"
+    feature._venv_path.mkdir()
+    (feature._venv_path / "environment.bin").write_bytes(b"environment")
+    (runtime_dir / "data" / "private.bin").write_bytes(b"private")
+    assert not (runtime_dir / "provisioning_cache").exists()
+
+    snapshot = await feature.sample_runtime_telemetry(refresh_disk=True)
+
+    assert snapshot.environment_bytes == len(b"environment")
+    assert snapshot.private_writable_bytes == len(b"private")
+    assert snapshot.downloaded_bytes == 0
     assert snapshot.disk_telemetry_status == "complete"
 
 
@@ -8373,6 +8526,39 @@ def test_relocation_repair_marker_recovers_only_its_interrupted_temp_link(tmp_pa
         assert external.is_file()
     finally:
         os.close(directory_fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="repair marker uses POSIX dirfds")
+def test_relocation_marker_cannot_downgrade_reclaim_repair_intent(tmp_path):
+    dirfd_runtime = tmp_path / "dirfd-runtime"
+    dirfd_runtime.mkdir(mode=0o700)
+    directory_fd = os.open(dirfd_runtime, isolated_runtime._directory_open_flags())
+    try:
+        isolated_runtime._ensure_venv_relocation_repair_marker_at(
+            directory_fd,
+            payload=isolated_runtime._VENV_RECLAIM_REPAIR_PAYLOAD,
+        )
+        isolated_runtime._ensure_venv_relocation_repair_marker_at(directory_fd)
+        assert (
+            isolated_runtime._read_venv_relocation_repair_marker_at(directory_fd)
+            == "reclaim"
+        )
+    finally:
+        os.close(directory_fd)
+
+    portable_runtime = tmp_path / "portable-runtime"
+    portable_runtime.mkdir(mode=0o700)
+    isolated_runtime._ensure_venv_relocation_repair_marker_portable(
+        portable_runtime,
+        payload=isolated_runtime._VENV_RECLAIM_REPAIR_PAYLOAD,
+    )
+    isolated_runtime._ensure_venv_relocation_repair_marker_portable(portable_runtime)
+    assert (
+        isolated_runtime._read_venv_relocation_repair_marker_portable(
+            portable_runtime
+        )
+        == "reclaim"
+    )
 
 
 def test_venv_repair_pending_tracks_real_marker_transition(tmp_path):
@@ -16498,6 +16684,24 @@ async def test_exact_lifecycle_rpc_bypasses_closed_data_plane_and_waits_for_drai
         if tool_task is not None and not tool_task.done():
             await tool_task
         await feature.shutdown()
+
+
+def test_inbound_policy_reads_do_not_mint_external_ingress_transition_tokens(
+    monkeypatch,
+):
+    client = FakeIsolatedClient()
+    client.host_ingress_capabilities = HostIngressCapabilities(
+        names=("external-ingress-quiesce", "external-ingress-resume")
+    )
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    mint = Mock(side_effect=AssertionError("policy read minted transition state"))
+    monkeypatch.setattr(isolated_runtime.secrets, "token_urlsafe", mint)
+
+    assert feature._owns_inbound_producer() is True
+    assert feature._inbound_producer_role_is_ambiguous() is False
+    mint.assert_not_called()
 
 
 class _HostIngressClient(FakeIsolatedClient):
