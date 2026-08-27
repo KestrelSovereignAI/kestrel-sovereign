@@ -103,7 +103,14 @@ tree. Before the first destructive mutation Core durably marks the managed
 environment for forced repair and preserves that marker until deletion fully
 succeeds, so a partial reclaim cannot be adopted as a healthy venv on the next
 wake. The seam never removes the agent namespace, sibling feature directories,
-or an external immutable venv.
+or an external immutable venv. An immutable operator venv located inside the
+feature's mutable workspace makes cleanup permanently ineligible: Core refuses
+reclamation with a configuration-specific error naming the selecting setting,
+because deleting the workspace would otherwise delete an artifact that Core
+does not own. This remains true when `BIN` is also configured; Core bases the
+decision on the separately validated `VENV` artifact rather than the launch
+path selected by `BIN`. Operators must relocate that immutable venv outside the
+agent-scoped workspace before Core can reclaim the workspace.
 
 Core 0.53.5 introduces a distinct interrupted-reclaim marker payload. A host
 must finish or retry any pending reclaim with Core 0.53.5 or newer before

@@ -1021,8 +1021,7 @@ async def test_contained_immutable_venv_override_is_never_cleanup_eligible(
         "KESTREL_FEATURE_TESTFEATURE_VENV",
         str(immutable_venv),
     )
-    feature._venv_path = immutable_venv.resolve()
-    feature._bin_path = None
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
     feature._idle_retired = True
     feature._client = None
 
@@ -1034,11 +1033,50 @@ async def test_contained_immutable_venv_override_is_never_cleanup_eligible(
     assert feature._runtime_venv_is_core_managed() is False
     with pytest.raises(
         IsolatedRuntimePreparationError,
-        match="not idle and reclaimable",
-    ):
+        match=(
+            "contains the immutable venv selected by "
+            "KESTREL_FEATURE_TESTFEATURE_VENV"
+        ),
+    ) as raised:
         await feature.reclaim_idle_workspace()
+    assert str(tmp_path) not in str(raised.value)
     assert immutable_venv.is_dir()
     assert isolated_runtime._venv_python(immutable_venv).is_file()
+
+
+@pytest.mark.asyncio
+async def test_external_immutable_venv_with_bin_does_not_block_workspace_reclaim(
+    monkeypatch, tmp_path
+):
+    external_venv = tmp_path / "operator" / "prebuilt-venv"
+    external_python = _write_prebuilt_venv_shape(external_venv)
+    external_bin = tmp_path / "operator" / "test-service"
+    external_bin.write_text("#!/bin/sh\nexit 0\n")
+    external_bin.chmod(0o700)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_VENV", str(external_venv))
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", str(external_bin))
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(agent, tmp_path, idle_timeout_seconds=3600)
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+    runtime_dir = feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._idle_retired = True
+    feature._client = None
+
+    assert feature._venv_path == runtime_dir / ".venv"
+    assert feature._bin_path == external_bin.resolve()
+    assert feature._validated_hosted_immutable_venv_path == external_venv.resolve()
+    assert feature.runtime_telemetry_snapshot().cleanup_eligible is True
+    assert (
+        await feature.reclaim_idle_workspace()
+        is isolated_runtime.RuntimeNamespaceCleanupOutcome.REMOVED
+    )
+    assert not runtime_dir.exists()
+    assert external_venv.is_dir()
+    assert external_python.is_file()
+    assert external_bin.is_file()
 
 
 @pytest.mark.asyncio

@@ -5866,6 +5866,7 @@ class _ValidatedHostedPrebuiltOverrides:
 
     venv_path: Optional[Path]
     venv_bin_path: Optional[Path]
+    venv_setting: Optional[str]
     bin_path: Optional[Path]
 
 
@@ -5909,6 +5910,11 @@ def _validate_hosted_process_prebuilt_overrides(
     selected_venv_bin_path = (
         selected_venv.bin_path if selected_venv is not None else None
     )
+    selected_venv_setting: Optional[str] = None
+    if validated_process_venv is not None:
+        selected_venv_setting = venv_key
+    elif validated_runtime_venv is not None:
+        selected_venv_setting = _HOSTED_RUNTIME_VENV_SETTING
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
@@ -5916,11 +5922,13 @@ def _validate_hosted_process_prebuilt_overrides(
         return _ValidatedHostedPrebuiltOverrides(
             venv_path=selected_venv_path,
             venv_bin_path=selected_venv_bin_path,
+            venv_setting=selected_venv_setting,
             bin_path=_validate_hosted_prebuilt_bin(bin_value, setting=bin_key),
         )
     return _ValidatedHostedPrebuiltOverrides(
         venv_path=selected_venv_path,
         venv_bin_path=selected_venv_bin_path,
+        venv_setting=selected_venv_setting,
         bin_path=None,
     )
 
@@ -6571,6 +6579,10 @@ class ProxyFeature(Feature):
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
+        # BIN deliberately makes _venv_path name the unused Core default.
+        # Retain the separately validated immutable VENV for custody checks.
+        self._validated_hosted_immutable_venv_path: Optional[Path] = None
+        self._validated_hosted_immutable_venv_setting: Optional[str] = None
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
         # child construction must execute that target rather than re-following
@@ -11424,6 +11436,8 @@ class ProxyFeature(Feature):
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
         # A new resolution invalidates any prior enable cycle's console pin.
         self._validated_hosted_console_path = None
+        self._validated_hosted_immutable_venv_path = None
+        self._validated_hosted_immutable_venv_setting = None
         validated_hosted_overrides: Optional[
             _ValidatedHostedPrebuiltOverrides
         ] = None
@@ -11435,6 +11449,12 @@ class ProxyFeature(Feature):
             validated_hosted_overrides = _validate_hosted_process_prebuilt_overrides(
                 self.name,
                 runtime_venv=self.runtime.venv,
+            )
+            self._validated_hosted_immutable_venv_path = (
+                validated_hosted_overrides.venv_path
+            )
+            self._validated_hosted_immutable_venv_setting = (
+                validated_hosted_overrides.venv_setting
             )
         bin_override = os.environ.get(_env_key(self.name, "BIN"))
         if bin_override:
@@ -11545,10 +11565,11 @@ class ProxyFeature(Feature):
     def _immutable_venv_override_is_inside_workspace(self) -> bool:
         """Refuse to advertise deletion of an operator-owned contained venv."""
 
-        if self._hosted_immutable_venv_setting() is None or self._venv_path is None:
+        selected_override = self._validated_hosted_immutable_venv_path
+        if selected_override is None:
             return False
         runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
-        selected_venv = Path(os.path.abspath(self._venv_path))
+        selected_venv = Path(os.path.abspath(selected_override))
         return selected_venv == runtime_dir or runtime_dir in selected_venv.parents
 
     def _process_venv_is_overridden(self) -> bool:
@@ -13060,10 +13081,16 @@ class ProxyFeature(Feature):
                     or not self._idle_retired
                     or self._client is not None
                     or self._retirement_is_uncertain()
-                    or self._immutable_venv_override_is_inside_workspace()
                 ):
                     raise IsolatedRuntimePreparationError(
                         "Hosted isolated feature workspace is not idle and reclaimable."
+                    )
+                if self._immutable_venv_override_is_inside_workspace():
+                    setting = self._validated_hosted_immutable_venv_setting
+                    assert setting is not None
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature workspace contains the immutable "
+                        f"venv selected by {setting} and cannot be reclaimed."
                     )
                 # Stop advertising assets and completed byte counts before the
                 # no-follow deletion begins. The event loop remains available
