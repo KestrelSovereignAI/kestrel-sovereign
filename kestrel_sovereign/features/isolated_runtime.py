@@ -4804,18 +4804,21 @@ def _assert_no_nested_runtime_owners_at(
                 return
             parent_identity, parent_name, remaining_children = ancestors.pop()
             parent_fd = _open_cleanup_parent_at(current_fd, parent_identity)
-            assert current_name is not None
-            metadata = os.stat(
-                current_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            if _cleanup_directory_identity(metadata) != current_identity:
-                os.close(parent_fd)
-                raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup target changed "
-                    "during nested-owner validation."
+            try:
+                assert current_name is not None
+                metadata = os.stat(
+                    current_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
                 )
+                if _cleanup_directory_identity(metadata) != current_identity:
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime cleanup target changed "
+                        "during nested-owner validation."
+                    )
+            except BaseException:
+                os.close(parent_fd)
+                raise
             os.close(current_fd)
             current_fd = parent_fd
             current_identity = parent_identity
@@ -4892,22 +4895,25 @@ def _remove_directory_contents_at(
                 return
             parent_identity, parent_name = ancestors.pop()
             parent_fd = _open_cleanup_parent_at(current_fd, parent_identity)
-            assert current_name is not None
-            metadata = os.stat(
-                current_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or _cleanup_directory_identity(metadata) != current_identity
-            ):
-                os.close(parent_fd)
-                raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup target changed "
-                    "during removal."
+            try:
+                assert current_name is not None
+                metadata = os.stat(
+                    current_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
                 )
-            os.rmdir(current_name, dir_fd=parent_fd)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or _cleanup_directory_identity(metadata) != current_identity
+                ):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime cleanup target changed "
+                        "during removal."
+                    )
+                os.rmdir(current_name, dir_fd=parent_fd)
+            except BaseException:
+                os.close(parent_fd)
+                raise
             os.close(current_fd)
             current_fd = parent_fd
             current_identity = parent_identity

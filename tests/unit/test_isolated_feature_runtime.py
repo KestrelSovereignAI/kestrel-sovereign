@@ -2069,6 +2069,80 @@ async def test_failed_final_reclaim_rmdir_republishes_durable_repair_intent(
     await feature.shutdown()
 
 
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/dev/fd").is_dir(),
+    reason="descriptor-count regression requires POSIX /dev/fd",
+)
+def test_remove_walker_closes_ascend_parent_fd_when_rmdir_fails(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "remove-root"
+    (root / "child").mkdir(parents=True)
+    root_fd = os.open(root, isolated_runtime._directory_open_flags())
+    real_rmdir = os.rmdir
+
+    def fail_child_rmdir(path, *args, **kwargs):
+        if path == "child" and kwargs.get("dir_fd") is not None:
+            raise OSError(errno.ENOTEMPTY, "synthetic concurrent child mutation")
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(isolated_runtime.os, "rmdir", fail_child_rmdir)
+    try:
+        baseline = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            with pytest.raises(OSError, match="concurrent child mutation"):
+                isolated_runtime._remove_directory_contents_at(
+                    root_fd,
+                    allow_owner_marker=False,
+                )
+            assert len(os.listdir("/dev/fd")) == baseline
+    finally:
+        os.close(root_fd)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/dev/fd").is_dir(),
+    reason="descriptor-count regression requires POSIX /dev/fd",
+)
+def test_nested_owner_walker_closes_ascend_parent_fd_when_stat_fails(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "owner-root"
+    (root / "child").mkdir(parents=True)
+    root_fd = os.open(root, isolated_runtime._directory_open_flags())
+    real_open_parent = isolated_runtime._open_cleanup_parent_at
+    real_stat = os.stat
+    ascending = False
+
+    def mark_ascend(*args, **kwargs):
+        nonlocal ascending
+        descriptor = real_open_parent(*args, **kwargs)
+        ascending = True
+        return descriptor
+
+    def fail_ascend_stat(path, *args, **kwargs):
+        nonlocal ascending
+        if ascending:
+            ascending = False
+            raise FileNotFoundError(errno.ENOENT, "synthetic ascend race", path)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(isolated_runtime, "_open_cleanup_parent_at", mark_ascend)
+    monkeypatch.setattr(isolated_runtime.os, "stat", fail_ascend_stat)
+    try:
+        baseline = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            ascending = False
+            with pytest.raises(FileNotFoundError, match="synthetic ascend race"):
+                isolated_runtime._assert_no_nested_runtime_owners_at(
+                    root_fd,
+                    allow_owner_marker=False,
+                )
+            assert len(os.listdir("/dev/fd")) == baseline
+    finally:
+        os.close(root_fd)
+
+
 @pytest.mark.asyncio
 async def test_failed_idle_reclaim_preserves_durable_reprovision_intent(
     monkeypatch, tmp_path
