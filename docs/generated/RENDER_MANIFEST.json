@@ -225,6 +225,32 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [
+        "kestrel_sovereign/endpoints/agent.py",
+        "kestrel_sovereign/endpoints/models.py",
+        "kestrel_sovereign/endpoints/rasa_shim.py",
+        "kestrel_sovereign/endpoints/restart_events.py",
+        "kestrel_sovereign/endpoints/spawn.py",
+        "kestrel_sovereign/features/bootstrap/feature.py",
+        "kestrel_sovereign/features/deploy/feature.py",
+        "kestrel_sovereign/features/peers/feature.py",
+        "kestrel_sovereign/features/restart_coordinator/feature.py",
+        "kestrel_sovereign/features/spawn/feature.py",
+        "kestrel_sovereign/features/tasks/feature.py",
+        "kestrel_sovereign/features/todo/feature.py",
+        "kestrel_sovereign/features/webhooks/receiver.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Cross-Agent Authority Audit",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [],
       "findings": [],
       "missing_code_refs": [],
