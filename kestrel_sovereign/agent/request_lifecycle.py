@@ -14,6 +14,7 @@ permanently blocks ``idle_agents_only`` restarts (#1558).
 import asyncio
 import logging
 import time
+from contextvars import ContextVar
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -25,17 +26,35 @@ class RequestCompletionDisposition(str, Enum):
     ABANDONED = "abandoned"
 
 
+_current_request_generation: ContextVar[tuple[int, str, int] | None] = ContextVar(
+    "kestrel_current_request_generation",
+    default=None,
+)
+
+
 class RequestLifecycleMixin:
     """Mixin providing request tracking and cancellation for KestrelAgent."""
 
-    def register_active_request(self, request_id: str) -> None:
-        """Track an active request for later cancellation and cleanup."""
+    def register_active_request(self, request_id: str) -> int:
+        """Track an active delivery and bind its generation to this task."""
         if not hasattr(self, "_active_request_ids"):
             self._active_request_ids = set()
         if not isinstance(getattr(self, "_active_request_counts", None), dict):
             self._active_request_counts = {}
         counts = self._active_request_counts
         was_inactive = counts.get(request_id, 0) == 0
+        generations = getattr(self, "_active_request_generations", None)
+        if not isinstance(generations, dict):
+            generations = {}
+            self._active_request_generations = generations
+        generation = generations.get(request_id)
+        if was_inactive or not isinstance(generation, int):
+            next_generation = getattr(self, "_next_request_generation", 0)
+            if not isinstance(next_generation, int):
+                next_generation = 0
+            generation = next_generation + 1
+            self._next_request_generation = generation
+            generations[request_id] = generation
         counts[request_id] = counts.get(request_id, 0) + 1
         self._active_request_ids.add(request_id)
         # Stamp the registration time (monotonic) so abandoned request
@@ -47,6 +66,34 @@ class RequestLifecycleMixin:
         # Preserve the legacy "current request" fallback for callers that
         # do not yet pass an explicit request ID.
         self._current_request_id = request_id
+        _current_request_generation.set((id(self), request_id, generation))
+        return generation
+
+    def _request_generation_for_current_task(
+        self,
+        request_id: str,
+    ) -> int | None:
+        """Resolve this task's delivery generation, then the active fallback."""
+
+        bound = _current_request_generation.get()
+        if (
+            bound is not None
+            and bound[0] == id(self)
+            and bound[1] == request_id
+        ):
+            return bound[2]
+        generations = getattr(self, "_active_request_generations", None)
+        if not isinstance(generations, dict):
+            return None
+        generation = generations.get(request_id)
+        return generation if isinstance(generation, int) else None
+
+    def _abandoned_generations(self, request_id: str) -> set[int]:
+        tombstones = getattr(self, "_abandoned_request_generations", None)
+        if not isinstance(tombstones, dict):
+            return set()
+        generations = tombstones.get(request_id)
+        return set(generations) if isinstance(generations, set) else set()
 
     def cancel_current_request(self, request_id: Optional[str] = None) -> bool:
         """
@@ -57,19 +104,68 @@ class RequestLifecycleMixin:
         """
         active_request_ids = getattr(self, "_active_request_ids", set())
         target_request_id = request_id or self._current_request_id
-        if target_request_id and (
+        if not target_request_id:
+            return False
+
+        generations: set[int] = self._abandoned_generations(target_request_id)
+        if (
             target_request_id in active_request_ids
             or target_request_id == self._current_request_id
         ):
-            self._cancelled_requests.add(target_request_id)
-            logging.info(f"Cancelled request: {target_request_id}")
-            return True
-        return False
+            active_generation = self._request_generation_for_current_task(
+                target_request_id
+            )
+            if active_generation is None:
+                active_generations = getattr(
+                    self,
+                    "_active_request_generations",
+                    None,
+                )
+                if not isinstance(active_generations, dict):
+                    active_generations = {}
+                    self._active_request_generations = active_generations
+                next_generation = getattr(self, "_next_request_generation", 0)
+                if not isinstance(next_generation, int):
+                    next_generation = 0
+                active_generation = next_generation + 1
+                self._next_request_generation = active_generation
+                active_generations[target_request_id] = active_generation
+            generations.add(active_generation)
+        if not generations:
+            return False
+
+        cancelled_generations = getattr(
+            self,
+            "_cancelled_request_generations",
+            None,
+        )
+        if not isinstance(cancelled_generations, set):
+            cancelled_generations = set()
+            self._cancelled_request_generations = cancelled_generations
+        cancelled_generations.update(
+            (target_request_id, generation) for generation in generations
+        )
+        self._cancelled_requests.add(target_request_id)
+        logging.info("Cancelled request lifecycle: %s", target_request_id)
+        return True
 
     def is_request_cancelled(self, request_id: Optional[str] = None) -> bool:
         """Check if a request has been cancelled."""
         rid = request_id or self._current_request_id
-        return rid in self._cancelled_requests if rid else False
+        if not rid:
+            return False
+        generation = self._request_generation_for_current_task(rid)
+        cancelled_generations = getattr(
+            self,
+            "_cancelled_request_generations",
+            None,
+        )
+        if isinstance(cancelled_generations, set) and generation is not None:
+            return (rid, generation) in cancelled_generations
+        # Compatibility for legacy/test registrations which never received a
+        # generation. Once a generation exists, a bare old ID is deliberately
+        # insufficient to poison a fresh delivery.
+        return generation is None and rid in self._cancelled_requests
 
     async def wait_for_request_completion(
         self,
@@ -87,20 +183,32 @@ class RequestLifecycleMixin:
         if target_request_id is None:
             return RequestCompletionDisposition.COMPLETED
         active_request_ids = getattr(self, "_active_request_ids", set())
+        abandoned = self._abandoned_generations(target_request_id)
         if (
             target_request_id not in active_request_ids
             and target_request_id != self._current_request_id
         ):
-            return RequestCompletionDisposition.COMPLETED
+            return (
+                RequestCompletionDisposition.ABANDONED
+                if abandoned
+                else RequestCompletionDisposition.COMPLETED
+            )
+        generation = self._request_generation_for_current_task(target_request_id)
+        if generation is None:
+            return RequestCompletionDisposition.ABANDONED
         waiters = getattr(self, "_request_completion_events", None)
         if not isinstance(waiters, dict):
             waiters = {}
             self._request_completion_events = waiters
-        completion = waiters.get(target_request_id)
+        waiter_key = (target_request_id, generation)
+        completion = waiters.get(waiter_key)
         if completion is None:
             completion = asyncio.get_running_loop().create_future()
-            waiters[target_request_id] = completion
-        return await asyncio.shield(completion)
+            waiters[waiter_key] = completion
+        disposition = await asyncio.shield(completion)
+        if self._abandoned_generations(target_request_id):
+            return RequestCompletionDisposition.ABANDONED
+        return disposition
 
     def _resolve_request_completion(
         self,
@@ -108,13 +216,22 @@ class RequestLifecycleMixin:
         disposition: RequestCompletionDisposition = (
             RequestCompletionDisposition.COMPLETED
         ),
+        *,
+        generation: int | None = None,
     ) -> None:
         """Terminally release and forget waiters for one request lifecycle."""
 
         waiters = getattr(self, "_request_completion_events", None)
         if not isinstance(waiters, dict):
             return
-        completion = waiters.pop(request_id, None)
+        generation = (
+            self._request_generation_for_current_task(request_id)
+            if generation is None
+            else generation
+        )
+        if generation is None:
+            return
+        completion = waiters.pop((request_id, generation), None)
         if completion is not None and not completion.done():
             completion.set_result(disposition)
 
@@ -122,20 +239,64 @@ class RequestLifecycleMixin:
         """Remove a request from the cancelled set after it's been handled."""
         active_request_ids = getattr(self, "_active_request_ids", None)
         counts = getattr(self, "_active_request_counts", None)
-        if isinstance(counts, dict) and counts.get(request_id, 0) > 1:
+        generation = self._request_generation_for_current_task(request_id)
+        active_generations = getattr(self, "_active_request_generations", None)
+        active_generation = (
+            active_generations.get(request_id)
+            if isinstance(active_generations, dict)
+            else None
+        )
+        cleans_active_generation = (
+            generation is not None and generation == active_generation
+        ) or (generation is None and active_generation is None)
+        if (
+            cleans_active_generation
+            and isinstance(counts, dict)
+            and counts.get(request_id, 0) > 1
+        ):
             counts[request_id] -= 1
             return
-        if isinstance(counts, dict):
-            counts.pop(request_id, None)
-        if active_request_ids is not None:
-            active_request_ids.discard(request_id)
+        if cleans_active_generation:
+            if isinstance(counts, dict):
+                counts.pop(request_id, None)
+            if active_request_ids is not None:
+                active_request_ids.discard(request_id)
+            if isinstance(active_generations, dict):
+                active_generations.pop(request_id, None)
         started = getattr(self, "_active_request_started_at", None)
-        if started is not None:
+        if cleans_active_generation and started is not None:
             started.pop(request_id, None)
-        self._cancelled_requests.discard(request_id)
-        if self._current_request_id == request_id:
+        tombstones = getattr(self, "_abandoned_request_generations", None)
+        if isinstance(tombstones, dict) and generation is not None:
+            abandoned = tombstones.get(request_id)
+            if isinstance(abandoned, set):
+                abandoned.discard(generation)
+                if not abandoned:
+                    tombstones.pop(request_id, None)
+        cancelled_generations = getattr(
+            self,
+            "_cancelled_request_generations",
+            None,
+        )
+        if isinstance(cancelled_generations, set) and generation is not None:
+            cancelled_generations.discard((request_id, generation))
+            if not any(rid == request_id for rid, _ in cancelled_generations):
+                self._cancelled_requests.discard(request_id)
+        else:
+            self._cancelled_requests.discard(request_id)
+        if cleans_active_generation and self._current_request_id == request_id:
             self._current_request_id = next(iter(active_request_ids), None) if active_request_ids else None
-        self._resolve_request_completion(request_id)
+        if cleans_active_generation:
+            disposition = (
+                RequestCompletionDisposition.ABANDONED
+                if self._abandoned_generations(request_id)
+                else RequestCompletionDisposition.COMPLETED
+            )
+            self._resolve_request_completion(
+                request_id,
+                disposition,
+                generation=generation,
+            )
 
     def active_request_ages(self) -> Dict[str, float]:
         """Return ``{request_id: age_seconds}`` for each active request.
@@ -188,10 +349,29 @@ class RequestLifecycleMixin:
             if now - ts >= max_age_seconds:
                 stale.append(rid)
         for rid in stale:
+            generations = getattr(self, "_active_request_generations", None)
+            generation = (
+                generations.get(rid)
+                if isinstance(generations, dict)
+                else None
+            )
+            if not isinstance(generation, int):
+                next_generation = getattr(self, "_next_request_generation", 0)
+                if not isinstance(next_generation, int):
+                    next_generation = 0
+                generation = next_generation + 1
+                self._next_request_generation = generation
+            tombstones = getattr(self, "_abandoned_request_generations", None)
+            if not isinstance(tombstones, dict):
+                tombstones = {}
+                self._abandoned_request_generations = tombstones
+            tombstones.setdefault(rid, set()).add(generation)
             active.discard(rid)
             counts = getattr(self, "_active_request_counts", None)
             if isinstance(counts, dict):
                 counts.pop(rid, None)
+            if isinstance(generations, dict):
+                generations.pop(rid, None)
             started.pop(rid, None)
             # If Stop already marked this genuinely live request, retain the
             # cooperative marker until the real endpoint finally runs. Age is
@@ -200,6 +380,7 @@ class RequestLifecycleMixin:
             self._resolve_request_completion(
                 rid,
                 RequestCompletionDisposition.ABANDONED,
+                generation=generation,
             )
         if stale and getattr(self, "_current_request_id", None) in stale:
             self._current_request_id = (

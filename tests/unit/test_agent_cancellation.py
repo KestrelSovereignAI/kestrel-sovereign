@@ -27,6 +27,8 @@ class TestAgentCancellation:
 
         # Bind actual methods
         agent.register_active_request = KestrelAgent.register_active_request.__get__(agent)
+        agent._request_generation_for_current_task = KestrelAgent._request_generation_for_current_task.__get__(agent)
+        agent._abandoned_generations = KestrelAgent._abandoned_generations.__get__(agent)
         agent.cancel_current_request = KestrelAgent.cancel_current_request.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)
         agent.wait_for_request_completion = KestrelAgent.wait_for_request_completion.__get__(agent)
@@ -459,16 +461,54 @@ class TestAgentCancellation:
             mock_agent.wait_for_request_completion("stale-waiter")
         )
         await asyncio.sleep(0)
-        assert "stale-waiter" in mock_agent._request_completion_events
+        assert any(
+            key[0] == "stale-waiter"
+            for key in mock_agent._request_completion_events
+        )
 
         assert mock_agent.prune_stale_active_requests(900) == ["stale-waiter"]
 
         outcome = await asyncio.wait_for(waiter, timeout=1.0)
         assert outcome is RequestCompletionDisposition.ABANDONED
-        assert "stale-waiter" not in mock_agent._request_completion_events
+        assert not mock_agent._request_completion_events
         # The still-running turn must retain its cooperative cancellation marker
         # until its real endpoint cleanup executes.
         assert "stale-waiter" in mock_agent._cancelled_requests
+
+    @pytest.mark.asyncio
+    async def test_abandoned_generation_does_not_poison_same_id_redelivery(
+        self,
+        mock_agent,
+    ):
+        """The old turn stays canceled while a fresh retry gets a clean key."""
+
+        old_registered = asyncio.Event()
+        inspect_old = asyncio.Event()
+        old_observation: list[bool] = []
+
+        async def old_delivery() -> None:
+            mock_agent.register_active_request("reused-id")
+            old_registered.set()
+            await inspect_old.wait()
+            old_observation.append(
+                mock_agent.is_request_cancelled("reused-id")
+            )
+            mock_agent._cleanup_cancelled_request("reused-id")
+
+        old_task = asyncio.create_task(old_delivery())
+        await old_registered.wait()
+        assert mock_agent.cancel_current_request("reused-id") is True
+        mock_agent._active_request_started_at["reused-id"] -= 1000
+        assert mock_agent.prune_stale_active_requests(900) == ["reused-id"]
+
+        mock_agent.register_active_request("reused-id")
+        assert mock_agent.is_request_cancelled("reused-id") is False
+
+        inspect_old.set()
+        await old_task
+        assert old_observation == [True]
+        assert "reused-id" in mock_agent._active_request_ids
+        mock_agent._cleanup_cancelled_request("reused-id")
 
     def test_prune_keeps_fresh_request(self, mock_agent):
         """A fresh request is not pruned."""

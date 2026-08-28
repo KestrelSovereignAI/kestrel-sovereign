@@ -4,6 +4,7 @@ import asyncio
 import gc
 import inspect
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -479,6 +480,19 @@ def test_stop_authority_has_no_process_lifecycle_dependency() -> None:
     assert "terminate_all" not in source
 
 
+def test_control_panel_uses_termination_wording_for_process_action() -> None:
+    panel = Path("control-panel/index.html").read_text()
+    function = panel.split("async function terminateAgent", 1)[1].split(
+        "// Initial load",
+        1,
+    )[0]
+
+    assert "Terminating..." in function
+    assert "Terminate" in function
+    assert "Stopping..." not in function
+    assert "textContent = 'Stop'" not in function
+
+
 def test_live_stop_endpoint_routes_request_through_typed_authority() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
@@ -636,8 +650,15 @@ async def test_live_stop_stale_prune_is_unreachable_not_stopped() -> None:
         assert agent.prune_stale_active_requests(900) == ["long-turn"]
         response = await asyncio.wait_for(stop_task, timeout=1)
 
+        retry = await client.post(
+            "/api/agent/stop",
+            json={"request_id": "long-turn"},
+        )
+
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
+    assert retry.status_code == 503
+    assert retry.json()["detail"] == "Cooperative Stop could not be confirmed."
     assert "long-turn" in agent._cancelled_requests
 
 

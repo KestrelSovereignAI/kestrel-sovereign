@@ -300,7 +300,7 @@
         async function terminateAgent(agentId) {
             const btn = event.target;
             btn.disabled = true;
-            btn.textContent = 'Stopping...';
+            btn.textContent = 'Terminating...';
             
             try {
                 const res = await fetch(`/api/agents/${agentId}/terminate`, { method: 'POST' });
@@ -312,7 +312,7 @@
             } catch (e) {
                 showError(e.message);
                 btn.disabled = false;
-                btn.textContent = 'Stop';
+                btn.textContent = 'Terminate';
             }
         }
         

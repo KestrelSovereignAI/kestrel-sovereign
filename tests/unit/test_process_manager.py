@@ -202,7 +202,7 @@ class TestStaticHelpers:
 
         After an OOM, a `kill -9` or a reboot the number is free for the OS to
         reuse, and the old path signalled whatever now held it — so
-        `kestrel stop --force` could SIGKILL an unrelated process (#2987).
+        `kestrel terminate --force` could SIGKILL an unrelated process (#2987).
         """
         victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         time.sleep(0.4)
