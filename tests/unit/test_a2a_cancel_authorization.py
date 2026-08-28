@@ -383,6 +383,166 @@ async def test_cancellation_suppresses_an_already_queued_submission_wake(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_post_registration_gate_does_not_cancel_working_dispatch(tmp_path):
+    """A legitimate SUBMITTED→WORKING transition is not cancellation."""
+
+    manager = await create_task_manager(str(tmp_path / "working-wake.db"))
+    release_delivery = asyncio.Event()
+    postcheck_complete = asyncio.Event()
+
+    class Handle:
+        def __init__(self):
+            async def active_delivery():
+                await release_delivery.wait()
+                return SimpleNamespace(
+                    status=SimpleNamespace(value="ok"),
+                    error=None,
+                )
+
+            self.task = asyncio.create_task(active_delivery())
+
+        async def wait(self):
+            postcheck_complete.set()
+            return await self.task
+
+    class Dispatcher:
+        handle = None
+
+        async def enqueue_signal(self, _signal):
+            self.handle = Handle()
+            return self.handle
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+        def __init__(self):
+            self.dispatcher = Dispatcher()
+            self.task_manager = manager
+            self.background_tasks = set()
+
+        def _track_background_task(self, coroutine, *, name):
+            task = asyncio.create_task(coroutine, name=name)
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+            return task
+
+    recipient = Recipient()
+    try:
+        created = await manager.create_task(
+            _params("working-wake"),
+            agent_name=recipient.did,
+            creator_agent_id="did:test:creator",
+        )
+        await manager.update_status(
+            created.id,
+            TaskState.WORKING,
+            agent_name=recipient.did,
+        )
+
+        recipient._on_task_submitted(created)
+        await asyncio.wait_for(postcheck_complete.wait(), timeout=1)
+        active = next(iter(recipient.background_tasks))
+        assert not recipient.dispatcher.handle.task.cancelled()
+        assert not active.done()
+
+        release_delivery.set()
+        await asyncio.wait_for(active, timeout=1)
+        assert not active.cancelled()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_execution_worker_rejects_cross_worker_durable_cancellation(
+    tmp_path,
+):
+    """A stale process-local wake cannot execute after another worker cancels."""
+
+    from kestrel_sdk.signals import Status
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        build_a2a_task_submitted_registration,
+        build_signal_for_submitted_task,
+    )
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    shared_path = str(tmp_path / "shared-task-authority.db")
+    execution_manager = await create_task_manager(shared_path)
+    cancellation_manager = await create_task_manager(shared_path)
+    signal_backend = SQLiteBackend(str(tmp_path / "signal-log.db"))
+    await signal_backend.connect()
+    signal_store = SignalLogStore(signal_backend)
+    await signal_store.initialize()
+
+    class ExecutionWorker(EventManagerMixin):
+        did = "did:test:recipient"
+
+        def __init__(self):
+            self.task_manager = execution_manager
+            self.process_input_calls = []
+            self.background_tasks = []
+
+        async def process_input(self, prompt):
+            self.process_input_calls.append(prompt)
+            return "should not execute"
+
+        def _track_background_task(self, coroutine, *, name):
+            task = asyncio.create_task(coroutine, name=name)
+            self.background_tasks.append(task)
+            return task
+
+    worker = ExecutionWorker()
+    registry = SourceRegistry()
+    registry.register(build_a2a_task_submitted_registration())
+    dispatcher = SignalDispatcher(
+        agent=worker,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=signal_store,
+    )
+    try:
+        task = await execution_manager.create_task(
+            _params(
+                "cross-worker-canceled",
+                metadata={
+                    "sender": "did:test:creator",
+                    "sender_verified": True,
+                },
+            ),
+            agent_name=worker.did,
+            creator_agent_id="did:test:creator",
+        )
+        stale_wake = build_signal_for_submitted_task(
+            task,
+            target_agent=worker.did,
+            sender="did:test:creator",
+        )
+
+        await cancellation_manager.cancel_task(
+            task.id,
+            reason="withdrawn on another worker",
+            agent_name="did:test:creator",
+        )
+        result = await dispatcher.dispatch_signal(stale_wake)
+
+        assert result.status is Status.DROPPED_VALIDATION
+        assert "already 'canceled'" in (result.error or "")
+        assert worker.process_input_calls == []
+    finally:
+        pending = [task for task in worker.background_tasks if not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await execution_manager.close()
+        await cancellation_manager.close()
+        await signal_backend.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
     """Rows without durable receipt columns cannot retain old metadata claims."""
 

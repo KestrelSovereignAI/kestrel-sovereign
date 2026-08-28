@@ -432,7 +432,7 @@ class EventManagerMixin:
                     # every earlier cancellation.
                     current = await self.task_manager.get_task(str(task_id))
                     state = getattr(getattr(current, "status", None), "state", None)
-                    if getattr(state, "value", state) != "submitted":
+                    if getattr(state, "value", state) == "canceled":
                         dispatch_task = getattr(handle, "task", None)
                         if dispatch_task is not None and not dispatch_task.done():
                             dispatch_task.cancel()
@@ -463,6 +463,35 @@ class EventManagerMixin:
                 "Failed to enqueue a2a.task_submitted signal for %s: %s",
                 task_id, e, exc_info=True,
             )
+
+    async def validate_cognition_signal_execution(self, signal) -> str | None:
+        """Fail closed when durable state withdraws an inbound A2A wake.
+
+        The queued signal handle is process-local, while PostgreSQL-backed A2A
+        tasks and their cancellation authority are shared across workers.  The
+        dispatcher therefore calls this hook in the execution worker directly
+        before ``process_input``.  A cancellation committed by another worker
+        can no longer leave a stale local wake free to execute.
+        """
+
+        if getattr(signal, "source", None) != "a2a.task_submitted":
+            return None
+        payload = getattr(signal, "payload", None)
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            return "a2a.task_submitted has no concrete durable task id"
+
+        current = await self.task_manager.get_task(task_id)
+        if current is None:
+            return f"A2A task {task_id!r} no longer exists"
+        state = getattr(getattr(current, "status", None), "state", None)
+        durable_state = getattr(state, "value", state)
+        if durable_state != "submitted":
+            return (
+                f"A2A task {task_id!r} is already {durable_state!r}; "
+                "its submission wake is no longer executable"
+            )
+        return None
 
     def _on_task_cancelled(self, task) -> None:
         """Cancel an admitted task-submission wake after durable cancellation."""

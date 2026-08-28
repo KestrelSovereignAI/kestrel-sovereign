@@ -3988,6 +3988,30 @@ class SignalDispatcher:
                 audit=audit,
             )
 
+        # Some COGNITION sources are volatile wakeups over durable work.  The
+        # producer's process-local task handle cannot prove that another worker
+        # has not withdrawn that work, so let the execution worker revalidate
+        # against the source's durable authority immediately before it builds
+        # or runs a cognition turn.  Missing hooks preserve existing sources.
+        validate_execution = getattr(
+            self._agent,
+            "validate_cognition_signal_execution",
+            None,
+        )
+        if callable(validate_execution):
+            validation_error = validate_execution(signal)
+            if asyncio.iscoroutine(validation_error):
+                validation_error = await validation_error
+            if validation_error is not None:
+                return self._fail(
+                    signal,
+                    start,
+                    Status.DROPPED_VALIDATION,
+                    error=str(validation_error),
+                    registration=registration,
+                    audit=audit,
+                )
+
         # Resolve the constitution body for full-injection sources.
         # Codex round-5 P1 fix: the dispatcher UNCONDITIONALLY
         # prepends a fenced constitution block to the rendered
