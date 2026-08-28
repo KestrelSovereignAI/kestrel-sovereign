@@ -206,7 +206,7 @@ class RequestLifecycleMixin:
             completion = asyncio.get_running_loop().create_future()
             waiters[waiter_key] = completion
         disposition = await asyncio.shield(completion)
-        if self._abandoned_generations(target_request_id):
+        if generation in self._abandoned_generations(target_request_id):
             return RequestCompletionDisposition.ABANDONED
         return disposition
 
@@ -235,8 +235,18 @@ class RequestLifecycleMixin:
         if completion is not None and not completion.done():
             completion.set_result(disposition)
 
-    def _cleanup_cancelled_request(self, request_id: str):
-        """Remove a request from the cancelled set after it's been handled."""
+    def _cleanup_cancelled_request(
+        self,
+        request_id: str,
+        *,
+        disposition: RequestCompletionDisposition = (
+            RequestCompletionDisposition.COMPLETED
+        ),
+    ) -> None:
+        """Release one delivery after completed or failed nested cleanup."""
+
+        if not isinstance(disposition, RequestCompletionDisposition):
+            raise TypeError("request completion disposition must be typed")
         active_request_ids = getattr(self, "_active_request_ids", None)
         counts = getattr(self, "_active_request_counts", None)
         generation = self._request_generation_for_current_task(request_id)
@@ -267,12 +277,18 @@ class RequestLifecycleMixin:
         if cleans_active_generation and started is not None:
             started.pop(request_id, None)
         tombstones = getattr(self, "_abandoned_request_generations", None)
-        if isinstance(tombstones, dict) and generation is not None:
-            abandoned = tombstones.get(request_id)
-            if isinstance(abandoned, set):
-                abandoned.discard(generation)
-                if not abandoned:
-                    tombstones.pop(request_id, None)
+        if generation is not None:
+            if disposition is RequestCompletionDisposition.ABANDONED:
+                if not isinstance(tombstones, dict):
+                    tombstones = {}
+                    self._abandoned_request_generations = tombstones
+                tombstones.setdefault(request_id, set()).add(generation)
+            elif isinstance(tombstones, dict):
+                abandoned = tombstones.get(request_id)
+                if isinstance(abandoned, set):
+                    abandoned.discard(generation)
+                    if not abandoned:
+                        tombstones.pop(request_id, None)
         cancelled_generations = getattr(
             self,
             "_cancelled_request_generations",
@@ -287,11 +303,6 @@ class RequestLifecycleMixin:
         if cleans_active_generation and self._current_request_id == request_id:
             self._current_request_id = next(iter(active_request_ids), None) if active_request_ids else None
         if cleans_active_generation:
-            disposition = (
-                RequestCompletionDisposition.ABANDONED
-                if self._abandoned_generations(request_id)
-                else RequestCompletionDisposition.COMPLETED
-            )
             self._resolve_request_completion(
                 request_id,
                 disposition,

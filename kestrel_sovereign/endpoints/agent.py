@@ -33,7 +33,7 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
 )
-from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
@@ -706,15 +706,18 @@ async def stream_agent_response(request: Request):
             agent_stream = None
             try:
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                agent_stream = agent.process_input_streaming(
-                    user_input,
-                    model_override=model_override,
-                    session_id=effective_session_id,
-                    audit_before_streaming=audit_before_streaming,
-                    caller=caller,
-                    request_id=request_id,
-                    invocation_provenance=invocation_provenance,
-                    attachments=attachments,
+                agent_stream = OwnedAsyncIterator(
+                    lambda: agent.process_input_streaming(
+                        user_input,
+                        model_override=model_override,
+                        session_id=effective_session_id,
+                        audit_before_streaming=audit_before_streaming,
+                        caller=caller,
+                        request_id=request_id,
+                        invocation_provenance=invocation_provenance,
+                        attachments=attachments,
+                    ),
+                    operation="agent stream cleanup",
                 )
                 async for chunk in agent_stream:
                     # Check if request was cancelled
@@ -779,29 +782,41 @@ async def stream_agent_response(request: Request):
                 )
                 yield agent_stream_error_block(e)
             finally:
+                agent_stream_cleanup_failed = False
                 try:
-                    # Breaking an ``async for`` does not synchronously close
-                    # its inner async generator. Await that generator's
-                    # ``finally`` (turn locks, tools, adapters) before endpoint
-                    # cleanup can wake a Stop acknowledgement waiter.
-                    close_agent_stream = getattr(agent_stream, "aclose", None)
-                    if callable(close_agent_stream):
-                        async def close_owned_agent_stream() -> None:
-                            await close_agent_stream()
-
-                        close_outcome = await await_owned_task(
-                            asyncio.create_task(close_owned_agent_stream())
-                        )
-                        raise_owned_outcome(
-                            close_outcome,
-                            operation="agent stream cleanup",
-                        )
+                    # One producer task owns construction, iteration, and close
+                    # of the nested generator. Its join is cancellation-safe
+                    # without moving ContextVar token reset into a copied task
+                    # context.
+                    if agent_stream is not None:
+                        await agent_stream.aclose()
+                except BaseException:
+                    agent_stream_cleanup_failed = (
+                        agent_stream is None
+                        or agent_stream.terminal_error is not None
+                    )
+                    raise
+                else:
+                    agent_stream_cleanup_failed = (
+                        agent_stream is not None
+                        and agent_stream.terminal_error is not None
+                    )
                 finally:
-                    # Signal stream completion for TTS consumers
-                    await stream_tap.finish(stream_delivery_id)
-                    # Cleanup request tracking only after the inner stream has
-                    # completed its own cooperative cleanup.
-                    agent._cleanup_cancelled_request(request_id)
+                    try:
+                        # Signal stream completion for TTS consumers
+                        await stream_tap.finish(stream_delivery_id)
+                    finally:
+                        # A failed nested close is an abandoned lifecycle,
+                        # never proof that Stop succeeded.
+                        if agent_stream_cleanup_failed:
+                            agent._cleanup_cancelled_request(
+                                request_id,
+                                disposition=(
+                                    RequestCompletionDisposition.ABANDONED
+                                ),
+                            )
+                        else:
+                            agent._cleanup_cancelled_request(request_id)
 
         headers = {
             "Cache-Control": "no-cache",
