@@ -24,7 +24,13 @@ from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore, _rows_affected
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
-from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
+from .async_graph_store import (
+    AsyncGraphStore,
+    Edge,
+    GraphNode,
+    NodeDeleteResult,
+    NodeSwapResult,
+)
 from .async_assertion_store import (
     AsyncAssertionStore,
     _AssertionTenantCapability,
@@ -1409,6 +1415,8 @@ class AsyncStorage:
         new_node: GraphNode,
         allowed_node_types: Optional[frozenset] = None,
         *,
+        expected_node_type: Optional[str] = None,
+        expected_label: Optional[str] = None,
         capability: Any = None,
     ) -> NodeSwapResult:
         """Atomically update a graph node's properties only if they still match.
@@ -1420,13 +1428,20 @@ class AsyncStorage:
         is written (``node_type`` / ``label`` are left as-is). ``allowed_node_types``
         (optional) constrains the effective node type the swap/create may touch
         — the privacy wrapper uses it to govern durable graph CAS in volatile
-        modes. Returns a :class:`NodeSwapResult` (``swapped`` /
-        ``predicate_failed`` / ``not_found`` / ``type_not_allowed``).
+        modes. ``expected_node_type`` and ``expected_label`` optionally add one
+        exact atomic identity predicate. Returns a :class:`NodeSwapResult`
+        (``swapped`` / ``predicate_failed`` / ``not_found`` /
+        ``type_not_allowed``).
         """
         if not self._initialized:
             await self.initialize()
         return await self.graph.compare_and_swap_node(
-            node_id, expected, new_node, allowed_node_types=allowed_node_types
+            node_id,
+            expected,
+            new_node,
+            allowed_node_types=allowed_node_types,
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
         )
 
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
@@ -1464,6 +1479,23 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         await self.graph.delete_node(node_id)
+
+    async def compare_and_delete_node(
+        self,
+        node_id: str,
+        *,
+        expected_node_type: str,
+        expected_label: str,
+    ) -> NodeDeleteResult:
+        """Delete a node only while its exact graph identity still matches."""
+
+        if not self._initialized:
+            await self.initialize()
+        return await self.graph.compare_and_delete_node(
+            node_id,
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
+        )
 
     async def get_edges_from(self, node_id: str) -> List[Edge]:
         """Get outgoing edges from a node."""

@@ -45,7 +45,10 @@ from kestrel_sovereign.storage.async_conversation_store import (
     _escape_like_session_value,
     search_session_summaries,
 )
-from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+from kestrel_sovereign.storage.async_graph_store import (
+    NodeDeleteResult,
+    NodeSwapResult,
+)
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
@@ -3048,7 +3051,10 @@ class PrivacyEnforcingStorage:
 
     async def _governed_compare_and_swap(
         self, store, node_id, expected, new_node, operation: str,
-        *, capability: Any = None,
+        *,
+        expected_node_type=None,
+        expected_label=None,
+        capability: Any = None,
     ):
         """Shared, TOCTOU-free CAS governance for the wrapper and the ``.graph``
         proxy.
@@ -3066,8 +3072,19 @@ class PrivacyEnforcingStorage:
         The storage layer instead refuses the swap unless the STORED row is of
         the validated structural type, atomically, without a wrapper pre-read.
         """
+        identity_options = {}
+        if expected_node_type is not None or expected_label is not None:
+            identity_options = {
+                "expected_node_type": expected_node_type,
+                "expected_label": expected_label,
+            }
         if not self._graph_writes_governed:
-            return await store.compare_and_swap_node(node_id, expected, new_node)
+            return await store.compare_and_swap_node(
+                node_id,
+                expected,
+                new_node,
+                **identity_options,
+            )
         self._assert_graph_node_write_allowed(
             new_node, operation, validate_label=(expected is None),
             capability=capability,
@@ -3101,6 +3118,7 @@ class PrivacyEnforcingStorage:
             expected,
             new_node,
             allowed_node_types=frozenset({getattr(new_node, "node_type", None)}),
+            **identity_options,
         )
         if result == NodeSwapResult.TYPE_NOT_ALLOWED:
             node_type = getattr(new_node, "node_type", None)
@@ -3143,7 +3161,14 @@ class PrivacyEnforcingStorage:
         await self._storage.add_node(node)
 
     async def compare_and_swap_node(
-        self, node_id, expected, new_node, *, capability: Any = None
+        self,
+        node_id,
+        expected,
+        new_node,
+        *,
+        expected_node_type=None,
+        expected_label=None,
+        capability: Any = None,
     ):
         """Atomically compare-and-swap a graph node, governed by the policy.
 
@@ -3154,6 +3179,8 @@ class PrivacyEnforcingStorage:
         """
         return await self._governed_compare_and_swap(
             self._storage, node_id, expected, new_node, "compare_and_swap_node",
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
             capability=capability,
         )
 
@@ -3194,6 +3221,21 @@ class PrivacyEnforcingStorage:
     async def delete_node(self, node_id: str) -> None:
         """Delete a graph node and its edges. Structural operation."""
         await self._storage.delete_node(node_id)
+
+    async def compare_and_delete_node(
+        self,
+        node_id: str,
+        *,
+        expected_node_type: str,
+        expected_label: str,
+    ) -> NodeDeleteResult:
+        """Delete only while the visible node's exact identity still matches."""
+
+        return await self._storage.compare_and_delete_node(
+            node_id,
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
+        )
 
     async def get_edges_from(self, node_id: str) -> List:
         """Get outgoing edges from a node."""
@@ -5430,6 +5472,7 @@ class _PrivacyGoverningGraphStore:
         "query_nodes_by_type_and_property",
         "get_edges",
         "delete_node",
+        "compare_and_delete_node",
         "delete_edge",
         "purge_agent_nodes",
         "bind_agent",
@@ -5450,7 +5493,14 @@ class _PrivacyGoverningGraphStore:
         return await self._store.add_node(node)
 
     async def compare_and_swap_node(
-        self, node_id, expected, new_node, *, capability: Any = None
+        self,
+        node_id,
+        expected,
+        new_node,
+        *,
+        expected_node_type=None,
+        expected_label=None,
+        capability: Any = None,
     ):
         # Govern the write intent without decomposing the atomic primitive: the
         # shared helper validates new_node's structural shape and pins the swap
@@ -5458,7 +5508,10 @@ class _PrivacyGoverningGraphStore:
         # predicate, then delegates the single atomic CAS on THIS store.
         return await self._wrapper._governed_compare_and_swap(
             self._store, node_id, expected, new_node,
-            "graph.compare_and_swap_node", capability=capability,
+            "graph.compare_and_swap_node",
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
+            capability=capability,
         )
 
     async def add_edge(self, source_id, target_id, label, properties=None,

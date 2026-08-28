@@ -39,6 +39,7 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_graph_store import (
     AsyncGraphStore,
     GraphNode,
+    NodeDeleteResult,
     NodeSwapResult,
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
@@ -110,6 +111,11 @@ class TestNodeSwapResult:
         # the plain string, not "NodeSwapResult.SWAPPED".
         assert NodeSwapResult.SWAPPED.value == "swapped"
         assert str(NodeSwapResult.SWAPPED) in ("swapped", "NodeSwapResult.SWAPPED")
+
+    def test_delete_result_is_str_enum(self):
+        assert NodeDeleteResult.DELETED == "deleted"
+        assert NodeDeleteResult.PREDICATE_FAILED == "predicate_failed"
+        assert NodeDeleteResult.NOT_FOUND == "not_found"
 
 
 # =====================================================================
@@ -230,6 +236,130 @@ class TestCompareAndSwap:
         assert after.label == "After"
         # ...and our properties change landed.
         assert after.properties == {"status": "done"}
+
+    async def test_expected_identity_refuses_post_read_relabel(self, graph_store):
+        """A caller that owns one graph shape can atomically refuse a row that
+        was relabeled after its read, even when the properties still match."""
+        nid = _nid("identity-label")
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="owned", label="Before")
+        )
+        snapshot = (await graph_store.get_node(nid)).properties
+
+        # Another whole-row writer changes identity but preserves the exact
+        # properties snapshot, reproducing the gap in a properties-only CAS.
+        await graph_store.add_node(
+            _node(nid, dict(snapshot), node_type="owned", label="After")
+        )
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            snapshot,
+            _node(nid, {"status": "done"}, node_type="owned", label="Before"),
+            expected_node_type="owned",
+            expected_label="Before",
+        )
+
+        assert result == NodeSwapResult.PREDICATE_FAILED
+        after = await graph_store.get_node(nid)
+        assert after.label == "After"
+        assert after.properties == {"status": "pending"}
+
+    async def test_expected_identity_refuses_post_read_retype(self, graph_store):
+        nid = _nid("identity-type")
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="owned", label="Stable")
+        )
+        snapshot = (await graph_store.get_node(nid)).properties
+        await graph_store.add_node(
+            _node(nid, dict(snapshot), node_type="foreign", label="Stable")
+        )
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            snapshot,
+            _node(nid, {"status": "done"}, node_type="owned", label="Stable"),
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeSwapResult.PREDICATE_FAILED
+        after = await graph_store.get_node(nid)
+        assert after.node_type == "foreign"
+        assert after.properties == {"status": "pending"}
+
+    async def test_expected_identity_allows_compare_and_create(self, graph_store):
+        nid = _nid("identity-create")
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            None,
+            _node(nid, {"status": "fresh"}, node_type="owned", label="Stable"),
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeSwapResult.SWAPPED
+        created = await graph_store.get_node(nid)
+        assert created is not None
+        assert created.node_type == "owned"
+        assert created.label == "Stable"
+
+    async def test_expected_identity_requires_type_and_label_together(
+        self, graph_store
+    ):
+        nid = _nid("identity-partial")
+        with pytest.raises(ValueError, match="expected_node_type.*expected_label"):
+            await graph_store.compare_and_swap_node(
+                nid,
+                None,
+                _node(nid, {"status": "fresh"}),
+                expected_node_type="cas_node",
+            )
+        assert await graph_store.get_node(nid) is None
+
+    async def test_expected_identity_rejects_a_different_new_node_shape(
+        self, graph_store
+    ):
+        nid = _nid("identity-new-shape")
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="owned", label="Stable")
+        )
+        snapshot = (await graph_store.get_node(nid)).properties
+
+        with pytest.raises(ValueError, match="new_node identity must match"):
+            await graph_store.compare_and_swap_node(
+                nid,
+                snapshot,
+                _node(
+                    nid,
+                    {"status": "done"},
+                    node_type="owned",
+                    label="Different",
+                ),
+                expected_node_type="owned",
+                expected_label="Stable",
+            )
+
+        after = await graph_store.get_node(nid)
+        assert after.label == "Stable"
+        assert after.properties == {"status": "pending"}
+
+    async def test_empty_allowed_type_set_denies_existing_swap(self, graph_store):
+        """An explicit empty allowlist must deny every effective node type."""
+        nid = _nid("empty-types")
+        await graph_store.add_node(_node(nid, {"status": "pending"}))
+        snapshot = (await graph_store.get_node(nid)).properties
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            snapshot,
+            _node(nid, {"status": "done"}),
+            allowed_node_types=frozenset(),
+        )
+
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
+        assert (await graph_store.get_node(nid)).properties == {"status": "pending"}
 
     async def test_snapshot_round_trips_through_get_node(self, graph_store):
         """A snapshot obtained via get_node must be an accepted predicate even
@@ -429,6 +559,74 @@ class TestAddNodeUnchanged:
 
 
 # =====================================================================
+# Atomic compare-and-delete by graph identity (dual backend)
+# =====================================================================
+
+
+class TestCompareAndDelete:
+
+    async def test_matching_identity_is_deleted(self, graph_store):
+        nid = _nid("delete-match")
+        await graph_store.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Stable")
+        )
+
+        result = await graph_store.compare_and_delete_node(
+            nid, expected_node_type="owned", expected_label="Stable"
+        )
+
+        assert result == "deleted"
+        assert await graph_store.get_node(nid) is None
+
+    @pytest.mark.parametrize(
+        "replacement_type,replacement_label",
+        (("foreign", "Stable"), ("owned", "After")),
+    )
+    async def test_post_read_identity_change_is_not_deleted(
+        self, graph_store, replacement_type, replacement_label
+    ):
+        nid = _nid("delete-race")
+        await graph_store.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Before")
+        )
+        observed = await graph_store.get_node(nid)
+        assert observed.node_type == "owned"
+        assert observed.label == "Before"
+
+        # Reproduce a replacement after the caller's read but before its delete.
+        await graph_store.add_node(
+            _node(
+                nid,
+                {"status": "replacement", "sentinel": "must survive"},
+                node_type=replacement_type,
+                label=replacement_label,
+            )
+        )
+
+        result = await graph_store.compare_and_delete_node(
+            nid, expected_node_type="owned", expected_label="Before"
+        )
+
+        assert result == "predicate_failed"
+        after = await graph_store.get_node(nid)
+        assert after is not None
+        assert after.node_type == replacement_type
+        assert after.label == replacement_label
+        assert after.properties == {
+            "status": "replacement",
+            "sentinel": "must survive",
+        }
+
+    async def test_absent_node_is_not_found(self, graph_store):
+        result = await graph_store.compare_and_delete_node(
+            _nid("delete-absent"),
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+        assert result == "not_found"
+
+
+# =====================================================================
 # Facade + privacy wrapper (SQLite; proves the delegation chain is atomic)
 # =====================================================================
 
@@ -468,6 +666,83 @@ class TestFacadeAndPrivacyWrapper:
             results = await asyncio.gather(*(swap(i) for i in range(8)))
             assert sum(1 for r in results if r == NodeSwapResult.SWAPPED) == 1
             assert sum(1 for r in results if r == NodeSwapResult.PREDICATE_FAILED) == 7
+        finally:
+            await storage.close()
+
+    async def test_privacy_wrapper_forwards_expected_identity(self, tmp_path):
+        storage = await AsyncStorage.create_sqlite(str(tmp_path / "identity.db"))
+        wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        try:
+            nid = _nid("wrapped-identity")
+            await wrapped.add_node(
+                _node(
+                    nid,
+                    {"status": "pending"},
+                    node_type="owned",
+                    label="Before",
+                )
+            )
+            snapshot = (await wrapped.get_node(nid)).properties
+            await storage.add_node(
+                _node(
+                    nid,
+                    dict(snapshot),
+                    node_type="owned",
+                    label="After",
+                )
+            )
+
+            result = await wrapped.compare_and_swap_node(
+                nid,
+                snapshot,
+                _node(
+                    nid,
+                    {"status": "done"},
+                    node_type="owned",
+                    label="Before",
+                ),
+                expected_node_type="owned",
+                expected_label="Before",
+            )
+
+            assert result == NodeSwapResult.PREDICATE_FAILED
+            assert (await storage.get_node(nid)).properties == {"status": "pending"}
+        finally:
+            await storage.close()
+
+    async def test_facade_and_graph_privacy_proxy_compare_and_delete(self, tmp_path):
+        storage = await AsyncStorage.create_sqlite(str(tmp_path / "delete.db"))
+        wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        try:
+            facade_id = _nid("facade-delete")
+            await storage.add_node(
+                _node(facade_id, {}, node_type="owned", label="Facade")
+            )
+            assert await storage.compare_and_delete_node(
+                facade_id,
+                expected_node_type="owned",
+                expected_label="Facade",
+            ) == "deleted"
+
+            wrapper_id = _nid("wrapper-delete")
+            await wrapped.add_node(
+                _node(wrapper_id, {}, node_type="owned", label="Wrapper")
+            )
+            assert await wrapped.compare_and_delete_node(
+                wrapper_id,
+                expected_node_type="owned",
+                expected_label="Wrapper",
+            ) == "deleted"
+
+            proxy_id = _nid("proxy-delete")
+            await wrapped.add_node(
+                _node(proxy_id, {}, node_type="owned", label="Proxy")
+            )
+            assert await wrapped.graph.compare_and_delete_node(
+                proxy_id,
+                expected_node_type="owned",
+                expected_label="Proxy",
+            ) == "deleted"
         finally:
             await storage.close()
 
@@ -630,6 +905,59 @@ class TestBoundOwnershipCAS:
         )
         assert result == NodeSwapResult.SWAPPED
         assert (await store_a.get_node(nid)).properties == {"status": "done"}
+
+    async def test_bound_compare_delete_cannot_observe_foreign_node(
+        self, bound_pair
+    ):
+        store_a, store_b = bound_pair
+        nid = _nid("bound-delete-foreign")
+        await store_a.add_node(
+            _node(nid, {"status": "A-owned"}, node_type="owned", label="Stable")
+        )
+
+        result = await store_b.compare_and_delete_node(
+            nid,
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeDeleteResult.NOT_FOUND
+        assert await store_b.get_node(nid) is None
+        assert (await store_a.get_node(nid)).properties == {"status": "A-owned"}
+
+    async def test_bound_compare_delete_releases_only_callers_shared_witness(
+        self, bound_pair
+    ):
+        store_a, store_b = bound_pair
+        nid = _nid("bound-delete-shared")
+        unbound = AsyncGraphStore(store_a.db)
+        await unbound.add_node(
+            _node(nid, {"status": "shared"}, node_type="owned", label="Stable")
+        )
+        await store_a.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, "agent-a"),
+        )
+        await store_a.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, "agent-b"),
+        )
+
+        result = await store_a.compare_and_delete_node(
+            nid,
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeDeleteResult.DELETED
+        assert await store_a.get_node(nid) is None
+        remaining = await store_b.get_node(nid)
+        assert remaining is not None
+        assert remaining.properties == {"status": "shared"}
+        owners = await store_a.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?", (nid,)
+        )
+        assert {row[0] for row in owners} == {"agent-b"}
 
     async def test_bound_create_rejects_foreign_declared_owner(self, bound_pair):
         """A bound store refuses a new_node that declares a different agent_id —

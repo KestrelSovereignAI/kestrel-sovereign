@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from kestrel_sovereign.storage.async_graph_store import (
+    lock_graph_nodes_for_update,
     record_graph_edge_owner,
     record_graph_node_owner,
     release_graph_node_owners,
@@ -635,9 +636,14 @@ class IdentityImporter:
             query += " AND ge.label = ?"
             query_params += (label,)
         rows = await self.db.fetchall(query, query_params)
+        # Graph writers take graph rows before ownership witnesses. Lock the
+        # entire component in the same order before removing any edge witness;
+        # release_graph_node_owners follows this order too.
+        node_ids = await lock_graph_nodes_for_update(
+            self.db, (row[0] for row in rows)
+        )
 
-        for row in rows:
-            node_id = row[0]
+        for node_id in node_ids:
             delete_condition = "source_id = ? AND target_id = ?"
             delete_params: tuple[Any, ...] = (agent_id, node_id)
             if label is not None:

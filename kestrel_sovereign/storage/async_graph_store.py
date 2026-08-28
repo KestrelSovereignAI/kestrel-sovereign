@@ -21,7 +21,7 @@ import logging
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, Optional, List, Any
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
@@ -384,7 +384,7 @@ async def release_graph_node_owners(
     if not agent_id:
         raise ValueError("Graph node ownership release requires an agent_id")
 
-    unique_node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+    unique_node_ids = await lock_graph_nodes_for_update(db, node_ids)
     affected = 0
     for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
         batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
@@ -441,6 +441,36 @@ async def release_graph_node_owners(
     return affected
 
 
+async def lock_graph_nodes_for_update(
+    db: AsyncDatabase,
+    node_ids: Iterable[str],
+) -> List[str]:
+    """Lock graph rows in the canonical order before ownership mutation.
+
+    Callers own the surrounding transaction. SQLite obtains serialization from
+    that transaction's writer lock; PostgreSQL needs explicit row locks. The
+    sorted return value lets every caller process overlapping batches in the
+    same order.
+    """
+
+    unique_node_ids = sorted(
+        dict.fromkeys(node_id for node_id in node_ids if node_id)
+    )
+    if db.backend_type != "postgres":
+        return unique_node_ids
+
+    for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
+        batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        await db.fetchall(
+            "SELECT node_id FROM graph_nodes "
+            f"WHERE node_id IN ({placeholders}) "
+            "ORDER BY node_id FOR UPDATE",
+            tuple(batch),
+        )
+    return unique_node_ids
+
+
 class NodeSwapResult(str, Enum):
     """Outcome of :meth:`AsyncGraphStore.compare_and_swap_node`.
 
@@ -459,6 +489,19 @@ class NodeSwapResult(str, Enum):
     # ``allowed_node_types`` — the privacy wrapper uses it to fail a durable
     # graph CAS closed in volatile modes (#2672) without a TOCTOU pre-read.
     TYPE_NOT_ALLOWED = "type_not_allowed"
+
+
+class NodeDeleteResult(str, Enum):
+    """Outcome of :meth:`AsyncGraphStore.compare_and_delete_node`.
+
+    ``DELETED`` means the node was removed from this store's tenant scope. A
+    shared physical row may remain visible to its other owners after a bound
+    store releases its own ownership witness.
+    """
+
+    DELETED = "deleted"
+    PREDICATE_FAILED = "predicate_failed"
+    NOT_FOUND = "not_found"
 
 
 @dataclass
@@ -815,6 +858,9 @@ class AsyncGraphStore:
         expected: Optional[Dict[str, Any]],
         new_node: GraphNode,
         allowed_node_types: Optional[frozenset] = None,
+        *,
+        expected_node_type: Optional[str] = None,
+        expected_label: Optional[str] = None,
     ) -> NodeSwapResult:
         """Atomically update a node's ``properties`` only if they still match.
 
@@ -865,6 +911,11 @@ class AsyncGraphStore:
                 onto whatever row already exists. ``None`` (the default) imposes
                 no type constraint, preserving the primitive's original
                 behaviour for every non-privacy caller.
+            expected_node_type: Optional exact stored ``node_type`` predicate.
+                Must be supplied together with ``expected_label``. The pair is
+                added to the same atomic ``UPDATE`` predicate as ``expected``.
+            expected_label: Optional exact stored ``label`` predicate. Must be
+                supplied together with ``expected_node_type``.
 
         Returns:
             * :attr:`NodeSwapResult.SWAPPED` — the predicate held and the write
@@ -896,11 +947,10 @@ class AsyncGraphStore:
             fail-closed on a real ``properties`` change: a writer that touched
             ``properties`` since your read yields ``PREDICATE_FAILED`` rather
             than overwriting their change. A concurrent ``node_type`` / ``label``
-            change is neither detected nor clobbered — it simply coexists,
-            because CAS reads and writes ``properties`` only. If a callsite needs
-            a wider whole-node predicate (also pinning ``node_type`` /
-            ``label``), add it as a distinct signature rather than loosening this
-            one.
+            change is neither detected nor clobbered by the default
+            properties-only signature. Callers that own an exact graph shape can
+            pass ``expected_node_type`` and ``expected_label`` to widen only the
+            predicate while retaining the properties-only write.
 
         Tenant scoping:
             On a store bound to an agent (:meth:`bind_agent`) this primitive is
@@ -920,6 +970,17 @@ class AsyncGraphStore:
             ownerless behaviour the primitive shipped with, where any existing
             row is a visible ``PREDICATE_FAILED`` conflict.
         """
+        identity_clause, identity_params = self._identity_predicate(
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
+        )
+        if identity_params and (
+            new_node.node_type != expected_node_type
+            or new_node.label != expected_label
+        ):
+            raise ValueError(
+                "new_node identity must match expected_node_type and expected_label"
+            )
         new_properties = json.dumps(new_node.properties)
         # Resolve the caller's authoritative owner up front, exactly like
         # add_node: a bound store may only write nodes it owns, and rejects a
@@ -947,6 +1008,8 @@ class AsyncGraphStore:
                 placeholders = ", ".join("?" for _ in allowed_tuple)
                 type_clause = f" AND node_type IN ({placeholders})"
                 type_params = allowed_tuple
+            else:
+                type_clause = " AND 1 = 0"
 
         async with self.db.transaction():
             if expected is None:
@@ -1045,12 +1108,13 @@ class AsyncGraphStore:
                 "UPDATE graph_nodes "
                 "SET properties = ? "
                 f"WHERE node_id = ? AND {self._properties_match_predicate()}"
-                f"{type_clause}{shared_clause} "
+                f"{identity_clause}{type_clause}{shared_clause} "
                 f"AND {scope}",
                 (
                     new_properties,
                     node_id,
                     expected_properties,
+                    *identity_params,
                     *type_params,
                     *shared_params,
                     *scope_params,
@@ -1089,6 +1153,25 @@ class AsyncGraphStore:
             ):
                 return NodeSwapResult.TYPE_NOT_ALLOWED
             return NodeSwapResult.PREDICATE_FAILED
+
+    @staticmethod
+    def _identity_predicate(
+        *,
+        expected_node_type: Optional[str],
+        expected_label: Optional[str],
+    ) -> tuple[str, tuple[str, ...]]:
+        """Build one exact type+label predicate or reject a partial identity."""
+
+        if (expected_node_type is None) != (expected_label is None):
+            raise ValueError(
+                "expected_node_type and expected_label must be supplied together"
+            )
+        if expected_node_type is None:
+            return "", ()
+        return (
+            " AND node_type = ? AND label = ?",
+            (expected_node_type, expected_label),
+        )
 
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
         """Get a node by ID."""
@@ -1205,6 +1288,53 @@ class AsyncGraphStore:
             for row in rows
         ]
 
+    async def _delete_node_in_transaction(self, node_id: str) -> bool:
+        """Delete/release one node while the caller holds a transaction."""
+
+        if self.agent_id:
+            owned = await self.db.fetchone(
+                "SELECT 1 FROM graph_node_owners "
+                "WHERE node_id = ? AND agent_id = ?",
+                (node_id, self.agent_id),
+            )
+            if not owned:
+                return False
+
+            await release_graph_node_owners(self.db, [node_id], self.agent_id)
+            return True
+
+        await self.db.execute(
+            "DELETE FROM graph_edge_owners "
+            "WHERE source_id = ? OR target_id = ?",
+            (node_id, node_id),
+        )
+        await self.db.execute(
+            "DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?",
+            (node_id, node_id),
+        )
+        await self.db.execute(
+            "DELETE FROM graph_node_owners WHERE node_id = ?",
+            (node_id,),
+        )
+        removed = await self.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ?",
+            (node_id,),
+        )
+        return bool(_rows_affected(removed))
+
+    async def _visible_node_identity_for_update(
+        self, node_id: str
+    ) -> Optional[tuple[str, str]]:
+        """Read and lock one tenant-visible graph identity inside a transaction."""
+
+        scope, scope_params = self._node_scope()
+        lock_suffix = " FOR UPDATE" if self.db.backend_type == "postgres" else ""
+        return await self.db.fetchone(
+            "SELECT node_type, label FROM graph_nodes "
+            f"WHERE node_id = ? AND {scope}{lock_suffix}",
+            (node_id, *scope_params),
+        )
+
     async def delete_node(self, node_id: str) -> None:
         """Release this store's node witness and reclaim ownerless rows.
 
@@ -1213,37 +1343,42 @@ class AsyncGraphStore:
         unbound maintenance store preserves the legacy physical-delete
         behavior.
         """
-        async with self.db.transaction():
-            if self.agent_id:
-                owned = await self.db.fetchone(
-                    "SELECT 1 FROM graph_node_owners "
-                    "WHERE node_id = ? AND agent_id = ?",
-                    (node_id, self.agent_id),
-                )
-                if not owned:
-                    return
-
-                await release_graph_node_owners(
-                    self.db, [node_id], self.agent_id
-                )
+        async with self.db.transaction(immediate=True):
+            if await self._visible_node_identity_for_update(node_id) is None:
                 return
+            await self._delete_node_in_transaction(node_id)
 
-            await self.db.execute(
-                "DELETE FROM graph_edge_owners "
-                "WHERE source_id = ? OR target_id = ?",
-                (node_id, node_id),
-            )
-            await self.db.execute(
-                "DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?",
-                (node_id, node_id)
-            )
-            await self.db.execute(
-                "DELETE FROM graph_node_owners WHERE node_id = ?",
-                (node_id,),
-            )
-            await self.db.execute(
-                "DELETE FROM graph_nodes WHERE node_id = ?",
-                (node_id,)
+    async def compare_and_delete_node(
+        self,
+        node_id: str,
+        *,
+        expected_node_type: str,
+        expected_label: str,
+    ) -> NodeDeleteResult:
+        """Delete only while the visible node's exact identity still matches.
+
+        The type+label read and deletion share one serialized transaction.
+        SQLite acquires its writer slot before reading; PostgreSQL locks the
+        selected graph row. A whole-row writer that replaces the node before
+        this operation therefore yields ``PREDICATE_FAILED`` without losing its
+        replacement, while a writer arriving afterward waits until deletion
+        commits.
+
+        On a bound store, ``DELETED`` means this tenant's ownership witness was
+        released. A shared physical row remains for any other owners.
+        """
+
+        async with self.db.transaction(immediate=True):
+            existing = await self._visible_node_identity_for_update(node_id)
+            if existing is None:
+                return NodeDeleteResult.NOT_FOUND
+            if existing != (expected_node_type, expected_label):
+                return NodeDeleteResult.PREDICATE_FAILED
+            deleted = await self._delete_node_in_transaction(node_id)
+            return (
+                NodeDeleteResult.DELETED
+                if deleted
+                else NodeDeleteResult.NOT_FOUND
             )
 
     async def purge_agent_nodes(
