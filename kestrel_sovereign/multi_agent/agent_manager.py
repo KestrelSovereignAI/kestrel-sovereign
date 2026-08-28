@@ -2044,12 +2044,26 @@ class AgentManager:
 
         for child_name, child in tuple(self._agents.items()):
             child_id = _loaded_agent_did(child)
-            if child_id is not None:
-                self._restore_persisted_spawn_authority(
-                    child_name,
-                    child,
-                    child_id,
-                )
+            if child_id is None:
+                continue
+            existing = self._child_mandates.get(child_name)
+            if existing is not None:
+                # This projection was signature-verified when the child was
+                # published. A supported non-cascading parent withdrawal may
+                # leave that child running; unrelated registrations must not
+                # reopen its proof against a parent that is intentionally no
+                # longer loaded. Still refuse a corrupted name/DID binding.
+                if existing.child_did != child_id:
+                    raise RuntimeError(
+                        f"Agent {child_name!r} has conflicting persisted spawn "
+                        "authority"
+                    )
+                continue
+            self._restore_persisted_spawn_authority(
+                child_name,
+                child,
+                child_id,
+            )
 
     def _registration_order_for_initialized_agents(self, items):
         """Return a stable parent-before-child order for one startup batch.

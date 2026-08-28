@@ -697,6 +697,33 @@ async def test_registration_rehydrates_parent_authority_after_restart(tmp_path):
     assert manager.get_mandate("RestartedChild") is None
 
 
+@pytest.mark.asyncio
+async def test_retained_child_does_not_block_unrelated_registration_after_parent_stop(
+    tmp_path,
+):
+    """A verified projection remains usable after non-cascading withdrawal."""
+
+    parent_did = "did:pkh:eip155:1:0xStoppedParent"
+    child_did = "did:pkh:eip155:1:0xRetainedChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("StoppedParent", parent)
+    manager._register_agent("RetainedChild", child)
+
+    assert await manager.remove_agent("StoppedParent") is True
+    assert manager.get_agent("RetainedChild") is child
+    assert manager.get_mandate("RetainedChild") is mandate
+
+    unrelated = _make_mock_agent("did:test:unrelated")
+    manager._register_agent("Unrelated", unrelated)
+
+    assert manager.get_agent("Unrelated") is unrelated
+    assert manager.get_children(parent_did) == ["RetainedChild"]
+    assert manager.get_mandate("RetainedChild") is mandate
+
+
 def test_signed_child_is_not_published_before_parent_authority(tmp_path):
     parent_did = "did:pkh:eip155:1:0xLateParent"
     child_did = "did:pkh:eip155:1:0xEarlyChild"
