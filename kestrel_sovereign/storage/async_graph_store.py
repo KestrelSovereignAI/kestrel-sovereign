@@ -1472,6 +1472,34 @@ class AsyncGraphStore:
                     return NodeSwapResult.PREDICATE_FAILED
                 return NodeSwapResult.NOT_FOUND
 
+            if self.db.backend_type == "postgres" and owner:
+                # Preserve the tenant-blind NOT_FOUND contract without letting
+                # an invalid tenant queue on either a foreign row or its graph
+                # reservation. Ownership mutations recheck under the same
+                # reservation below, so this unlocked probe is only a cheap
+                # refusal and never authorizes the write.
+                visible = await self.db.fetchone(
+                    f"SELECT 1 FROM graph_nodes WHERE node_id = ? AND {scope}",
+                    (node_id, *scope_params),
+                )
+                if visible is None:
+                    return NodeSwapResult.NOT_FOUND
+
+            # Existing-row CAS must enter through the same shard-before-row
+            # protocol as add/delete and composed graph writers. Otherwise it
+            # can hold this physical row while a composed writer holds the
+            # node's reservation shard, forming a PostgreSQL row<->advisory
+            # deadlock when CAS later extends its transaction to another node.
+            await _lock_graph_node_ids_for_insert(self.db, [node_id])
+            if self.db.backend_type == "postgres":
+                locked = await self.db.fetchone(
+                    "SELECT 1 FROM graph_nodes "
+                    f"WHERE node_id = ? AND {scope} FOR UPDATE",
+                    (node_id, *scope_params),
+                )
+                if locked is None:
+                    return NodeSwapResult.NOT_FOUND
+
             # An existing fleet-shared row has exactly ONE writer: ``add_node``.
             # This primitive refuses them rather than reimplementing that door's
             # rules — shareability, immutable identity, co-ownership — a second

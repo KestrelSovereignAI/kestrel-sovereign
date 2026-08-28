@@ -146,6 +146,78 @@ async def test_compare_and_create_waits_for_absent_node_reservation(graph_store)
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_existing_swap_takes_reservation_before_graph_row(graph_store):
+    """An existing-row CAS cannot invert the composed-writer lock order."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL exposes the shard-to-row deadlock cycle")
+
+    candidates = []
+    for index in range(10000):
+        node_id = _nid(f"cas-reservation-order-{index}")
+        shard = int.from_bytes(
+            hashlib.sha256(
+                f"kestrel:graph-node:{node_id}".encode("utf-8")
+            ).digest()[:8],
+            "big",
+        ) % graph_store_module._GRAPH_NODE_RESERVATION_SHARDS
+        key = graph_store_module._GRAPH_NODE_RESERVATION_KEY_BY_SHARD[shard]
+        candidates.append((key, node_id))
+        if len({candidate[0] for candidate in candidates}) >= 2:
+            break
+    low, high = sorted(
+        {key: node_id for key, node_id in candidates}.items()
+    )[:2]
+    low_id, high_id = low[1], high[1]
+    await graph_store.add_node(_node(low_id, {"status": "pending"}))
+    snapshot = (await graph_store.get_node(low_id)).properties
+    swap_done = asyncio.Event()
+    prelock_started = asyncio.Event()
+
+    async def swap_then_extend():
+        async with graph_store.db.transaction():
+            result = await graph_store.compare_and_swap_node(
+                low_id,
+                snapshot,
+                _node(low_id, {"status": "swapped"}),
+            )
+            swap_done.set()
+            await asyncio.wait_for(prelock_started.wait(), timeout=5)
+            # Give the competing transaction time to acquire every shard it
+            # can before reaching the row held by this transaction. With the
+            # required shard-before-row order it blocks on ``low_id`` instead.
+            await asyncio.sleep(0.2)
+            await graph_store.lock_nodes_for_update([high_id])
+            return result
+
+    async def prelock_both():
+        await asyncio.wait_for(swap_done.wait(), timeout=5)
+        prelock_started.set()
+        async with graph_store.db.transaction():
+            return await graph_store.lock_nodes_for_update([low_id, high_id])
+
+    try:
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                asyncio.create_task(swap_then_extend()),
+                asyncio.create_task(prelock_both()),
+                return_exceptions=True,
+            ),
+            timeout=5,
+        )
+        assert not [
+            result for result in outcomes if isinstance(result, BaseException)
+        ], outcomes
+        assert outcomes[0] == NodeSwapResult.SWAPPED
+    finally:
+        await graph_store.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ? OR node_id = ?",
+            (low_id, high_id),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_predicate_failed_leaves_post_read_update_untouched_on_backend(graph_store):
     """The core safety property on the production DB: a swap that loses the race
     must not clobber the winner's write."""
@@ -1037,17 +1109,18 @@ async def test_bootstrap_writer_adopts_valid_ownerless_agent_root(
         def __init__(self, node_id):
             self.content_hash = node_id
 
+    artifact_node_id = (
+        storage.files._avatar_node_id(agent_id, "primary", content_hash)
+        if operation == "avatar"
+        else content_hash
+    )
     try:
         if operation == "avatar":
             await storage.files.store_avatar(payload, agent_id, "primary")
-            artifact_node_id = storage.files._avatar_node_id(
-                agent_id, "primary", content_hash
-            )
         else:
             await storage.record_backup_artifact(
                 agent_id, BackupResult(content_hash)
             )
-            artifact_node_id = content_hash
 
         assert await storage.db.fetchall(
             "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
