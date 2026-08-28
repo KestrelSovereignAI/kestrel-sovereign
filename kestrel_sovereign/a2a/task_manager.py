@@ -523,7 +523,7 @@ class TaskManager:
         *,
         authority_agent_id: str,
     ) -> Task:
-        """Commit a handler cancellation or return an earlier winning cancel."""
+        """Commit handler cancellation or return an earlier terminal winner."""
 
         try:
             return await self.cancel_task(
@@ -534,10 +534,11 @@ class TaskManager:
             )
         except ValueError:
             current = await self.task_store.get(task.id)
-            if (
-                current is not None
-                and current.status.state is TaskState.CANCELED
-            ):
+            if current is not None and current.status.state in {
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.CANCELED,
+            }:
                 return current
             raise
 

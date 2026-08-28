@@ -853,6 +853,77 @@ async def test_sync_handler_returns_concurrent_winning_cancellation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_async_canceling_handler_preserves_concurrent_completed_winner(tmp_path):
+    """A stale handler cancellation cannot rewrite completed state as failed."""
+    host_did = "did:test:host"
+    manager = await create_task_manager(
+        str(tmp_path / "async-completed-winner.db"), host_agent_id=host_did
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class CancelingHandler:
+        name = "canceling"
+
+        async def handle_task(self, task):
+            entered.set()
+            await release.wait()
+            task.status = TaskStatus(
+                state=TaskState.CANCELED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="stale cancellation")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="canceling-agent",
+            url="/agents/canceling-agent",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="canceling-skill",
+                    name="canceling-skill",
+                    description="cancel",
+                )
+            ],
+        ),
+        CancelingHandler(),
+    )
+    try:
+        await manager.execute_skill(
+            "canceling-agent", "canceling-skill", {}, sync=False
+        )
+        await entered.wait()
+        pending = (await manager.get_pending_tasks())[0]
+        winning = await manager.get_task(pending.id)
+        winning.status = TaskStatus(
+            state=TaskState.COMPLETED,
+            message=Message(
+                role="agent",
+                parts=[TextPart(text="concurrent completion")],
+            ),
+        )
+        assert await manager.task_store.save(winning) is True
+
+        release.set()
+        await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(pending.id)
+        assert persisted.status.state is TaskState.COMPLETED
+        assert persisted.status.message.parts[0].text == "concurrent completion"
+    finally:
+        release.set()
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
     from kestrel_sovereign.a2a import outbound_store
 
