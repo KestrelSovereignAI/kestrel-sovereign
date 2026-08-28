@@ -1862,7 +1862,7 @@ class ConstitutionMixin:
                 # rows in different semantic order. Take the complete set first
                 # so PostgreSQL always observes one canonical lock order.
                 await self.storage.lock_nodes_for_update(
-                    [artifact_hash, stored_hash]
+                    [self.agent_id, artifact_hash, stored_hash]
                 )
                 await self.storage.add_node(
                     artifact_node,

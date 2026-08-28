@@ -344,6 +344,44 @@ async def record_graph_node_owner(
     )
 
 
+async def reserve_provisional_agent_owner(
+    db: AsyncDatabase, agent_id: str
+) -> None:
+    """Reserve an agent root without claiming a conflicting shared-graph id.
+
+    Avatar and backup storage can precede physical agent-root creation. Both
+    bootstrap paths use this one guard while their surrounding transaction is
+    open. The lock covers an absent PostgreSQL row as well as a present one, so
+    the identity validation and ownership witness are one serialized action.
+    """
+
+    if not agent_id:
+        raise ValueError("Provisional agent ownership requires an agent_id")
+    await lock_graph_nodes_for_update(db, [agent_id])
+    root = await db.fetchone(
+        "SELECT node_type, properties FROM graph_nodes WHERE node_id = ?",
+        (agent_id,),
+    )
+    if root and root[0] != "agent":
+        raise ValueError("Agent owner id collides with a non-agent graph node")
+    if root:
+        try:
+            properties = json.loads(root[1]) if root[1] else {}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Existing agent graph node has invalid properties") from exc
+        declared = properties.get("agent_id")
+        if declared and declared != agent_id:
+            raise ValueError("Existing agent graph node declares another agent_id")
+
+    owner_rows = await db.fetchall(
+        "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+        (agent_id,),
+    )
+    if any(row[0] != agent_id for row in owner_rows):
+        raise ValueError("Agent owner id is owned by another agent")
+    await record_graph_node_owner(db, agent_id, agent_id)
+
+
 async def record_graph_edge_owner(
     db: AsyncDatabase,
     source_id: str,
@@ -1653,9 +1691,7 @@ class AsyncGraphStore:
             # before the physical agent root exists. The ownership checks below
             # validate the reservation atomically. Unbound maintenance writers
             # have no such proof and must present a physical source too.
-            if (not trusted_cross_agent and not target_exists) or (
-                not source_exists and not requested_owner
-            ):
+            if not requested_owner and (not source_exists or not target_exists):
                 raise ValueError("Graph edge endpoints do not both exist")
 
             if requested_owner:
@@ -1674,7 +1710,7 @@ class AsyncGraphStore:
                         raise ValueError(
                             "Trusted cross-agent edge source is not owned by the bound agent"
                         )
-                elif not (owns_source and owns_target):
+                elif not (owns_source and owns_target and target_exists):
                     raise ValueError(
                         "Graph edge endpoints are not both owned by the bound agent"
                     )

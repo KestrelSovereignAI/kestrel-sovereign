@@ -56,8 +56,12 @@ def test_both_reanchor_writers_prelock_the_complete_shared_node_set():
     """Opposite semantic write order must not become opposite lock order."""
 
     expected_names = {
-        ConstitutionMixin.reanchor_constitution: {"artifact_hash", "stored_hash"},
-        _write_reanchor: {"artifact_hash", "new_hash"},
+        ConstitutionMixin.reanchor_constitution: {
+            "artifact_hash",
+            "stored_hash",
+            "self.agent_id",
+        },
+        _write_reanchor: {"agent_did", "artifact_hash", "new_hash"},
     }
     for function, expected in expected_names.items():
         calls = _graph_write_calls(function)
@@ -67,9 +71,7 @@ def test_both_reanchor_writers_prelock_the_complete_shared_node_set():
         assert add_calls
         assert lock_calls[0][0] < add_calls[0][0]
         locked_names = {
-            node.id
-            for node in ast.walk(lock_calls[0][2].args[0])
-            if isinstance(node, ast.Name)
+            ast.unparse(element) for element in lock_calls[0][2].args[0].elts
         }
         assert locked_names == expected
 

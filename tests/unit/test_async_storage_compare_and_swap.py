@@ -811,6 +811,33 @@ class TestEdgeAdmission:
             (agent_id, target_id, "bootstrap"),
         ) is not None
 
+    async def test_bound_edge_hides_foreign_target_existence(self, graph_store):
+        """Missing and foreign targets are indistinguishable to a tenant."""
+
+        store_a = AsyncGraphStore(graph_store.db, agent_id="agent-a")
+        store_b = AsyncGraphStore(graph_store.db, agent_id="agent-b")
+        source_id = _nid("owned-source")
+        foreign_id = _nid("foreign-target")
+        missing_id = _nid("missing-target")
+        await store_a.add_node(
+            _node(source_id, {"agent_id": "agent-a"}, node_type="owned")
+        )
+        await store_b.add_node(
+            _node(foreign_id, {"agent_id": "agent-b"}, node_type="owned")
+        )
+
+        with pytest.raises(Exception) as missing_error:
+            await store_a.add_edge(source_id, missing_id, "references")
+        with pytest.raises(Exception) as foreign_error:
+            await store_a.add_edge(source_id, foreign_id, "references")
+
+        assert type(missing_error.value) is type(foreign_error.value)
+        assert str(missing_error.value) == str(foreign_error.value)
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE source_id = ? AND label = ?",
+            (source_id, "references"),
+        ) is None
+
 
 # =====================================================================
 # Facade + privacy wrapper (SQLite; proves the delegation chain is atomic)

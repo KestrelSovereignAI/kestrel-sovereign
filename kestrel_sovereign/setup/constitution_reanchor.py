@@ -1129,7 +1129,9 @@ async def _write_reanchor(
             # this setup path writes the document before the artifact. Lock the
             # complete shared set first so semantic order cannot become an
             # opposite PostgreSQL row-lock order.
-            await storage.graph.lock_nodes_for_update([new_hash, artifact_hash])
+            await storage.graph.lock_nodes_for_update(
+                [agent_did, new_hash, artifact_hash]
+            )
 
             # 2. Document graph node for the new constitution.
             await storage.graph.add_node(
