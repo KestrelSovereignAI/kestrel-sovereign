@@ -280,12 +280,47 @@ def bind_async_generator_invocation(
         @wraps(function)
         async def wrapped(*args: Any, **kwargs: Any) -> AsyncIterator[_T]:
             bound = signature.bind_partial(*args, **kwargs)
-            with invocation_scope(
-                bound.arguments.get(parameter),
-                provenance=bound.arguments.get("invocation_provenance"),
+            # Do not hold ContextVar tokens across an outward ``yield``. The
+            # consumer is allowed to close this iterator from a cancellation-
+            # safe owner task; resetting a token created by the original task
+            # from that closer's Context raises ValueError and can falsely make
+            # request cleanup look complete. Bind only while advancing or
+            # closing the underlying generator, and retain one effective id and
+            # provenance for every advance even if different tasks drive it.
+            effective_id = ensure_invocation_id(bound.arguments.get(parameter))
+            supplied_provenance = bound.arguments.get("invocation_provenance")
+            if supplied_provenance is not None and not isinstance(
+                supplied_provenance, InvocationProvenance
             ):
-                async for item in function(*bound.args, **bound.kwargs):
+                raise TypeError(
+                    "invocation provenance must be endpoint-owned "
+                    "InvocationProvenance"
+                )
+            effective_provenance = (
+                supplied_provenance
+                if supplied_provenance is not None
+                else _current_invocation_provenance.get()
+            )
+            iterator = function(*bound.args, **bound.kwargs)
+            try:
+                while True:
+                    with invocation_scope(
+                        effective_id,
+                        provenance=effective_provenance,
+                    ):
+                        try:
+                            item = await anext(iterator)
+                        except StopAsyncIteration:
+                            return
                     yield item
+            finally:
+                close_iterator = getattr(iterator, "aclose", None)
+                if callable(close_iterator):
+                    with invocation_scope(
+                        effective_id,
+                        provenance=effective_provenance,
+                    ):
+                        await close_iterator()
 
         return wrapped
 

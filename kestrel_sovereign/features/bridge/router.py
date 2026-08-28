@@ -22,6 +22,7 @@ Usage:
         app.include_router(get_router())
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -36,6 +37,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     resolve_request_invocation_id,
 )
 from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -212,6 +214,7 @@ def get_router() -> APIRouter:
         async def event_generator():
             full_response = []
             request_lifecycle_registered = False
+            agent_stream = None
             try:
                 if hasattr(agent, "register_active_request"):
                     agent.register_active_request(request_id)
@@ -223,14 +226,15 @@ def get_router() -> APIRouter:
                 # strip it before serializing each chunk into the
                 # bridge SSE event payload.
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                async for chunk in agent.process_input_streaming(
+                agent_stream = agent.process_input_streaming(
                     user_input,
                     model_override=body.model_override,
                     session_id=session.id,
                     caller=get_caller(request),
                     request_id=request_id,
                     invocation_provenance=invocation_provenance,
-                ):
+                )
+                async for chunk in agent_stream:
                     chunk = strip_revise_sentinels(chunk)
                     if not chunk:
                         continue
@@ -272,12 +276,30 @@ def get_router() -> APIRouter:
                 )
                 yield bridge_sse_error_event(e)
             finally:
-                # Bridge streams use the same counted lifecycle contract as
-                # /api/agent/stream.  Duplicate retry ids deliberately share
-                # a cancellation key; each generator releases only its own
-                # registration in this finally block.
-                if request_lifecycle_registered:
-                    agent._cleanup_cancelled_request(request_id)
+                try:
+                    # A bridge disconnect closes the SSE wrapper while the
+                    # agent iterator is suspended at its own yield. Explicitly
+                    # own and await that iterator's cleanup before releasing
+                    # the request lifecycle and waking Stop acknowledgement.
+                    close_agent_stream = getattr(agent_stream, "aclose", None)
+                    if callable(close_agent_stream):
+                        async def close_owned_agent_stream() -> None:
+                            await close_agent_stream()
+
+                        close_outcome = await await_owned_task(
+                            asyncio.create_task(close_owned_agent_stream())
+                        )
+                        raise_owned_outcome(
+                            close_outcome,
+                            operation="bridge agent stream cleanup",
+                        )
+                finally:
+                    # Bridge streams use the same counted lifecycle contract as
+                    # /api/agent/stream. Duplicate retry ids deliberately share
+                    # a cancellation key; each generator releases only its own
+                    # registration after nested stream cleanup is terminal.
+                    if request_lifecycle_registered:
+                        agent._cleanup_cancelled_request(request_id)
 
         return StreamingResponse(
             event_generator(),

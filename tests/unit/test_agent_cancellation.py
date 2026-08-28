@@ -130,6 +130,9 @@ class TestAgentCancellation:
         from fastapi import FastAPI
         from starlette.requests import Request
 
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+        )
         from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
@@ -147,7 +150,14 @@ class TestAgentCancellation:
                 self.storage = MagicMock()
                 self.storage.resolve_session_id = AsyncMock(return_value=None)
 
-            async def process_input_streaming(self, *_args, **_kwargs):
+            @bind_async_generator_invocation("request_id")
+            async def process_input_streaming(
+                self,
+                *_args,
+                request_id=None,
+                invocation_provenance=None,
+                **_kwargs,
+            ):
                 try:
                     yield "first"
                     yield "second"
@@ -209,6 +219,136 @@ class TestAgentCancellation:
         release_inner_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await eof
+        await asyncio.wait_for(completion, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_decorated_stream_can_close_from_its_owned_cleanup_task(self):
+        """Cross-task close awaits the underlying generator without token drift."""
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+            current_invocation_id,
+        )
+
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        observed_ids = []
+
+        @bind_async_generator_invocation("request_id")
+        async def decorated(*, request_id=None):
+            try:
+                observed_ids.append(current_invocation_id())
+                yield "chunk"
+            finally:
+                observed_ids.append(current_invocation_id())
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+        stream = decorated(request_id="owned-close")
+        assert await anext(stream) == "chunk"
+        close = asyncio.create_task(stream.aclose())
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        assert close.done() is False
+        release_cleanup.set()
+        await asyncio.wait_for(close, timeout=1)
+
+        assert observed_ids == ["owned-close", "owned-close"]
+
+    @pytest.mark.asyncio
+    async def test_bridge_disconnect_closes_inner_generator_before_completion_ack(
+        self,
+    ):
+        """Bridge SSE cannot release Stop while its nested turn still cleans up."""
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+        )
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        inner_cleanup_started = asyncio.Event()
+        release_inner_cleanup = asyncio.Event()
+
+        class LiveAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+
+            @bind_async_generator_invocation("request_id")
+            async def process_input_streaming(
+                self,
+                *_args,
+                request_id=None,
+                invocation_provenance=None,
+                **_kwargs,
+            ):
+                try:
+                    yield "first"
+                    yield "second"
+                finally:
+                    inner_cleanup_started.set()
+                    await release_inner_cleanup.wait()
+
+        agent = LiveAgent()
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent.features = {"BridgeFeature": bridge}
+        app = FastAPI()
+        app.state.agent = agent
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/bridge/stream",
+                "raw_path": b"/api/bridge/stream",
+                "query_string": b"",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            }
+        )
+        route = next(
+            route
+            for route in get_router().routes
+            if route.path == "/api/bridge/stream"
+        )
+        endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+        response = await endpoint(
+            request,
+            BridgeRequest(
+                message="work",
+                request_id="bridge-inner-cleanup",
+            ),
+        )
+        stream = response.body_iterator
+
+        assert "first" in await anext(stream)
+        assert agent.cancel_current_request("bridge-inner-cleanup") is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion("bridge-inner-cleanup")
+        )
+        close = asyncio.create_task(stream.aclose())
+        await asyncio.wait_for(inner_cleanup_started.wait(), timeout=1)
+        assert completion.done() is False
+
+        close.cancel()
+        await asyncio.sleep(0)
+        assert completion.done() is False
+        release_inner_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close
         await asyncio.wait_for(completion, timeout=1)
 
     def test_multiple_cancellations_tracked(self, mock_agent):
