@@ -16,9 +16,16 @@ import pytest
 import pytest_asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
+from kestrel_sdk.signals import (
+    CausationFrame,
+    SignalHandle,
+    SignalMode,
+    SignalResult,
+    Status,
+)
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.base import Feature
@@ -3035,6 +3042,28 @@ class TestEcosystemDiscoveryWatchHandler:
         feature._save_ecosystem_discovery_state.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_notify_cannot_forge_discovery_wake_target(self, feature):
+        feature.agent.did = "did:test:watch-owner"
+        feature._agent_id = feature.agent.did
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_finding())
+        feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        _wire_watch_dispatcher(feature)
+
+        out = await feature._run_ecosystem_discovery_watch(
+            {
+                "tool": "discover_ecosystem",
+                "repo": "owner/name",
+                "notify": "did:test:forged-peer",
+            }
+        )
+
+        assert json.loads(out)["signaled"] is True
+        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+        assert signal.target_agent == "did:test:watch-owner"
+        await _settle_watch_deliveries(feature)
+
+    @pytest.mark.asyncio
     async def test_unchanged_finding_does_not_signal(self, feature):
         from kestrel_sovereign.signals.sources.ecosystem_discovery import (
             normalize_discovery_result,
@@ -3430,6 +3459,65 @@ class TestGitHubPRWatchHandler:
         await _settle_watch_deliveries(feature)
 
         feature._save_pr_watch_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_notify_cannot_forge_pr_causation_or_evade_cycle_detection(
+        self, feature
+    ):
+        from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            SOURCE_NAME,
+            build_github_pr_activity_registration,
+            compute_fingerprint,
+            normalize_pr_state,
+        )
+
+        feature.agent.did = "did:test:watch-owner"
+        feature._agent_id = feature.agent.did
+        previous = normalize_pr_state(_pr_payload(comments=2))
+        feature._load_pr_watch_state = AsyncMock(
+            return_value=(compute_fingerprint(previous), previous)
+        )
+        feature._save_pr_watch_state = AsyncMock()
+        _wire_watch_dispatcher(feature)
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH,
+            new=AsyncMock(return_value=_pr_payload(comments=3)),
+        ):
+            out = await feature._run_github_pr_watch(
+                {
+                    "repo": "owner/name",
+                    "pr": 1614,
+                    "notify": "did:test:forged-peer",
+                }
+            )
+
+        assert json.loads(out)["signaled"] is True
+        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+        assert signal.target_agent == "did:test:watch-owner"
+
+        signal.causation_chain.append(
+            CausationFrame(
+                agent_id="did:test:watch-owner",
+                source=SOURCE_NAME,
+                signal_id="prior-watch-wake",
+                turn_id="turn-prior",
+                depth=1,
+                emitted_at=datetime.now(timezone.utc),
+            )
+        )
+        dispatcher = SimpleNamespace(
+            _ttl=5,
+            _clock=lambda: datetime.now(timezone.utc),
+        )
+        frame, cycle = SignalDispatcher._compute_frame_and_check_cycle(
+            dispatcher,
+            signal,
+            build_github_pr_activity_registration(),
+        )
+        assert frame.agent_id == "did:test:watch-owner"
+        assert cycle is not None and "Cycle detected" in cycle
+        await _settle_watch_deliveries(feature)
 
     @pytest.mark.asyncio
     async def test_dispatch_error_does_not_advance_watch_state(self, feature):
