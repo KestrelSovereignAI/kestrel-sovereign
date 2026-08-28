@@ -38,6 +38,18 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
     return agent
 
 
+async def _persist_and_publish_spawn_test_child(manager, name, child) -> None:
+    child._raw_storage = SimpleNamespace(
+        graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+    )
+    admission = manager._agent_operations[manager._canonical_agent_name(name)]
+    assert admission.before_publish is not None
+    assert manager.get_agent(name) is None
+    await admission.before_publish(child)
+    manager._agents[name] = child
+    manager._agent_names[child.agent_id] = name
+
+
 def _exception_leaves(error: BaseException) -> list[BaseException]:
     if isinstance(error, BaseExceptionGroup):
         leaves: list[BaseException] = []
@@ -2034,6 +2046,7 @@ class TestAgentManagerSpawn:
     @pytest.mark.asyncio
     async def test_spawn_agent_creates_and_tracks(self):
         parent = _make_mock_agent("did:parent")
+        parent._private_key, _ = generate_secp256k1_keypair()
         child = _make_mock_agent("did:child")
 
         manager = AgentManager()
@@ -2051,8 +2064,7 @@ class TestAgentManagerSpawn:
             # Public spawn commits its mandate only for the exact child already
             # published by create/load; this fake keeps the test on that
             # production contract.
-            manager._agents[name] = child
-            manager._agent_names[child.agent_id] = name
+            await _persist_and_publish_spawn_test_child(manager, name, child)
             return child
 
         with patch.object(manager, "create_agent", side_effect=create_and_publish):
@@ -2066,6 +2078,7 @@ class TestAgentManagerSpawn:
     @pytest.mark.asyncio
     async def test_spawn_agent_duplicate_raises(self):
         parent = _make_mock_agent("did:parent")
+        parent._private_key, _ = generate_secp256k1_keypair()
 
         manager = AgentManager()
         manager._agents["helper"] = _make_mock_agent("did:existing")
@@ -2080,14 +2093,14 @@ class TestAgentManagerSpawn:
         """A refused rollback cannot masquerade as a completed failed spawn."""
 
         parent = _make_mock_agent("did:parent")
+        parent._private_key, _ = generate_secp256k1_keypair()
         child = _make_mock_agent("did:child")
         child.shutdown.side_effect = RuntimeError("shutdown refused")
         manager = AgentManager()
         mandate = SpawnMandate(parent_did="did:parent", purpose="test")
 
         async def create_and_publish(name, **_kwargs):
-            manager._agents[name] = child
-            manager._agent_names[child.agent_id] = name
+            await _persist_and_publish_spawn_test_child(manager, name, child)
             return child
 
         manager._apply_delegated_budget = AsyncMock(
@@ -2115,14 +2128,14 @@ class TestAgentManagerSpawn:
         """Cancellation cannot hide a rollback that left a child routable."""
 
         parent = _make_mock_agent("did:parent")
+        parent._private_key, _ = generate_secp256k1_keypair()
         child = _make_mock_agent("did:child")
         child.shutdown.side_effect = RuntimeError("shutdown refused")
         manager = AgentManager()
         mandate = SpawnMandate(parent_did="did:parent", purpose="test")
 
         async def create_and_publish(name, **_kwargs):
-            manager._agents[name] = child
-            manager._agent_names[child.agent_id] = name
+            await _persist_and_publish_spawn_test_child(manager, name, child)
             return child
 
         budget_started = asyncio.Event()
@@ -2156,6 +2169,7 @@ class TestAgentManagerSpawn:
         """Final slot retirement cannot replace rollback evidence with cancellation."""
 
         parent = _make_mock_agent("did:parent")
+        parent._private_key, _ = generate_secp256k1_keypair()
         child = _make_mock_agent("did:child")
         manager = AgentManager()
         mandate = SpawnMandate(parent_did="did:parent", purpose="test")
@@ -2163,8 +2177,7 @@ class TestAgentManagerSpawn:
         budget_started = asyncio.Event()
 
         async def create_and_publish(name, **_kwargs):
-            manager._agents[name] = child
-            manager._agent_names[child.agent_id] = name
+            await _persist_and_publish_spawn_test_child(manager, name, child)
             return child
 
         async def allocate_then_wait(name, *_args, **_kwargs):

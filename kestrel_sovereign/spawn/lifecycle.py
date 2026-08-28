@@ -300,7 +300,7 @@ class SpawnedAgentLifecycle:
             )
             return
         tracked.ttl_task = loop.create_task(
-            self._ttl_monitor(tracked.child_name, remaining),
+            self._ttl_monitor(tracked.child_name, tracked.child_did, remaining),
             name=f"spawn_ttl:{tracked.child_name}",
         )
 
@@ -360,12 +360,49 @@ class SpawnedAgentLifecycle:
             self._arm_restored_ttl_if_possible(tracked)
         self._tracked[child_name] = tracked
 
-    def withdraw_persisted_child(self, child_name: str) -> None:
-        """Undo cold-load lifecycle adoption when publication rolls back."""
+    def withdraw_persisted_child(
+        self,
+        child_name: str,
+        *,
+        expected_child_did: Optional[str] = None,
+    ) -> bool:
+        """Withdraw an exact child's timer without touching a replacement."""
 
-        tracked = self._tracked.pop(child_name, None)
-        if tracked is not None and tracked.ttl_task is not None:
+        tracked = self._tracked.get(child_name)
+        if tracked is None or (
+            expected_child_did is not None
+            and tracked.child_did != expected_child_did
+        ):
+            return False
+        self._tracked.pop(child_name, None)
+        if (
+            tracked.ttl_task is not None
+            and tracked.ttl_task is not asyncio.current_task()
+        ):
             tracked.ttl_task.cancel()
+        return True
+
+    def disarm_persisted_child(
+        self,
+        child_name: str,
+        *,
+        expected_child_did: Optional[str] = None,
+    ) -> bool:
+        """Cancel an exact child's timer while retaining terminal reconciliation."""
+
+        tracked = self._tracked.get(child_name)
+        if tracked is None or (
+            expected_child_did is not None
+            and tracked.child_did != expected_child_did
+        ):
+            return False
+        if (
+            tracked.ttl_task is not None
+            and tracked.ttl_task is not asyncio.current_task()
+        ):
+            tracked.ttl_task.cancel()
+        tracked.ttl_task = None
+        return True
 
     def create_ephemeral_dir(self) -> str:
         """Create a temporary directory for an ephemeral child agent.
@@ -428,7 +465,7 @@ class SpawnedAgentLifecycle:
                 else ttl_seconds
             )
             tracked.ttl_task = asyncio.create_task(
-                self._ttl_monitor(child_name, remaining),
+                self._ttl_monitor(child_name, child_did, remaining),
                 name=f"spawn_ttl:{child_name}",
             )
 
@@ -615,7 +652,12 @@ class SpawnedAgentLifecycle:
                 terminal_outcomes,
             )
 
-    async def _ttl_monitor(self, child_name: str, ttl_seconds: int) -> None:
+    async def _ttl_monitor(
+        self,
+        child_name: str,
+        child_did: str,
+        ttl_seconds: int,
+    ) -> None:
         """Background task that auto-terminates a child when TTL expires."""
         try:
             await asyncio.sleep(ttl_seconds)
@@ -626,7 +668,11 @@ class SpawnedAgentLifecycle:
         # report can't both finalize the child (#1729). Idempotent.
         async with self._lock:
             tracked = self._tracked.get(child_name)
-            if tracked is None or tracked.result is not None:
+            if (
+                tracked is None
+                or tracked.child_did != child_did
+                or tracked.result is not None
+            ):
                 return  # already finalized by report_result
 
             logger.info("TTL expired for child '%s' after %ds", child_name, ttl_seconds)
@@ -759,7 +805,11 @@ class SpawnedAgentLifecycle:
                     attempts = tracked.automatic_termination_attempts
                     if attempts < _MAX_AUTOMATIC_TERMINATION_ATTEMPTS:
                         tracked.ttl_task = asyncio.create_task(
-                            self._ttl_monitor(child_name, tracked.ttl_seconds)
+                            self._ttl_monitor(
+                                child_name,
+                                tracked.child_did,
+                                tracked.ttl_seconds,
+                            )
                         )
                     else:
                         tracked.termination_refusal = TerminationRefusalState(

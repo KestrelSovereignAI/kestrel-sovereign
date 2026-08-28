@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
@@ -370,7 +371,7 @@ async def test_shutdown_all_releases_outstanding_holds():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -411,6 +412,12 @@ def _mgr_with_mock_child(child):
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
         # Mimic load_agent registering the child, so the REAL remove_agent (the
         # path that releases budget holds — #2113) finds and stops it.
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = mgr._agent_operations[mgr._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
         mgr._agents[name] = child
         mgr._agent_names[child.agent_id] = name
         return child
@@ -421,11 +428,10 @@ def _mgr_with_mock_child(child):
 
 @pytest.mark.asyncio
 async def test_spawn_holds_budget_and_terminate_releases():
-    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -466,7 +472,7 @@ async def test_spawn_cancellation_after_provider_allocation_refunds_tracked_hold
             return child_wallet
 
     parent = SimpleNamespace(
-        _private_key=None,
+        _private_key=generate_secp256k1_keypair()[0],
         identity=None,
         agent_id="did:test:provider-parent",
         features={},
@@ -478,6 +484,12 @@ async def test_spawn_cancellation_after_provider_allocation_refunds_tracked_hold
     )
 
     async def fake_create_agent(name, **_kwargs):
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = manager._agent_operations[manager._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
         manager._agents[name] = child
         manager._agent_names[child.agent_id] = name
         return child
@@ -543,7 +555,7 @@ async def test_direct_remove_agent_releases_budget():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(
@@ -554,6 +566,12 @@ async def test_direct_remove_agent_releases_budget():
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
         # Match the public create/load contract: a spawn may only commit after
         # its exact child is published to both routing maps.
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = mgr._agent_operations[mgr._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
         mgr._agents[name] = child
         mgr._agent_names[child.agent_id] = name
         return child
@@ -825,7 +843,7 @@ async def test_budget_refused_for_persistent_child():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -843,7 +861,7 @@ async def test_budget_refused_without_funded_parent_wallet():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={}, wallet=None,
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={}, wallet=None,
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
@@ -858,7 +876,7 @@ async def test_budget_refused_when_parent_cannot_afford():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("3")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -899,7 +917,7 @@ async def test_no_budget_leaves_wallet_untouched():
 
     original = FakeWallet(initial_balance=Decimal("100"))
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={}, wallet=original,
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={}, wallet=original,
     )
     child = SimpleNamespace(agent_id="did:c", wallet="preexisting", wallet_agent=None)
     mgr = _mgr_with_mock_child(child)

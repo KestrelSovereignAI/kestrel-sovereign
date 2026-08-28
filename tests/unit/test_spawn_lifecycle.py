@@ -57,6 +57,64 @@ def test_restored_ephemeral_ttl_rearms_after_sync_construction() -> None:
     asyncio.run(rearm())
 
 
+@pytest.mark.asyncio
+async def test_manager_prune_cancels_removed_child_ttl_before_name_reuse() -> None:
+    manager = AgentManager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    old_did = "did:test:removed-child"
+    await lifecycle.register(
+        "Reusable",
+        old_did,
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+    old_task = lifecycle._tracked["Reusable"].ttl_task
+    manager._parent_children["did:test:parent"] = ["Reusable"]
+    manager._child_mandates["Reusable"] = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=old_did,
+    )
+
+    manager._prune_child_relationship_and_mandate(
+        "did:test:parent",
+        "Reusable",
+    )
+    await asyncio.sleep(0)
+    await lifecycle.register(
+        "Reusable",
+        "did:test:replacement-child",
+        "did:test:other-parent",
+        ttl_seconds=3600,
+    )
+
+    assert old_task is not None and old_task.cancelled()
+    assert lifecycle._tracked["Reusable"].child_did == "did:test:replacement-child"
+    await lifecycle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stale_ttl_monitor_cannot_terminate_same_name_replacement() -> None:
+    manager = _make_mock_manager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    await lifecycle.register(
+        "Reusable",
+        "did:test:replacement-child",
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+
+    await lifecycle._ttl_monitor(
+        "Reusable",
+        "did:test:removed-child",
+        0,
+    )
+
+    manager.terminate_child.assert_not_awaited()
+    assert lifecycle._tracked["Reusable"].child_did == "did:test:replacement-child"
+    await lifecycle.shutdown()
+
+
 class TestSpawnResult:
     """SpawnResult dataclass basics."""
 

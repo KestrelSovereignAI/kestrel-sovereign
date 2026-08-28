@@ -10,6 +10,7 @@ import json
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -45,6 +46,18 @@ class SpawnMandate:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
 
+    def _wire_budget_allocation(self) -> int | float:
+        """Return the JSON numeric representation bound by the signature."""
+
+        value = self.budget_allocation
+        if isinstance(value, Decimal):
+            if not value.is_finite():
+                raise ValueError("spawn mandate budget must be finite")
+            return float(value)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError("spawn mandate budget must be numeric")
+        return value
+
     def _signable_payload(self) -> bytes:
         """Return the canonical bytes representation for signing.
 
@@ -65,7 +78,7 @@ class SpawnMandate:
             "child_did": self.child_did,
             "constitution_hash": self.constitution_hash,
             "additional_constraints": self.additional_constraints,
-            "budget_allocation": self.budget_allocation,
+            "budget_allocation": self._wire_budget_allocation(),
             "ttl_seconds": self.ttl_seconds,
             "features_allowed": self.features_allowed,
             "purpose": self.purpose,
@@ -91,7 +104,7 @@ class SpawnMandate:
         return {
             "constitution_hash": self.constitution_hash,
             "additional_constraints": dict(self.additional_constraints),
-            "budget_allocation": self.budget_allocation,
+            "budget_allocation": self._wire_budget_allocation(),
             "ttl_seconds": self.ttl_seconds,
             "features_allowed": list(self.features_allowed),
             "purpose": self.purpose,

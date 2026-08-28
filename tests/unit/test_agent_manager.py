@@ -63,6 +63,25 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
     return agent
 
 
+async def _persist_and_publish_spawn_test_child(
+    manager: AgentManager,
+    name: str,
+    child,
+) -> None:
+    """Model create -> load's signed-receipt-before-routing contract."""
+
+    if vars(child).get("_raw_storage") is None:
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+    admission = manager._agent_operations[manager._canonical_agent_name(name)]
+    assert admission.before_publish is not None
+    assert manager.get_agent(name) is None
+    await admission.before_publish(child)
+    manager._agents[name] = child
+    manager._agent_names[child.agent_id] = name
+
+
 def _signed_restored_mandate(
     parent_did: str,
     child_did: str,
@@ -134,6 +153,37 @@ async def test_spawn_refuses_prebound_child_identity(tmp_path):
         )
 
     assert manager._agent_operations == {}
+
+
+@pytest.mark.asyncio
+async def test_load_awaits_spawn_receipt_before_routing_publication(tmp_path):
+    manager = AgentManager(base_data_dir=tmp_path)
+    child = _make_mock_agent("did:test:prepublication-child")
+    manager._initialize_agent = AsyncMock(return_value=child)
+    manager._on_agent_registered = AsyncMock()
+    admission, owns = await manager._admit_agent_operation(
+        "PrepublicationChild",
+        kind="spawn",
+    )
+    assert owns
+    observed: list[object] = []
+
+    async def persist_before_publish(candidate):
+        observed.append(manager.get_agent("PrepublicationChild"))
+        observed.append(candidate)
+
+    admission.before_publish = persist_before_publish
+    try:
+        loaded = await manager.load_agent(
+            "PrepublicationChild",
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+    finally:
+        await manager._release_agent_operation(admission)
+
+    assert loaded is child
+    assert observed == [None, child]
+    assert manager.get_agent("PrepublicationChild") is child
 
 
 @pytest.mark.asyncio
@@ -380,7 +430,7 @@ async def test_spawn_commit_rechecks_cap_after_concurrent_authority_restore(tmp_
     """A cold-loaded child can consume the last cap slot during spawn I/O."""
 
     parent = _make_mock_agent("did:pkh:eip155:1:0xSpawnParent")
-    parent._private_key = None
+    parent._private_key, _ = generate_secp256k1_keypair()
     parent.identity = None
     parent.features = {}
     fresh = _make_mock_agent("did:pkh:eip155:1:0xFreshChild")
@@ -397,8 +447,7 @@ async def test_spawn_commit_rechecks_cap_after_concurrent_authority_restore(tmp_
 
     async def create_after_restore(name, **_kwargs):
         manager._register_agent("RestoredChild", restored)
-        manager._agents[name] = fresh
-        manager._agent_names[fresh.agent_id] = name
+        await _persist_and_publish_spawn_test_child(manager, name, fresh)
         return fresh
 
     async def rollback_fresh(_admission, _child):
@@ -424,7 +473,7 @@ async def test_spawn_commit_rechecks_cap_after_concurrent_authority_restore(tmp_
 
 
 @pytest.mark.asyncio
-async def test_failed_spawn_rollback_deletes_its_signed_receipt(tmp_path):
+async def test_failed_spawn_rollback_revokes_authority_but_keeps_restrictions(tmp_path):
     private_key, _ = generate_secp256k1_keypair()
     parent = _make_mock_agent("did:test:rollback-parent")
     parent._private_key = private_key
@@ -439,8 +488,7 @@ async def test_failed_spawn_rollback_deletes_its_signed_receipt(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
 
     async def create_child(name, **_kwargs):
-        manager._agents[name] = child
-        manager._agent_names[child.agent_id] = name
+        await _persist_and_publish_spawn_test_child(manager, name, child)
         return child
 
     async def remove_child(name, **_kwargs):
@@ -461,12 +509,12 @@ async def test_failed_spawn_rollback_deletes_its_signed_receipt(tmp_path):
             SpawnMandate(parent_did=parent.agent_id, purpose="must roll back"),
         )
 
-    graph.delete_edge.assert_awaited_once_with(
-        child.agent_id,
-        parent.agent_id,
-        "spawned_by",
-    )
-    assert "_persisted_spawn_mandate" not in vars(child)
+    assert graph.add_trusted_cross_agent_edge.await_count == 2
+    revoked = graph.add_trusted_cross_agent_edge.await_args_list[-1]
+    assert revoked.args == (child.agent_id, parent.agent_id, "spawned_by")
+    assert revoked.kwargs["properties"]["parent_signature"] is None
+    assert child._persisted_spawn_mandate.parent_signature is None
+    graph.delete_edge.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -485,8 +533,7 @@ async def test_spawn_restamps_proposal_at_final_child_identity(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
 
     async def create_child(name, **_kwargs):
-        manager._agents[name] = child
-        manager._agent_names[child.agent_id] = name
+        await _persist_and_publish_spawn_test_child(manager, name, child)
         return child
 
     manager.create_agent = AsyncMock(side_effect=create_child)
@@ -519,8 +566,7 @@ async def test_spawn_expired_before_commit_rolls_back_signed_receipt(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
 
     async def create_child(name, **_kwargs):
-        manager._agents[name] = child
-        manager._agent_names[child.agent_id] = name
+        await _persist_and_publish_spawn_test_child(manager, name, child)
         return child
 
     async def remove_child(name, **_kwargs):
@@ -544,11 +590,9 @@ async def test_spawn_expired_before_commit_rolls_back_signed_receipt(tmp_path):
             SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
         )
 
-    graph.delete_edge.assert_awaited_once_with(
-        child.agent_id,
-        parent.agent_id,
-        "spawned_by",
-    )
+    assert graph.add_trusted_cross_agent_edge.await_count == 2
+    revoked = graph.add_trusted_cross_agent_edge.await_args_list[-1]
+    assert revoked.kwargs["properties"]["parent_signature"] is None
 
 
 @pytest.mark.asyncio
@@ -664,7 +708,7 @@ async def test_over_cap_spawn_retires_slot_before_rollback_allows_one_winner(
     manager = AgentManager(base_data_dir=tmp_path)
     manager._max_spawned_agents = 2
     parent = _make_mock_agent("did:pkh:eip155:1:0xConcurrentParent")
-    parent._private_key = None
+    parent._private_key, _ = generate_secp256k1_keypair()
     parent.identity = None
     parent.features = {}
     restored = _make_mock_agent("did:pkh:eip155:1:0xConcurrentRestored")
@@ -692,8 +736,7 @@ async def test_over_cap_spawn_retires_slot_before_rollback_allows_one_winner(
             both_created.set()
         await both_created.wait()
         child = fresh[name]
-        manager._agents[name] = child
-        manager._agent_names[child.agent_id] = name
+        await _persist_and_publish_spawn_test_child(manager, name, child)
         return child
 
     async def rollback_rejected(admission, child):
@@ -5795,12 +5838,15 @@ class TestSpawnAgent:
         """spawn_agent should pass parent's DID to create_agent for delegation."""
         mock_get_did.return_value = "did:spawned-child"
         mock_child = _make_mock_agent("did:spawned-child")
+        mock_child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
         mock_agent_cls.return_value = mock_child
 
         manager = AgentManager(base_data_dir=tmp_path)
 
         parent = _make_mock_agent("did:parent-xyz")
-        parent._private_key = None  # No key — skip signing
+        parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
 
         mandate = SpawnMandate(
@@ -5889,12 +5935,15 @@ class TestSpawnAgent:
         """
         mock_get_did.return_value = "did:featured-child"
         mock_child = _make_mock_agent("did:featured-child")
+        mock_child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
         mock_agent_cls.return_value = mock_child
 
         manager = AgentManager(base_data_dir=tmp_path)
 
         parent = _make_mock_agent("did:parent-feat")
-        parent._private_key = None  # No key — skip signing
+        parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
 
         mandate = SpawnMandate(
@@ -5922,12 +5971,15 @@ class TestSpawnAgent:
         """An empty (default) mandate allowlist means "load all" (allowed_features=None)."""
         mock_get_did.return_value = "did:open-child"
         mock_child = _make_mock_agent("did:open-child")
+        mock_child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
         mock_agent_cls.return_value = mock_child
 
         manager = AgentManager(base_data_dir=tmp_path)
 
         parent = _make_mock_agent("did:parent-open")
-        parent._private_key = None
+        parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
 
         # No features_allowed → default empty list → load all features.
