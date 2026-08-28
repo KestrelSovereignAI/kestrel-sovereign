@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -1137,6 +1138,30 @@ class TestBoundOwnershipCAS:
         assert result == NodeDeleteResult.NOT_FOUND
         assert await store_b.get_node(nid) is None
         assert (await store_a.get_node(nid)).properties == {"status": "A-owned"}
+
+    async def test_bound_compare_delete_does_not_lock_foreign_node(
+        self, bound_pair, monkeypatch
+    ):
+        """Tenant scope is checked before any graph-row/advisory lock."""
+
+        import kestrel_sovereign.storage.async_graph_store as graph_module
+
+        store_a, store_b = bound_pair
+        nid = _nid("bound-delete-no-foreign-lock")
+        await store_a.add_node(
+            _node(nid, {"status": "A-owned"}, node_type="owned", label="Stable")
+        )
+        lock = AsyncMock(return_value=[nid])
+        monkeypatch.setattr(graph_module, "lock_graph_nodes_for_update", lock)
+
+        result = await store_b.compare_and_delete_node(
+            nid,
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeDeleteResult.NOT_FOUND
+        lock.assert_not_awaited()
 
     async def test_bound_compare_delete_releases_only_callers_shared_witness(
         self, bound_pair

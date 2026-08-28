@@ -2913,6 +2913,10 @@ class AsyncStorage:
         Expects a result compatible with FilecoinAdapter.StorageResult.
         Returns the backup node_id.
         """
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError(
+                "A bound storage facade cannot record another agent's backup"
+            )
         if not self._initialized:
             await self.initialize()
             
@@ -2936,7 +2940,10 @@ class AsyncStorage:
             # Reserve its canonical self-owner exactly like avatar bootstrap,
             # then use a bound graph writer so edge admission can distinguish
             # this provisional source from an arbitrary missing endpoint.
-            graph = AsyncGraphStore(self.db, agent_id=agent_id)
+            graph = self.graph if self.agent_id else AsyncGraphStore(
+                self.db, agent_id=agent_id
+            )
+            assert graph is not None
             await graph.lock_nodes_for_update([agent_id, backup_node.node_id])
             await reserve_provisional_agent_owner(self.db, agent_id)
             await graph.add_node(backup_node)

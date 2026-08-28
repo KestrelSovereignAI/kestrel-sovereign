@@ -1430,10 +1430,24 @@ class AsyncGraphStore:
         """Read and lock one tenant-visible graph identity inside a transaction."""
 
         scope, scope_params = self._node_scope()
+        if self.agent_id:
+            # Scope before taking either the PostgreSQL advisory lock or the
+            # physical row lock. An invisible id must behave exactly like an
+            # absent id and must not let one tenant hold another tenant's locks
+            # until a caller-managed outer transaction eventually commits.
+            visible = await self.db.fetchone(
+                "SELECT 1 FROM graph_node_owners "
+                "WHERE node_id = ? AND agent_id = ?",
+                (node_id, self.agent_id),
+            )
+            if visible is None:
+                return None
         # ``transaction(immediate=True)`` cannot upgrade a same-task outer
         # deferred transaction because SQLite's nested transaction scope is a
         # no-op. Acquire explicitly before reading identity so the composed
         # public ``AsyncStorage.transaction()`` path remains serialized too.
+        # The scoped read below is deliberately repeated after locking: an
+        # ownership witness can disappear between the cheap probe and the lock.
         await lock_graph_nodes_for_update(self.db, [node_id])
         return await self.db.fetchone(
             "SELECT node_type, label FROM graph_nodes "

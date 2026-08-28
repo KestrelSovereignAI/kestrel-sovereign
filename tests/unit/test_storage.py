@@ -9,7 +9,7 @@ import tempfile
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from kestrel_sovereign.storage import AsyncStorage, GraphNode
+from kestrel_sovereign.storage import AsyncGraphStore, AsyncStorage, GraphNode
 from kestrel_sovereign.storage.db import TransactionError
 
 @pytest_asyncio.fixture
@@ -156,3 +156,46 @@ async def test_backup_rejects_foreign_node_at_provisional_agent_id(storage):
     assert await storage.db.fetchone(
         "SELECT 1 FROM graph_nodes WHERE node_id = ?", (_FakeResult.content_hash,)
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_bound_storage_rejects_backup_for_another_agent(temp_dir):
+    """A per-call backup id cannot replace the facade's tenant capability."""
+
+    bound_agent = "did:test:backup-bound"
+    requested_agent = "did:test:backup-foreign"
+    bound = AsyncStorage(
+        db_path=str(temp_dir / "bound-backup.db"),
+        agent_id=bound_agent,
+    )
+    await bound.initialize()
+
+    class _FakeResult:
+        content_hash = "e" * 64
+        storage_tier = type("T", (), {"value": "local"})()
+        ipfs_cid = None
+        filecoin_deal_id = None
+        encrypted = False
+        encryption_key_hash = None
+
+    try:
+        foreign = AsyncGraphStore(bound.db, agent_id=requested_agent)
+        await foreign.add_node(
+            GraphNode(
+                node_id=requested_agent,
+                node_type="agent",
+                label="Foreign agent",
+                properties={"agent_id": requested_agent},
+            )
+        )
+
+        with pytest.raises(ValueError, match="bound storage"):
+            await bound.record_backup_artifact(requested_agent, _FakeResult())
+
+        assert await foreign.get_node(_FakeResult.content_hash) is None
+        assert await bound.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE source_id = ? AND target_id = ?",
+            (requested_agent, _FakeResult.content_hash),
+        ) is None
+    finally:
+        await bound.close()
