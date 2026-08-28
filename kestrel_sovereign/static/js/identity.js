@@ -863,7 +863,10 @@ function openNewAgentFlow() {
     // all (405) — the server advertises `can_create_agents` and the client
     // treats absence as false (codex P2 rounds 1-2). Those consoles route to
     // the legacy Spawn flow instead.
-    if (!agentListDefaultAdapter.canCreateAgents) {
+    // The adapter mirrors feature availability for presentation, but only the
+    // API client's resettable, caller-scoped authority state may gate the host
+    // mutation. It is revoked before every refresh and stays false on errors.
+    if (!API.canManageHostAgentLifecycle('create')) {
         if (!goToSpawnTab()) Toast.info('Creating a new agent requires the Spawn feature.');
         return;
     }

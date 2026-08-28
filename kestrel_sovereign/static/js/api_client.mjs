@@ -624,6 +624,10 @@ export function createApiClient({
             create: false,
             delete: false,
         },
+        // Monotonic request generation for caller-scoped lifecycle discovery.
+        // An older sovereign response must never overwrite a newer OAuth/JWT
+        // response when /api/agents refreshes overlap across an auth change.
+        hostLifecycleAuthorityGeneration: 0,
         // Cached double-submit CSRF token for host-scoped state-changing
         // requests (#2293). Fetched lazily from GET /api/host/csrf (which also
         // sets the matching cookie) and reused for the page's lifetime. Only
@@ -799,17 +803,20 @@ export function createApiClient({
         health: () => client.request('/health'),
         getAgentInfo: () => client.request('/api/agent/info'),
         async getAgents() {
+            const generation = ++state.hostLifecycleAuthorityGeneration;
             state.hostLifecycleAuthority = {
                 classified: false,
                 create: false,
                 delete: false,
             };
             const data = await client.request('/api/agents');
-            state.hostLifecycleAuthority = {
-                classified: true,
-                create: data.can_create_agents === true,
-                delete: data.can_delete_agents === true,
-            };
+            if (generation === state.hostLifecycleAuthorityGeneration) {
+                state.hostLifecycleAuthority = {
+                    classified: true,
+                    create: data.can_create_agents === true,
+                    delete: data.can_delete_agents === true,
+                };
+            }
             return data;
         },
         canManageHostAgentLifecycle(operation) {

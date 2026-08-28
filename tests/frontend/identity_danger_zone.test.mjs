@@ -37,7 +37,7 @@ globalThis.window.SharedMarkdown = {
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 const API = apiModule.default;
 const { Modal, setOverlayRoot } = await import('../../kestrel_sovereign/static/js/ui.js');
-const { renderIdentityDangerZone } = await import(
+const { renderIdentityDangerZone, resolveDeleteAction } = await import(
     '../../kestrel_sovereign/static/js/identity-danger-zone.js'
 );
 
@@ -119,6 +119,51 @@ test('multi-agent feature presence does not expose delete without caller authori
         '',
         'feature availability cannot substitute for sovereign lifecycle authority',
     );
+});
+
+test('native delete rechecks caller authority after the panel was rendered', () => {
+    let allowed = true;
+    let deleted = false;
+    const action = resolveDeleteAction({
+        identity: { name: 'Emma' },
+        api: {
+            getHostAgent: () => 'emma',
+            canManageHostAgentLifecycle: () => allowed,
+            deleteAgent: () => { deleted = true; },
+        },
+        dz: {},
+    });
+    assert.equal(action.show, true);
+
+    allowed = false;
+    assert.throws(() => action.handler(), /authority is no longer available/i);
+    assert.equal(deleted, false);
+});
+
+test('stale native delete button disappears instead of opening after revocation', () => {
+    resetPanel();
+    Modal.hide();
+    let allowed = true;
+    let deleted = false;
+    const container = document.getElementById('identity-danger-zone');
+    const api = {
+        getHostAgent: () => 'emma',
+        canManageHostAgentLifecycle: () => allowed,
+        deleteAgent: () => { deleted = true; },
+    };
+    assert.equal(renderIdentityDangerZone({
+        container,
+        identity: { name: 'Emma' },
+        api,
+        Modal,
+        Toast: {},
+    }), true);
+
+    allowed = false;
+    container.querySelector('#danger-zone-delete-btn').click();
+    assert.equal(container.innerHTML, '');
+    assert.equal(document.getElementById('danger-zone-confirm-input'), null);
+    assert.equal(deleted, false);
 });
 
 test('loadIdentity() renders a host-injected delete handler even without native capability (#2208)', async () => {

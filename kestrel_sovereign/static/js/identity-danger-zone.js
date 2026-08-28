@@ -95,7 +95,15 @@ export function resolveDeleteAction({ identity, api, dz }) {
     const native = !hostHandler && canNative;
     const handler = hostHandler
         ? () => hostHandler(identity)
-        : () => api.deleteAgent(agentKey);
+        : () => {
+            // Authority is caller-scoped and can be revoked while the panel or
+            // confirm modal remains mounted. Re-check at the irreversible
+            // boundary rather than trusting the render-time snapshot.
+            if (!api.canManageHostAgentLifecycle('delete')) {
+                throw new Error('Delete authority is no longer available. Refresh and try again.');
+            }
+            return api.deleteAgent(agentKey);
+        };
 
     // The name the user must type to arm the button. Hosts may override it (e.g.
     // a companion display name that differs from the Kestrel agent name).
@@ -165,7 +173,14 @@ export function renderIdentityDangerZone({ container, identity, api, Modal, Toas
     const btn = container.querySelector('#danger-zone-delete-btn');
     if (btn) {
         btn.addEventListener('click', () => {
-            _openConfirmModal({ action, identity, Modal, Toast });
+            // Re-resolve after any intervening authentication or discovery
+            // refresh. A stale button must not open an actionable modal.
+            const currentAction = resolveDeleteAction({ identity, api, dz });
+            if (!currentAction.show) {
+                container.innerHTML = '';
+                return;
+            }
+            _openConfirmModal({ action: currentAction, identity, Modal, Toast });
         });
     }
     return true;
