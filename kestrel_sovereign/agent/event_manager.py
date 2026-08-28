@@ -385,7 +385,8 @@ class EventManagerMixin:
         task_id = getattr(task, "id", "<unknown>")
         try:
             from kestrel_sovereign.signals.delivery import (
-                harvest_detached_delivery,
+                ACCEPTED_STATUSES,
+                await_terminal_delivery,
             )
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 build_signal_for_submitted_task,
@@ -405,16 +406,54 @@ class EventManagerMixin:
                 sender=sender,
             )
 
-            # Detached dispatch, same posture as task_complete above
-            # (#2532): the TaskStore row is already persisted, so nothing
-            # durable rides on this wake and retrying is not this
-            # callback's job — but the task is owned and its terminal
-            # result harvested so a failed wake is observable.
-            harvest_detached_delivery(
-                self._track_background_task,
-                lambda: dispatcher.enqueue_signal(signal),
-                label=f"a2a.task_submitted[{task_id}]",
-                task_name=f"a2a_submitted:{str(task_id)[:8]}",
+            label = f"a2a.task_submitted[{task_id}]"
+            pending = vars(self).setdefault(
+                "_a2a_submitted_signal_handles",
+                {},
+            )
+
+            async def enqueue_and_gate() -> None:
+                try:
+                    handle = await dispatcher.enqueue_signal(signal)
+                except Exception as exc:
+                    logging.warning(
+                        "%s: enqueue_signal raised: %s",
+                        label,
+                        exc,
+                        exc_info=True,
+                    )
+                    return
+                pending[str(task_id)] = handle
+                try:
+                    # Close the race where cancellation commits before the
+                    # handle becomes visible to ``_on_task_cancelled``.  Once
+                    # stored, any later cancellation synchronously cancels the
+                    # exact dispatch task; this post-registration read covers
+                    # every earlier cancellation.
+                    current = await self.task_manager.get_task(str(task_id))
+                    state = getattr(getattr(current, "status", None), "state", None)
+                    if getattr(state, "value", state) != "submitted":
+                        dispatch_task = getattr(handle, "task", None)
+                        if dispatch_task is not None and not dispatch_task.done():
+                            dispatch_task.cancel()
+                    outcome = await await_terminal_delivery(
+                        handle,
+                        label=label,
+                        delivered_statuses=ACCEPTED_STATUSES,
+                    )
+                    if not outcome.delivered:
+                        logging.warning(
+                            "%s: signal was accepted but never delivered (%s)",
+                            label,
+                            outcome.describe(),
+                        )
+                finally:
+                    if pending.get(str(task_id)) is handle:
+                        pending.pop(str(task_id), None)
+
+            self._track_background_task(
+                enqueue_and_gate(),
+                name=f"a2a_submitted:{str(task_id)[:8]}",
             )
         except Exception as e:
             # Same posture as task_complete: never let a dispatcher
@@ -424,6 +463,16 @@ class EventManagerMixin:
                 "Failed to enqueue a2a.task_submitted signal for %s: %s",
                 task_id, e, exc_info=True,
             )
+
+    def _on_task_cancelled(self, task) -> None:
+        """Cancel an admitted task-submission wake after durable cancellation."""
+
+        task_id = str(getattr(task, "id", ""))
+        pending = vars(self).get("_a2a_submitted_signal_handles", {})
+        handle = pending.pop(task_id, None)
+        dispatch_task = getattr(handle, "task", None)
+        if dispatch_task is not None and not dispatch_task.done():
+            dispatch_task.cancel()
 
     def get_pending_notifications(self) -> List[str]:
         """

@@ -96,6 +96,7 @@ class TaskManager:
         on_task_submitted: Optional[Callable[[Task], None]] = None,
         causation_chain_provider: Optional[Callable[[], Optional[list]]] = None,
         host_agent_id: Optional[str] = None,
+        on_task_cancelled: Optional[Callable[[Task], None]] = None,
     ):
         self.task_store = task_store
         self.session_service = session_service
@@ -121,6 +122,10 @@ class TaskManager:
         # task created by a peer agent sits SUBMITTED in the store with
         # nobody acting on it until the next user-driven chat turn.
         self._on_task_submitted = on_task_submitted
+        # Durable cancellation callback.  The owning agent uses this to cancel
+        # an already-queued ``a2a.task_submitted`` cognition delivery after the
+        # task row has atomically reached CANCELED.
+        self._on_task_cancelled = on_task_cancelled
 
         # Callback returning the in-flight cognition turn's causation
         # chain (already serialized as list of dicts) or None when no
@@ -895,39 +900,15 @@ class TaskManager:
                 f"Invalid state transition: task is already {state}"
             )
 
-        # Log to session
-        if task.sessionId:
-            await self.session_service.append_event(
-                session_id=task.sessionId,
-                event_type="status_update",
-                data={
-                    "task_id": task_id,
-                    "old_state": current_state.value,
-                    "new_state": new_state.value,
-                }
-            )
-
-        # Log to observability
-        if agent_name:
-            await self.observability_store.log_agent_response(
-                agent_name=agent_name,
-                duration_ms=0,  # No timing for status updates
-                session_id=task.sessionId,
-                metadata={
-                    "task_id": task_id,
-                    "state_transition": f"{current_state} -> {new_state}"
-                }
-            )
-
         # Determine if this is a final state
         is_final = new_state in (TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED)
-
-        # Notify subscribers
-        await self._notify_status_update(task, final=is_final)
-
-        # If completed, optionally save to memory
-        if is_final and self.memory_service and task.sessionId:
-            await self._save_to_memory(task)
+        await self._project_status_transition(
+            task,
+            old_state=current_state.value,
+            new_state=new_state,
+            agent_name=agent_name,
+            is_final=is_final,
+        )
 
         logger.info(f"Task {task_id} transitioned: {current_state} -> {new_state}")
         return task
@@ -1082,61 +1063,24 @@ class TaskManager:
 
         receipt = (task.metadata or {}).get("cancellation_receipt") or {}
         previous_state = receipt.get("status_before")
-        if task.sessionId:
+        if self._on_task_cancelled is not None:
             try:
-                await self.session_service.append_event(
-                    session_id=task.sessionId,
-                    event_type="status_update",
-                    data={
-                        "task_id": task_id,
-                        "old_state": previous_state,
-                        "new_state": TaskState.CANCELED.value,
-                        "actor_agent_id": agent_name,
-                        "reason": reason,
-                    },
-                )
-            except Exception:
+                self._on_task_cancelled(task)
+            except Exception as exc:
                 logger.warning(
-                    "Task %s was canceled but its session event could not be recorded",
-                    task_id,
+                    "on_task_cancelled callback failed for %s: %s",
+                    task.id,
+                    exc,
                     exc_info=True,
                 )
-        try:
-            await self.observability_store.log_agent_response(
-                agent_name=agent_name,
-                duration_ms=0,
-                session_id=task.sessionId,
-                metadata={
-                    "task_id": task_id,
-                    "state_transition": (
-                        f"{previous_state} -> {TaskState.CANCELED.value}"
-                    ),
-                    "cancellation_reason": reason,
-                },
-            )
-        except Exception:
-            logger.warning(
-                "Task %s was canceled but observability logging failed",
-                task_id,
-                exc_info=True,
-            )
-        try:
-            await self._notify_status_update(task, final=True)
-        except Exception:
-            logger.warning(
-                "Task %s was canceled but subscriber notification failed",
-                task_id,
-                exc_info=True,
-            )
-        if self.memory_service and task.sessionId:
-            try:
-                await self._save_to_memory(task)
-            except Exception:
-                logger.warning(
-                    "Task %s was canceled but memory recording failed",
-                    task_id,
-                    exc_info=True,
-                )
+        await self._project_status_transition(
+            task,
+            old_state=str(previous_state or TaskState.UNKNOWN.value),
+            new_state=TaskState.CANCELED,
+            agent_name=agent_name,
+            is_final=True,
+            reason=reason,
+        )
 
         logger.info(
             "Task %s canceled by %s: %s -> %s",
@@ -1222,6 +1166,86 @@ class TaskManager:
             message=message,
             agent_name=agent_name,
         )
+
+    async def _project_status_transition(
+        self,
+        task: Task,
+        *,
+        old_state: str,
+        new_state: TaskState,
+        agent_name: Optional[str],
+        is_final: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Best-effort projections after the durable task row has committed.
+
+        Session history, observability, SSE, and memory are projections of the
+        canonical task row.  None may turn a committed transition into an
+        apparent failure that a retry then experiences as an invalid state.
+        """
+
+        event_data: dict[str, Any] = {
+            "task_id": task.id,
+            "old_state": old_state,
+            "new_state": new_state.value,
+        }
+        if new_state is TaskState.CANCELED:
+            event_data.update(
+                actor_agent_id=agent_name,
+                reason=reason,
+            )
+        if task.sessionId:
+            try:
+                await self.session_service.append_event(
+                    session_id=task.sessionId,
+                    event_type="status_update",
+                    data=event_data,
+                )
+            except Exception:
+                logger.warning(
+                    "Task %s transitioned durably but its session projection failed",
+                    task.id,
+                    exc_info=True,
+                )
+
+        if agent_name:
+            metadata: dict[str, Any] = {
+                "task_id": task.id,
+                "state_transition": f"{old_state} -> {new_state.value}",
+            }
+            if new_state is TaskState.CANCELED:
+                metadata["cancellation_reason"] = reason
+            try:
+                await self.observability_store.log_agent_response(
+                    agent_name=agent_name,
+                    duration_ms=0,
+                    session_id=task.sessionId,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.warning(
+                    "Task %s transitioned durably but observability logging failed",
+                    task.id,
+                    exc_info=True,
+                )
+
+        try:
+            await self._notify_status_update(task, final=is_final)
+        except Exception:
+            logger.warning(
+                "Task %s transitioned durably but subscriber notification failed",
+                task.id,
+                exc_info=True,
+            )
+        if is_final and self.memory_service and task.sessionId:
+            try:
+                await self._save_to_memory(task)
+            except Exception:
+                logger.warning(
+                    "Task %s transitioned durably but memory recording failed",
+                    task.id,
+                    exc_info=True,
+                )
 
     # =========================================================================
     # SSE Streaming

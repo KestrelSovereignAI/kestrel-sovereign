@@ -2164,6 +2164,10 @@ class KestrelAgent(
             # — the missing piece behind every "I sent it, did you
             # get it?" thread (#645 / Emma↔Meridian).
             on_task_submitted=self._on_task_submitted,
+            # Cancellation is durable before this callback fires.  The agent
+            # uses it to suppress the matching queued cognition delivery so a
+            # withdrawn task cannot execute from its inline signal payload.
+            on_task_cancelled=self._on_task_cancelled,
             # Provider returns the in-flight cognition turn's
             # causation chain (serialized) so outbound A2A tasks
             # carry the lineage. The dispatcher sets the chain on

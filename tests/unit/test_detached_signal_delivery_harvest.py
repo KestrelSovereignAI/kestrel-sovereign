@@ -56,6 +56,10 @@ class _Agent(EventManagerMixin):
         self.did = "did:test:agent"
         self._pending_task_notifications = []
         self.dispatcher = MagicMock()
+        self.task_manager = MagicMock()
+        self.task_manager.get_task = AsyncMock(
+            side_effect=lambda task_id: _task(task_id, state=TaskState.SUBMITTED)
+        )
         self.tracked: list = []
 
     def _track_background_task(self, coro, *, name: str) -> asyncio.Task:

@@ -27,6 +27,7 @@ from kestrel_sovereign.a2a.types import (
     TaskState,
     TextPart,
 )
+from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.features.peers.directory import (
     PeerIdentity,
@@ -303,6 +304,85 @@ async def test_task_creation_strips_sender_authored_cancellation_receipt(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_cancellation_suppresses_an_already_queued_submission_wake(tmp_path):
+    """A durable cancellation must cancel the matching cognition delivery."""
+
+    manager = await create_task_manager(str(tmp_path / "queued-wake.db"))
+    release_delivery = asyncio.Event()
+    enqueue_started = asyncio.Event()
+    postcheck_complete = asyncio.Event()
+    cognition_executed = asyncio.Event()
+
+    class Handle:
+        def __init__(self):
+            async def queued_delivery():
+                await release_delivery.wait()
+                cognition_executed.set()
+                return SimpleNamespace(
+                    status=SimpleNamespace(value="ok"),
+                    error=None,
+                )
+
+            self.task = asyncio.create_task(queued_delivery())
+
+        async def wait(self):
+            postcheck_complete.set()
+            return await self.task
+
+    class Dispatcher:
+        handle = None
+
+        async def enqueue_signal(self, _signal):
+            self.handle = Handle()
+            enqueue_started.set()
+            return self.handle
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+        def __init__(self):
+            self.dispatcher = Dispatcher()
+            self.task_manager = manager
+            self.background_tasks = set()
+
+        def _track_background_task(self, coroutine, *, name):
+            task = asyncio.create_task(coroutine, name=name)
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+            return task
+
+    recipient = Recipient()
+    manager._on_task_submitted = recipient._on_task_submitted
+    manager._on_task_cancelled = recipient._on_task_cancelled
+    try:
+        await manager.create_task(
+            _params("queued-wake"),
+            agent_name=recipient.did,
+            creator_agent_id="did:test:creator",
+        )
+        await asyncio.wait_for(enqueue_started.wait(), timeout=1)
+        await asyncio.wait_for(postcheck_complete.wait(), timeout=1)
+
+        await manager.cancel_task(
+            "queued-wake",
+            reason="withdrawn before execution",
+            agent_name="did:test:creator",
+        )
+        await asyncio.sleep(0)
+
+        assert recipient.dispatcher.handle.task.cancelled()
+        assert not cognition_executed.is_set()
+    finally:
+        release_delivery.set()
+        if recipient.background_tasks:
+            await asyncio.gather(
+                *tuple(recipient.background_tasks),
+                return_exceptions=True,
+            )
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
     """Rows without durable receipt columns cannot retain old metadata claims."""
 
@@ -572,7 +652,12 @@ async def test_create_task_projection_failure_does_not_report_durable_commit_as_
         )
 
         assert created.id == f"accepted-{projection}"
-        assert (await manager.get_task(created.id)).status.state is TaskState.SUBMITTED
+        result = await _feature(
+            manager,
+            "did:test:recipient",
+        ).respond_to_a2a_task(created.id, "completed despite projection outage")
+        assert result.status is ToolResultStatus.OK
+        assert (await manager.get_task(created.id)).status.state is TaskState.COMPLETED
     finally:
         await manager.close()
 
