@@ -217,8 +217,10 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
     // New stream: capture that we got there, then end cleanly so
     // sendMessage's await resolves.
     const ctrl = controlledStream();
+    let dispatchedRequestId = null;
     apiModule.default.streamInvoke = (...args) => {
         eventLog.push('streamInvoke');
+        dispatchedRequestId = args[7];
         return ctrl.iter;
     };
     apiModule.default.invoke = async () => ({ response: '' });
@@ -249,6 +251,9 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
         'POST /api/agent/stop must resolve BEFORE the new streamInvoke opens');
     assert.ok(abortIdx <= stopIdx,
         'client-side abort must precede or coincide with the stop POST');
+    assert.equal(typeof dispatchedRequestId, 'string');
+    assert.ok(dispatchedRequestId.length > 0,
+        'chat must allocate the next turn address before opening its stream');
 });
 
 

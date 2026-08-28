@@ -637,6 +637,44 @@ test('streamInvoke does not leak an abort controller when auth header build reje
     assert.equal(fetchFn.calls.length, 0);
 });
 
+test('streamInvoke publishes and sends a client request id before response headers', async () => {
+    let releaseAuth;
+    const authReady = new Promise((resolve) => { releaseAuth = resolve; });
+    const provider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            await authReady;
+            return headers;
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const stream = pendingStreamResponse({ 'X-Request-ID': 'client-turn-id' });
+    const fetchFn = createFetchQueue(stream.response);
+    const { client } = createClient({ fetchFn, authProvider: provider });
+    client.setHostAgent('agent-A');
+
+    const iter = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, 'client-turn-id',
+    );
+    const firstChunk = iter.next();
+    await Promise.resolve();
+
+    assert.equal(
+        client.getCurrentStreamRequestId('agent-A'),
+        'client-turn-id',
+        'Stop must have a turn address while auth and headers are pending',
+    );
+    assert.equal(fetchFn.calls.length, 0, 'auth is still pending');
+
+    releaseAuth();
+    await firstChunk;
+    assert.equal(fetchFn.calls[0].options.headers['X-Request-ID'], 'client-turn-id');
+
+    stream.finish();
+    for await (const _ of iter) { /* drain */ }
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
+});
+
 test('streamInvoke captures dispatch agent BEFORE awaiting auth headers (PR #874)', async () => {
     // Pre-fix, streamInvoke awaited buildHeaders() before snapshotting
     // selectedHostAgent. With an async auth provider, switching agents

@@ -2665,6 +2665,17 @@ export async function stopAgent(agentName) {
     return true;
 }
 
+function newChatRequestId() {
+    const randomUuid = globalThis.crypto?.randomUUID;
+    if (typeof randomUuid === 'function') {
+        return randomUuid.call(globalThis.crypto);
+    }
+    // Cancellation identity is uniqueness, not a secret. The timestamp and
+    // two independent random components keep legacy browsers turn-addressable
+    // without introducing a dependency on response headers.
+    return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
 // ============================================================================
 // Queue Mode (#1257)
 // ============================================================================
@@ -2971,7 +2982,17 @@ export async function sendMessage(overrideText, overrideAgent) {
                 // no visible char after it; consumed when the next
                 // packet's leading visible text is welded onto fullContent.
                 let pendingReviseBoundary = false;
-                for await (const rawChunk of deps().api.streamInvoke(text, null, sessionId, null, false, dispatchAgent, turnAttachments)) {
+                const clientRequestId = newChatRequestId();
+                for await (const rawChunk of deps().api.streamInvoke(
+                    text,
+                    null,
+                    sessionId,
+                    null,
+                    false,
+                    dispatchAgent,
+                    turnAttachments,
+                    clientRequestId,
+                )) {
                     const merged = sentinelBuffer + rawChunk;
                     sentinelBuffer = '';
                     let processable = merged;
