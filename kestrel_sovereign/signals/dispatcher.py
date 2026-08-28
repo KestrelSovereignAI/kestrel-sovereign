@@ -4046,7 +4046,7 @@ class SignalDispatcher:
                 if monitor is not None:
                     if inspect.iscoroutine(execution):
                         execution.close()
-                    return None, str(monitor)
+                    return None, str(monitor), None
                 result, tracking = await execute_with_tracking()
                 return result, None, tracking
 

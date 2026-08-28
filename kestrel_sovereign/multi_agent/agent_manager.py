@@ -1126,7 +1126,6 @@ class AgentManager:
                     reason=reason,
                     agent_name=sender_id,
                     recipient_agent_id=peer.agent_id,
-                    task_payload=current,
                 )
             except TaskCancellationAuthorizationError as exc:
                 raise PeerAccessDeniedError(

@@ -780,6 +780,40 @@ async def test_recipient_decline_finishes_under_live_cancellation_monitor(
 
 
 @pytest.mark.asyncio
+async def test_provisional_self_decline_does_not_exempt_creator_winning_receipt():
+    """The receipt actor, not an in-flight local marker, owns the exemption."""
+
+    task_id = "creator-won-self-decline-race"
+    canceled = SimpleNamespace(
+        status=SimpleNamespace(state=TaskState.CANCELED),
+        metadata={
+            "cancellation_receipt": {
+                "actor_agent_id": "did:test:creator",
+                "status_before": "submitted",
+            }
+        },
+    )
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+    recipient = Recipient()
+    recipient.task_manager = SimpleNamespace(
+        get_task=AsyncMock(return_value=canceled)
+    )
+    recipient._a2a_self_declining_task_ids = {task_id}
+    signal = SimpleNamespace(
+        source="a2a.task_submitted",
+        payload={"task_id": task_id},
+    )
+
+    withdrawal = await recipient.monitor_cognition_signal_execution(signal)
+
+    assert "was canceled while" in withdrawal
+    assert recipient._a2a_self_declining_task_ids == set()
+
+
+@pytest.mark.asyncio
 async def test_refused_cancellation_rolls_back_local_execution_exemption(
     tmp_path,
 ):
@@ -1917,8 +1951,70 @@ async def test_manager_attests_pre_ceremony_local_cancellation():
         reason="pre-ceremony withdrawal",
         agent_name=sender.did,
         recipient_agent_id=recipient.did,
-        task_payload=current,
     )
+
+
+@pytest.mark.asyncio
+async def test_manager_attested_local_cancellation_transitions_live_task(tmp_path):
+    task_manager = await create_task_manager(str(tmp_path / "local-live.db"))
+    manager = AgentManager()
+    sender = SimpleNamespace(
+        did="did:test:creator",
+        agent_id="did:test:creator",
+        identity=None,
+    )
+    recipient = SimpleNamespace(
+        did="did:test:recipient",
+        agent_id="did:test:recipient",
+        task_manager=task_manager,
+    )
+    manager._register_agent("creator", sender)
+    manager._register_agent("recipient", recipient)
+    sender_requester = PeerRequester(sender.did, object())
+    recipient_requester = PeerRequester(recipient.did, object())
+    manager.install_a2a_hosted_policy(
+        sender,
+        resolver=object(),
+        authorizer=object(),
+        router=SimpleNamespace(),
+        requester=sender_requester,
+    )
+    manager.install_a2a_hosted_policy(
+        recipient,
+        resolver=object(),
+        authorizer=object(),
+        router=SimpleNamespace(
+            authorize_inbound_sender=AsyncMock(return_value=True)
+        ),
+        requester=recipient_requester,
+    )
+    try:
+        task = await task_manager.create_task(
+            _params("live-local-cancel"),
+            agent_name=recipient.did,
+            creator_agent_id=sender.did,
+        )
+
+        result = await manager.cancel_host_attested_local_a2a_task(
+            sender=sender,
+            requester=sender_requester,
+            peer=PeerIdentity(
+                agent_id=recipient.did,
+                slug="recipient",
+                routing_key="recipient",
+            ),
+            task_id=task.id,
+            payload={"reason": "creator withdrew live task"},
+        )
+
+        assert result["status"] == "canceled"
+        persisted = await task_manager.get_task(task.id)
+        assert persisted.status.state is TaskState.CANCELED
+        assert persisted.metadata["cancellation_receipt"]["actor_agent_id"] == (
+            sender.did
+        )
+    finally:
+        await task_manager.close()
 
 
 @pytest.mark.asyncio

@@ -524,6 +524,9 @@ class EventManagerMixin:
             state = getattr(getattr(current, "status", None), "state", None)
             durable_state = getattr(state, "value", state)
             if durable_state == "canceled":
+                receipt = (
+                    getattr(current, "metadata", None) or {}
+                ).get("cancellation_receipt") or {}
                 self_declines = vars(self).get(
                     "_a2a_self_declining_task_ids",
                 )
@@ -532,7 +535,12 @@ class EventManagerMixin:
                     and task_id in self_declines
                 ):
                     self_declines.discard(task_id)
-                    return None
+                    # The marker is provisional while the recipient's CAS is
+                    # in flight. A creator on another worker may win first;
+                    # only the durable receipt actor proves this wake owns the
+                    # self-decline exemption.
+                    if receipt.get("actor_agent_id") == self.did:
+                        return None
                 return (
                     f"A2A task {task_id!r} was canceled while its "
                     "submission wake was executing"
