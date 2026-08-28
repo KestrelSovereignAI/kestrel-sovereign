@@ -174,6 +174,74 @@ async def test_manager_prune_does_not_cancel_lifecycle_task_terminating_itself()
 
 
 @pytest.mark.asyncio
+async def test_direct_prune_does_not_cancel_same_child_finalizer_waiting_for_lock() -> None:
+    """A queued TTL owner finishes reconciliation after direct removal."""
+
+    manager = AgentManager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def terminate_child(_parent_did, child_name, **_kwargs):
+        if child_name == "BlockingA":
+            entered.set()
+            await release.wait()
+        return True
+
+    manager.terminate_child = AsyncMock(side_effect=terminate_child)
+    await lifecycle.register(
+        "BlockingA",
+        "did:test:blocking-a",
+        "did:test:parent",
+        ttl_seconds=0,
+        mode=SpawnMode.PERSISTENT,
+    )
+    await lifecycle.register(
+        "QueuedB",
+        "did:test:queued-b",
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+    original_timer = lifecycle._tracked["QueuedB"].ttl_task
+    assert original_timer is not None
+    original_timer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await original_timer
+
+    blocker = asyncio.create_task(lifecycle.terminate("BlockingA"))
+    await entered.wait()
+    queued = asyncio.create_task(
+        lifecycle._ttl_monitor("QueuedB", "did:test:queued-b", 0)
+    )
+    lifecycle._tracked["QueuedB"].ttl_task = queued
+    for _ in range(20):
+        if lifecycle._finalization_owner_counts.get(
+            ("QueuedB", "did:test:queued-b")
+        ):
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("queued TTL finalizer never claimed ownership")
+
+    manager._parent_children["did:test:parent"] = ["QueuedB"]
+    manager._child_mandates["QueuedB"] = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did="did:test:queued-b",
+    )
+    manager._prune_child_relationship_and_mandate(
+        "did:test:parent",
+        "QueuedB",
+    )
+
+    release.set()
+    await blocker
+    await queued
+    assert not lifecycle.is_tracked("QueuedB")
+    assert ("QueuedB", "did:test:queued-b") not in lifecycle._finalization_owner_counts
+
+
+@pytest.mark.asyncio
 async def test_stale_ttl_monitor_cannot_terminate_same_name_replacement() -> None:
     manager = _make_mock_manager()
     lifecycle = SpawnedAgentLifecycle(manager)

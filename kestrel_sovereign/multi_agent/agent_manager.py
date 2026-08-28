@@ -2014,6 +2014,52 @@ class AgentManager:
         if ready is not None:
             await ready(agent)
 
+    async def _run_hosted_agent_ready_hooks_before_mandate_expiry(
+        self,
+        agent: KestrelAgent,
+    ) -> None:
+        """Keep wake-capable readiness inside a signed ephemeral lifetime.
+
+        Authority is projected before ready hooks so they can observe the
+        child's restrictions, but publication/TTL commit happens afterward.
+        Bound that otherwise-unarmed interval with the receipt's exact
+        remaining lifetime. ``wait_for`` delivers cancellation to the hook at
+        the deadline and joins its cleanup before onboarding rolls back.
+        """
+
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if (
+            not isinstance(mandate, SpawnMandate)
+            or not mandate.parent_signature
+            or mandate.ttl_seconds <= 0
+        ):
+            await self._run_hosted_agent_ready_hooks(agent)
+            return
+        remaining = remaining_spawn_ttl_seconds(
+            mandate.created_at,
+            mandate.ttl_seconds,
+        )
+        if remaining <= 0:
+            raise RuntimeError("Persisted spawn mandate expired before agent readiness")
+        try:
+            await asyncio.wait_for(
+                self._run_hosted_agent_ready_hooks(agent),
+                timeout=remaining,
+            )
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "Persisted spawn mandate expired during agent readiness"
+            ) from exc
+        # A hook that catches task cancellation can return after wait_for's
+        # deadline. It still cannot proceed to publication as valid authority.
+        if remaining_spawn_ttl_seconds(
+            mandate.created_at,
+            mandate.ttl_seconds,
+        ) <= 0:
+            raise RuntimeError(
+                "Persisted spawn mandate expired during agent readiness"
+            )
+
     def _commit_restored_child_ttl(
         self, name: str, agent: KestrelAgent
     ) -> None:
@@ -2733,7 +2779,9 @@ class AgentManager:
                         )
                     async with self._lock:
                         self._prepare_agent_authority(name, agent)
-                await self._run_hosted_agent_ready_hooks(agent)
+                await self._run_hosted_agent_ready_hooks_before_mandate_expiry(
+                    agent
+                )
                 async with self._a2a_lifecycle_lock:
                     if not self._operation_is_admitted(admission):
                         raise RuntimeError(
@@ -2967,7 +3015,9 @@ class AgentManager:
                                 )
                             async with self._lock:
                                 self._prepare_agent_authority(name, result)
-                        await self._run_hosted_agent_ready_hooks(result)
+                        await self._run_hosted_agent_ready_hooks_before_mandate_expiry(
+                            result
+                        )
                         async with self._a2a_lifecycle_lock:
                             if not self._operation_is_admitted(admission):
                                 raise RuntimeError(

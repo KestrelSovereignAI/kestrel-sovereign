@@ -482,10 +482,13 @@ class SpawnedAgentLifecycle:
         ):
             return False
         if self._finalization_owner_counts.get((child_name, tracked.child_did), 0):
-            return self.disarm_persisted_child(
-                child_name,
-                expected_child_did=expected_child_did,
-            )
+            # The exact child's finalizer may have claimed ownership before it
+            # reached the global lifecycle lock. Cancelling its timer here
+            # strands ``_tracked``: the task's ``finally`` releases only its
+            # owner count. Let that queued owner observe manager-side removal
+            # and finish local reconciliation; the active finalizer will
+            # disarm any sibling timer when it publishes its terminal result.
+            return True
         return self.withdraw_persisted_child(
             child_name,
             expected_child_did=expected_child_did,

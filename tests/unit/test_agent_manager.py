@@ -310,6 +310,44 @@ async def test_restored_ttl_cannot_remove_child_before_load_commits(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_restored_ttl_cancels_ready_hook_at_signed_deadline(tmp_path):
+    """Wake-capable readiness cannot run past an ephemeral mandate expiry."""
+
+    parent_did = "did:pkh:eip155:1:0xDeadlineParent"
+    child_did = "did:pkh:eip155:1:0xDeadlineChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=2,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=1.4)).isoformat(),
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("DeadlineParent", parent)
+    manager._initialize_agent = AsyncMock(return_value=child)
+    wake_effects: list[str] = []
+
+    async def wake_after_expiry(_agent):
+        await asyncio.sleep(0.8)
+        wake_effects.append("dispatched")
+
+    manager._run_hosted_agent_ready_hooks = AsyncMock(
+        side_effect=wake_after_expiry
+    )
+
+    with pytest.raises(RuntimeError, match="expired during agent readiness"):
+        await manager.load_agent(
+            "DeadlineChild",
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+
+    assert wake_effects == []
+    assert manager.get_agent("DeadlineChild") is None
+    assert manager.get_children(parent_did) == []
+
+
+@pytest.mark.asyncio
 async def test_delete_joins_active_spawn_before_closing_child_storage(tmp_path):
     """DELETE cannot close the graph still owned by spawn receipt rollback."""
 
@@ -5534,6 +5572,49 @@ class TestLoadFromConfig:
         assert manager.get_mandate("BatchPreparedChild") is None
         assert manager.get_children(parent_did) == []
         assert "batch ready hook failed" in str(manager.init_failures[0][1])
+
+    @pytest.mark.asyncio
+    async def test_batch_ready_hook_is_bounded_by_signed_deadline(self, tmp_path):
+        parent_did = "did:test:batch-deadline-parent"
+        child_did = "did:test:batch-deadline-child"
+        parent, mandate = _signed_restored_mandate(
+            parent_did,
+            child_did,
+            ttl_seconds=2,
+            created_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1.4)
+            ).isoformat(),
+        )
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager._register_agent("BatchDeadlineParent", parent)
+        manager._initialize_agent = AsyncMock(return_value=child)
+        wake_effects: list[str] = []
+
+        async def wake_after_expiry(_agent):
+            await asyncio.sleep(0.8)
+            wake_effects.append("dispatched")
+
+        manager._run_hosted_agent_ready_hooks = AsyncMock(
+            side_effect=wake_after_expiry
+        )
+        config = MultiAgentConfig(
+            agents={
+                "BatchDeadlineChild": LocalAgentConfig(
+                    data_dir=tmp_path / "child",
+                    port=8801,
+                )
+            }
+        )
+
+        assert await manager.load_from_config(config) == 0
+        assert wake_effects == []
+        assert manager.get_agent("BatchDeadlineChild") is None
+        assert manager.get_children(parent_did) == []
+        assert "expired during agent readiness" in str(
+            manager.init_failures[0][1]
+        )
 
     @pytest.mark.asyncio
     async def test_load_from_config_withdraws_child_when_parent_is_unavailable(
