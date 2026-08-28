@@ -19,6 +19,7 @@ it always runs.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from unittest.mock import AsyncMock
 
@@ -880,17 +881,19 @@ async def test_postgres_large_absent_write_set_uses_bounded_advisory_shards(
 async def test_postgres_nested_single_node_writes_share_bounded_advisory_shards(
     graph_store,
 ):
-    """Many nested writes cannot exceed the fixed reservation-shard budget."""
+    """A complete prelock lets nested writes reuse a bounded shard set."""
 
     if graph_store.db.backend_type != "postgres":
         pytest.skip("PostgreSQL exposes transaction advisory locks")
 
     prefix = _nid("nested-advisory-cap") + ":"
+    node_ids = [f"{prefix}{index}" for index in range(150)]
     try:
         async with graph_store.db.transaction():
-            for index in range(150):
+            await graph_store.lock_nodes_for_update(node_ids)
+            for index, node_id in enumerate(node_ids):
                 await graph_store.add_node(
-                    _node(f"{prefix}{index}", {"index": index})
+                    _node(node_id, {"index": index})
                 )
             held = await graph_store.db.fetchone(
                 "SELECT COUNT(*) FROM pg_locks "
@@ -902,3 +905,73 @@ async def test_postgres_nested_single_node_writes_share_bounded_advisory_shards(
             "DELETE FROM graph_nodes WHERE node_id LIKE ?",
             (f"{prefix}%",),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_reverse_incremental_shard_order_is_rejected_before_wait(
+    graph_store,
+):
+    """Disjoint nested writes cannot turn advisory collisions into deadlock."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL exposes transaction advisory locks")
+
+    by_key = {}
+    for index in range(10000):
+        node_id = _nid(f"shard-order-{index}")
+        shard = int.from_bytes(
+            hashlib.sha256(
+                f"kestrel:graph-node:{node_id}".encode("utf-8")
+            ).digest()[:8],
+            "big",
+        ) % 128
+        key = int.from_bytes(
+            hashlib.sha256(
+                f"kestrel:graph-node-reservation-shard:{shard}".encode(
+                    "utf-8"
+                )
+            ).digest()[:8],
+            "big",
+            signed=True,
+        )
+        by_key.setdefault(key, []).append(node_id)
+        complete = [
+            (candidate, ids)
+            for candidate, ids in by_key.items()
+            if len(ids) >= 2
+        ]
+        if len(complete) >= 2:
+            break
+
+    ordered = sorted(complete, key=lambda item: item[0])
+    low, high = ordered[0], ordered[-1]
+    low_ids = low[1][:2]
+    high_ids = high[1][:2]
+    low_ready = asyncio.Event()
+    high_ready = asyncio.Event()
+
+    async def high_then_low():
+        async with graph_store.db.transaction():
+            await graph_store.lock_nodes_for_update([high_ids[0]])
+            high_ready.set()
+            await low_ready.wait()
+            try:
+                await graph_store.lock_nodes_for_update([low_ids[0]])
+            except ValueError as exc:
+                assert "complete graph write set" in str(exc)
+                return "rejected"
+            return "acquired"
+
+    async def low_then_high():
+        async with graph_store.db.transaction():
+            await graph_store.lock_nodes_for_update([low_ids[1]])
+            low_ready.set()
+            await high_ready.wait()
+            await graph_store.lock_nodes_for_update([high_ids[1]])
+            return "acquired"
+
+    results = await asyncio.wait_for(
+        asyncio.gather(high_then_low(), low_then_high()), timeout=5
+    )
+    assert results == ["rejected", "acquired"]

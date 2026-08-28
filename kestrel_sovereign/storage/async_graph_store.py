@@ -32,6 +32,19 @@ logger = logging.getLogger(__name__)
 
 _DELETE_ID_BATCH = 500
 _GRAPH_NODE_RESERVATION_SHARDS = 128
+_GRAPH_NODE_RESERVATION_KEY_BY_SHARD = tuple(
+    int.from_bytes(
+        hashlib.sha256(
+            f"kestrel:graph-node-reservation-shard:{shard_id}".encode("utf-8")
+        ).digest()[:8],
+        "big",
+        signed=True,
+    )
+    for shard_id in range(_GRAPH_NODE_RESERVATION_SHARDS)
+)
+_GRAPH_NODE_RESERVATION_LOCK_KEYS = frozenset(
+    _GRAPH_NODE_RESERVATION_KEY_BY_SHARD
+)
 
 #: A SHA-256 digest as this codebase writes them: lowercase hex, 64 chars.
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -536,21 +549,42 @@ async def _lock_graph_node_ids_for_insert(
         for node_id in unique_node_ids
     }
     advisory_keys = sorted(
-        {
-            int.from_bytes(
-                hashlib.sha256(
-                    f"kestrel:graph-node-reservation-shard:{shard_id}".encode(
-                        "utf-8"
-                    )
-                ).digest()[:8],
-                "big",
-                signed=True,
-            )
-            for shard_id in shard_ids
-        }
+        {_GRAPH_NODE_RESERVATION_KEY_BY_SHARD[shard_id] for shard_id in shard_ids}
     )
-    for start in range(0, len(advisory_keys), _DELETE_ID_BATCH):
-        batch = advisory_keys[start:start + _DELETE_ID_BATCH]
+
+    # Nested writes join a caller's outer transaction, so their xact locks from
+    # earlier calls remain held. Sorting one call is insufficient: high->low in
+    # one transaction and low->high in another deadlocks even when their node
+    # IDs are disjoint but collide on these bounded shards. Identify only this
+    # graph namespace's retained bigint locks and refuse a backwards extension;
+    # composed writers must prelock their complete set in one call.
+    held_rows = await db.fetchall(
+        "SELECT classid::bigint, objid::bigint, objsubid "
+        "FROM pg_locks WHERE pid = pg_backend_pid() "
+        "AND locktype = 'advisory' AND granted"
+    )
+    held_graph_keys = set()
+    for class_id, object_id, object_sub_id in held_rows:
+        if int(object_sub_id) != 1:
+            continue
+        unsigned_key = (int(class_id) << 32) | int(object_id)
+        key = (
+            unsigned_key
+            if unsigned_key < (1 << 63)
+            else unsigned_key - (1 << 64)
+        )
+        if key in _GRAPH_NODE_RESERVATION_LOCK_KEYS:
+            held_graph_keys.add(key)
+
+    new_keys = [key for key in advisory_keys if key not in held_graph_keys]
+    if held_graph_keys and new_keys and new_keys[0] < max(held_graph_keys):
+        raise ValueError(
+            "Graph reservation shards would be acquired out of transaction "
+            "order; prelock the complete graph write set before nested writes"
+        )
+
+    for start in range(0, len(new_keys), _DELETE_ID_BATCH):
+        batch = new_keys[start:start + _DELETE_ID_BATCH]
         values = ", ".join("(?::bigint)" for _ in batch)
         await db.fetchall(
             "SELECT pg_advisory_xact_lock(lock_key) "
