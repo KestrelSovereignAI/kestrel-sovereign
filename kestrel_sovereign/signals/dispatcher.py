@@ -4015,13 +4015,26 @@ class SignalDispatcher:
         async def await_monitored_execution(execution):
             """Race cognition against source-owned durable withdrawal."""
 
+            async def execute_with_tracking():
+                result = await execution
+                # A monitored cognition turn runs in ``execution_task``.
+                # ContextVar writes belong to that task and are invisible to
+                # the dispatcher's parent task, so carry the audit value back
+                # explicitly with the result.
+                from kestrel_sovereign.agent.context_manager import (
+                    get_current_injection_tracking,
+                )
+
+                return result, get_current_injection_tracking()
+
             monitor_execution = getattr(
                 self._agent,
                 "monitor_cognition_signal_execution",
                 None,
             )
             if not callable(monitor_execution):
-                return await execution, None
+                result, tracking = await execute_with_tracking()
+                return result, None, tracking
 
             try:
                 monitor = monitor_execution(signal)
@@ -4034,10 +4047,11 @@ class SignalDispatcher:
                     if inspect.iscoroutine(execution):
                         execution.close()
                     return None, str(monitor)
-                return await execution, None
+                result, tracking = await execute_with_tracking()
+                return result, None, tracking
 
             execution_task = asyncio.create_task(
-                execution,
+                execute_with_tracking(),
                 name=f"signal_cognition:{signal.id}",
             )
             monitor_task = asyncio.create_task(
@@ -4058,8 +4072,9 @@ class SignalDispatcher:
                             execution_task,
                             return_exceptions=True,
                         )
-                        return None, str(withdrawal)
-                return await execution_task, None
+                        return None, str(withdrawal), None
+                result, tracking = await execution_task
+                return result, None, tracking
             finally:
                 for task in (execution_task, monitor_task):
                     if not task.done():
@@ -4417,14 +4432,19 @@ class SignalDispatcher:
             }
 
         execution_withdrawal = None
+        injection_tracking = None
         try:
             if process_input_kwargs:
-                result, execution_withdrawal = await await_monitored_execution(
+                result, execution_withdrawal, injection_tracking = (
+                    await await_monitored_execution(
                     self._agent.process_input(prompt, **process_input_kwargs)
+                    )
                 )
             else:
-                result, execution_withdrawal = await await_monitored_execution(
+                result, execution_withdrawal, injection_tracking = (
+                    await await_monitored_execution(
                     self._agent.process_input(prompt)
+                    )
                 )
         except Exception:
             if receipt_tool_registered:
@@ -4460,11 +4480,6 @@ class SignalDispatcher:
         # published per-async-task via a ContextVar in
         # `kestrel_sovereign.agent.context_manager`, so concurrent
         # COGNITION dispatches don't race on a shared attribute.
-        from kestrel_sovereign.agent.context_manager import (
-            get_current_injection_tracking,
-        )
-
-        injection_tracking = get_current_injection_tracking()
         if injection_tracking is not None:
             tracked_injected, tracked_dropped = injection_tracking
             if tracked_injected is not None:

@@ -1051,10 +1051,15 @@ class TaskManager:
                 rollback_local_intent()
             raise
         if task is None:
-            if rollback_local_intent is not None:
-                rollback_local_intent()
-            current = await self.task_store.get(task_id)
+            try:
+                current = await self.task_store.get(task_id)
+            except BaseException:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise
             if current is None:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
                 raise ValueError(f"Task not found: {task_id}")
             receipt = (current.metadata or {}).get("cancellation_receipt") or {}
             if (
@@ -1070,8 +1075,13 @@ class TaskManager:
             ):
                 # The first atomic cancellation may have committed while its
                 # transport response was lost. Return that exact durable
-                # receipt without replaying notifications/projections.
+                # receipt without replaying notifications/projections. Keep
+                # the just-acquired local execution exemption: this retry is
+                # still the same authorized recipient decline and its monitor
+                # must not cancel the response after observing CANCELED.
                 return current
+            if rollback_local_intent is not None:
+                rollback_local_intent()
             if current.status.state not in {
                 TaskState.SUBMITTED,
                 TaskState.WORKING,

@@ -30,11 +30,14 @@ from kestrel_sovereign.a2a.types import (
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.features.peers.directory import (
+    LocalHostPeerDirectory,
+    PeerAccessDeniedError,
     PeerIdentity,
     PeerRequester,
     PeerTaskConflictError,
 )
 from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
 
 def _params(task_id: str, *, metadata=None) -> TaskSendParams:
@@ -812,6 +815,54 @@ async def test_refused_cancellation_rolls_back_local_execution_exemption(
             await manager.get_task("refused-intent")
         ).status.state is TaskState.SUBMITTED
     finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_idempotent_recipient_decline_keeps_live_execution_exemption(tmp_path):
+    """A same-actor receipt retry remains an authorized in-turn decline."""
+
+    from kestrel_sdk.signals import Signal, SignalMode
+    from kestrel_sovereign.signals.context import (
+        reset_current_signal,
+        set_current_signal,
+    )
+
+    manager = await create_task_manager(str(tmp_path / "idempotent-decline.db"))
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+    recipient = Recipient()
+    manager._on_task_cancellation_started = (
+        recipient._on_task_cancellation_started
+    )
+    manager._on_task_cancelled = recipient._on_task_cancelled
+    task = await manager.create_task(
+        _params("idempotent-decline"),
+        agent_name=recipient.did,
+        creator_agent_id="did:test:creator",
+    )
+    signal = Signal(
+        source="a2a.task_submitted",
+        kind="task_submitted",
+        mode=SignalMode.COGNITION,
+        payload={"task_id": task.id},
+        target_agent=recipient.did,
+    )
+    token = set_current_signal(signal)
+    try:
+        await manager.cancel_task(task.id, agent_name=recipient.did)
+        # Model the monitor consuming the first attempt's exemption before the
+        # tool retries after a lost response.
+        recipient._a2a_self_declining_task_ids.discard(task.id)
+
+        retried = await manager.cancel_task(task.id, agent_name=recipient.did)
+
+        assert retried.status.state is TaskState.CANCELED
+        assert task.id in recipient._a2a_self_declining_task_ids
+    finally:
+        reset_current_signal(token)
         await manager.close()
 
 
@@ -1744,6 +1795,175 @@ async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
         task_id="outbound-task",
         terminal_state="canceled",
     )
+
+
+@pytest.mark.asyncio
+async def test_local_router_uses_process_local_cancel_capability_without_http():
+    local_cancel = AsyncMock(
+        return_value={
+            "id": "local-task",
+            "status": "canceled",
+            "cancellation_receipt": {"status_before": "submitted"},
+        }
+    )
+    client_factory = MagicMock()
+    router = LocalHostPeerDirectory(
+        "http://local-host",
+        client_factory=client_factory,
+        local_cancel=local_cancel,
+    )
+    router._directory_entries = AsyncMock(
+        return_value=[
+            PeerIdentity(
+                agent_id="did:test:recipient",
+                slug="recipient",
+                routing_key="recipient",
+            )
+        ]
+    )
+    requester = PeerRequester("did:test:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:test:recipient",
+        slug="recipient",
+        routing_key="recipient",
+    )
+    payload = {
+        "reason": "pre-ceremony withdrawal",
+        "metadata": {"a2a_verb": "cancel_task"},
+    }
+
+    result = await router.cancel_a2a_task(
+        requester, peer, "local-task", payload
+    )
+
+    assert result["status"] == "canceled"
+    local_cancel.assert_awaited_once_with(
+        requester, peer, "local-task", payload
+    )
+    client_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manager_attests_pre_ceremony_local_cancellation():
+    manager = AgentManager()
+    sender = SimpleNamespace(
+        did="did:test:creator",
+        agent_id="did:test:creator",
+        identity=None,
+    )
+    current = SimpleNamespace(id="local-task")
+    canceled = SimpleNamespace(
+        id="local-task",
+        status=SimpleNamespace(state=TaskState.CANCELED),
+        metadata={
+            "cancellation_receipt": {
+                "actor_agent_id": sender.did,
+                "status_before": "submitted",
+            }
+        },
+    )
+    task_manager = SimpleNamespace(
+        get_task=AsyncMock(return_value=current),
+        cancel_task=AsyncMock(return_value=canceled),
+    )
+    recipient = SimpleNamespace(
+        did="did:test:recipient",
+        agent_id="did:test:recipient",
+        task_manager=task_manager,
+    )
+    manager._register_agent("creator", sender)
+    manager._register_agent("recipient", recipient)
+    sender_requester = PeerRequester(sender.did, object())
+    recipient_requester = PeerRequester(recipient.did, object())
+    sender_router = SimpleNamespace()
+    recipient_router = SimpleNamespace(
+        authorize_inbound_sender=AsyncMock(return_value=True)
+    )
+    manager.install_a2a_hosted_policy(
+        sender,
+        resolver=object(),
+        authorizer=object(),
+        router=sender_router,
+        requester=sender_requester,
+    )
+    manager.install_a2a_hosted_policy(
+        recipient,
+        resolver=object(),
+        authorizer=object(),
+        router=recipient_router,
+        requester=recipient_requester,
+    )
+    peer = PeerIdentity(
+        agent_id=recipient.did,
+        slug="recipient",
+        routing_key="recipient",
+    )
+
+    result = await manager.cancel_host_attested_local_a2a_task(
+        sender=sender,
+        requester=sender_requester,
+        peer=peer,
+        task_id="local-task",
+        payload={"reason": "pre-ceremony withdrawal"},
+    )
+
+    assert result["status"] == "canceled"
+    recipient_router.authorize_inbound_sender.assert_awaited_once_with(
+        recipient_requester,
+        sender.did,
+    )
+    task_manager.cancel_task.assert_awaited_once_with(
+        "local-task",
+        reason="pre-ceremony withdrawal",
+        agent_name=sender.did,
+        recipient_agent_id=recipient.did,
+        task_payload=current,
+    )
+
+
+@pytest.mark.asyncio
+async def test_manager_local_cancel_rejects_forged_requester_handle():
+    manager = AgentManager()
+    sender = SimpleNamespace(
+        did="did:test:creator",
+        agent_id="did:test:creator",
+        identity=None,
+    )
+    recipient = SimpleNamespace(
+        did="did:test:recipient",
+        agent_id="did:test:recipient",
+        task_manager=SimpleNamespace(),
+    )
+    manager._register_agent("creator", sender)
+    manager._register_agent("recipient", recipient)
+    trusted = PeerRequester(sender.did, object())
+    manager.install_a2a_hosted_policy(
+        sender,
+        resolver=object(),
+        authorizer=object(),
+        router=SimpleNamespace(),
+        requester=trusted,
+    )
+    manager.install_a2a_hosted_policy(
+        recipient,
+        resolver=object(),
+        authorizer=object(),
+        router=SimpleNamespace(authorize_inbound_sender=AsyncMock(return_value=True)),
+        requester=PeerRequester(recipient.did, object()),
+    )
+
+    with pytest.raises(PeerAccessDeniedError):
+        await manager.cancel_host_attested_local_a2a_task(
+            sender=sender,
+            requester=PeerRequester(sender.did, object()),
+            peer=PeerIdentity(
+                agent_id=recipient.did,
+                slug="recipient",
+                routing_key="recipient",
+            ),
+            task_id="local-task",
+            payload={"reason": "forged handle"},
+        )
 
 
 @pytest.mark.asyncio
