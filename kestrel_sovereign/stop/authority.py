@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from .types import StopDisposition, StopOutcome, StopRequest, StopScope
 
@@ -22,6 +23,7 @@ class CooperativeStopTarget:
     cancel: StopOperation
     turn_ids: frozenset[str] = field(default_factory=frozenset)
     tool_call_ids: frozenset[str] = field(default_factory=frozenset)
+    turn_request_ids: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -44,6 +46,25 @@ class CooperativeStopTarget:
                 raise TypeError(
                     f"Stop target {field_name} must be a frozenset of concrete strings"
                 )
+        if not isinstance(self.turn_request_ids, Mapping):
+            raise TypeError("Stop target turn_request_ids must be a mapping")
+        turn_request_ids = dict(self.turn_request_ids)
+        if any(
+            not isinstance(turn_id, str)
+            or not turn_id.strip()
+            or not isinstance(request_id, str)
+            or not request_id.strip()
+            for turn_id, request_id in turn_request_ids.items()
+        ):
+            raise TypeError(
+                "Stop target turn_request_ids must map concrete turn strings "
+                "to concrete request strings"
+            )
+        object.__setattr__(
+            self,
+            "turn_request_ids",
+            MappingProxyType(turn_request_ids),
+        )
 
 
 class StopCleanupRegistry:
@@ -117,10 +138,14 @@ class CancellationAuthority:
                 ),
             )
 
-        async def stop_one(target: CooperativeStopTarget) -> StopOutcome:
+        async def stop_one(
+            target: CooperativeStopTarget,
+            target_request: StopRequest,
+            resolved_target: str,
+        ) -> StopOutcome:
             detail = None
             try:
-                disposition = await target.cancel(request)
+                disposition = await target.cancel(target_request)
                 if not isinstance(disposition, StopDisposition):
                     raise TypeError("Stop target returned an untyped disposition")
             except asyncio.CancelledError:
@@ -136,19 +161,23 @@ class CancellationAuthority:
             return StopOutcome(
                 scope=request.scope,
                 requested_target=request.target,
-                resolved_target=target.target_id,
+                resolved_target=resolved_target,
                 agent_id=target.agent_id,
                 disposition=disposition,
                 correlation_id=request.correlation_id,
                 detail=detail,
             )
 
+        resolved_targets = tuple(
+            (target, *self._request_for_target(request, target))
+            for target in targets
+        )
         tasks = {
             asyncio.create_task(
-                stop_one(target),
+                stop_one(target, target_request, resolved_target),
                 name=f"cooperative-stop:{target.target_id}",
-            ): target
-            for target in targets
+            ): (target, resolved_target)
+            for target, target_request, resolved_target in resolved_targets
         }
         try:
             done, pending = await asyncio.wait(
@@ -161,7 +190,10 @@ class CancellationAuthority:
                 self._detach_cleanup(task)
             raise
 
-        completed = {tasks[task].target_id: task.result() for task in done}
+        completed = {
+            tasks[task][0].target_id: task.result()
+            for task in done
+        }
         for task in pending:
             task.cancel()
             # Cooperative cancellation is advisory: a target may catch
@@ -170,17 +202,42 @@ class CancellationAuthority:
             # detached with exception consumption instead of awaited here.
             self._detach_cleanup(task)
         for task in pending:
-            target = tasks[task]
+            target, resolved_target = tasks[task]
             completed[target.target_id] = StopOutcome(
                 scope=request.scope,
                 requested_target=request.target,
-                resolved_target=target.target_id,
+                resolved_target=resolved_target,
                 agent_id=target.agent_id,
                 disposition=StopDisposition.UNREACHABLE,
                 correlation_id=request.correlation_id,
                 detail="Cooperative Stop target timed out",
             )
         return tuple(completed[target.target_id] for target in targets)
+
+    @staticmethod
+    def _request_for_target(
+        request: StopRequest,
+        target: CooperativeStopTarget,
+    ) -> tuple[StopRequest, str]:
+        """Resolve a public turn address behind the single authority seam."""
+
+        if request.scope is not StopScope.TURN or request.target is None:
+            return request, target.target_id
+        request_id = target.turn_request_ids.get(request.target)
+        if request_id is None:
+            return request, target.target_id
+        return (
+            StopRequest(
+                scope=request.scope,
+                actor_id=request.actor_id,
+                target=request_id,
+                target_agent_id=request.target_agent_id,
+                reason=request.reason,
+                cascade=request.cascade,
+                correlation_id=request.correlation_id,
+            ),
+            request_id,
+        )
 
     @staticmethod
     def _validated_request(request: StopRequest) -> StopRequest:
@@ -219,7 +276,10 @@ class CancellationAuthority:
                 target
                 for target in inventory
                 if target.agent_id == request.target_agent_id
-                and request.target in target.turn_ids
+                and (
+                    request.target in target.turn_ids
+                    or request.target in target.turn_request_ids
+                )
             )
         else:
             matches = tuple(

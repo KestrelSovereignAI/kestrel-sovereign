@@ -29,6 +29,7 @@ from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
     new_stream_delivery_id,
+    validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
@@ -859,6 +860,30 @@ async def stop_agent_request(request: Request):
         explicit_request_id = (
             data.get("request_id") or request.query_params.get("request_id")
         )
+        explicit_turn_id = data.get("turn_id")
+        if explicit_turn_id is None:
+            explicit_turn_id = request.query_params.get("turn_id")
+        has_request_address = (
+            explicit_request_id is not None
+            or request.headers.get("X-Request-ID") is not None
+        )
+        if explicit_turn_id is not None and has_request_address:
+            raise ApiHTTPException(
+                status_code=400,
+                code="ambiguous_stop_target",
+                message="Pass either request_id or turn_id, not both.",
+            )
+        if explicit_turn_id is not None:
+            try:
+                turn_id = validate_invocation_id(explicit_turn_id)
+            except ValueError as error:
+                raise ApiHTTPException(
+                    status_code=400,
+                    code="invalid_turn_id",
+                    message=f"Invalid turn_id: {error}",
+                ) from error
+        else:
+            turn_id = None
         request_id = (
             resolve_request_invocation_id(
                 request,
@@ -881,15 +906,33 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        active_turns = set(getattr(agent, "_active_request_ids", set()) or set())
+        active_request_ids = set(
+            getattr(agent, "_active_request_ids", set()) or set()
+        )
         abandoned_turns = getattr(agent, "_abandoned_request_generations", None)
         if isinstance(abandoned_turns, dict):
-            active_turns.update(abandoned_turns)
+            active_request_ids.update(abandoned_turns)
         current_turn = getattr(agent, "_current_request_id", None)
         if isinstance(current_turn, str) and current_turn:
-            active_turns.add(current_turn)
+            active_request_ids.add(current_turn)
         if request_id is not None:
-            active_turns.add(request_id)
+            active_request_ids.add(request_id)
+        turn_index_accessor = vars(agent).get("active_turn_request_ids")
+        if not callable(turn_index_accessor):
+            turn_index_accessor = getattr(
+                type(agent),
+                "active_turn_request_ids",
+                None,
+            )
+            if callable(turn_index_accessor):
+                turn_request_ids = turn_index_accessor(agent)
+            else:
+                turn_request_ids = {}
+        else:
+            turn_request_ids = turn_index_accessor()
+        if not isinstance(turn_request_ids, dict):
+            raise TypeError("agent turn request inventory has an invalid type")
+        turn_addresses = active_request_ids.union(turn_request_ids)
 
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
             cancelled_request_ids: list[Optional[str]] = []
@@ -901,14 +944,14 @@ async def stop_agent_request(request: Request):
                     cancelled_request_ids.append(stop_request.target)
             else:
                 canceled = False
-                for active_request_id in sorted(active_turns):
+                for active_request_id in sorted(active_request_ids):
                     request_cancelled = agent.cancel_current_request(
                         request_id=active_request_id
                     )
                     if request_cancelled:
                         cancelled_request_ids.append(active_request_id)
                     canceled = request_cancelled or canceled
-                if not active_turns:
+                if not active_request_ids:
                     canceled = agent.cancel_current_request(request_id=None)
                     if canceled:
                         cancelled_request_ids.append(None)
@@ -960,16 +1003,25 @@ async def stop_agent_request(request: Request):
                     target_id=agent_id,
                     agent_id=agent_id,
                     cancel=cancel_request,
-                    turn_ids=frozenset(active_turns),
+                    turn_ids=frozenset(turn_addresses),
+                    turn_request_ids=turn_request_ids,
                 ),
             ),
             cleanup_registry=cleanup_registry,
         )
         stop_request = StopRequest(
-            scope=StopScope.TURN if request_id is not None else StopScope.AGENT,
+            scope=(
+                StopScope.TURN
+                if request_id is not None or turn_id is not None
+                else StopScope.AGENT
+            ),
             actor_id=actor_id,
-            target=request_id if request_id is not None else agent_id,
-            target_agent_id=agent_id if request_id is not None else None,
+            target=turn_id or request_id or agent_id,
+            target_agent_id=(
+                agent_id
+                if request_id is not None or turn_id is not None
+                else None
+            ),
         )
         outcomes = await authority.stop(stop_request)
         failed_outcomes = tuple(
@@ -992,6 +1044,7 @@ async def stop_agent_request(request: Request):
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
+            "turn_id": turn_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel",
             "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }
