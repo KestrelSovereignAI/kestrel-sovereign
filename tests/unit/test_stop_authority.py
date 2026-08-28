@@ -7,6 +7,7 @@ import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -525,6 +526,7 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     agent._active_request_ids = {"turn-b", "turn-a"}
     agent._current_request_id = "turn-b"
     agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(return_value=None)
     app.state.agent = agent
 
     response = TestClient(app).post("/api/agent/stop")
@@ -535,6 +537,59 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
         call(request_id="turn-a"),
         call(request_id="turn-b"),
     ]
+    assert agent.wait_for_request_completion.await_args_list == [
+        call("turn-a"),
+        call("turn-b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
+    """The endpoint must not confuse a cancel marker with completed execution."""
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+
+    cancel_seen = asyncio.Event()
+
+    class LiveAgent(RequestLifecycleMixin):
+        agent_id = "did:test:live-agent"
+
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        def cancel_current_request(self, request_id=None):
+            cancelled = super().cancel_current_request(request_id)
+            if cancelled:
+                cancel_seen.set()
+            return cancelled
+
+    agent = LiveAgent()
+    agent.register_active_request("turn-live")
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        stop_task = asyncio.create_task(
+            client.post("/api/agent/stop", json={"request_id": "turn-live"})
+        )
+        await asyncio.wait_for(cancel_seen.wait(), timeout=1)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(stop_task), timeout=0.05)
+
+        agent._cleanup_cancelled_request("turn-live")
+        response = await asyncio.wait_for(stop_task, timeout=1)
+
+    assert response.status_code == 200
+    assert response.json()["stop_outcomes"][0]["disposition"] == "stopped"
 
 
 def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:

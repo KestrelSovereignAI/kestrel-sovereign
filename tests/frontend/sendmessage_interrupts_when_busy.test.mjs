@@ -292,6 +292,46 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
 });
 
 
+test('queue mode preserves composer input behind an unconfirmed Stop', async () => {
+    const agent = 'agent-queue-stop-failed';
+    const pane = getOrCreateChatPane(agent);
+    pane.composerMode = 'queue';
+    pane.queuedMessage = null;
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    // The prior local stream has already aborted, but its backend Stop never
+    // acknowledged. There is no live stream completion left to drain a queue.
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => null;
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-request';
+    let stopAttempts = 0;
+    apiModule.default.stop = async () => {
+        stopAttempts += 1;
+        throw new Error('stop_not_confirmed');
+    };
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return (async function* () {})();
+    };
+
+    messageInput.value = 'keep this queued redirect editable';
+    await sendMessage();
+
+    assert.equal(stopAttempts, 1,
+        'Send retries the unconfirmed Stop before applying queue behavior');
+    assert.equal(replacementStarted, false);
+    assert.equal(messageInput.value, 'keep this queued redirect editable',
+        'an unacknowledged Stop must not consume composer input');
+    assert.equal(pane.queuedMessage, null,
+        'there is no live completion path that could drain a queued message');
+
+    state.unconfirmedStopAgents.delete(agent);
+});
+
+
 test('sendMessage does NOT call stopAgent when the agent is idle (#1255)', async () => {
     getOrCreateChatPane('agent-idle');
     apiModule.default.setHostAgent('agent-idle');

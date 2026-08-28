@@ -11,6 +11,7 @@ disconnect, crashed generator). Without that, an abandoned request id
 permanently blocks ``idle_agents_only`` restarts (#1558).
 """
 
+import asyncio
 import logging
 import time
 from typing import Dict, List, Optional
@@ -62,6 +63,37 @@ class RequestLifecycleMixin:
         rid = request_id or self._current_request_id
         return rid in self._cancelled_requests if rid else False
 
+    async def wait_for_request_completion(
+        self,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Wait until the targeted request has left the live lifecycle.
+
+        Marking ``_cancelled_requests`` is only a cooperative request to stop.
+        A caller that needs a Stop acknowledgement must wait for endpoint
+        cleanup before it may report success or start replacement work.  The
+        waiter is installed before yielding to the event loop, which closes the
+        check-then-sleep race with ``_cleanup_cancelled_request``.
+        """
+        target_request_id = request_id or self._current_request_id
+        if target_request_id is None:
+            return
+        active_request_ids = getattr(self, "_active_request_ids", set())
+        if (
+            target_request_id not in active_request_ids
+            and target_request_id != self._current_request_id
+        ):
+            return
+        waiters = getattr(self, "_request_completion_events", None)
+        if not isinstance(waiters, dict):
+            waiters = {}
+            self._request_completion_events = waiters
+        completion = waiters.get(target_request_id)
+        if completion is None:
+            completion = asyncio.Event()
+            waiters[target_request_id] = completion
+        await completion.wait()
+
     def _cleanup_cancelled_request(self, request_id: str):
         """Remove a request from the cancelled set after it's been handled."""
         active_request_ids = getattr(self, "_active_request_ids", None)
@@ -79,6 +111,11 @@ class RequestLifecycleMixin:
         self._cancelled_requests.discard(request_id)
         if self._current_request_id == request_id:
             self._current_request_id = next(iter(active_request_ids), None) if active_request_ids else None
+        waiters = getattr(self, "_request_completion_events", None)
+        if isinstance(waiters, dict):
+            completion = waiters.pop(request_id, None)
+            if completion is not None:
+                completion.set()
 
     def active_request_ages(self) -> Dict[str, float]:
         """Return ``{request_id: age_seconds}`` for each active request.

@@ -849,21 +849,42 @@ async def stop_agent_request(request: Request):
             active_turns.add(request_id)
 
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
+            cancelled_request_ids: list[Optional[str]] = []
             if stop_request.scope is StopScope.TURN:
                 canceled = agent.cancel_current_request(
                     request_id=stop_request.target
                 )
+                if canceled:
+                    cancelled_request_ids.append(stop_request.target)
             else:
                 canceled = False
                 for active_request_id in sorted(active_turns):
-                    canceled = (
-                        agent.cancel_current_request(
-                            request_id=active_request_id
-                        )
-                        or canceled
+                    request_cancelled = agent.cancel_current_request(
+                        request_id=active_request_id
                     )
+                    if request_cancelled:
+                        cancelled_request_ids.append(active_request_id)
+                    canceled = request_cancelled or canceled
                 if not active_turns:
                     canceled = agent.cancel_current_request(request_id=None)
+                    if canceled:
+                        cancelled_request_ids.append(None)
+            if canceled:
+                wait_for_completion = getattr(
+                    agent,
+                    "wait_for_request_completion",
+                    None,
+                )
+                if not callable(wait_for_completion):
+                    raise RuntimeError(
+                        "agent cannot confirm request lifecycle completion"
+                    )
+                # Every cancellation marker is installed before the first
+                # await, so agent-wide Stop reaches all snapshotted turns at
+                # once. STOPPED is returned only after each one has run its
+                # endpoint cleanup; CancellationAuthority bounds this wait.
+                for cancelled_request_id in cancelled_request_ids:
+                    await wait_for_completion(cancelled_request_id)
             return (
                 StopDisposition.STOPPED
                 if canceled

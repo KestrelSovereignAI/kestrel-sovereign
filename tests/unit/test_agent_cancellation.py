@@ -2,6 +2,8 @@
 Unit tests for agent request cancellation (stop button).
 """
 
+import asyncio
+
 import pytest
 from unittest.mock import MagicMock, AsyncMock
 
@@ -20,11 +22,13 @@ class TestAgentCancellation:
         agent._active_request_ids = set()
         agent._active_request_started_at = {}
         agent._cancelled_requests = set()
+        agent._request_completion_events = {}
 
         # Bind actual methods
         agent.register_active_request = KestrelAgent.register_active_request.__get__(agent)
         agent.cancel_current_request = KestrelAgent.cancel_current_request.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)
+        agent.wait_for_request_completion = KestrelAgent.wait_for_request_completion.__get__(agent)
         agent._cleanup_cancelled_request = KestrelAgent._cleanup_cancelled_request.__get__(agent)
         agent.active_request_ages = KestrelAgent.active_request_ages.__get__(agent)
         agent.prune_stale_active_requests = KestrelAgent.prune_stale_active_requests.__get__(agent)
@@ -86,6 +90,38 @@ class TestAgentCancellation:
         
         assert "test-req" not in mock_agent._cancelled_requests
         assert mock_agent._current_request_id == "different-req"  # Not cleared
+
+    @pytest.mark.asyncio
+    async def test_completion_waiter_does_not_acknowledge_cancel_marker(self, mock_agent):
+        """A cooperative cancel marker is not proof that execution stopped."""
+        mock_agent.register_active_request("still-running")
+        assert mock_agent.cancel_current_request("still-running") is True
+
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("still-running")
+        )
+        await asyncio.sleep(0)
+
+        assert waiter.done() is False
+        mock_agent._cleanup_cancelled_request("still-running")
+        await asyncio.wait_for(waiter, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_completion_waiter_requires_final_duplicate_cleanup(self, mock_agent):
+        """One retry cleanup cannot acknowledge a same-id sibling still running."""
+        mock_agent.register_active_request("retry-id")
+        mock_agent.register_active_request("retry-id")
+        assert mock_agent.cancel_current_request("retry-id") is True
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("retry-id")
+        )
+
+        mock_agent._cleanup_cancelled_request("retry-id")
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+
+        mock_agent._cleanup_cancelled_request("retry-id")
+        await asyncio.wait_for(waiter, timeout=1)
 
     def test_multiple_cancellations_tracked(self, mock_agent):
         """Multiple requests can be cancelled and tracked."""
@@ -186,6 +222,7 @@ class TestStopEndpoint:
         # Mock agent
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
         
         client = TestClient(app)
@@ -232,6 +269,7 @@ class TestStopEndpoint:
 
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
 
         client = TestClient(app)
@@ -259,6 +297,7 @@ class TestStopEndpoint:
         app.include_router(router)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
 
         response = TestClient(app).post(
@@ -282,6 +321,7 @@ class TestStopEndpoint:
         app.include_router(router)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
 
         response = TestClient(app).post(

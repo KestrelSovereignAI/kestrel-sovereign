@@ -1389,6 +1389,9 @@ class KestrelAgent(
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
+        # Stop is acknowledged only after endpoint cleanup has observed the
+        # request leave execution. RequestLifecycleMixin owns these waiters.
+        self._request_completion_events: dict[str, asyncio.Event] = {}
         # Task-reentrant so a durable-identity write (rename / description /
         # discovery / user-name / SOUL) invoked as a TOOL inside a streamed turn
         # — which already holds this lock across the whole turn — re-enters
@@ -6999,6 +7002,7 @@ Expected Duration: {expected_duration}
     # - register_active_request
     # - cancel_current_request
     # - is_request_cancelled
+    # - wait_for_request_completion
     # - _cleanup_cancelled_request
 
     def resolve_effective_name(

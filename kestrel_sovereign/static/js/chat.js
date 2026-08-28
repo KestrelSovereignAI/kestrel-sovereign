@@ -2762,6 +2762,15 @@ export async function sendMessage(overrideText, overrideAgent) {
     // dropping it (and leaving it staged for the next turn).
     if (fromComposer) await awaitPendingUploads(pane);
 
+    // A failed/unreachable Stop is not an ordinary busy turn: the local
+    // stream was already aborted, so there is no completion ``finally`` left
+    // that can drain queue mode. Retry the acknowledgement without consuming
+    // the composer or staged attachments. Only a confirmed Stop may proceed.
+    if (unconfirmedStopAgents().has(dispatchAgent)) {
+        const stopConfirmed = await stopAgent(dispatchAgent);
+        if (!stopConfirmed) return;
+    }
+
     // Send-while-busy. Behavior depends on the pane's composerMode.
     if (isAgentBusy(dispatchAgent)) {
         if (pane.composerMode === 'queue') {
