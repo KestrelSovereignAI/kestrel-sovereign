@@ -37,7 +37,7 @@ globalThis.window.SharedMarkdown = {
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 const API = apiModule.default;
 const { Modal, setOverlayRoot } = await import('../../kestrel_sovereign/static/js/ui.js');
-const { renderIdentityDangerZone } = await import(
+const { renderIdentityDangerZone, resolveDeleteAction } = await import(
     '../../kestrel_sovereign/static/js/identity-danger-zone.js'
 );
 
@@ -55,7 +55,8 @@ function resetPanel() {
 test('loadIdentity() populates #identity-danger-zone via the native (multi_agent) capability path (#2208)', async () => {
     resetPanel();
     API.getIdentity = async () => ({ name: 'Emma', did: 'did:pkh:emma' });
-    API.hasCapability = (cap) => true; // identity + multi_agent both enabled
+    API.hasCapability = (cap) => true;
+    API.canManageHostAgentLifecycle = (operation) => operation === 'delete';
     let deleted = null;
     API.deleteAgent = async (name) => { deleted = name; return { success: true }; };
 
@@ -92,6 +93,7 @@ test('loadIdentity() leaves #identity-danger-zone empty when neither host handle
     API.getIdentity = async () => ({ name: 'Solo', did: 'did:pkh:solo' });
     // No host handler, and multi_agent capability off → section hidden.
     API.hasCapability = (cap) => cap === 'identity';
+    API.canManageHostAgentLifecycle = () => false;
     delete globalThis.KESTREL_UI_CONFIG;
 
     await loadIdentity();
@@ -101,6 +103,67 @@ test('loadIdentity() leaves #identity-danger-zone empty when neither host handle
         '',
         'danger zone stays empty with no delete capability',
     );
+});
+
+test('multi-agent feature presence does not expose delete without caller authority', async () => {
+    resetPanel();
+    API.getIdentity = async () => ({ name: 'OAuthAgent', did: 'did:pkh:oauth' });
+    API.hasCapability = () => true;
+    API.canManageHostAgentLifecycle = () => false;
+    delete globalThis.KESTREL_UI_CONFIG;
+
+    await loadIdentity();
+
+    assert.equal(
+        document.getElementById('identity-danger-zone').innerHTML.trim(),
+        '',
+        'feature availability cannot substitute for sovereign lifecycle authority',
+    );
+});
+
+test('native delete rechecks caller authority after the panel was rendered', () => {
+    let allowed = true;
+    let deleted = false;
+    const action = resolveDeleteAction({
+        identity: { name: 'Emma' },
+        api: {
+            getHostAgent: () => 'emma',
+            canManageHostAgentLifecycle: () => allowed,
+            deleteAgent: () => { deleted = true; },
+        },
+        dz: {},
+    });
+    assert.equal(action.show, true);
+
+    allowed = false;
+    assert.throws(() => action.handler(), /authority is no longer available/i);
+    assert.equal(deleted, false);
+});
+
+test('stale native delete button disappears instead of opening after revocation', () => {
+    resetPanel();
+    Modal.hide();
+    let allowed = true;
+    let deleted = false;
+    const container = document.getElementById('identity-danger-zone');
+    const api = {
+        getHostAgent: () => 'emma',
+        canManageHostAgentLifecycle: () => allowed,
+        deleteAgent: () => { deleted = true; },
+    };
+    assert.equal(renderIdentityDangerZone({
+        container,
+        identity: { name: 'Emma' },
+        api,
+        Modal,
+        Toast: {},
+    }), true);
+
+    allowed = false;
+    container.querySelector('#danger-zone-delete-btn').click();
+    assert.equal(container.innerHTML, '');
+    assert.equal(document.getElementById('danger-zone-confirm-input'), null);
+    assert.equal(deleted, false);
 });
 
 test('loadIdentity() renders a host-injected delete handler even without native capability (#2208)', async () => {
@@ -137,6 +200,7 @@ test('IME composition Enter never confirms a danger-zone deletion', async () => 
     resetPanel();
     API.getIdentity = async () => ({ name: 'Emma', did: 'did:pkh:emma' });
     API.hasCapability = () => true;
+    API.canManageHostAgentLifecycle = (operation) => operation === 'delete';
     const prevGetHostAgent = API.getHostAgent;
     API.getHostAgent = () => 'Emma';
     let deletes = 0;
@@ -176,6 +240,7 @@ test('a confirmed deletion still starts when modal focus restoration fails', asy
     resetPanel();
     API.getIdentity = async () => ({ name: 'Emma', did: 'did:pkh:emma' });
     API.hasCapability = () => true;
+    API.canManageHostAgentLifecycle = (operation) => operation === 'delete';
     const prevGetHostAgent = API.getHostAgent;
     API.getHostAgent = () => 'Emma';
     let deletes = 0;
@@ -260,6 +325,7 @@ test('native delete targets the manager routing key, not the editable display na
     // manager's routing key. DELETE must hit the routing key or it 404s.
     API.getIdentity = async () => ({ name: 'Renamed Emma', did: 'did:pkh:emma' });
     API.hasCapability = () => true;
+    API.canManageHostAgentLifecycle = (operation) => operation === 'delete';
     const prevGetHostAgent = API.getHostAgent;
     API.getHostAgent = () => 'emma';
     let deleted = null;
