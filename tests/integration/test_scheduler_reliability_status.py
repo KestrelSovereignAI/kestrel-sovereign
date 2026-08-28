@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.features.health.checks import check_scheduler_liveness
 from kestrel_sovereign.features.restart_coordinator.feature import (
     MAX_IDLE_ONLY_DEFERRAL_SECONDS,
@@ -45,6 +46,15 @@ async def _database(path) -> AsyncDatabase:
     backend = SQLiteBackend(str(path))
     await backend.connect()
     return AsyncDatabase(backend)
+
+
+async def _insert_sovereign_restart(db, **kwargs):
+    """Create a restart through the authority boundary used in production."""
+
+    with caller_context_scope(
+        CallerContext.sovereign(identity="scheduler-reliability-test")
+    ):
+        return await insert_request(db, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -1998,7 +2008,11 @@ async def test_schedule_list_survives_unavailable_runtime_telemetry(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_path):
+async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("KESTREL_API_KEY", "scheduler-reliability-test-key")
     db = await _database(tmp_path / "restart-scope.db")
     requester = SimpleNamespace(
         did="agent-1",
@@ -2022,7 +2036,7 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
     feature = RestartCoordinatorFeature(requester)
     try:
         await feature.initialize()
-        fresh = await insert_request(
+        fresh = await _insert_sovereign_restart(
             db, requested_by_agent="agent-1", reason="requester scoped"
         )
         fresh, decision = await feature._evaluate_and_track_safety(fresh)
@@ -2089,7 +2103,7 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
 
         # A migrated backlog row starts a fresh deferral clock on this boot and
         # cannot escalate until its one-time acknowledgement is recorded.
-        legacy = await insert_request(
+        legacy = await _insert_sovereign_restart(
             db, requested_by_agent="agent-1", reason="pre-upgrade backlog"
         )
         ancient_request = (
@@ -2130,6 +2144,7 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
 async def test_restart_deferral_escalation_uses_database_time_under_host_skew(
     monkeypatch, tmp_path,
 ):
+    monkeypatch.setenv("KESTREL_API_KEY", "scheduler-reliability-test-key")
     from kestrel_sovereign.features.restart_coordinator import (
         feature as restart_feature_module,
     )
@@ -2164,7 +2179,7 @@ async def test_restart_deferral_escalation_uses_database_time_under_host_skew(
 
     try:
         await feature.initialize()
-        request = await insert_request(
+        request = await _insert_sovereign_restart(
             db, requested_by_agent="agent-1", reason="clock skew"
         )
         monkeypatch.setattr(restart_feature_module, "datetime", FastHostDateTime)
