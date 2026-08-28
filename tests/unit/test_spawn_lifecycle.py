@@ -80,6 +80,7 @@ async def test_manager_prune_cancels_removed_child_ttl_before_name_reuse() -> No
         "did:test:parent",
         "Reusable",
     )
+    assert not lifecycle.is_tracked("Reusable")
     await asyncio.sleep(0)
     await lifecycle.register(
         "Reusable",
@@ -91,6 +92,39 @@ async def test_manager_prune_cancels_removed_child_ttl_before_name_reuse() -> No
     assert old_task is not None and old_task.cancelled()
     assert lifecycle._tracked["Reusable"].child_did == "did:test:replacement-child"
     await lifecycle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_manager_prune_does_not_cancel_lifecycle_task_terminating_itself() -> None:
+    manager = AgentManager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    child_did = "did:test:self-terminating-child"
+    await lifecycle.register(
+        "SelfTerminating",
+        child_did,
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+    original_ttl = lifecycle._tracked["SelfTerminating"].ttl_task
+    assert original_ttl is not None
+    original_ttl.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await original_ttl
+    lifecycle._tracked["SelfTerminating"].ttl_task = asyncio.current_task()
+    manager._parent_children["did:test:parent"] = ["SelfTerminating"]
+    manager._child_mandates["SelfTerminating"] = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=child_did,
+    )
+
+    manager._prune_child_relationship_and_mandate(
+        "did:test:parent",
+        "SelfTerminating",
+    )
+
+    assert not lifecycle.is_tracked("SelfTerminating")
+    assert not asyncio.current_task().cancelling()
 
 
 @pytest.mark.asyncio

@@ -4972,39 +4972,17 @@ class AgentManager:
         parent_wallet = getattr(parent_agent, "wallet", None)
         if parent_wallet is None:
             return  # precondition already refused this; defensive.
-        try:
-            delegated = await create_delegated_wallet(
-                parent_wallet=parent_wallet,
-                parent_did=parent_agent.agent_id,
-                child_did=child.agent_id,
-                budget=budget,
-            )
-        except BaseException as allocation_failure:
-            # The hold failed AFTER the child was created (e.g. a concurrent
-            # spend drained the parent). Don't leave an uncapped child running.
-            try:
-                removed = await self.remove_agent(name, offboard_runtime=True)
-                if not removed:
-                    raise RuntimeError(
-                        "Delegated-budget rollback did not remove its child"
-                    )
-            except BaseException as rollback_failure:
-                not_hosted_cancellation = (
-                    _uncommitted_spawn_not_hosted_cancellation(rollback_failure)
-                )
-                if not_hosted_cancellation is not None:
-                    if not_hosted_cancellation:
-                        raise BaseExceptionGroup(
-                            "Delegated-budget allocation failed after cancelled "
-                            "storage-backed child rollback",
-                            [allocation_failure, asyncio.CancelledError()],
-                        )
-                    raise allocation_failure
-                raise BaseExceptionGroup(
-                    "Delegated-budget allocation and child rollback both failed",
-                    [allocation_failure, rollback_failure],
-                )
-            raise allocation_failure
+        # Do not remove the already-published child from this helper when the
+        # provider refuses the allocation. ``_do_spawn`` owns that failure and
+        # must first downgrade its durable signed receipt, then close storage
+        # and withdraw routing. A nested cleanup here used to destroy the graph
+        # before the receipt-first rollback could revoke that authority.
+        delegated = await create_delegated_wallet(
+            parent_wallet=parent_wallet,
+            parent_did=parent_agent.agent_id,
+            child_did=child.agent_id,
+            budget=budget,
+        )
 
         # Provider I/O may have yielded to terminal shutdown or a direct DELETE.
         # Claim the exact hold *before* any post-provider await. A positive
@@ -5879,7 +5857,7 @@ class AgentManager:
 
         lifecycle = getattr(self, "_lifecycle", None)
         if isinstance(lifecycle, SpawnedAgentLifecycle):
-            lifecycle.disarm_persisted_child(
+            lifecycle.retire_persisted_child(
                 child_name,
                 expected_child_did=(
                     mandate.child_did if isinstance(mandate, SpawnMandate) else None

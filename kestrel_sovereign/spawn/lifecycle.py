@@ -404,6 +404,32 @@ class SpawnedAgentLifecycle:
         tracked.ttl_task = None
         return True
 
+    def retire_persisted_child(
+        self,
+        child_name: str,
+        *,
+        expected_child_did: Optional[str] = None,
+    ) -> bool:
+        """Retire direct-removal tracking without stealing lifecycle cleanup.
+
+        An explicit termination, result report, or TTL expiry holds ``_lock``
+        while it asks AgentManager to remove the child. That lifecycle owner
+        still needs its local record to publish the terminal result and hook,
+        so manager pruning only disarms its timer. A direct manager removal has
+        no such owner and withdraws the exact record immediately. Both paths
+        avoid cancelling the TTL task when it is the current task.
+        """
+
+        if self._lock.locked():
+            return self.disarm_persisted_child(
+                child_name,
+                expected_child_did=expected_child_did,
+            )
+        return self.withdraw_persisted_child(
+            child_name,
+            expected_child_did=expected_child_did,
+        )
+
     def create_ephemeral_dir(self) -> str:
         """Create a temporary directory for an ephemeral child agent.
 
