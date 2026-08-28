@@ -119,6 +119,42 @@ class TestNodeSwapResult:
         assert NodeDeleteResult.NOT_FOUND == "not_found"
 
 
+async def test_postgres_bulk_row_locks_use_python_compatible_byte_order():
+    """Every batch must use the same UTF-8 ordering used to form the batches."""
+
+    import kestrel_sovereign.storage.async_graph_store as graph_store_module
+
+    class _PostgresProbe:
+        backend_type = "postgres"
+
+        def __init__(self):
+            self.queries = []
+
+        async def fetchall(self, query, params=()):
+            self.queries.append(query)
+            if "FROM graph_nodes" in query:
+                return [(node_id,) for node_id in params]
+            return []
+
+    db = _PostgresProbe()
+    node_ids = [f"node:{index:04d}" for index in range(501)] + [
+        "node:angstrom:\u00e5",
+        "node:emoji:\U0001f642",
+    ]
+
+    locked = await graph_store_module.lock_graph_nodes_for_update(db, node_ids)
+
+    assert locked == sorted(node_ids)
+    row_lock_queries = [
+        query for query in db.queries if "FROM graph_nodes" in query
+    ]
+    assert len(row_lock_queries) == 2
+    assert all(
+        'ORDER BY node_id COLLATE "C" FOR UPDATE' in query
+        for query in row_lock_queries
+    )
+
+
 # =====================================================================
 # Happy path + failure classification (dual backend)
 # =====================================================================

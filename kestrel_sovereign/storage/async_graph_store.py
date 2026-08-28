@@ -31,7 +31,7 @@ from .async_conversation_store import _rows_affected
 logger = logging.getLogger(__name__)
 
 _DELETE_ID_BATCH = 500
-_MAX_ABSENT_NODE_ADVISORY_LOCKS = 128
+_GRAPH_NODE_RESERVATION_SHARDS = 128
 
 #: A SHA-256 digest as this codebase writes them: lowercase hex, 64 chars.
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -499,14 +499,19 @@ async def _lock_graph_node_ids_for_insert(
     db: AsyncDatabase,
     node_ids: Iterable[str],
 ) -> List[str]:
-    """Reserve graph identifiers in canonical order, including absent rows.
+    """Reserve graph identifiers through a bounded, canonical shard set.
 
     PostgreSQL row locks cannot cover a missing row.  The graph therefore has
-    one transaction-advisory namespace shared by composed write-set locks and
-    compare-and-create.  SQLite's writer slot provides the equivalent
-    serialization.  This helper deliberately does not lock physical rows: a
-    caller that has already established absence must not acquire a foreign
-    tenant's row lock if another writer won just before the reservation.
+    a fixed set of transaction-advisory reservation shards shared by composed
+    write-set locks and compare-and-create. Every identifier maps stably to one
+    shard, so equal IDs still serialize while an arbitrarily large replication
+    retains at most ``_GRAPH_NODE_RESERVATION_SHARDS`` shared locks. SQLite's
+    writer slot provides the equivalent serialization.
+
+    Call this before taking any graph row locks. Reservation shards are always
+    acquired in signed-key order; row locks then use the bytewise node-id order.
+    Keeping those lock classes in one global order prevents a shard collision
+    from creating a row-lock/advisory-lock cycle.
     """
 
     unique_node_ids = sorted(
@@ -520,48 +525,30 @@ async def _lock_graph_node_ids_for_insert(
     if not unique_node_ids:
         return unique_node_ids
 
-    if len(unique_node_ids) > _MAX_ABSENT_NODE_ADVISORY_LOCKS:
-        raise ValueError(
-            "A graph write may reserve at most "
-            f"{_MAX_ABSENT_NODE_ADVISORY_LOCKS} absent node ids per transaction"
+    shard_ids = {
+        int.from_bytes(
+            hashlib.sha256(
+                f"kestrel:graph-node:{node_id}".encode("utf-8")
+            ).digest()[:8],
+            "big",
         )
-
+        % _GRAPH_NODE_RESERVATION_SHARDS
+        for node_id in unique_node_ids
+    }
     advisory_keys = sorted(
         {
             int.from_bytes(
                 hashlib.sha256(
-                    f"kestrel:graph-node:{node_id}".encode("utf-8")
+                    f"kestrel:graph-node-reservation-shard:{shard_id}".encode(
+                        "utf-8"
+                    )
                 ).digest()[:8],
                 "big",
                 signed=True,
             )
-            for node_id in unique_node_ids
+            for shard_id in shard_ids
         }
     )
-    # The per-call cardinality check above is not enough: nested graph writes
-    # join their caller's outer transaction, and transaction advisory locks do
-    # not release when a successful savepoint exits. Count the locks already
-    # retained by this PostgreSQL transaction and charge only genuinely new
-    # bigint keys, so 129 singleton calls cannot bypass the same 128-lock cap.
-    held_rows = await db.fetchall(
-        "SELECT classid::bigint, objid::bigint, objsubid "
-        "FROM pg_locks WHERE pid = pg_backend_pid() "
-        "AND locktype = 'advisory' AND granted"
-    )
-    held_locks = {
-        (int(row[0]), int(row[1]), int(row[2])) for row in held_rows
-    }
-    candidate_locks = set()
-    for key in advisory_keys:
-        unsigned_key = key & ((1 << 64) - 1)
-        candidate_locks.add(
-            (unsigned_key >> 32, unsigned_key & 0xFFFFFFFF, 1)
-        )
-    if len(held_locks | candidate_locks) > _MAX_ABSENT_NODE_ADVISORY_LOCKS:
-        raise ValueError(
-            "A graph write may reserve at most "
-            f"{_MAX_ABSENT_NODE_ADVISORY_LOCKS} absent node ids per transaction"
-        )
     for start in range(0, len(advisory_keys), _DELETE_ID_BATCH):
         batch = advisory_keys[start:start + _DELETE_ID_BATCH]
         values = ", ".join("(?::bigint)" for _ in batch)
@@ -637,13 +624,12 @@ async def lock_graph_nodes_for_update(
     if db.backend_type != "postgres":
         return unique_node_ids
 
-    # Existing rows need only ordinary row locks. Taking one transaction-level
-    # advisory lock for every row in a bulk purge/import exhausts PostgreSQL's
-    # shared lock table on large tenant graphs because batching the statements
-    # does not release locks before commit. Lock every existing row first, then
-    # reserve only the identifiers that are genuinely absent. All callers use
-    # that same row-before-absent order, while the absent helper enforces a hard
-    # bound suitable for the small composed creation sets that need it.
+    # Reserve a fixed shard set before any physical row. This covers both
+    # absent/present transitions and existing rows without consuming one shared
+    # advisory slot per graph node, and establishes one lock-class order across
+    # every writer even when unrelated IDs collide onto the same shard.
+    await _lock_graph_node_ids_for_insert(db, unique_node_ids)
+
     if agent_id:
         shared_clause = " OR ".join(
             "(graph_nodes.node_type = ? AND graph_nodes.label = ?)"
@@ -673,7 +659,7 @@ async def lock_graph_nodes_for_update(
             "SELECT node_id FROM graph_nodes "
             f"WHERE node_id IN ({placeholders}) "
             f"AND {lock_scope} "
-            "ORDER BY node_id FOR UPDATE",
+            'ORDER BY node_id COLLATE "C" FOR UPDATE',
             (*batch, *lock_scope_params),
         )
         existing_ids.update(row[0] for row in rows)
@@ -681,7 +667,6 @@ async def lock_graph_nodes_for_update(
     absent_ids = [
         node_id for node_id in unique_node_ids if node_id not in existing_ids
     ]
-    await _lock_graph_node_ids_for_insert(db, absent_ids)
     if agent_id:
         # Recheck after waiting on an absent-id reservation. A foreign writer
         # may have won the identifier between the caller's cheap preflight and
@@ -699,7 +684,7 @@ async def lock_graph_nodes_for_update(
             "SELECT node_id FROM graph_nodes "
             f"WHERE node_id IN ({placeholders}) "
             f"AND {lock_scope} "
-            "ORDER BY node_id FOR UPDATE",
+            'ORDER BY node_id COLLATE "C" FOR UPDATE',
             (*batch, *lock_scope_params),
         )
     return unique_node_ids

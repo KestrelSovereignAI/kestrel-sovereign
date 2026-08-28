@@ -820,10 +820,10 @@ async def test_complete_write_set_locks_absent_node_ids_on_backend(graph_store):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_postgres_bulk_existing_write_set_does_not_retain_advisory_locks(
+async def test_postgres_bulk_existing_write_set_uses_bounded_advisory_shards(
     graph_store,
 ):
-    """Bulk purge/import locking scales with rows, not shared advisory slots."""
+    """Bulk locking uses a fixed reservation-shard budget, not one lock per row."""
 
     if graph_store.db.backend_type != "postgres":
         pytest.skip("PostgreSQL exposes transaction advisory locks")
@@ -845,7 +845,7 @@ async def test_postgres_bulk_existing_write_set_does_not_retain_advisory_locks(
                 "SELECT COUNT(*) FROM pg_locks "
                 "WHERE pid = pg_backend_pid() AND locktype = 'advisory'"
             )
-            assert held == (0,)
+            assert 0 < held[0] <= 128
     finally:
         await graph_store.db.execute(
             "DELETE FROM graph_nodes WHERE node_id LIKE ?",
@@ -855,31 +855,32 @@ async def test_postgres_bulk_existing_write_set_does_not_retain_advisory_locks(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_postgres_absent_write_set_advisory_reservations_are_capped(
+async def test_postgres_large_absent_write_set_uses_bounded_advisory_shards(
     graph_store,
 ):
-    """A malformed bulk create cannot exhaust PostgreSQL's shared lock table."""
+    """A valid large replication fits within a bounded shared-lock footprint."""
 
     if graph_store.db.backend_type != "postgres":
         pytest.skip("PostgreSQL exposes transaction advisory locks")
 
-    absent_ids = [_nid(f"absent-cap-{index}") for index in range(129)]
+    absent_ids = [_nid(f"absent-shard-{index}") for index in range(1500)]
     async with graph_store.db.transaction():
-        with pytest.raises(ValueError, match="at most 128 absent node ids"):
-            await graph_store.lock_nodes_for_update(absent_ids)
+        assert await graph_store.lock_nodes_for_update(absent_ids) == sorted(
+            absent_ids
+        )
         held = await graph_store.db.fetchone(
             "SELECT COUNT(*) FROM pg_locks "
             "WHERE pid = pg_backend_pid() AND locktype = 'advisory'"
         )
-        assert held == (0,)
+        assert 0 < held[0] <= 128
 
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_postgres_nested_single_node_writes_share_one_advisory_budget(
+async def test_postgres_nested_single_node_writes_share_bounded_advisory_shards(
     graph_store,
 ):
-    """Singleton nested writes cannot bypass the per-transaction lock cap."""
+    """Many nested writes cannot exceed the fixed reservation-shard budget."""
 
     if graph_store.db.backend_type != "postgres":
         pytest.skip("PostgreSQL exposes transaction advisory locks")
@@ -887,19 +888,15 @@ async def test_postgres_nested_single_node_writes_share_one_advisory_budget(
     prefix = _nid("nested-advisory-cap") + ":"
     try:
         async with graph_store.db.transaction():
-            for index in range(128):
+            for index in range(150):
                 await graph_store.add_node(
                     _node(f"{prefix}{index}", {"index": index})
-                )
-            with pytest.raises(ValueError, match="at most 128 absent node ids"):
-                await graph_store.add_node(
-                    _node(f"{prefix}128", {"index": 128})
                 )
             held = await graph_store.db.fetchone(
                 "SELECT COUNT(*) FROM pg_locks "
                 "WHERE pid = pg_backend_pid() AND locktype = 'advisory'"
             )
-            assert held == (128,)
+            assert 0 < held[0] <= 128
     finally:
         await graph_store.db.execute(
             "DELETE FROM graph_nodes WHERE node_id LIKE ?",
