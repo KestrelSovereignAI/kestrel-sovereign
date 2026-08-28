@@ -306,8 +306,11 @@ class AsyncFileStore:
             # so reserve that witness; later root creation uses the same owner.
             # Lock both possibly-absent IDs first so source deletion and another
             # bootstrap writer observe the same canonical serialization order.
-            await graph.lock_nodes_for_update([agent_id, avatar_node_id])
-            await reserve_provisional_agent_owner(self.db, agent_id)
+            await reserve_provisional_agent_owner(
+                self.db,
+                agent_id,
+                additional_graph_node_ids=[avatar_node_id],
+            )
             await graph.add_node(
                 GraphNode(
                     node_id=avatar_node_id,

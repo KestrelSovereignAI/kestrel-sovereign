@@ -359,23 +359,40 @@ async def record_graph_node_owner(
 
 
 async def reserve_provisional_agent_owner(
-    db: AsyncDatabase, agent_id: str
+    db: AsyncDatabase,
+    agent_id: str,
+    *,
+    additional_graph_node_ids: Iterable[str] = (),
 ) -> None:
     """Reserve an agent root without claiming a conflicting shared-graph id.
 
     Avatar and backup storage can precede physical agent-root creation. Both
     bootstrap paths use this one guard while their surrounding transaction is
-    open. The lock covers an absent PostgreSQL row as well as a present one, so
-    the identity validation and ownership witness are one serialized action.
+    open. ``additional_graph_node_ids`` carries the rest of that bootstrap's
+    complete write set, so PostgreSQL reserves every shard in canonical order
+    before validating the ownerless root and recording its witness.
     """
 
     if not agent_id:
         raise ValueError("Provisional agent ownership requires an agent_id")
-    # This infrastructure repair is deliberately privileged: an ownerless
-    # legacy root is invisible to a bound graph scope, but must be row-locked
-    # before it can be validated and given its canonical self-owner. The checks
-    # below still refuse every foreign owner and every non-agent collision.
-    await lock_graph_nodes_for_update(db, [agent_id])
+    write_ids = (agent_id, *additional_graph_node_ids)
+    # This infrastructure repair has one deliberately privileged case: the
+    # caller's valid, ownerless legacy root is invisible to ordinary bound
+    # scope. Everything else is preflighted as the bound tenant before any
+    # reservation is taken, and the lower helper repeats that check after it
+    # owns the complete absent-id shard set.
+    await _preflight_bound_graph_node_locks(
+        db,
+        write_ids,
+        agent_id,
+        provisional_agent_id=agent_id,
+    )
+    await lock_graph_nodes_for_update(
+        db,
+        write_ids,
+        agent_id=agent_id,
+        provisional_agent_id=agent_id,
+    )
     root = await db.fetchone(
         "SELECT node_type, properties FROM graph_nodes WHERE node_id = ?",
         (agent_id,),
@@ -387,6 +404,8 @@ async def reserve_provisional_agent_owner(
             properties = json.loads(root[1]) if root[1] else {}
         except (TypeError, ValueError) as exc:
             raise ValueError("Existing agent graph node has invalid properties") from exc
+        if not isinstance(properties, dict):
+            raise ValueError("Existing agent graph node has invalid properties")
         declared = properties.get("agent_id")
         if declared and declared != agent_id:
             raise ValueError("Existing agent graph node declares another agent_id")
@@ -603,11 +622,15 @@ async def _preflight_bound_graph_node_locks(
     db: AsyncDatabase,
     node_ids: Iterable[str],
     agent_id: str,
+    *,
+    provisional_agent_id: str = "",
 ) -> None:
     """Reject rows outside a bound tenant before any physical lock is taken."""
 
     if db.backend_type != "postgres" or not agent_id:
         return
+    if provisional_agent_id and provisional_agent_id != agent_id:
+        raise ValueError("Provisional graph root must match the bound agent")
     unique_node_ids = sorted(
         dict.fromkeys(node_id for node_id in node_ids if node_id)
     )
@@ -619,18 +642,39 @@ async def _preflight_bound_graph_node_locks(
             "nodes.properties, EXISTS("
             "  SELECT 1 FROM graph_node_owners AS owner "
             "  WHERE owner.node_id = nodes.node_id AND owner.agent_id = ?"
+            "), EXISTS("
+            "  SELECT 1 FROM graph_node_owners AS any_owner "
+            "  WHERE any_owner.node_id = nodes.node_id"
             ") FROM graph_nodes AS nodes "
             f"WHERE nodes.node_id IN ({placeholders})",
             (agent_id, *batch),
         )
-        for node_id, node_type, label, raw_properties, owned in rows:
+        for (
+            node_id,
+            node_type,
+            label,
+            raw_properties,
+            owned,
+            has_any_owner,
+        ) in rows:
             if owned:
                 continue
-            shape = _SHARED_CONTENT_SHAPES.get((node_type, label))
             try:
                 properties = json.loads(raw_properties) if raw_properties else {}
+                properties_valid = isinstance(properties, dict)
             except (TypeError, ValueError):
                 properties = {}
+                properties_valid = False
+            if (
+                provisional_agent_id
+                and node_id == provisional_agent_id
+                and node_type == "agent"
+                and not has_any_owner
+                and properties_valid
+                and properties.get("agent_id") in (None, "", agent_id)
+            ):
+                continue
+            shape = _SHARED_CONTENT_SHAPES.get((node_type, label))
             if shape is not None and shape.is_shareable(properties, node_id):
                 continue
             raise ValueError(
@@ -643,6 +687,7 @@ async def lock_graph_nodes_for_update(
     node_ids: Iterable[str],
     *,
     agent_id: str = "",
+    provisional_agent_id: str = "",
 ) -> List[str]:
     """Lock graph rows in the canonical order before ownership mutation.
 
@@ -656,6 +701,8 @@ async def lock_graph_nodes_for_update(
     unique_node_ids = sorted(
         dict.fromkeys(node_id for node_id in node_ids if node_id)
     )
+    if provisional_agent_id and provisional_agent_id != agent_id:
+        raise ValueError("Provisional graph root must match the bound agent")
     if db.backend_type == "sqlite":
         await _acquire_sqlite_graph_writer_slot(db)
         return unique_node_ids
@@ -667,6 +714,13 @@ async def lock_graph_nodes_for_update(
     # advisory slot per graph node, and establishes one lock-class order across
     # every writer even when unrelated IDs collide onto the same shard.
     await _lock_graph_node_ids_for_insert(db, unique_node_ids)
+    if agent_id and provisional_agent_id:
+        await _preflight_bound_graph_node_locks(
+            db,
+            unique_node_ids,
+            agent_id,
+            provisional_agent_id=provisional_agent_id,
+        )
 
     if agent_id:
         shared_clause = " OR ".join(
@@ -685,6 +739,17 @@ async def lock_graph_nodes_for_update(
         if shared_clause:
             lock_scope = f"({lock_scope} OR {shared_clause})"
             lock_scope_params += shared_params
+        if provisional_agent_id:
+            provisional_clause = (
+                "(graph_nodes.node_id = ? "
+                "AND graph_nodes.node_type = 'agent' "
+                "AND NOT EXISTS("
+                "  SELECT 1 FROM graph_node_owners AS provisional_owner "
+                "  WHERE provisional_owner.node_id = graph_nodes.node_id"
+                "))"
+            )
+            lock_scope = f"({lock_scope} OR {provisional_clause})"
+            lock_scope_params += (provisional_agent_id,)
     else:
         lock_scope = "1 = 1"
         lock_scope_params = ()
@@ -710,7 +775,12 @@ async def lock_graph_nodes_for_update(
         # may have won the identifier between the caller's cheap preflight and
         # this transaction's reservation, but it must never make us take that
         # tenant's row lock.
-        await _preflight_bound_graph_node_locks(db, absent_ids, agent_id)
+        await _preflight_bound_graph_node_locks(
+            db,
+            absent_ids,
+            agent_id,
+            provisional_agent_id=provisional_agent_id,
+        )
 
     # A creator may have committed while this transaction waited for an absent-
     # id reservation. Re-lock any such newly-present row while the reservation

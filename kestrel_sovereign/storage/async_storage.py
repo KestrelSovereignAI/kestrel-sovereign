@@ -2944,8 +2944,11 @@ class AsyncStorage:
                 self.db, agent_id=agent_id
             )
             assert graph is not None
-            await graph.lock_nodes_for_update([agent_id, backup_node.node_id])
-            await reserve_provisional_agent_owner(self.db, agent_id)
+            await reserve_provisional_agent_owner(
+                self.db,
+                agent_id,
+                additional_graph_node_ids=[backup_node.node_id],
+            )
             await graph.add_node(backup_node)
             await graph.add_edge(agent_id, backup_node.node_id, "backup")
         return backup_node.node_id

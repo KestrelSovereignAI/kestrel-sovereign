@@ -36,6 +36,7 @@ from kestrel_sovereign.storage.async_graph_store import (
     release_graph_node_owners,
     reserve_provisional_agent_owner,
 )
+from kestrel_sovereign.storage.async_storage import AsyncStorage
 
 
 def _nid(prefix: str = "cas-pg") -> str:
@@ -998,6 +999,119 @@ async def test_provisional_owner_adopts_valid_ownerless_agent_root(graph_store):
             "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
             (agent_id,),
         ) == [(agent_id,)]
+    finally:
+        await graph_store.db.execute(
+            "DELETE FROM graph_node_owners WHERE node_id = ?", (agent_id,)
+        )
+        await graph_store.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ?", (agent_id,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("operation", ["avatar", "backup"])
+async def test_bootstrap_writer_adopts_valid_ownerless_agent_root(
+    db_backend, operation
+):
+    """Complete bootstrap callers can repair a legacy root before graph writes."""
+
+    agent_id = _nid(f"ownerless-{operation}-root")
+    payload = f"{operation}:{uuid.uuid4().hex}".encode()
+    content_hash = hashlib.sha256(payload).hexdigest()
+    storage = AsyncStorage.from_backend(db_backend)
+    await storage.initialize()
+    await storage.db.execute(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+        "VALUES (?, 'agent', 'Legacy agent', ?)",
+        (agent_id, '{"agent_id": "' + agent_id + '"}'),
+    )
+
+    class BackupResult:
+        storage_tier = type("Tier", (), {"value": "local"})()
+        ipfs_cid = None
+        filecoin_deal_id = None
+        encrypted = False
+        encryption_key_hash = None
+
+        def __init__(self, node_id):
+            self.content_hash = node_id
+
+    try:
+        if operation == "avatar":
+            await storage.files.store_avatar(payload, agent_id, "primary")
+            artifact_node_id = storage.files._avatar_node_id(
+                agent_id, "primary", content_hash
+            )
+        else:
+            await storage.record_backup_artifact(
+                agent_id, BackupResult(content_hash)
+            )
+            artifact_node_id = content_hash
+
+        assert await storage.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            (agent_id,),
+        ) == [(agent_id,)]
+    finally:
+        await storage.db.execute(
+            "DELETE FROM graph_edge_owners WHERE source_id = ?", (agent_id,)
+        )
+        await storage.db.execute(
+            "DELETE FROM graph_edges WHERE source_id = ?", (agent_id,)
+        )
+        await storage.db.execute(
+            "DELETE FROM graph_node_owners WHERE node_id = ? OR agent_id = ?",
+            (agent_id, agent_id),
+        )
+        await storage.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ? OR node_id = ?",
+            (agent_id, artifact_node_id),
+        )
+        await storage.db.execute(
+            "DELETE FROM file_owners WHERE content_hash = ?", (content_hash,)
+        )
+        await storage.db.execute(
+            "DELETE FROM files WHERE content_hash = ?", (content_hash,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_provisional_owner_refuses_valid_root_owned_by_another_agent(
+    graph_store
+):
+    """The legacy-root allowance never adopts a foreign ownership witness."""
+
+    agent_id = _nid("foreign-owned-agent-root")
+    foreign_owner = _nid("foreign-root-owner")
+    additional_id = _nid("foreign-root-additional")
+    await graph_store.db.execute(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+        "VALUES (?, 'agent', 'Foreign-owned agent', ?)",
+        (agent_id, '{"agent_id": "' + agent_id + '"}'),
+    )
+    await graph_store.db.execute(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+        (agent_id, foreign_owner),
+    )
+
+    try:
+        with pytest.raises(Exception, match="owned|outside the bound agent"):
+            async with graph_store.db.transaction():
+                await reserve_provisional_agent_owner(
+                    graph_store.db,
+                    agent_id,
+                    additional_graph_node_ids=[additional_id],
+                )
+
+        assert await graph_store.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            (agent_id,),
+        ) == [(foreign_owner,)]
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_nodes WHERE node_id = ?", (additional_id,)
+        ) is None
     finally:
         await graph_store.db.execute(
             "DELETE FROM graph_node_owners WHERE node_id = ?", (agent_id,)
