@@ -1254,6 +1254,11 @@ class KestrelAgent(
         # (``features/isolated_runtime.py``), which never receives this object.
         self._raw_storage = None
         self.storage = None
+        # Set only from the durable spawned_by edge during initialize().
+        # AgentManager consumes this private projection when rebuilding its
+        # runtime authority indexes; it must never trust an arbitrary in-memory
+        # ``spawn_mandate`` supplied by a caller for that purpose.
+        self._persisted_spawn_mandate = None
 
         # Explicit boot state (#2522). Replaces the old ``_raw_storage is None``
         # proxy that let a second initialize() skip the body and run only the
@@ -1262,6 +1267,12 @@ class KestrelAgent(
         # on any phase failure. Readiness may only fire in READY.
         self._boot_state: BootPhaseState = BootPhaseState.NOT_STARTED
         self._boot_context: Optional[BootContext] = None
+        # A co-hosted AgentManager defers wake-capable readiness hooks until it
+        # has validated the child's durable authority.  Direct/single-agent
+        # boots retain the historical initialize() contract.
+        self._host_ready_hooks_deferred = False
+        self._agent_ready_hooks_completed = False
+        self._agent_ready_hooks_running = False
 
         self.llm_service = llm_service or LLMService()
         from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
@@ -3384,12 +3395,13 @@ class KestrelAgent(
             except Exception as e:
                 logging.warning(f"failed to start salvage worker: {e}")
 
-        # Reattach spawn-mandate enforcement (#2137). initialize() is the single
-        # boot path shared by single-agent, multi-agent (AgentManager), and
-        # direct-test starts, so registering here — not in AgentManager — means a
-        # spawned child's restricted_tools are hard-denied whenever the child
-        # runs, reconstructed from the durable spawned_by delegation edge
-        # (survives restart). No-op for root agents / spawns with no constraints.
+        # Reattach the complete spawn mandate and its enforcement (#2137,
+        # #3133). initialize() is the single boot path shared by single-agent,
+        # multi-agent (AgentManager), and direct-test starts. Keeping the full
+        # projection on the child lets AgentManager rebuild parent authority at
+        # publication after a restart; registering the restriction hook here
+        # still protects every non-manager boot path. Root agents remain a
+        # no-op, while an unconstrained child retains its lineage mandate.
         if self.did and self.storage is not None and self.hooks_manager is not None:
             from kestrel_sovereign.spawn.mandate_reload import (
                 read_spawn_mandate,
@@ -3397,9 +3409,20 @@ class KestrelAgent(
             )
 
             _spawn_mandate = await read_spawn_mandate(self.storage, self.did)
+            self._persisted_spawn_mandate = _spawn_mandate
             if _spawn_mandate is not None:
-                if getattr(self, "spawn_mandate", None) is None:
-                    self.spawn_mandate = _spawn_mandate
+                # Feature discovery already enforced the durable ceiling above.
+                # The constitutional verifier's ``parent_features`` input is
+                # this child's *currently loaded* set, so replaying the original
+                # ceiling there would classify a legitimately removed optional
+                # feature as a new grant and drive the child into Safe Mode.
+                # Preserve the complete projection privately for manager
+                # authority restoration while exposing the prior audit-safe
+                # restriction projection to the runtime verifier/renderer.
+                self.spawn_mandate = _replace_dataclass(
+                    _spawn_mandate,
+                    features_allowed=[],
+                )
                 register_restriction_hook(self.hooks_manager, _spawn_mandate)
 
         # Lifecycle hardening (#377): refuse to declare initialization
@@ -3416,25 +3439,51 @@ class KestrelAgent(
         verify_llm_providers_initialized(self.llm_service)
         await verify_llm_providers_reachable(self.llm_service)
 
-        # All subsystems are now up (memory system, context manager, dispatcher,
-        # LLM). Notify features that the agent is fully ready, so any that must
-        # run a COGNITION turn at boot — notably RestartCoordinator's
-        # post-restart wake — fire NOW, after the context manager exists. This
-        # is deliberately distinct from post_all_features_loaded, which runs
-        # during the feature-load phase BEFORE memory/context are built; a wake
-        # dispatched there could not run a turn and would defer for a full cron
-        # interval (#1809). Best-effort per feature; the hook is optional.
-        for feature in list(self.features.values()):
-            ready_hook = getattr(feature, "on_agent_ready", None)
-            if ready_hook is None:
-                continue
-            try:
-                await ready_hook(self)
-            except Exception as e:
-                logging.warning(
-                    "on_agent_ready failed for %s: %s",
-                    getattr(feature, "name", type(feature).__name__), e,
-                )
+        if not self._host_ready_hooks_deferred:
+            await self.run_agent_ready_hooks()
+
+    async def run_agent_ready_hooks(self) -> None:
+        """Notify features only after the host has admitted agent authority.
+
+        Direct boots call this from the final boot phase.  ``AgentManager``
+        deliberately defers it until a fresh receipt has been persisted or a
+        restored receipt has passed parent/signature/TTL validation.  The
+        method is idempotent so publication code has one explicit readiness
+        seam without replaying wake signals.
+        """
+
+        if self._agent_ready_hooks_completed:
+            return
+        if self._agent_ready_hooks_running:
+            raise AgentBootError("agent-ready hooks are already running")
+        self._agent_ready_hooks_running = True
+        try:
+            # All subsystems are now up (memory system, context manager,
+            # dispatcher, LLM). Notify features that the agent is fully ready,
+            # so any that must run a COGNITION turn at boot — notably
+            # RestartCoordinator's post-restart wake — fire NOW, after the
+            # context manager exists. This is deliberately distinct from
+            # post_all_features_loaded, which runs during the feature-load
+            # phase BEFORE memory/context are built; a wake dispatched there
+            # could not run a turn and would defer for a full cron interval
+            # (#1809). Best-effort per feature; the hook is optional.
+            for feature in list(self.features.values()):
+                ready_hook = getattr(feature, "on_agent_ready", None)
+                if ready_hook is None:
+                    continue
+                try:
+                    await ready_hook(self)
+                except Exception as e:
+                    logging.warning(
+                        "on_agent_ready failed for %s: %s",
+                        getattr(feature, "name", type(feature).__name__), e,
+                    )
+        except BaseException:
+            raise
+        else:
+            self._agent_ready_hooks_completed = True
+        finally:
+            self._agent_ready_hooks_running = False
 
     # ------------------------------------------------------------------
     # Boot rollback teardown helpers (#2522)

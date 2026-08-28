@@ -606,32 +606,56 @@ class SpawnFeature(Feature):
         single-agent mode we create a lightweight one on-the-fly so
         spawn_agent works regardless of deployment mode.
         """
-        if self._agent_manager is not None:
-            return self._agent_manager
-
-        # Try to get from the agent's registered manager
-        manager = getattr(self.agent, '_agent_manager', None)
+        manager = self._agent_manager
+        manager_was_injected = manager is not None
         if manager is None:
-            manager = getattr(self.agent, 'agent_manager', None)
+            # Try to get from the agent's registered manager
+            manager = getattr(self.agent, '_agent_manager', None)
+            if manager is None:
+                manager = getattr(self.agent, 'agent_manager', None)
+
+        from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
         # Single-agent mode: create a lightweight AgentManager
         if manager is None:
-            from kestrel_sovereign.multi_agent.agent_manager import AgentManager
             storage_dir = getattr(self.agent, 'storage_path', None)
             base_dir = Path(storage_dir).parent.parent if storage_dir else None
             manager = AgentManager(base_data_dir=base_dir)
-            # Register the current agent so it appears as the parent
-            agent_name = getattr(self.agent, 'agent_name', None) or 'default'
-            manager._agents[agent_name] = self.agent
-            agent_did = getattr(self.agent, 'did', None) or ''
-            if agent_did:
-                manager._agent_names[agent_did] = agent_name
-            # Attach back to agent so endpoints and other code can find it
-            self.agent._agent_manager = manager
             logger.info("Created lightweight AgentManager for single-agent spawn")
 
+        # Route every real manager through its canonical registration seam.
+        # This is idempotent for hosted agents, restores a single-agent child's
+        # durable mandate, and makes injected real managers obey the same depth
+        # and parent-control rules. Test doubles remain untouched.
+        if isinstance(manager, AgentManager):
+            agent_state = vars(self.agent)
+            agent_did = agent_state.get("did")
+            if not isinstance(agent_did, str) or not agent_did:
+                agent_did = agent_state.get("agent_id")
+            names = vars(manager).get("_agent_names", {})
+            agent_name = names.get(agent_did) if isinstance(names, dict) else None
+            if not isinstance(agent_name, str) or not agent_name:
+                for attribute in ("agent_name", "_agent_name"):
+                    candidate = getattr(self.agent, attribute, None)
+                    if isinstance(candidate, str) and candidate:
+                        agent_name = candidate
+                        break
+            if not isinstance(agent_name, str) or not agent_name:
+                agent_name = "default"
+            already_published = (
+                manager.get_agent(agent_name) is self.agent
+                and vars(manager).get("_agent_names", {}).get(agent_did)
+                == agent_name
+            )
+            if not already_published:
+                manager._register_agent(agent_name, self.agent)
+
         # Ensure lifecycle is wired up
-        if not getattr(manager, '_lifecycle', None):
+        if (
+            isinstance(manager, AgentManager)
+            and not manager_was_injected
+            and not getattr(manager, '_lifecycle', None)
+        ):
             from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
             lifecycle = SpawnedAgentLifecycle(manager)
             manager._lifecycle = lifecycle
@@ -806,9 +830,14 @@ class SpawnFeature(Feature):
                     child_name=name,
                     child_did=child.agent_id,
                     parent_did=self.agent.agent_id,
-                    ttl_seconds=ttl,
-                    purpose=purpose,
-                    mode=SpawnMode.EPHEMERAL if ttl > 0 else SpawnMode.PERSISTENT,
+                    ttl_seconds=mandate.ttl_seconds,
+                    purpose=mandate.purpose,
+                    mode=(
+                        SpawnMode.EPHEMERAL
+                        if mandate.ttl_seconds > 0
+                        else SpawnMode.PERSISTENT
+                    ),
+                    started_at=mandate.created_at,
                 )
             return ToolResult.ok(
                 f"Spawned child '{name}' (did={child.agent_id}, ttl={ttl}s).",

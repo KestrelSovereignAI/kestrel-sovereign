@@ -18,7 +18,8 @@ import stat
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
@@ -42,7 +43,11 @@ from kestrel_sovereign.spawn.delegated_wallet import (
     has_durable_delegated_child_wallet_provisioning_contract,
     release_delegated_wallet,
 )
-from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
+from kestrel_sovereign.spawn.mandate import (
+    SpawnMandate,
+    remaining_spawn_ttl_seconds,
+    sign_mandate,
+)
 
 from .config import LocalAgentConfig, MultiAgentConfig
 
@@ -257,6 +262,10 @@ class ChildTerminationNotPerformedError(RuntimeError):
             "agent_removed": False,
         }
         super().__init__(f"Child {child_name!r} was not removed.")
+
+
+class PersistedSpawnParentUnavailableError(RuntimeError):
+    """A signed child receipt cannot be verified without its live parent."""
 
 
 def _agent_runtime_path(agent: object) -> Optional[Path]:
@@ -486,10 +495,41 @@ class AgentOperationAdmission:
     # still owns it until the parent relationship and budget commit below.
     published: bool = False
     committed: bool = False
+    # True only while this spawn owns one slot in ``_pending_spawns``.  The
+    # final governance commit converts that reservation into a child mandate
+    # under the same lock, so concurrent restored children cannot overflow the
+    # cap and concurrent successful spawns do not double-count one another.
+    spawn_slot_active: bool = False
+    # A cold restore can make one already-published pending spawn the loser at
+    # governance commit. Other pending spawns wait for this exact slot to reach
+    # terminal rollback instead of also rejecting against the same transient
+    # over-cap snapshot.
+    spawn_cap_rejected: bool = False
+    spawn_slot_terminal: "asyncio.Future[None] | None" = None
     # A ``remove_agent(False)`` rollback inspection found this operation's
     # child or hold still live.  The public spawn tail must not let a later
     # cancellation overwrite the rollback failure with a bare cancellation.
     rollback_incomplete: bool = False
+    # The signed edge is written before the final governance commit. Retain its
+    # exact storage witness from before the await so rollback can revoke even an
+    # add whose commit succeeded immediately before caller cancellation.
+    spawn_receipt_graph: object | None = None
+    spawn_receipt_source_id: str | None = None
+    spawn_receipt_target_id: str | None = None
+    spawn_receipt_unsigned_properties: dict[str, object] | None = None
+    # A live spawn installs this private initializer handoff before entering
+    # create -> load. The load path must await it after initialization and
+    # before routing publication, so the final-child-DID signed receipt is
+    # durable before any peer can address the child.
+    before_publish: Optional[Callable[[KestrelAgent], Awaitable[None]]] = None
+    # If publication does not commit after ``before_publish`` starts, this
+    # inverse must run while the unpublished child's storage is still live.
+    # A failed inverse leaves cleanup with the outer spawn owner; closing the
+    # graph first would make a possibly-committed signed receipt irrevocable.
+    before_publish_rollback: Optional[
+        Callable[[KestrelAgent], Awaitable[None]]
+    ] = None
+    unpublished_cleanup_deferred_to_spawn: bool = False
 
 
 class _DynamicSchedulerTenantRegistration:
@@ -591,6 +631,32 @@ def _loaded_agent_did(agent: object) -> Optional[str]:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _loaded_agent_bound_dids(agent: object) -> frozenset[str]:
+    """Return the stable DID and verified runtime-identity aliases.
+
+    A rotated agent keeps its legacy DID as the manager routing identity while
+    signing new artifacts as its successor DID.  Only expand aliases when the
+    loaded identity itself contains the stable DID; an unrelated mutable
+    identity object must not manufacture a parent binding.
+    """
+
+    stable_did = _loaded_agent_did(agent)
+    if stable_did is None:
+        return frozenset()
+    identity = vars(agent).get("identity")
+    identity_dids = {
+        candidate
+        for candidate in (
+            getattr(identity, "legacy_did", None),
+            getattr(identity, "new_did", None),
+        )
+        if isinstance(candidate, str) and candidate
+    }
+    if stable_did not in identity_dids:
+        return frozenset({stable_did})
+    return frozenset({stable_did, *identity_dids})
 
 
 class AgentManager:
@@ -715,6 +781,8 @@ class AgentManager:
         # one drain cannot reopen admissions beneath another drain that still
         # owns the terminal boundary.
         self._quarantined_shutdown_handoffs_sealed = False
+        self._quarantined_shutdown_handoffs_open = asyncio.Event()
+        self._quarantined_shutdown_handoffs_open.set()
         self._quarantined_shutdown_drain_lock = asyncio.Lock()
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
         # monotonic counter avoided unload-reuse but couldn't express "this
@@ -735,6 +803,7 @@ class AgentManager:
         # In-flight spawns whose mandate isn't registered yet (counts toward the
         # cap under the lock so concurrent spawns can't race past it).
         self._pending_spawns = 0
+        self._rejected_spawn_slot_waiters: set[asyncio.Future[None]] = set()
         # Per-agent initialization failures recorded by load_from_config so
         # the FastAPI lifespan can surface them via /health (#377 lifecycle
         # hardening for multi-agent boot).
@@ -1480,6 +1549,11 @@ class AgentManager:
                 agent._dynamic_scheduler_tenant_registration = (
                     scheduler_registration
                 )
+            # A co-hosted child must not fire wake-capable ``on_agent_ready``
+            # hooks until AgentManager has persisted or validated its spawn
+            # authority.  The flag preserves initialize()'s direct-boot API
+            # while making hosted readiness an explicit publication phase.
+            agent._host_ready_hooks_deferred = True
             await agent.initialize()
         except BaseException:
             if agent is not None:
@@ -1606,6 +1680,11 @@ class AgentManager:
         agent_id = _loaded_agent_did(agent)
         if agent_id is not None and self._agent_names.get(agent_id) == name:
             self._agent_names.pop(agent_id, None)
+        self._withdraw_restored_spawn_authority(name, agent_id)
+        if vars(agent).get("_agent_manager_authority_prepared") is self:
+            agent._agent_manager_authority_prepared = None
+        if vars(agent).get("_agent_manager") is self:
+            agent._agent_manager = None
 
     async def _discard_unpublished_initialized_agent(
         self, name: str, agent: KestrelAgent
@@ -1619,7 +1698,18 @@ class AgentManager:
         while waiting for the A2A lifecycle writer.
         """
 
-        self._withdraw_initialized_agent(name, agent)
+        # Prepared restored authority is a real cap/topology reservation even
+        # before routing publication. Withdraw it under the same lock order as
+        # preparation so a concurrent spawn or restore cannot admit against a
+        # half-rolled-back projection. An initializer cancelled while waiting
+        # for that boundary remains privately owned and must not reacquire the
+        # writer that prevented it from preparing in the first place.
+        if vars(agent).get("_agent_manager_authority_prepared") is self:
+            async with self._a2a_lifecycle_lock:
+                async with self._lock:
+                    self._withdraw_initialized_agent(name, agent)
+        else:
+            self._withdraw_initialized_agent(name, agent)
         await self._shutdown_unregistered_agent(name, agent)
 
     async def _discard_unpublished_initialized_agents(
@@ -1681,13 +1771,484 @@ class AgentManager:
             )
         return False
 
-    def _register_agent(self, name: str, agent: KestrelAgent) -> None:
+    def _restore_persisted_spawn_authority(
+        self,
+        name: str,
+        agent: KestrelAgent,
+        agent_id: str,
+        *,
+        project: bool = True,
+    ) -> None:
+        """Project one durable ``spawned_by`` edge into runtime indexes.
+
+        The maps are caches used by the existing control paths, not an
+        authority source. A fresh spawn deliberately waits for ``_do_spawn``'s
+        budget + mandate commit; only ordinary load/batch-load operations
+        restore the edge here.
+        """
+
+        # Read concrete instance state rather than ``getattr`` so permissive
+        # test/proxy objects cannot synthesize an apparent authority value.
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if mandate is None:
+            return
+        if not isinstance(mandate, SpawnMandate):
+            raise TypeError("persisted spawn authority must be a SpawnMandate")
+
+        admission = self._agent_operations.get(self._canonical_agent_name(name))
+        if (
+            admission is not None
+            and admission.kind in {"spawn", "direct-spawn-test"}
+            and not admission.committed
+        ):
+            # The live spawn still owns this durable receipt and converts its
+            # reserved cap slot into runtime authority at the later governance
+            # commit. Registration must not replay it as a cold-load receipt.
+            return
+
+        # Legacy spawned_by edges are unsigned attribution. They continue to
+        # re-apply restrictions on the child, but can never recreate parental
+        # governance. A signed receipt is restored only when its parent is
+        # loaded and the signature verifies against that parent's live,
+        # trusted identity.
+        if not mandate.parent_signature:
+            return
+        parent_matches = [
+            (candidate_name, candidate)
+            for candidate_name, candidate in self._agents.items()
+            if mandate.parent_did in _loaded_agent_bound_dids(candidate)
+        ]
+        if len(parent_matches) > 1:
+            raise RuntimeError(
+                "Persisted spawn mandate parent identity is ambiguous"
+            )
+        if not parent_matches:
+            raise PersistedSpawnParentUnavailableError(
+                "Refusing to publish a signed child before its parent authority "
+                "is loaded"
+            )
+        _parent_name, parent = parent_matches[0]
+        authority_parent_did = _loaded_agent_did(parent)
+        if authority_parent_did is None:
+            raise PersistedSpawnParentUnavailableError(
+                "Refusing to publish a signed child without stable parent authority"
+            )
+        parent_state = vars(parent)
+        parent_identity = parent_state.get("identity")
+        parent_private_key = parent_state.get("_private_key")
+        public_key = None
+        public_key_getter = getattr(parent_private_key, "public_key", None)
+        if callable(public_key_getter):
+            public_key = public_key_getter()
+        from kestrel_sovereign.spawn.mandate import verify_mandate
+
+        if not verify_mandate(
+            mandate,
+            public_key,
+            parent_identity=parent_identity,
+        ):
+            raise RuntimeError("Persisted spawn mandate signature is invalid")
+
+        if (
+            mandate.ttl_seconds > 0
+            and remaining_spawn_ttl_seconds(
+                mandate.created_at,
+                mandate.ttl_seconds,
+            ) <= 0
+        ):
+            raise RuntimeError("Persisted spawn mandate has expired")
+
+        if mandate.child_did != agent_id:
+            raise RuntimeError(
+                "Persisted spawn mandate child DID does not match the loaded agent"
+            )
+        parent_did = authority_parent_did
+        if not isinstance(parent_did, str) or not parent_did or parent_did == agent_id:
+            raise RuntimeError("Persisted spawn mandate has an invalid parent DID")
+
+        canonical_name = self._canonical_agent_name(name)
+        for recorded_parent, children in self._parent_children.items():
+            if recorded_parent == parent_did:
+                continue
+            if any(
+                self._canonical_agent_name(child) == canonical_name
+                for child in children
+            ):
+                raise RuntimeError(
+                    f"Agent {name!r} is already attached to a different parent"
+                )
+
+        existing = self._child_mandates.get(name)
+        if existing is not None:
+            existing_parent_did = existing.parent_did
+            existing_parent_matches = [
+                candidate
+                for candidate in self._agents.values()
+                if existing_parent_did in _loaded_agent_bound_dids(candidate)
+            ]
+            if len(existing_parent_matches) == 1:
+                existing_parent_did = (
+                    _loaded_agent_did(existing_parent_matches[0])
+                    or existing_parent_did
+                )
+            if (
+                existing_parent_did != parent_did
+                or existing.child_did != agent_id
+            ):
+                raise RuntimeError(
+                    f"Agent {name!r} has conflicting persisted spawn authority"
+                )
+
+        # Treat the durable child->parent edges as a directed forest.  Walk
+        # DIDs rather than routing names so load order and renames cannot hide
+        # a cycle (A spawned_by B, B spawned_by A).  Any already-corrupt loop
+        # is also refused instead of being extended into recursive control
+        # paths such as terminate_child and delegation-chain construction.
+        parent_by_child: dict[str, str] = {}
+        for recorded in self._child_mandates.values():
+            recorded_child = recorded.child_did
+            recorded_parent = recorded.parent_did
+            matches = [
+                candidate
+                for candidate in self._agents.values()
+                if recorded_parent in _loaded_agent_bound_dids(candidate)
+            ]
+            if len(matches) == 1:
+                recorded_parent = _loaded_agent_did(matches[0]) or recorded_parent
+            if not isinstance(recorded_child, str) or not recorded_child:
+                continue
+            prior_parent = parent_by_child.get(recorded_child)
+            if prior_parent is not None and prior_parent != recorded_parent:
+                raise RuntimeError(
+                    "Persisted spawn authority has conflicting parents for one DID"
+                )
+            parent_by_child[recorded_child] = recorded_parent
+        ancestor = parent_did
+        visited: set[str] = set()
+        while ancestor in parent_by_child:
+            if ancestor == agent_id or ancestor in visited:
+                raise RuntimeError("Persisted spawn authority contains a cycle")
+            visited.add(ancestor)
+            ancestor = parent_by_child[ancestor]
+        if ancestor == agent_id:
+            raise RuntimeError("Persisted spawn authority contains a cycle")
+
+        retained_cleanup_slots = self._retained_spawn_cleanup_slots()
+        if (
+            existing is None
+            and len(self._child_mandates) + retained_cleanup_slots
+            >= self._max_spawned_agents
+        ):
+            raise RuntimeError(
+                "Persisted spawn authority exceeds the configured spawned-agent cap"
+            )
+        if not project:
+            return
+
+        children = self._parent_children.setdefault(parent_did, [])
+        if not any(
+            self._canonical_agent_name(child) == canonical_name for child in children
+        ):
+            children.append(name)
+        self._child_mandates[name] = mandate
+        self._ensure_spawn_lifecycle().restore_persisted_child(
+            name,
+            mandate,
+            authority_parent_did=parent_did,
+            arm_ttl=False,
+        )
+
+    def _prepare_agent_authority(
+        self, name: str, agent: KestrelAgent
+    ) -> None:
+        """Reserve verified durable authority before hosted readiness may fire.
+
+        Callers hold the A2A lifecycle writer and manager state lock. The
+        projection is deliberately committed before wake-capable ready hooks;
+        unpublished cleanup withdraws it if any later onboarding stage fails.
+        """
+
+        agent_id = _loaded_agent_did(agent)
+        if not isinstance(agent_id, str) or not agent_id:
+            raise RuntimeError(
+                f"Cannot prepare agent {name!r} without a concrete agent DID"
+            )
+        self._refuse_unrestored_delegated_budget(name, agent)
+        self._restore_persisted_spawn_authority(
+            name,
+            agent,
+            agent_id,
+        )
+        agent._agent_manager_authority_prepared = self
+
+    def _retained_spawn_cleanup_slots(self) -> int:
+        """Cap slots retained by quarantine rather than active spawn owners.
+
+        ``_pending_spawns`` includes both ordinary in-flight reservations and
+        failed-cleanup reservations transferred to quarantine. Cold restoration
+        is allowed to arbitrate ahead of the former (the active spawn becomes
+        the rollback loser at governance commit), but it must never bypass the
+        latter because that child is still live and has no active admission
+        left to lose.
+
+        Callers that participate in async admission hold ``_lock``. Direct
+        registration is a synchronous compatibility seam and observes the same
+        event-loop-atomic snapshot.
+        """
+
+        active_slots = sum(
+            1
+            for admission in self._agent_operations.values()
+            if admission.spawn_slot_active
+        )
+        retained = self._pending_spawns - active_slots
+        if retained < 0:
+            raise RuntimeError("Spawn cap reservation accounting underflowed")
+        return retained
+
+    @staticmethod
+    async def _run_hosted_agent_ready_hooks(agent: KestrelAgent) -> None:
+        """Cross the deferred ready boundary for a concrete Kestrel agent."""
+
+        ready = getattr(type(agent), "run_agent_ready_hooks", None)
+        if ready is not None:
+            await ready(agent)
+
+    async def _run_hosted_agent_ready_hooks_before_mandate_expiry(
+        self,
+        agent: KestrelAgent,
+    ) -> None:
+        """Keep wake-capable readiness inside a signed ephemeral lifetime.
+
+        Authority is projected before ready hooks so they can observe the
+        child's restrictions, but publication/TTL commit happens afterward.
+        Bound that otherwise-unarmed interval with the receipt's exact
+        remaining lifetime. ``wait_for`` delivers cancellation to the hook at
+        the deadline and joins its cleanup before onboarding rolls back.
+        """
+
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if (
+            not isinstance(mandate, SpawnMandate)
+            or not mandate.parent_signature
+            or mandate.ttl_seconds <= 0
+        ):
+            await self._run_hosted_agent_ready_hooks(agent)
+            return
+        remaining = remaining_spawn_ttl_seconds(
+            mandate.created_at,
+            mandate.ttl_seconds,
+        )
+        if remaining <= 0:
+            raise RuntimeError("Persisted spawn mandate expired before agent readiness")
+        try:
+            await asyncio.wait_for(
+                self._run_hosted_agent_ready_hooks(agent),
+                timeout=remaining,
+            )
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "Persisted spawn mandate expired during agent readiness"
+            ) from exc
+        # A hook that catches task cancellation can return after wait_for's
+        # deadline. It still cannot proceed to publication as valid authority.
+        if remaining_spawn_ttl_seconds(
+            mandate.created_at,
+            mandate.ttl_seconds,
+        ) <= 0:
+            raise RuntimeError(
+                "Persisted spawn mandate expired during agent readiness"
+            )
+
+    def _commit_restored_child_ttl(
+        self, name: str, agent: KestrelAgent
+    ) -> None:
+        """Arm an adopted TTL only after every onboarding stage committed."""
+
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if not isinstance(mandate, SpawnMandate) or not mandate.parent_signature:
+            return
+        admission = self._agent_operations.get(self._canonical_agent_name(name))
+        if (
+            admission is not None
+            and admission.kind in {"spawn", "direct-spawn-test"}
+            and not admission.committed
+        ):
+            return
+        self._ensure_spawn_lifecycle().arm_restored_child_ttl(
+            name,
+            expected_child_did=_loaded_agent_did(agent),
+        )
+
+    def _ensure_spawn_lifecycle(self):
+        """Return the manager-owned lifecycle used by cold and live spawns.
+
+        Cold authority restoration is a startup responsibility. It cannot
+        wait for a later SpawnFeature tool call, because an expired child may
+        otherwise remain routable forever on a host that never invokes that
+        feature. Construction is synchronous and idempotent; TTL tasks arm
+        when the signed receipt is adopted inside the running startup loop.
+        """
+
+        from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+        lifecycle = getattr(self, "_lifecycle", None)
+        if not isinstance(lifecycle, SpawnedAgentLifecycle):
+            lifecycle = SpawnedAgentLifecycle(self)
+            self._lifecycle = lifecycle
+        return lifecycle
+
+    def _refuse_unrestored_delegated_budget(
+        self, name: str, agent: KestrelAgent
+    ) -> None:
+        """Fail closed before publishing a cold child without budget custody.
+
+        The live spawn path owns the hold from inception through governance
+        commit. A cold load currently has no async provider reconciliation
+        seam at this synchronous publication boundary, so accepting a positive
+        persisted allocation would give the child its ordinary wallet and
+        silently discard the signed spend ceiling. Refuse that load until a
+        durable delegated-wallet restoration protocol is implemented.
+        """
+
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if not isinstance(mandate, SpawnMandate):
+            return
+        try:
+            budget = Decimal(str(mandate.budget_allocation))
+        except (ArithmeticError, TypeError, ValueError):
+            raise RuntimeError("Persisted spawn budget is invalid") from None
+        if not budget.is_finite() or budget <= 0:
+            return
+
+        admission = self._agent_operations.get(self._canonical_agent_name(name))
+        live_spawn_owns_custody = (
+            admission is not None
+            and admission.kind in {"spawn", "direct-spawn-test"}
+            and not admission.committed
+        )
+        if not live_spawn_owns_custody:
+            raise RuntimeError(
+                "Refusing to publish a cold budgeted child before delegated "
+                "wallet custody is durably restored"
+            )
+
+    def _restore_all_verifiable_spawn_authority(self) -> None:
+        """Reconcile signed child receipts after either load order."""
+
+        for child_name, child in tuple(self._agents.items()):
+            child_id = _loaded_agent_did(child)
+            if child_id is None:
+                continue
+            existing = self._child_mandates.get(child_name)
+            if existing is not None:
+                # This projection was signature-verified when the child was
+                # published. A supported non-cascading parent withdrawal may
+                # leave that child running; unrelated registrations must not
+                # reopen its proof against a parent that is intentionally no
+                # longer loaded. Still refuse a corrupted name/DID binding.
+                if existing.child_did != child_id:
+                    raise RuntimeError(
+                        f"Agent {child_name!r} has conflicting persisted spawn "
+                        "authority"
+                    )
+                continue
+            self._restore_persisted_spawn_authority(
+                child_name,
+                child,
+                child_id,
+            )
+
+    def _registration_order_for_initialized_agents(self, items):
+        """Return a stable parent-before-child order for one startup batch.
+
+        Initialization remains fully concurrent. Only publication is ordered,
+        using the signed receipt's parent DID as a dependency when that parent
+        is another successfully initialized member of this same batch.
+        Unknown parents stay in their original relative order and fail closed
+        at ``_register_agent``; cycles likewise reach the verifier rather than
+        being guessed into a relationship.
+        """
+
+        batch_dids = {
+            bound_did
+            for *_prefix, agent in items
+            for bound_did in _loaded_agent_bound_dids(agent)
+        }
+        emitted_dids = {
+            bound_did
+            for agent in self._agents.values()
+            for bound_did in _loaded_agent_bound_dids(agent)
+        }
+        pending = list(items)
+        ordered = []
+        while pending:
+            progress = False
+            deferred = []
+            for item in pending:
+                agent = item[-1]
+                mandate = vars(agent).get("_persisted_spawn_mandate")
+                parent_did = (
+                    mandate.parent_did
+                    if isinstance(mandate, SpawnMandate)
+                    and mandate.parent_signature
+                    else None
+                )
+                if (
+                    parent_did is not None
+                    and parent_did in batch_dids
+                    and parent_did not in emitted_dids
+                ):
+                    deferred.append(item)
+                    continue
+                ordered.append(item)
+                emitted_dids.update(_loaded_agent_bound_dids(agent))
+                progress = True
+            if not progress:
+                ordered.extend(deferred)
+                break
+            pending = deferred
+        return ordered
+
+    def _withdraw_restored_spawn_authority(
+        self, name: str, agent_id: Optional[str]
+    ) -> None:
+        """Roll back authority projected by a registration that did not commit."""
+
+        mandate = self._child_mandates.get(name)
+        if mandate is None or mandate.child_did != agent_id:
+            return
+        from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+        lifecycle = getattr(self, "_lifecycle", None)
+        if isinstance(lifecycle, SpawnedAgentLifecycle):
+            lifecycle.withdraw_persisted_child(name)
+        parent_ids = [
+            parent_did
+            for parent_did, children in self._parent_children.items()
+            if name in children
+        ]
+        if len(parent_ids) > 1:
+            raise RuntimeError(
+                f"Agent {name!r} is attached to multiple parent identities"
+            )
+        parent_did = parent_ids[0] if parent_ids else mandate.parent_did
+        self._prune_child_relationship_and_mandate(parent_did, name)
+
+    def _register_agent(
+        self,
+        name: str,
+        agent: KestrelAgent,
+        *,
+        arm_restored_ttl: bool = True,
+    ) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
         agent_id = _loaded_agent_did(agent)
         if not isinstance(agent_id, str) or not agent_id:
             raise RuntimeError(
                 f"Cannot publish agent {name!r} without a concrete agent DID"
             )
+        self._refuse_unrestored_delegated_budget(name, agent)
         # The operation admission normally proves these are absent.  Keep the
         # publication seam defensive too: callers/tests may construct manager
         # state directly, and routing must never overwrite a different live
@@ -1708,8 +2269,43 @@ class AgentManager:
                 "Cannot publish an agent DID already routed under a different "
                 f"name: {agent_id!r} -> {bound_name!r}"
             )
+        attached_manager = vars(agent).get("_agent_manager")
+        if attached_manager is not None and attached_manager is not self:
+            raise RuntimeError("Cannot publish an agent attached to another manager")
+        was_published = self._agents.get(name) is agent
+        parent_children_before = {
+            parent: list(children)
+            for parent, children in self._parent_children.items()
+        }
+        child_mandates_before = dict(self._child_mandates)
         self._agents[name] = agent
         self._agent_names[agent_id] = name
+        try:
+            self._restore_persisted_spawn_authority(name, agent, agent_id)
+            self._restore_all_verifiable_spawn_authority()
+        except BaseException:
+            from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+            lifecycle = getattr(self, "_lifecycle", None)
+            if isinstance(lifecycle, SpawnedAgentLifecycle):
+                for restored_name in set(self._child_mandates).difference(
+                    child_mandates_before
+                ):
+                    lifecycle.withdraw_persisted_child(restored_name)
+            self._parent_children.clear()
+            self._parent_children.update(parent_children_before)
+            self._child_mandates.clear()
+            self._child_mandates.update(child_mandates_before)
+            if not was_published:
+                self._agents.pop(name, None)
+                if self._agent_names.get(agent_id) == name:
+                    self._agent_names.pop(agent_id, None)
+            raise
+        # SpawnFeature is agent-owned and has no request/app-state context.
+        # Give every hosted agent the same manager that published it so its
+        # control tools cannot silently manufacture a lineage-empty lightweight
+        # manager after restart.
+        agent._agent_manager = self
         # Publish the registered routing key as the human display name so the
         # observability emitter (and any other consumer) attributes events to
         # the real agent name instead of falling back to "unknown" (#2461).
@@ -1723,6 +2319,12 @@ class AgentManager:
             setter(name)
         else:
             agent.agent_name = name
+        if arm_restored_ttl:
+            try:
+                self._commit_restored_child_ttl(name, agent)
+            except BaseException:
+                self._withdraw_initialized_agent(name, agent)
+                raise
         # Fleet-idleness (#F235): give EVERY agent — including ones created or
         # spawned after startup — a live view of all co-hosted agents, so
         # RestartCoordinator can gate a whole-host restart on the whole fleet
@@ -2019,10 +2621,13 @@ class AgentManager:
         """Retire a spawn's cap slot and name admission as one terminal tail."""
 
         async def retire_spawn_slot() -> None:
-            if not spawn_slot_admitted:
+            if not spawn_slot_admitted or not admission.spawn_slot_active:
                 return
             async with self._lock:
-                self._pending_spawns -= 1
+                if admission.spawn_slot_active:
+                    self._pending_spawns -= 1
+                    admission.spawn_slot_active = False
+                    self._resolve_spawn_slot_terminal(admission)
 
         tasks: list["asyncio.Future[object]"] = [
             asyncio.create_task(
@@ -2041,6 +2646,18 @@ class AgentManager:
             tasks,
             description="One or more spawn lifecycle owners failed to retire",
         )
+
+    def _resolve_spawn_slot_terminal(
+        self,
+        admission: AgentOperationAdmission,
+    ) -> None:
+        """Wake pending governance commits after one cap slot is terminal."""
+
+        terminal = admission.spawn_slot_terminal
+        if terminal is not None and not terminal.done():
+            terminal.set_result(None)
+        if terminal is not None:
+            self._rejected_spawn_slot_waiters.discard(terminal)
 
     def _operation_is_admitted(self, admission: AgentOperationAdmission) -> bool:
         """Whether a named operation may still publish or commit state.
@@ -2153,15 +2770,32 @@ class AgentManager:
             committed = False
             withdrawn_after_onboarding_failure = False
             try:
+                if admission.before_publish is not None:
+                    await admission.before_publish(agent)
+                async with self._a2a_lifecycle_lock:
+                    if not self._operation_is_admitted(admission):
+                        raise RuntimeError(
+                            "Refusing agent readiness because the manager is shutting down"
+                        )
+                    async with self._lock:
+                        self._prepare_agent_authority(name, agent)
+                await self._run_hosted_agent_ready_hooks_before_mandate_expiry(
+                    agent
+                )
                 async with self._a2a_lifecycle_lock:
                     if not self._operation_is_admitted(admission):
                         raise RuntimeError(
                             "Refusing agent registration because the manager is shutting down"
                         )
                     try:
-                        self._register_agent(name, agent)
+                        self._register_agent(
+                            name,
+                            agent,
+                            arm_restored_ttl=False,
+                        )
                         await self._on_agent_registered(name, agent)
                         self._commit_dynamic_scheduler_registration(agent)
+                        self._commit_restored_child_ttl(name, agent)
                     except BaseException:
                         # The registration hook can install hosted A2A policy
                         # and app routes before it reports failure.  Withdraw
@@ -2176,16 +2810,38 @@ class AgentManager:
                     committed = True
                     admission.published = True
                 return agent
-            except BaseException:
+            except BaseException as onboarding_failure:
                 if not committed:
-                    cleanup_cancelled = (
-                        await self._discard_unpublished_initialized_agents(
-                            [(name, agent)],
-                            already_withdrawn=withdrawn_after_onboarding_failure,
+                    rollback_cancelled = False
+                    rollback_failure: BaseException | None = None
+                    if admission.before_publish_rollback is not None:
+                        rollback_task = asyncio.create_task(
+                            admission.before_publish_rollback(agent),
+                            name=f"agent_before_publish_rollback:{name}",
                         )
-                    )
-                    if cleanup_cancelled:
-                        raise asyncio.CancelledError()
+                        rollback_cancelled, rollback_failure = (
+                            await await_lifecycle_task_completion(rollback_task)
+                        )
+                    if rollback_failure is None:
+                        cleanup_cancelled = (
+                            await self._discard_unpublished_initialized_agents(
+                                [(name, agent)],
+                                already_withdrawn=withdrawn_after_onboarding_failure,
+                            )
+                        )
+                        if cleanup_cancelled or rollback_cancelled:
+                            raise asyncio.CancelledError()
+                    else:
+                        # The nested load must not close the graph underneath a
+                        # signed receipt whose write outcome is ambiguous. The
+                        # outer spawn still owns ``admission.child`` and will
+                        # retry revocation before shutting this private child
+                        # down (or hand it to observable quarantine).
+                        admission.unpublished_cleanup_deferred_to_spawn = True
+                        _raise_lifecycle_outcomes(
+                            "Agent onboarding and prepublication rollback failed",
+                            [onboarding_failure, rollback_failure],
+                        )
                 raise
         finally:
             if owns_admission:
@@ -2321,6 +2977,7 @@ class AgentManager:
                 if not isinstance(result, BaseException)
             }
             try:
+                initialized_for_registration = []
                 for (name, _, admission), result in zip(admitted, results):
                     if isinstance(result, BaseException):
                         e = result
@@ -2340,6 +2997,15 @@ class AgentManager:
                             )
                         self._init_failures.append((name, e))
                         continue
+                    initialized_for_registration.append(
+                        (name, admission, result)
+                    )
+
+                for name, admission, result in (
+                    self._registration_order_for_initialized_agents(
+                        initialized_for_registration
+                    )
+                ):
                     try:
                         withdrawn_after_onboarding_failure = False
                         async with self._a2a_lifecycle_lock:
@@ -2347,10 +3013,25 @@ class AgentManager:
                                 raise RuntimeError(
                                     "Agent initialization completed after manager shutdown began"
                                 )
+                            async with self._lock:
+                                self._prepare_agent_authority(name, result)
+                        await self._run_hosted_agent_ready_hooks_before_mandate_expiry(
+                            result
+                        )
+                        async with self._a2a_lifecycle_lock:
+                            if not self._operation_is_admitted(admission):
+                                raise RuntimeError(
+                                    "Agent initialization completed after manager shutdown began"
+                                )
                             try:
-                                self._register_agent(name, result)
+                                self._register_agent(
+                                    name,
+                                    result,
+                                    arm_restored_ttl=False,
+                                )
                                 await self._on_agent_registered(name, result)
                                 self._commit_dynamic_scheduler_registration(result)
+                                self._commit_restored_child_ttl(name, result)
                             except BaseException:
                                 # Mirror the single-load path: an onboarding
                                 # rejection is withdrawn before releasing the
@@ -2651,6 +3332,7 @@ class AgentManager:
         known_agent_id: Optional[str] = None,
         known_agent_config: Optional[LocalAgentConfig] = None,
         offboarding_admission: Optional[RuntimeOffboardingAdmission] = None,
+        _spawn_rollback_admission: Optional[AgentOperationAdmission] = None,
     ) -> bool:
         """Stop/unpublish an agent and optionally offboard its runtime tree.
 
@@ -2661,6 +3343,16 @@ class AgentManager:
         or caller cancellation leaves the exact cleanup worker manager-owned
         and reports cleanup as pending without restoring a stopped agent.
         """
+
+        if _spawn_rollback_admission is not None and (
+            _spawn_rollback_admission.canonical_name
+            != self._canonical_agent_name(name)
+        ):
+            raise ValueError("spawn rollback admission does not own this agent name")
+        if _spawn_rollback_admission is None:
+            join_cancelled = await self._join_active_spawn_before_removal(name)
+            if join_cancelled:
+                raise asyncio.CancelledError()
 
         if offboarding_admission is not None and (
             not offboard_runtime
@@ -2724,6 +3416,31 @@ class AgentManager:
                 "Agent removal had multiple terminal outcomes", outcomes
             )
         return removed
+
+    async def _join_active_spawn_before_removal(self, name: str) -> bool:
+        """Fence DELETE behind the spawn that still owns receipt rollback.
+
+        A published child can remain inside provider I/O before governance
+        commit.  Its graph is the sole durable receipt-revocation handle, so a
+        concurrent remover must join that spawn before it may shut the child
+        down.  The spawn's own terminal exception belongs to its caller; this
+        remover continues against the authoritative post-spawn state.
+        """
+
+        async with self._lock:
+            admission = self._agent_operations.get(
+                self._canonical_agent_name(name)
+            )
+            spawn_task = (
+                admission.spawn_task
+                if admission is not None
+                and admission.kind in {"spawn", "direct-spawn-test"}
+                else None
+            )
+        if spawn_task is None or spawn_task is asyncio.current_task():
+            return False
+        cancelled, _failure = await await_lifecycle_task_completion(spawn_task)
+        return cancelled
 
     async def _remove_agent_serialized(
         self,
@@ -3589,6 +4306,10 @@ class AgentManager:
             ) from failure
         try:
             self._quarantined_shutdown_handoffs_sealed = sealed
+            if sealed:
+                self._quarantined_shutdown_handoffs_open.clear()
+            else:
+                self._quarantined_shutdown_handoffs_open.set()
         finally:
             self._lock.release()
         return cancelled
@@ -3635,11 +4356,22 @@ class AgentManager:
         # retained must remain retryable by a later startup/server shutdown.
         cancelled = await self._acquire_quarantined_shutdown_drain()
         try:
-            return await self._drain_quarantined_shutdowns_while_locked(
+            self._seal_agent_registration_for_shutdown_all()
+            spawn_cancelled, spawn_failures = (
+                await self._join_admitted_spawn_operations()
+            )
+            cancelled = cancelled or spawn_cancelled
+            result = await self._drain_quarantined_shutdowns_while_locked(
                 cancelled=cancelled,
                 reported_budget_release_failures=reported_budget_release_failures,
             )
+            _raise_lifecycle_outcomes(
+                "One or more admitted spawns had terminal failures",
+                spawn_failures,
+            )
+            return result
         finally:
+            self._reopen_agent_registration_after_shutdown_all()
             self._quarantined_shutdown_drain_lock.release()
 
     async def _drain_quarantined_shutdowns_while_locked(
@@ -4211,6 +4943,8 @@ class AgentManager:
             self._agents.pop(name, None)
             self._agent_names.pop(agent.agent_id, None)
             self._revoke_a2a_hosted_policy(agent)
+            if vars(agent).get("_agent_manager") is self:
+                agent._agent_manager = None
             if shutdown_handed_off:
                 # Keep both quarantine handoffs under the same lock that
                 # linearizes terminal sealing.  This synchronous fence is
@@ -4550,39 +5284,17 @@ class AgentManager:
         parent_wallet = getattr(parent_agent, "wallet", None)
         if parent_wallet is None:
             return  # precondition already refused this; defensive.
-        try:
-            delegated = await create_delegated_wallet(
-                parent_wallet=parent_wallet,
-                parent_did=parent_agent.agent_id,
-                child_did=child.agent_id,
-                budget=budget,
-            )
-        except BaseException as allocation_failure:
-            # The hold failed AFTER the child was created (e.g. a concurrent
-            # spend drained the parent). Don't leave an uncapped child running.
-            try:
-                removed = await self.remove_agent(name, offboard_runtime=True)
-                if not removed:
-                    raise RuntimeError(
-                        "Delegated-budget rollback did not remove its child"
-                    )
-            except BaseException as rollback_failure:
-                not_hosted_cancellation = (
-                    _uncommitted_spawn_not_hosted_cancellation(rollback_failure)
-                )
-                if not_hosted_cancellation is not None:
-                    if not_hosted_cancellation:
-                        raise BaseExceptionGroup(
-                            "Delegated-budget allocation failed after cancelled "
-                            "storage-backed child rollback",
-                            [allocation_failure, asyncio.CancelledError()],
-                        )
-                    raise allocation_failure
-                raise BaseExceptionGroup(
-                    "Delegated-budget allocation and child rollback both failed",
-                    [allocation_failure, rollback_failure],
-                )
-            raise allocation_failure
+        # Do not remove the already-published child from this helper when the
+        # provider refuses the allocation. ``_do_spawn`` owns that failure and
+        # must first downgrade its durable signed receipt, then close storage
+        # and withdraw routing. A nested cleanup here used to destroy the graph
+        # before the receipt-first rollback could revoke that authority.
+        delegated = await create_delegated_wallet(
+            parent_wallet=parent_wallet,
+            parent_did=parent_agent.agent_id,
+            child_did=child.agent_id,
+            budget=budget,
+        )
 
         # Provider I/O may have yielded to terminal shutdown or a direct DELETE.
         # Claim the exact hold *before* any post-provider await. A positive
@@ -4919,6 +5631,23 @@ class AgentManager:
         Raises:
             ValueError: If an agent with this name already exists or inception fails.
         """
+        parent_did = _loaded_agent_did(parent_agent)
+        if (
+            parent_did is None
+            or mandate.parent_did not in _loaded_agent_bound_dids(parent_agent)
+        ):
+            raise ValueError(
+                "Spawn mandate parent DID does not match the requesting agent"
+            )
+        if mandate.child_did is not None:
+            raise ValueError(
+                "Spawn mandate child DID must be unset until inception"
+            )
+        # The caller may address a rotated parent by its successor signing DID.
+        # New receipts persist the manager's stable routing DID so graph edges,
+        # termination, and restart indexes retain one canonical parent key.
+        mandate.parent_did = parent_did
+
         # Subset-of-parent validation (F277): a mandate must only ever RESTRICT
         # the child relative to the parent — it may never grant features the
         # parent lacks or add constitution-weakening constraints. Enforce this
@@ -4965,6 +5694,10 @@ class AgentManager:
                         f"(mandate max_child_depth={getattr(parent_mandate, 'max_child_depth', 0)})."
                 )
                 self._pending_spawns += 1
+                admission.spawn_slot_active = True
+                admission.spawn_slot_terminal = (
+                    asyncio.get_running_loop().create_future()
+                )
                 spawn_slot_admitted = True
             # DECREMENT remaining depth on delegation (codex r2): a non-leaf
             # spawned parent's child must have strictly less depth, regardless of
@@ -5020,7 +5753,10 @@ class AgentManager:
                     raise asyncio.CancelledError()
 
         assert admission is not None
-        # Sign the mandate with the parent's keys if available.
+        # Resolve the parent's signing material now. The final signature is
+        # created only after inception returns the child's DID; signing before
+        # that point would bind ``child_did=None`` and cannot authorize the
+        # identity that was actually born.
         # Hybrid parents (post-rotation ceremony) get an additional
         # ``parent_identity`` arg so the mandate is signed with both
         # Ed25519 and ML-DSA-65; legacy parents fall through to the
@@ -5052,15 +5788,59 @@ class AgentManager:
         parent_identity = getattr(parent_agent, 'identity', None)
         # A hybrid parent (rotated or born-hybrid #2397) signs via its
         # hybrid keypair and needs no legacy private key; a legacy
-        # parent signs with its ECDSA key. Only a parent with neither
-        # (pre-inception construction) leaves the mandate unsigned.
+        # parent signs with its ECDSA key.
         parent_is_hybrid = bool(parent_identity is not None and parent_identity.is_hybrid)
-        if parent_private_key is not None or parent_is_hybrid:
-            sign_mandate(
-                mandate, parent_private_key,
-                parent_identity=parent_identity,
-            )
+        mandate.parent_signature = None
         child: Optional[KestrelAgent] = None
+
+        async def persist_final_spawn_receipt(candidate: KestrelAgent) -> None:
+            """Bind and persist authority before ``load_agent`` publishes."""
+
+            admission.child = candidate
+            mandate.child_did = candidate.agent_id
+            raw_storage = vars(candidate).get("_raw_storage")
+            if raw_storage is None:
+                raise RuntimeError(
+                    "Spawned child has no durable storage for its signed mandate"
+                )
+            # A caller-created mandate is only a proposal until the final child
+            # DID exists. Establish the signed window at this last prepublication
+            # seam so slow inception cannot consume the child's authority TTL.
+            mandate.created_at = datetime.now(timezone.utc).isoformat()
+            sign_mandate(
+                mandate,
+                parent_private_key,
+                parent_identity=parent_identity if parent_is_hybrid else None,
+            )
+            graph = getattr(raw_storage, "graph", None)
+            if graph is None:
+                raise RuntimeError(
+                    "Spawned child has no durable graph for its signed mandate"
+                )
+            properties = mandate.to_edge_properties()
+            admission.spawn_receipt_graph = graph
+            admission.spawn_receipt_source_id = candidate.agent_id
+            admission.spawn_receipt_target_id = parent_agent.agent_id
+            admission.spawn_receipt_unsigned_properties = {
+                **properties,
+                "parent_signature": None,
+            }
+            await graph.add_trusted_cross_agent_edge(
+                candidate.agent_id,
+                parent_agent.agent_id,
+                "spawned_by",
+                properties=properties,
+            )
+            candidate._persisted_spawn_mandate = mandate
+
+        admission.before_publish = persist_final_spawn_receipt
+
+        async def revoke_failed_prepublication_receipt(
+            candidate: KestrelAgent,
+        ) -> None:
+            await self._downgrade_uncommitted_spawn_receipt(admission, candidate)
+
+        admission.before_publish_rollback = revoke_failed_prepublication_receipt
         try:
             child = await self.create_agent(
                 name,
@@ -5071,10 +5851,13 @@ class AgentManager:
             admission.child = child
             await self._ensure_spawn_operation_admitted(admission, child)
 
-            # Fill in child DID on the mandate before the final commit.  The
-            # rollback below owns the live child if shutdown/delete fences this
-            # operation before it can publish the parent relationship.
-            mandate.child_did = child.agent_id
+            if (
+                admission.spawn_receipt_graph is None
+                and admission.kind != "direct-spawn-test"
+            ):
+                raise RuntimeError(
+                    "Spawned child reached publication without a durable signed receipt"
+                )
 
             # Per-child budget (#2113): hold from the parent and route the
             # child's spend through a ceiling'd DelegatedWallet.  The operation
@@ -5087,17 +5870,78 @@ class AgentManager:
             # is applied uniformly in load_agent from the persisted delegation
             # edge (#2137), which already ran for this child inside create_agent.
             parent_did = parent_agent.agent_id
-            async with self._a2a_lifecycle_lock:
-                async with self._lock:
-                    if not self._spawn_operation_is_admitted(admission, child):
-                        raise RuntimeError(
-                            "Spawn was fenced before its budget and mandate could commit"
-                        )
-                    children = self._parent_children.setdefault(parent_did, [])
-                    if name not in children:
-                        children.append(name)
-                    self._child_mandates[name] = mandate
-                    admission.committed = True
+            while True:
+                capacity_waiter: asyncio.Future[None] | None = None
+                async with self._a2a_lifecycle_lock:
+                    async with self._lock:
+                        if not self._spawn_operation_is_admitted(admission, child):
+                            raise RuntimeError(
+                                "Spawn was fenced before its budget and mandate could commit"
+                            )
+                        if (
+                            mandate.ttl_seconds > 0
+                            and remaining_spawn_ttl_seconds(
+                                mandate.created_at,
+                                mandate.ttl_seconds,
+                            ) <= 0
+                        ):
+                            raise RuntimeError(
+                                "Spawn mandate expired before governance commit"
+                            )
+                        # A cold load may restore a persisted child while this
+                        # spawn is doing inception/provider I/O. Exactly one
+                        # pending spawn becomes the rollback loser. Later
+                        # contenders wait for that exact reservation to reach a
+                        # terminal commit/rollback boundary, rather than all
+                        # rejecting against the same transient over-cap count.
+                        if admission.kind == "spawn":
+                            in_use = (
+                                len(self._child_mandates)
+                                + self._pending_spawns
+                            )
+                            if in_use > self._max_spawned_agents:
+                                capacity_waiter = next(
+                                    (
+                                        waiter
+                                        for waiter in self._rejected_spawn_slot_waiters
+                                        if waiter is not admission.spawn_slot_terminal
+                                        and not waiter.done()
+                                    ),
+                                    None,
+                                )
+                                if capacity_waiter is None:
+                                    admission.spawn_cap_rejected = True
+                                    terminal = admission.spawn_slot_terminal
+                                    if terminal is None:
+                                        raise RuntimeError(
+                                            "Rejected spawn has no cap-slot lifecycle"
+                                        )
+                                    self._rejected_spawn_slot_waiters.add(terminal)
+                                    raise ValueError(
+                                        f"Spawn refused: restored authority consumed the "
+                                        f"last spawned-agent cap slot "
+                                        f"({self._max_spawned_agents})."
+                                    )
+                            else:
+                                if not admission.spawn_slot_active:
+                                    raise RuntimeError(
+                                        "Spawn cap reservation was lost before commit"
+                                    )
+                                self._pending_spawns -= 1
+                                admission.spawn_slot_active = False
+                                self._resolve_spawn_slot_terminal(admission)
+                        if capacity_waiter is None:
+                            children = self._parent_children.setdefault(
+                                parent_did,
+                                [],
+                            )
+                            if name not in children:
+                                children.append(name)
+                            self._child_mandates[name] = mandate
+                            admission.committed = True
+                if capacity_waiter is None:
+                    break
+                await asyncio.shield(capacity_waiter)
 
             logger.info(
                 f"Spawned child '{name}' (DID: {child.agent_id[:30]}...) "
@@ -5105,6 +5949,8 @@ class AgentManager:
             )
             return child
         except BaseException as spawn_failure:
+            if child is None:
+                child = admission.child
             if child is not None and not admission.committed:
                 cleanup_failure: Optional[BaseException] = None
                 cleanup_cancelled = False
@@ -5201,8 +6047,116 @@ class AgentManager:
         have both reached terminal state.
         """
 
+        receipt_cleanup = asyncio.create_task(
+            self._downgrade_uncommitted_spawn_receipt(admission, child),
+            name=f"rollback_spawn_receipt:{admission.name}",
+        )
+        receipt_cancelled, receipt_failure = (
+            await await_lifecycle_task_completion(receipt_cleanup)
+        )
+
+        if receipt_failure is not None:
+            # A failed revocation is ambiguous whether the signed edge remains
+            # durable.  Publication does not make that ambiguity safe: the
+            # failed spawn still owns the child until an idempotent revocation
+            # succeeds and the matching runtime is withdrawn.  Retain that
+            # cleanup owner for both prepublication and published children.
+            handoff_cancelled = await self._handoff_failed_spawn_cleanup(
+                admission,
+                child,
+            )
+            admission.rollback_incomplete = True
+            if handoff_cancelled:
+                raise BaseExceptionGroup(
+                    "Spawn receipt revocation failed during cancellation",
+                    [asyncio.CancelledError(), receipt_failure],
+                )
+            raise receipt_failure
+
+        runtime_cleanup = asyncio.create_task(
+            self._rollback_uncommitted_spawn_runtime(admission, child),
+            name=f"rollback_spawn_runtime:{admission.name}",
+        )
+        runtime_cancelled, runtime_failure = (
+            await await_lifecycle_task_completion(runtime_cleanup)
+        )
+        failures = [
+            failure
+            for failure in (receipt_failure, runtime_failure)
+            if failure is not None
+        ]
+        if failures:
+            admission.rollback_incomplete = True
+            _raise_lifecycle_outcomes(
+                "Spawn receipt and runtime rollback failed",
+                failures,
+            )
+        return (
+            receipt_cancelled
+            or runtime_cancelled
+            or receipt_cleanup.result()
+            or runtime_cleanup.result()
+        )
+
+    async def _downgrade_uncommitted_spawn_receipt(
+        self,
+        admission: AgentOperationAdmission,
+        child: KestrelAgent,
+    ) -> bool:
+        """Atomically revoke authority while preserving restrictive lineage."""
+
+        graph = admission.spawn_receipt_graph
+        source_id = admission.spawn_receipt_source_id
+        target_id = admission.spawn_receipt_target_id
+        if graph is None:
+            return False
+        if not isinstance(source_id, str) or not isinstance(target_id, str):
+            raise RuntimeError("Uncommitted spawn receipt witness is incomplete")
+        unsigned_properties = admission.spawn_receipt_unsigned_properties
+        if unsigned_properties is None:
+            raise RuntimeError("Uncommitted spawn receipt rollback is incomplete")
+        replace_edge = getattr(graph, "add_trusted_cross_agent_edge", None)
+        if not callable(replace_edge):
+            raise RuntimeError("Spawn receipt graph cannot revoke its authority")
+        await replace_edge(
+            source_id,
+            target_id,
+            "spawned_by",
+            properties=unsigned_properties,
+        )
+        admission.spawn_receipt_graph = None
+        admission.spawn_receipt_source_id = None
+        admission.spawn_receipt_target_id = None
+        admission.spawn_receipt_unsigned_properties = None
+        persisted = vars(child).get("_persisted_spawn_mandate")
+        if isinstance(persisted, SpawnMandate):
+            child._persisted_spawn_mandate = replace(
+                persisted,
+                parent_signature=None,
+            )
+        return False
+
+    async def _rollback_uncommitted_spawn_runtime(
+        self,
+        admission: AgentOperationAdmission,
+        child: KestrelAgent,
+    ) -> bool:
+        """Remove the live child and budget after its receipt is withdrawn."""
+
+        if admission.unpublished_cleanup_deferred_to_spawn:
+            await self._discard_unpublished_initialized_agent(
+                admission.name,
+                child,
+            )
+            admission.unpublished_cleanup_deferred_to_spawn = False
+            return False
+
         cleanup = asyncio.create_task(
-            self.remove_agent(admission.name, offboard_runtime=True),
+            self.remove_agent(
+                admission.name,
+                offboard_runtime=True,
+                _spawn_rollback_admission=admission,
+            ),
             name=f"rollback_uncommitted_spawn:{admission.name}",
         )
         cancelled, failure = await await_lifecycle_task_completion(cleanup)
@@ -5257,6 +6211,146 @@ class AgentManager:
             )
         return cancelled or inspection_cancelled
 
+    async def _handoff_failed_spawn_cleanup(
+        self,
+        admission: AgentOperationAdmission,
+        child: KestrelAgent,
+    ) -> bool:
+        """Retain an ambiguous receipt and its live storage until revocation.
+
+        This is the last-resort owner after a prepublication receipt write or a
+        published spawn's later governance commit failed. It deliberately
+        retries the idempotent restrictive replacement before withdrawing the
+        exact runtime through the rollback path appropriate to its publication
+        state. A durable backend outage remains visible in the quarantine
+        registry and keeps the routing name reserved instead of abandoning
+        signed power.
+
+        The manager state lock is the admission boundary shared with the drain
+        seal. A drain joins already-admitted spawns before sealing, so this
+        spawn must not reacquire the drain lock that its joining owner holds.
+        A defensive gate handles any already-sealed direct drain without
+        creating an unregistered task behind its snapshot. A spawn cap slot
+        transfers to the retained task at the same boundary and is released
+        only after the child runtime and delegated hold are both gone.
+
+        Returns whether cancellation was observed while completing admission.
+        """
+
+        slot_transferred = False
+
+        async def revoke_then_shutdown() -> None:
+            while admission.spawn_receipt_graph is not None:
+                try:
+                    await self._downgrade_uncommitted_spawn_receipt(
+                        admission,
+                        child,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed spawn receipt revocation remains pending for %r",
+                        admission.name,
+                    )
+                    await asyncio.sleep(1.0)
+            while True:
+                try:
+                    await self._rollback_uncommitted_spawn_runtime(
+                        admission,
+                        child,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed spawn runtime cleanup remains pending for %r",
+                        admission.name,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+                break
+
+            if slot_transferred:
+                async with self._lock:
+                    if self._pending_spawns <= 0:
+                        raise RuntimeError(
+                            "Quarantined spawn cap ownership underflowed"
+                        )
+                    self._pending_spawns -= 1
+                    self._resolve_spawn_slot_terminal(admission)
+
+        cancelled = False
+        cleanup: asyncio.Task[None] | None = None
+        admission_failure: BaseException | None = None
+        while True:
+            acquire = asyncio.create_task(
+                self._lock.acquire(),
+                name=f"failed_spawn_cleanup_admission:{admission.name}",
+            )
+            acquire_cancelled, acquire_failure = (
+                await await_lifecycle_task_completion(acquire)
+            )
+            cancelled = cancelled or acquire_cancelled
+            if acquire_failure is not None:
+                raise RuntimeError(
+                    "Unable to admit failed spawn cleanup"
+                ) from acquire_failure
+            wait_for_open: asyncio.Event | None = None
+            try:
+                if self._quarantined_shutdown_handoffs_sealed:
+                    wait_for_open = self._quarantined_shutdown_handoffs_open
+                else:
+                    cleanup = asyncio.create_task(
+                        revoke_then_shutdown(),
+                        name=f"failed_spawn_receipt_cleanup:{admission.name}",
+                    )
+                    try:
+                        self._retain_quarantined_cleanup(
+                            name=admission.name,
+                            agent_id=_loaded_agent_did(child) or "<unknown>",
+                            task=cleanup,
+                        )
+                    except BaseException as exc:
+                        # The task has not had an event-loop turn while this
+                        # code holds the lock. Cancel it before leaving the
+                        # admission boundary so an unregistered cleanup can
+                        # never escape.
+                        cleanup.cancel()
+                        admission_failure = exc
+                    else:
+                        if admission.spawn_slot_active:
+                            slot_transferred = True
+                            admission.spawn_slot_active = False
+            finally:
+                self._lock.release()
+            if wait_for_open is None:
+                break
+            wait = asyncio.create_task(
+                wait_for_open.wait(),
+                name=f"failed_spawn_cleanup_wait_for_drain:{admission.name}",
+            )
+            wait_cancelled, wait_failure = (
+                await await_lifecycle_task_completion(wait)
+            )
+            cancelled = cancelled or wait_cancelled
+            if wait_failure is not None:
+                raise RuntimeError(
+                    "Unable to wait for failed spawn cleanup admission"
+                ) from wait_failure
+
+        if admission_failure is not None:
+            assert cleanup is not None
+            cleanup_cancelled, cleanup_failure = (
+                await await_lifecycle_task_completion(cleanup)
+            )
+            cancelled = cancelled or cleanup_cancelled
+            if cleanup_failure is not None and not isinstance(
+                cleanup_failure, asyncio.CancelledError
+            ):
+                raise BaseExceptionGroup(
+                    "Failed cleanup admission left multiple terminal outcomes",
+                    [admission_failure, cleanup_failure],
+                )
+            raise admission_failure
+        return cancelled
+
     async def _child_runtime_or_delegated_hold_is_live(
         self, child_name: str
     ) -> tuple[bool, bool]:
@@ -5273,6 +6367,17 @@ class AgentManager:
     ) -> None:
         """Forget one fully removed child from parent spawn-cap bookkeeping."""
 
+        mandate = self._child_mandates.get(child_name)
+        from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+        lifecycle = getattr(self, "_lifecycle", None)
+        if isinstance(lifecycle, SpawnedAgentLifecycle):
+            lifecycle.retire_persisted_child(
+                child_name,
+                expected_child_did=(
+                    mandate.child_did if isinstance(mandate, SpawnMandate) else None
+                ),
+            )
         children = self._parent_children.get(parent_did)
         if children is not None:
             try:

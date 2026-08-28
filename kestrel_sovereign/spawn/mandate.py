@@ -8,8 +8,10 @@ key and can be verified by anyone with the parent's public key.
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -45,6 +47,32 @@ class SpawnMandate:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
 
+    def _wire_budget_allocation(self) -> int | float:
+        """Normalize and return the JSON number bound by the signature.
+
+        ``Decimal`` is accepted at API boundaries, but the persisted receipt is
+        a JSON number. Normalize the mandate itself to that exact finite float
+        before signing so runtime enforcement cannot retain a more precise (or
+        overflowed) value than the cryptographic authorization records.
+        """
+
+        value = self.budget_allocation
+        if isinstance(value, Decimal):
+            if not value.is_finite():
+                raise ValueError("spawn mandate budget must be finite")
+            wire_value = float(value)
+            if not math.isfinite(wire_value):
+                raise ValueError("spawn mandate budget exceeds JSON numeric range")
+            if value != 0 and wire_value == 0:
+                raise ValueError("spawn mandate budget exceeds JSON numeric range")
+            self.budget_allocation = wire_value
+            return wire_value
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError("spawn mandate budget must be numeric")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("spawn mandate budget must be finite")
+        return value
+
     def _signable_payload(self) -> bytes:
         """Return the canonical bytes representation for signing.
 
@@ -55,18 +83,17 @@ class SpawnMandate:
         otherwise-valid mandate. ``created_at`` is assigned at construction
         (``default_factory``), so it is always present by signing time.
 
-        Format note: mandates are ephemeral — signed at spawn and held in the
-        AgentManager's in-memory ``_child_mandates`` map, never persisted or
-        re-verified across restarts (a restart re-spawns and re-signs). So
-        adding ``created_at`` to the signed bytes is a clean cutover: there are
-        no stored old-format signatures to invalidate.
+        Format note: current mandates are persisted as signed ``spawned_by``
+        receipts and re-verified when runtime authority is restored. Legacy
+        edges without a signature remain attribution-only and cannot regain
+        governance authority after restart.
         """
         payload = {
             "parent_did": self.parent_did,
             "child_did": self.child_did,
             "constitution_hash": self.constitution_hash,
             "additional_constraints": self.additional_constraints,
-            "budget_allocation": self.budget_allocation,
+            "budget_allocation": self._wire_budget_allocation(),
             "ttl_seconds": self.ttl_seconds,
             "features_allowed": self.features_allowed,
             "purpose": self.purpose,
@@ -80,6 +107,54 @@ class SpawnMandate:
     def to_dict(self) -> dict:
         """Serialize the mandate to a plain dict."""
         return asdict(self)
+
+    def to_edge_properties(self) -> dict:
+        """Serialize the signed receipt fields carried by ``spawned_by``.
+
+        Parent and child DIDs are encoded by the edge endpoints. Every other
+        signable field and the signature itself must survive together or the
+        receipt cannot be verified after restart.
+        """
+
+        return {
+            "constitution_hash": self.constitution_hash,
+            "additional_constraints": dict(self.additional_constraints),
+            "budget_allocation": self._wire_budget_allocation(),
+            "ttl_seconds": self.ttl_seconds,
+            "features_allowed": list(self.features_allowed),
+            "purpose": self.purpose,
+            "max_child_depth": self.max_child_depth,
+            "parent_signature": self.parent_signature,
+            "created_at": self.created_at,
+        }
+
+
+def remaining_spawn_ttl_seconds(
+    created_at: str,
+    ttl_seconds: int,
+    *,
+    now: Optional[datetime] = None,
+) -> float:
+    """Return a signed spawn receipt's remaining lifetime.
+
+    ``ttl_seconds <= 0`` denotes a persistent child.  A signed ephemeral
+    receipt with a missing or timezone-naive creation time is invalid rather
+    than eligible for a fresh window at restart.
+    """
+
+    if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
+        raise TypeError("spawn mandate TTL must be an integer")
+    if ttl_seconds <= 0:
+        return 0.0
+    if not isinstance(created_at, str) or not created_at:
+        return 0.0
+    created = datetime.fromisoformat(created_at)
+    if created.tzinfo is None:
+        raise ValueError("persisted spawn mandate created_at must include timezone")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("spawn TTL comparison time must include timezone")
+    return max(0.0, created.timestamp() + ttl_seconds - current.timestamp())
 
 
 _HYBRID_PREFIX = "hybrid:"

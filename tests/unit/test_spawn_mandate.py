@@ -1,7 +1,9 @@
 """Tests for SpawnMandate data structure and DID delegation chains."""
 
+import json
+from decimal import Decimal
+
 import pytest
-from cryptography.hazmat.primitives.asymmetric import ec
 
 from kestrel_sovereign.spawn.mandate import (
     SpawnMandate,
@@ -63,6 +65,38 @@ class TestSpawnMandate:
         assert d["parent_did"] == "did:pkh:eip155:1:0xParent123"
         assert d["budget_allocation"] == 10.0
         assert isinstance(d, dict)
+
+    def test_decimal_budget_normalizes_mandate_to_signed_json_number(self):
+        """Runtime budget and durable receipt use one normalized value."""
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("0.100000000000000005"),
+        )
+
+        payload = json.loads(mandate._signable_payload())
+        edge = mandate.to_edge_properties()
+
+        assert mandate.budget_allocation == 0.1
+        assert payload["budget_allocation"] == mandate.budget_allocation
+        assert edge["budget_allocation"] == mandate.budget_allocation
+
+    def test_decimal_budget_rejects_float_overflow_before_signing(self):
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("1e10000"),
+        )
+
+        with pytest.raises(ValueError, match="JSON numeric range"):
+            mandate._signable_payload()
+
+    def test_decimal_budget_rejects_float_underflow_before_signing(self):
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("1e-400"),
+        )
+
+        with pytest.raises(ValueError, match="JSON numeric range"):
+            mandate._signable_payload()
 
 
 class TestMandateSigning:

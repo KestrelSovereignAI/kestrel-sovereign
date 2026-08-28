@@ -1,4 +1,4 @@
-"""Reload-time reconstruction and enforcement of a spawned child's mandate (#2137).
+"""Reload-time reconstruction and enforcement of a spawned child's mandate.
 
 A spawn mandate's restrictions are recorded on the child's ``spawned_by``
 delegation edge at inception. Every agent boot path funnels through
@@ -19,48 +19,120 @@ from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
 logger = logging.getLogger(__name__)
 
 
+async def _read_spawned_by_edge(storage: Any, agent_did: str) -> Any:
+    """Return the one durable lineage edge for ``agent_did``.
+
+    A child can have at most one authority parent.  Silently choosing the first
+    of several edges would make database iteration order decide who may govern
+    the child, so ambiguous lineage fails closed on every reload path.
+    """
+
+    edges = await storage.get_edges_from(agent_did)
+    spawned = [edge for edge in edges if getattr(edge, "label", None) == "spawned_by"]
+    if not spawned:
+        return None
+    if len(spawned) != 1:
+        raise ValueError(
+            f"Agent {agent_did!r} has {len(spawned)} spawned_by parents; "
+            "refusing ambiguous delegation authority"
+        )
+    edge = spawned[0]
+    if getattr(edge, "source_id", None) != agent_did:
+        raise ValueError("spawned_by edge source does not match the child DID")
+    parent_did = getattr(edge, "target_id", None)
+    if not isinstance(parent_did, str) or not parent_did or parent_did == agent_did:
+        raise ValueError("spawned_by edge has an invalid parent DID")
+    properties = getattr(edge, "properties", None)
+    if properties is not None and not isinstance(properties, dict):
+        raise TypeError("spawned_by edge properties must be a mapping")
+    return edge
+
+
 async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMandate]:
     """Reconstruct a child's mandate from its persisted ``spawned_by`` edge.
 
-    Returns ``None`` for a root (non-spawned) agent or a spawn with no recorded
-    enforceable ``additional_constraints``. The reconstruction is intentionally
-    UNSIGNED: the edge is the durable record and the mandate is used only to
-    *re-apply restrictions* (which only ever tighten — fail-safe), not to
-    re-verify the parent signature.
+    Returns ``None`` only for a root (non-spawned) agent. Legacy edges may
+    reconstruct an unsigned projection for restriction enforcement and
+    attribution. Governance consumers must independently require and verify
+    ``parent_signature`` before treating the projection as authority.
 
     Fail CLOSED: a delegation-edge read error is NOT swallowed — it propagates so
     boot fails rather than silently continuing without a spawned child's
     restrictions (the read runs against already-initialised local storage, so a
     failure here is genuinely exceptional).
 
-    Scope: ``features_allowed`` is deliberately NOT reconstructed onto this
-    mandate object. Enforcing a spawned child's feature allowlist runs at feature
-    discovery (see :func:`read_spawn_features_allowed`, applied in
-    ``KestrelAgent.initialize`` — #2226); keeping it off the mandate object also
-    avoids the constitution re-validation's features-subset check misfiring on
-    reload against the child's own already-narrowed feature set.
+    ``features_allowed`` is reconstructed on the returned projection and read
+    by :func:`read_spawn_features_allowed` during feature discovery. The
+    constitution check runs before this reload projection is attached to the
+    child, so it still cannot misread the child's already-narrowed set as a new
+    grant.
     """
-    # No try/except: propagate read errors (fail closed) — see docstring.
-    edges = await storage.get_edges_from(agent_did)
+    # No try/except: propagate read/validation errors (fail closed).
+    edge = await _read_spawned_by_edge(storage, agent_did)
+    if edge is None:
+        return None
+    props = edge.properties or {}
 
-    spawned = [e for e in edges if getattr(e, "label", None) == "spawned_by"]
-    if not spawned:
-        return None
-    props = spawned[0].properties or {}
-    constraints = props.get("additional_constraints") or {}
-    if not constraints:
-        return None
+    constraints = props.get("additional_constraints")
+    if constraints is None:
+        constraints = {}
+    if not isinstance(constraints, dict):
+        raise TypeError("spawned_by additional_constraints must be a mapping")
+    features_allowed = props.get("features_allowed")
+    if features_allowed is None:
+        features_allowed = []
+    if not isinstance(features_allowed, list) or any(
+        not isinstance(feature, str) or not feature.strip()
+        for feature in features_allowed
+    ):
+        raise TypeError("spawned_by features_allowed must be a list of names")
+
+    created_at = props.get("created_at", "")
+    if not isinstance(created_at, str):
+        raise TypeError("spawned_by created_at must be a string")
+    purpose = props.get("purpose", "")
+    constitution_hash = props.get("constitution_hash", "")
+    budget_allocation = props.get("budget_allocation", 0.0)
+    parent_signature = props.get("parent_signature")
+    ttl_seconds = props.get("ttl_seconds", 3600)
+    max_child_depth = props.get("max_child_depth", 0)
+    if not isinstance(purpose, str):
+        raise TypeError("spawned_by purpose must be a string")
+    if not isinstance(constitution_hash, str):
+        raise TypeError("spawned_by constitution_hash must be a string")
+    if not isinstance(budget_allocation, (int, float)) or isinstance(
+        budget_allocation, bool
+    ):
+        raise TypeError("spawned_by budget_allocation must be numeric")
+    if parent_signature is not None and not isinstance(parent_signature, str):
+        raise TypeError("spawned_by parent_signature must be a string")
+    if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
+        raise TypeError("spawned_by ttl_seconds must be an integer")
+    if not isinstance(max_child_depth, int) or isinstance(max_child_depth, bool):
+        raise TypeError("spawned_by max_child_depth must be an integer")
+    # ``ttl_seconds <= 0`` is the documented persistent-child sentinel.  Keep
+    # its exact value on the authority projection; only delegation depth is a
+    # non-negative bound.
+    if max_child_depth < 0:
+        raise ValueError("spawned_by max_child_depth cannot be negative")
 
     kwargs = {
-        "parent_did": spawned[0].target_id,
-        "purpose": props.get("purpose", ""),
-        "ttl_seconds": props.get("ttl_seconds", 3600),
-        "max_child_depth": props.get("max_child_depth", 0),
+        "parent_did": edge.target_id,
+        "purpose": purpose,
+        "ttl_seconds": ttl_seconds,
+        "max_child_depth": max_child_depth,
         "additional_constraints": constraints,
+        "features_allowed": list(features_allowed),
         "child_did": agent_did,
+        "constitution_hash": constitution_hash,
+        # Preserve the original JSON number representation. ``1`` and ``1.0``
+        # compare numerically but serialize differently in the signed payload.
+        "budget_allocation": budget_allocation,
+        "parent_signature": parent_signature,
+        # Legacy parent-only edges predate mandate timestamps.  Preserve that
+        # absence instead of manufacturing a fresh validity window at boot.
+        "created_at": created_at,
     }
-    if props.get("created_at"):
-        kwargs["created_at"] = props["created_at"]
     return SpawnMandate(**kwargs)
 
 
@@ -88,11 +160,10 @@ async def read_spawn_features_allowed(storage: Any, agent_did: str) -> Optional[
     Fail CLOSED: like :func:`read_spawn_mandate`, an edge read error propagates
     (boot fails) rather than silently loading a child without its feature ceiling.
     """
-    edges = await storage.get_edges_from(agent_did)
-    spawned = [e for e in edges if getattr(e, "label", None) == "spawned_by"]
-    if not spawned:
+    mandate = await read_spawn_mandate(storage, agent_did)
+    if mandate is None:
         return None
-    raw = (spawned[0].properties or {}).get("features_allowed")
+    raw = mandate.features_allowed
     if not raw:
         return None
     names = [str(f) for f in raw if str(f).strip()]

@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from starlette.routing import Mount, Route
 
 from kestrel_sovereign import cli, main, server
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     await_agent_shutdown_completion,
@@ -3215,7 +3216,7 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
     child = Child()
     parent = SimpleNamespace(
         agent_id="did:test:spawn-fenced-parent",
-        _private_key=None,
+        _private_key=generate_secp256k1_keypair()[0],
         identity=None,
         features={},
         wallet=None,
@@ -3224,6 +3225,12 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
     allow_budget = asyncio.Event()
 
     async def create_child(name, **_kwargs):
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = manager._agent_operations[manager._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
         manager._agents[name] = child
         manager._agent_names[child.agent_id] = name
         return child

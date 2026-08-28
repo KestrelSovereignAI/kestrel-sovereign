@@ -21,6 +21,7 @@ from kestrel_sovereign.spawn.lifecycle import (
     SpawnResult,
     SpawnStatus,
 )
+from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
 def _make_mock_manager():
@@ -30,6 +31,236 @@ def _make_mock_manager():
     manager.get_children = MagicMock(return_value=[])
     manager.get_agent = MagicMock(return_value=None)
     return manager
+
+
+def test_restored_ephemeral_ttl_rearms_after_sync_construction() -> None:
+    """A lifecycle first built without a loop must arm its timer later."""
+
+    manager = AgentManager()
+    mandate = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did="did:test:child",
+        ttl_seconds=3600,
+    )
+    manager._child_mandates["Restored"] = mandate
+    lifecycle = SpawnedAgentLifecycle(manager)
+    assert lifecycle._tracked["Restored"].ttl_task is None
+
+    async def rearm() -> None:
+        lifecycle.restore_from_manager()
+        ttl_task = lifecycle._tracked["Restored"].ttl_task
+        assert ttl_task is not None
+        lifecycle.withdraw_persisted_child("Restored")
+        await asyncio.sleep(0)
+        assert ttl_task.cancelled()
+
+    asyncio.run(rearm())
+
+
+@pytest.mark.asyncio
+async def test_direct_retirement_is_not_owned_by_another_child_finalizer() -> None:
+    """A's lifecycle operation must not strand B behind the global lock."""
+
+    manager = _make_mock_manager()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def terminate_child(_parent_did, child_name, **_kwargs):
+        assert child_name == "FinalizingA"
+        entered.set()
+        await release.wait()
+        return True
+
+    manager.terminate_child = AsyncMock(side_effect=terminate_child)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    await lifecycle.register(
+        "FinalizingA",
+        "did:test:finalizing-a",
+        "did:test:parent",
+        ttl_seconds=0,
+        mode=SpawnMode.PERSISTENT,
+    )
+    await lifecycle.register(
+        "DirectB",
+        "did:test:direct-b",
+        "did:test:parent",
+        ttl_seconds=0,
+        mode=SpawnMode.PERSISTENT,
+    )
+
+    finalizer = asyncio.create_task(lifecycle.terminate("FinalizingA"))
+    await entered.wait()
+    assert lifecycle._lock.locked()
+
+    assert lifecycle.retire_persisted_child(
+        "DirectB", expected_child_did="did:test:direct-b"
+    )
+    assert not lifecycle.is_tracked("DirectB")
+    assert lifecycle.is_tracked("FinalizingA")
+
+    release.set()
+    await finalizer
+    assert lifecycle.get_tracked_children() == []
+
+
+@pytest.mark.asyncio
+async def test_manager_prune_cancels_removed_child_ttl_before_name_reuse() -> None:
+    manager = AgentManager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    old_did = "did:test:removed-child"
+    await lifecycle.register(
+        "Reusable",
+        old_did,
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+    old_task = lifecycle._tracked["Reusable"].ttl_task
+    manager._parent_children["did:test:parent"] = ["Reusable"]
+    manager._child_mandates["Reusable"] = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=old_did,
+    )
+
+    manager._prune_child_relationship_and_mandate(
+        "did:test:parent",
+        "Reusable",
+    )
+    assert not lifecycle.is_tracked("Reusable")
+    await asyncio.sleep(0)
+    await lifecycle.register(
+        "Reusable",
+        "did:test:replacement-child",
+        "did:test:other-parent",
+        ttl_seconds=3600,
+    )
+
+    assert old_task is not None and old_task.cancelled()
+    assert lifecycle._tracked["Reusable"].child_did == "did:test:replacement-child"
+    await lifecycle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_manager_prune_does_not_cancel_lifecycle_task_terminating_itself() -> None:
+    manager = AgentManager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    child_did = "did:test:self-terminating-child"
+    await lifecycle.register(
+        "SelfTerminating",
+        child_did,
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+    original_ttl = lifecycle._tracked["SelfTerminating"].ttl_task
+    assert original_ttl is not None
+    original_ttl.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await original_ttl
+    lifecycle._tracked["SelfTerminating"].ttl_task = asyncio.current_task()
+    manager._parent_children["did:test:parent"] = ["SelfTerminating"]
+    manager._child_mandates["SelfTerminating"] = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=child_did,
+    )
+
+    manager._prune_child_relationship_and_mandate(
+        "did:test:parent",
+        "SelfTerminating",
+    )
+
+    assert not lifecycle.is_tracked("SelfTerminating")
+    assert not asyncio.current_task().cancelling()
+
+
+@pytest.mark.asyncio
+async def test_direct_prune_does_not_cancel_same_child_finalizer_waiting_for_lock() -> None:
+    """A queued TTL owner finishes reconciliation after direct removal."""
+
+    manager = AgentManager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def terminate_child(_parent_did, child_name, **_kwargs):
+        if child_name == "BlockingA":
+            entered.set()
+            await release.wait()
+        return True
+
+    manager.terminate_child = AsyncMock(side_effect=terminate_child)
+    await lifecycle.register(
+        "BlockingA",
+        "did:test:blocking-a",
+        "did:test:parent",
+        ttl_seconds=0,
+        mode=SpawnMode.PERSISTENT,
+    )
+    await lifecycle.register(
+        "QueuedB",
+        "did:test:queued-b",
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+    original_timer = lifecycle._tracked["QueuedB"].ttl_task
+    assert original_timer is not None
+    original_timer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await original_timer
+
+    blocker = asyncio.create_task(lifecycle.terminate("BlockingA"))
+    await entered.wait()
+    queued = asyncio.create_task(
+        lifecycle._ttl_monitor("QueuedB", "did:test:queued-b", 0)
+    )
+    lifecycle._tracked["QueuedB"].ttl_task = queued
+    for _ in range(20):
+        if lifecycle._finalization_owner_counts.get(
+            ("QueuedB", "did:test:queued-b")
+        ):
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("queued TTL finalizer never claimed ownership")
+
+    manager._parent_children["did:test:parent"] = ["QueuedB"]
+    manager._child_mandates["QueuedB"] = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did="did:test:queued-b",
+    )
+    manager._prune_child_relationship_and_mandate(
+        "did:test:parent",
+        "QueuedB",
+    )
+
+    release.set()
+    await blocker
+    await queued
+    assert not lifecycle.is_tracked("QueuedB")
+    assert ("QueuedB", "did:test:queued-b") not in lifecycle._finalization_owner_counts
+
+
+@pytest.mark.asyncio
+async def test_stale_ttl_monitor_cannot_terminate_same_name_replacement() -> None:
+    manager = _make_mock_manager()
+    lifecycle = SpawnedAgentLifecycle(manager)
+    await lifecycle.register(
+        "Reusable",
+        "did:test:replacement-child",
+        "did:test:parent",
+        ttl_seconds=3600,
+    )
+
+    await lifecycle._ttl_monitor(
+        "Reusable",
+        "did:test:removed-child",
+        0,
+    )
+
+    manager.terminate_child.assert_not_awaited()
+    assert lifecycle._tracked["Reusable"].child_did == "did:test:replacement-child"
+    await lifecycle.shutdown()
 
 
 class TestSpawnResult:

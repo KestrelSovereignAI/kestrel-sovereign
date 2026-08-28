@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
@@ -370,7 +371,7 @@ async def test_shutdown_all_releases_outstanding_holds():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -411,6 +412,12 @@ def _mgr_with_mock_child(child):
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
         # Mimic load_agent registering the child, so the REAL remove_agent (the
         # path that releases budget holds — #2113) finds and stops it.
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = mgr._agent_operations[mgr._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
         mgr._agents[name] = child
         mgr._agent_names[child.agent_id] = name
         return child
@@ -421,11 +428,10 @@ def _mgr_with_mock_child(child):
 
 @pytest.mark.asyncio
 async def test_spawn_holds_budget_and_terminate_releases():
-    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -466,7 +472,7 @@ async def test_spawn_cancellation_after_provider_allocation_refunds_tracked_hold
             return child_wallet
 
     parent = SimpleNamespace(
-        _private_key=None,
+        _private_key=generate_secp256k1_keypair()[0],
         identity=None,
         agent_id="did:test:provider-parent",
         features={},
@@ -478,6 +484,12 @@ async def test_spawn_cancellation_after_provider_allocation_refunds_tracked_hold
     )
 
     async def fake_create_agent(name, **_kwargs):
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = manager._agent_operations[manager._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
         manager._agents[name] = child
         manager._agent_names[child.agent_id] = name
         return child
@@ -543,7 +555,7 @@ async def test_direct_remove_agent_releases_budget():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(
@@ -554,6 +566,12 @@ async def test_direct_remove_agent_releases_budget():
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
         # Match the public create/load contract: a spawn may only commit after
         # its exact child is published to both routing maps.
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = mgr._agent_operations[mgr._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
         mgr._agents[name] = child
         mgr._agent_names[child.agent_id] = name
         return child
@@ -569,13 +587,10 @@ async def test_direct_remove_agent_releases_budget():
 
 
 @pytest.mark.asyncio
-async def test_budget_allocation_failure_preserves_retained_offboarding_outcome():
-    """Budget rollback must not mask a child tree retained after unpublication."""
+async def test_budget_allocation_helper_leaves_child_cleanup_to_spawn_owner():
+    """Allocation failure alone must not bypass receipt-first spawn rollback."""
 
-    from kestrel_sovereign.multi_agent.agent_manager import (
-        AgentManager,
-        RuntimeOffboardingRetainedError,
-    )
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     manager = AgentManager()
@@ -590,48 +605,76 @@ async def test_budget_allocation_failure_preserves_retained_offboarding_outcome(
         budget_allocation=Decimal("30"),
         ttl_seconds=60,
     )
-    retained = RuntimeOffboardingRetainedError(
-        agent_name="Child",
-        agent_id=child.agent_id,
-        runtime_path=None,
-        cause=RuntimeError("synthetic retained tree"),
-    )
-    manager.remove_agent = AsyncMock(side_effect=retained)
+    manager.remove_agent = AsyncMock()
+    allocation_failure = RuntimeError("allocation failed")
 
     with patch(
         "kestrel_sovereign.multi_agent.agent_manager.create_delegated_wallet",
-        new=AsyncMock(side_effect=RuntimeError("allocation failed")),
+        new=AsyncMock(side_effect=allocation_failure),
     ):
-        with pytest.raises(BaseExceptionGroup) as raised:
+        with pytest.raises(RuntimeError) as raised:
             await manager._apply_delegated_budget(
                 "Child", parent, child, mandate
             )
 
-    assert any("allocation failed" in str(error) for error in raised.value.exceptions)
-    assert any(error is retained for error in raised.value.exceptions)
-    manager.remove_agent.assert_awaited_once_with(
-        "Child", offboard_runtime=True
-    )
+    assert raised.value is allocation_failure
+    manager.remove_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_budget_allocation_failure_accepts_real_non_hosted_child_rollback():
-    """Storage-backed rollback shutdown is complete despite its typed no-op."""
+async def test_budget_allocation_failure_revokes_receipt_before_child_shutdown():
+    """The outer spawn owner revokes authority while child graph storage is live."""
 
     from kestrel_sovereign.multi_agent.agent_manager import AgentManager
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     manager = AgentManager()
+    events: list[str] = []
+
+    class ClosingGraph:
+        closed = False
+
+        async def add_trusted_cross_agent_edge(
+            self, _source, _target, _relation, *, properties
+        ) -> None:
+            if self.closed:
+                raise RuntimeError("receipt graph is already closed")
+            events.append(
+                "signed-receipt"
+                if properties.get("parent_signature")
+                else "unsigned-lineage"
+            )
+
+    graph = ClosingGraph()
     parent = SimpleNamespace(
+        _private_key=generate_secp256k1_keypair()[0],
+        identity=None,
         agent_id="did:test:budget-parent-non-hosted",
+        features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
+
+    async def close_child() -> None:
+        events.append("child-shutdown")
+        graph.closed = True
+
     child = SimpleNamespace(
         agent_id="did:test:budget-child-non-hosted",
-        shutdown=AsyncMock(),
+        wallet=None,
+        wallet_agent=None,
+        shutdown=AsyncMock(side_effect=close_child),
+        _raw_storage=SimpleNamespace(graph=graph),
     )
-    manager._agents["Child"] = child
-    manager._agent_names[child.agent_id] = "Child"
+
+    async def create_and_publish(name, **_kwargs):
+        admission = manager._agent_operations[manager._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        await admission.before_publish(child)
+        manager._agents[name] = child
+        manager._agent_names[child.agent_id] = name
+        return child
+
+    manager.create_agent = create_and_publish
     mandate = SpawnMandate(
         parent_did=parent.agent_id,
         purpose="rollback",
@@ -645,9 +688,10 @@ async def test_budget_allocation_failure_accepts_real_non_hosted_child_rollback(
         new=AsyncMock(side_effect=allocation_failure),
     ):
         with pytest.raises(RuntimeError) as raised:
-            await manager._apply_delegated_budget("Child", parent, child, mandate)
+            await manager.spawn_agent("Child", parent, mandate)
 
     assert raised.value is allocation_failure
+    assert events == ["signed-receipt", "unsigned-lineage", "child-shutdown"]
     child.shutdown.assert_awaited_once_with()
     assert manager.get_agent("Child") is None
     assert child.agent_id not in manager._agent_names
@@ -825,7 +869,7 @@ async def test_budget_refused_for_persistent_child():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -843,7 +887,7 @@ async def test_budget_refused_without_funded_parent_wallet():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={}, wallet=None,
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={}, wallet=None,
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
@@ -858,7 +902,7 @@ async def test_budget_refused_when_parent_cannot_afford():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={},
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("3")),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
@@ -899,7 +943,7 @@ async def test_no_budget_leaves_wallet_untouched():
 
     original = FakeWallet(initial_balance=Decimal("100"))
     parent = SimpleNamespace(
-        _private_key=None, identity=None, agent_id="did:p", features={}, wallet=original,
+        _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={}, wallet=original,
     )
     child = SimpleNamespace(agent_id="did:c", wallet="preexisting", wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
