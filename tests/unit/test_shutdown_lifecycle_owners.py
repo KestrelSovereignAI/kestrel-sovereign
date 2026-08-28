@@ -3395,6 +3395,11 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
     manager._child_budgets[child_name] = entry
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
+    # This lifecycle-ownership fixture intentionally uses object sentinels,
+    # not signed authority receipts. Keep it focused on quarantine tracking.
+    manager.get_authoritative_children = AsyncMock(
+        side_effect=manager.get_children
+    )
     refund_started = asyncio.Event()
     allow_refund = asyncio.Event()
 
@@ -3447,6 +3452,11 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
     manager._child_budgets[child_name] = entry
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
+    # This lifecycle-ownership fixture intentionally uses object sentinels,
+    # not signed authority receipts. Keep it focused on quarantine tracking.
+    manager.get_authoritative_children = AsyncMock(
+        side_effect=manager.get_children
+    )
     refund_started = asyncio.Event()
     allow_failure = asyncio.Event()
 
