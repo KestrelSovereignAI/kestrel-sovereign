@@ -8,6 +8,7 @@ key and can be verified by anyone with the parent's public key.
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -47,15 +48,27 @@ class SpawnMandate:
     )
 
     def _wire_budget_allocation(self) -> int | float:
-        """Return the JSON numeric representation bound by the signature."""
+        """Normalize and return the JSON number bound by the signature.
+
+        ``Decimal`` is accepted at API boundaries, but the persisted receipt is
+        a JSON number. Normalize the mandate itself to that exact finite float
+        before signing so runtime enforcement cannot retain a more precise (or
+        overflowed) value than the cryptographic authorization records.
+        """
 
         value = self.budget_allocation
         if isinstance(value, Decimal):
             if not value.is_finite():
                 raise ValueError("spawn mandate budget must be finite")
-            return float(value)
+            wire_value = float(value)
+            if not math.isfinite(wire_value):
+                raise ValueError("spawn mandate budget exceeds JSON numeric range")
+            self.budget_allocation = wire_value
+            return wire_value
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise TypeError("spawn mandate budget must be numeric")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("spawn mandate budget must be finite")
         return value
 
     def _signable_payload(self) -> bytes:

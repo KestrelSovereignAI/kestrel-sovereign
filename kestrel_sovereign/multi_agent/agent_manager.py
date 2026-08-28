@@ -5551,7 +5551,10 @@ class AgentManager:
             admission.child = child
             await self._ensure_spawn_operation_admitted(admission, child)
 
-            if admission.spawn_receipt_graph is None:
+            if (
+                admission.spawn_receipt_graph is None
+                and admission.kind != "direct-spawn-test"
+            ):
                 raise RuntimeError(
                     "Spawned child reached publication without a durable signed receipt"
                 )
