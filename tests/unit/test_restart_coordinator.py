@@ -1557,6 +1557,45 @@ async def test_executor_reverifies_at_update_mutation_boundary(
 
 
 @pytest.mark.asyncio
+async def test_executor_rejects_rotated_authority_before_post_update_safety_write(
+    tmp_path,
+    monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="rotate after update",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+
+    async def rotate_during_update(_req, _profile):
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-after-update")
+        feat.agent._active_request_ids.add("became-busy")
+        return {
+            "ok": True,
+            "failed_step": None,
+            "steps": [],
+            "resolved_ref": "",
+            "migration": {"ran": False},
+        }
+
+    feat._run_update = rotate_during_update
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_executor_never_runs_manual_only_policy(tmp_path):
     feat, backend = await _make_feature(tmp_path)
     await feat.request_restart(reason="r", policy="manual_only")

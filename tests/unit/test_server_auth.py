@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 from kestrel_sovereign import server as server_module
+from kestrel_sovereign.features.peers.directory import LocalHostPeerDirectory
 
 API_KEY = "unit-test-key-2490"
 SENTINEL = "sentinel downstream failure"
@@ -55,6 +56,15 @@ def _build_app():
         request.session["user_email"] = "operator@example.com"
         return {"ok": True}
 
+    @app.get("/api/test/caller")
+    async def caller_route(request: Request):
+        caller = request.state.caller
+        return {
+            "role": caller.role.value,
+            "auth_method": caller.auth_method.value,
+            "is_sovereign": caller.is_sovereign,
+        }
+
     return app
 
 
@@ -86,6 +96,22 @@ def test_valid_credentials_reach_route(client, lane):
     response = client.get(path, **_lane_kwargs(client, lane))
     assert response.status_code == 200
     assert response.json() == {"ok": True}
+
+
+def test_local_peer_transport_key_is_authenticated_but_not_sovereign(client):
+    headers = LocalHostPeerDirectory(
+        "http://localhost:8888",
+        api_key=API_KEY,
+    )._headers()
+
+    response = client.get("/api/test/caller", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "role": "authenticated",
+        "auth_method": "internal",
+        "is_sovereign": False,
+    }
 
 
 @pytest.mark.parametrize(
