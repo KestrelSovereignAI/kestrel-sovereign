@@ -527,11 +527,14 @@ def _turn_input_text_for_estimate(turn_input: CodexTurnInput) -> str:
 
 
 def _usage_from(tu: dict) -> Dict[str, Optional[int]]:
-    total = (tu or {}).get("total", {}) or {}
-    inp = total.get("inputTokens")
-    out = total.get("outputTokens")
-    tot = total.get("totalTokens")
-    cached = total.get("cachedInputTokens")
+    # ``total`` is cumulative for the whole reused Codex thread.  Durable
+    # usage accounting is per invocation, so prefer the latest-turn bucket;
+    # retain ``total`` as a compatibility fallback for older app servers.
+    usage = (tu or {}).get("last") or (tu or {}).get("total") or {}
+    inp = usage.get("inputTokens")
+    out = usage.get("outputTokens")
+    tot = usage.get("totalTokens")
+    cached = usage.get("cachedInputTokens")
     if isinstance(cached, int) and not isinstance(cached, bool):
         if isinstance(inp, int) and not isinstance(inp, bool):
             inp = max(0, inp - cached)

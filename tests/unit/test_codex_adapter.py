@@ -398,6 +398,27 @@ class TestUsageProjection:
             "total_tokens": 60, "cache_read_input_tokens": 40,
         }
 
+    def test_reused_thread_projects_latest_turn_not_cumulative_total(self):
+        assert _usage_from({
+            "total": {
+                "totalTokens": 300,
+                "inputTokens": 270,
+                "cachedInputTokens": 120,
+                "outputTokens": 30,
+            },
+            "last": {
+                "totalTokens": 100,
+                "inputTokens": 90,
+                "cachedInputTokens": 40,
+                "outputTokens": 10,
+            },
+        }) == {
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "total_tokens": 60,
+            "cache_read_input_tokens": 40,
+        }
+
 
 class TestThreadOccupancy:
     """#1844: codex's TRUE server-side thread occupancy capture.

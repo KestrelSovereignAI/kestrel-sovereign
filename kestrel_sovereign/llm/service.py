@@ -3862,6 +3862,23 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if not usage_available:
             record_metadata.setdefault("usage_available", False)
 
+        # ``input_tokens`` follows the SDK's cache-aware contract and excludes
+        # separately reported cache buckets.  The older observability row and
+        # Prometheus counter have only one input field, so preserve their
+        # historical inclusive total by folding those buckets back in at the
+        # compatibility boundary.  The structured log and new usage tables
+        # below keep the separated values.
+        legacy_input_tokens = input_tokens
+        if legacy_input_tokens is not None:
+            legacy_input_tokens += sum(
+                value
+                for value in (
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                )
+                if value is not None
+            )
+
         # Log to observability store
         observability_store = getattr(self, "_observability_store", None)
         if observability_store:
@@ -3881,7 +3898,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     error_message=error_message,
                     tool_calls=tool_calls,
                     metadata=record_metadata,
-                    input_tokens=input_tokens,
+                    input_tokens=legacy_input_tokens,
                     output_tokens=output_tokens,
                 )
             except asyncio.CancelledError:
@@ -3905,9 +3922,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 LLM_DURATION.labels(provider=provider, model=model).observe(
                     duration_ms / 1000
                 )
-                if input_tokens is not None:
+                if legacy_input_tokens is not None:
                     LLM_TOKENS.labels(model=model, direction="input").inc(
-                        input_tokens
+                        legacy_input_tokens
                     )
                 if output_tokens is not None:
                     LLM_TOKENS.labels(model=model, direction="output").inc(

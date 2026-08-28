@@ -457,6 +457,8 @@ class TestCoreGeneration:
             cache_read_input_tokens=66482,
         ))
         llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
 
         with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
             await llm_service.get_response(
@@ -478,6 +480,7 @@ class TestCoreGeneration:
             cache_creation_input_tokens=0,
             cache_read_input_tokens=66482,
         )
+        assert store.log_llm_call.await_args.kwargs["input_tokens"] == 68585
         assert "duration_ms" in payload
         assert "model" in payload
         assert payload["tools"] is False
@@ -931,6 +934,65 @@ class TestMeteringAndCost:
         )
 
         assert seen == [(40, 5, 7, 80)]
+
+    @pytest.mark.asyncio
+    async def test_legacy_observability_store_keeps_inclusive_prompt_total(
+        self, llm_service
+    ):
+        """The legacy per-call row has no cache columns, so it must retain
+        its historical inclusive input-token total after cache separation."""
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+
+        await llm_service._log_llm_call(
+            provider="openai:api",
+            model="gpt-5-mini",
+            duration_ms=1,
+            success=True,
+            input_tokens=40,
+            output_tokens=5,
+            cache_creation_input_tokens=7,
+            cache_read_input_tokens=80,
+        )
+
+        assert store.log_llm_call.await_args.kwargs["input_tokens"] == 127
+
+    @pytest.mark.asyncio
+    async def test_legacy_prometheus_counter_keeps_inclusive_prompt_total(
+        self, llm_service
+    ):
+        increments = []
+
+        class _Metric:
+            def labels(self, **labels):
+                class _Child:
+                    def inc(self, value=1):
+                        increments.append((labels, value))
+
+                    def observe(self, value):
+                        increments.append((labels, value))
+
+                return _Child()
+
+        metric = _Metric()
+        with (
+            patch("kestrel_sdk.metrics.PROMETHEUS_AVAILABLE", True),
+            patch("kestrel_sdk.metrics.LLM_CALLS", metric),
+            patch("kestrel_sdk.metrics.LLM_DURATION", metric),
+            patch("kestrel_sdk.metrics.LLM_TOKENS", metric),
+        ):
+            await llm_service._log_llm_call(
+                provider="openai:api",
+                model="gpt-5-mini",
+                duration_ms=1,
+                success=True,
+                input_tokens=40,
+                output_tokens=5,
+                cache_creation_input_tokens=7,
+                cache_read_input_tokens=80,
+            )
+
+        assert ({"model": "gpt-5-mini", "direction": "input"}, 127) in increments
 
     @pytest.mark.asyncio
     async def test_cache_read_folded_into_prompt_for_cost_only_callback(
