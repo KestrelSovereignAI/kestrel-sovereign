@@ -117,6 +117,12 @@ def _make_spawn_feature(parent_agent=None, manager=None):
     return feature
 
 
+def _use_runtime_projection_as_authority_test_double(manager: AgentManager) -> None:
+    """Keep lifecycle-only tests focused on their pre-authority fixtures."""
+
+    manager.get_authoritative_children = AsyncMock(side_effect=manager.get_children)
+
+
 class TestSpawnFeatureTools:
     """Verify SpawnFeature exposes the correct tools."""
 
@@ -236,7 +242,9 @@ class TestSpawnFeatureAutoManager:
 
     @pytest.mark.asyncio
     async def test_delegate_without_children(self):
-        feature = _make_spawn_feature(manager=MagicMock())
+        manager = MagicMock()
+        manager.get_agent.return_value = None
+        feature = _make_spawn_feature(manager=manager)
         envelope = await feature.delegate_task(child_name="child1", task="do stuff")
         assert envelope.status is ToolResultStatus.ERROR
 
@@ -340,7 +348,8 @@ class TestSpawnFeatureWithManager:
         child = _make_mock_agent("did:child")
 
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_children = MagicMock(return_value=[])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=child)
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
@@ -349,13 +358,15 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["count"] == 1
         assert envelope.data["children"][0]["name"] == "helper"
         assert envelope.data["children"][0]["status"] == "running"
+        manager.get_authoritative_children.assert_awaited_once_with("did:parent")
+        manager.get_children.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_list_children_surfaces_exhausted_ttl_refusal(self):
         parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=child)
         manager.terminate_child = AsyncMock(return_value=False)
         lifecycle = SpawnedAgentLifecycle(manager)
@@ -394,7 +405,8 @@ class TestSpawnFeatureWithManager:
 
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=child)
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_children = MagicMock(return_value=[])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager._lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle.report_result = AsyncMock()
 
@@ -403,6 +415,7 @@ class TestSpawnFeatureWithManager:
 
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["child_name"] == "helper"
+        manager.get_children.assert_not_called()
 
         # Wait for the async task to finish
         await asyncio.sleep(0.1)
@@ -422,7 +435,7 @@ class TestSpawnFeatureWithManager:
         child = _make_mock_agent("did:child")
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=child)
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager._lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle.report_result = AsyncMock()
         manager.terminate_child = AsyncMock()
@@ -463,7 +476,7 @@ class TestSpawnFeatureWithManager:
 
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=other)
-        manager.get_children = MagicMock(return_value=[])  # not our child
+        manager.get_authoritative_children = AsyncMock(return_value=[])  # not our child
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
         envelope = await feature.delegate_task(child_name="stranger", task="hack")
@@ -479,7 +492,7 @@ class TestSpawnFeatureWithManager:
 
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=child)
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
@@ -505,7 +518,7 @@ class TestSpawnFeatureWithManager:
 
         manager = MagicMock()
         manager.get_agent = MagicMock(return_value=child)
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
         await feature.delegate_task(child_name="helper", task="slow work")
@@ -528,7 +541,7 @@ class TestSpawnFeatureWithManager:
         parent = _make_mock_agent("did:parent")
 
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager._lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle.terminate = AsyncMock(return_value=SimpleNamespace())
 
@@ -547,7 +560,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_explicit_offboard_threads_destructive_intent(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager._lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle.terminate = AsyncMock(return_value=SimpleNamespace())
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
@@ -572,7 +585,7 @@ class TestSpawnFeatureWithManager:
 
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager.terminate_child = AsyncMock()
         lifecycle = SpawnedAgentLifecycle(manager)
@@ -651,7 +664,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager.terminate_child = AsyncMock(
             side_effect=RuntimeOffboardingNotPerformedError(
@@ -714,7 +727,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -774,7 +787,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -808,7 +821,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         retained = RuntimeOffboardingRetainedError(
@@ -868,7 +881,7 @@ class TestSpawnFeatureWithManager:
     async def test_descendant_retention_does_not_override_removed_named_child(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -909,7 +922,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -970,7 +983,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -1034,7 +1047,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -1126,6 +1139,7 @@ class TestSpawnFeatureWithManager:
         manager._agents["helper"] = child
         manager._agent_names[child.agent_id] = "helper"
         manager._parent_children[parent.agent_id] = ["helper"]
+        _use_runtime_projection_as_authority_test_double(manager)
         manager._offboard_agent_runtime_namespace = AsyncMock(return_value=(False, None))
         lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle = lifecycle
@@ -1161,7 +1175,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_flattens_grouped_retained_agents(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager.terminate_child = AsyncMock()
         lifecycle = SpawnedAgentLifecycle(manager)
@@ -1229,6 +1243,7 @@ class TestSpawnFeatureWithManager:
         )
         manager._parent_children["did:parent"] = ["Child"]
         manager._parent_children[child.agent_id] = ["Grandchild"]
+        _use_runtime_projection_as_authority_test_double(manager)
         lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle = lifecycle
         await lifecycle.register(
@@ -1292,6 +1307,7 @@ class TestSpawnFeatureWithManager:
         )
         manager._parent_children[parent.agent_id] = ["Child"]
         manager._parent_children[child.agent_id] = ["Grandchild"]
+        _use_runtime_projection_as_authority_test_double(manager)
         manager._lifecycle = None
         manager.terminate_children = AsyncMock(
             side_effect=BaseExceptionGroup(
@@ -1345,7 +1361,7 @@ class TestSpawnFeatureWithManager:
     async def test_descendant_tnp_and_retention_leave_named_removed_state(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -1400,7 +1416,7 @@ class TestSpawnFeatureWithManager:
     ):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         if named_outcome == "retained":
@@ -1452,7 +1468,7 @@ class TestSpawnFeatureWithManager:
 
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_authoritative_children = AsyncMock(return_value=["Child"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         unsafe = ChildTerminationNotPerformedError(child_name="../private")
@@ -1476,7 +1492,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_flattens_retained_and_cancellation(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager.terminate_child = AsyncMock()
         lifecycle = SpawnedAgentLifecycle(manager)
@@ -1527,7 +1543,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_preserves_active_cancellation_group(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         retained = RuntimeOffboardingRetainedError(
@@ -1566,7 +1582,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_supports_typed_reconciliation_outcome(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -1597,7 +1613,7 @@ class TestSpawnFeatureWithManager:
     async def test_destructive_reconciliation_partial_reports_runtime_removed(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -1633,7 +1649,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_flattens_retained_and_reconciliation(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(
@@ -1679,7 +1695,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_reraises_unsupported_grouped_failure(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         retained = RuntimeOffboardingRetainedError(
@@ -1706,7 +1722,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_reraises_untyped_operational_failure(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.get_agent = MagicMock(return_value=None)
         manager._lifecycle = None
         failure = RuntimeError("untyped lifecycle failure")
@@ -1723,7 +1739,7 @@ class TestSpawnFeatureWithManager:
         parent = _make_mock_agent("did:parent")
 
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(return_value=True)
 
@@ -1737,7 +1753,7 @@ class TestSpawnFeatureWithManager:
     async def test_terminate_child_false_result_remains_error(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager._lifecycle = None
         manager.terminate_child = AsyncMock(return_value=False)
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
@@ -1754,7 +1770,7 @@ class TestSpawnFeatureWithManager:
 
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_authoritative_children = AsyncMock(return_value=["helper"])
         manager.terminate_child = AsyncMock(return_value=False)
         lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle = lifecycle
@@ -1812,6 +1828,7 @@ class TestSpawnFeatureWithManager:
         manager._agents["worker"] = child
         manager._agent_names[child.agent_id] = "worker"
         manager._parent_children[parent.agent_id] = ["worker"]
+        _use_runtime_projection_as_authority_test_double(manager)
         lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle = lifecycle
         await lifecycle.register(
@@ -1895,6 +1912,7 @@ class TestSpawnFeatureWithManager:
         manager._agents["worker"] = child
         manager._agent_names[child.agent_id] = "worker"
         manager._parent_children[parent.agent_id] = ["worker"]
+        _use_runtime_projection_as_authority_test_double(manager)
         lifecycle = SpawnedAgentLifecycle(manager)
         manager._lifecycle = lifecycle
         await lifecycle.register(
@@ -1961,6 +1979,7 @@ class TestSpawnFeatureWithManager:
         manager._agents["Child"] = child
         manager._agent_names[child.agent_id] = "Child"
         manager._parent_children[parent.agent_id] = ["Child"]
+        _use_runtime_projection_as_authority_test_double(manager)
         manager.terminate_children = AsyncMock(
             side_effect=ChildTerminationReconciliationError(
                 child_name="Grandchild",
@@ -2006,7 +2025,7 @@ class TestSpawnFeatureWithManager:
         parent = _make_mock_agent("did:parent")
 
         manager = MagicMock()
-        manager.get_children = MagicMock(return_value=[])
+        manager.get_authoritative_children = AsyncMock(return_value=[])
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
         envelope = await feature.terminate_child(child_name="stranger")
@@ -2228,6 +2247,7 @@ class TestAgentManagerSpawn:
         manager._child_mandates["helper"] = SpawnMandate(
             parent_did="did:parent", purpose="test"
         )
+        _use_runtime_projection_as_authority_test_double(manager)
 
         removed = await manager.terminate_child("did:parent", "helper")
 
@@ -2259,6 +2279,7 @@ class TestAgentManagerSpawn:
         manager._agents["helper"] = child
         manager._agent_names[child.agent_id] = "helper"
         manager._parent_children["did:parent"] = ["helper"]
+        _use_runtime_projection_as_authority_test_double(manager)
 
         assert await manager.terminate_child("did:parent", "helper") is True
 
@@ -2288,6 +2309,7 @@ class TestAgentManagerSpawn:
         manager._agents["helper"] = child
         manager._agent_names[child.agent_id] = "helper"
         manager._parent_children["did:parent"] = ["helper"]
+        _use_runtime_projection_as_authority_test_double(manager)
 
         assert await manager.terminate_child(
             "did:parent",
@@ -2324,6 +2346,7 @@ class TestAgentManagerSpawn:
         manager._child_mandates["grandchild1"] = SpawnMandate(
             parent_did="did:child", purpose="grandchild"
         )
+        _use_runtime_projection_as_authority_test_double(manager)
 
         count = await manager.terminate_children("did:parent")
 
@@ -2364,7 +2387,7 @@ class TestSpawnLifecycle:
         manager = MagicMock()
         manager.spawn_agent = AsyncMock(return_value=child)
         manager.get_agent = MagicMock(return_value=child)
-        manager.get_children = MagicMock(return_value=["worker"])
+        manager.get_authoritative_children = AsyncMock(return_value=["worker"])
         manager.terminate_child = AsyncMock(return_value=True)
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)

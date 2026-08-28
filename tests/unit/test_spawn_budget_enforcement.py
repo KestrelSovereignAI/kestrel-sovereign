@@ -426,6 +426,12 @@ def _mgr_with_mock_child(child):
     return mgr
 
 
+def _use_runtime_projection_as_authority_test_double(manager) -> None:
+    """Keep budget-only fixtures focused on refund/custody behavior."""
+
+    manager.get_authoritative_children = AsyncMock(side_effect=manager.get_children)
+
+
 @pytest.mark.asyncio
 async def test_spawn_holds_budget_and_terminate_releases():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -436,6 +442,8 @@ async def test_spawn_holds_budget_and_terminate_releases():
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
+    mgr._agents["Parent"] = parent
+    mgr._agent_names[parent.agent_id] = "Parent"
 
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("30"))
     result = await mgr.spawn_agent("Kid", parent, mandate)
@@ -731,6 +739,7 @@ async def test_terminate_child_keeps_retry_tracking_after_refund_failure() -> No
     manager._child_budgets["retry-child"] = entry
     manager._parent_children["did:test:retry-parent"] = ["retry-child"]
     manager._child_mandates["retry-child"] = mandate
+    _use_runtime_projection_as_authority_test_double(manager)
 
     async def fail_refund(name: str) -> bool:
         assert name == "retry-child"
@@ -776,6 +785,7 @@ async def test_terminate_child_prunes_tracking_after_completed_removal_cancellat
     manager._child_budgets["cancelled-child"] = entry
     manager._parent_children["did:test:cancelled-parent"] = ["cancelled-child"]
     manager._child_mandates["cancelled-child"] = mandate
+    _use_runtime_projection_as_authority_test_double(manager)
 
     async def refund_then_report_cancellation(name: str) -> bool:
         assert name == "cancelled-child"
@@ -816,6 +826,7 @@ async def test_terminate_child_cascade_releases_nested_to_root():
     # root spawned child; child spawned gc.
     mgr._parent_children = {"did:root": ["child"], "did:child": ["gc"]}
     mgr._child_budgets = {"child": (child_dw, root), "gc": (gc_dw, child_dw)}
+    _use_runtime_projection_as_authority_test_double(mgr)
 
     await mgr.terminate_child("did:root", "child")
     assert root.get_balance() == Decimal("100")   # gc released into child, then child to root

@@ -417,6 +417,10 @@ class A2AHostedPolicy:
     requester: object
 
 
+class SpawnAuthorityGraphError(RuntimeError):
+    """Durable signed spawn receipts do not form one safe authority forest."""
+
+
 @dataclass
 class QuarantinedShutdownReaper:
     """Observable ownership record for cleanup that outlived agent removal.
@@ -6507,8 +6511,160 @@ class AgentManager:
                     raise failure
 
     def get_children(self, parent_did: str) -> list[str]:
-        """Get list of child agent names for a parent DID."""
+        """Return the verified runtime projection for display/reconciliation.
+
+        This synchronous cache is not an authority predicate. Mutation paths
+        must use :meth:`get_authoritative_children`, which reconstructs and
+        re-verifies the signed graph before granting control.
+        """
         return list(self._parent_children.get(parent_did, []))
+
+    def _verified_spawn_relations(self) -> dict[str, tuple[str, str]]:
+        """Return ``child_did -> (parent_did, child_name)`` after revalidation."""
+
+        from kestrel_sovereign.spawn.mandate import verify_mandate
+
+        relations: dict[str, tuple[str, str]] = {}
+        names_seen: set[str] = set()
+        for child_name, mandate in sorted(
+            self._child_mandates.items(),
+            key=lambda item: (item[0].casefold(), item[0]),
+        ):
+            canonical_name = self._canonical_agent_name(child_name)
+            if canonical_name in names_seen:
+                raise SpawnAuthorityGraphError(
+                    "Signed spawn authority has ambiguous child routing names"
+                )
+            names_seen.add(canonical_name)
+            if (
+                not isinstance(mandate, SpawnMandate)
+                or not mandate.parent_signature
+                or not isinstance(mandate.child_did, str)
+                or not mandate.child_did
+            ):
+                # Unsigned legacy projections remain attribution/restriction
+                # data only and cannot enter the authority graph.
+                continue
+
+            parent_matches = [
+                candidate
+                for candidate in self._agents.values()
+                if mandate.parent_did in _loaded_agent_bound_dids(candidate)
+            ]
+            if len(parent_matches) > 1:
+                raise SpawnAuthorityGraphError(
+                    "Signed spawn authority has an ambiguous parent identity"
+                )
+            if not parent_matches:
+                continue
+            parent = parent_matches[0]
+            parent_did = _loaded_agent_did(parent)
+            if not isinstance(parent_did, str) or not parent_did:
+                raise SpawnAuthorityGraphError(
+                    "Signed spawn authority parent has no stable DID"
+                )
+            parent_state = vars(parent)
+            private_key = parent_state.get("_private_key")
+            public_key_getter = getattr(private_key, "public_key", None)
+            public_key = public_key_getter() if callable(public_key_getter) else None
+            if not verify_mandate(
+                mandate,
+                public_key,
+                parent_identity=parent_state.get("identity"),
+            ):
+                raise SpawnAuthorityGraphError(
+                    "Signed spawn authority contains an invalid mandate"
+                )
+
+            child = self.get_agent(child_name)
+            if child is not None:
+                child_did = _loaded_agent_did(child)
+                if child_did != mandate.child_did:
+                    raise SpawnAuthorityGraphError(
+                        "Signed spawn authority child DID does not match routing"
+                    )
+            else:
+                retained_did = self._budgeted_child_agent_id(child_name)
+                if retained_did is not None and retained_did != mandate.child_did:
+                    raise SpawnAuthorityGraphError(
+                        "Signed spawn authority child DID conflicts with cleanup custody"
+                    )
+                if (
+                    retained_did is None
+                    and not self._quarantined_cleanup_name_is_reserved(
+                        canonical_name
+                    )
+                ):
+                    # A completed removal can leave a cache entry until its
+                    # reconciliation tail runs. It is not a controllable child.
+                    continue
+
+            prior = relations.get(mandate.child_did)
+            relation = (parent_did, child_name)
+            if prior is not None and prior != relation:
+                raise SpawnAuthorityGraphError(
+                    "Signed spawn authority assigns one child DID more than once"
+                )
+            relations[mandate.child_did] = relation
+
+        # Validate the complete graph before returning even one edge. A query
+        # must never grant a safe-looking branch beside a corrupt cycle.
+        parent_by_child = {
+            child_did: parent_did
+            for child_did, (parent_did, _name) in relations.items()
+        }
+        for child_did in sorted(parent_by_child):
+            cursor = child_did
+            visited: set[str] = set()
+            while cursor in parent_by_child:
+                if cursor in visited:
+                    raise SpawnAuthorityGraphError(
+                        "Signed spawn authority contains a cycle"
+                    )
+                visited.add(cursor)
+                cursor = parent_by_child[cursor]
+        return relations
+
+    async def get_authoritative_children(self, parent_did: str) -> list[str]:
+        """Return deterministic direct children proven by signed receipts."""
+
+        if not isinstance(parent_did, str) or not parent_did:
+            return []
+        relations = self._verified_spawn_relations()
+        return sorted(
+            (
+                child_name
+                for _child_did, (relation_parent, child_name) in relations.items()
+                if relation_parent == parent_did
+            ),
+            key=lambda name: (name.casefold(), name),
+        )
+
+    async def get_authoritative_descendants(self, parent_did: str) -> list[str]:
+        """Return deterministic breadth-first descendants, cycle-safe."""
+
+        if not isinstance(parent_did, str) or not parent_did:
+            return []
+        relations = self._verified_spawn_relations()
+        by_parent: dict[str, list[tuple[str, str]]] = {}
+        for child_did, (relation_parent, child_name) in relations.items():
+            by_parent.setdefault(relation_parent, []).append((child_did, child_name))
+        for children in by_parent.values():
+            children.sort(key=lambda item: (item[1].casefold(), item[1], item[0]))
+
+        descendants: list[str] = []
+        queue = list(by_parent.get(parent_did, ()))
+        visited: set[str] = set()
+        while queue:
+            child_did, child_name = queue.pop(0)
+            if child_did in visited:
+                raise SpawnAuthorityGraphError(
+                    "Signed spawn authority contains a repeated descendant"
+                )
+            visited.add(child_did)
+            descendants.append(child_name)
+            queue.extend(by_parent.get(child_did, ()))
+        return descendants
 
     def get_mandate(self, child_name: str) -> Optional[SpawnMandate]:
         """Get the SpawnMandate for a child agent."""
@@ -6537,7 +6693,7 @@ class AgentManager:
         Returns:
             True if the child was found and terminated.
         """
-        children = self._parent_children.get(parent_did, [])
+        children = await self.get_authoritative_children(parent_did)
         if child_name not in children:
             return False
         if type(offboard_runtime) is not bool:
@@ -6696,7 +6852,7 @@ class AgentManager:
         Returns:
             Number of children terminated.
         """
-        children = list(self._parent_children.get(parent_did, []))
+        children = await self.get_authoritative_children(parent_did)
         if type(offboard_runtime) is not bool:
             raise TypeError("offboard_runtime must be a bool")
         count = 0

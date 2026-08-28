@@ -60,7 +60,7 @@ async def get_spawn_children(request: Request):
         return {"children": [], "count": 0, "delegation_chain": {}, "history": []}
 
     parent_did = agent.agent_id
-    child_names = manager.get_children(parent_did)
+    child_names = await manager.get_authoritative_children(parent_did)
 
     children = []
     now = datetime.now(timezone.utc)
@@ -113,7 +113,9 @@ async def get_spawn_children(request: Request):
         children.append(child_info)
 
     # Build delegation chain tree
-    delegation_chain = _build_delegation_chain(manager, parent_did, agent.agent_id)
+    delegation_chain = await _build_delegation_chain(
+        manager, parent_did, agent.agent_id
+    )
 
     # Build spawn history from lifecycle results
     history = _build_spawn_history(agent, manager, request=request)
@@ -126,9 +128,11 @@ async def get_spawn_children(request: Request):
     }
 
 
-def _build_delegation_chain(manager, parent_did: str, parent_name: str) -> dict:
+async def _build_delegation_chain(
+    manager, parent_did: str, parent_name: str
+) -> dict:
     """Build a tree structure showing Parent -> Child -> Grandchild relationships."""
-    child_names = manager.get_children(parent_did)
+    child_names = await manager.get_authoritative_children(parent_did)
     children_nodes = []
 
     for child_name in child_names:
@@ -146,11 +150,10 @@ def _build_delegation_chain(manager, parent_did: str, parent_name: str) -> dict:
 
         # Recurse for grandchildren
         if child_did:
-            grandchildren = manager.get_children(child_did)
-            if grandchildren:
-                child_node["children"] = _build_delegation_chain(
-                    manager, child_did, child_name
-                ).get("children", [])
+            descendant_tree = await _build_delegation_chain(
+                manager, child_did, child_name
+            )
+            child_node["children"] = descendant_tree.get("children", [])
 
         children_nodes.append(child_node)
 

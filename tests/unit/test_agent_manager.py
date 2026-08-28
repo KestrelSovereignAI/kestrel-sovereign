@@ -39,6 +39,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
+    SpawnAuthorityGraphError,
     _parse_runtime_offboard_timeout,
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
@@ -994,6 +995,117 @@ def test_tampered_signed_lineage_fails_closed_and_rolls_back_parent_load(tmp_pat
     assert manager.get_agent("TamperParent") is parent
     assert manager.get_agent("TamperChild") is None
     assert manager.get_children(parent_did) == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_descendants_rebuild_from_signed_receipts_not_cache(
+    tmp_path,
+):
+    root_did = "did:pkh:eip155:1:0xGraphRoot"
+    alpha_did = "did:pkh:eip155:1:0xGraphAlpha"
+    zeta_did = "did:pkh:eip155:1:0xGraphZeta"
+    leaf_did = "did:pkh:eip155:1:0xGraphLeaf"
+    root_private, _ = generate_secp256k1_keypair()
+    zeta_private, _ = generate_secp256k1_keypair()
+    root = _make_mock_agent(root_did)
+    root._private_key = root_private
+    root.identity = None
+    root._persisted_spawn_mandate = None
+    alpha = _make_mock_agent(alpha_did)
+    alpha._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(parent_did=root_did, child_did=alpha_did, ttl_seconds=0),
+        root_private,
+    )
+    zeta = _make_mock_agent(zeta_did)
+    zeta._private_key = zeta_private
+    zeta.identity = None
+    zeta._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(parent_did=root_did, child_did=zeta_did, ttl_seconds=0),
+        root_private,
+    )
+    leaf = _make_mock_agent(leaf_did)
+    leaf._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(parent_did=zeta_did, child_did=leaf_did, ttl_seconds=0),
+        zeta_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    for name, agent in (
+        ("Root", root),
+        ("Zeta", zeta),
+        ("Alpha", alpha),
+        ("Leaf", leaf),
+    ):
+        manager._register_agent(name, agent)
+
+    # This is the mutation that used to erase all parental control after a
+    # restart: the unsigned runtime projection is deliberately unavailable.
+    manager._parent_children.clear()
+
+    assert await manager.get_authoritative_children(root_did) == ["Alpha", "Zeta"]
+    assert await manager.get_authoritative_descendants(root_did) == [
+        "Alpha",
+        "Zeta",
+        "Leaf",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_reverifies_projected_receipt(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xQueryParent"
+    child_did = "did:pkh:eip155:1:0xQueryChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Parent", parent)
+    manager._register_agent("Child", child)
+
+    mandate.purpose = "tampered after projection"
+
+    with pytest.raises(SpawnAuthorityGraphError, match="invalid mandate"):
+        await manager.get_authoritative_children(parent_did)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_rejects_signed_cycle(tmp_path):
+    first_did = "did:pkh:eip155:1:0xQueryCycleFirst"
+    second_did = "did:pkh:eip155:1:0xQueryCycleSecond"
+    first_private, _ = generate_secp256k1_keypair()
+    second_private, _ = generate_secp256k1_keypair()
+    first = _make_mock_agent(first_did)
+    first._private_key = first_private
+    first.identity = None
+    second = _make_mock_agent(second_did)
+    second._private_key = second_private
+    second.identity = None
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents.update({"First": first, "Second": second})
+    manager._agent_names.update({first_did: "First", second_did: "Second"})
+    manager._child_mandates.update(
+        {
+            "First": sign_mandate(
+                SpawnMandate(parent_did=second_did, child_did=first_did),
+                second_private,
+            ),
+            "Second": sign_mandate(
+                SpawnMandate(parent_did=first_did, child_did=second_did),
+                first_private,
+            ),
+        }
+    )
+
+    with pytest.raises(SpawnAuthorityGraphError, match="cycle"):
+        await manager.get_authoritative_descendants(first_did)
+
+
+@pytest.mark.asyncio
+async def test_terminate_child_ignores_forged_runtime_projection(tmp_path):
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._parent_children["did:test:parent"] = ["Forged"]
+    manager.remove_agent = AsyncMock(return_value=True)
+
+    assert await manager.terminate_child("did:test:parent", "Forged") is False
+    manager.remove_agent.assert_not_awaited()
 
 
 def test_failed_onboarding_rolls_back_rehydrated_parent_authority(tmp_path):
@@ -4509,6 +4621,9 @@ class TestAgentManagerBasics:
         manager._parent_children[parent_did] = ["Child"]
         mandate = SpawnMandate(parent_did=parent_did, purpose="offboard")
         manager._child_mandates["Child"] = mandate
+        manager.get_authoritative_children = AsyncMock(
+            side_effect=manager.get_children
+        )
         retained = RuntimeOffboardingRetainedError(
             agent_name="Child",
             agent_id=child.agent_id,
@@ -4541,6 +4656,9 @@ class TestAgentManagerBasics:
             manager._child_mandates[name] = SpawnMandate(
                 parent_did=parent_did, purpose="cascade"
             )
+        manager.get_authoritative_children = AsyncMock(
+            side_effect=manager.get_children
+        )
         retained = RuntimeOffboardingRetainedError(
             agent_name="First",
             agent_id="did:pkh:first",
@@ -4591,6 +4709,9 @@ class TestAgentManagerBasics:
         manager._child_mandates["Child"] = SpawnMandate(
             parent_did=parent_did, purpose="cascade"
         )
+        manager.get_authoritative_children = AsyncMock(
+            side_effect=manager.get_children
+        )
         descendant_retained = RuntimeOffboardingRetainedError(
             agent_name="Grandchild",
             agent_id="did:pkh:grandchild",
@@ -4625,6 +4746,9 @@ class TestAgentManagerBasics:
         manager = AgentManager()
         parent_did = "did:pkh:reconcile-parent"
         manager._parent_children[parent_did] = ["Child"]
+        manager.get_authoritative_children = AsyncMock(
+            side_effect=manager.get_children
+        )
         manager.remove_agent = AsyncMock(return_value=True)
         cause = OSError("private reconciliation path /operator/runtime")
         manager._prune_child_tracking_if_fully_removed = AsyncMock(

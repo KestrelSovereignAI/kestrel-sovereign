@@ -874,7 +874,7 @@ class SpawnFeature(Feature):
             return ToolResult.failed(error="No AgentManager available")
 
         parent_did = self.agent.agent_id
-        child_names = manager.get_children(parent_did)
+        child_names = await manager.get_authoritative_children(parent_did)
         lifecycle = self._get_lifecycle(manager)
 
         children = []
@@ -948,7 +948,8 @@ class SpawnFeature(Feature):
 
         # Verify this is actually our child
         parent_did = self.agent.agent_id
-        if child_name not in manager.get_children(parent_did):
+        authoritative_children = await manager.get_authoritative_children(parent_did)
+        if child_name not in authoritative_children:
             return ToolResult.failed(
                 error=f"Agent '{child_name}' is not a child of this agent"
             )
@@ -1103,7 +1104,8 @@ class SpawnFeature(Feature):
 
         # Verify this is our child
         parent_did = self.agent.agent_id
-        if child_name not in manager.get_children(parent_did):
+        authoritative_children = await manager.get_authoritative_children(parent_did)
+        if child_name not in authoritative_children:
             return ToolResult.failed(
                 error=f"Agent '{child_name}' is not a child of this agent"
             )
