@@ -599,6 +599,41 @@ def test_creator_cancellation_rejects_unsigned_actor(app_with_send):
     agent.task_manager.cancel_task.assert_not_awaited()
 
 
+def test_hosted_legacy_unsigned_peer_cannot_impersonate_cancellation_actor(
+    app_with_send,
+):
+    """Task-creation compatibility never grants destructive peer authority."""
+    agent = _stub_agent()
+    _manager, victim = _install_hosted_legacy_unsigned_manager(
+        agent,
+        AsyncMock(return_value=True),
+        sender_name="victim",
+        sender_display_name="Victim",
+    )
+    agent.task_manager.cancel_task = AsyncMock()
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/preexisting/cancel",
+            json={
+                "reason": "forged",
+                "sessionId": "a2a-cancel:preexisting",
+                "metadata": {
+                    "sender": "Victim",
+                    "a2a_verb": "cancel_task",
+                },
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "A2A cancellation requires a verified sender signature"
+    )
+    assert victim.did == "did:pkh:hosted:victim"
+    agent.task_manager.cancel_task.assert_not_awaited()
+
+
 def test_scoped_valid_signed_sender_is_authorized_after_verification(
     app_with_send,
 ):

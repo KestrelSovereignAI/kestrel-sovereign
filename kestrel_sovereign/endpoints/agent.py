@@ -2255,6 +2255,16 @@ async def _create_a2a_task_under_lifecycle_lease(
             status_code=403,
             detail=f"A2A sender verification failed: {sender_verdict.reason}",
         )
+    if callable(commit) and not sender_verdict.verified:
+        # Legacy unsigned envelopes are a narrow task-creation compatibility
+        # lane. They cannot authorize a destructive lifecycle transition: the
+        # shared host API key authenticates transport access, not the peer name
+        # in caller-controlled metadata. Local Core callers use the separate
+        # host-attested submission/cancellation contract instead.
+        raise HTTPException(
+            status_code=403,
+            detail="A2A cancellation requires a verified sender signature",
+        )
     if hosted_policy is not None:
         if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
             raise HTTPException(
