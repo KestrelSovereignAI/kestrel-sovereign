@@ -651,22 +651,22 @@ async def mark_deferral_started(
 
 async def clear_deferral_started(
     db, request_id: str, *, expected_current_status: str,
-) -> bool:
-    """Clear a busy interval after fleet quiescence is observed."""
+) -> Optional[RestartRequest]:
+    """Clear a busy interval and return the exact newly resealed row."""
 
     current = await get_request(db, request_id)
     if current is None:
-        return False
+        return None
     verified, _ = verify_restart_authority(current)
     if not verified:
-        return False
+        return None
     try:
         authority_evidence, authority_signature = reseal_restart_safety_state(
             current,
             first_blocked_at="",
         )
     except RestartAuthorityError:
-        return False
+        return None
     result = await db.execute(
         "UPDATE restart_requests SET first_blocked_at = '', "
         "authority_evidence = ?, authority_signature = ? "
@@ -681,9 +681,20 @@ async def clear_deferral_started(
             current.authority_signature,
         ),
     )
-    return await _write_landed(
+    landed = await _write_landed(
         db, result, request_id, lambda row: row.first_blocked_at == "",
     )
+    if not landed:
+        return None
+    refreshed = await get_request(db, request_id)
+    if (
+        refreshed is None
+        or refreshed.status != expected_current_status
+        or refreshed.first_blocked_at
+        or refreshed.authority_signature != authority_signature
+    ):
+        return None
+    return refreshed
 
 
 async def acknowledge_escalation(

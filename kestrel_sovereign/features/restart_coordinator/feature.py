@@ -1072,6 +1072,14 @@ class RestartCoordinatorFeature(Feature):
             # here records the audit log and decides retryable vs
             # terminal; only a clean update proceeds to the spawn.
             if req.operation == "update_then_restart":
+                # The transition and status event both await external work.
+                # Re-verify at the actual mutation boundary so key rotation
+                # during either await revokes the update as well as restart.
+                if await self._reject_invalid_authority(
+                    req,
+                    expected_current_status="updating",
+                ):
+                    continue
                 handled = await self._handle_update_then_restart(req)
                 if handled is not None:
                     # Either deferred (retryable) or rejected (terminal).
@@ -1435,12 +1443,15 @@ class RestartCoordinatorFeature(Feature):
             # A genuinely idle observation breaks the continuous-deferral
             # interval. An escalation that proceeds while busy deliberately
             # retains its evidence if dispatch later fails and the row retries.
-            if await clear_deferral_started(
+            cleared = await clear_deferral_started(
                 self._db,
                 req.id,
                 expected_current_status=req.status,
-            ):
-                req.first_blocked_at = ""
+            )
+            if cleared is not None:
+                # The clear reseals authority evidence. Continue with that
+                # exact durable row, never the pre-clear in-memory signature.
+                req = cleared
             else:
                 refreshed = await get_request(self._db, req.id)
                 verified = (

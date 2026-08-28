@@ -950,6 +950,32 @@ async def test_executor_defers_when_agent_reports_active_request(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_executor_uses_resealed_row_after_idle_deferral_clears(tmp_path):
+    """An idle observation must dispatch the exact row resealed by the clear."""
+
+    feat, backend = await _make_feature(tmp_path)
+    feat.agent._active_request_ids.add("busy-turn")
+    created = await feat.request_restart(reason="wait for idle")
+    request_id = created.data["request"]["id"]
+
+    await feat.restart_coordinator()
+    blocked = await get_request(backend, request_id)
+    assert blocked.first_blocked_at
+
+    feat.agent._active_request_ids.clear()
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    mock_spawn.assert_called_once()
+    assert result.data["executed"][0]["request_id"] == request_id
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    assert row.first_blocked_at == ""
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("racing_status", ["canceled", "executing"])
 async def test_deferral_status_race_cannot_dispatch_or_resurrect_request(
     tmp_path, racing_status,
@@ -1055,7 +1081,7 @@ async def test_deferral_clear_cannot_reset_competing_execution_interval(tmp_path
         expected_current_status="pending",
     )
 
-    assert cleared is False
+    assert cleared is None
     row = await get_request(backend, request_id)
     assert row.status == "executing"
     assert row.first_blocked_at == blocked_at
@@ -1078,12 +1104,12 @@ async def test_deferral_clock_transitions_reseal_exact_safety_state(tmp_path):
     assert marked.first_blocked_at == blocked_at
     assert verify_restart_authority(marked)[0] is True
 
-    assert await clear_deferral_started(
+    cleared = await clear_deferral_started(
         backend,
         request_id,
         expected_current_status="pending",
     )
-    cleared = await get_request(backend, request_id)
+    assert cleared is not None
     assert cleared.first_blocked_at == ""
     assert verify_restart_authority(cleared)[0] is True
 
@@ -1492,6 +1518,41 @@ async def test_executor_reverifies_at_restart_boundary(
     row = await get_request(backend, request_id)
     assert row.status == "rejected"
     assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_reverifies_at_update_mutation_boundary(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="rotate before update",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def rotate_after_updating_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "updating":
+            monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-update")
+
+    feat._emit_status_event = rotate_after_updating_transition
+    with patch.object(
+        RestartCoordinatorFeature, "_run_update",
+    ) as run_update, patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    run_update.assert_not_called()
     mock_spawn.assert_not_called()
 
 
