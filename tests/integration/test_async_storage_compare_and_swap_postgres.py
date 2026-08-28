@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -97,6 +98,47 @@ async def test_concurrent_create_exactly_one_wins_on_backend(graph_store):
     results = await asyncio.gather(*(create(i) for i in range(8)))
     assert sum(1 for r in results if r == NodeSwapResult.SWAPPED) == 1
     assert sum(1 for r in results if r == NodeSwapResult.PREDICATE_FAILED) == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_compare_and_create_waits_for_absent_node_reservation(graph_store):
+    """CAS creation shares the lock protocol used by composed graph writers."""
+
+    nid = _nid("create-reservation")
+    reservation_acquired = asyncio.Event()
+    release_reservation = asyncio.Event()
+
+    async def reserve():
+        async with graph_store.db.transaction():
+            await graph_store.lock_nodes_for_update([nid])
+            reservation_acquired.set()
+            await release_reservation.wait()
+
+    holder = asyncio.create_task(reserve())
+    creator = None
+    try:
+        await asyncio.wait_for(reservation_acquired.wait(), timeout=5)
+        creator = asyncio.create_task(
+            graph_store.compare_and_swap_node(
+                nid,
+                None,
+                _node(nid, {"creator": "cas"}),
+            )
+        )
+        await asyncio.sleep(0.1)
+        assert not creator.done(), (
+            "compare-and-create bypassed the absent-node reservation"
+        )
+        release_reservation.set()
+        assert await asyncio.wait_for(creator, timeout=5) == NodeSwapResult.SWAPPED
+    finally:
+        release_reservation.set()
+        pending = [task for task in (holder, creator) if task is not None]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -597,6 +639,81 @@ async def test_edge_admission_waits_for_endpoint_delete_on_backend(
         "WHERE source_id = ? AND target_id = ? AND label = ?",
         (source_id, target_id, "references"),
     ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_bound_edge_preflights_foreign_target_before_lock(
+    graph_store, monkeypatch
+):
+    """A rejected tenant edge never queues behind a foreign graph row."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL has per-row locks; SQLite has one writer slot")
+    owner = f"agent:{uuid.uuid4().hex}"
+    foreign_owner = f"agent:{uuid.uuid4().hex}"
+    source_id = _nid("owned-edge-source")
+    foreign_id = _nid("foreign-edge-target")
+    bound = AsyncGraphStore(graph_store.db, agent_id=owner)
+    foreign = AsyncGraphStore(graph_store.db, agent_id=foreign_owner)
+    await bound.add_node(
+        _node(source_id, {"agent_id": owner}, node_type="owned")
+    )
+    await foreign.add_node(
+        _node(foreign_id, {"agent_id": foreign_owner}, node_type="owned")
+    )
+
+    lock = AsyncMock(return_value=[source_id, foreign_id])
+    monkeypatch.setattr(graph_store_module, "lock_graph_nodes_for_update", lock)
+
+    with pytest.raises(Exception, match="endpoints"):
+        await bound.add_edge(source_id, foreign_id, "references")
+
+    lock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_trusted_edge_locks_only_owned_source(
+    graph_store, monkeypatch
+):
+    """Trusted lineage never locks the deliberately foreign target row."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL has per-row locks; SQLite has one writer slot")
+    owner = f"agent:{uuid.uuid4().hex}"
+    foreign_owner = f"agent:{uuid.uuid4().hex}"
+    source_id = _nid("trusted-edge-source")
+    foreign_id = _nid("trusted-edge-target")
+    bound = AsyncGraphStore(graph_store.db, agent_id=owner)
+    foreign = AsyncGraphStore(graph_store.db, agent_id=foreign_owner)
+    await bound.add_node(
+        _node(source_id, {"agent_id": owner}, node_type="owned")
+    )
+    await foreign.add_node(
+        _node(foreign_id, {"agent_id": foreign_owner}, node_type="owned")
+    )
+
+    original_lock = graph_store_module.lock_graph_nodes_for_update
+    locked = []
+
+    async def observe_lock(db, node_ids):
+        locked.append(list(node_ids))
+        return await original_lock(db, node_ids)
+
+    monkeypatch.setattr(
+        graph_store_module,
+        "lock_graph_nodes_for_update",
+        observe_lock,
+    )
+
+    await bound.add_trusted_cross_agent_edge(
+        source_id,
+        foreign_id,
+        "spawned_by",
+    )
+
+    assert locked == [[source_id]]
 
 
 @pytest.mark.asyncio

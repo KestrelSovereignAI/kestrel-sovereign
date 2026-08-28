@@ -492,16 +492,18 @@ async def _acquire_sqlite_graph_writer_slot(db: AsyncDatabase) -> None:
         await db.execute("UPDATE graph_nodes SET node_id = node_id WHERE 0")
 
 
-async def lock_graph_nodes_for_update(
+async def _lock_graph_node_ids_for_insert(
     db: AsyncDatabase,
     node_ids: Iterable[str],
 ) -> List[str]:
-    """Lock graph rows in the canonical order before ownership mutation.
+    """Reserve graph identifiers in canonical order, including absent rows.
 
-    Callers own the surrounding transaction. SQLite obtains serialization from
-    that transaction's writer lock; PostgreSQL needs explicit row locks. The
-    sorted return value lets every caller process overlapping batches in the
-    same order.
+    PostgreSQL row locks cannot cover a missing row.  The graph therefore has
+    one transaction-advisory namespace shared by composed write-set locks and
+    compare-and-create.  SQLite's writer slot provides the equivalent
+    serialization.  This helper deliberately does not lock physical rows: a
+    caller that has already established absence must not acquire a foreign
+    tenant's row lock if another writer won just before the reservation.
     """
 
     unique_node_ids = sorted(
@@ -513,12 +515,6 @@ async def lock_graph_nodes_for_update(
     if db.backend_type != "postgres":
         return unique_node_ids
 
-    # Row locks do not cover absent identifiers. Reanchor and other composed
-    # writers may be about to INSERT the complete set, so take transaction-
-    # scoped advisory locks first. Derive and sort the keys independently of
-    # caller order; the hash namespace keeps them separate from other advisory
-    # lock protocols in this database. Hash collisions only serialize unrelated
-    # graph IDs and cannot weaken correctness.
     advisory_keys = sorted(
         {
             int.from_bytes(
@@ -540,7 +536,31 @@ async def lock_graph_nodes_for_update(
             "ORDER BY lock_key",
             tuple(batch),
         )
+    return unique_node_ids
 
+
+async def lock_graph_nodes_for_update(
+    db: AsyncDatabase,
+    node_ids: Iterable[str],
+) -> List[str]:
+    """Lock graph rows in the canonical order before ownership mutation.
+
+    Callers own the surrounding transaction. SQLite obtains serialization from
+    that transaction's writer lock; PostgreSQL needs explicit row locks. The
+    sorted return value lets every caller process overlapping batches in the
+    same order.
+    """
+
+    unique_node_ids = await _lock_graph_node_ids_for_insert(db, node_ids)
+    if db.backend_type != "postgres":
+        return unique_node_ids
+
+    # Row locks do not cover absent identifiers. Reanchor and other composed
+    # writers may be about to INSERT the complete set, so take transaction-
+    # scoped advisory locks first. Derive and sort the keys independently of
+    # caller order; the hash namespace keeps them separate from other advisory
+    # lock protocols in this database. Hash collisions only serialize unrelated
+    # graph IDs and cannot weaken correctness.
     for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
         batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
         placeholders = ", ".join("?" for _ in batch)
@@ -1138,6 +1158,29 @@ class AsyncGraphStore:
                 self._refuse_unshareable_properties(
                     (new_node.node_type, new_node.label), new_node.properties, node_id
                 )
+                if self.db.backend_type == "postgres" and owner:
+                    # Refuse an already-present foreign id before taking this
+                    # graph namespace's advisory lock.  The scoped result is
+                    # unchanged (NOT_FOUND), but one tenant cannot make an
+                    # invalid create queue behind another tenant's row work.
+                    visibility = await self.db.fetchone(
+                        "SELECT "
+                        "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?), "
+                        "EXISTS(SELECT 1 FROM graph_node_owners "
+                        "       WHERE node_id = ? AND agent_id = ?)",
+                        (node_id, node_id, owner),
+                    )
+                    if visibility and visibility[0]:
+                        return (
+                            NodeSwapResult.PREDICATE_FAILED
+                            if visibility[1]
+                            else NodeSwapResult.NOT_FOUND
+                        )
+                # Share the absent-row reservation used by composed graph
+                # writers.  Without this, PostgreSQL's conflict-safe INSERT
+                # can land while another transaction believes its complete
+                # (currently absent) graph write set is exclusively reserved.
+                await _lock_graph_node_ids_for_insert(self.db, [node_id])
                 affected = await self.db.execute(
                     self._insert_if_absent_node_sql(),
                     (node_id, new_node.node_type, new_node.label, new_properties),
@@ -1685,12 +1728,62 @@ class AsyncGraphStore:
         requested_owner = self.agent_id or declared or ""
 
         async with self.db.transaction():
+            if self.db.backend_type == "postgres" and requested_owner:
+                # Establish tenant scope before taking a physical/advisory row
+                # lock.  Invalid ordinary edges must not let a tenant queue on
+                # a foreign endpoint, while trusted lineage intentionally owns
+                # only its source and never locks its foreign/absent target.
+                preflight_owners = await self.db.fetchone(
+                    "SELECT "
+                    "EXISTS(SELECT 1 FROM graph_node_owners "
+                    "       WHERE node_id = ? AND agent_id = ?), "
+                    "EXISTS(SELECT 1 FROM graph_node_owners "
+                    "       WHERE node_id = ? AND agent_id = ?), "
+                    "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?)",
+                    (
+                        source_id,
+                        requested_owner,
+                        target_id,
+                        requested_owner,
+                        target_id,
+                    ),
+                )
+                preflight_owns_source = bool(
+                    preflight_owners and preflight_owners[0]
+                )
+                preflight_owns_target = bool(
+                    preflight_owners and preflight_owners[1]
+                )
+                preflight_target_exists = bool(
+                    preflight_owners and preflight_owners[2]
+                )
+                if trusted_cross_agent:
+                    if not preflight_owns_source:
+                        raise ValueError(
+                            "Trusted cross-agent edge source is not owned by the bound agent"
+                        )
+                elif not (
+                    preflight_owns_source
+                    and preflight_owns_target
+                    and preflight_target_exists
+                ):
+                    raise ValueError(
+                        "Graph edge endpoints are not both owned by the bound agent"
+                    )
+
             # Node deletion and ownership release take graph rows before any
-            # edge ledger row. Edge admission must use the same order and lock
-            # both endpoints together (sorted by the shared helper), otherwise
-            # PostgreSQL can validate a soon-to-be-deleted witness through MVCC
-            # and commit a dangling edge after node cleanup has passed it.
-            await lock_graph_nodes_for_update(self.db, [source_id, target_id])
+            # edge ledger row. Ordinary edge admission must use the same order
+            # and lock both endpoints together (sorted by the shared helper),
+            # otherwise PostgreSQL can validate a soon-to-be-deleted witness
+            # through MVCC and commit a dangling edge after node cleanup has
+            # passed it. Trusted cross-agent edges deliberately permit an
+            # absent/foreign target, so only their owned source participates.
+            lock_ids = (
+                [source_id]
+                if self.db.backend_type == "postgres" and trusted_cross_agent
+                else [source_id, target_id]
+            )
+            await lock_graph_nodes_for_update(self.db, lock_ids)
             endpoint_rows = await self.db.fetchone(
                 "SELECT "
                 "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?), "

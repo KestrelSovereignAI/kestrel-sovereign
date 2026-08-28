@@ -368,6 +368,7 @@ class SkillsFeature(Feature):
                         expected_label=node.label,
                     )
                     removed_node = result == "deleted"
+                    graph_delete_failed = result == "predicate_failed"
             except Exception as e:
                 logger.warning("Could not remove skill node %s: %s", skill_id, e)
                 graph_delete_failed = True
@@ -386,10 +387,10 @@ class SkillsFeature(Feature):
         #    graph delete succeeded — the file will resurrect on the
         #    next list/save.
         # 2. File deletion succeeded AND a graph get_node/compare-and-delete
-        #    call actually *raised* — the graph node may still surface
-        #    in associative recall. (We can't reliably tell "raised
-        #    because already absent" from "raised because backend down"
-        #    without backend-specific introspection, so this caveat is
+        #    call raised or its atomic identity predicate failed — the graph
+        #    node may still surface in associative recall. (We can't reliably
+        #    tell "raised because already absent" from "raised because backend
+        #    down" without backend-specific introspection, so this caveat is
         #    conservatively spoken.)
         #
         # Cases that are NOT asymmetric and stay OK (codex round 2 of
@@ -416,7 +417,7 @@ class SkillsFeature(Feature):
                 data=data,
             )
         if removed_file and graph_delete_failed:
-            # Case 2: file went, graph get_node/compare-and-delete raised.
+            # Case 2: file went, graph deletion raised or lost an identity race.
             # Conservative PARTIAL — see comment above.
             caveat = (
                 f"file removed but graph node {skill_id} could not be "

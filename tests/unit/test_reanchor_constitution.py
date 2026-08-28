@@ -76,6 +76,20 @@ def test_both_reanchor_writers_prelock_the_complete_shared_node_set():
         assert locked_names == expected
 
 
+def test_governance_helper_prelocks_both_endpoints_before_writing():
+    """Every caller of the composed helper gets one canonical outer lock set."""
+
+    calls = _graph_write_calls(ConstitutionMixin._anchor_constitution_governance)
+    lock_calls = [entry for entry in calls if entry[1] == "lock_nodes_for_update"]
+    add_calls = [entry for entry in calls if entry[1] == "add_node"]
+    assert len(lock_calls) == 1
+    assert add_calls
+    assert lock_calls[0][0] < add_calls[0][0]
+    assert {
+        ast.unparse(element) for element in lock_calls[0][2].args[0].elts
+    } == {"self.agent_id", "constitution_hash"}
+
+
 @pytest.fixture(autouse=True)
 def _operator_pinned_root(tmp_path, monkeypatch):
     """Every authorization test uses a root outside the mocked graph DB."""

@@ -512,6 +512,33 @@ class TestListShowDelete:
         )
         feature.agent.storage.delete_node.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_delete_race_after_file_unlink_reports_partial(self, feature):
+        """A replacement graph node surviving file deletion is spoken aloud."""
+
+        skill_id = "skill-raced-after-unlink"
+        path = feature._skill_path(skill_id)
+        path.write_text("authoritative skill", encoding="utf-8")
+        feature.agent.storage.get_node = AsyncMock(
+            return_value=SimpleNamespace(
+                node_type=SKILL_NODE_TYPE,
+                label="Observed skill",
+            )
+        )
+        feature.agent.storage.compare_and_delete_node = AsyncMock(
+            return_value="predicate_failed"
+        )
+
+        envelope = await feature.skill_delete(skill_id=skill_id)
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data == {
+            "skill_id": skill_id,
+            "removed_file": True,
+            "removed_node": False,
+        }
+        assert not path.exists()
+
 
 # =============================================================================
 # Module-level constants used by callers

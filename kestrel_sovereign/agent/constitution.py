@@ -1573,6 +1573,9 @@ class ConstitutionMixin:
         """
         pruned: list[str] = []
         async with self.storage.transaction():
+            await self.storage.lock_nodes_for_update(
+                [self.agent_id, constitution_hash]
+            )
             if await self.storage.get_node(constitution_hash) is None:
                 constitution_node = GraphNode(
                     node_id=constitution_hash,

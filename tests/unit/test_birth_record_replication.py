@@ -20,6 +20,10 @@ Mutation traps this file is written against:
   The second pass here runs against an already-populated target.
 """
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 
 from kestrel_sovereign.identity.birth_record import (
@@ -45,6 +49,28 @@ from kestrel_sovereign.storage.async_rag_store import (
 
 TEST_DOMAIN = "agents.kestrel-sovereign.test"
 TEST_DATA_KEY = "test-master-key-for-encryption-32chars!"
+
+
+def test_replication_prelocks_graph_write_set_before_first_graph_write():
+    """The outer transaction cannot acquire endpoint locks piecemeal."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(replicate_birth_record)))
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {
+                "lock_nodes_for_update",
+                "add_node",
+                "add_edge",
+                "add_trusted_cross_agent_edge",
+            }:
+                calls.append((node.lineno, node.func.attr))
+    calls.sort()
+    lock_calls = [line for line, name in calls if name == "lock_nodes_for_update"]
+    write_calls = [line for line, name in calls if name != "lock_nodes_for_update"]
+    assert len(lock_calls) == 1
+    assert write_calls
+    assert lock_calls[0] < write_calls[0]
 
 
 @pytest.fixture
