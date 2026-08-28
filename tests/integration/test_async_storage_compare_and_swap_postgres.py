@@ -789,3 +789,59 @@ async def test_complete_write_set_locks_absent_node_ids_on_backend(graph_store):
             if not task.done():
                 task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_bulk_existing_write_set_does_not_retain_advisory_locks(
+    graph_store,
+):
+    """Bulk purge/import locking scales with rows, not shared advisory slots."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL exposes transaction advisory locks")
+
+    prefix = _nid("bulk-existing-lock") + ":"
+    count = 1500
+    node_ids = [f"{prefix}{index}" for index in range(count)]
+    await graph_store.db.execute(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+        "SELECT ? || series::text, 'owned', 'Bulk', '{}' "
+        "FROM generate_series(0, ?) AS series",
+        (prefix, count - 1),
+    )
+
+    try:
+        async with graph_store.db.transaction():
+            await graph_store.lock_nodes_for_update(node_ids)
+            held = await graph_store.db.fetchone(
+                "SELECT COUNT(*) FROM pg_locks "
+                "WHERE pid = pg_backend_pid() AND locktype = 'advisory'"
+            )
+            assert held == (0,)
+    finally:
+        await graph_store.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id LIKE ?",
+            (f"{prefix}%",),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_absent_write_set_advisory_reservations_are_capped(
+    graph_store,
+):
+    """A malformed bulk create cannot exhaust PostgreSQL's shared lock table."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL exposes transaction advisory locks")
+
+    absent_ids = [_nid(f"absent-cap-{index}") for index in range(129)]
+    async with graph_store.db.transaction():
+        with pytest.raises(ValueError, match="at most 128 absent node ids"):
+            await graph_store.lock_nodes_for_update(absent_ids)
+        held = await graph_store.db.fetchone(
+            "SELECT COUNT(*) FROM pg_locks "
+            "WHERE pid = pg_backend_pid() AND locktype = 'advisory'"
+        )
+        assert held == (0,)

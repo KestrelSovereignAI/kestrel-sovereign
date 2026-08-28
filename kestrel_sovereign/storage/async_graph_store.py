@@ -31,6 +31,7 @@ from .async_conversation_store import _rows_affected
 logger = logging.getLogger(__name__)
 
 _DELETE_ID_BATCH = 500
+_MAX_ABSENT_NODE_ADVISORY_LOCKS = 128
 
 #: A SHA-256 digest as this codebase writes them: lowercase hex, 64 chars.
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -515,6 +516,12 @@ async def _lock_graph_node_ids_for_insert(
     if db.backend_type != "postgres":
         return unique_node_ids
 
+    if len(unique_node_ids) > _MAX_ABSENT_NODE_ADVISORY_LOCKS:
+        raise ValueError(
+            "A graph write may reserve at most "
+            f"{_MAX_ABSENT_NODE_ADVISORY_LOCKS} absent node ids per transaction"
+        )
+
     advisory_keys = sorted(
         {
             int.from_bytes(
@@ -551,18 +558,44 @@ async def lock_graph_nodes_for_update(
     same order.
     """
 
-    unique_node_ids = await _lock_graph_node_ids_for_insert(db, node_ids)
+    unique_node_ids = sorted(
+        dict.fromkeys(node_id for node_id in node_ids if node_id)
+    )
+    if db.backend_type == "sqlite":
+        await _acquire_sqlite_graph_writer_slot(db)
+        return unique_node_ids
     if db.backend_type != "postgres":
         return unique_node_ids
 
-    # Row locks do not cover absent identifiers. Reanchor and other composed
-    # writers may be about to INSERT the complete set, so take transaction-
-    # scoped advisory locks first. Derive and sort the keys independently of
-    # caller order; the hash namespace keeps them separate from other advisory
-    # lock protocols in this database. Hash collisions only serialize unrelated
-    # graph IDs and cannot weaken correctness.
+    # Existing rows need only ordinary row locks. Taking one transaction-level
+    # advisory lock for every row in a bulk purge/import exhausts PostgreSQL's
+    # shared lock table on large tenant graphs because batching the statements
+    # does not release locks before commit. Lock every existing row first, then
+    # reserve only the identifiers that are genuinely absent. All callers use
+    # that same row-before-absent order, while the absent helper enforces a hard
+    # bound suitable for the small composed creation sets that need it.
+    existing_ids: set[str] = set()
     for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
         batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = await db.fetchall(
+            "SELECT node_id FROM graph_nodes "
+            f"WHERE node_id IN ({placeholders}) "
+            "ORDER BY node_id FOR UPDATE",
+            tuple(batch),
+        )
+        existing_ids.update(row[0] for row in rows)
+
+    absent_ids = [
+        node_id for node_id in unique_node_ids if node_id not in existing_ids
+    ]
+    await _lock_graph_node_ids_for_insert(db, absent_ids)
+
+    # A creator may have committed while this transaction waited for an absent-
+    # id reservation. Re-lock any such newly-present row while the reservation
+    # is held so deletion/ownership mutation cannot race its physical row.
+    for start in range(0, len(absent_ids), _DELETE_ID_BATCH):
+        batch = absent_ids[start:start + _DELETE_ID_BATCH]
         placeholders = ", ".join("?" for _ in batch)
         await db.fetchall(
             "SELECT node_id FROM graph_nodes "
