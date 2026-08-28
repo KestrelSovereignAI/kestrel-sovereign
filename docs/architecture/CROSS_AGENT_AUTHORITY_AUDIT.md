@@ -57,6 +57,7 @@ narrow, revocable, signed delegation.
 | Discover peers | `list_peers`; `GET /api/agents` | Agents in the requester's automatic directory | Universal policy (read-only) | `PeerDirectoryRouter.list_peers` scopes feature discovery. Host discovery is authenticated but intentionally contains public agent cards; mutation authority does not follow from visibility. |
 | Synchronous peer message | `ask_agent` | One directory-resolved peer | Universal policy (communication) | The router resolves in trusted `PeerRequester.authorization_scope` and must reauthorize `invoke`. The request creates causation, not control authority. |
 | Asynchronous peer message/question/task | `send_a2a_message`, `send_a2a_question`, `send_a2a_task`; `POST /api/agent/tasks/send` | One directory-resolved recipient | Universal policy (communication) | Outbound routing reauthorizes the stable peer identity; inbound hosted delivery requires a verified sender/scoped authorizer. Signed-envelope verification authenticates the sender but does not create hierarchy. |
+| External webhook ingress | `POST /webhooks/{webhook_name}`; Rasa `POST /webhooks/rest/webhook` | The request-bound agent or uniquely configured receiver | Universal policy (bounded ingress) | The route binds the target from trusted request state/receiver registration and the configured receiver authenticates and rate-limits the payload. Rasa uses its sovereign-configured shared secret and the host-bound agent; payload sender fields create no agent authority. |
 | Read outbound peer result/audit | `get_peer_task_result`, `list_outbound_a2a_tasks` | A task created by the caller | Self (creator) | Outbound records retain creator/recipient binding. Shared-store reads and HTTP/SSE still need durable principal predicates: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | Read task inbox/status/result | `check_task_status`, `list_my_tasks`, `get_task_result`; task GET/list/SSE endpoints | Recipient inbox or creator-owned result | Self (recipient or creator, according to operation) | Current task-ID/full-table reads are not consistently principal-scoped on shared PostgreSQL. Defect: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | Respond/fail/complete or attach artifact | `respond_to_a2a_task`, `attach_artifact_to_a2a_task` | An incoming A2A task | Self (recipient) | Current mutations use task ID without an atomic recipient predicate. Defect: [#3144](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3144). |
@@ -129,7 +130,9 @@ cannot silently appear.
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents` | Authenticated read-only host discovery. |
 | `kestrel_sovereign/endpoints/models.py::POST /api/agents` | Sovereign/delegated host lifecycle; #3149. |
 | `kestrel_sovereign/endpoints/restart_events.py::GET /api/restart/status-events` | Requester/explicit host-coordination read; #3146. |
+| `kestrel_sovereign/endpoints/rasa_shim.py::POST /webhooks/rest/webhook` | Sovereign-configured, authenticated ingress to the host-bound agent; payload sender is not authority. |
 | `kestrel_sovereign/endpoints/spawn.py::GET /api/spawn/children` | Read-only child status projected from verified relationships. |
+| `kestrel_sovereign/features/webhooks/receiver.py::POST /webhooks/{webhook_name}` | Bounded ingress to the request-scoped or uniquely configured receiver; webhook auth does not create agent hierarchy. |
 
 ## Review rule
 

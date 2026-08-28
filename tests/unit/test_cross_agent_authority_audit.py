@@ -9,7 +9,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = REPO_ROOT / "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md"
 TOOL_KEYWORDS = ("agent", "peer", "a2a", "child", "restart", "task")
-HTTP_SEGMENTS = {"agents", "tasks", "stop", "restart", "a2a", "peers", "children"}
+HTTP_SEGMENTS = {
+    "agents",
+    "tasks",
+    "stop",
+    "restart",
+    "a2a",
+    "peers",
+    "children",
+    "webhooks",
+}
 HTTP_EXACT_ROUTES = {"/api/agent/invoke"}
 SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/(?:features|endpoints)/[^`]+)`\s*\|"
@@ -57,7 +66,9 @@ def _discovered_tool_surfaces() -> set[str]:
 
 
 def _router_prefix(tree: ast.Module) -> str:
-    for node in tree.body:
+    # Feature routers are commonly built inside ``get_router`` factories, so
+    # the APIRouter assignment is not necessarily at module scope.
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
         if not any(isinstance(target, ast.Name) and target.id == "router" for target in node.targets):
@@ -95,11 +106,15 @@ def _route_methods(decorator: ast.Call) -> tuple[str, ...]:
 
 def _discovered_http_surfaces() -> set[str]:
     surfaces: set[str] = set()
-    endpoint_root = REPO_ROOT / "kestrel_sovereign/endpoints"
-    for path in endpoint_root.rglob("*.py"):
+    roots = (
+        REPO_ROOT / "kestrel_sovereign/endpoints",
+        REPO_ROOT / "kestrel_sovereign/features",
+    )
+    paths = sorted({path for root in roots for path in root.rglob("*.py")})
+    for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         prefix = _router_prefix(tree)
-        for node in tree.body:
+        for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for decorator in node.decorator_list:
@@ -145,6 +160,13 @@ def test_every_cross_agent_http_route_is_classified() -> None:
     )
 
 
+def test_feature_contributed_nested_webhook_router_is_discovered() -> None:
+    assert (
+        "kestrel_sovereign/features/webhooks/receiver.py::"
+        "POST /webhooks/{webhook_name}"
+    ) in _discovered_http_surfaces()
+
+
 def test_api_route_declarations_expand_every_registered_method() -> None:
     decorator = ast.parse(
         '@router.api_route("/api/tasks", methods=["POST", "PUT"])\n'
@@ -179,6 +201,17 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             for term in ("authoriz", "permission")
         )
         for node in ast.walk(function):
+            if isinstance(node, ast.Return):
+                if (
+                    function_is_permission_boundary
+                    and node.value is not None
+                    and any(
+                        "causation" in token or "orchestrator" in token
+                        for token in _identifier_tokens(node.value)
+                    )
+                ):
+                    lines.add(node.lineno)
+                continue
             if not isinstance(node, (ast.If, ast.IfExp, ast.Assert)):
                 continue
             tokens = _identifier_tokens(node.test)
@@ -225,8 +258,13 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "def check(metadata):\n"
         '    return authorize(metadata.get("kestrel.orchestrator"))\n'
     )
+    direct_return = ast.parse(
+        "def is_authorized(request):\n"
+        "    return bool(request.causation_chain)\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
+    assert _authority_provenance_lines(direct_return) == {2}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
