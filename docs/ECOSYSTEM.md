@@ -122,9 +122,17 @@ isolated feature venvs (see `docs/design/ISOLATED_FEATURE_RUNTIME.md`).
 Not feature plugins — separate applications that work with or on top of the
 platform.
 
+Repository-run orchestration is not agent hierarchy. In particular,
+`kestrel-talon` coordinates issue-processing runs and operating-system
+processes; it has no agent DID, `CausationFrame`, verified parent-signed spawn
+mandate, or `spawned_by` authority. The independently installed
+`kestrel-feature-talon` package gives an agent a governed control surface for
+that separate runner. It does not turn Talon runs into agents or bridge Talon
+process relationships onto either agent relationship axis.
+
 | Repository | What it is |
 |---|---|
-| [kestrel-talon](https://github.com/KestrelSovereignAI/kestrel-talon) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-talon/blob/main/AGENTS.md)) | Standalone GitHub/ADO issue-processing engine used by the independently installed `kestrel-feature-talon` coordinator. |
+| [kestrel-talon](https://github.com/KestrelSovereignAI/kestrel-talon) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-talon/blob/main/AGENTS.md)) | Standalone GitHub/ADO issue-processing engine used by the independently installed `kestrel-feature-talon` coordinator; its repository-run orchestration is outside agent causation and authority. |
 | [kestrel-eye](https://github.com/KestrelSovereignAI/kestrel-eye) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-eye/blob/main/AGENTS.md)) | Vision-verified E2E feedback loop — AI reviews screenshots until they're right. |
 | [kestrel-flight](https://github.com/KestrelSovereignAI/kestrel-flight) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-flight/blob/main/AGENTS.md)) | Playwright demo/test orchestration with narration, state, and dependency management. |
 | [kestrel-claws](https://github.com/KestrelSovereignAI/kestrel-claws) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-claws/blob/main/AGENTS.md)) | The Grip — sovereign fleet orchestration CLI for the Falconer. |
