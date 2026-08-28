@@ -1441,6 +1441,42 @@ class RestartCoordinatorFeature(Feature):
                 expected_current_status=req.status,
             ):
                 req.first_blocked_at = ""
+            else:
+                refreshed = await get_request(self._db, req.id)
+                verified = (
+                    verify_restart_authority(refreshed)[0]
+                    if refreshed is not None
+                    else False
+                )
+                if (
+                    not verified
+                    or refreshed is None
+                    or refreshed.status != req.status
+                    or refreshed.first_blocked_at
+                ):
+                    current_status = (
+                        refreshed.status if refreshed is not None else "missing"
+                    )
+                    return req, {
+                        "safe": False,
+                        "deferable": True,
+                        "lost_race": True,
+                        "reason": (
+                            "lost race while clearing restart deferral: "
+                            f"expected {req.status!r}, found "
+                            f"{current_status!r}"
+                        ),
+                        "blocker": None,
+                        "request_age_seconds": self._request_age_seconds(
+                            req,
+                            database_now,
+                        ),
+                        "deferral_age_seconds": self._deferral_age_seconds(
+                            req,
+                            database_now,
+                        ),
+                    }
+                req = refreshed
         return req, decision
 
     def _evaluate_safety(

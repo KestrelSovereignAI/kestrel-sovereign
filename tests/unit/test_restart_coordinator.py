@@ -18,7 +18,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -50,6 +50,7 @@ from kestrel_sovereign.features.restart_coordinator.store import (
     get_request,
     insert_request,
     list_requests,
+    mark_deferral_started,
     record_update_log,
     update_status,
 )
@@ -932,7 +933,8 @@ async def test_executor_defers_when_agent_reports_active_request(tmp_path):
     agent._active_request_ids.add("req-1")
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
-    await feat.request_restart(reason="r")
+    created = await feat.request_restart(reason="r")
+    request_id = created.data["request"]["id"]
 
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
@@ -942,6 +944,9 @@ async def test_executor_defers_when_agent_reports_active_request(tmp_path):
     assert mock_spawn.call_count == 0
     assert len(result.data["deferred"]) == 1
     assert "busy" in result.data["deferred"][0]["reason"]
+    row = await get_request(backend, request_id)
+    assert row.first_blocked_at
+    assert verify_restart_authority(row)[0] is True
 
 
 @pytest.mark.asyncio
@@ -998,9 +1003,11 @@ async def test_escalation_event_is_not_emitted_before_lifecycle_cas(tmp_path):
         datetime.now(timezone.utc)
         - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
     ).isoformat()
-    await backend.execute(
-        "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-        (blocked_at, request_id),
+    assert await mark_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+        blocked_at=blocked_at,
     )
     captured = _attach_emit_capture(feat)
 
@@ -1029,9 +1036,11 @@ async def test_deferral_clear_cannot_reset_competing_execution_interval(tmp_path
     created = await feat.request_restart(reason="clear race")
     request_id = created.data["request"]["id"]
     blocked_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    await backend.execute(
-        "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-        (blocked_at, request_id),
+    assert await mark_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+        blocked_at=blocked_at,
     )
     assert await update_status(
         backend,
@@ -1050,6 +1059,33 @@ async def test_deferral_clear_cannot_reset_competing_execution_interval(tmp_path
     row = await get_request(backend, request_id)
     assert row.status == "executing"
     assert row.first_blocked_at == blocked_at
+
+
+@pytest.mark.asyncio
+async def test_deferral_clock_transitions_reseal_exact_safety_state(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="signed deferral transitions")
+    request_id = created.data["request"]["id"]
+    blocked_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+    marked = await mark_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+        blocked_at=blocked_at,
+    )
+    assert marked is not None
+    assert marked.first_blocked_at == blocked_at
+    assert verify_restart_authority(marked)[0] is True
+
+    assert await clear_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+    )
+    cleared = await get_request(backend, request_id)
+    assert cleared.first_blocked_at == ""
+    assert verify_restart_authority(cleared)[0] is True
 
 
 def _attach_lifecycle(agent):
@@ -1240,7 +1276,14 @@ async def test_executor_defers_for_unrelated_active_request(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
+async def test_executor_executes_on_busy_with_timeout_policy(
+    tmp_path,
+    monkeypatch,
+):
+    from kestrel_sovereign.features.restart_coordinator import (
+        store as restart_store_module,
+    )
+
     backend = await _backend(tmp_path)
     agent = _make_agent(backend)
     agent._active_request_ids.add("req-busy")
@@ -1248,20 +1291,18 @@ async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
     await feat.initialize()
     # File a request, then back-date requested_at past the 5-min
     # timeout so the policy allows execution despite a busy agent.
+    aged = datetime.now(timezone.utc) - timedelta(seconds=600)
+    monkeypatch.setattr(
+        restart_store_module,
+        "database_clock",
+        AsyncMock(return_value=aged),
+    )
     req = await insert_request(
         backend,
         requested_by_agent=agent.did,
         reason="r",
         policy="allow_busy_after_timeout",
     )
-    aged = (
-        datetime.now(timezone.utc) - timedelta(seconds=600)
-    ).isoformat()
-    await backend.execute(
-        "UPDATE restart_requests SET requested_at = ? WHERE id = ?",
-        (aged, req.id),
-    )
-
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
     ) as mock_spawn:
@@ -1332,6 +1373,43 @@ async def test_executor_rejects_tampered_signed_request_bounds(tmp_path):
 
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "do not match signed authority bounds" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timestamp_field", ["requested_at", "first_blocked_at"])
+async def test_executor_rejects_tampered_safety_clock(
+    tmp_path,
+    timestamp_field,
+):
+    """Row aging cannot release a busy-host gate outside the signed seam."""
+
+    feat, backend = await _make_feature(tmp_path)
+    feat.agent._active_request_ids.add("busy-turn")
+    created = await feat.request_restart(
+        reason="signed safety clock",
+        policy=(
+            "allow_busy_after_timeout"
+            if timestamp_field == "requested_at"
+            else "idle_agents_only"
+        ),
+    )
+    request_id = created.data["request"]["id"]
+    aged = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    await backend.execute(
+        f"UPDATE restart_requests SET {timestamp_field} = ? WHERE id = ?",
+        (aged, request_id),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
     ) as mock_spawn:
         await feat.restart_coordinator()
 

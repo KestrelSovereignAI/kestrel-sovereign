@@ -19,8 +19,10 @@ from kestrel_sovereign.features.restart_coordinator.feature import (
     RestartCoordinatorFeature,
 )
 from kestrel_sovereign.features.restart_coordinator.store import (
+    clear_deferral_started,
     get_request,
     insert_request,
+    mark_deferral_started,
 )
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import (
@@ -2053,11 +2055,18 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(
             datetime.now(timezone.utc)
             - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
         ).isoformat()
-        await db.execute(
-            "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-            (aged, fresh.id),
+        assert await clear_deferral_started(
+            db,
+            fresh.id,
+            expected_current_status=fresh.status,
         )
-        fresh.first_blocked_at = aged
+        fresh = await mark_deferral_started(
+            db,
+            fresh.id,
+            expected_current_status=fresh.status,
+            blocked_at=aged,
+        )
+        assert fresh is not None
         escalated = feature._evaluate_safety(
             fresh, database_now=await scheduler_database_clock(db)
         )
@@ -2103,27 +2112,43 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(
 
         # A migrated backlog row starts a fresh deferral clock on this boot and
         # cannot escalate until its one-time acknowledgement is recorded.
-        legacy = await _insert_sovereign_restart(
-            db, requested_by_agent="agent-1", reason="pre-upgrade backlog"
+        from kestrel_sovereign.features.restart_coordinator import (
+            store as restart_store_module,
         )
-        ancient_request = (
-            datetime.now(timezone.utc) - timedelta(days=30)
-        ).isoformat()
+
+        ancient_request = datetime.now(timezone.utc) - timedelta(days=30)
+        with monkeypatch.context() as clock_patch:
+            clock_patch.setattr(
+                restart_store_module,
+                "database_clock",
+                AsyncMock(return_value=ancient_request),
+            )
+            legacy = await _insert_sovereign_restart(
+                db,
+                requested_by_agent="agent-1",
+                reason="pre-upgrade backlog",
+            )
         await db.execute(
-            "UPDATE restart_requests SET requested_at = ?, "
-            "first_blocked_at = '', escalation_acknowledged = 0 WHERE id = ?",
-            (ancient_request, legacy.id),
+            "UPDATE restart_requests SET escalation_acknowledged = 0 WHERE id = ?",
+            (legacy.id,),
         )
         legacy = await get_request(db, legacy.id)
         legacy, initial = await feature._evaluate_and_track_safety(legacy)
         assert initial["safe"] is False
         assert initial["request_age_seconds"] > 60 * 60 * 24
         assert initial["deferral_age_seconds"] < 5
-        await db.execute(
-            "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-            (aged, legacy.id),
+        assert await clear_deferral_started(
+            db,
+            legacy.id,
+            expected_current_status=legacy.status,
         )
-        legacy = await get_request(db, legacy.id)
+        legacy = await mark_deferral_started(
+            db,
+            legacy.id,
+            expected_current_status=legacy.status,
+            blocked_at=aged,
+        )
+        assert legacy is not None
         needs_ack = feature._evaluate_safety(
             legacy, database_now=await scheduler_database_clock(db)
         )
@@ -2197,11 +2222,18 @@ async def test_restart_deferral_escalation_uses_database_time_under_host_skew(
             database_now
             - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
         ).isoformat()
-        await db.execute(
-            "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-            (aged, request.id),
+        assert await clear_deferral_started(
+            db,
+            request.id,
+            expected_current_status=request.status,
         )
-        request = await get_request(db, request.id)
+        request = await mark_deferral_started(
+            db,
+            request.id,
+            expected_current_status=request.status,
+            blocked_at=aged,
+        )
+        assert request is not None
         monkeypatch.setattr(restart_feature_module, "datetime", SlowHostDateTime)
         monkeypatch.setattr(restart_store_module, "datetime", SlowHostDateTime)
 
