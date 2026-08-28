@@ -23,6 +23,7 @@ Usage:
 """
 
 import asyncio
+from functools import lru_cache
 import json
 import logging
 import time
@@ -71,12 +72,16 @@ def _get_bridge_feature(request: Request):
     return agent, bridge
 
 
+@lru_cache(maxsize=1)
 def get_router() -> APIRouter:
     """
-    Build and return the bridge APIRouter.
+    Build and return the process-local bridge APIRouter.
 
-    This factory function creates the router with all bridge endpoints.
-    Call it once and include the result in the FastAPI app.
+    SlowAPI indexes decorated routes by ``module.function``. Rebuilding this
+    router re-registers identical limits under those keys, multiplying the
+    cost of every request until legitimate traffic receives a false 429. The
+    handlers are request-scoped and hold no agent state, so one cached router
+    is the correct lifecycle and remains safe for multi-agent mounting.
     """
     router = APIRouter(prefix="/api/bridge", tags=["bridge"])
 
