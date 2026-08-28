@@ -88,6 +88,80 @@ class RequestLifecycleMixin:
         generation = generations.get(request_id)
         return generation if isinstance(generation, int) else None
 
+    def _request_generation_for_cleanup(self, request_id: str) -> int | None:
+        """Resolve the generation whose endpoint cleanup is now running.
+
+        A normally registered delivery carries an exact task-local generation.
+        Legacy/foreign deliveries do not.  Once one of those is pruned from the
+        active projection, retain its generations in cleanup order so its
+        eventual ``finally`` cannot accidentally clean a fresh redelivery (or
+        fail to clean anything at all).
+        """
+
+        bound = _current_request_generation.get()
+        if (
+            bound is not None
+            and bound[0] == id(self)
+            and bound[1] == request_id
+        ):
+            return bound[2]
+        cleanup_generations = getattr(
+            self,
+            "_legacy_request_cleanup_generations",
+            None,
+        )
+        queued = (
+            cleanup_generations.get(request_id)
+            if isinstance(cleanup_generations, dict)
+            else None
+        )
+        if isinstance(queued, list) and queued:
+            return queued[0]
+        generations = getattr(self, "_active_request_generations", None)
+        if not isinstance(generations, dict):
+            return None
+        generation = generations.get(request_id)
+        return generation if isinstance(generation, int) else None
+
+    def _remember_pruned_cleanup_generation(
+        self,
+        request_id: str,
+        generation: int,
+    ) -> None:
+        cleanup_generations = getattr(
+            self,
+            "_legacy_request_cleanup_generations",
+            None,
+        )
+        if not isinstance(cleanup_generations, dict):
+            cleanup_generations = {}
+            self._legacy_request_cleanup_generations = cleanup_generations
+        queued = cleanup_generations.setdefault(request_id, [])
+        if generation not in queued:
+            queued.append(generation)
+
+    def _forget_pruned_cleanup_generation(
+        self,
+        request_id: str,
+        generation: int,
+    ) -> None:
+        cleanup_generations = getattr(
+            self,
+            "_legacy_request_cleanup_generations",
+            None,
+        )
+        if not isinstance(cleanup_generations, dict):
+            return
+        queued = cleanup_generations.get(request_id)
+        if not isinstance(queued, list):
+            return
+        try:
+            queued.remove(generation)
+        except ValueError:
+            return
+        if not queued:
+            cleanup_generations.pop(request_id, None)
+
     def _abandoned_generations(self, request_id: str) -> set[int]:
         tombstones = getattr(self, "_abandoned_request_generations", None)
         if not isinstance(tombstones, dict):
@@ -102,7 +176,10 @@ class RequestLifecycleMixin:
         Returns:
             True if a request was cancelled, False if no request was active.
         """
-        active_request_ids = getattr(self, "_active_request_ids", set())
+        active_request_ids = getattr(self, "_active_request_ids", None)
+        if not isinstance(active_request_ids, set):
+            active_request_ids = set()
+            self._active_request_ids = active_request_ids
         target_request_id = request_id or self._current_request_id
         if not target_request_id:
             return False
@@ -130,6 +207,11 @@ class RequestLifecycleMixin:
                 active_generation = next_generation + 1
                 self._next_request_generation = active_generation
                 active_generations[target_request_id] = active_generation
+            # A legacy caller may expose liveness only through
+            # ``_current_request_id``. The synthesized generation is still
+            # executing until that caller's eventual cleanup; project it as
+            # active so Stop cannot acknowledge completion immediately.
+            active_request_ids.add(target_request_id)
             generations.add(active_generation)
         if not generations:
             return False
@@ -290,7 +372,7 @@ class RequestLifecycleMixin:
             raise TypeError("request completion disposition must be typed")
         active_request_ids = getattr(self, "_active_request_ids", None)
         counts = getattr(self, "_active_request_counts", None)
-        generation = self._request_generation_for_current_task(request_id)
+        generation = self._request_generation_for_cleanup(request_id)
         active_generations = getattr(self, "_active_request_generations", None)
         active_generation = (
             active_generations.get(request_id)
@@ -352,6 +434,7 @@ class RequestLifecycleMixin:
                 abandoned_counts[abandoned_key] = remaining - 1
                 return
             abandoned_counts.pop(abandoned_key, None)
+            self._forget_pruned_cleanup_generation(request_id, generation)
             final_disposition = abandoned_dispositions.pop(
                 abandoned_key,
                 disposition,
@@ -516,6 +599,7 @@ class RequestLifecycleMixin:
                 abandoned_counts = {}
                 self._abandoned_request_counts = abandoned_counts
             abandoned_counts[(rid, generation)] = max(1, delivery_count)
+            self._remember_pruned_cleanup_generation(rid, generation)
             active.discard(rid)
             if isinstance(counts, dict):
                 counts.pop(rid, None)

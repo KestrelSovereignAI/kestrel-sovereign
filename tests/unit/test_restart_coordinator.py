@@ -929,6 +929,9 @@ def _attach_lifecycle(agent):
         "prune_stale_active_requests",
         "active_request_ages",
         "_cleanup_cancelled_request",
+        "_request_generation_for_cleanup",
+        "_remember_pruned_cleanup_generation",
+        "_forget_pruned_cleanup_generation",
     ):
         setattr(
             agent, name,

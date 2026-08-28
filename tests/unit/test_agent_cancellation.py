@@ -28,6 +28,9 @@ class TestAgentCancellation:
         # Bind actual methods
         agent.register_active_request = KestrelAgent.register_active_request.__get__(agent)
         agent._request_generation_for_current_task = KestrelAgent._request_generation_for_current_task.__get__(agent)
+        agent._request_generation_for_cleanup = KestrelAgent._request_generation_for_cleanup.__get__(agent)
+        agent._remember_pruned_cleanup_generation = KestrelAgent._remember_pruned_cleanup_generation.__get__(agent)
+        agent._forget_pruned_cleanup_generation = KestrelAgent._forget_pruned_cleanup_generation.__get__(agent)
         agent._abandoned_generations = KestrelAgent._abandoned_generations.__get__(agent)
         agent.cancel_current_request = KestrelAgent.cancel_current_request.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)

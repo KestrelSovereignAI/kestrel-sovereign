@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import inspect
+import time
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -560,7 +561,10 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
 @pytest.mark.asyncio
 async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     """The endpoint must not confuse a cancel marker with completed execution."""
-    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
     from kestrel_sovereign.endpoints.agent import router
 
     cancel_seen = asyncio.Event()
@@ -604,6 +608,36 @@ async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
 
     assert response.status_code == 200
     assert response.json()["stop_outcomes"][0]["disposition"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_legacy_current_only_stop_waits_for_real_cleanup() -> None:
+    """A synthesized generation remains live until its legacy owner exits."""
+
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
+
+    class LegacyAgent(RequestLifecycleMixin):
+        def __init__(self) -> None:
+            self._current_request_id = "legacy-current"
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    agent = LegacyAgent()
+    assert agent.cancel_current_request("legacy-current")
+    waiter = asyncio.create_task(
+        agent.wait_for_request_completion("legacy-current")
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(waiter), timeout=0.05)
+
+    agent._cleanup_cancelled_request("legacy-current")
+    assert await asyncio.wait_for(waiter, timeout=1) is RequestCompletionDisposition.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -692,6 +726,38 @@ def test_agent_wide_stop_includes_pruned_unconfirmed_turns() -> None:
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
     assert "pruned-turn" in agent._cancelled_requests
+
+
+@pytest.mark.asyncio
+async def test_pruned_legacy_generation_is_reaped_by_eventual_cleanup() -> None:
+    """A generation synthesized during prune retains its cleanup owner."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    class LegacyAgent(RequestLifecycleMixin):
+        def __init__(self) -> None:
+            self._current_request_id = "legacy-pruned"
+            self._active_request_ids = {"legacy-pruned"}
+            self._active_request_counts = {"legacy-pruned": 1}
+            self._active_request_started_at = {
+                "legacy-pruned": time.monotonic() - 1000
+            }
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    agent = LegacyAgent()
+    assert agent.cancel_current_request("legacy-pruned")
+    generation = agent._active_request_generations["legacy-pruned"]
+    assert agent.prune_stale_active_requests(900) == ["legacy-pruned"]
+    assert ("legacy-pruned", generation) in agent._abandoned_request_counts
+
+    agent._cleanup_cancelled_request("legacy-pruned")
+
+    assert ("legacy-pruned", generation) not in agent._abandoned_request_counts
+    assert generation not in agent._abandoned_request_generations.get(
+        "legacy-pruned", set()
+    )
+    assert "legacy-pruned" not in agent._cancelled_requests
 
 
 def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
