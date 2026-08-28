@@ -264,6 +264,116 @@ async def test_corrupt_active_latch_fails_closed(hold_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_inactive_latch_with_retained_evidence_fails_closed(
+    hold_db,
+    monkeypatch,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_read_latch_row",
+        AsyncMock(
+            return_value=(
+                "agent",
+                "did:agent:kite",
+                0,
+                "retained-receipt",
+                "retained reason",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                2,
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="inactive latch"):
+        await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
+async def test_malformed_applied_hold_replay_fails_closed(
+    hold_db,
+    monkeypatch,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_read_receipt_by_operation",
+        AsyncMock(
+            return_value=(
+                "receipt-id",
+                "poisoned-replay",
+                "hold",
+                "applied",
+                "agent",
+                "did:agent:kite",
+                "investigate",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                "",
+                "",
+                "",
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="receipt invariant"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="investigate",
+            operation_id="poisoned-replay",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "disposition", "expected", "prior", "resulting"),
+    [
+        ("hold", "refused_stale", "", "prior", "prior"),
+        ("hold", "already_in_state", "", "", ""),
+        ("release", "applied", "expected", "other", ""),
+        ("release", "already_in_state", "expected", "prior", "prior"),
+        ("release", "refused_stale", "expected", "expected", "expected"),
+    ],
+)
+async def test_impossible_receipt_state_combinations_fail_closed(
+    hold_db,
+    monkeypatch,
+    action,
+    disposition,
+    expected,
+    prior,
+    resulting,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_read_receipt_by_operation",
+        AsyncMock(
+            return_value=(
+                "receipt-id",
+                "corrupt-combination",
+                action,
+                disposition,
+                "agent",
+                "did:agent:kite",
+                "investigate",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                expected,
+                prior,
+                resulting,
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="receipt invariant"):
+        await store.get_receipt("corrupt-combination")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["set", "release"])
 async def test_mutations_preserve_typed_corrupt_state_error(
     hold_db,

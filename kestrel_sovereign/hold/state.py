@@ -164,16 +164,23 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
         raise HoldCorruptStateError("hold latch active flag is invalid")
     if revision < 0:
         raise HoldCorruptStateError("hold latch revision is invalid")
-    if active == 0:
-        return None
     hold_receipt_id = str(row[3] or "")
     reason = str(row[4] or "")
     actor_id = str(row[5] or "")
     set_at = str(row[6] or "")
-    if not all((target_id, hold_receipt_id, reason, actor_id, set_at)):
-        raise HoldCorruptStateError("active hold latch is missing required evidence")
+    if not target_id:
+        raise HoldCorruptStateError("hold latch is missing its target identity")
     if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
         raise HoldCorruptStateError("host hold latch has a foreign target")
+    evidence = (hold_receipt_id, reason, actor_id, set_at)
+    if active == 0:
+        if any(evidence):
+            raise HoldCorruptStateError(
+                "inactive latch retains active hold evidence"
+            )
+        return None
+    if not all(evidence):
+        raise HoldCorruptStateError("active hold latch is missing required evidence")
     return HoldState(
         scope=scope,
         target_id=target_id,
@@ -189,7 +196,7 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
     if row is None or len(row) != 12:
         raise HoldCorruptStateError("hold receipt row has an unexpected shape")
     try:
-        return HoldReceipt(
+        receipt = HoldReceipt(
             receipt_id=str(row[0]),
             operation_id=str(row[1]),
             action=HoldAction(str(row[2])),
@@ -205,6 +212,56 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
         )
     except (TypeError, ValueError) as exc:
         raise HoldCorruptStateError("hold receipt has invalid typed fields") from exc
+    common_evidence = (
+        receipt.receipt_id,
+        receipt.operation_id,
+        receipt.target_id,
+        receipt.reason,
+        receipt.actor_id,
+        receipt.occurred_at,
+    )
+    if not all(common_evidence):
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
+    if receipt.scope is HoldScope.HOST and receipt.target_id != HOST_HOLD_TARGET:
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
+
+    prior = receipt.prior_hold_receipt_id
+    resulting = receipt.resulting_hold_receipt_id
+    expected = receipt.expected_hold_receipt_id
+    if receipt.action is HoldAction.HOLD:
+        valid = expected == "" and (
+            (
+                receipt.disposition is HoldDisposition.APPLIED
+                and resulting == receipt.receipt_id
+            )
+            or (
+                receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+                and bool(prior)
+                and resulting == prior
+            )
+        )
+    else:
+        valid = bool(expected) and (
+            (
+                receipt.disposition is HoldDisposition.APPLIED
+                and prior == expected
+                and resulting == ""
+            )
+            or (
+                receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+                and prior == ""
+                and resulting == ""
+            )
+            or (
+                receipt.disposition is HoldDisposition.REFUSED_STALE
+                and bool(prior)
+                and prior != expected
+                and resulting == prior
+            )
+        )
+    if not valid:
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
+    return receipt
 
 
 class HoldStore:
