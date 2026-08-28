@@ -217,6 +217,22 @@ def current_invocation_provenance() -> InvocationProvenance | None:
 
 
 @contextmanager
+def _exact_invocation_scope(
+    invocation_id: str,
+    provenance: InvocationProvenance | None,
+) -> Iterator[str]:
+    """Bind an already-resolved identity and an exact provenance value."""
+
+    id_token = _current_invocation_id.set(invocation_id)
+    provenance_token = _current_invocation_provenance.set(provenance)
+    try:
+        yield invocation_id
+    finally:
+        _current_invocation_provenance.reset(provenance_token)
+        _current_invocation_id.reset(id_token)
+
+
+@contextmanager
 def invocation_scope(
     invocation_id: object = None,
     *,
@@ -231,13 +247,8 @@ def invocation_scope(
         if provenance is not None
         else _current_invocation_provenance.get()
     )
-    id_token = _current_invocation_id.set(effective_id)
-    provenance_token = _current_invocation_provenance.set(effective_provenance)
-    try:
+    with _exact_invocation_scope(effective_id, effective_provenance):
         yield effective_id
-    finally:
-        _current_invocation_provenance.reset(provenance_token)
-        _current_invocation_id.reset(id_token)
 
 
 def bind_async_invocation(
@@ -304,9 +315,9 @@ def bind_async_generator_invocation(
             iterator = function(*bound.args, **bound.kwargs)
             try:
                 while True:
-                    with invocation_scope(
+                    with _exact_invocation_scope(
                         effective_id,
-                        provenance=effective_provenance,
+                        effective_provenance,
                     ):
                         try:
                             item = await anext(iterator)
@@ -316,9 +327,9 @@ def bind_async_generator_invocation(
             finally:
                 close_iterator = getattr(iterator, "aclose", None)
                 if callable(close_iterator):
-                    with invocation_scope(
+                    with _exact_invocation_scope(
                         effective_id,
-                        provenance=effective_provenance,
+                        effective_provenance,
                     ):
                         await close_iterator()
 

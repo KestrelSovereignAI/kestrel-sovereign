@@ -14,7 +14,15 @@ permanently blocks ``idle_agents_only`` restarts (#1558).
 import asyncio
 import logging
 import time
+from enum import Enum
 from typing import Dict, List, Optional
+
+
+class RequestCompletionDisposition(str, Enum):
+    """What released a cooperative Stop lifecycle waiter."""
+
+    COMPLETED = "completed"
+    ABANDONED = "abandoned"
 
 
 class RequestLifecycleMixin:
@@ -66,7 +74,7 @@ class RequestLifecycleMixin:
     async def wait_for_request_completion(
         self,
         request_id: Optional[str] = None,
-    ) -> None:
+    ) -> RequestCompletionDisposition:
         """Wait until the targeted request has left the live lifecycle.
 
         Marking ``_cancelled_requests`` is only a cooperative request to stop.
@@ -77,32 +85,38 @@ class RequestLifecycleMixin:
         """
         target_request_id = request_id or self._current_request_id
         if target_request_id is None:
-            return
+            return RequestCompletionDisposition.COMPLETED
         active_request_ids = getattr(self, "_active_request_ids", set())
         if (
             target_request_id not in active_request_ids
             and target_request_id != self._current_request_id
         ):
-            return
+            return RequestCompletionDisposition.COMPLETED
         waiters = getattr(self, "_request_completion_events", None)
         if not isinstance(waiters, dict):
             waiters = {}
             self._request_completion_events = waiters
         completion = waiters.get(target_request_id)
         if completion is None:
-            completion = asyncio.Event()
+            completion = asyncio.get_running_loop().create_future()
             waiters[target_request_id] = completion
-        await completion.wait()
+        return await asyncio.shield(completion)
 
-    def _resolve_request_completion(self, request_id: str) -> None:
+    def _resolve_request_completion(
+        self,
+        request_id: str,
+        disposition: RequestCompletionDisposition = (
+            RequestCompletionDisposition.COMPLETED
+        ),
+    ) -> None:
         """Terminally release and forget waiters for one request lifecycle."""
 
         waiters = getattr(self, "_request_completion_events", None)
         if not isinstance(waiters, dict):
             return
         completion = waiters.pop(request_id, None)
-        if completion is not None:
-            completion.set()
+        if completion is not None and not completion.done():
+            completion.set_result(disposition)
 
     def _cleanup_cancelled_request(self, request_id: str):
         """Remove a request from the cancelled set after it's been handled."""
@@ -179,10 +193,14 @@ class RequestLifecycleMixin:
             if isinstance(counts, dict):
                 counts.pop(rid, None)
             started.pop(rid, None)
-            cancelled = getattr(self, "_cancelled_requests", None)
-            if cancelled is not None:
-                cancelled.discard(rid)
-            self._resolve_request_completion(rid)
+            # If Stop already marked this genuinely live request, retain the
+            # cooperative marker until the real endpoint finally runs. Age is
+            # evidence that bookkeeping may be abandoned, never evidence that
+            # execution completed or permission to let it continue.
+            self._resolve_request_completion(
+                rid,
+                RequestCompletionDisposition.ABANDONED,
+            )
         if stale and getattr(self, "_current_request_id", None) in stale:
             self._current_request_id = (
                 next(iter(active), None) if active else None

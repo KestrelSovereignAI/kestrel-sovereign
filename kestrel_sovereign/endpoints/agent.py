@@ -30,6 +30,9 @@ from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
     new_stream_delivery_id,
 )
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+)
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
@@ -905,8 +908,17 @@ async def stop_agent_request(request: Request):
                 # await, so agent-wide Stop reaches all snapshotted turns at
                 # once. STOPPED is returned only after each one has run its
                 # endpoint cleanup; CancellationAuthority bounds this wait.
+                abandoned = False
                 for cancelled_request_id in cancelled_request_ids:
-                    await wait_for_completion(cancelled_request_id)
+                    completion_disposition = await wait_for_completion(
+                        cancelled_request_id
+                    )
+                    abandoned = abandoned or (
+                        completion_disposition
+                        is RequestCompletionDisposition.ABANDONED
+                    )
+                if abandoned:
+                    return StopDisposition.UNREACHABLE
             return (
                 StopDisposition.STOPPED
                 if canceled

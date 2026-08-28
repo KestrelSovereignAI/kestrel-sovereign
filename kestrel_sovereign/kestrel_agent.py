@@ -1391,7 +1391,7 @@ class KestrelAgent(
         self._cancelled_requests: set = set()
         # Stop is acknowledged only after endpoint cleanup has observed the
         # request leave execution. RequestLifecycleMixin owns these waiters.
-        self._request_completion_events: dict[str, asyncio.Event] = {}
+        self._request_completion_events: dict[str, asyncio.Future[object]] = {}
         # Task-reentrant so a durable-identity write (rename / description /
         # discovery / user-name / SOUL) invoked as a TOOL inside a streamed turn
         # — which already holds this lock across the whole turn — re-enters

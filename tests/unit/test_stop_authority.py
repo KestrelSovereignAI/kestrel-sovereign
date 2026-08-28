@@ -592,6 +592,55 @@ async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     assert response.json()["stop_outcomes"][0]["disposition"] == "stopped"
 
 
+@pytest.mark.asyncio
+async def test_live_stop_stale_prune_is_unreachable_not_stopped() -> None:
+    """Age-only bookkeeping abandonment is never execution completion."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+
+    cancel_seen = asyncio.Event()
+
+    class LiveAgent(RequestLifecycleMixin):
+        agent_id = "did:test:long-running-agent"
+
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        def cancel_current_request(self, request_id=None):
+            cancelled = super().cancel_current_request(request_id)
+            if cancelled:
+                cancel_seen.set()
+            return cancelled
+
+    agent = LiveAgent()
+    agent.register_active_request("long-turn")
+    agent._active_request_started_at["long-turn"] -= 1000
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        stop_task = asyncio.create_task(
+            client.post("/api/agent/stop", json={"request_id": "long-turn"})
+        )
+        await asyncio.wait_for(cancel_seen.wait(), timeout=1)
+        assert agent.prune_stale_active_requests(900) == ["long-turn"]
+        response = await asyncio.wait_for(stop_task, timeout=1)
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
+    assert "long-turn" in agent._cancelled_requests
+
+
 def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
     from kestrel_sovereign.endpoints.agent import router
 

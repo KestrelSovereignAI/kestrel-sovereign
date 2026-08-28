@@ -255,6 +255,39 @@ class TestAgentCancellation:
         assert observed_ids == ["owned-close", "owned-close"]
 
     @pytest.mark.asyncio
+    async def test_decorated_stream_pins_absent_provenance_across_task_handoffs(self):
+        """Another task's trusted actor cannot drift into an unbound stream."""
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+            current_invocation_provenance,
+            invocation_scope,
+            request_provenance,
+        )
+
+        observed = []
+
+        @bind_async_generator_invocation("request_id")
+        async def decorated(*, request_id=None):
+            observed.append(current_invocation_provenance())
+            yield "first"
+            observed.append(current_invocation_provenance())
+            yield "second"
+
+        stream = decorated(request_id="absent-provenance")
+        assert await anext(stream) == "first"
+        foreign = request_provenance(
+            actor="did:test:other",
+            source_kind="http",
+            source_locator="/other",
+        )
+        with invocation_scope("other-request", provenance=foreign):
+            assert await anext(stream) == "second"
+        await stream.aclose()
+
+        assert observed == [None, None]
+
+    @pytest.mark.asyncio
     async def test_bridge_disconnect_closes_inner_generator_before_completion_ack(
         self,
     ):
@@ -414,8 +447,13 @@ class TestAgentCancellation:
         assert mock_agent._current_request_id is None
 
     @pytest.mark.asyncio
-    async def test_prune_resolves_and_forgets_completion_waiter(self, mock_agent):
+    async def test_prune_releases_waiter_as_abandoned_without_stop_ack(self, mock_agent):
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+        )
+
         mock_agent.register_active_request("stale-waiter")
+        mock_agent.cancel_current_request("stale-waiter")
         mock_agent._active_request_started_at["stale-waiter"] -= 1000
         waiter = asyncio.create_task(
             mock_agent.wait_for_request_completion("stale-waiter")
@@ -425,8 +463,12 @@ class TestAgentCancellation:
 
         assert mock_agent.prune_stale_active_requests(900) == ["stale-waiter"]
 
-        await asyncio.wait_for(waiter, timeout=1.0)
+        outcome = await asyncio.wait_for(waiter, timeout=1.0)
+        assert outcome is RequestCompletionDisposition.ABANDONED
         assert "stale-waiter" not in mock_agent._request_completion_events
+        # The still-running turn must retain its cooperative cancellation marker
+        # until its real endpoint cleanup executes.
+        assert "stale-waiter" in mock_agent._cancelled_requests
 
     def test_prune_keeps_fresh_request(self, mock_agent):
         """A fresh request is not pruned."""
