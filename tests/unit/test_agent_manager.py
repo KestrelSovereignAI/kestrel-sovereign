@@ -240,6 +240,42 @@ async def test_load_validates_restored_authority_before_agent_ready(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_load_projects_restored_authority_before_ready_and_rolls_it_back(
+    tmp_path,
+):
+    """Wake-capable hooks run only inside a reserved authority boundary."""
+
+    parent_did = "did:pkh:eip155:1:0xPreparedParent"
+    child_did = "did:pkh:eip155:1:0xPreparedChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("PreparedParent", parent)
+    manager._initialize_agent = AsyncMock(return_value=child)
+    observed_authority = []
+
+    async def fail_after_observing_authority(_agent):
+        observed_authority.append(manager.get_mandate("PreparedChild"))
+        raise RuntimeError("ready hook failed after authority observation")
+
+    manager._run_hosted_agent_ready_hooks = AsyncMock(
+        side_effect=fail_after_observing_authority
+    )
+
+    with pytest.raises(RuntimeError, match="ready hook failed"):
+        await manager.load_agent(
+            "PreparedChild",
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+
+    assert observed_authority == [mandate]
+    assert manager.get_agent("PreparedChild") is None
+    assert manager.get_mandate("PreparedChild") is None
+    assert manager.get_children(parent_did) == []
+
+
+@pytest.mark.asyncio
 async def test_restored_ttl_cannot_remove_child_before_load_commits(tmp_path):
     """TTL adoption is the last onboarding commit, never a concurrent reaper."""
 
@@ -795,6 +831,30 @@ def test_cold_restore_enforces_current_spawn_cap(tmp_path):
     assert manager.get_children(parent_did) == ["CappedFirst"]
     assert manager.get_agent("CappedSecond") is None
     assert len(manager._child_mandates) == 1
+
+
+def test_cold_restore_counts_quarantined_spawn_cap_reservation(tmp_path):
+    """A retained failed-cleanup slot remains capacity even without a mandate."""
+
+    parent_did = "did:pkh:eip155:1:0xQuarantineParent"
+    child_did = "did:pkh:eip155:1:0xRestoredAroundQuarantine"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._max_spawned_agents = 1
+    manager._register_agent("QuarantineParent", parent)
+    # A quarantined cleanup transfers its live cap slot by clearing the
+    # admission's ``spawn_slot_active`` while deliberately retaining this
+    # durable count until revocation and runtime cleanup both settle.
+    manager._pending_spawns = 1
+
+    with pytest.raises(RuntimeError, match="spawned-agent cap"):
+        manager._register_agent("RestoredAroundQuarantine", child)
+
+    assert manager.get_agent("RestoredAroundQuarantine") is None
+    assert manager.get_mandate("RestoredAroundQuarantine") is None
+    assert manager.get_children(parent_did) == []
 
 
 def test_hybrid_parent_signing_alias_restores_to_stable_parent(tmp_path):
@@ -5435,6 +5495,45 @@ class TestLoadFromConfig:
             "ChildFirstInConfig",
         ]
         assert manager.get_children(parent_did) == ["ChildFirstInConfig"]
+
+    @pytest.mark.asyncio
+    async def test_batch_projects_authority_before_ready_and_rolls_it_back(
+        self, tmp_path
+    ):
+        parent_did = "did:test:batch-prepared-parent"
+        child_did = "did:test:batch-prepared-child"
+        parent, mandate = _signed_restored_mandate(parent_did, child_did)
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager._register_agent("BatchPreparedParent", parent)
+        manager._initialize_agent = AsyncMock(return_value=child)
+        observed_authority = []
+
+        async def fail_after_observing_authority(_agent):
+            observed_authority.append(
+                manager.get_mandate("BatchPreparedChild")
+            )
+            raise RuntimeError("batch ready hook failed")
+
+        manager._run_hosted_agent_ready_hooks = AsyncMock(
+            side_effect=fail_after_observing_authority
+        )
+        config = MultiAgentConfig(
+            agents={
+                "BatchPreparedChild": LocalAgentConfig(
+                    data_dir=tmp_path / "child",
+                    port=8801,
+                )
+            }
+        )
+
+        assert await manager.load_from_config(config) == 0
+        assert observed_authority == [mandate]
+        assert manager.get_agent("BatchPreparedChild") is None
+        assert manager.get_mandate("BatchPreparedChild") is None
+        assert manager.get_children(parent_did) == []
+        assert "batch ready hook failed" in str(manager.init_failures[0][1])
 
     @pytest.mark.asyncio
     async def test_load_from_config_withdraws_child_when_parent_is_unavailable(

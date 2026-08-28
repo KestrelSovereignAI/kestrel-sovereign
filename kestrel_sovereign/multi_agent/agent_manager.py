@@ -1681,6 +1681,8 @@ class AgentManager:
         if agent_id is not None and self._agent_names.get(agent_id) == name:
             self._agent_names.pop(agent_id, None)
         self._withdraw_restored_spawn_authority(name, agent_id)
+        if vars(agent).get("_agent_manager_authority_prepared") is self:
+            agent._agent_manager_authority_prepared = None
         if vars(agent).get("_agent_manager") is self:
             agent._agent_manager = None
 
@@ -1696,7 +1698,18 @@ class AgentManager:
         while waiting for the A2A lifecycle writer.
         """
 
-        self._withdraw_initialized_agent(name, agent)
+        # Prepared restored authority is a real cap/topology reservation even
+        # before routing publication. Withdraw it under the same lock order as
+        # preparation so a concurrent spawn or restore cannot admit against a
+        # half-rolled-back projection. An initializer cancelled while waiting
+        # for that boundary remains privately owned and must not reacquire the
+        # writer that prevented it from preparing in the first place.
+        if vars(agent).get("_agent_manager_authority_prepared") is self:
+            async with self._a2a_lifecycle_lock:
+                async with self._lock:
+                    self._withdraw_initialized_agent(name, agent)
+        else:
+            self._withdraw_initialized_agent(name, agent)
         await self._shutdown_unregistered_agent(name, agent)
 
     async def _discard_unpublished_initialized_agents(
@@ -1920,7 +1933,12 @@ class AgentManager:
         if ancestor == agent_id:
             raise RuntimeError("Persisted spawn authority contains a cycle")
 
-        if existing is None and len(self._child_mandates) >= self._max_spawned_agents:
+        retained_cleanup_slots = self._retained_spawn_cleanup_slots()
+        if (
+            existing is None
+            and len(self._child_mandates) + retained_cleanup_slots
+            >= self._max_spawned_agents
+        ):
             raise RuntimeError(
                 "Persisted spawn authority exceeds the configured spawned-agent cap"
             )
@@ -1943,7 +1961,12 @@ class AgentManager:
     def _prepare_agent_authority(
         self, name: str, agent: KestrelAgent
     ) -> None:
-        """Validate/adopt durable authority before hosted readiness may fire."""
+        """Reserve verified durable authority before hosted readiness may fire.
+
+        Callers hold the A2A lifecycle writer and manager state lock. The
+        projection is deliberately committed before wake-capable ready hooks;
+        unpublished cleanup withdraws it if any later onboarding stage fails.
+        """
 
         agent_id = _loaded_agent_did(agent)
         if not isinstance(agent_id, str) or not agent_id:
@@ -1955,8 +1978,33 @@ class AgentManager:
             name,
             agent,
             agent_id,
-            project=False,
         )
+        agent._agent_manager_authority_prepared = self
+
+    def _retained_spawn_cleanup_slots(self) -> int:
+        """Cap slots retained by quarantine rather than active spawn owners.
+
+        ``_pending_spawns`` includes both ordinary in-flight reservations and
+        failed-cleanup reservations transferred to quarantine. Cold restoration
+        is allowed to arbitrate ahead of the former (the active spawn becomes
+        the rollback loser at governance commit), but it must never bypass the
+        latter because that child is still live and has no active admission
+        left to lose.
+
+        Callers that participate in async admission hold ``_lock``. Direct
+        registration is a synchronous compatibility seam and observes the same
+        event-loop-atomic snapshot.
+        """
+
+        active_slots = sum(
+            1
+            for admission in self._agent_operations.values()
+            if admission.spawn_slot_active
+        )
+        retained = self._pending_spawns - active_slots
+        if retained < 0:
+            raise RuntimeError("Spawn cap reservation accounting underflowed")
+        return retained
 
     @staticmethod
     async def _run_hosted_agent_ready_hooks(agent: KestrelAgent) -> None:
@@ -2683,7 +2731,8 @@ class AgentManager:
                         raise RuntimeError(
                             "Refusing agent readiness because the manager is shutting down"
                         )
-                    self._prepare_agent_authority(name, agent)
+                    async with self._lock:
+                        self._prepare_agent_authority(name, agent)
                 await self._run_hosted_agent_ready_hooks(agent)
                 async with self._a2a_lifecycle_lock:
                     if not self._operation_is_admitted(admission):
@@ -2916,7 +2965,8 @@ class AgentManager:
                                 raise RuntimeError(
                                     "Agent initialization completed after manager shutdown began"
                                 )
-                            self._prepare_agent_authority(name, result)
+                            async with self._lock:
+                                self._prepare_agent_authority(name, result)
                         await self._run_hosted_agent_ready_hooks(result)
                         async with self._a2a_lifecycle_lock:
                             if not self._operation_is_admitted(admission):
