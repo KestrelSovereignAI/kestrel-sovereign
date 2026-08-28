@@ -500,6 +500,12 @@ class AgentOperationAdmission:
     # under the same lock, so concurrent restored children cannot overflow the
     # cap and concurrent successful spawns do not double-count one another.
     spawn_slot_active: bool = False
+    # A cold restore can make one already-published pending spawn the loser at
+    # governance commit. Other pending spawns wait for this exact slot to reach
+    # terminal rollback instead of also rejecting against the same transient
+    # over-cap snapshot.
+    spawn_cap_rejected: bool = False
+    spawn_slot_terminal: "asyncio.Future[None] | None" = None
     # A ``remove_agent(False)`` rollback inspection found this operation's
     # child or hold still live.  The public spawn tail must not let a later
     # cancellation overwrite the rollback failure with a bare cancellation.
@@ -775,6 +781,8 @@ class AgentManager:
         # one drain cannot reopen admissions beneath another drain that still
         # owns the terminal boundary.
         self._quarantined_shutdown_handoffs_sealed = False
+        self._quarantined_shutdown_handoffs_open = asyncio.Event()
+        self._quarantined_shutdown_handoffs_open.set()
         self._quarantined_shutdown_drain_lock = asyncio.Lock()
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
         # monotonic counter avoided unload-reuse but couldn't express "this
@@ -795,6 +803,7 @@ class AgentManager:
         # In-flight spawns whose mandate isn't registered yet (counts toward the
         # cap under the lock so concurrent spawns can't race past it).
         self._pending_spawns = 0
+        self._rejected_spawn_slot_waiters: set[asyncio.Future[None]] = set()
         # Per-agent initialization failures recorded by load_from_config so
         # the FastAPI lifespan can surface them via /health (#377 lifecycle
         # hardening for multi-agent boot).
@@ -2439,6 +2448,7 @@ class AgentManager:
                 if admission.spawn_slot_active:
                     self._pending_spawns -= 1
                     admission.spawn_slot_active = False
+                    self._resolve_spawn_slot_terminal(admission)
 
         tasks: list["asyncio.Future[object]"] = [
             asyncio.create_task(
@@ -2457,6 +2467,18 @@ class AgentManager:
             tasks,
             description="One or more spawn lifecycle owners failed to retire",
         )
+
+    def _resolve_spawn_slot_terminal(
+        self,
+        admission: AgentOperationAdmission,
+    ) -> None:
+        """Wake pending governance commits after one cap slot is terminal."""
+
+        terminal = admission.spawn_slot_terminal
+        if terminal is not None and not terminal.done():
+            terminal.set_result(None)
+        if terminal is not None:
+            self._rejected_spawn_slot_waiters.discard(terminal)
 
     def _operation_is_admitted(self, admission: AgentOperationAdmission) -> bool:
         """Whether a named operation may still publish or commit state.
@@ -4039,6 +4061,10 @@ class AgentManager:
             ) from failure
         try:
             self._quarantined_shutdown_handoffs_sealed = sealed
+            if sealed:
+                self._quarantined_shutdown_handoffs_open.clear()
+            else:
+                self._quarantined_shutdown_handoffs_open.set()
         finally:
             self._lock.release()
         return cancelled
@@ -4085,11 +4111,22 @@ class AgentManager:
         # retained must remain retryable by a later startup/server shutdown.
         cancelled = await self._acquire_quarantined_shutdown_drain()
         try:
-            return await self._drain_quarantined_shutdowns_while_locked(
+            self._seal_agent_registration_for_shutdown_all()
+            spawn_cancelled, spawn_failures = (
+                await self._join_admitted_spawn_operations()
+            )
+            cancelled = cancelled or spawn_cancelled
+            result = await self._drain_quarantined_shutdowns_while_locked(
                 cancelled=cancelled,
                 reported_budget_release_failures=reported_budget_release_failures,
             )
+            _raise_lifecycle_outcomes(
+                "One or more admitted spawns had terminal failures",
+                spawn_failures,
+            )
+            return result
         finally:
+            self._reopen_agent_registration_after_shutdown_all()
             self._quarantined_shutdown_drain_lock.release()
 
     async def _drain_quarantined_shutdowns_while_locked(
@@ -5413,6 +5450,9 @@ class AgentManager:
                 )
                 self._pending_spawns += 1
                 admission.spawn_slot_active = True
+                admission.spawn_slot_terminal = (
+                    asyncio.get_running_loop().create_future()
+                )
                 spawn_slot_admitted = True
             # DECREMENT remaining depth on delegation (codex r2): a non-leaf
             # spawned parent's child must have strictly less depth, regardless of
@@ -5585,56 +5625,78 @@ class AgentManager:
             # is applied uniformly in load_agent from the persisted delegation
             # edge (#2137), which already ran for this child inside create_agent.
             parent_did = parent_agent.agent_id
-            async with self._a2a_lifecycle_lock:
-                async with self._lock:
-                    if not self._spawn_operation_is_admitted(admission, child):
-                        raise RuntimeError(
-                            "Spawn was fenced before its budget and mandate could commit"
-                        )
-                    if (
-                        mandate.ttl_seconds > 0
-                        and remaining_spawn_ttl_seconds(
-                            mandate.created_at,
-                            mandate.ttl_seconds,
-                        ) <= 0
-                    ):
-                        raise RuntimeError(
-                            "Spawn mandate expired before governance commit"
-                        )
-                    # A cold load may restore a persisted child while this
-                    # spawn is doing inception/provider I/O.  Convert our
-                    # reserved slot to the committed mandate atomically and
-                    # recheck the total so that restoration cannot drive the
-                    # fleet above the configured cap.  Successful concurrent
-                    # spawns each convert (rather than double-count) their own
-                    # pending slot at this same boundary.
-                    if admission.kind == "spawn":
-                        in_use = len(self._child_mandates) + self._pending_spawns
-                        if in_use > self._max_spawned_agents:
-                            # This spawn has definitively lost its reserved cap
-                            # slot. Retire it at the same linearization point as
-                            # the refusal, before slower child rollback begins,
-                            # so another pending spawn can consume the slot that
-                            # remains after the cold restoration.
-                            if admission.spawn_slot_active:
+            while True:
+                capacity_waiter: asyncio.Future[None] | None = None
+                async with self._a2a_lifecycle_lock:
+                    async with self._lock:
+                        if not self._spawn_operation_is_admitted(admission, child):
+                            raise RuntimeError(
+                                "Spawn was fenced before its budget and mandate could commit"
+                            )
+                        if (
+                            mandate.ttl_seconds > 0
+                            and remaining_spawn_ttl_seconds(
+                                mandate.created_at,
+                                mandate.ttl_seconds,
+                            ) <= 0
+                        ):
+                            raise RuntimeError(
+                                "Spawn mandate expired before governance commit"
+                            )
+                        # A cold load may restore a persisted child while this
+                        # spawn is doing inception/provider I/O. Exactly one
+                        # pending spawn becomes the rollback loser. Later
+                        # contenders wait for that exact reservation to reach a
+                        # terminal commit/rollback boundary, rather than all
+                        # rejecting against the same transient over-cap count.
+                        if admission.kind == "spawn":
+                            in_use = (
+                                len(self._child_mandates)
+                                + self._pending_spawns
+                            )
+                            if in_use > self._max_spawned_agents:
+                                capacity_waiter = next(
+                                    (
+                                        waiter
+                                        for waiter in self._rejected_spawn_slot_waiters
+                                        if waiter is not admission.spawn_slot_terminal
+                                        and not waiter.done()
+                                    ),
+                                    None,
+                                )
+                                if capacity_waiter is None:
+                                    admission.spawn_cap_rejected = True
+                                    terminal = admission.spawn_slot_terminal
+                                    if terminal is None:
+                                        raise RuntimeError(
+                                            "Rejected spawn has no cap-slot lifecycle"
+                                        )
+                                    self._rejected_spawn_slot_waiters.add(terminal)
+                                    raise ValueError(
+                                        f"Spawn refused: restored authority consumed the "
+                                        f"last spawned-agent cap slot "
+                                        f"({self._max_spawned_agents})."
+                                    )
+                            else:
+                                if not admission.spawn_slot_active:
+                                    raise RuntimeError(
+                                        "Spawn cap reservation was lost before commit"
+                                    )
                                 self._pending_spawns -= 1
                                 admission.spawn_slot_active = False
-                            raise ValueError(
-                                f"Spawn refused: restored authority consumed the "
-                                f"last spawned-agent cap slot "
-                                f"({self._max_spawned_agents})."
+                                self._resolve_spawn_slot_terminal(admission)
+                        if capacity_waiter is None:
+                            children = self._parent_children.setdefault(
+                                parent_did,
+                                [],
                             )
-                        if not admission.spawn_slot_active:
-                            raise RuntimeError(
-                                "Spawn cap reservation was lost before commit"
-                            )
-                        self._pending_spawns -= 1
-                        admission.spawn_slot_active = False
-                    children = self._parent_children.setdefault(parent_did, [])
-                    if name not in children:
-                        children.append(name)
-                    self._child_mandates[name] = mandate
-                    admission.committed = True
+                            if name not in children:
+                                children.append(name)
+                            self._child_mandates[name] = mandate
+                            admission.committed = True
+                if capacity_waiter is None:
+                    break
+                await asyncio.shield(capacity_waiter)
 
             logger.info(
                 f"Spawned child '{name}' (DID: {child.agent_id[:30]}...) "
@@ -5915,11 +5977,13 @@ class AgentManager:
         registry and keeps the routing name reserved instead of abandoning
         signed power.
 
-        The terminal-drain lock is the admission boundary. If a drain already
-        sealed handoffs, this operation waits until that complete snapshot has
-        settled instead of creating an unregistered task behind it. A spawn
-        cap slot transfers to the retained task at the same boundary and is
-        released only after the child runtime and delegated hold are both gone.
+        The manager state lock is the admission boundary shared with the drain
+        seal. A drain joins already-admitted spawns before sealing, so this
+        spawn must not reacquire the drain lock that its joining owner holds.
+        A defensive gate handles any already-sealed direct drain without
+        creating an unregistered task behind its snapshot. A spawn cap slot
+        transfers to the retained task at the same boundary and is released
+        only after the child runtime and delegated hold are both gone.
 
         Returns whether cancellation was observed while completing admission.
         """
@@ -5961,11 +6025,12 @@ class AgentManager:
                             "Quarantined spawn cap ownership underflowed"
                         )
                     self._pending_spawns -= 1
+                    self._resolve_spawn_slot_terminal(admission)
 
-        cancelled = await self._acquire_quarantined_shutdown_drain()
+        cancelled = False
         cleanup: asyncio.Task[None] | None = None
         admission_failure: BaseException | None = None
-        try:
+        while True:
             acquire = asyncio.create_task(
                 self._lock.acquire(),
                 name=f"failed_spawn_cleanup_admission:{admission.name}",
@@ -5978,35 +6043,48 @@ class AgentManager:
                 raise RuntimeError(
                     "Unable to admit failed spawn cleanup"
                 ) from acquire_failure
+            wait_for_open: asyncio.Event | None = None
             try:
                 if self._quarantined_shutdown_handoffs_sealed:
-                    raise RuntimeError(
-                        "terminal drain remained sealed after admission lock"
-                    )
-                cleanup = asyncio.create_task(
-                    revoke_then_shutdown(),
-                    name=f"failed_spawn_receipt_cleanup:{admission.name}",
-                )
-                try:
-                    self._retain_quarantined_cleanup(
-                        name=admission.name,
-                        agent_id=_loaded_agent_did(child) or "<unknown>",
-                        task=cleanup,
-                    )
-                except BaseException as exc:
-                    # The task has not had an event-loop turn while this code
-                    # holds the lock. Cancel it before leaving the admission
-                    # boundary so an unregistered cleanup can never escape.
-                    cleanup.cancel()
-                    admission_failure = exc
+                    wait_for_open = self._quarantined_shutdown_handoffs_open
                 else:
-                    if admission.spawn_slot_active:
-                        slot_transferred = True
-                        admission.spawn_slot_active = False
+                    cleanup = asyncio.create_task(
+                        revoke_then_shutdown(),
+                        name=f"failed_spawn_receipt_cleanup:{admission.name}",
+                    )
+                    try:
+                        self._retain_quarantined_cleanup(
+                            name=admission.name,
+                            agent_id=_loaded_agent_did(child) or "<unknown>",
+                            task=cleanup,
+                        )
+                    except BaseException as exc:
+                        # The task has not had an event-loop turn while this
+                        # code holds the lock. Cancel it before leaving the
+                        # admission boundary so an unregistered cleanup can
+                        # never escape.
+                        cleanup.cancel()
+                        admission_failure = exc
+                    else:
+                        if admission.spawn_slot_active:
+                            slot_transferred = True
+                            admission.spawn_slot_active = False
             finally:
                 self._lock.release()
-        finally:
-            self._quarantined_shutdown_drain_lock.release()
+            if wait_for_open is None:
+                break
+            wait = asyncio.create_task(
+                wait_for_open.wait(),
+                name=f"failed_spawn_cleanup_wait_for_drain:{admission.name}",
+            )
+            wait_cancelled, wait_failure = (
+                await await_lifecycle_task_completion(wait)
+            )
+            cancelled = cancelled or wait_cancelled
+            if wait_failure is not None:
+                raise RuntimeError(
+                    "Unable to wait for failed spawn cleanup admission"
+                ) from wait_failure
 
         if admission_failure is not None:
             assert cleanup is not None

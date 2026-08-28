@@ -400,6 +400,7 @@ async def test_failed_spawn_cleanup_waits_out_terminal_handoff_seal(tmp_path):
     )
     manager._pending_spawns = 1
     manager._quarantined_shutdown_handoffs_sealed = True
+    manager._quarantined_shutdown_handoffs_open.clear()
     await manager._quarantined_shutdown_drain_lock.acquire()
     manager._rollback_uncommitted_spawn_runtime = AsyncMock(return_value=False)
 
@@ -411,11 +412,113 @@ async def test_failed_spawn_cleanup_waits_out_terminal_handoff_seal(tmp_path):
     assert manager._quarantined_shutdown_reapers == {}
 
     manager._quarantined_shutdown_handoffs_sealed = False
+    manager._quarantined_shutdown_handoffs_open.set()
     manager._quarantined_shutdown_drain_lock.release()
     await asyncio.wait_for(handoff, timeout=1.0)
     await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1.0)
 
     assert manager._rollback_uncommitted_spawn_runtime.await_count == 1
+    assert manager._pending_spawns == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_spawn_cleanup_does_not_reacquire_owning_drain_lock(tmp_path):
+    """Fleet shutdown can join a spawn while already owning the drain lock."""
+
+    graph = SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+    child = _make_mock_agent("did:test:joined-spawn-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    admission = AgentOperationAdmission(
+        name="JoinedSpawnChild",
+        canonical_name="joinedspawnchild",
+        kind="spawn",
+        registration_epoch=0,
+        owner_task=asyncio.current_task(),
+        child=child,
+        spawn_slot_active=True,
+        spawn_receipt_graph=graph,
+        spawn_receipt_source_id=child.agent_id,
+        spawn_receipt_target_id="did:test:joined-spawn-parent",
+        spawn_receipt_unsigned_properties={"parent_signature": None},
+    )
+    manager._pending_spawns = 1
+    manager._rollback_uncommitted_spawn_runtime = AsyncMock(return_value=False)
+    await manager._quarantined_shutdown_drain_lock.acquire()
+    handoff = asyncio.create_task(
+        manager._handoff_failed_spawn_cleanup(admission, child)
+    )
+    try:
+        done, _pending = await asyncio.wait({handoff}, timeout=0.05)
+    finally:
+        manager._quarantined_shutdown_drain_lock.release()
+    if handoff not in done:
+        await asyncio.wait_for(handoff, timeout=1.0)
+    assert handoff in done
+    assert handoff.result() is False
+
+    await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1.0)
+    assert manager._pending_spawns == 0
+
+
+@pytest.mark.asyncio
+async def test_over_cap_rejected_spawn_keeps_slot_if_rollback_is_quarantined(
+    tmp_path,
+):
+    """A restored child cannot open a cap gap around failed revocation."""
+
+    allow_revocation = asyncio.Event()
+
+    class BlockedRevocationGraph:
+        def __init__(self) -> None:
+            self.write_count = 0
+
+        async def add_trusted_cross_agent_edge(
+            self, _source, _target, _label, *, properties
+        ) -> None:
+            self.write_count += 1
+            if properties.get("parent_signature"):
+                return
+            if self.write_count == 2:
+                raise RuntimeError("revocation unavailable")
+            await allow_revocation.wait()
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._max_spawned_agents = 1
+    parent = _make_mock_agent("did:test:over-cap-quarantine-parent")
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    graph = BlockedRevocationGraph()
+    child = _make_mock_agent("did:test:over-cap-quarantine-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+
+    async def create_after_cold_restore(name, **_kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child)
+        manager._child_mandates["RestoredChild"] = SpawnMandate(
+            parent_did="did:test:other-parent",
+            child_did="did:test:restored-child",
+        )
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_after_cold_restore)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    with pytest.raises(ExceptionGroup, match="owned rollback failed"):
+        await manager.spawn_agent(
+            "OverCapQuarantineChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id),
+        )
+
+    assert manager._pending_spawns == 1
+    allow_revocation.set()
+    await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1.0)
     assert manager._pending_spawns == 0
 
 
