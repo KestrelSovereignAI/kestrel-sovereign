@@ -51,6 +51,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._stop = asyncio.Event()
         self._item_outstanding = False
         self._closed = False
+        self._cleanup_error: BaseException | None = None
         self._owner = asyncio.create_task(
             self._run(),
             name=f"owned_async_iterator:{operation}",
@@ -69,6 +70,12 @@ class OwnedAsyncIterator(Generic[_T]):
             return self._owner.exception()
         except asyncio.CancelledError as error:
             return error
+
+    @property
+    def cleanup_error(self) -> BaseException | None:
+        """Return an error raised while cancellation/closure unwound the source."""
+
+        return self._cleanup_error
 
     async def __anext__(self) -> _T:
         if self._closed:
@@ -91,20 +98,36 @@ class OwnedAsyncIterator(Generic[_T]):
         iterator: AsyncIterator[_T] | None = None
         try:
             iterator = self._iterator_factory()
-            async for item in iterator:
-                if self._stop.is_set():
-                    break
-                await self._items.put((self, item))
-                await self._continue.wait()
-                self._continue.clear()
-                if self._stop.is_set():
-                    break
+            try:
+                async for item in iterator:
+                    if self._stop.is_set():
+                        break
+                    await self._items.put((self, item))
+                    await self._continue.wait()
+                    self._continue.clear()
+                    if self._stop.is_set():
+                        break
+            except BaseException as error:
+                # An exception raised while a requested close interrupts
+                # ``anext`` belongs to generator unwinding, not ordinary
+                # source execution. Preserve that distinction for lifecycle
+                # acknowledgement at the transport boundary.
+                if self._stop.is_set() and not isinstance(
+                    error,
+                    asyncio.CancelledError,
+                ):
+                    self._cleanup_error = error
+                raise
         finally:
             try:
                 if iterator is not None:
                     close_iterator = getattr(iterator, "aclose", None)
                     if callable(close_iterator):
-                        await close_iterator()
+                        try:
+                            await close_iterator()
+                        except BaseException as error:
+                            self._cleanup_error = error
+                            raise
             finally:
                 self._items.put_nowait((_ITERATOR_TERMINAL, None))
 
@@ -116,7 +139,20 @@ class OwnedAsyncIterator(Generic[_T]):
         self._closed = True
         self._stop.set()
         self._continue.set()
+        owner_cancelled_by_close = False
+        if not self._owner.done():
+            owner_cancelled_by_close = self._owner.cancel()
         outcome = await await_owned_task(self._owner)
+        if (
+            owner_cancelled_by_close
+            and isinstance(outcome.error, asyncio.CancelledError)
+            and self._cleanup_error is None
+        ):
+            # Cancellation is the private interrupt used to wake a producer
+            # blocked in ``anext``. Once the owner's finally block has closed
+            # the iterator, it is a successful close, while cancellation of
+            # the caller itself still takes precedence below.
+            outcome = OwnedTaskOutcome(None, None, outcome.cancellation)
         raise_owned_outcome(outcome, operation=self._operation)
 
 

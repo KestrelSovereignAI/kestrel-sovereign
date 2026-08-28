@@ -792,14 +792,14 @@ async def stream_agent_response(request: Request):
                         await agent_stream.aclose()
                 except BaseException:
                     agent_stream_cleanup_failed = (
-                        agent_stream is None
-                        or agent_stream.terminal_error is not None
+                        agent_stream is not None
+                        and agent_stream.cleanup_error is not None
                     )
                     raise
                 else:
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
-                        and agent_stream.terminal_error is not None
+                        and agent_stream.cleanup_error is not None
                     )
                 finally:
                     try:

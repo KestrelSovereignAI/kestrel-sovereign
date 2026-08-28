@@ -288,14 +288,14 @@ def get_router() -> APIRouter:
                         await agent_stream.aclose()
                 except BaseException:
                     agent_stream_cleanup_failed = (
-                        agent_stream is None
-                        or agent_stream.terminal_error is not None
+                        agent_stream is not None
+                        and agent_stream.cleanup_error is not None
                     )
                     raise
                 else:
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
-                        and agent_stream.terminal_error is not None
+                        and agent_stream.cleanup_error is not None
                     )
                 finally:
                     # Bridge streams use the same counted lifecycle contract as

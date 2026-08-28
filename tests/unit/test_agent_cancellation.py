@@ -1363,6 +1363,25 @@ class TestStreamEndpointErrorContract:
         assert "Error generating response." in response.text
 
     @pytest.mark.asyncio
+    async def test_source_failure_is_not_recorded_as_abandoned_cleanup(self):
+        """A provider failure is terminal execution, not failed cleanup."""
+        from fastapi.testclient import TestClient
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("provider failed")
+            yield  # pragma: no cover
+
+        app = self._app_with_stream(_boom)
+        response = TestClient(app).post(
+            "/api/agent/stream",
+            json={"input": "hi", "request_id": "provider-failure"},
+        )
+
+        assert response.status_code == 200
+        cleanup = app.state.agent._cleanup_cancelled_request
+        cleanup.assert_called_once_with("provider-failure")
+
+    @pytest.mark.asyncio
     async def test_generic_exception_body_is_constant_across_errors(self):
         """Two different internal exceptions produce the SAME safe body — the
         constant contract, not a per-exception rendering."""
