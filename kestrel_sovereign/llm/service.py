@@ -544,6 +544,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Metering callback for usage billing (Vending Machine)
         # Set via set_metering_callback() after initialization
         self._metering_callback = None
+        # Optional billing fields explicitly accepted by the callback. Keep
+        # the historical cost boolean below for callers/tests that inspect it.
+        self._metering_callback_optional_kwargs: frozenset[str] = frozenset()
         # Whether the registered callback accepts the optional per-call
         # ``cost`` kwarg (#1806). Resolved in set_metering_callback().
         self._metering_callback_accepts_cost = False
@@ -3295,29 +3298,47 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 completion_tokens=int,
             )
 
-        The callback MAY additionally accept an optional ``cost`` keyword
-        (the provider-reported per-call cost in USD, e.g. OpenRouter
+        The callback MAY additionally accept optional ``cost``,
+        ``cache_creation_input_tokens``, and ``cache_read_input_tokens``
+        keywords. For a cache-aware callback, ``prompt_tokens`` follows the SDK
+        contract and excludes the separately supplied cache buckets. For a
+        callback that does not accept a cache bucket, that bucket is folded
+        back into ``prompt_tokens`` so existing billing integrations never
+        silently lose billable usage.
+
+        ``cost`` is the provider-reported per-call cost in USD (e.g. OpenRouter
         ``usage.cost``; ``None`` when the provider does not report one).
-        Callbacks that don't declare ``cost`` (or ``**kwargs``) are still
-        called with the original signature — see #1806.
+        Callbacks that don't declare an optional keyword (or ``**kwargs``) are
+        still called with the original signature — see #1806 and #3019.
 
         Args:
             callback: Async function to call after each LLM call
         """
         self._metering_callback = callback
-        # Detect whether the callback opts into the optional per-call cost
-        # (#1806) so we stay backward-compatible with callbacks written
-        # against the original (provider, model, tokens) signature.
-        accepts_cost = False
+        # Detect exactly which optional billing fields the callback opts into
+        # so we stay backward-compatible with the original signature.
+        optional_names = {
+            "cost",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        }
+        accepted_optional: set[str] = set()
         try:
             params = inspect.signature(callback).parameters
-            accepts_cost = "cost" in params or any(
+            accepts_all = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
+            accepted_optional = (
+                optional_names if accepts_all else optional_names.intersection(params)
+            )
         except (ValueError, TypeError):
-            accepts_cost = False
-        self._metering_callback_accepts_cost = accepts_cost
-        logger.info("LLM metering enabled (per-call cost: %s)", accepts_cost)
+            accepted_optional = set()
+        self._metering_callback_optional_kwargs = frozenset(accepted_optional)
+        self._metering_callback_accepts_cost = "cost" in accepted_optional
+        logger.info(
+            "LLM metering enabled (optional fields: %s)",
+            sorted(accepted_optional),
+        )
 
     def set_observability_context(
         self,
@@ -3571,8 +3592,18 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             tracked_tokens = (input_tokens or 0) + (output_tokens or 0)
         if track_model_usage and usage_tracker_ready and tracked_tokens is not None:
             try:
+                cache_usage: dict[str, int] = {}
+                if cache_creation_input_tokens is not None:
+                    cache_usage["cache_creation_input_tokens"] = (
+                        cache_creation_input_tokens
+                    )
+                if cache_read_input_tokens is not None:
+                    cache_usage["cache_read_input_tokens"] = cache_read_input_tokens
                 await self._track_model_usage(
-                    model, provider_name, tokens=tracked_tokens
+                    model,
+                    provider_name,
+                    tokens=tracked_tokens,
+                    **cache_usage,
                 )
             except asyncio.CancelledError:
                 raise
@@ -3900,19 +3931,36 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             user_id = context.user_id
 
             if companion_id and user_id:
+                accepted_optional = getattr(
+                    self, "_metering_callback_optional_kwargs", frozenset()
+                )
+                billable_prompt_tokens = input_tokens or 0
+                cache_buckets = {
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                }
+                for name, value in cache_buckets.items():
+                    if name not in accepted_optional and value is not None:
+                        billable_prompt_tokens += value
                 meter_kwargs = dict(
                     companion_id=companion_id,
                     user_id=user_id,
                     provider=provider,
                     model=model,
-                    prompt_tokens=input_tokens or 0,
+                    prompt_tokens=billable_prompt_tokens,
                     completion_tokens=output_tokens or 0,
                 )
-                # Only pass the provider-reported per-call cost (#1806) to
-                # callbacks that opted in; keeps the original signature
-                # working for callbacks that don't declare ``cost``.
-                if getattr(self, "_metering_callback_accepts_cost", False):
-                    meter_kwargs["cost"] = cost
+                optional_values = {
+                    "cost": cost,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                }
+                # Only pass optional fields to callbacks that opted in; this
+                # keeps callbacks written against the original signature live.
+                for name in accepted_optional:
+                    if name != "cost" and optional_values[name] is None:
+                        continue
+                    meter_kwargs[name] = optional_values[name]
                 try:
                     await metering_callback(**meter_kwargs)
                 except asyncio.CancelledError:

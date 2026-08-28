@@ -456,6 +456,7 @@ class TestCoreGeneration:
             cache_creation_input_tokens=0,
             cache_read_input_tokens=66482,
         ))
+        llm_service._track_model_usage = AsyncMock()
 
         with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
             await llm_service.get_response(
@@ -470,6 +471,13 @@ class TestCoreGeneration:
         assert payload["output_tokens"] == 42
         assert payload["cache_creation_input_tokens"] == 0
         assert payload["cache_read_input_tokens"] == 66482
+        llm_service._track_model_usage.assert_awaited_once_with(
+            "gpt-5-mini",
+            "openai:api",
+            tokens=2145,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=66482,
+        )
         assert "duration_ms" in payload
         assert "model" in payload
         assert payload["tools"] is False
@@ -881,6 +889,79 @@ class TestMeteringAndCost:
         assert seen == [0.0042]
 
     @pytest.mark.asyncio
+    async def test_cache_breakdown_forwarded_to_opted_in_callback(
+        self, llm_service, mock_adapter
+    ):
+        """Uncached input and discounted cache buckets both reach billing."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=40,
+            output_tokens=5,
+            total_tokens=45,
+            cache_creation_input_tokens=7,
+            cache_read_input_tokens=80,
+        ))
+        seen = []
+
+        async def _cb(
+            *,
+            companion_id,
+            user_id,
+            provider,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            cache_creation_input_tokens=None,
+            cache_read_input_tokens=None,
+        ):
+            seen.append(
+                (
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                )
+            )
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(40, 5, 7, 80)]
+
+    @pytest.mark.asyncio
+    async def test_cache_read_folded_into_prompt_for_cost_only_callback(
+        self, llm_service, mock_adapter
+    ):
+        """Existing Frinz-shaped callbacks retain the inclusive token count."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=40,
+            output_tokens=5,
+            total_tokens=45,
+            cache_read_input_tokens=80,
+        ))
+        seen = []
+
+        async def _cb(
+            *, companion_id, user_id, provider, model,
+            prompt_tokens, completion_tokens, cost=None,
+        ):
+            seen.append((prompt_tokens, completion_tokens, cost))
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(120, 5, None)]
+
+    @pytest.mark.asyncio
     async def test_legacy_callback_without_cost_still_called(self, llm_service):
         """A callback written against the original signature (no cost kwarg)
         is not handed an unexpected kwarg — backward compatible (#1806)."""
@@ -892,6 +973,7 @@ class TestMeteringAndCost:
 
         llm_service.set_metering_callback(_legacy)
         assert llm_service._metering_callback_accepts_cost is False
+        assert llm_service._metering_callback_optional_kwargs == frozenset()
         llm_service.set_observability_context(companion_id="c1", user_id="u1")
 
         await llm_service.generate_with_messages(

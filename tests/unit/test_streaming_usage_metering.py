@@ -74,7 +74,16 @@ def test_text_only_stream_emits_terminal_llmresponse_with_usage():
     from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 
     events = [
-        _ev("message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=12))),
+        _ev(
+            "message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=12,
+                    cache_creation_input_tokens=101,
+                    cache_read_input_tokens=202,
+                )
+            ),
+        ),
         _ev("content_block_start", index=0, content_block=SimpleNamespace(type="text")),
         _ev("content_block_delta", index=0,
             delta=SimpleNamespace(type="text_delta", text="hello world")),
@@ -93,6 +102,8 @@ def test_text_only_stream_emits_terminal_llmresponse_with_usage():
     resp = terminals[0]
     assert resp.input_tokens == 12
     assert resp.output_tokens == 7
+    assert resp.cache_creation_input_tokens == 101
+    assert resp.cache_read_input_tokens == 202
     assert not resp.tool_calls  # text-only: no tool calls
 
 
@@ -120,8 +131,16 @@ class _FakeService(StreamingMixin):
 
 def test_record_streamed_usage_meters_terminal_response():
     svc = _FakeService()
-    resp = LLMResponse(content="hi", tool_calls=None, raw=None,
-                       input_tokens=10, output_tokens=20, total_tokens=30)
+    resp = LLMResponse(
+        content="hi",
+        tool_calls=None,
+        raw=None,
+        input_tokens=10,
+        output_tokens=20,
+        total_tokens=30,
+        cache_creation_input_tokens=40,
+        cache_read_input_tokens=50,
+    )
 
     asyncio.run(svc._record_streamed_usage(resp, "claude-x", "anthropic", duration_ms=42))
 
@@ -129,6 +148,8 @@ def test_record_streamed_usage_meters_terminal_response():
     args, kwargs = svc._track_model_usage.await_args
     assert args[0] == "claude-x" and args[1] == "anthropic"
     assert kwargs.get("tokens") == 30  # input + output
+    assert kwargs["cache_creation_input_tokens"] == 40
+    assert kwargs["cache_read_input_tokens"] == 50
 
     svc._log_llm_call.assert_awaited_once()
     _, lk = svc._log_llm_call.await_args
@@ -435,7 +456,15 @@ def test_openai_text_only_stream_emits_terminal_llmresponse_with_usage(monkeypat
         )],
     )
     usage_chunk = SimpleNamespace(
-        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=7, total_tokens=19),
+        usage=SimpleNamespace(
+            prompt_tokens=12,
+            completion_tokens=7,
+            total_tokens=19,
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=8,
+                cache_write_tokens=2,
+            ),
+        ),
         choices=[],
     )
 
@@ -459,8 +488,11 @@ def test_openai_text_only_stream_emits_terminal_llmresponse_with_usage(monkeypat
     assert "".join(i for i in items if isinstance(i, str)) == "hello world"
     terminals = [i for i in items if isinstance(i, LLMResponse)]
     assert len(terminals) == 1, items
-    assert terminals[0].input_tokens == 12
+    assert terminals[0].input_tokens == 2
     assert terminals[0].output_tokens == 7
+    assert terminals[0].total_tokens == 9
+    assert terminals[0].cache_creation_input_tokens == 2
+    assert terminals[0].cache_read_input_tokens == 8
     assert not terminals[0].tool_calls
 
 
@@ -597,7 +629,16 @@ def test_anthropic_populates_usage_sink_as_events_arrive():
     assert AnthropicAdapter.supports_partial_usage_flush is True
 
     events = [
-        _ev("message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=42))),
+        _ev(
+            "message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=42,
+                    cache_creation_input_tokens=88,
+                    cache_read_input_tokens=99,
+                )
+            ),
+        ),
         _ev("message_delta", usage=SimpleNamespace(output_tokens=8)),
     ]
     sink: dict = {}
@@ -616,7 +657,12 @@ def test_anthropic_populates_usage_sink_as_events_arrive():
             pass
 
     asyncio.run(_run())
-    assert sink == {"input_tokens": 42, "output_tokens": 8}
+    assert sink == {
+        "input_tokens": 42,
+        "output_tokens": 8,
+        "cache_creation_input_tokens": 88,
+        "cache_read_input_tokens": 99,
+    }
 
 
 class _AbortingAdapter:
@@ -632,6 +678,8 @@ class _AbortingAdapter:
         if sink is not None:
             sink["input_tokens"] = 100
             sink["output_tokens"] = 3
+            sink["cache_creation_input_tokens"] = 17
+            sink["cache_read_input_tokens"] = 83
         raise asyncio.CancelledError()
 
 
@@ -652,10 +700,18 @@ def test_stream_with_tool_detection_flushes_partial_on_abort(monkeypatch):
     asyncio.run(_run())
 
     # The aborted stream still recorded the partial usage the provider billed.
-    svc._track_model_usage.assert_awaited_once()
+    svc._track_model_usage.assert_awaited_once_with(
+        "claude-x",
+        "anthropic",
+        tokens=103,
+        cache_creation_input_tokens=17,
+        cache_read_input_tokens=83,
+    )
     svc._log_llm_call.assert_awaited_once()
     _, lk = svc._log_llm_call.await_args
     assert lk["input_tokens"] == 100 and lk["output_tokens"] == 3
+    assert lk["cache_creation_input_tokens"] == 17
+    assert lk["cache_read_input_tokens"] == 83
     assert lk["metadata"] == {
         "streamed": True,
         "path": "stream_with_tool_detection",

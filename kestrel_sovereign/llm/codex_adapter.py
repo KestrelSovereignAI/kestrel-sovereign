@@ -531,13 +531,19 @@ def _usage_from(tu: dict) -> Dict[str, Optional[int]]:
     inp = total.get("inputTokens")
     out = total.get("outputTokens")
     tot = total.get("totalTokens")
+    cached = total.get("cachedInputTokens")
+    if isinstance(cached, int) and not isinstance(cached, bool):
+        if isinstance(inp, int) and not isinstance(inp, bool):
+            inp = max(0, inp - cached)
+        if isinstance(tot, int) and not isinstance(tot, bool):
+            tot = max(0, tot - cached)
     if tot is None and (inp is not None or out is not None):
         tot = (inp or 0) + (out or 0)
     return {
         "input_tokens": inp,
         "output_tokens": out,
         "total_tokens": tot,
-        "cache_read_input_tokens": total.get("cachedInputTokens"),
+        "cache_read_input_tokens": cached,
     }
 
 

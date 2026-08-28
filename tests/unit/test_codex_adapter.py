@@ -394,8 +394,8 @@ class TestUsageProjection:
             "totalTokens": 100, "inputTokens": 90,
             "cachedInputTokens": 40, "outputTokens": 10,
         }}) == {
-            "input_tokens": 90, "output_tokens": 10,
-            "total_tokens": 100, "cache_read_input_tokens": 40,
+            "input_tokens": 50, "output_tokens": 10,
+            "total_tokens": 60, "cache_read_input_tokens": 40,
         }
 
 
@@ -596,7 +596,7 @@ class TestAdapterTextPath:
         )
         assert isinstance(r, LLMResponse)
         assert r.content == "Hello"
-        assert (r.input_tokens, r.output_tokens, r.total_tokens) == (7, 2, 9)
+        assert (r.input_tokens, r.output_tokens, r.total_tokens) == (4, 2, 6)
         assert r.cache_read_input_tokens == 3
         cached_id, cached_fp = a._session_threads["s1"]
         assert cached_id == "thr-1" and cached_fp  # fingerprint set

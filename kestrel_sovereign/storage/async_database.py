@@ -71,6 +71,31 @@ _SESSION_PROJECTION_INDEX = (
     "conversation_sessions",
 )
 
+#: Daily cache-effectiveness buckets for #3019. Kept out of ``CORE_SCHEMA``
+#: because ``CREATE TABLE IF NOT EXISTS`` is only idempotent in sequence on
+#: PostgreSQL; concurrent ``from_pool()`` initializers can both pass its
+#: catalogue probe before either relation exists. ``_ensure_model_usage_periods``
+#: owns the probe -> migration lock -> re-probe that makes first-upgrade boot
+#: safe under a request burst.
+_MODEL_USAGE_PERIODS_DDL = """
+CREATE TABLE IF NOT EXISTS model_usage_periods (
+    period_start TIMESTAMP NOT NULL,
+    model_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    total_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (period_start, model_id, provider)
+)
+"""
+
+_MODEL_USAGE_PERIODS_INDEX = (
+    "idx_model_usage_periods_start",
+    "model_usage_periods",
+    "period_start",
+)
+
 #: ``(name, table, columns)`` of the index that makes the #2959 staleness probe
 #: the "one indexed ``max(id)`` lookup" it is described as.
 #:
@@ -263,6 +288,8 @@ CREATE TABLE IF NOT EXISTS model_usage (
     last_used TIMESTAMP NOT NULL,
     use_count INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
+    cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -836,7 +863,6 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));
 """
 
-
 #: Hex digits in an index-name fingerprint. Named because ``_index_family``
 #: matches on it: a family boundary and the names it generates have to be the
 #: same length or the boundary is not exact.
@@ -1038,6 +1064,24 @@ class AsyncDatabase:
             if statement:
                 await self._backend.execute(statement)
 
+        # Cache-effectiveness observability (#3019). Existing model_usage
+        # databases predate these provider-reported counters, so the greenfield
+        # CREATE shape above is insufficient on upgrade. Keep both additions in
+        # one concurrency-safe migration; legacy rows honestly start at zero.
+        await self.migrate_columns_once(
+            "model_usage",
+            (
+                (
+                    "cache_creation_input_tokens",
+                    "BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "cache_read_input_tokens",
+                    "BIGINT NOT NULL DEFAULT 0",
+                ),
+            ),
+        )
+        await self._ensure_model_usage_periods()
         # Canonical semantic assertions are an additive, normalized authority
         # behind this same AsyncDatabase.  Do not place their lifecycle and
         # provenance state in graph JSON: the migration owns one transactional
@@ -1918,6 +1962,33 @@ class AsyncDatabase:
                     f"{table} is missing column(s) after migration: "
                     + ", ".join(still_missing)
                 )
+
+    async def _ensure_model_usage_periods(self) -> None:
+        """Create #3019's daily usage buckets safely under concurrent boot.
+
+        The lifetime ``model_usage`` table deliberately retains its historical
+        ``model_id`` key so old-revision writers remain valid during a rolling
+        deployment. This companion table supplies the missing provider and UTC
+        period dimensions without rewriting that contract.
+
+        Use the same probe -> migration lock -> re-probe discipline as the
+        newer schema helpers. A bare ``CREATE TABLE IF NOT EXISTS`` in
+        ``CORE_SCHEMA`` is unsafe when PostgreSQL initializers race: both can
+        observe the missing relation before catalogue locking excludes either,
+        and one request loses on ``pg_class``'s unique index.
+        """
+        table = "model_usage_periods"
+        if not await self.table_exists(table):
+            async with self.migration_lock(f"create_{table}"):
+                if not await self.table_exists(table):
+                    await self.execute(_MODEL_USAGE_PERIODS_DDL)
+
+        if not await self.table_exists(table):
+            raise RuntimeError(
+                "model_usage_periods was not created; cache-token usage "
+                "cannot be reported by period"
+            )
+        await self.ensure_index(*_MODEL_USAGE_PERIODS_INDEX)
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",

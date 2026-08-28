@@ -124,8 +124,16 @@ class UsageTrackingMixin:
             logger.warning(f"Failed to initialize usage tracking: {e}")
             self._usage_db = None
 
-    async def _track_model_usage(self, model_id: str, provider: str, tokens: int = 0):
-        """Track model usage for cleanup decisions."""
+    async def _track_model_usage(
+        self,
+        model_id: str,
+        provider: str,
+        tokens: int = 0,
+        *,
+        cache_creation_input_tokens: int | None = None,
+        cache_read_input_tokens: int | None = None,
+    ):
+        """Track cumulative model and provider-reported prompt-cache usage."""
         await self._ensure_db_initialized()
         if not self._usage_db:
             return
@@ -135,17 +143,76 @@ class UsageTrackingMixin:
             # PostgreSQL TIMESTAMP (without timezone) requires naive datetimes
             # SQLite doesn't care about timezone info
             now = datetime.now(timezone.utc).replace(tzinfo=None)
+            period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            cache_creation_tokens = (
+                cache_creation_input_tokens
+                if cache_creation_input_tokens is not None
+                else 0
+            )
+            cache_read_tokens = (
+                cache_read_input_tokens
+                if cache_read_input_tokens is not None
+                else 0
+            )
 
-            # Use abstract data layer - queries are backend-agnostic
-            # Note: Column references in ON CONFLICT must be qualified for PostgreSQL
-            await self._usage_db.execute("""
-                INSERT INTO model_usage (model_id, provider, last_used, use_count, total_tokens, created_at)
-                VALUES (?, ?, ?, 1, ?, ?)
-                ON CONFLICT(model_id) DO UPDATE SET
-                    last_used = ?,
-                    use_count = model_usage.use_count + 1,
-                    total_tokens = model_usage.total_tokens + ?
-            """, (model_id, provider, now, tokens, now, now, tokens))
+            # Keep the legacy lifetime aggregate and the UTC daily bucket in
+            # one transaction. The former preserves cleanup consumers and old
+            # writers; the latter makes arbitrary day-range cache queries
+            # truthful instead of attributing a lifetime total to last_used.
+            async with self._usage_db.transaction():
+                await self._usage_db.execute("""
+                    INSERT INTO model_usage (
+                        model_id, provider, last_used, use_count, total_tokens,
+                        cache_creation_input_tokens, cache_read_input_tokens,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                    ON CONFLICT(model_id) DO UPDATE SET
+                        last_used = ?,
+                        use_count = model_usage.use_count + 1,
+                        total_tokens = model_usage.total_tokens + ?,
+                        cache_creation_input_tokens =
+                            model_usage.cache_creation_input_tokens + ?,
+                        cache_read_input_tokens =
+                            model_usage.cache_read_input_tokens + ?
+                """, (
+                    model_id,
+                    provider,
+                    now,
+                    tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    now,
+                    now,
+                    tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                ))
+                await self._usage_db.execute("""
+                    INSERT INTO model_usage_periods (
+                        period_start, model_id, provider, use_count,
+                        total_tokens, cache_creation_input_tokens,
+                        cache_read_input_tokens
+                    )
+                    VALUES (?, ?, ?, 1, ?, ?, ?)
+                    ON CONFLICT(period_start, model_id, provider) DO UPDATE SET
+                        use_count = model_usage_periods.use_count + 1,
+                        total_tokens = model_usage_periods.total_tokens + ?,
+                        cache_creation_input_tokens =
+                            model_usage_periods.cache_creation_input_tokens + ?,
+                        cache_read_input_tokens =
+                            model_usage_periods.cache_read_input_tokens + ?
+                """, (
+                    period_start,
+                    model_id,
+                    provider,
+                    tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                ))
         except Exception as e:
             logger.warning(f"Failed to track usage for {model_id}: {e}")
 
