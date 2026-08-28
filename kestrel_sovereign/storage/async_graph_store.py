@@ -441,6 +441,18 @@ async def release_graph_node_owners(
     return affected
 
 
+async def _acquire_sqlite_graph_writer_slot(db: AsyncDatabase) -> None:
+    """Acquire SQLite's writer slot without changing a graph row.
+
+    The caller owns the surrounding transaction. This explicit write is also
+    effective inside a same-task nested transaction, where a requested
+    ``BEGIN IMMEDIATE`` cannot replace the outer deferred ``BEGIN``.
+    """
+
+    if db.backend_type == "sqlite":
+        await db.execute("UPDATE graph_nodes SET node_id = node_id WHERE 0")
+
+
 async def lock_graph_nodes_for_update(
     db: AsyncDatabase,
     node_ids: Iterable[str],
@@ -456,6 +468,9 @@ async def lock_graph_nodes_for_update(
     unique_node_ids = sorted(
         dict.fromkeys(node_id for node_id in node_ids if node_id)
     )
+    if db.backend_type == "sqlite":
+        await _acquire_sqlite_graph_writer_slot(db)
+        return unique_node_ids
     if db.backend_type != "postgres":
         return unique_node_ids
 
@@ -704,6 +719,7 @@ class AsyncGraphStore:
             (node.node_type, node.label), node.properties, node.node_id
         )
         async with self.db.transaction():
+            await _acquire_sqlite_graph_writer_slot(self.db)
             existing = await self.db.fetchone(
                 "SELECT node_type, label, properties FROM graph_nodes "
                 "WHERE node_id = ?",
@@ -1328,6 +1344,11 @@ class AsyncGraphStore:
         """Read and lock one tenant-visible graph identity inside a transaction."""
 
         scope, scope_params = self._node_scope()
+        # ``transaction(immediate=True)`` cannot upgrade a same-task outer
+        # deferred transaction because SQLite's nested transaction scope is a
+        # no-op. Acquire explicitly before reading identity so the composed
+        # public ``AsyncStorage.transaction()`` path remains serialized too.
+        await _acquire_sqlite_graph_writer_slot(self.db)
         lock_suffix = " FOR UPDATE" if self.db.backend_type == "postgres" else ""
         return await self.db.fetchone(
             "SELECT node_type, label FROM graph_nodes "

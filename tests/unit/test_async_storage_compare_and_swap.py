@@ -625,6 +625,77 @@ class TestCompareAndDelete:
         )
         assert result == "not_found"
 
+    async def test_nested_deferred_sqlite_transaction_keeps_writer_slot(
+        self, tmp_path, monkeypatch
+    ):
+        """A public outer transaction cannot erase delete serialization."""
+
+        db_path = str(tmp_path / "nested-delete.db")
+        first_db = await AsyncDatabase.sqlite(db_path)
+        second_db = await AsyncDatabase.sqlite(db_path)
+        first = AsyncGraphStore(first_db)
+        second = AsyncGraphStore(second_db)
+        nid = _nid("nested-delete")
+        await first.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Before")
+        )
+
+        delete_entered = asyncio.Event()
+        release_delete = asyncio.Event()
+        original_delete = first._delete_node_in_transaction
+
+        async def pause_before_delete(candidate_id):
+            delete_entered.set()
+            await release_delete.wait()
+            return await original_delete(candidate_id)
+
+        monkeypatch.setattr(first, "_delete_node_in_transaction", pause_before_delete)
+
+        async def delete_inside_public_transaction():
+            async with first_db.transaction():
+                return await first.compare_and_delete_node(
+                    nid,
+                    expected_node_type="owned",
+                    expected_label="Before",
+                )
+
+        deletion = asyncio.create_task(delete_inside_public_transaction())
+        replacement = None
+        try:
+            await asyncio.wait_for(delete_entered.wait(), timeout=5)
+            replacement = asyncio.create_task(
+                second.add_node(
+                    _node(
+                        nid,
+                        {"status": "replacement", "sentinel": "must survive"},
+                        node_type="owned",
+                        label="After",
+                    )
+                )
+            )
+            await asyncio.sleep(0.1)
+            assert not replacement.done(), (
+                "replacement passed a nested in-flight conditional delete"
+            )
+            release_delete.set()
+            result, _ = await asyncio.wait_for(
+                asyncio.gather(deletion, replacement), timeout=5
+            )
+            assert result == NodeDeleteResult.DELETED
+            after = await second.get_node(nid)
+            assert after is not None
+            assert after.label == "After"
+            assert after.properties["sentinel"] == "must survive"
+        finally:
+            release_delete.set()
+            pending = [task for task in (deletion, replacement) if task is not None]
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await first_db.close()
+            await second_db.close()
+
 
 # =====================================================================
 # Facade + privacy wrapper (SQLite; proves the delegation chain is atomic)
