@@ -16,8 +16,9 @@ import asyncio
 from datetime import datetime, timezone
 
 import pytest
-
 from kestrel_sdk.signals import CausationFrame, ResourceLock
+
+from kestrel_sovereign.agent.invocation import invocation_scope
 from kestrel_sovereign.agent.turn_lifecycle import (
     TurnLifecycleMixin,
     bind_turn_session,
@@ -144,6 +145,50 @@ async def test_turn_id_is_unique_per_call():
         async with agent._turn_lifecycle() as turn_id:
             seen.append(turn_id)
     assert len(seen) == len(set(seen)), f"duplicate turn_ids: {seen}"
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_indexes_task_local_request_until_exit():
+    agent = _StubAgent()
+
+    with invocation_scope("request-visible-to-stop"):
+        async with agent._turn_lifecycle() as turn_id:
+            assert (
+                agent.resolve_turn_request_id(turn_id)
+                == "request-visible-to-stop"
+            )
+
+    assert agent.resolve_turn_request_id(turn_id) is None
+
+
+@pytest.mark.asyncio
+async def test_turn_request_index_cleanup_survives_turn_failure():
+    agent = _StubAgent()
+    turn_id = None
+
+    with invocation_scope("request-that-fails"):
+        with pytest.raises(RuntimeError, match="turn failed"):
+            async with agent._turn_lifecycle() as turn_id:
+                assert agent.resolve_turn_request_id(turn_id) == "request-that-fails"
+                raise RuntimeError("turn failed")
+
+    assert turn_id is not None
+    assert agent.resolve_turn_request_id(turn_id) is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_request_id_gets_distinct_live_turn_bindings():
+    agent = _StubAgent()
+    turn_ids = []
+
+    for _ in range(2):
+        with invocation_scope("retry-request"):
+            async with agent._turn_lifecycle() as turn_id:
+                turn_ids.append(turn_id)
+                assert agent.resolve_turn_request_id(turn_id) == "retry-request"
+
+    assert turn_ids[0] != turn_ids[1]
+    assert all(agent.resolve_turn_request_id(turn_id) is None for turn_id in turn_ids)
 
 
 # ---------------------------------------------------------------------------

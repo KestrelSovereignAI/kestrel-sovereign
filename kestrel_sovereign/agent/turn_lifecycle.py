@@ -27,6 +27,8 @@ from typing import AsyncIterator, Iterator, Optional
 from uuid import uuid4
 
 from kestrel_sdk.signals import CausationFrame, ResourceLock
+
+from kestrel_sovereign.agent.invocation import current_invocation_id
 from kestrel_sovereign.signals import OrderedLockManager
 
 logger = logging.getLogger(__name__)
@@ -179,6 +181,51 @@ class TurnLifecycleMixin:
         """Return the current agent turn id for per-turn observability."""
         return _CURRENT_TURN_ID.get()
 
+    def _turn_request_index(self) -> dict[str, str]:
+        """Return the live turn-to-request index, creating it for test doubles."""
+
+        index = getattr(self, "_turn_request_ids", None)
+        if index is None:
+            index = {}
+            self._turn_request_ids = index
+        if not isinstance(index, dict):
+            raise TypeError("turn request index has an invalid type")
+        return index
+
+    def _register_turn_request_id(self, turn_id: str, request_id: str) -> None:
+        """Bind one freshly-created observable turn to its cancellation key."""
+
+        for field_name, value in (("turn_id", turn_id), ("request_id", request_id)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a concrete string")
+        index = self._turn_request_index()
+        if turn_id in index:
+            raise RuntimeError("turn_id is already bound to a request")
+        index[turn_id] = request_id
+
+    def resolve_turn_request_id(self, turn_id: str) -> Optional[str]:
+        """Resolve an active observable turn to its process-local cancel key."""
+
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            return None
+        request_id = self._turn_request_index().get(turn_id)
+        if request_id is not None and (
+            not isinstance(request_id, str) or not request_id.strip()
+        ):
+            raise TypeError("turn request index contains an invalid request identity")
+        return request_id
+
+    def _unregister_turn_request_id(self, turn_id: str, request_id: str) -> None:
+        """Remove only the exact lifecycle binding that this turn registered."""
+
+        index = self._turn_request_index()
+        current = index.get(turn_id)
+        if current is None:
+            return
+        if current != request_id:
+            raise RuntimeError("turn request cleanup does not own the live binding")
+        del index[turn_id]
+
     def get_turn_bound_session_id(self) -> Optional[str]:
         """The chat session of the turn the CALLING task belongs to, or None.
 
@@ -319,22 +366,31 @@ class TurnLifecycleMixin:
             # never enter this boundary, so their explicit stale/unbound veto
             # remains intact (#2928 review P1).
             bound_token = _BOUND_TURN_SESSION.set(None)
+            request_id = current_invocation_id()
+            request_binding_registered = False
             try:
+                if request_id is not None:
+                    self._register_turn_request_id(turn_id, request_id)
+                    request_binding_registered = True
                 yield turn_id
             finally:
-                _BOUND_TURN_SESSION.reset(bound_token)
-                _CURRENT_TURN_ID.reset(token)
-                self._live_turn_id = None
-                # Clear the per-turn active session on exit so an out-of-turn
-                # caller (e.g. a CLI/system-filed request_restart after a chat
-                # turn) cannot read a stale session and misroute its wake into
-                # an old chat window (#1809). Set inside the turn body by
-                # process_input / the streaming turn; both run under this lock.
-                self._active_session_id = None
-                # Duration on the exit line so a slow turn is measurable from
-                # the log alone, without correlating two timestamps by hand.
-                logger.info(
-                    "turn_lifecycle: %s end after %.1fs",
-                    label,
-                    time.monotonic() - started,
-                )
+                try:
+                    if request_binding_registered:
+                        self._unregister_turn_request_id(turn_id, request_id)
+                finally:
+                    _BOUND_TURN_SESSION.reset(bound_token)
+                    _CURRENT_TURN_ID.reset(token)
+                    self._live_turn_id = None
+                    # Clear the per-turn active session on exit so an out-of-turn
+                    # caller (e.g. a CLI/system-filed request_restart after a chat
+                    # turn) cannot read a stale session and misroute its wake into
+                    # an old chat window (#1809). Set inside the turn body by
+                    # process_input / the streaming turn; both run under this lock.
+                    self._active_session_id = None
+                    # Duration on the exit line so a slow turn is measurable from
+                    # the log alone, without correlating two timestamps by hand.
+                    logger.info(
+                        "turn_lifecycle: %s end after %.1fs",
+                        label,
+                        time.monotonic() - started,
+                    )
