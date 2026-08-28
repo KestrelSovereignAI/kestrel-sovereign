@@ -483,7 +483,7 @@ class AsyncStorage:
             checker()
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self, *, immediate: bool = False):
         """Run the enclosed storage operations as one atomic write unit.
 
         Delegates to the backend's transaction context manager: every write
@@ -493,10 +493,16 @@ class AsyncStorage:
         backends are re-entrant for the SAME asyncio task, so nested
         ``transaction()`` scopes (e.g. a helper opening its own around a
         caller's outer one) join the outer transaction.
+
+        ``immediate`` is forwarded to SQLite so a composed read-then-write unit
+        can acquire the writer slot before its first read. This is required for
+        nesting conditional graph mutations: SQLite cannot upgrade a deferred
+        snapshot after another connection has committed. Other backends ignore
+        the hint and use their normal row-locking primitives.
         """
         if not self._initialized:
             await self.initialize()
-        async with self.db.transaction():
+        async with self.db.transaction(immediate=immediate):
             yield
 
     # --- File Operations ---

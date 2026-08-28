@@ -625,76 +625,135 @@ class TestCompareAndDelete:
         )
         assert result == "not_found"
 
-    async def test_nested_deferred_sqlite_transaction_keeps_writer_slot(
-        self, tmp_path, monkeypatch
+    async def test_public_immediate_transaction_locks_before_outer_read(
+        self, tmp_path
     ):
-        """A public outer transaction cannot erase delete serialization."""
+        """A public atomic read/write scope takes SQLite's slot up front.
+
+        A nested graph mutation cannot upgrade a deferred snapshot after a
+        competing connection commits.  The storage and privacy facades must
+        therefore expose the backend's immediate mode so callers composing a
+        read with conditional deletion can serialize before that first read.
+        """
 
         db_path = str(tmp_path / "nested-delete.db")
-        first_db = await AsyncDatabase.sqlite(db_path)
-        second_db = await AsyncDatabase.sqlite(db_path)
-        first = AsyncGraphStore(first_db)
-        second = AsyncGraphStore(second_db)
+        first_storage = await AsyncStorage.create_sqlite(db_path)
+        first = PrivacyEnforcingStorage(first_storage, PrivacyMode.NORMAL)
+        second = await AsyncStorage.create_sqlite(db_path)
         nid = _nid("nested-delete")
         await first.add_node(
             _node(nid, {"status": "stale"}, node_type="owned", label="Before")
         )
 
-        delete_entered = asyncio.Event()
-        release_delete = asyncio.Event()
-        original_delete = first._delete_node_in_transaction
-
-        async def pause_before_delete(candidate_id):
-            delete_entered.set()
-            await release_delete.wait()
-            return await original_delete(candidate_id)
-
-        monkeypatch.setattr(first, "_delete_node_in_transaction", pause_before_delete)
-
-        async def delete_inside_public_transaction():
-            async with first_db.transaction():
-                return await first.compare_and_delete_node(
+        replacement = None
+        try:
+            async with first.transaction(immediate=True):
+                observed = await first.get_node(nid)
+                assert observed is not None
+                assert observed.label == "Before"
+                replacement = asyncio.create_task(
+                    second.add_node(
+                        _node(
+                            nid,
+                            {"status": "replacement", "sentinel": "must survive"},
+                            node_type="owned",
+                            label="After",
+                        )
+                    )
+                )
+                await asyncio.sleep(0.1)
+                assert not replacement.done(), (
+                    "replacement passed the public immediate transaction"
+                )
+                result = await first.compare_and_delete_node(
                     nid,
                     expected_node_type="owned",
                     expected_label="Before",
                 )
-
-        deletion = asyncio.create_task(delete_inside_public_transaction())
-        replacement = None
-        try:
-            await asyncio.wait_for(delete_entered.wait(), timeout=5)
-            replacement = asyncio.create_task(
-                second.add_node(
-                    _node(
-                        nid,
-                        {"status": "replacement", "sentinel": "must survive"},
-                        node_type="owned",
-                        label="After",
-                    )
-                )
-            )
-            await asyncio.sleep(0.1)
-            assert not replacement.done(), (
-                "replacement passed a nested in-flight conditional delete"
-            )
-            release_delete.set()
-            result, _ = await asyncio.wait_for(
-                asyncio.gather(deletion, replacement), timeout=5
-            )
             assert result == NodeDeleteResult.DELETED
+
+            await asyncio.wait_for(replacement, timeout=5)
             after = await second.get_node(nid)
             assert after is not None
             assert after.label == "After"
             assert after.properties["sentinel"] == "must survive"
         finally:
-            release_delete.set()
-            pending = [task for task in (deletion, replacement) if task is not None]
-            for task in pending:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            await first_db.close()
-            await second_db.close()
+            if replacement is not None and not replacement.done():
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+            await first_storage.close()
+            await second.close()
+
+    async def test_ordinary_unbound_delete_cleans_dangling_graph_records(
+        self, graph_store
+    ):
+        """Physical maintenance deletion still repairs an absent graph row."""
+
+        nid = _nid("dangling-unbound")
+        source = _nid("dangling-source")
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, "agent-a"),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", "{}"),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edge_owners "
+            "(source_id, target_id, label, agent_id) VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", "agent-a"),
+        )
+
+        await graph_store.delete_node(nid)
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_node_owners WHERE node_id = ?", (nid,)
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE target_id = ?", (nid,)
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edge_owners WHERE target_id = ?", (nid,)
+        ) is None
+
+    async def test_ordinary_bound_delete_releases_dangling_owned_records(
+        self, graph_store
+    ):
+        """A tenant can repair its witnesses even after the node disappeared."""
+
+        agent_id = f"agent:{uuid.uuid4().hex}"
+        bound = AsyncGraphStore(graph_store.db, agent_id=agent_id)
+        nid = _nid("dangling-bound")
+        source = _nid("dangling-source")
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, agent_id),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", "{}"),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edge_owners "
+            "(source_id, target_id, label, agent_id) VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", agent_id),
+        )
+
+        await bound.delete_node(nid)
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_node_owners WHERE node_id = ? AND agent_id = ?",
+            (nid, agent_id),
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE target_id = ?", (nid,)
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edge_owners WHERE target_id = ?", (nid,)
+        ) is None
 
 
 # =====================================================================

@@ -172,9 +172,9 @@ class _PrivacyDatabaseView:
             )
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self, *, immediate: bool = False):
         """Preserve transactions while keeping each proxied call governed."""
-        async with self.__database.transaction():
+        async with self.__database.transaction(immediate=immediate):
             yield self
 
     def __getattr__(self, name):
@@ -3207,15 +3207,18 @@ class PrivacyEnforcingStorage:
         await self._storage.delete_edge(source_id, target_id, label)
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self, *, immediate: bool = False):
         """Atomic write unit over the underlying storage.
 
         The transaction scope itself grants no extra write permission —
         every operation inside it still goes through this wrapper's
         privacy checks individually. It only guarantees that the writes
         which ARE permitted commit or roll back together.
+
+        Pass ``immediate=True`` for a SQLite read-then-write composition that
+        must own the writer slot before its first read.
         """
-        async with self._storage.transaction():
+        async with self._storage.transaction(immediate=immediate):
             yield
 
     async def delete_node(self, node_id: str) -> None:

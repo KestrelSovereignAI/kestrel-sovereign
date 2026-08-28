@@ -24,7 +24,9 @@ import uuid
 import pytest
 import pytest_asyncio
 
+import kestrel_sovereign.storage.async_graph_store as graph_store_module
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import (
     AsyncGraphStore,
     GraphNode,
@@ -387,3 +389,103 @@ async def test_owner_release_and_conditional_delete_share_lock_order_on_backend(
     assert release_waited, "ownership release passed the held graph-row lock"
     assert conditional_result == "deleted"
     assert await bound.get_node(nid) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_shared_owner_admission_waits_for_final_owner_delete_on_backend(
+    graph_store, monkeypatch
+):
+    """Adding a shared witness locks the row against final-owner deletion.
+
+    Without the PostgreSQL row lock, the joining tenant can validate the
+    existing row, pause before recording its witness, and then record that
+    witness after the final owner has deleted the physical row.  The add call
+    reports success but leaves only a dangling owner record.
+    """
+
+    agent_a = f"agent:{uuid.uuid4().hex}"
+    agent_b = f"agent:{uuid.uuid4().hex}"
+    store_a = AsyncGraphStore(graph_store.db, agent_id=agent_a)
+    store_b = AsyncGraphStore(graph_store.db, agent_id=agent_b)
+    content = f"# shared constitution\n{uuid.uuid4().hex}\n".encode()
+    node_id = await AsyncFileStore(graph_store.db, agent_a).store_file(
+        content, "KESTREL_CONSTITUTION.md"
+    )
+    assert await AsyncFileStore(graph_store.db, agent_b).store_file(
+        content, "KESTREL_CONSTITUTION.md"
+    ) == node_id
+    node = GraphNode(
+        node_id=node_id,
+        node_type="document",
+        label="KESTREL_CONSTITUTION",
+        properties={
+            "hash": node_id,
+            "type": "Constitution",
+            "created_at": "2026-08-28T00:00:00+00:00",
+        },
+    )
+    await store_a.add_node(node)
+
+    delete_entered = asyncio.Event()
+    release_delete = asyncio.Event()
+    original_delete = store_a._delete_node_in_transaction
+
+    async def pause_before_delete(candidate_id):
+        delete_entered.set()
+        await release_delete.wait()
+        return await original_delete(candidate_id)
+
+    monkeypatch.setattr(store_a, "_delete_node_in_transaction", pause_before_delete)
+
+    owner_record_entered = asyncio.Event()
+    release_owner_record = asyncio.Event()
+    original_record_owner = graph_store_module.record_graph_node_owner
+
+    async def pause_before_owner_record(db, candidate_id, candidate_agent):
+        if candidate_id == node_id and candidate_agent == agent_b:
+            owner_record_entered.set()
+            await release_owner_record.wait()
+        await original_record_owner(db, candidate_id, candidate_agent)
+
+    monkeypatch.setattr(
+        graph_store_module, "record_graph_node_owner", pause_before_owner_record
+    )
+
+    deletion = asyncio.create_task(
+        store_a.compare_and_delete_node(
+            node_id,
+            expected_node_type="document",
+            expected_label="KESTREL_CONSTITUTION",
+        )
+    )
+    admission = None
+    try:
+        await asyncio.wait_for(delete_entered.wait(), timeout=5)
+        admission = asyncio.create_task(store_b.add_node(node))
+        await asyncio.sleep(0.1)
+        assert not owner_record_entered.is_set(), (
+            "shared-owner admission passed an in-flight final-owner delete"
+        )
+
+        release_delete.set()
+        assert await asyncio.wait_for(deletion, timeout=5) == "deleted"
+        await asyncio.wait_for(owner_record_entered.wait(), timeout=5)
+        release_owner_record.set()
+        await asyncio.wait_for(admission, timeout=5)
+    finally:
+        release_delete.set()
+        release_owner_record.set()
+        pending = [task for task in (deletion, admission) if task is not None]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    stored = await store_b.get_node(node_id)
+    assert stored is not None
+    assert stored.label == "KESTREL_CONSTITUTION"
+    owners = await graph_store.db.fetchall(
+        "SELECT agent_id FROM graph_node_owners WHERE node_id = ?", (node_id,)
+    )
+    assert {row[0] for row in owners} == {agent_b}

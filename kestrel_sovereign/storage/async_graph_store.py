@@ -720,9 +720,16 @@ class AsyncGraphStore:
         )
         async with self.db.transaction():
             await _acquire_sqlite_graph_writer_slot(self.db)
+            # A compatible fleet-shared row adds only an ownership witness.
+            # Lock the physical row before deciding that on PostgreSQL: final-
+            # owner deletion locks the same row first, so it cannot delete the
+            # row between this identity read and ``record_graph_node_owner``.
+            lock_suffix = (
+                " FOR UPDATE" if self.db.backend_type == "postgres" else ""
+            )
             existing = await self.db.fetchone(
                 "SELECT node_type, label, properties FROM graph_nodes "
-                "WHERE node_id = ?",
+                f"WHERE node_id = ?{lock_suffix}",
                 (node.node_id,),
             )
             existing_owner_rows = await self.db.fetchall(
@@ -1365,8 +1372,11 @@ class AsyncGraphStore:
         behavior.
         """
         async with self.db.transaction(immediate=True):
-            if await self._visible_node_identity_for_update(node_id) is None:
-                return
+            # Take the graph-row lock first when the row exists, but always run
+            # cleanup. Ownership and edge ledgers intentionally have no foreign
+            # keys, so an interrupted/legacy write can leave repairable records
+            # after the physical node has already disappeared.
+            await self._visible_node_identity_for_update(node_id)
             await self._delete_node_in_transaction(node_id)
 
     async def compare_and_delete_node(
