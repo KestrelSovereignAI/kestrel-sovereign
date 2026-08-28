@@ -322,19 +322,91 @@ class TaskStore(UnifiedStoreBase):
             ],
         )
         if task_payload is not None:
-            payload_metadata = dict(task_payload.metadata or {})
-            payload_metadata.pop("cancellation_receipt", None)
-            history = [item.model_dump() for item in (task_payload.history or [])]
-            history.append(message.model_dump())
-            payload_assignment = "artifacts = ?, history = ?, metadata = ?,"
-            payload_values = (
-                json_dumps(
-                    [artifact.model_dump() for artifact in (task_payload.artifacts or [])]
-                ),
-                json_dumps(history),
-                json_dumps(payload_metadata),
+            transaction = (
+                self._backend.transaction(immediate=True)
+                if self.is_sqlite
+                else self._backend.transaction()
             )
-        elif self.is_postgres:
+            async with transaction:
+                lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+                current = await self._backend.fetch_one(
+                    "SELECT artifacts, history, metadata FROM a2a_tasks "
+                    f"WHERE id = ?{lock_suffix}",
+                    (task_id,),
+                )
+                if current is None:
+                    return None
+
+                def decode_json(value, default):
+                    if value is None:
+                        return default
+                    if isinstance(value, (list, dict)):
+                        return value
+                    return json_loads(value) or default
+
+                def merge_sequence(current_items, payload_items):
+                    merged = list(current_items)
+                    for item in payload_items:
+                        if item not in merged:
+                            merged.append(item)
+                    return merged
+
+                current_artifacts = decode_json(current[0], [])
+                current_history = decode_json(current[1], [])
+                current_metadata = decode_json(current[2], {})
+                payload_artifacts = [
+                    artifact.model_dump()
+                    for artifact in (task_payload.artifacts or [])
+                ]
+                payload_history = [
+                    item.model_dump() for item in (task_payload.history or [])
+                ]
+                payload_metadata = dict(task_payload.metadata or {})
+                payload_metadata.pop("cancellation_receipt", None)
+                merged_metadata = {
+                    **current_metadata,
+                    **payload_metadata,
+                }
+                merged_history = merge_sequence(
+                    current_history,
+                    payload_history,
+                )
+                merged_history.append(message.model_dump())
+                rows_affected = await self._backend.execute(
+                    f"""
+                    UPDATE a2a_tasks
+                    SET cancel_previous_status = status,
+                        status = 'canceled',
+                        message = ?,
+                        artifacts = ?,
+                        history = ?,
+                        metadata = ?,
+                        canceled_by = ?,
+                        cancel_reason = ?,
+                        updated_at = {self.now_sql()}
+                    WHERE id = ?
+                      AND status IN ('submitted', 'working', 'input-required')
+                      AND (creator_agent_id = ? OR recipient_agent_id = ?)
+                    """,
+                    (
+                        message.model_dump_json(),
+                        json_dumps(
+                            merge_sequence(current_artifacts, payload_artifacts)
+                        ),
+                        json_dumps(merged_history),
+                        json_dumps(merged_metadata),
+                        actor_agent_id,
+                        reason,
+                        task_id,
+                        actor_agent_id,
+                        actor_agent_id,
+                    ),
+                )
+            if rows_affected != 1:
+                return None
+            return await self.get(task_id)
+
+        if self.is_postgres:
             payload_assignment = (
                 "history = COALESCE(history, '[]'::jsonb) || ?::jsonb,"
             )

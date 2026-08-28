@@ -694,6 +694,165 @@ async def test_sync_handler_cancellation_runs_post_hook_with_durable_payload(tmp
 
 
 @pytest.mark.asyncio
+async def test_handler_cancellation_merges_concurrently_committed_payload(tmp_path):
+    """A stale handler snapshot cannot erase data committed while it ran."""
+    host_did = "did:test:host"
+    manager = await create_task_manager(
+        str(tmp_path / "handler-cancel-merge.db"), host_agent_id=host_did
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class CancelingHandler:
+        name = "canceling"
+
+        async def handle_task(self, task):
+            entered.set()
+            await release.wait()
+            task.artifacts = [
+                Artifact(name="handler", parts=[TextPart(text="partial")])
+            ]
+            task.metadata["handler_state"] = "declined"
+            task.history.append(
+                Message(role="agent", parts=[TextPart(text="handler history")])
+            )
+            task.status = TaskStatus(
+                state=TaskState.CANCELED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="Handler declined")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="canceling-agent",
+            url="/agents/canceling-agent",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="canceling-skill",
+                    name="canceling-skill",
+                    description="cancel",
+                )
+            ],
+        ),
+        CancelingHandler(),
+    )
+    try:
+        execution = asyncio.create_task(
+            manager.execute_skill(
+                "canceling-agent", "canceling-skill", {}, sync=True
+            )
+        )
+        await entered.wait()
+        pending = (await manager.get_pending_tasks())[0]
+        concurrent = await manager.get_task(pending.id)
+        concurrent.artifacts = [
+            Artifact(name="concurrent", parts=[TextPart(text="keep")])
+        ]
+        concurrent.metadata["concurrent_state"] = "committed"
+        concurrent.history.append(
+            Message(role="agent", parts=[TextPart(text="concurrent history")])
+        )
+        assert await manager.task_store.save(concurrent) is True
+
+        release.set()
+        result = await execution
+
+        assert result.status.state is TaskState.CANCELED
+        assert {artifact.name for artifact in result.artifacts} == {
+            "concurrent",
+            "handler",
+        }
+        assert result.metadata["concurrent_state"] == "committed"
+        assert result.metadata["handler_state"] == "declined"
+        history_text = [
+            part.text for message in result.history for part in message.parts
+        ]
+        assert "concurrent history" in history_text
+        assert "handler history" in history_text
+    finally:
+        release.set()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_handler_returns_concurrent_winning_cancellation(tmp_path):
+    """A valid external cancellation wins without making sync execution fail."""
+    host_did = "did:test:host"
+    manager = await create_task_manager(
+        str(tmp_path / "sync-cancel-winner.db"), host_agent_id=host_did
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class CancelingHandler:
+        name = "canceling"
+
+        async def handle_task(self, task):
+            entered.set()
+            await release.wait()
+            task.status = TaskStatus(
+                state=TaskState.CANCELED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="Handler also canceled")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="canceling-agent",
+            url="/agents/canceling-agent",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="canceling-skill",
+                    name="canceling-skill",
+                    description="cancel",
+                )
+            ],
+        ),
+        CancelingHandler(),
+    )
+    try:
+        execution = asyncio.create_task(
+            manager.execute_skill(
+                "canceling-agent", "canceling-skill", {}, sync=True
+            )
+        )
+        await entered.wait()
+        pending = (await manager.get_pending_tasks())[0]
+        await manager.cancel_task(
+            pending.id,
+            reason="external winner",
+            agent_name=host_did,
+        )
+
+        release.set()
+        result = await execution
+
+        assert result.status.state is TaskState.CANCELED
+        assert result.metadata["cancellation_receipt"]["reason"] == (
+            "external winner"
+        )
+    finally:
+        release.set()
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
     from kestrel_sovereign.a2a import outbound_store
 

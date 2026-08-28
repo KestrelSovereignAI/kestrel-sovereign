@@ -2745,7 +2745,7 @@ async def get_task(request: Request, task_id: str):
     }
 
 
-@router.post("/tasks/{task_id}/cancel")
+@router.post("/tasks/{task_id:path}/cancel")
 @limiter.limit("120/minute")
 async def cancel_task_from_peer(request: Request, task_id: str):
     """Cancel an A2A task through the recipient's authoritative store.

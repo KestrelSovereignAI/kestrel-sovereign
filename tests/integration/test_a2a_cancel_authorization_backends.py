@@ -6,7 +6,14 @@ from uuid import uuid4
 import pytest
 
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
-from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus
+from kestrel_sovereign.a2a.types import (
+    Artifact,
+    Message,
+    Task,
+    TaskState,
+    TaskStatus,
+    TextPart,
+)
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 
@@ -19,6 +26,7 @@ POSTGRES_URL = (
 
 async def _exercise_authorized_cancel(store: TaskStore) -> None:
     task_id = f"cancel-auth-{uuid4().hex}"
+    payload_task_id = f"cancel-payload-{uuid4().hex}"
     creator = f"did:test:creator:{uuid4().hex}"
     recipient = f"did:test:recipient:{uuid4().hex}"
     try:
@@ -57,8 +65,60 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
         stale = Task(id=task_id, status=TaskStatus(state=TaskState.COMPLETED))
         assert await store.save(stale) is False
         assert (await store.get(task_id)).status.state is TaskState.CANCELED
+
+        initial = Task(
+            id=payload_task_id,
+            status=TaskStatus(state=TaskState.SUBMITTED),
+            history=[Message(role="user", parts=[TextPart(text="initial")])],
+            metadata={"initial": True},
+        )
+        await store.save(
+            initial,
+            creator_agent_id=creator,
+            recipient_agent_id=recipient,
+        )
+        concurrent = await store.get(payload_task_id)
+        concurrent.artifacts = [
+            Artifact(name="concurrent", parts=[TextPart(text="keep")])
+        ]
+        concurrent.history.append(
+            Message(role="agent", parts=[TextPart(text="concurrent")])
+        )
+        concurrent.metadata["concurrent"] = True
+        assert await store.save(concurrent) is True
+
+        handler_payload = Task(
+            id=payload_task_id,
+            status=TaskStatus(state=TaskState.CANCELED),
+            artifacts=[Artifact(name="handler", parts=[TextPart(text="partial")])],
+            history=[
+                initial.history[0],
+                Message(role="agent", parts=[TextPart(text="handler")]),
+            ],
+            metadata={"initial": True, "handler": True},
+        )
+        merged = await store.cancel_if_authorized(
+            payload_task_id,
+            actor_agent_id=recipient,
+            reason="handler declined",
+            task_payload=handler_payload,
+        )
+
+        assert merged is not None
+        assert {artifact.name for artifact in merged.artifacts} == {
+            "concurrent",
+            "handler",
+        }
+        assert merged.metadata["concurrent"] is True
+        assert merged.metadata["handler"] is True
+        merged_history = [
+            part.text for message in merged.history for part in message.parts
+        ]
+        assert "concurrent" in merged_history
+        assert "handler" in merged_history
     finally:
         await store.delete(task_id)
+        await store.delete(payload_task_id)
 
 
 @pytest.mark.asyncio

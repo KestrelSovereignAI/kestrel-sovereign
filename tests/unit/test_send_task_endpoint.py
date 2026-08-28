@@ -468,6 +468,56 @@ def test_signed_creator_cancellation_is_verified_and_committed(app_with_send):
     )
 
 
+def test_signed_creator_cancellation_accepts_slash_bearing_task_id(app_with_send):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    task_id = "task/with slash"
+    reason = "assignment withdrawn"
+    session_id = f"a2a-cancel:{task_id}"
+    metadata = {"sender": _SENDER_DID, "a2a_verb": "cancel_task"}
+    agent.task_manager.cancel_task = AsyncMock(
+        return_value=Task(
+            id=task_id,
+            status=TaskStatus(state=TaskState.CANCELED),
+            metadata={
+                "cancellation_receipt": {
+                    "actor_agent_id": _SENDER_DID,
+                    "reason": reason,
+                    "status_before": "submitted",
+                }
+            },
+        )
+    )
+    _attach(app_with_send, agent)
+    body = {
+        "reason": reason,
+        "sessionId": session_id,
+        "metadata": {
+            **metadata,
+            "signature": sign(
+                [reason],
+                task_id=task_id,
+                session_id=session_id,
+                metadata=metadata,
+            ),
+        },
+    }
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/task%2Fwith%20slash/cancel",
+            json=body,
+        )
+
+    assert response.status_code == 200, response.text
+    agent.task_manager.cancel_task.assert_awaited_once_with(
+        task_id,
+        reason=reason,
+        agent_name=_SENDER_DID,
+    )
+
+
 def test_hosted_rotated_creator_cancellation_uses_stable_principal(
     app_with_send,
 ):

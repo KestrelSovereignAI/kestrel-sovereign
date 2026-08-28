@@ -397,11 +397,9 @@ class TaskManager:
             # Execute synchronously with transaction safety
             task = await handler.handle_task(task)
             if task.status.state is TaskState.CANCELED:
-                task = await self.cancel_task(
-                    task.id,
-                    reason=self._cancellation_reason(task),
-                    agent_name=authority_agent_id,
-                    task_payload=task,
+                task = await self._persist_handler_cancellation(
+                    task,
+                    authority_agent_id=authority_agent_id,
                 )
             else:
                 saved: Optional[bool] = None
@@ -519,6 +517,30 @@ class TaskManager:
                     return text
         return "Task canceled"
 
+    async def _persist_handler_cancellation(
+        self,
+        task: Task,
+        *,
+        authority_agent_id: str,
+    ) -> Task:
+        """Commit a handler cancellation or return an earlier winning cancel."""
+
+        try:
+            return await self.cancel_task(
+                task.id,
+                reason=self._cancellation_reason(task),
+                agent_name=authority_agent_id,
+                task_payload=task,
+            )
+        except ValueError:
+            current = await self.task_store.get(task.id)
+            if (
+                current is not None
+                and current.status.state is TaskState.CANCELED
+            ):
+                return current
+            raise
+
     async def _execute_async(
         self,
         handler: TaskHandler,
@@ -567,11 +589,9 @@ class TaskManager:
 
         if task.status.state is TaskState.CANCELED:
             return (
-                await self.cancel_task(
-                    task.id,
-                    reason=self._cancellation_reason(task),
-                    agent_name=authority_agent_id,
-                    task_payload=task,
+                await self._persist_handler_cancellation(
+                    task,
+                    authority_agent_id=authority_agent_id,
                 ),
                 False,
             )
