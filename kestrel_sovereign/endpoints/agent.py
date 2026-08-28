@@ -2799,6 +2799,23 @@ async def cancel_task_from_peer(request: Request, task_id: str):
         message=Message(role="user", parts=[TextPart(text=reason)]),
         metadata=metadata,
     )
+    recipient_agent_id = next(
+        (
+            candidate
+            for candidate in (
+                getattr(agent.task_manager, "host_agent_id", None),
+                getattr(agent, "did", None),
+                getattr(agent, "agent_id", None),
+            )
+            if isinstance(candidate, str) and candidate
+        ),
+        None,
+    )
+    if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="A2A task cancellation requires a durable recipient identity",
+        )
 
     async def _cancel(authorized_sender_id: str):
         if not isinstance(authorized_sender_id, str) or not authorized_sender_id:
@@ -2811,6 +2828,7 @@ async def cancel_task_from_peer(request: Request, task_id: str):
                 task_id,
                 reason=reason,
                 agent_name=authorized_sender_id,
+                recipient_agent_id=recipient_agent_id,
             )
         except TaskCancellationAuthorizationError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc

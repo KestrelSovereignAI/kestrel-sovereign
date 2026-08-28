@@ -424,8 +424,11 @@ def test_signed_creator_cancellation_is_verified_and_committed(app_with_send):
     session_id = "a2a-cancel:task-1"
     metadata = {"sender": _SENDER_DID, "a2a_verb": "cancel_task"}
 
-    async def cancel_task(task_id, reason=None, agent_name=None):
+    async def cancel_task(
+        task_id, reason=None, agent_name=None, recipient_agent_id=None
+    ):
         assert agent_name == _SENDER_DID
+        assert recipient_agent_id == agent.did
         return Task(
             id=task_id,
             status=TaskStatus(state=TaskState.CANCELED),
@@ -464,7 +467,10 @@ def test_signed_creator_cancellation_is_verified_and_committed(app_with_send):
         "status_before": "submitted",
     }
     agent.task_manager.cancel_task.assert_awaited_once_with(
-        "task-1", reason=reason, agent_name=_SENDER_DID
+        "task-1",
+        reason=reason,
+        agent_name=_SENDER_DID,
+        recipient_agent_id=agent.did,
     )
 
 
@@ -515,6 +521,7 @@ def test_signed_creator_cancellation_accepts_slash_bearing_task_id(app_with_send
         task_id,
         reason=reason,
         agent_name=_SENDER_DID,
+        recipient_agent_id=agent.did,
     )
 
 
@@ -534,8 +541,11 @@ def test_hosted_rotated_creator_cancellation_uses_stable_principal(
     session_id = "a2a-cancel:task-before-ceremony"
     metadata = {"sender": _SENDER_DID, "a2a_verb": "cancel_task"}
 
-    async def cancel_task(task_id, reason=None, agent_name=None):
+    async def cancel_task(
+        task_id, reason=None, agent_name=None, recipient_agent_id=None
+    ):
         assert agent_name == sender.did
+        assert recipient_agent_id == agent.did
         return Task(
             id=task_id,
             status=TaskStatus(state=TaskState.CANCELED),
@@ -576,6 +586,7 @@ def test_hosted_rotated_creator_cancellation_uses_stable_principal(
         "task-before-ceremony",
         reason=reason,
         agent_name=sender.did,
+        recipient_agent_id=agent.did,
     )
 
 

@@ -103,6 +103,40 @@ class TaskStore(UnifiedStoreBase):
         for column in authority_columns:
             await self.add_column_if_missing("a2a_tasks", column, "TEXT")
 
+        # Pre-#3134 live rows have no trustworthy creator/recipient columns.
+        # Metadata was caller-controlled and a shared PostgreSQL table contains
+        # multiple recipients, so guessing either principal would mint power.
+        # Settle those rows explicitly instead of leaving work permanently live
+        # but uncancellable after upgrade. Operators and clients see a terminal
+        # failure with the migration reason; terminal legacy rows remain intact.
+        legacy_settlement = Message(
+            role="agent",
+            parts=[
+                TextPart(
+                    text=(
+                        "Task settled during the cancellation-authority upgrade: "
+                        "its legacy row has no trustworthy creator/recipient binding"
+                    )
+                )
+            ],
+        )
+        settled = await self._backend.execute(
+            f"""
+            UPDATE a2a_tasks
+            SET status = 'failed',
+                message = ?,
+                updated_at = {self.now_sql()}
+            WHERE status IN ('submitted', 'working', 'input-required')
+              AND (creator_agent_id IS NULL OR recipient_agent_id IS NULL)
+            """,
+            (legacy_settlement.model_dump_json(),),
+        )
+        if settled:
+            logger.warning(
+                "Settled %d live legacy A2A task(s) without durable authority",
+                settled,
+            )
+
         # Create indexes
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_status ON a2a_tasks(status)"
@@ -284,6 +318,7 @@ class TaskStore(UnifiedStoreBase):
         task_id: str,
         *,
         actor_agent_id: str,
+        expected_recipient_agent_id: Optional[str] = None,
         reason: Optional[str] = None,
         task_payload: Optional[Task] = None,
     ) -> Optional[Task]:
@@ -298,6 +333,13 @@ class TaskStore(UnifiedStoreBase):
         """
         if not isinstance(actor_agent_id, str) or not actor_agent_id:
             raise ValueError("Cancellation actor must be a concrete agent identity")
+        if expected_recipient_agent_id is not None and (
+            not isinstance(expected_recipient_agent_id, str)
+            or not expected_recipient_agent_id
+        ):
+            raise ValueError(
+                "Expected cancellation recipient must be a concrete agent identity"
+            )
         if task_payload is not None and (
             task_payload.id != task_id
             or task_payload.status.state is not TaskState.CANCELED
@@ -372,6 +414,16 @@ class TaskStore(UnifiedStoreBase):
                     payload_history,
                 )
                 merged_history.append(message.model_dump())
+                recipient_predicate = (
+                    " AND recipient_agent_id = ?"
+                    if expected_recipient_agent_id is not None
+                    else ""
+                )
+                recipient_values = (
+                    (expected_recipient_agent_id,)
+                    if expected_recipient_agent_id is not None
+                    else ()
+                )
                 rows_affected = await self._backend.execute(
                     f"""
                     UPDATE a2a_tasks
@@ -387,6 +439,7 @@ class TaskStore(UnifiedStoreBase):
                     WHERE id = ?
                       AND status IN ('submitted', 'working', 'input-required')
                       AND (creator_agent_id = ? OR recipient_agent_id = ?)
+                      {recipient_predicate}
                     """,
                     (
                         message.model_dump_json(),
@@ -400,6 +453,7 @@ class TaskStore(UnifiedStoreBase):
                         task_id,
                         actor_agent_id,
                         actor_agent_id,
+                        *recipient_values,
                     ),
                 )
             if rows_affected != 1:
@@ -416,6 +470,16 @@ class TaskStore(UnifiedStoreBase):
                 "history = json_insert(COALESCE(history, '[]'), '$[#]', json(?)),"
             )
             payload_values = (message.model_dump_json(),)
+        recipient_predicate = (
+            " AND recipient_agent_id = ?"
+            if expected_recipient_agent_id is not None
+            else ""
+        )
+        recipient_values = (
+            (expected_recipient_agent_id,)
+            if expected_recipient_agent_id is not None
+            else ()
+        )
         rows_affected = await self._backend.execute(
             f"""
             UPDATE a2a_tasks
@@ -429,6 +493,7 @@ class TaskStore(UnifiedStoreBase):
             WHERE id = ?
               AND status IN ('submitted', 'working', 'input-required')
               AND (creator_agent_id = ? OR recipient_agent_id = ?)
+              {recipient_predicate}
             """,
             (
                 message.model_dump_json(),
@@ -438,6 +503,7 @@ class TaskStore(UnifiedStoreBase):
                 task_id,
                 actor_agent_id,
                 actor_agent_id,
+                *recipient_values,
             ),
         )
         if rows_affected != 1:

@@ -46,10 +46,21 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             is None
         )
         assert (await store.get(task_id)).status.state is TaskState.SUBMITTED
+        assert (
+            await store.cancel_if_authorized(
+                task_id,
+                actor_agent_id=creator,
+                expected_recipient_agent_id=f"did:test:wrong-recipient:{uuid4().hex}",
+                reason="misrouted",
+            )
+            is None
+        )
+        assert (await store.get(task_id)).status.state is TaskState.SUBMITTED
 
         canceled = await store.cancel_if_authorized(
             task_id,
             actor_agent_id=recipient,
+            expected_recipient_agent_id=recipient,
             reason="delegate stopped work",
         )
         assert canceled is not None
@@ -127,6 +138,47 @@ async def test_cancel_authorization_sqlite(tmp_path):
     await backend.connect()
     try:
         await _exercise_authorized_cancel(TaskStore(backend))
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_settles_live_rows_without_trustworthy_authority(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "legacy-live-task.db"))
+    await backend.connect()
+    try:
+        await backend.execute_script(
+            """
+            CREATE TABLE a2a_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                user_id TEXT,
+                task_type TEXT NOT NULL,
+                status TEXT DEFAULT 'submitted',
+                message TEXT,
+                artifacts TEXT DEFAULT '[]',
+                history TEXT DEFAULT '[]',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO a2a_tasks
+                (id, task_type, status, metadata)
+            VALUES
+                ('legacy-live', 'generic', 'working', '{"sender":"untrusted"}'),
+                ('legacy-done', 'generic', 'completed', '{}');
+            """
+        )
+        store = TaskStore(backend)
+        await store.initialize()
+
+        live = await store.get("legacy-live")
+        done = await store.get("legacy-done")
+        assert live.status.state is TaskState.FAILED
+        assert "no trustworthy creator/recipient binding" in (
+            live.status.message.parts[0].text
+        )
+        assert done.status.state is TaskState.COMPLETED
     finally:
         await backend.close()
 

@@ -105,6 +105,75 @@ async def test_cancel_task_creator_and_execution_delegate_are_authorized(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_cancel_task_binds_atomic_transition_to_routed_recipient(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "routed-recipient.db"))
+    try:
+        await manager.create_task(
+            _params("recipient-bound"),
+            agent_name="did:test:actual-recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        with pytest.raises(TaskCancellationAuthorizationError):
+            await manager.cancel_task(
+                "recipient-bound",
+                agent_name="did:test:creator",
+                recipient_agent_id="did:test:wrong-recipient",
+            )
+
+        assert (
+            await manager.get_task("recipient-bound")
+        ).status.state is TaskState.SUBMITTED
+        canceled = await manager.cancel_task(
+            "recipient-bound",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:actual-recipient",
+        )
+        assert canceled.status.state is TaskState.CANCELED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_same_actor_cancel_retry_returns_existing_receipt_once(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "idempotent-cancel.db"))
+    try:
+        await manager.create_task(
+            _params("idempotent"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        first = await manager.cancel_task(
+            "idempotent",
+            reason="withdrawn",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+        history_count = len(first.history or [])
+
+        retry = await manager.cancel_task(
+            "idempotent",
+            reason="withdrawn",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+
+        assert retry.metadata["cancellation_receipt"] == first.metadata[
+            "cancellation_receipt"
+        ]
+        assert len(retry.history or []) == history_count
+        with pytest.raises(ValueError, match="Invalid state transition"):
+            await manager.cancel_task(
+                "idempotent",
+                reason="different actor",
+                agent_name="did:test:recipient",
+                recipient_agent_id="did:test:recipient",
+            )
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller,metadata",
     [

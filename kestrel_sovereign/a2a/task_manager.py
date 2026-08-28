@@ -1008,6 +1008,7 @@ class TaskManager:
         task_id: str,
         reason: Optional[str] = None,
         agent_name: Optional[str] = None,
+        recipient_agent_id: Optional[str] = None,
         task_payload: Optional[Task] = None,
     ) -> Task:
         """
@@ -1018,6 +1019,10 @@ class TaskManager:
             reason: Optional cancellation reason
             agent_name: Durable DID of the agent performing the cancellation.
                 Display names and causation metadata are not authority.
+            recipient_agent_id: Optional durable DID of the recipient through
+                which a peer cancellation was routed. When present, it joins
+                the atomic authorization predicate so another manager sharing
+                the same task table cannot mutate this row.
             task_payload: Optional canceled handler result whose artifacts,
                 history, and non-authority metadata must commit atomically with
                 the authorized terminal transition.
@@ -1034,6 +1039,8 @@ class TaskManager:
             "actor_agent_id": agent_name,
             "reason": reason,
         }
+        if recipient_agent_id is not None:
+            cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
         if task_payload is not None:
             cancel_kwargs["task_payload"] = task_payload
         task = await self.task_store.cancel_if_authorized(task_id, **cancel_kwargs)
@@ -1041,6 +1048,22 @@ class TaskManager:
             current = await self.task_store.get(task_id)
             if current is None:
                 raise ValueError(f"Task not found: {task_id}")
+            receipt = (current.metadata or {}).get("cancellation_receipt") or {}
+            if (
+                current.status.state is TaskState.CANCELED
+                and receipt.get("actor_agent_id") == agent_name
+                and (
+                    recipient_agent_id is None
+                    or await self.task_store.is_task_recipient(
+                        task_id,
+                        recipient_agent_id,
+                    )
+                )
+            ):
+                # The first atomic cancellation may have committed while its
+                # transport response was lost. Return that exact durable
+                # receipt without replaying notifications/projections.
+                return current
             if current.status.state not in {
                 TaskState.SUBMITTED,
                 TaskState.WORKING,
