@@ -2,6 +2,7 @@
 
 Uses the abstract data layer for both SQLite (local) and PostgreSQL (cloud) backends.
 """
+import asyncio
 import logging
 import os
 import shutil
@@ -9,6 +10,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
+
+from kestrel_sovereign.storage.db.postgres import (
+    concurrent_write_retry_delay,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -155,64 +160,83 @@ class UsageTrackingMixin:
                 else 0
             )
 
-            # Keep the legacy lifetime aggregate and the UTC daily bucket in
-            # one transaction. The former preserves cleanup consumers and old
-            # writers; the latter makes arbitrary day-range cache queries
-            # truthful instead of attributing a lifetime total to last_used.
-            async with self._usage_db.transaction():
-                await self._usage_db.execute("""
-                    INSERT INTO model_usage (
-                        model_id, provider, last_used, use_count, total_tokens,
-                        cache_creation_input_tokens, cache_read_input_tokens,
-                        created_at
+            async def write_usage_transaction() -> None:
+                # Keep the legacy lifetime aggregate and UTC daily bucket in
+                # one transaction. The former preserves cleanup consumers and
+                # old writers; the latter makes arbitrary day-range cache
+                # queries truthful instead of attributing a lifetime total to
+                # last_used.
+                async with self._usage_db.transaction():
+                    await self._usage_db.execute("""
+                        INSERT INTO model_usage (
+                            model_id, provider, last_used, use_count, total_tokens,
+                            cache_creation_input_tokens, cache_read_input_tokens,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                        ON CONFLICT(model_id) DO UPDATE SET
+                            last_used = ?,
+                            use_count = model_usage.use_count + 1,
+                            total_tokens = model_usage.total_tokens + ?,
+                            cache_creation_input_tokens =
+                                model_usage.cache_creation_input_tokens + ?,
+                            cache_read_input_tokens =
+                                model_usage.cache_read_input_tokens + ?
+                    """, (
+                        model_id,
+                        provider,
+                        now,
+                        tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                        now,
+                        now,
+                        tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                    ))
+                    await self._usage_db.execute("""
+                        INSERT INTO model_usage_periods (
+                            period_start, model_id, provider, use_count,
+                            total_tokens, cache_creation_input_tokens,
+                            cache_read_input_tokens
+                        )
+                        VALUES (?, ?, ?, 1, ?, ?, ?)
+                        ON CONFLICT(period_start, model_id, provider) DO UPDATE SET
+                            use_count = model_usage_periods.use_count + 1,
+                            total_tokens = model_usage_periods.total_tokens + ?,
+                            cache_creation_input_tokens =
+                                model_usage_periods.cache_creation_input_tokens + ?,
+                            cache_read_input_tokens =
+                                model_usage_periods.cache_read_input_tokens + ?
+                    """, (
+                        period_start,
+                        model_id,
+                        provider,
+                        tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                        tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                    ))
+
+            retries_done = 0
+            while True:
+                try:
+                    await write_usage_transaction()
+                    break
+                except Exception as exc:
+                    retry_delay = concurrent_write_retry_delay(exc, retries_done)
+                    if retry_delay is None:
+                        raise
+                    retries_done += 1
+                    logger.warning(
+                        "Concurrent model-usage update (attempt %d), retrying: %s",
+                        retries_done,
+                        exc,
                     )
-                    VALUES (?, ?, ?, 1, ?, ?, ?, ?)
-                    ON CONFLICT(model_id) DO UPDATE SET
-                        last_used = ?,
-                        use_count = model_usage.use_count + 1,
-                        total_tokens = model_usage.total_tokens + ?,
-                        cache_creation_input_tokens =
-                            model_usage.cache_creation_input_tokens + ?,
-                        cache_read_input_tokens =
-                            model_usage.cache_read_input_tokens + ?
-                """, (
-                    model_id,
-                    provider,
-                    now,
-                    tokens,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                    now,
-                    now,
-                    tokens,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                ))
-                await self._usage_db.execute("""
-                    INSERT INTO model_usage_periods (
-                        period_start, model_id, provider, use_count,
-                        total_tokens, cache_creation_input_tokens,
-                        cache_read_input_tokens
-                    )
-                    VALUES (?, ?, ?, 1, ?, ?, ?)
-                    ON CONFLICT(period_start, model_id, provider) DO UPDATE SET
-                        use_count = model_usage_periods.use_count + 1,
-                        total_tokens = model_usage_periods.total_tokens + ?,
-                        cache_creation_input_tokens =
-                            model_usage_periods.cache_creation_input_tokens + ?,
-                        cache_read_input_tokens =
-                            model_usage_periods.cache_read_input_tokens + ?
-                """, (
-                    period_start,
-                    model_id,
-                    provider,
-                    tokens,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                    tokens,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                ))
+                    await asyncio.sleep(retry_delay)
         except Exception as e:
             logger.warning(f"Failed to track usage for {model_id}: {e}")
 

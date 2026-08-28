@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from kestrel_sovereign.llm.usage_tracking import UsageTrackingMixin
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
 
 PRE_CACHE_SCHEMA = """
@@ -25,6 +28,54 @@ INSERT INTO model_usage
 VALUES
     ('legacy-model', 'anthropic', '2026-08-01 00:00:00', 3, 120);
 """
+
+
+@pytest.mark.asyncio
+async def test_usage_transaction_retries_postgres_concurrent_update() -> None:
+    """A poisoned PostgreSQL transaction must be replayed as one whole unit."""
+
+    class FlakyPostgresUsageDB:
+        backend_type = "postgres"
+
+        def __init__(self) -> None:
+            self.attempt = 0
+            self.executed: list[tuple[int, str]] = []
+
+        @asynccontextmanager
+        async def transaction(self):
+            self.attempt += 1
+            try:
+                yield
+            except Exception as exc:
+                raise TransactionError(f"Transaction failed: {exc}") from exc
+
+        async def execute(self, sql, _params=()):
+            table = (
+                "period"
+                if "INSERT INTO model_usage_periods" in sql
+                else "lifetime"
+            )
+            self.executed.append((self.attempt, table))
+            if self.attempt == 1 and table == "period":
+                raise QueryError("Query failed: tuple concurrently updated")
+
+    tracker = UsageTrackingMixin()
+    tracker._usage_db = FlakyPostgresUsageDB()
+    tracker._db_initialized = True
+
+    await tracker._track_model_usage(
+        "claude-cache-test",
+        "anthropic",
+        tokens=13,
+        cache_read_input_tokens=8,
+    )
+
+    assert tracker._usage_db.executed == [
+        (1, "lifetime"),
+        (1, "period"),
+        (2, "lifetime"),
+        (2, "period"),
+    ]
 
 
 @pytest.mark.asyncio

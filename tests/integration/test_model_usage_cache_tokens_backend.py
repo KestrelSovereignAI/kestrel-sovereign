@@ -195,3 +195,62 @@ async def test_postgres_concurrent_period_schema_initializers_converge(
         await db.close()
         await pool.close()
         await db_backend.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_concurrent_usage_writes_preserve_every_update(
+    db_backend,
+) -> None:
+    """Same-model/day writers must survive real pool-level contention."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL contention path")
+
+    import asyncpg
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    schema = f"model_usage_write_race_{uuid4().hex}"
+    await db_backend.execute(f'CREATE SCHEMA "{schema}"')
+    pool = await asyncpg.create_pool(
+        db_backend._dsn,
+        min_size=8,
+        max_size=24,
+        server_settings={"search_path": schema},
+    )
+    db = AsyncDatabase(PostgresBackend.from_pool(pool))
+    try:
+        await db._init_schema()
+        tracker = UsageTrackingMixin()
+        tracker._usage_db = db
+        tracker._db_initialized = True
+
+        await asyncio.gather(
+            *(
+                tracker._track_model_usage(
+                    "contended-cache-model",
+                    "anthropic",
+                    tokens=1,
+                    cache_creation_input_tokens=2,
+                    cache_read_input_tokens=3,
+                )
+                for _ in range(24)
+            )
+        )
+
+        expected = (24, 24, 48, 72)
+        assert await db.fetchone(
+            "SELECT use_count, total_tokens, cache_creation_input_tokens, "
+            "cache_read_input_tokens FROM model_usage WHERE model_id = ?",
+            ("contended-cache-model",),
+        ) == expected
+        assert await db.fetchone(
+            "SELECT use_count, total_tokens, cache_creation_input_tokens, "
+            "cache_read_input_tokens FROM model_usage_periods "
+            "WHERE model_id = ? AND provider = ?",
+            ("contended-cache-model", "anthropic"),
+        ) == expected
+    finally:
+        await db.close()
+        await pool.close()
+        await db_backend.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
