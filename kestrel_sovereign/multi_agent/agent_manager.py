@@ -516,6 +516,14 @@ class AgentOperationAdmission:
     # before routing publication, so the final-child-DID signed receipt is
     # durable before any peer can address the child.
     before_publish: Optional[Callable[[KestrelAgent], Awaitable[None]]] = None
+    # If publication does not commit after ``before_publish`` starts, this
+    # inverse must run while the unpublished child's storage is still live.
+    # A failed inverse leaves cleanup with the outer spawn owner; closing the
+    # graph first would make a possibly-committed signed receipt irrevocable.
+    before_publish_rollback: Optional[
+        Callable[[KestrelAgent], Awaitable[None]]
+    ] = None
+    unpublished_cleanup_deferred_to_spawn: bool = False
 
 
 class _DynamicSchedulerTenantRegistration:
@@ -2586,16 +2594,38 @@ class AgentManager:
                     committed = True
                     admission.published = True
                 return agent
-            except BaseException:
+            except BaseException as onboarding_failure:
                 if not committed:
-                    cleanup_cancelled = (
-                        await self._discard_unpublished_initialized_agents(
-                            [(name, agent)],
-                            already_withdrawn=withdrawn_after_onboarding_failure,
+                    rollback_cancelled = False
+                    rollback_failure: BaseException | None = None
+                    if admission.before_publish_rollback is not None:
+                        rollback_task = asyncio.create_task(
+                            admission.before_publish_rollback(agent),
+                            name=f"agent_before_publish_rollback:{name}",
                         )
-                    )
-                    if cleanup_cancelled:
-                        raise asyncio.CancelledError()
+                        rollback_cancelled, rollback_failure = (
+                            await await_lifecycle_task_completion(rollback_task)
+                        )
+                    if rollback_failure is None:
+                        cleanup_cancelled = (
+                            await self._discard_unpublished_initialized_agents(
+                                [(name, agent)],
+                                already_withdrawn=withdrawn_after_onboarding_failure,
+                            )
+                        )
+                        if cleanup_cancelled or rollback_cancelled:
+                            raise asyncio.CancelledError()
+                    else:
+                        # The nested load must not close the graph underneath a
+                        # signed receipt whose write outcome is ambiguous. The
+                        # outer spawn still owns ``admission.child`` and will
+                        # retry revocation before shutting this private child
+                        # down (or hand it to observable quarantine).
+                        admission.unpublished_cleanup_deferred_to_spawn = True
+                        _raise_lifecycle_outcomes(
+                            "Agent onboarding and prepublication rollback failed",
+                            [onboarding_failure, rollback_failure],
+                        )
                 raise
         finally:
             if owns_admission:
@@ -5519,6 +5549,13 @@ class AgentManager:
             candidate._persisted_spawn_mandate = mandate
 
         admission.before_publish = persist_final_spawn_receipt
+
+        async def revoke_failed_prepublication_receipt(
+            candidate: KestrelAgent,
+        ) -> None:
+            await self._downgrade_uncommitted_spawn_receipt(admission, candidate)
+
+        admission.before_publish_rollback = revoke_failed_prepublication_receipt
         try:
             child = await self.create_agent(
                 name,
@@ -5711,8 +5748,14 @@ class AgentManager:
             await await_lifecycle_task_completion(receipt_cleanup)
         )
 
+        if receipt_failure is not None:
+            if admission.unpublished_cleanup_deferred_to_spawn:
+                self._handoff_unpublished_spawn_cleanup(admission, child)
+            admission.rollback_incomplete = True
+            raise receipt_failure
+
         runtime_cleanup = asyncio.create_task(
-            self._rollback_uncommitted_spawn_runtime(admission),
+            self._rollback_uncommitted_spawn_runtime(admission, child),
             name=f"rollback_spawn_runtime:{admission.name}",
         )
         runtime_cancelled, runtime_failure = (
@@ -5777,8 +5820,17 @@ class AgentManager:
     async def _rollback_uncommitted_spawn_runtime(
         self,
         admission: AgentOperationAdmission,
+        child: KestrelAgent,
     ) -> bool:
         """Remove the live child and budget after its receipt is withdrawn."""
+
+        if admission.unpublished_cleanup_deferred_to_spawn:
+            await self._discard_unpublished_initialized_agent(
+                admission.name,
+                child,
+            )
+            admission.unpublished_cleanup_deferred_to_spawn = False
+            return False
 
         cleanup = asyncio.create_task(
             self.remove_agent(admission.name, offboard_runtime=True),
@@ -5835,6 +5887,50 @@ class AgentManager:
                 f"{admission.name!r} did not remove its live {live_resources}"
             )
         return cancelled or inspection_cancelled
+
+    def _handoff_unpublished_spawn_cleanup(
+        self,
+        admission: AgentOperationAdmission,
+        child: KestrelAgent,
+    ) -> None:
+        """Retain an ambiguous receipt and its live storage until revocation.
+
+        This is the last-resort owner after both the nested load and outer spawn
+        observed a receipt-write failure. It deliberately retries the
+        idempotent restrictive replacement before closing storage. The normal
+        post-commit transport-error path settles on the first retry; a durable
+        backend outage remains visible in the existing quarantine registry and
+        keeps the routing name reserved instead of resurrecting signed power.
+        """
+
+        async def revoke_then_shutdown() -> None:
+            while admission.spawn_receipt_graph is not None:
+                try:
+                    await self._downgrade_uncommitted_spawn_receipt(
+                        admission,
+                        child,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unpublished spawn receipt revocation remains pending for %r",
+                        admission.name,
+                    )
+                    await asyncio.sleep(1.0)
+            await self._discard_unpublished_initialized_agent(
+                admission.name,
+                child,
+            )
+            admission.unpublished_cleanup_deferred_to_spawn = False
+
+        cleanup = asyncio.create_task(
+            revoke_then_shutdown(),
+            name=f"unpublished_spawn_receipt_cleanup:{admission.name}",
+        )
+        self._retain_quarantined_cleanup(
+            name=admission.name,
+            agent_id=_loaded_agent_did(child) or "<unknown>",
+            task=cleanup,
+        )
 
     async def _child_runtime_or_delegated_hold_is_live(
         self, child_name: str

@@ -187,6 +187,65 @@ async def test_load_awaits_spawn_receipt_before_routing_publication(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_spawn_revokes_ambiguous_receipt_before_child_storage_closes(tmp_path):
+    """A post-commit write error must not close the only revocation handle."""
+
+    events: list[str] = []
+
+    class PostCommitErrorGraph:
+        def __init__(self) -> None:
+            self.closed = False
+            self.write_count = 0
+
+        async def add_trusted_cross_agent_edge(
+            self, _source, _target, _label, *, properties
+        ) -> None:
+            assert not self.closed
+            self.write_count += 1
+            events.append(
+                "signed" if properties.get("parent_signature") else "revoked"
+            )
+            if self.write_count == 1:
+                # Model a database commit followed by a transport failure.
+                raise RuntimeError("post-commit transport failure")
+
+    graph = PostCommitErrorGraph()
+    child = _make_mock_agent("did:test:ambiguous-receipt-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+
+    async def close_child() -> None:
+        graph.closed = True
+        events.append("shutdown")
+
+    child.shutdown = AsyncMock(side_effect=close_child)
+    parent = _make_mock_agent("did:test:ambiguous-receipt-parent")
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._initialize_agent = AsyncMock(return_value=child)
+
+    async def create_through_real_load(name, **_kwargs):
+        return await manager.load_agent(
+            name,
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+
+    manager.create_agent = AsyncMock(side_effect=create_through_real_load)
+
+    with pytest.raises(RuntimeError, match="post-commit transport failure"):
+        await manager.spawn_agent(
+            "AmbiguousReceiptChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id),
+        )
+
+    assert events == ["signed", "revoked", "shutdown"]
+    assert graph.closed is True
+    assert manager.get_agent("AmbiguousReceiptChild") is None
+
+
+@pytest.mark.asyncio
 async def test_registration_rehydrates_parent_authority_after_restart(tmp_path):
     """A fresh manager derives control from the child's durable mandate projection."""
 

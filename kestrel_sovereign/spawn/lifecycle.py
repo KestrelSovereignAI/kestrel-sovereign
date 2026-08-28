@@ -242,11 +242,30 @@ class SpawnedAgentLifecycle:
         self._tracked: Dict[str, _TrackedChild] = {}
         self._results: Dict[str, SpawnResult] = {}
         self._lock = asyncio.Lock()
+        # The lifecycle lock serializes finalizers, but lock ownership alone
+        # does not identify which child the active finalizer owns. Manager-side
+        # direct removal of a different child must still retire that exact
+        # record rather than mistaking the unrelated lock holder for its owner.
+        self._finalization_owner_counts: dict[tuple[str, str], int] = {}
         # The lifecycle object is intentionally created lazily by SpawnFeature,
         # often after AgentManager has cold-loaded every agent.  Adopt the
         # manager's durable mandate projections at construction so public
         # terminate/TTL paths see the same children as the authority maps.
         self.restore_from_manager()
+
+    def _claim_finalization(self, child_name: str, child_did: str) -> None:
+        key = (child_name, child_did)
+        self._finalization_owner_counts[key] = (
+            self._finalization_owner_counts.get(key, 0) + 1
+        )
+
+    def _release_finalization(self, child_name: str, child_did: str) -> None:
+        key = (child_name, child_did)
+        remaining = self._finalization_owner_counts.get(key, 0) - 1
+        if remaining > 0:
+            self._finalization_owner_counts[key] = remaining
+        else:
+            self._finalization_owner_counts.pop(key, None)
 
     @staticmethod
     def _remaining_ttl_seconds(created_at: str, ttl_seconds: int) -> float:
@@ -420,7 +439,13 @@ class SpawnedAgentLifecycle:
         avoid cancelling the TTL task when it is the current task.
         """
 
-        if self._lock.locked():
+        tracked = self._tracked.get(child_name)
+        if tracked is None or (
+            expected_child_did is not None
+            and tracked.child_did != expected_child_did
+        ):
+            return False
+        if self._finalization_owner_counts.get((child_name, tracked.child_did), 0):
             return self.disarm_persisted_child(
                 child_name,
                 expected_child_did=expected_child_did,
@@ -532,35 +557,43 @@ class SpawnedAgentLifecycle:
         Returns:
             The SpawnResult, or None if the child is not tracked.
         """
+        initially_tracked = self._tracked.get(child_name)
+        if initially_tracked is None:
+            logger.warning("report_result for untracked child '%s'", child_name)
+            return None
+        owned_child_did = initially_tracked.child_did
+        self._claim_finalization(child_name, owned_child_did)
         # Hold the lifecycle lock so report_result and the TTL monitor can't
         # BOTH finalize the same child concurrently (double cleanup / result
         # clobber). The lock was created but never acquired (#1729). Idempotent:
         # if the child is already finalized, return the existing result.
-        async with self._lock:
-            tracked = self._tracked.get(child_name)
-            if tracked is None:
-                logger.warning("report_result for untracked child '%s'", child_name)
-                return None
-            if tracked.result is not None:
-                return tracked.result  # already finalized (e.g. by TTL)
-            result = SpawnResult(
-                child_name=child_name,
-                child_did=tracked.child_did,
-                status=status,
-                output_artifacts=output_artifacts or {},
-                budget_consumed=budget_consumed,
-                started_at=tracked.started_at,
-                parent_did=tracked.parent_did,
-            )
+        try:
+            async with self._lock:
+                tracked = self._tracked.get(child_name)
+                if tracked is None or tracked.child_did != owned_child_did:
+                    return None
+                if tracked.result is not None:
+                    return tracked.result  # already finalized (e.g. by TTL)
+                result = SpawnResult(
+                    child_name=child_name,
+                    child_did=tracked.child_did,
+                    status=status,
+                    output_artifacts=output_artifacts or {},
+                    budget_consumed=budget_consumed,
+                    started_at=tracked.started_at,
+                    parent_did=tracked.parent_did,
+                )
 
-            # Terminate and clean up
-            terminated = await self._terminate_and_cleanup(
-                child_name,
-                status,
-                result=result,
-            )
+                # Terminate and clean up
+                terminated = await self._terminate_and_cleanup(
+                    child_name,
+                    status,
+                    result=result,
+                )
 
-            return result if terminated else None
+                return result if terminated else None
+        finally:
+            self._release_finalization(child_name, owned_child_did)
 
     def get_result(self, child_name: str) -> Optional[SpawnResult]:
         """Retrieve the result for a terminated child.
@@ -621,31 +654,39 @@ class SpawnedAgentLifecycle:
         Returns:
             SpawnResult if the child was tracked, None otherwise.
         """
+        initially_tracked = self._tracked.get(child_name)
+        if initially_tracked is None:
+            return None
+        owned_child_did = initially_tracked.child_did
+        self._claim_finalization(child_name, owned_child_did)
         # Serialize explicit termination with result reports and TTL expiry.
         # A refused manager removal must leave the exact child and its timer
         # available to a later retry instead of publishing a false terminal
         # result.
-        async with self._lock:
-            tracked = self._tracked.get(child_name)
-            if tracked is None:
-                return None
+        try:
+            async with self._lock:
+                tracked = self._tracked.get(child_name)
+                if tracked is None or tracked.child_did != owned_child_did:
+                    return None
 
-            result = SpawnResult(
-                child_name=child_name,
-                child_did=tracked.child_did,
-                status=SpawnStatus.TERMINATED,
-                started_at=tracked.started_at,
-                parent_did=tracked.parent_did,
-            )
-            terminated = await self._terminate_and_cleanup(
-                child_name,
-                SpawnStatus.TERMINATED,
-                reason=reason,
-                offboard_runtime=offboard_runtime,
-                result=result,
-            )
+                result = SpawnResult(
+                    child_name=child_name,
+                    child_did=tracked.child_did,
+                    status=SpawnStatus.TERMINATED,
+                    started_at=tracked.started_at,
+                    parent_did=tracked.parent_did,
+                )
+                terminated = await self._terminate_and_cleanup(
+                    child_name,
+                    SpawnStatus.TERMINATED,
+                    reason=reason,
+                    offboard_runtime=offboard_runtime,
+                    result=result,
+                )
 
-            return result if terminated else None
+                return result if terminated else None
+        finally:
+            self._release_finalization(child_name, owned_child_did)
 
     async def shutdown(self) -> None:
         """Shut down all tracked children and clean up.
@@ -690,55 +731,63 @@ class SpawnedAgentLifecycle:
         except asyncio.CancelledError:
             return
 
+        self._claim_finalization(child_name, child_did)
         # Same lock as report_result so TTL expiry and a just-in-time result
         # report can't both finalize the child (#1729). Idempotent.
-        async with self._lock:
-            tracked = self._tracked.get(child_name)
-            if (
-                tracked is None
-                or tracked.child_did != child_did
-                or tracked.result is not None
-            ):
-                return  # already finalized by report_result
+        try:
+            async with self._lock:
+                tracked = self._tracked.get(child_name)
+                if (
+                    tracked is None
+                    or tracked.child_did != child_did
+                    or tracked.result is not None
+                ):
+                    return  # already finalized by report_result
 
-            logger.info("TTL expired for child '%s' after %ds", child_name, ttl_seconds)
+                logger.info(
+                    "TTL expired for child '%s' after %ds",
+                    child_name,
+                    ttl_seconds,
+                )
 
-            result = SpawnResult(
-                child_name=child_name,
-                child_did=tracked.child_did,
-                status=SpawnStatus.TIMED_OUT,
-                started_at=tracked.started_at,
-                parent_did=tracked.parent_did,
-            )
-            try:
-                terminated = await self._terminate_and_cleanup(
-                    child_name,
-                    SpawnStatus.TIMED_OUT,
-                    reason="TTL expired",
-                    result=result,
+                result = SpawnResult(
+                    child_name=child_name,
+                    child_did=tracked.child_did,
+                    status=SpawnStatus.TIMED_OUT,
+                    started_at=tracked.started_at,
+                    parent_did=tracked.parent_did,
                 )
-                if not terminated:
-                    still_tracked = self._tracked.get(child_name)
-                    if (
-                        still_tracked is not None
-                        and still_tracked.termination_refusal is None
-                    ):
-                        logger.warning(
-                            "TTL termination was refused for child '%s'; "
-                            "tracking and periodic retry remain active",
-                            child_name,
-                        )
-            except BaseException as exc:
-                if not _is_expected_termination_outcome(exc):
-                    raise
-                # The local lifecycle record and ephemeral resources have
-                # already been reconciled. Keep the background TTL monitor
-                # terminal while preserving the manager outcome in logs.
-                logger.error(
-                    "TTL termination retained cleanup for child '%s': %s",
-                    child_name,
-                    exc,
-                )
+                try:
+                    terminated = await self._terminate_and_cleanup(
+                        child_name,
+                        SpawnStatus.TIMED_OUT,
+                        reason="TTL expired",
+                        result=result,
+                    )
+                    if not terminated:
+                        still_tracked = self._tracked.get(child_name)
+                        if (
+                            still_tracked is not None
+                            and still_tracked.termination_refusal is None
+                        ):
+                            logger.warning(
+                                "TTL termination was refused for child '%s'; "
+                                "tracking and periodic retry remain active",
+                                child_name,
+                            )
+                except BaseException as exc:
+                    if not _is_expected_termination_outcome(exc):
+                        raise
+                    # The local lifecycle record and ephemeral resources have
+                    # already been reconciled. Keep the background TTL monitor
+                    # terminal while preserving the manager outcome in logs.
+                    logger.error(
+                        "TTL termination retained cleanup for child '%s': %s",
+                        child_name,
+                        exc,
+                    )
+        finally:
+            self._release_finalization(child_name, child_did)
 
     async def _terminate_and_cleanup(
         self,
@@ -761,7 +810,9 @@ class SpawnedAgentLifecycle:
         if tracked is None:
             return False
 
-        # Terminate via AgentManager (handles cascading grandchildren)
+        # Terminate via AgentManager (handles cascading grandchildren). The
+        # calling entry point already marked the exact child as the owner that
+        # still needs this record after manager-side relationship pruning.
         termination_failure: BaseException | None = None
         terminated = False
         finalized_from_absence = False

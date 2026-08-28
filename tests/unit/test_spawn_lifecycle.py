@@ -58,6 +58,52 @@ def test_restored_ephemeral_ttl_rearms_after_sync_construction() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_retirement_is_not_owned_by_another_child_finalizer() -> None:
+    """A's lifecycle operation must not strand B behind the global lock."""
+
+    manager = _make_mock_manager()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def terminate_child(_parent_did, child_name, **_kwargs):
+        assert child_name == "FinalizingA"
+        entered.set()
+        await release.wait()
+        return True
+
+    manager.terminate_child = AsyncMock(side_effect=terminate_child)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    await lifecycle.register(
+        "FinalizingA",
+        "did:test:finalizing-a",
+        "did:test:parent",
+        ttl_seconds=0,
+        mode=SpawnMode.PERSISTENT,
+    )
+    await lifecycle.register(
+        "DirectB",
+        "did:test:direct-b",
+        "did:test:parent",
+        ttl_seconds=0,
+        mode=SpawnMode.PERSISTENT,
+    )
+
+    finalizer = asyncio.create_task(lifecycle.terminate("FinalizingA"))
+    await entered.wait()
+    assert lifecycle._lock.locked()
+
+    assert lifecycle.retire_persisted_child(
+        "DirectB", expected_child_did="did:test:direct-b"
+    )
+    assert not lifecycle.is_tracked("DirectB")
+    assert lifecycle.is_tracked("FinalizingA")
+
+    release.set()
+    await finalizer
+    assert lifecycle.get_tracked_children() == []
+
+
+@pytest.mark.asyncio
 async def test_manager_prune_cancels_removed_child_ttl_before_name_reuse() -> None:
     manager = AgentManager()
     lifecycle = SpawnedAgentLifecycle(manager)
