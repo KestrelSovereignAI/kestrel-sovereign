@@ -4012,6 +4012,73 @@ class SignalDispatcher:
                     audit=audit,
                 )
 
+        async def await_monitored_execution(execution):
+            """Race cognition against source-owned durable withdrawal."""
+
+            monitor_execution = getattr(
+                self._agent,
+                "monitor_cognition_signal_execution",
+                None,
+            )
+            if not callable(monitor_execution):
+                return await execution, None
+
+            try:
+                monitor = monitor_execution(signal)
+            except BaseException:
+                if inspect.iscoroutine(execution):
+                    execution.close()
+                raise
+            if not inspect.isawaitable(monitor):
+                if monitor is not None:
+                    if inspect.iscoroutine(execution):
+                        execution.close()
+                    return None, str(monitor)
+                return await execution, None
+
+            execution_task = asyncio.create_task(
+                execution,
+                name=f"signal_cognition:{signal.id}",
+            )
+            monitor_task = asyncio.create_task(
+                monitor,
+                name=f"signal_cognition_monitor:{signal.id}",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {execution_task, monitor_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if monitor_task in done:
+                    withdrawal = await monitor_task
+                    if withdrawal is not None:
+                        if not execution_task.done():
+                            execution_task.cancel()
+                        await asyncio.gather(
+                            execution_task,
+                            return_exceptions=True,
+                        )
+                        return None, str(withdrawal)
+                return await execution_task, None
+            finally:
+                for task in (execution_task, monitor_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    execution_task,
+                    monitor_task,
+                    return_exceptions=True,
+                )
+                finish_execution = getattr(
+                    self._agent,
+                    "finish_cognition_signal_execution",
+                    None,
+                )
+                if callable(finish_execution):
+                    finished = finish_execution(signal)
+                    if inspect.isawaitable(finished):
+                        await finished
+
         # Resolve the constitution body for full-injection sources.
         # Codex round-5 P1 fix: the dispatcher UNCONDITIONALLY
         # prepends a fenced constitution block to the rendered
@@ -4349,13 +4416,16 @@ class SignalDispatcher:
                 "mode": signal.mode.value,
             }
 
+        execution_withdrawal = None
         try:
             if process_input_kwargs:
-                result = await self._agent.process_input(
-                    prompt, **process_input_kwargs
+                result, execution_withdrawal = await await_monitored_execution(
+                    self._agent.process_input(prompt, **process_input_kwargs)
                 )
             else:
-                result = await self._agent.process_input(prompt)
+                result, execution_withdrawal = await await_monitored_execution(
+                    self._agent.process_input(prompt)
+                )
         except Exception:
             if receipt_tool_registered:
                 clear_receipt = getattr(
@@ -4367,6 +4437,22 @@ class SignalDispatcher:
         finally:
             if clear_chain is not None:
                 clear_chain(token)
+
+        if execution_withdrawal is not None:
+            if receipt_tool_registered:
+                clear_receipt = getattr(
+                    self._agent, "clear_constitution_receipt_tool", None
+                )
+                if callable(clear_receipt):
+                    clear_receipt()
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=execution_withdrawal,
+                registration=registration,
+                audit=audit,
+            )
 
         # Codex round-13/14 P2: surface the agent's actual
         # injected/dropped clause tracking from the budget-aware

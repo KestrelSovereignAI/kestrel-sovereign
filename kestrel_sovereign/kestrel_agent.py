@@ -2168,6 +2168,7 @@ class KestrelAgent(
             # uses it to suppress the matching queued cognition delivery so a
             # withdrawn task cannot execute from its inline signal payload.
             on_task_cancelled=self._on_task_cancelled,
+            on_task_cancellation_started=self._on_task_cancellation_started,
             # Provider returns the in-flight cognition turn's
             # causation chain (serialized) so outbound A2A tasks
             # carry the lineage. The dispatcher sets the chain on

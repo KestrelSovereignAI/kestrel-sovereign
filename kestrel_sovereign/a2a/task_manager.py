@@ -97,6 +97,9 @@ class TaskManager:
         causation_chain_provider: Optional[Callable[[], Optional[list]]] = None,
         host_agent_id: Optional[str] = None,
         on_task_cancelled: Optional[Callable[[Task], None]] = None,
+        on_task_cancellation_started: Optional[
+            Callable[[str, str], Optional[Callable[[], None]]]
+        ] = None,
     ):
         self.task_store = task_store
         self.session_service = session_service
@@ -126,6 +129,11 @@ class TaskManager:
         # an already-queued ``a2a.task_submitted`` cognition delivery after the
         # task row has atomically reached CANCELED.
         self._on_task_cancelled = on_task_cancelled
+        # Process-local intent is announced before the shared-store await so a
+        # live execution monitor cannot observe the committed row and cancel
+        # the recipient's own decline before the post-commit callback runs.
+        # The callback returns a rollback closure for refused/failed attempts.
+        self._on_task_cancellation_started = on_task_cancellation_started
 
         # Callback returning the in-flight cognition turn's causation
         # chain (already serialized as list of dicts) or None when no
@@ -1027,8 +1035,24 @@ class TaskManager:
             cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
         if task_payload is not None:
             cancel_kwargs["task_payload"] = task_payload
-        task = await self.task_store.cancel_if_authorized(task_id, **cancel_kwargs)
+        rollback_local_intent = None
+        if self._on_task_cancellation_started is not None:
+            rollback_local_intent = self._on_task_cancellation_started(
+                task_id,
+                agent_name,
+            )
+        try:
+            task = await self.task_store.cancel_if_authorized(
+                task_id,
+                **cancel_kwargs,
+            )
+        except BaseException:
+            if rollback_local_intent is not None:
+                rollback_local_intent()
+            raise
         if task is None:
+            if rollback_local_intent is not None:
+                rollback_local_intent()
             current = await self.task_store.get(task_id)
             if current is None:
                 raise ValueError(f"Task not found: {task_id}")

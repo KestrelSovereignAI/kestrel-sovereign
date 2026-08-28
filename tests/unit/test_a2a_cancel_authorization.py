@@ -396,6 +396,9 @@ async def test_recipient_decline_does_not_cancel_its_current_dispatch(tmp_path):
 
     recipient = Recipient()
     manager._on_task_cancelled = recipient._on_task_cancelled
+    manager._on_task_cancellation_started = (
+        recipient._on_task_cancellation_started
+    )
     manager._project_status_transition = AsyncMock()
     try:
         created = await manager.create_task(
@@ -587,6 +590,229 @@ async def test_execution_worker_rejects_cross_worker_durable_cancellation(
         await execution_manager.close()
         await cancellation_manager.close()
         await signal_backend.close()
+
+
+@pytest.mark.asyncio
+async def test_execution_worker_stops_when_cross_worker_cancels_mid_turn(
+    tmp_path,
+):
+    """Durable cancellation remains live authority after initial validation."""
+
+    from kestrel_sdk.signals import Status
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        build_a2a_task_submitted_registration,
+        build_signal_for_submitted_task,
+    )
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    shared_path = str(tmp_path / "shared-live-task-authority.db")
+    execution_manager = await create_task_manager(shared_path)
+    cancellation_manager = await create_task_manager(shared_path)
+    signal_backend = SQLiteBackend(str(tmp_path / "live-signal-log.db"))
+    await signal_backend.connect()
+    signal_store = SignalLogStore(signal_backend)
+    await signal_store.initialize()
+    cognition_started = asyncio.Event()
+    cognition_stopped = asyncio.Event()
+
+    class ExecutionWorker(EventManagerMixin):
+        did = "did:test:recipient"
+
+        def __init__(self):
+            self.task_manager = execution_manager
+            self.background_tasks = []
+
+        async def process_input(self, _prompt):
+            cognition_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cognition_stopped.set()
+
+        def _track_background_task(self, coroutine, *, name):
+            task = asyncio.create_task(coroutine, name=name)
+            self.background_tasks.append(task)
+            return task
+
+    worker = ExecutionWorker()
+    registry = SourceRegistry()
+    registry.register(build_a2a_task_submitted_registration())
+    dispatcher = SignalDispatcher(
+        agent=worker,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=signal_store,
+    )
+    try:
+        task = await execution_manager.create_task(
+            _params(
+                "cross-worker-live-cancel",
+                metadata={
+                    "sender": "did:test:creator",
+                    "sender_verified": True,
+                },
+            ),
+            agent_name=worker.did,
+            creator_agent_id="did:test:creator",
+        )
+        wake = build_signal_for_submitted_task(
+            task,
+            target_agent=worker.did,
+            sender="did:test:creator",
+        )
+        delivery = asyncio.create_task(dispatcher.dispatch_signal(wake))
+        await asyncio.wait_for(cognition_started.wait(), timeout=1)
+
+        await cancellation_manager.cancel_task(
+            task.id,
+            reason="withdrawn during execution on another worker",
+            agent_name="did:test:creator",
+        )
+        result = await asyncio.wait_for(delivery, timeout=2)
+
+        assert result.status is Status.DROPPED_VALIDATION
+        assert "canceled while" in (result.error or "")
+        assert cognition_stopped.is_set()
+    finally:
+        await execution_manager.close()
+        await cancellation_manager.close()
+        await signal_backend.close()
+
+
+@pytest.mark.asyncio
+async def test_recipient_decline_finishes_under_live_cancellation_monitor(
+    tmp_path,
+):
+    """A recipient's in-turn decline is not mistaken for a remote Stop."""
+
+    from kestrel_sdk.signals import Status
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        build_a2a_task_submitted_registration,
+        build_signal_for_submitted_task,
+    )
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    manager = await create_task_manager(str(tmp_path / "self-decline-live.db"))
+    signal_backend = SQLiteBackend(str(tmp_path / "self-decline-signal-log.db"))
+    await signal_backend.connect()
+    signal_store = SignalLogStore(signal_backend)
+    await signal_store.initialize()
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+        def __init__(self):
+            self.task_manager = manager
+            self.task_id = ""
+            self.background_tasks = []
+            self.decline_finished = False
+
+        async def process_input(self, _prompt):
+            result = await manager.cancel_task(
+                self.task_id,
+                reason="recipient cannot continue",
+                agent_name=self.did,
+            )
+            await asyncio.sleep(0.1)
+            self.decline_finished = True
+            return result.status.state.value
+
+        def _track_background_task(self, coroutine, *, name):
+            task = asyncio.create_task(coroutine, name=name)
+            self.background_tasks.append(task)
+            return task
+
+    recipient = Recipient()
+    manager._on_task_cancelled = recipient._on_task_cancelled
+    manager._on_task_cancellation_started = (
+        recipient._on_task_cancellation_started
+    )
+    registry = SourceRegistry()
+    registry.register(build_a2a_task_submitted_registration())
+    dispatcher = SignalDispatcher(
+        agent=recipient,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=signal_store,
+    )
+    try:
+        task = await manager.create_task(
+            _params(
+                "self-decline-live",
+                metadata={
+                    "sender": "did:test:creator",
+                    "sender_verified": True,
+                },
+            ),
+            agent_name=recipient.did,
+            creator_agent_id="did:test:creator",
+        )
+        recipient.task_id = task.id
+        wake = build_signal_for_submitted_task(
+            task,
+            target_agent=recipient.did,
+            sender="did:test:creator",
+        )
+
+        result = await dispatcher.dispatch_signal(wake)
+
+        assert result.status is Status.OK
+        assert recipient.decline_finished is True
+        assert not vars(recipient).get("_a2a_self_declining_task_ids", set())
+    finally:
+        await manager.close()
+        await signal_backend.close()
+
+
+@pytest.mark.asyncio
+async def test_refused_cancellation_rolls_back_local_execution_exemption(
+    tmp_path,
+):
+    """A failed authority predicate cannot leave a later wake exempt."""
+
+    manager = await create_task_manager(str(tmp_path / "intent-rollback.db"))
+    local_intents = set()
+
+    def mark_intent(task_id, _actor):
+        local_intents.add(task_id)
+
+        def rollback():
+            local_intents.discard(task_id)
+
+        return rollback
+
+    manager._on_task_cancellation_started = mark_intent
+    try:
+        await manager.create_task(
+            _params("refused-intent"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        with pytest.raises(TaskCancellationAuthorizationError):
+            await manager.cancel_task(
+                "refused-intent",
+                agent_name="did:test:stranger",
+            )
+
+        assert local_intents == set()
+        assert (
+            await manager.get_task("refused-intent")
+        ).status.state is TaskState.SUBMITTED
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio

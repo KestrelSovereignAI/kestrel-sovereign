@@ -451,6 +451,11 @@ class EventManagerMixin:
                 finally:
                     if pending.get(str(task_id)) is handle:
                         pending.pop(str(task_id), None)
+                    self_declines = vars(self).get(
+                        "_a2a_self_declining_task_ids",
+                    )
+                    if isinstance(self_declines, set):
+                        self_declines.discard(str(task_id))
 
             self._track_background_task(
                 enqueue_and_gate(),
@@ -494,6 +499,86 @@ class EventManagerMixin:
             )
         return None
 
+    async def monitor_cognition_signal_execution(self, signal) -> str | None:
+        """Watch durable A2A cancellation throughout a cognition turn.
+
+        Validation closes the stale-before-start case. This monitor closes the
+        cross-worker race after validation by polling the shared task row until
+        either cognition finishes or cancellation commits. A decline issued by
+        this exact signal turn is exempt so its status projection and tool
+        response can finish; other workers do not share that process-local
+        exemption and therefore stop their stale execution.
+        """
+
+        if getattr(signal, "source", None) != "a2a.task_submitted":
+            return None
+        payload = getattr(signal, "payload", None)
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            return "a2a.task_submitted has no concrete durable task id"
+
+        while True:
+            current = await self.task_manager.get_task(task_id)
+            if current is None:
+                return f"A2A task {task_id!r} no longer exists"
+            state = getattr(getattr(current, "status", None), "state", None)
+            durable_state = getattr(state, "value", state)
+            if durable_state == "canceled":
+                self_declines = vars(self).get(
+                    "_a2a_self_declining_task_ids",
+                )
+                if (
+                    isinstance(self_declines, set)
+                    and task_id in self_declines
+                ):
+                    self_declines.discard(task_id)
+                    return None
+                return (
+                    f"A2A task {task_id!r} was canceled while its "
+                    "submission wake was executing"
+                )
+            await asyncio.sleep(0.05)
+
+    def finish_cognition_signal_execution(self, signal) -> None:
+        """Release any process-local exemption owned by a completed wake."""
+
+        if getattr(signal, "source", None) != "a2a.task_submitted":
+            return
+        payload = getattr(signal, "payload", None)
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        self_declines = vars(self).get("_a2a_self_declining_task_ids")
+        if isinstance(task_id, str) and isinstance(self_declines, set):
+            self_declines.discard(task_id)
+
+    def _on_task_cancellation_started(
+        self,
+        task_id: str,
+        actor_agent_id: str,
+    ):
+        """Mark this exact signal turn's recipient decline before DB await."""
+
+        from kestrel_sovereign.signals.context import get_current_signal
+
+        current_signal = get_current_signal()
+        payload = getattr(current_signal, "payload", None)
+        if (
+            actor_agent_id != getattr(self, "did", None)
+            or getattr(current_signal, "source", None) != "a2a.task_submitted"
+            or not isinstance(payload, dict)
+            or payload.get("task_id") != task_id
+        ):
+            return None
+        self_declines = vars(self).setdefault(
+            "_a2a_self_declining_task_ids",
+            set(),
+        )
+        self_declines.add(task_id)
+
+        def rollback() -> None:
+            self_declines.discard(task_id)
+
+        return rollback
+
     def _on_task_cancelled(self, task) -> None:
         """Cancel an admitted task-submission wake after durable cancellation."""
 
@@ -501,15 +586,30 @@ class EventManagerMixin:
         pending = vars(self).get("_a2a_submitted_signal_handles", {})
         handle = pending.pop(task_id, None)
         dispatch_task = getattr(handle, "task", None)
+        from kestrel_sovereign.signals.context import get_current_signal
+
+        current_signal = get_current_signal()
+        current_payload = getattr(current_signal, "payload", None)
+        is_current_signal_decline = (
+            getattr(current_signal, "source", None) == "a2a.task_submitted"
+            and isinstance(current_payload, dict)
+            and current_payload.get("task_id") == task_id
+        )
+        is_current_dispatch = dispatch_task is asyncio.current_task()
         # A recipient may decline from inside the cognition dispatch that this
         # very handle represents. Cancelling it here would interrupt
         # TaskManager.cancel_task at its next await, after the durable state
         # transition but before status projection and the tool response. Only
         # suppress a queued/different delivery; the current dispatch is already
         # consuming the cancellation and must finish publishing it.
-        if (
+        if is_current_signal_decline or is_current_dispatch:
+            self_declines = vars(self).setdefault(
+                "_a2a_self_declining_task_ids",
+                set(),
+            )
+            self_declines.add(task_id)
+        elif (
             dispatch_task is not None
-            and dispatch_task is not asyncio.current_task()
             and not dispatch_task.done()
         ):
             dispatch_task.cancel()
