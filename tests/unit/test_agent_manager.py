@@ -173,7 +173,11 @@ async def test_load_awaits_spawn_receipt_before_routing_publication(tmp_path):
         observed.append(manager.get_agent("PrepublicationChild"))
         observed.append(candidate)
 
+    async def run_ready(candidate):
+        observed.append(("ready", candidate))
+
     admission.before_publish = persist_before_publish
+    manager._run_hosted_agent_ready_hooks = AsyncMock(side_effect=run_ready)
     try:
         loaded = await manager.load_agent(
             "PrepublicationChild",
@@ -183,8 +187,135 @@ async def test_load_awaits_spawn_receipt_before_routing_publication(tmp_path):
         await manager._release_agent_operation(admission)
 
     assert loaded is child
-    assert observed == [None, child]
+    assert observed == [None, child, ("ready", child)]
     assert manager.get_agent("PrepublicationChild") is child
+
+
+@pytest.mark.asyncio
+async def test_load_validates_restored_authority_before_agent_ready(tmp_path):
+    """A rejected cold child must never cross the wake-capable ready boundary."""
+
+    parent_did = "did:pkh:eip155:1:0xReadyParent"
+    child_did = "did:pkh:eip155:1:0xReadyChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    mandate.purpose = "tampered after signing"
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("ReadyParent", parent)
+    ready_events: list[str] = []
+
+    class HostedChild:
+        def __init__(self, *, did, **_kwargs):
+            self.agent_id = did
+            self.did = did
+            self.identity = None
+            self._persisted_spawn_mandate = mandate
+
+        async def initialize(self):
+            if not vars(self).get("_host_ready_hooks_deferred", False):
+                ready_events.append("ready")
+
+        async def run_agent_ready_hooks(self):
+            ready_events.append("ready")
+
+        async def shutdown(self):
+            return None
+
+    config = LocalAgentConfig(data_dir=Path("ready-child"), port=8801)
+    with (
+        patch.object(LocalAgentConfig, "validate_runtime", return_value=[]),
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+            new=AsyncMock(return_value=child_did),
+        ),
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.KestrelAgent",
+            HostedChild,
+        ),
+        pytest.raises(RuntimeError, match="signature is invalid"),
+    ):
+        await manager.load_agent("ReadyChild", config)
+
+    assert ready_events == []
+    assert manager.get_agent("ReadyChild") is None
+
+
+@pytest.mark.asyncio
+async def test_restored_ttl_cannot_remove_child_before_load_commits(tmp_path):
+    """TTL adoption is the last onboarding commit, never a concurrent reaper."""
+
+    parent_did = "did:pkh:eip155:1:0xSlowParent"
+    child_did = "did:pkh:eip155:1:0xSlowChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=1,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=0.9)).isoformat(),
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("SlowParent", parent)
+    manager._initialize_agent = AsyncMock(return_value=child)
+
+    async def slow_onboarding(_name, _agent):
+        await asyncio.sleep(0.2)
+
+    manager._on_agent_registered = AsyncMock(side_effect=slow_onboarding)
+
+    with pytest.raises(RuntimeError, match="expired during onboarding"):
+        await manager.load_agent(
+            "SlowChild",
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+
+    await asyncio.sleep(0)
+    assert manager.get_agent("SlowChild") is None
+    assert manager.get_children(parent_did) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_joins_active_spawn_before_closing_child_storage(tmp_path):
+    """DELETE cannot close the graph still owned by spawn receipt rollback."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    child = _make_mock_agent("did:test:delete-during-spawn")
+    graph = SimpleNamespace(closed=False)
+    child._raw_storage = SimpleNamespace(graph=graph)
+
+    async def shutdown():
+        graph.closed = True
+
+    child.shutdown = AsyncMock(side_effect=shutdown)
+    spawn_started = asyncio.Event()
+    release_spawn = asyncio.Event()
+
+    async def active_spawn_owner():
+        admission, owns = await manager._admit_agent_operation(
+            "DeleteDuringSpawn", kind="spawn"
+        )
+        assert owns
+        admission.spawn_task = asyncio.current_task()
+        manager._agents["DeleteDuringSpawn"] = child
+        manager._agent_names[child.agent_id] = "DeleteDuringSpawn"
+        spawn_started.set()
+        try:
+            await release_spawn.wait()
+        finally:
+            await manager._release_agent_operation(admission)
+
+    spawn_task = asyncio.create_task(active_spawn_owner())
+    await asyncio.wait_for(spawn_started.wait(), timeout=1)
+    delete_task = asyncio.create_task(manager.remove_agent("DeleteDuringSpawn"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert not graph.closed
+    child.shutdown.assert_not_awaited()
+
+    release_spawn.set()
+    await asyncio.wait_for(spawn_task, timeout=1)
+    assert await asyncio.wait_for(delete_task, timeout=1) is True
+    assert graph.closed
 
 
 @pytest.mark.asyncio

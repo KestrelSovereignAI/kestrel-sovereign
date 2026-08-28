@@ -1549,6 +1549,11 @@ class AgentManager:
                 agent._dynamic_scheduler_tenant_registration = (
                     scheduler_registration
                 )
+            # A co-hosted child must not fire wake-capable ``on_agent_ready``
+            # hooks until AgentManager has persisted or validated its spawn
+            # authority.  The flag preserves initialize()'s direct-boot API
+            # while making hosted readiness an explicit publication phase.
+            agent._host_ready_hooks_deferred = True
             await agent.initialize()
         except BaseException:
             if agent is not None:
@@ -1754,7 +1759,12 @@ class AgentManager:
         return False
 
     def _restore_persisted_spawn_authority(
-        self, name: str, agent: KestrelAgent, agent_id: str
+        self,
+        name: str,
+        agent: KestrelAgent,
+        agent_id: str,
+        *,
+        project: bool = True,
     ) -> None:
         """Project one durable ``spawned_by`` edge into runtime indexes.
 
@@ -1914,6 +1924,8 @@ class AgentManager:
             raise RuntimeError(
                 "Persisted spawn authority exceeds the configured spawned-agent cap"
             )
+        if not project:
+            return
 
         children = self._parent_children.setdefault(parent_did, [])
         if not any(
@@ -1925,6 +1937,53 @@ class AgentManager:
             name,
             mandate,
             authority_parent_did=parent_did,
+            arm_ttl=False,
+        )
+
+    def _prepare_agent_authority(
+        self, name: str, agent: KestrelAgent
+    ) -> None:
+        """Validate/adopt durable authority before hosted readiness may fire."""
+
+        agent_id = _loaded_agent_did(agent)
+        if not isinstance(agent_id, str) or not agent_id:
+            raise RuntimeError(
+                f"Cannot prepare agent {name!r} without a concrete agent DID"
+            )
+        self._refuse_unrestored_delegated_budget(name, agent)
+        self._restore_persisted_spawn_authority(
+            name,
+            agent,
+            agent_id,
+            project=False,
+        )
+
+    @staticmethod
+    async def _run_hosted_agent_ready_hooks(agent: KestrelAgent) -> None:
+        """Cross the deferred ready boundary for a concrete Kestrel agent."""
+
+        ready = getattr(type(agent), "run_agent_ready_hooks", None)
+        if ready is not None:
+            await ready(agent)
+
+    def _commit_restored_child_ttl(
+        self, name: str, agent: KestrelAgent
+    ) -> None:
+        """Arm an adopted TTL only after every onboarding stage committed."""
+
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if not isinstance(mandate, SpawnMandate) or not mandate.parent_signature:
+            return
+        admission = self._agent_operations.get(self._canonical_agent_name(name))
+        if (
+            admission is not None
+            and admission.kind in {"spawn", "direct-spawn-test"}
+            and not admission.committed
+        ):
+            return
+        self._ensure_spawn_lifecycle().arm_restored_child_ttl(
+            name,
+            expected_child_did=_loaded_agent_did(agent),
         )
 
     def _ensure_spawn_lifecycle(self):
@@ -2068,7 +2127,13 @@ class AgentManager:
         parent_did = parent_ids[0] if parent_ids else mandate.parent_did
         self._prune_child_relationship_and_mandate(parent_did, name)
 
-    def _register_agent(self, name: str, agent: KestrelAgent) -> None:
+    def _register_agent(
+        self,
+        name: str,
+        agent: KestrelAgent,
+        *,
+        arm_restored_ttl: bool = True,
+    ) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
         agent_id = _loaded_agent_did(agent)
         if not isinstance(agent_id, str) or not agent_id:
@@ -2146,6 +2211,12 @@ class AgentManager:
             setter(name)
         else:
             agent.agent_name = name
+        if arm_restored_ttl:
+            try:
+                self._commit_restored_child_ttl(name, agent)
+            except BaseException:
+                self._withdraw_initialized_agent(name, agent)
+                raise
         # Fleet-idleness (#F235): give EVERY agent — including ones created or
         # spawned after startup — a live view of all co-hosted agents, so
         # RestartCoordinator can gate a whole-host restart on the whole fleet
@@ -2596,12 +2667,24 @@ class AgentManager:
                 async with self._a2a_lifecycle_lock:
                     if not self._operation_is_admitted(admission):
                         raise RuntimeError(
+                            "Refusing agent readiness because the manager is shutting down"
+                        )
+                    self._prepare_agent_authority(name, agent)
+                await self._run_hosted_agent_ready_hooks(agent)
+                async with self._a2a_lifecycle_lock:
+                    if not self._operation_is_admitted(admission):
+                        raise RuntimeError(
                             "Refusing agent registration because the manager is shutting down"
                         )
                     try:
-                        self._register_agent(name, agent)
+                        self._register_agent(
+                            name,
+                            agent,
+                            arm_restored_ttl=False,
+                        )
                         await self._on_agent_registered(name, agent)
                         self._commit_dynamic_scheduler_registration(agent)
+                        self._commit_restored_child_ttl(name, agent)
                     except BaseException:
                         # The registration hook can install hosted A2A policy
                         # and app routes before it reports failure.  Withdraw
@@ -2819,10 +2902,22 @@ class AgentManager:
                                 raise RuntimeError(
                                     "Agent initialization completed after manager shutdown began"
                                 )
+                            self._prepare_agent_authority(name, result)
+                        await self._run_hosted_agent_ready_hooks(result)
+                        async with self._a2a_lifecycle_lock:
+                            if not self._operation_is_admitted(admission):
+                                raise RuntimeError(
+                                    "Agent initialization completed after manager shutdown began"
+                                )
                             try:
-                                self._register_agent(name, result)
+                                self._register_agent(
+                                    name,
+                                    result,
+                                    arm_restored_ttl=False,
+                                )
                                 await self._on_agent_registered(name, result)
                                 self._commit_dynamic_scheduler_registration(result)
+                                self._commit_restored_child_ttl(name, result)
                             except BaseException:
                                 # Mirror the single-load path: an onboarding
                                 # rejection is withdrawn before releasing the
@@ -3123,6 +3218,7 @@ class AgentManager:
         known_agent_id: Optional[str] = None,
         known_agent_config: Optional[LocalAgentConfig] = None,
         offboarding_admission: Optional[RuntimeOffboardingAdmission] = None,
+        _spawn_rollback_admission: Optional[AgentOperationAdmission] = None,
     ) -> bool:
         """Stop/unpublish an agent and optionally offboard its runtime tree.
 
@@ -3133,6 +3229,16 @@ class AgentManager:
         or caller cancellation leaves the exact cleanup worker manager-owned
         and reports cleanup as pending without restoring a stopped agent.
         """
+
+        if _spawn_rollback_admission is not None and (
+            _spawn_rollback_admission.canonical_name
+            != self._canonical_agent_name(name)
+        ):
+            raise ValueError("spawn rollback admission does not own this agent name")
+        if _spawn_rollback_admission is None:
+            join_cancelled = await self._join_active_spawn_before_removal(name)
+            if join_cancelled:
+                raise asyncio.CancelledError()
 
         if offboarding_admission is not None and (
             not offboard_runtime
@@ -3196,6 +3302,31 @@ class AgentManager:
                 "Agent removal had multiple terminal outcomes", outcomes
             )
         return removed
+
+    async def _join_active_spawn_before_removal(self, name: str) -> bool:
+        """Fence DELETE behind the spawn that still owns receipt rollback.
+
+        A published child can remain inside provider I/O before governance
+        commit.  Its graph is the sole durable receipt-revocation handle, so a
+        concurrent remover must join that spawn before it may shut the child
+        down.  The spawn's own terminal exception belongs to its caller; this
+        remover continues against the authoritative post-spawn state.
+        """
+
+        async with self._lock:
+            admission = self._agent_operations.get(
+                self._canonical_agent_name(name)
+            )
+            spawn_task = (
+                admission.spawn_task
+                if admission is not None
+                and admission.kind in {"spawn", "direct-spawn-test"}
+                else None
+            )
+        if spawn_task is None or spawn_task is asyncio.current_task():
+            return False
+        cancelled, _failure = await await_lifecycle_task_completion(spawn_task)
+        return cancelled
 
     async def _remove_agent_serialized(
         self,
@@ -5907,7 +6038,11 @@ class AgentManager:
             return False
 
         cleanup = asyncio.create_task(
-            self.remove_agent(admission.name, offboard_runtime=True),
+            self.remove_agent(
+                admission.name,
+                offboard_runtime=True,
+                _spawn_rollback_admission=admission,
+            ),
             name=f"rollback_uncommitted_spawn:{admission.name}",
         )
         cancelled, failure = await await_lifecycle_task_completion(cleanup)

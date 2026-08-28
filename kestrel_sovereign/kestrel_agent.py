@@ -1267,6 +1267,12 @@ class KestrelAgent(
         # on any phase failure. Readiness may only fire in READY.
         self._boot_state: BootPhaseState = BootPhaseState.NOT_STARTED
         self._boot_context: Optional[BootContext] = None
+        # A co-hosted AgentManager defers wake-capable readiness hooks until it
+        # has validated the child's durable authority.  Direct/single-agent
+        # boots retain the historical initialize() contract.
+        self._host_ready_hooks_deferred = False
+        self._agent_ready_hooks_completed = False
+        self._agent_ready_hooks_running = False
 
         self.llm_service = llm_service or LLMService()
         from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
@@ -3433,25 +3439,51 @@ class KestrelAgent(
         verify_llm_providers_initialized(self.llm_service)
         await verify_llm_providers_reachable(self.llm_service)
 
-        # All subsystems are now up (memory system, context manager, dispatcher,
-        # LLM). Notify features that the agent is fully ready, so any that must
-        # run a COGNITION turn at boot — notably RestartCoordinator's
-        # post-restart wake — fire NOW, after the context manager exists. This
-        # is deliberately distinct from post_all_features_loaded, which runs
-        # during the feature-load phase BEFORE memory/context are built; a wake
-        # dispatched there could not run a turn and would defer for a full cron
-        # interval (#1809). Best-effort per feature; the hook is optional.
-        for feature in list(self.features.values()):
-            ready_hook = getattr(feature, "on_agent_ready", None)
-            if ready_hook is None:
-                continue
-            try:
-                await ready_hook(self)
-            except Exception as e:
-                logging.warning(
-                    "on_agent_ready failed for %s: %s",
-                    getattr(feature, "name", type(feature).__name__), e,
-                )
+        if not self._host_ready_hooks_deferred:
+            await self.run_agent_ready_hooks()
+
+    async def run_agent_ready_hooks(self) -> None:
+        """Notify features only after the host has admitted agent authority.
+
+        Direct boots call this from the final boot phase.  ``AgentManager``
+        deliberately defers it until a fresh receipt has been persisted or a
+        restored receipt has passed parent/signature/TTL validation.  The
+        method is idempotent so publication code has one explicit readiness
+        seam without replaying wake signals.
+        """
+
+        if self._agent_ready_hooks_completed:
+            return
+        if self._agent_ready_hooks_running:
+            raise AgentBootError("agent-ready hooks are already running")
+        self._agent_ready_hooks_running = True
+        try:
+            # All subsystems are now up (memory system, context manager,
+            # dispatcher, LLM). Notify features that the agent is fully ready,
+            # so any that must run a COGNITION turn at boot — notably
+            # RestartCoordinator's post-restart wake — fire NOW, after the
+            # context manager exists. This is deliberately distinct from
+            # post_all_features_loaded, which runs during the feature-load
+            # phase BEFORE memory/context are built; a wake dispatched there
+            # could not run a turn and would defer for a full cron interval
+            # (#1809). Best-effort per feature; the hook is optional.
+            for feature in list(self.features.values()):
+                ready_hook = getattr(feature, "on_agent_ready", None)
+                if ready_hook is None:
+                    continue
+                try:
+                    await ready_hook(self)
+                except Exception as e:
+                    logging.warning(
+                        "on_agent_ready failed for %s: %s",
+                        getattr(feature, "name", type(feature).__name__), e,
+                    )
+        except BaseException:
+            raise
+        else:
+            self._agent_ready_hooks_completed = True
+        finally:
+            self._agent_ready_hooks_running = False
 
     # ------------------------------------------------------------------
     # Boot rollback teardown helpers (#2522)

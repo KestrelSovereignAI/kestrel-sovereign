@@ -251,7 +251,10 @@ class SpawnedAgentLifecycle:
         # often after AgentManager has cold-loaded every agent.  Adopt the
         # manager's durable mandate projections at construction so public
         # terminate/TTL paths see the same children as the authority maps.
-        self.restore_from_manager()
+        # Construction may happen while AgentManager is still onboarding a
+        # restored child.  Adopt the records now, but let the publication
+        # commit arm each TTL explicitly so a reaper cannot race that commit.
+        self.restore_from_manager(arm_ttls=False)
 
     def _claim_finalization(self, child_name: str, child_did: str) -> None:
         key = (child_name, child_did)
@@ -273,7 +276,7 @@ class SpawnedAgentLifecycle:
 
         return remaining_spawn_ttl_seconds(created_at, ttl_seconds)
 
-    def restore_from_manager(self) -> None:
+    def restore_from_manager(self, *, arm_ttls: bool = True) -> None:
         """Adopt every durable child authority already projected by the manager."""
 
         # Read concrete manager state: permissive proxies (notably test
@@ -298,6 +301,7 @@ class SpawnedAgentLifecycle:
                 child_name,
                 mandate,
                 authority_parent_did=parent_ids[0] if parent_ids else None,
+                arm_ttl=arm_ttls,
             )
 
     def _arm_restored_ttl_if_possible(self, tracked: _TrackedChild) -> None:
@@ -329,6 +333,7 @@ class SpawnedAgentLifecycle:
         mandate: Any,
         *,
         authority_parent_did: Optional[str] = None,
+        arm_ttl: bool = True,
     ) -> None:
         """Rehydrate one cold-loaded child without replaying the spawn hook."""
 
@@ -362,7 +367,8 @@ class SpawnedAgentLifecycle:
                 raise RuntimeError(
                     f"Conflicting lifecycle authority for child {child_name!r}"
                 )
-            self._arm_restored_ttl_if_possible(existing)
+            if arm_ttl:
+                self._arm_restored_ttl_if_possible(existing)
             return
 
         mode = SpawnMode.PERSISTENT if ttl_seconds <= 0 else SpawnMode.EPHEMERAL
@@ -375,9 +381,39 @@ class SpawnedAgentLifecycle:
             purpose=purpose,
             started_at=created_at,
         )
-        if mode is SpawnMode.EPHEMERAL:
+        if mode is SpawnMode.EPHEMERAL and arm_ttl:
             self._arm_restored_ttl_if_possible(tracked)
         self._tracked[child_name] = tracked
+
+    def arm_restored_child_ttl(
+        self,
+        child_name: str,
+        *,
+        expected_child_did: Optional[str] = None,
+    ) -> None:
+        """Commit a restored child's TTL after host onboarding completes.
+
+        Expiry at this boundary is a rejected load, not an immediately queued
+        reaper: callers must still be able to withdraw publication and report
+        failure instead of returning an already-unroutable agent.
+        """
+
+        tracked = self._tracked.get(child_name)
+        if tracked is None or (
+            expected_child_did is not None
+            and tracked.child_did != expected_child_did
+        ):
+            raise RuntimeError(
+                f"Restored lifecycle authority for child {child_name!r} is unavailable"
+            )
+        if tracked.mode is not SpawnMode.EPHEMERAL or tracked.ttl_task is not None:
+            return
+        if self._remaining_ttl_seconds(
+            tracked.started_at,
+            tracked.ttl_seconds,
+        ) <= 0:
+            raise RuntimeError("Persisted spawn mandate expired during onboarding")
+        self._arm_restored_ttl_if_possible(tracked)
 
     def withdraw_persisted_child(
         self,
