@@ -33,6 +33,7 @@ from kestrel_sovereign.agent.invocation import (
     invocation_log_correlation,
     invocation_id_response_header,
     new_stream_delivery_id,
+    validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
@@ -968,6 +969,34 @@ async def stop_agent_request(request: Request):
         explicit_request_id_present = (
             body_has_request_id or query_has_request_id
         )
+        body_has_turn_id = "turn_id" in data
+        query_has_turn_id = "turn_id" in request.query_params
+        explicit_turn_id_present = body_has_turn_id or query_has_turn_id
+        explicit_turn_id = (
+            data["turn_id"]
+            if body_has_turn_id
+            else request.query_params.get("turn_id")
+        )
+        if explicit_turn_id_present and (
+            explicit_request_id_present
+            or request.headers.get("X-Request-ID") is not None
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="ambiguous_stop_target",
+                message="Pass either request_id or turn_id, not both.",
+            )
+        if explicit_turn_id_present:
+            try:
+                turn_id = validate_invocation_id(explicit_turn_id)
+            except ValueError as error:
+                raise ApiHTTPException(
+                    status_code=400,
+                    code="invalid_turn_id",
+                    message=f"Invalid turn_id: {error}",
+                ) from error
+        else:
+            turn_id = None
         if explicit_request_id_present:
             request_id = validate_request_invocation_id(explicit_request_id)
         elif request.headers.get("X-Request-ID") is not None:
@@ -985,15 +1014,33 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        active_turns = set(getattr(agent, "_active_request_ids", set()) or set())
+        active_request_ids = set(
+            getattr(agent, "_active_request_ids", set()) or set()
+        )
         abandoned_turns = getattr(agent, "_abandoned_request_generations", None)
         if isinstance(abandoned_turns, dict):
-            active_turns.update(abandoned_turns)
+            active_request_ids.update(abandoned_turns)
         current_turn = getattr(agent, "_current_request_id", None)
         if isinstance(current_turn, str) and current_turn:
-            active_turns.add(current_turn)
+            active_request_ids.add(current_turn)
         if request_id is not None:
-            active_turns.add(request_id)
+            active_request_ids.add(request_id)
+        turn_index_accessor = vars(agent).get("active_turn_request_ids")
+        if not callable(turn_index_accessor):
+            turn_index_accessor = getattr(
+                type(agent),
+                "active_turn_request_ids",
+                None,
+            )
+            if callable(turn_index_accessor):
+                turn_request_ids = turn_index_accessor(agent)
+            else:
+                turn_request_ids = {}
+        else:
+            turn_request_ids = turn_index_accessor()
+        if not isinstance(turn_request_ids, dict):
+            raise TypeError("agent turn request inventory has an invalid type")
+        turn_addresses = active_request_ids.union(turn_request_ids)
 
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
             cancelled_request_ids: list[Optional[str]] = []
@@ -1018,14 +1065,14 @@ async def stop_agent_request(request: Request):
                         reserve(agent, stop_request.target)
             else:
                 canceled = False
-                for active_request_id in sorted(active_turns):
+                for active_request_id in sorted(active_request_ids):
                     request_cancelled = agent.cancel_current_request(
                         request_id=active_request_id
                     )
                     if request_cancelled:
                         cancelled_request_ids.append(active_request_id)
                     canceled = request_cancelled or canceled
-                if not active_turns:
+                if not active_request_ids:
                     canceled = agent.cancel_current_request(request_id=None)
                     if canceled:
                         cancelled_request_ids.append(None)
@@ -1077,16 +1124,25 @@ async def stop_agent_request(request: Request):
                     target_id=agent_id,
                     agent_id=agent_id,
                     cancel=cancel_request,
-                    turn_ids=frozenset(active_turns),
+                    turn_ids=frozenset(turn_addresses),
+                    turn_request_ids=turn_request_ids,
                 ),
             ),
             cleanup_registry=cleanup_registry,
         )
         stop_request = StopRequest(
-            scope=StopScope.TURN if request_id is not None else StopScope.AGENT,
+            scope=(
+                StopScope.TURN
+                if request_id is not None or turn_id is not None
+                else StopScope.AGENT
+            ),
             actor_id=actor_id,
-            target=request_id if request_id is not None else agent_id,
-            target_agent_id=agent_id if request_id is not None else None,
+            target=turn_id or request_id or agent_id,
+            target_agent_id=(
+                agent_id
+                if request_id is not None or turn_id is not None
+                else None
+            ),
         )
         outcomes = await authority.stop(stop_request)
         failed_outcomes = tuple(
@@ -1109,6 +1165,7 @@ async def stop_agent_request(request: Request):
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
+            "turn_id": turn_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel",
             "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }

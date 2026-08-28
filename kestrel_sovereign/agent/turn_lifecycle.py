@@ -215,6 +215,11 @@ class TurnLifecycleMixin:
             raise TypeError("turn request index contains an invalid request identity")
         return request_id
 
+    def active_turn_request_ids(self) -> dict[str, str]:
+        """Snapshot live observable-turn addresses for cancellation inventory."""
+
+        return dict(self._turn_request_index())
+
     def _unregister_turn_request_id(self, turn_id: str, request_id: str) -> None:
         """Remove only the exact lifecycle binding that this turn registered."""
 
