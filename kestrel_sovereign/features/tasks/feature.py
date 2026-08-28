@@ -1086,6 +1086,13 @@ class TaskFeature(Feature):
                 data={"task_id": task_id, "state": current.value},
             )
 
+        # CANCELED is not an ordinary response-state write. Delegate to the
+        # canonical cancellation tool so a sender-owned task follows its
+        # durable outbound route (and peer-scope reauthorization) even when a
+        # shared PostgreSQL store also exposes the recipient's row locally.
+        if terminal == TaskState.CANCELED:
+            return await self.cancel_task(task_id, reason=content)
+
         agent_name = getattr(self.agent, "did", None) or type(self.agent).__name__
         response_message = Message(
             role="agent",
@@ -1097,13 +1104,7 @@ class TaskFeature(Feature):
         # through WORKING first. Chain automatically so the receiver
         # doesn't need to know about the intermediate step.
         try:
-            if terminal == TaskState.CANCELED:
-                updated = await self.task_manager.cancel_task(
-                    task_id=task_id,
-                    reason=content,
-                    agent_name=agent_name,
-                )
-            elif current == TaskState.SUBMITTED:
+            if current == TaskState.SUBMITTED:
                 await self.task_manager.update_status(
                     task_id=task_id,
                     new_state=TaskState.WORKING,

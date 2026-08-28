@@ -45,6 +45,14 @@ class TaskStore(UnifiedStoreBase):
         """
         super().__init__(backend)
 
+    @staticmethod
+    def _without_reserved_cancellation_metadata(task: Task) -> dict:
+        """Return caller metadata without state minted by cancellation."""
+
+        metadata = dict(task.metadata or {})
+        metadata.pop("cancellation_receipt", None)
+        return metadata
+
     async def initialize(self) -> None:
         """Create tables if not exists."""
         ts_type = self.timestamp_type()
@@ -191,7 +199,9 @@ class TaskStore(UnifiedStoreBase):
         message_json = task.status.message.model_dump_json() if task.status.message else None
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
         history_json = json_dumps([m.model_dump() for m in (task.history or [])])
-        metadata_json = json_dumps(task.metadata or {})
+        metadata_json = json_dumps(
+            self._without_reserved_cancellation_metadata(task)
+        )
 
         rows_affected = await self._backend.execute(
             f"""
@@ -226,16 +236,19 @@ class TaskStore(UnifiedStoreBase):
 
         if not creator_agent_id or not recipient_agent_id:
             raise ValueError("Task creation requires concrete authority identities")
+        if task.status.state is TaskState.CANCELED:
+            raise ValueError(
+                "CANCELED is an authorized transition; use cancel_if_authorized"
+            )
         message_json = (
             task.status.message.model_dump_json() if task.status.message else None
         )
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
         history_json = json_dumps([m.model_dump() for m in (task.history or [])])
-        metadata = dict(task.metadata or {})
+        metadata = self._without_reserved_cancellation_metadata(task)
         # Cancellation receipts are reserved durable state. A sender may put
         # arbitrary metadata on a new envelope, but only the authorized atomic
         # cancellation transition below may mint this field.
-        metadata.pop("cancellation_receipt", None)
         metadata_json = json_dumps(metadata)
         task_type = (
             metadata.get("task_type", "generic")

@@ -150,7 +150,7 @@ async def test_canceled_state_supported():
     assert result.status is ToolResultStatus.OK
     assert state["task"].status.state == TaskState.CANCELED
     feature.task_manager.cancel_task.assert_awaited_once_with(
-        task_id="task-1",
+        "task-1",
         reason="declining: out of scope",
         agent_name="did:test:receiver",
     )

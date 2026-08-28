@@ -298,6 +298,52 @@ async def test_task_creation_strips_sender_authored_cancellation_receipt(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_task_cannot_be_created_already_canceled(tmp_path):
+    """Creation cannot bypass the authorized cancellation transition."""
+
+    manager = await create_task_manager(str(tmp_path / "born-canceled.db"))
+    try:
+        with pytest.raises(ValueError, match="authorized transition"):
+            await manager.task_store.save(
+                Task(
+                    id="born-canceled",
+                    status=TaskStatus(state=TaskState.CANCELED),
+                ),
+                creator_agent_id="did:test:creator",
+                recipient_agent_id="did:test:recipient",
+            )
+
+        assert await manager.get_task("born-canceled") is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_save_strips_forged_cancellation_receipt(tmp_path):
+    """Ordinary lifecycle persistence cannot mint a cancellation receipt."""
+
+    manager = await create_task_manager(str(tmp_path / "forged-save-receipt.db"))
+    try:
+        task = await manager.create_task(
+            _params("forged-save-receipt", metadata={"payload": "retained"}),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        task.metadata["cancellation_receipt"] = {
+            "actor_agent_id": "did:test:creator",
+            "reason": "forged",
+            "status_before": "working",
+        }
+
+        assert await manager.task_store.save(task) is True
+
+        persisted = await manager.get_task("forged-save-receipt")
+        assert persisted.metadata == {"payload": "retained"}
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_task_save_cannot_reassign_cancellation_authority(tmp_path):
     """A stale/replayed lifecycle write cannot mint a new delegate."""
 
@@ -1141,6 +1187,45 @@ async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
         task_id="outbound-task",
         terminal_state="canceled",
     )
+
+
+@pytest.mark.asyncio
+async def test_respond_canceled_uses_outbound_route_before_shared_task_row():
+    """The response alias must preserve sender-side routing and peer scope."""
+
+    routed_result = MagicMock(status=ToolResultStatus.OK)
+    route_feature = SimpleNamespace(
+        cancel_outbound_task=AsyncMock(return_value=routed_result)
+    )
+    actor = SimpleNamespace(
+        did="did:test:creator",
+        features={"PeersFeature": route_feature},
+    )
+    visible_recipient_row = Task(
+        id="outbound-task",
+        status=TaskStatus(state=TaskState.WORKING),
+    )
+    local_manager = MagicMock(
+        get_task=AsyncMock(return_value=visible_recipient_row),
+        is_task_recipient=AsyncMock(return_value=False),
+        cancel_task=AsyncMock(),
+    )
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.respond_to_a2a_task(
+        "outbound-task",
+        content="withdrawn through response alias",
+        state="canceled",
+    )
+
+    assert result is routed_result
+    route_feature.cancel_outbound_task.assert_awaited_once_with(
+        "outbound-task",
+        reason="withdrawn through response alias",
+        local_recipient_match=False,
+    )
+    local_manager.cancel_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio

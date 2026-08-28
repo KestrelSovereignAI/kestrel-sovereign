@@ -295,14 +295,25 @@ class TestTaskStore:
         ]
         # One task per state so each filter must select exactly its own row.
         for state in five_states:
+            initial_state = (
+                TaskState.SUBMITTED
+                if state is TaskState.CANCELED
+                else state
+            )
             await store.save(
                 Task(
                     id=f"task-{state.value}",
-                    status=TaskStatus(state=state),
+                    status=TaskStatus(state=initial_state),
                 ),
                 creator_agent_id="did:test:creator",
                 recipient_agent_id="did:test:recipient",
             )
+            if state is TaskState.CANCELED:
+                canceled = await store.cancel_if_authorized(
+                    f"task-{state.value}",
+                    actor_agent_id="did:test:creator",
+                )
+                assert canceled is not None
 
         for state in five_states:
             rows = await store.list_tasks(status=state)
