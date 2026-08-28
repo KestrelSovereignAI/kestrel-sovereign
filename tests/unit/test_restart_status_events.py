@@ -358,6 +358,14 @@ async def test_emit_persists_even_when_sse_listener_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_list_restart_status_events_description_is_principal_scoped():
+    desc = RestartCoordinatorFeature.list_restart_status_events._tool_schema[
+        "description"
+    ]
+    assert "this agent's" in desc
+    assert "Other agents' events are never visible" in desc
+
+
 @pytest.mark.asyncio
 async def test_list_restart_status_events_tool(tmp_path):
     db = await _backend(tmp_path)
@@ -393,6 +401,31 @@ async def test_list_restart_status_events_tool_clamps_limit(tmp_path):
     # Garbage → defaults to 100, no crash.
     res = await feat.list_restart_status_events(limit="not-an-int")
     assert res.status is ToolResultStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_restart_status_event_history_is_scoped_to_requesting_agent(tmp_path):
+    db = await _backend(tmp_path)
+    owner = RestartCoordinatorFeature(_make_agent(db, did="did:test:owner"))
+    await owner.initialize()
+    own_request = await insert_request(
+        db,
+        requested_by_agent="did:test:owner",
+        reason="owner detail",
+    )
+    other_request = await insert_request(
+        db,
+        requested_by_agent="did:test:other",
+        reason="other private detail",
+    )
+    await owner._emit_status_event(own_request, state="pending")
+    await owner._emit_status_event(other_request, state="pending")
+
+    result = await owner.list_restart_status_events()
+
+    assert result.data["count"] == 1
+    assert result.data["events"][0]["request_id"] == own_request.id
+    assert "other private detail" not in str(result.data)
 
 
 # ---------------------------------------------------------------------------
