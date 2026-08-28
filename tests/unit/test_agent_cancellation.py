@@ -775,6 +775,7 @@ class TestAgentCancellation:
 
         mock_agent._cleanup_cancelled_request("duplicate-stale")
         assert "duplicate-stale" not in mock_agent._active_request_counts
+        assert "duplicate-stale" not in mock_agent._abandoned_request_generations
 
     def test_prune_removes_stale_request(self, mock_agent):
         """A request older than the window is pruned and returned."""
@@ -853,11 +854,11 @@ class TestAgentCancellation:
         mock_agent._cleanup_cancelled_request("reused-id")
 
     @pytest.mark.asyncio
-    async def test_abandoned_old_generation_does_not_poison_fresh_stop_waiter(
+    async def test_fresh_stop_waiter_includes_still_running_abandoned_generation(
         self,
         mock_agent,
     ):
-        """Completion disposition is scoped to the delivery generation."""
+        """Same-ID redelivery cannot hide a pruned delivery from Stop."""
 
         old_registered = asyncio.Event()
         release_old = asyncio.Event()
@@ -881,19 +882,20 @@ class TestAgentCancellation:
         )
         await asyncio.sleep(0)
         mock_agent._cleanup_cancelled_request("waiter-reuse")
+        await asyncio.sleep(0)
+        assert fresh_waiter.done() is False
 
         from kestrel_sovereign.agent.request_lifecycle import (
             RequestCompletionDisposition,
         )
 
-        try:
-            assert (
-                await fresh_waiter
-                is RequestCompletionDisposition.COMPLETED
-            )
-        finally:
-            release_old.set()
-            await old_task
+        release_old.set()
+        await old_task
+        assert (
+            await fresh_waiter
+            is RequestCompletionDisposition.COMPLETED
+        )
+        assert "waiter-reuse" not in mock_agent._abandoned_request_generations
 
     def test_prune_keeps_fresh_request(self, mock_agent):
         """A fresh request is not pruned."""
@@ -919,6 +921,81 @@ class TestAgentCancellation:
 
 class TestStopEndpoint:
     """Tests for the /agent/stop endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_agent_stop_waits_for_pruned_same_id_generation(self):
+        """Agent-wide Stop cannot acknowledge while an old delivery runs."""
+        import httpx
+        from fastapi import FastAPI
+
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.endpoints.agent import router
+
+        class LiveAgent(RequestLifecycleMixin):
+            agent_id = "generation-stop-agent"
+
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_generations = {}
+                self._next_request_generation = 0
+                self._abandoned_request_generations = {}
+                self._abandoned_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._cancelled_request_generations = set()
+                self._request_completion_events = {}
+
+        agent = LiveAgent()
+        old_ready = asyncio.Event()
+        fresh_ready = asyncio.Event()
+        old_release = asyncio.Event()
+        fresh_release = asyncio.Event()
+
+        async def delivery(ready, release):
+            agent.register_active_request("same-id")
+            ready.set()
+            await release.wait()
+            agent._cleanup_cancelled_request("same-id")
+
+        old = asyncio.create_task(delivery(old_ready, old_release))
+        await old_ready.wait()
+        agent._active_request_started_at["same-id"] -= 1000
+        assert agent.prune_stale_active_requests(900) == ["same-id"]
+        fresh = asyncio.create_task(delivery(fresh_ready, fresh_release))
+        await fresh_ready.wait()
+
+        app = FastAPI()
+        app.include_router(router)
+        app.state.agent = agent
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                stop = asyncio.create_task(client.post("/api/agent/stop"))
+                for _ in range(100):
+                    if len(agent._cancelled_request_generations) == 2:
+                        break
+                    await asyncio.sleep(0.001)
+                assert len(agent._cancelled_request_generations) == 2
+
+                fresh_release.set()
+                await fresh
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(stop), timeout=0.05)
+
+                old_release.set()
+                await old
+                response = await asyncio.wait_for(stop, timeout=1)
+                assert response.status_code == 200
+                assert response.json()["stop_outcomes"][0]["disposition"] == "stopped"
+                assert not agent._abandoned_request_generations
+        finally:
+            fresh_release.set()
+            old_release.set()
+            await asyncio.gather(old, fresh, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_stop_endpoint_calls_cancel(self):

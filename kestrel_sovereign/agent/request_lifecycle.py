@@ -171,44 +171,85 @@ class RequestLifecycleMixin:
         self,
         request_id: Optional[str] = None,
     ) -> RequestCompletionDisposition:
-        """Wait until the targeted request has left the live lifecycle.
+        """Wait until every cancelled generation has left the live lifecycle.
 
         Marking ``_cancelled_requests`` is only a cooperative request to stop.
         A caller that needs a Stop acknowledgement must wait for endpoint
-        cleanup before it may report success or start replacement work.  The
-        waiter is installed before yielding to the event loop, which closes the
-        check-then-sleep race with ``_cleanup_cancelled_request``.
+        cleanup before it may report success or start replacement work. A
+        request ID can name a pruned old delivery and a fresh redelivery at the
+        same time, so waiting only for the active projection is insufficient.
+        The waiters for all snapshotted cancelled generations are installed
+        before yielding, which closes the check-then-sleep cleanup race.
         """
         target_request_id = request_id or self._current_request_id
         if target_request_id is None:
             return RequestCompletionDisposition.COMPLETED
-        active_request_ids = getattr(self, "_active_request_ids", set())
+        cancelled = getattr(self, "_cancelled_request_generations", None)
+        generations = {
+            generation
+            for rid, generation in (
+                cancelled if isinstance(cancelled, set) else set()
+            )
+            if rid == target_request_id
+        }
         abandoned = self._abandoned_generations(target_request_id)
-        if (
-            target_request_id not in active_request_ids
-            and target_request_id != self._current_request_id
-        ):
+        if not generations:
             return (
                 RequestCompletionDisposition.ABANDONED
                 if abandoned
                 else RequestCompletionDisposition.COMPLETED
             )
-        generation = self._request_generation_for_current_task(target_request_id)
-        if generation is None:
-            return RequestCompletionDisposition.ABANDONED
+
+        active_request_ids = getattr(self, "_active_request_ids", set())
+        active_generations = getattr(self, "_active_request_generations", None)
+        active_generation = (
+            active_generations.get(target_request_id)
+            if isinstance(active_generations, dict)
+            else None
+        )
+        abandoned_counts = getattr(self, "_abandoned_request_counts", None)
         waiters = getattr(self, "_request_completion_events", None)
         if not isinstance(waiters, dict):
             waiters = {}
             self._request_completion_events = waiters
-        waiter_key = (target_request_id, generation)
-        completion = waiters.get(waiter_key)
-        if completion is None:
-            completion = asyncio.get_running_loop().create_future()
-            waiters[waiter_key] = completion
-        disposition = await asyncio.shield(completion)
-        if generation in self._abandoned_generations(target_request_id):
+        completions: list[asyncio.Future[object]] = []
+        terminally_abandoned = False
+        for generation in sorted(generations):
+            abandoned_key = (target_request_id, generation)
+            is_pruned_and_running = (
+                isinstance(abandoned_counts, dict)
+                and abandoned_counts.get(abandoned_key, 0) > 0
+            )
+            is_active = (
+                generation == active_generation
+                and target_request_id in active_request_ids
+            )
+            if generation in abandoned and not is_pruned_and_running:
+                terminally_abandoned = True
+                continue
+            if not is_active and not is_pruned_and_running:
+                # The generation completed between cancellation and this
+                # synchronous snapshot. Its cleanup removed execution state.
+                continue
+            completion = waiters.get(abandoned_key)
+            if completion is None:
+                completion = asyncio.get_running_loop().create_future()
+                waiters[abandoned_key] = completion
+            completions.append(completion)
+
+        dispositions = (
+            await asyncio.gather(
+                *(asyncio.shield(completion) for completion in completions)
+            )
+            if completions
+            else ()
+        )
+        if terminally_abandoned or any(
+            disposition is RequestCompletionDisposition.ABANDONED
+            for disposition in dispositions
+        ):
             return RequestCompletionDisposition.ABANDONED
-        return disposition
+        return RequestCompletionDisposition.COMPLETED
 
     def _resolve_request_completion(
         self,
@@ -292,10 +333,17 @@ class RequestLifecycleMixin:
                 abandoned_counts[abandoned_key] = remaining - 1
                 return
             abandoned_counts.pop(abandoned_key, None)
+            if isinstance(tombstones, dict):
+                abandoned = tombstones.get(request_id)
+                if isinstance(abandoned, set):
+                    if disposition is RequestCompletionDisposition.COMPLETED:
+                        abandoned.discard(generation)
+                    if not abandoned:
+                        tombstones.pop(request_id, None)
             self._release_cancelled_generation(request_id, generation)
             self._resolve_request_completion(
                 request_id,
-                effective_disposition,
+                disposition,
                 generation=generation,
             )
             return
