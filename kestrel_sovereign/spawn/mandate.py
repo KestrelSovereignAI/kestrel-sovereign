@@ -63,6 +63,8 @@ class SpawnMandate:
             wire_value = float(value)
             if not math.isfinite(wire_value):
                 raise ValueError("spawn mandate budget exceeds JSON numeric range")
+            if value != 0 and wire_value == 0:
+                raise ValueError("spawn mandate budget exceeds JSON numeric range")
             self.budget_allocation = wire_value
             return wire_value
         if not isinstance(value, (int, float)) or isinstance(value, bool):

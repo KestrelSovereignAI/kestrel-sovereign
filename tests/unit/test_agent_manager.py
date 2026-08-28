@@ -32,6 +32,7 @@ from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.knowledge import InferenceError, InferenceProfile, OntologyRef
 from kestrel_sovereign.multi_agent.agent_manager import (
+    AgentOperationAdmission,
     AgentManager,
     ChildTerminationReconciliationError,
     RUNTIME_OFFBOARD_TIMEOUT_S,
@@ -307,6 +308,115 @@ async def test_failed_published_spawn_retains_cleanup_when_receipt_revocation_fa
 
     assert events == ["signed", "revocation-failed", "revoked", "shutdown"]
     assert manager.get_agent("PublishedRevocationChild") is None
+
+
+@pytest.mark.asyncio
+async def test_failed_spawn_quarantine_retains_cap_slot_until_child_is_removed(
+    tmp_path,
+):
+    """A quarantined, mandate-less child still consumes a fleet-cap slot."""
+
+    allow_revocation = asyncio.Event()
+
+    class BlockedRevocationGraph:
+        def __init__(self) -> None:
+            self.write_count = 0
+
+        async def add_trusted_cross_agent_edge(
+            self, _source, _target, _label, *, properties
+        ) -> None:
+            self.write_count += 1
+            if properties.get("parent_signature"):
+                return
+            if self.write_count == 2:
+                raise RuntimeError("revocation unavailable")
+            await allow_revocation.wait()
+
+    graph = BlockedRevocationGraph()
+    child = _make_mock_agent("did:test:quarantined-cap-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    parent = _make_mock_agent("did:test:quarantined-cap-parent")
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._max_spawned_agents = 1
+
+    async def create_child(name, **_kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+    manager._apply_delegated_budget = AsyncMock(
+        side_effect=RuntimeError("budget provider failed")
+    )
+
+    with pytest.raises(ExceptionGroup, match="owned rollback failed"):
+        await manager.spawn_agent(
+            "QuarantinedCapChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id),
+        )
+
+    assert manager._pending_spawns == 1
+    with pytest.raises(ValueError, match="spawned-agent cap"):
+        await manager.spawn_agent(
+            "MustWaitForQuarantine",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id),
+        )
+
+    allow_revocation.set()
+    await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1.0)
+    assert manager._pending_spawns == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_spawn_cleanup_waits_out_terminal_handoff_seal(tmp_path):
+    """A terminal drain seal cannot orphan a newly-created cleanup task."""
+
+    graph = SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+    child = _make_mock_agent("did:test:sealed-handoff-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    admission = AgentOperationAdmission(
+        name="SealedHandoffChild",
+        canonical_name="sealedhandoffchild",
+        kind="spawn",
+        registration_epoch=0,
+        owner_task=asyncio.current_task(),
+        child=child,
+        spawn_slot_active=True,
+        spawn_receipt_graph=graph,
+        spawn_receipt_source_id=child.agent_id,
+        spawn_receipt_target_id="did:test:sealed-handoff-parent",
+        spawn_receipt_unsigned_properties={"parent_signature": None},
+    )
+    manager._pending_spawns = 1
+    manager._quarantined_shutdown_handoffs_sealed = True
+    await manager._quarantined_shutdown_drain_lock.acquire()
+    manager._rollback_uncommitted_spawn_runtime = AsyncMock(return_value=False)
+
+    handoff = asyncio.create_task(
+        manager._handoff_failed_spawn_cleanup(admission, child)
+    )
+    await asyncio.sleep(0)
+    assert not handoff.done()
+    assert manager._quarantined_shutdown_reapers == {}
+
+    manager._quarantined_shutdown_handoffs_sealed = False
+    manager._quarantined_shutdown_drain_lock.release()
+    await asyncio.wait_for(handoff, timeout=1.0)
+    await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1.0)
+
+    assert manager._rollback_uncommitted_spawn_runtime.await_count == 1
+    assert manager._pending_spawns == 0
 
 
 @pytest.mark.asyncio

@@ -5754,8 +5754,16 @@ class AgentManager:
             # failed spawn still owns the child until an idempotent revocation
             # succeeds and the matching runtime is withdrawn.  Retain that
             # cleanup owner for both prepublication and published children.
-            self._handoff_failed_spawn_cleanup(admission, child)
+            handoff_cancelled = await self._handoff_failed_spawn_cleanup(
+                admission,
+                child,
+            )
             admission.rollback_incomplete = True
+            if handoff_cancelled:
+                raise BaseExceptionGroup(
+                    "Spawn receipt revocation failed during cancellation",
+                    [asyncio.CancelledError(), receipt_failure],
+                )
             raise receipt_failure
 
         runtime_cleanup = asyncio.create_task(
@@ -5892,11 +5900,11 @@ class AgentManager:
             )
         return cancelled or inspection_cancelled
 
-    def _handoff_failed_spawn_cleanup(
+    async def _handoff_failed_spawn_cleanup(
         self,
         admission: AgentOperationAdmission,
         child: KestrelAgent,
-    ) -> None:
+    ) -> bool:
         """Retain an ambiguous receipt and its live storage until revocation.
 
         This is the last-resort owner after a prepublication receipt write or a
@@ -5906,7 +5914,17 @@ class AgentManager:
         state. A durable backend outage remains visible in the quarantine
         registry and keeps the routing name reserved instead of abandoning
         signed power.
+
+        The terminal-drain lock is the admission boundary. If a drain already
+        sealed handoffs, this operation waits until that complete snapshot has
+        settled instead of creating an unregistered task behind it. A spawn
+        cap slot transfers to the retained task at the same boundary and is
+        released only after the child runtime and delegated hold are both gone.
+
+        Returns whether cancellation was observed while completing admission.
         """
+
+        slot_transferred = False
 
         async def revoke_then_shutdown() -> None:
             while admission.spawn_receipt_graph is not None:
@@ -5921,17 +5939,90 @@ class AgentManager:
                         admission.name,
                     )
                     await asyncio.sleep(1.0)
-            await self._rollback_uncommitted_spawn_runtime(admission, child)
+            while True:
+                try:
+                    await self._rollback_uncommitted_spawn_runtime(
+                        admission,
+                        child,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed spawn runtime cleanup remains pending for %r",
+                        admission.name,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+                break
 
-        cleanup = asyncio.create_task(
-            revoke_then_shutdown(),
-            name=f"failed_spawn_receipt_cleanup:{admission.name}",
-        )
-        self._retain_quarantined_cleanup(
-            name=admission.name,
-            agent_id=_loaded_agent_did(child) or "<unknown>",
-            task=cleanup,
-        )
+            if slot_transferred:
+                async with self._lock:
+                    if self._pending_spawns <= 0:
+                        raise RuntimeError(
+                            "Quarantined spawn cap ownership underflowed"
+                        )
+                    self._pending_spawns -= 1
+
+        cancelled = await self._acquire_quarantined_shutdown_drain()
+        cleanup: asyncio.Task[None] | None = None
+        admission_failure: BaseException | None = None
+        try:
+            acquire = asyncio.create_task(
+                self._lock.acquire(),
+                name=f"failed_spawn_cleanup_admission:{admission.name}",
+            )
+            acquire_cancelled, acquire_failure = (
+                await await_lifecycle_task_completion(acquire)
+            )
+            cancelled = cancelled or acquire_cancelled
+            if acquire_failure is not None:
+                raise RuntimeError(
+                    "Unable to admit failed spawn cleanup"
+                ) from acquire_failure
+            try:
+                if self._quarantined_shutdown_handoffs_sealed:
+                    raise RuntimeError(
+                        "terminal drain remained sealed after admission lock"
+                    )
+                cleanup = asyncio.create_task(
+                    revoke_then_shutdown(),
+                    name=f"failed_spawn_receipt_cleanup:{admission.name}",
+                )
+                try:
+                    self._retain_quarantined_cleanup(
+                        name=admission.name,
+                        agent_id=_loaded_agent_did(child) or "<unknown>",
+                        task=cleanup,
+                    )
+                except BaseException as exc:
+                    # The task has not had an event-loop turn while this code
+                    # holds the lock. Cancel it before leaving the admission
+                    # boundary so an unregistered cleanup can never escape.
+                    cleanup.cancel()
+                    admission_failure = exc
+                else:
+                    if admission.spawn_slot_active:
+                        slot_transferred = True
+                        admission.spawn_slot_active = False
+            finally:
+                self._lock.release()
+        finally:
+            self._quarantined_shutdown_drain_lock.release()
+
+        if admission_failure is not None:
+            assert cleanup is not None
+            cleanup_cancelled, cleanup_failure = (
+                await await_lifecycle_task_completion(cleanup)
+            )
+            cancelled = cancelled or cleanup_cancelled
+            if cleanup_failure is not None and not isinstance(
+                cleanup_failure, asyncio.CancelledError
+            ):
+                raise BaseExceptionGroup(
+                    "Failed cleanup admission left multiple terminal outcomes",
+                    [admission_failure, cleanup_failure],
+                )
+            raise admission_failure
+        return cancelled
 
     async def _child_runtime_or_delegated_hold_is_live(
         self, child_name: str

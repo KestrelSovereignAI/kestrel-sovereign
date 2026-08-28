@@ -89,6 +89,15 @@ class TestSpawnMandate:
         with pytest.raises(ValueError, match="JSON numeric range"):
             mandate._signable_payload()
 
+    def test_decimal_budget_rejects_float_underflow_before_signing(self):
+        mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            budget_allocation=Decimal("1e-400"),
+        )
+
+        with pytest.raises(ValueError, match="JSON numeric range"):
+            mandate._signable_payload()
+
 
 class TestMandateSigning:
     def test_sign_and_verify_roundtrip(self, sample_mandate, parent_keys):
