@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.features.isolated_runtime import (
     derive_isolated_runtime_namespace,
     prepare_isolated_runtime_namespace,
@@ -22,7 +23,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     _uncommitted_spawn_not_hosted_cancellation,
 )
 from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle, SpawnMode
-from kestrel_sovereign.spawn.mandate import SpawnMandate
+from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
@@ -162,6 +163,66 @@ class TestSpawnFeatureAutoManager:
         assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
+    async def test_hosted_restored_leaf_uses_host_manager_and_keeps_depth_ceiling(
+        self, tmp_path
+    ):
+        parent_did = "did:test:durable-parent"
+        leaf = _make_mock_agent("did:test:restored-leaf")
+        leaf.features = {}
+        leaf._agent_manager = None
+        leaf.agent_manager = None
+        parent = _make_mock_agent(parent_did)
+        parent_private, _ = generate_secp256k1_keypair()
+        parent._private_key = parent_private
+        parent.identity = None
+        parent._persisted_spawn_mandate = None
+        leaf._persisted_spawn_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=parent_did,
+                child_did=leaf.agent_id,
+                max_child_depth=0,
+            ),
+            parent_private,
+        )
+        host_manager = AgentManager(base_data_dir=tmp_path)
+        host_manager._register_agent("DurableParent", parent)
+        host_manager._register_agent("RestoredLeaf", leaf)
+        feature = SpawnFeature(leaf)
+        await feature.initialize()
+
+        resolved = feature._get_agent_manager()
+
+        assert resolved is host_manager
+        assert resolved.get_children(parent_did) == ["RestoredLeaf"]
+        with pytest.raises(ValueError, match="max child depth"):
+            await resolved.spawn_agent(
+                "ForbiddenGrandchild",
+                leaf,
+                SpawnMandate(parent_did=leaf.agent_id),
+            )
+
+    def test_budgeted_published_child_manager_lookup_is_idempotent(self, tmp_path):
+        child = _make_mock_agent("did:test:budgeted-child")
+        child._persisted_spawn_mandate = SpawnMandate(
+            parent_did="did:test:parent",
+            child_did=child.agent_id,
+            budget_allocation=5,
+            parent_signature="already-verified-at-publication",
+        )
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager._agents["BudgetedChild"] = child
+        manager._agent_names[child.agent_id] = "BudgetedChild"
+        child._agent_manager = manager
+        feature = SpawnFeature(child)
+        feature._agent_manager = manager
+        manager._register_agent = MagicMock(
+            side_effect=AssertionError("published agents must not be re-registered")
+        )
+
+        assert feature._get_agent_manager() is manager
+        manager._register_agent.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_delegate_without_children(self):
         feature = _make_spawn_feature(manager=MagicMock())
         envelope = await feature.delegate_task(child_name="child1", task="do stuff")
@@ -211,6 +272,43 @@ class TestSpawnFeatureWithManager:
         # child's feature loader (which filters by cls.__name__) can match them
         # (#1946).
         assert mandate.features_allowed == ["MemoryFeature", "WebSearchFeature"]
+
+    @pytest.mark.asyncio
+    async def test_spawn_lifecycle_uses_signed_mandate_start(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        signed_start = "2026-08-28T16:00:00+00:00"
+        manager = MagicMock()
+
+        async def signed_spawn(**kwargs):
+            mandate = kwargs["mandate"]
+            mandate.child_did = child.agent_id
+            mandate.created_at = signed_start
+            return child
+
+        manager.spawn_agent = AsyncMock(side_effect=signed_spawn)
+        manager._child_mandates = {}
+        manager._parent_children = {}
+        manager._lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle.register = AsyncMock()
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.spawn_agent(
+            name="helper",
+            purpose="signed deadline",
+            ttl=1800,
+        )
+
+        assert envelope.status is ToolResultStatus.OK
+        manager._lifecycle.register.assert_awaited_once_with(
+            child_name="helper",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=1800,
+            purpose="signed deadline",
+            mode=SpawnMode.EPHEMERAL,
+            started_at=signed_start,
+        )
 
     @pytest.mark.asyncio
     async def test_spawn_agent_failure(self):

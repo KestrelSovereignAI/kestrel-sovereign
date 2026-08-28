@@ -151,5 +151,9 @@ async def test_inception_with_spawn_mandate_records_properties(tmp_dir, constitu
     assert edge.properties["purpose"] == "research helper"
     assert edge.properties["ttl_seconds"] == 7200
     assert edge.properties["max_child_depth"] == 1
+    # This signature was made before inception generated the child's DID and
+    # cannot authorize the resulting identity.  The manager replaces it with
+    # a final-DID-bound signature on the managed spawn path.
+    assert edge.properties["parent_signature"] is None
 
     await db.close()

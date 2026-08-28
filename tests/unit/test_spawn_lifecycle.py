@@ -21,6 +21,7 @@ from kestrel_sovereign.spawn.lifecycle import (
     SpawnResult,
     SpawnStatus,
 )
+from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
 def _make_mock_manager():
@@ -30,6 +31,30 @@ def _make_mock_manager():
     manager.get_children = MagicMock(return_value=[])
     manager.get_agent = MagicMock(return_value=None)
     return manager
+
+
+def test_restored_ephemeral_ttl_rearms_after_sync_construction() -> None:
+    """A lifecycle first built without a loop must arm its timer later."""
+
+    manager = AgentManager()
+    mandate = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did="did:test:child",
+        ttl_seconds=3600,
+    )
+    manager._child_mandates["Restored"] = mandate
+    lifecycle = SpawnedAgentLifecycle(manager)
+    assert lifecycle._tracked["Restored"].ttl_task is None
+
+    async def rearm() -> None:
+        lifecycle.restore_from_manager()
+        ttl_task = lifecycle._tracked["Restored"].ttl_task
+        assert ttl_task is not None
+        lifecycle.withdraw_persisted_child("Restored")
+        await asyncio.sleep(0)
+        assert ttl_task.cancelled()
+
+    asyncio.run(rearm())
 
 
 class TestSpawnResult:

@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 
 from kestrel_sovereign.hooks.manager import HooksManager
+from kestrel_sovereign.spawn.mandate import remaining_spawn_ttl_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,130 @@ class SpawnedAgentLifecycle:
         self._tracked: Dict[str, _TrackedChild] = {}
         self._results: Dict[str, SpawnResult] = {}
         self._lock = asyncio.Lock()
+        # The lifecycle object is intentionally created lazily by SpawnFeature,
+        # often after AgentManager has cold-loaded every agent.  Adopt the
+        # manager's durable mandate projections at construction so public
+        # terminate/TTL paths see the same children as the authority maps.
+        self.restore_from_manager()
+
+    @staticmethod
+    def _remaining_ttl_seconds(created_at: str, ttl_seconds: int) -> float:
+        """Return a persisted mandate's remaining lifetime, never a fresh TTL."""
+
+        return remaining_spawn_ttl_seconds(created_at, ttl_seconds)
+
+    def restore_from_manager(self) -> None:
+        """Adopt every durable child authority already projected by the manager."""
+
+        # Read concrete manager state: permissive proxies (notably test
+        # MagicMocks) can fabricate an apparent authority map via getattr.
+        mandates = vars(self._agent_manager).get("_child_mandates", {})
+        if not isinstance(mandates, dict):
+            raise TypeError("agent manager child mandates must be a mapping")
+        relationships = vars(self._agent_manager).get("_parent_children", {})
+        if not isinstance(relationships, dict):
+            raise TypeError("agent manager parent relationships must be a mapping")
+        for child_name, mandate in tuple(mandates.items()):
+            parent_ids = [
+                parent_did
+                for parent_did, children in relationships.items()
+                if child_name in children
+            ]
+            if len(parent_ids) > 1:
+                raise RuntimeError(
+                    f"Child {child_name!r} has multiple lifecycle parents"
+                )
+            self.restore_persisted_child(
+                child_name,
+                mandate,
+                authority_parent_did=parent_ids[0] if parent_ids else None,
+            )
+
+    def _arm_restored_ttl_if_possible(self, tracked: _TrackedChild) -> None:
+        """Arm a restored ephemeral timer once called inside a running loop."""
+
+        if tracked.mode is not SpawnMode.EPHEMERAL or tracked.ttl_task is not None:
+            return
+        remaining = self._remaining_ttl_seconds(
+            tracked.started_at,
+            tracked.ttl_seconds,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "Restored child %r outside a running event loop; TTL will "
+                "be armed when lifecycle state is next adopted",
+                tracked.child_name,
+            )
+            return
+        tracked.ttl_task = loop.create_task(
+            self._ttl_monitor(tracked.child_name, remaining),
+            name=f"spawn_ttl:{tracked.child_name}",
+        )
+
+    def restore_persisted_child(
+        self,
+        child_name: str,
+        mandate: Any,
+        *,
+        authority_parent_did: Optional[str] = None,
+    ) -> None:
+        """Rehydrate one cold-loaded child without replaying the spawn hook."""
+
+        child_did = getattr(mandate, "child_did", None)
+        parent_did = getattr(mandate, "parent_did", None)
+        ttl_seconds = getattr(mandate, "ttl_seconds", None)
+        purpose = getattr(mandate, "purpose", "")
+        created_at = getattr(mandate, "created_at", "")
+        if not isinstance(child_name, str) or not child_name:
+            raise TypeError("persisted child name must be a non-empty string")
+        if not isinstance(child_did, str) or not child_did:
+            raise TypeError("persisted child DID must be a non-empty string")
+        if not isinstance(parent_did, str) or not parent_did:
+            raise TypeError("persisted parent DID must be a non-empty string")
+        if authority_parent_did is not None:
+            if not isinstance(authority_parent_did, str) or not authority_parent_did:
+                raise TypeError("authority parent DID must be a non-empty string")
+            parent_did = authority_parent_did
+        if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
+            raise TypeError("persisted spawn TTL must be an integer")
+        if not isinstance(purpose, str) or not isinstance(created_at, str):
+            raise TypeError("persisted spawn purpose and created_at must be strings")
+
+        existing = self._tracked.get(child_name)
+        if existing is not None:
+            if (
+                existing.child_did != child_did
+                or existing.parent_did != parent_did
+                or existing.ttl_seconds != ttl_seconds
+            ):
+                raise RuntimeError(
+                    f"Conflicting lifecycle authority for child {child_name!r}"
+                )
+            self._arm_restored_ttl_if_possible(existing)
+            return
+
+        mode = SpawnMode.PERSISTENT if ttl_seconds <= 0 else SpawnMode.EPHEMERAL
+        tracked = _TrackedChild(
+            child_name=child_name,
+            child_did=child_did,
+            parent_did=parent_did,
+            mode=mode,
+            ttl_seconds=ttl_seconds,
+            purpose=purpose,
+            started_at=created_at,
+        )
+        if mode is SpawnMode.EPHEMERAL:
+            self._arm_restored_ttl_if_possible(tracked)
+        self._tracked[child_name] = tracked
+
+    def withdraw_persisted_child(self, child_name: str) -> None:
+        """Undo cold-load lifecycle adoption when publication rolls back."""
+
+        tracked = self._tracked.pop(child_name, None)
+        if tracked is not None and tracked.ttl_task is not None:
+            tracked.ttl_task.cancel()
 
     def create_ephemeral_dir(self) -> str:
         """Create a temporary directory for an ephemeral child agent.
@@ -259,6 +384,7 @@ class SpawnedAgentLifecycle:
         mode: SpawnMode = SpawnMode.EPHEMERAL,
         purpose: str = "",
         temp_dir: Optional[str] = None,
+        started_at: Optional[str] = None,
     ) -> None:
         """Register a spawned child for lifecycle tracking.
 
@@ -274,6 +400,7 @@ class SpawnedAgentLifecycle:
             purpose: Purpose description from the spawn mandate.
             temp_dir: Path to temp directory (for ephemeral mode cleanup).
         """
+        signed_start = started_at is not None
         tracked = _TrackedChild(
             child_name=child_name,
             child_did=child_did,
@@ -282,12 +409,28 @@ class SpawnedAgentLifecycle:
             ttl_seconds=ttl_seconds,
             purpose=purpose,
             temp_dir=temp_dir,
+            started_at=(
+                started_at
+                if started_at is not None
+                else datetime.now(timezone.utc).isoformat()
+            ),
         )
 
-        # Start TTL monitoring
-        tracked.ttl_task = asyncio.create_task(
-            self._ttl_monitor(child_name, ttl_seconds)
-        )
+        # Persistent children deliberately have no automatic expiry.  This is
+        # also the shape restored from a durable ``ttl_seconds <= 0`` mandate.
+        if mode is SpawnMode.EPHEMERAL:
+            remaining = (
+                self._remaining_ttl_seconds(
+                    tracked.started_at,
+                    tracked.ttl_seconds,
+                )
+                if signed_start
+                else ttl_seconds
+            )
+            tracked.ttl_task = asyncio.create_task(
+                self._ttl_monitor(child_name, remaining),
+                name=f"spawn_ttl:{child_name}",
+            )
 
         self._tracked[child_name] = tracked
 

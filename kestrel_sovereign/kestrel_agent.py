@@ -1254,6 +1254,11 @@ class KestrelAgent(
         # (``features/isolated_runtime.py``), which never receives this object.
         self._raw_storage = None
         self.storage = None
+        # Set only from the durable spawned_by edge during initialize().
+        # AgentManager consumes this private projection when rebuilding its
+        # runtime authority indexes; it must never trust an arbitrary in-memory
+        # ``spawn_mandate`` supplied by a caller for that purpose.
+        self._persisted_spawn_mandate = None
 
         # Explicit boot state (#2522). Replaces the old ``_raw_storage is None``
         # proxy that let a second initialize() skip the body and run only the
@@ -3384,12 +3389,13 @@ class KestrelAgent(
             except Exception as e:
                 logging.warning(f"failed to start salvage worker: {e}")
 
-        # Reattach spawn-mandate enforcement (#2137). initialize() is the single
-        # boot path shared by single-agent, multi-agent (AgentManager), and
-        # direct-test starts, so registering here — not in AgentManager — means a
-        # spawned child's restricted_tools are hard-denied whenever the child
-        # runs, reconstructed from the durable spawned_by delegation edge
-        # (survives restart). No-op for root agents / spawns with no constraints.
+        # Reattach the complete spawn mandate and its enforcement (#2137,
+        # #3133). initialize() is the single boot path shared by single-agent,
+        # multi-agent (AgentManager), and direct-test starts. Keeping the full
+        # projection on the child lets AgentManager rebuild parent authority at
+        # publication after a restart; registering the restriction hook here
+        # still protects every non-manager boot path. Root agents remain a
+        # no-op, while an unconstrained child retains its lineage mandate.
         if self.did and self.storage is not None and self.hooks_manager is not None:
             from kestrel_sovereign.spawn.mandate_reload import (
                 read_spawn_mandate,
@@ -3397,9 +3403,20 @@ class KestrelAgent(
             )
 
             _spawn_mandate = await read_spawn_mandate(self.storage, self.did)
+            self._persisted_spawn_mandate = _spawn_mandate
             if _spawn_mandate is not None:
-                if getattr(self, "spawn_mandate", None) is None:
-                    self.spawn_mandate = _spawn_mandate
+                # Feature discovery already enforced the durable ceiling above.
+                # The constitutional verifier's ``parent_features`` input is
+                # this child's *currently loaded* set, so replaying the original
+                # ceiling there would classify a legitimately removed optional
+                # feature as a new grant and drive the child into Safe Mode.
+                # Preserve the complete projection privately for manager
+                # authority restoration while exposing the prior audit-safe
+                # restriction projection to the runtime verifier/renderer.
+                self.spawn_mandate = _replace_dataclass(
+                    _spawn_mandate,
+                    features_allowed=[],
+                )
                 register_restriction_hook(self.hooks_manager, _spawn_mandate)
 
         # Lifecycle hardening (#377): refuse to declare initialization

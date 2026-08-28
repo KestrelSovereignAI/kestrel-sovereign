@@ -19,6 +19,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
@@ -42,7 +43,11 @@ from kestrel_sovereign.spawn.delegated_wallet import (
     has_durable_delegated_child_wallet_provisioning_contract,
     release_delegated_wallet,
 )
-from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
+from kestrel_sovereign.spawn.mandate import (
+    SpawnMandate,
+    remaining_spawn_ttl_seconds,
+    sign_mandate,
+)
 
 from .config import LocalAgentConfig, MultiAgentConfig
 
@@ -257,6 +262,10 @@ class ChildTerminationNotPerformedError(RuntimeError):
             "agent_removed": False,
         }
         super().__init__(f"Child {child_name!r} was not removed.")
+
+
+class PersistedSpawnParentUnavailableError(RuntimeError):
+    """A signed child receipt cannot be verified without its live parent."""
 
 
 def _agent_runtime_path(agent: object) -> Optional[Path]:
@@ -486,10 +495,21 @@ class AgentOperationAdmission:
     # still owns it until the parent relationship and budget commit below.
     published: bool = False
     committed: bool = False
+    # True only while this spawn owns one slot in ``_pending_spawns``.  The
+    # final governance commit converts that reservation into a child mandate
+    # under the same lock, so concurrent restored children cannot overflow the
+    # cap and concurrent successful spawns do not double-count one another.
+    spawn_slot_active: bool = False
     # A ``remove_agent(False)`` rollback inspection found this operation's
     # child or hold still live.  The public spawn tail must not let a later
     # cancellation overwrite the rollback failure with a bare cancellation.
     rollback_incomplete: bool = False
+    # The signed edge is written before the final governance commit. Retain its
+    # exact storage witness from before the await so rollback can delete even an
+    # add whose commit succeeded immediately before caller cancellation.
+    spawn_receipt_graph: object | None = None
+    spawn_receipt_source_id: str | None = None
+    spawn_receipt_target_id: str | None = None
 
 
 class _DynamicSchedulerTenantRegistration:
@@ -591,6 +611,32 @@ def _loaded_agent_did(agent: object) -> Optional[str]:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _loaded_agent_bound_dids(agent: object) -> frozenset[str]:
+    """Return the stable DID and verified runtime-identity aliases.
+
+    A rotated agent keeps its legacy DID as the manager routing identity while
+    signing new artifacts as its successor DID.  Only expand aliases when the
+    loaded identity itself contains the stable DID; an unrelated mutable
+    identity object must not manufacture a parent binding.
+    """
+
+    stable_did = _loaded_agent_did(agent)
+    if stable_did is None:
+        return frozenset()
+    identity = vars(agent).get("identity")
+    identity_dids = {
+        candidate
+        for candidate in (
+            getattr(identity, "legacy_did", None),
+            getattr(identity, "new_did", None),
+        )
+        if isinstance(candidate, str) and candidate
+    }
+    if stable_did not in identity_dids:
+        return frozenset({stable_did})
+    return frozenset({stable_did, *identity_dids})
 
 
 class AgentManager:
@@ -1606,6 +1652,9 @@ class AgentManager:
         agent_id = _loaded_agent_did(agent)
         if agent_id is not None and self._agent_names.get(agent_id) == name:
             self._agent_names.pop(agent_id, None)
+        self._withdraw_restored_spawn_authority(name, agent_id)
+        if vars(agent).get("_agent_manager") is self:
+            agent._agent_manager = None
 
     async def _discard_unpublished_initialized_agent(
         self, name: str, agent: KestrelAgent
@@ -1681,6 +1730,318 @@ class AgentManager:
             )
         return False
 
+    def _restore_persisted_spawn_authority(
+        self, name: str, agent: KestrelAgent, agent_id: str
+    ) -> None:
+        """Project one durable ``spawned_by`` edge into runtime indexes.
+
+        The maps are caches used by the existing control paths, not an
+        authority source. A fresh spawn deliberately waits for ``_do_spawn``'s
+        budget + mandate commit; only ordinary load/batch-load operations
+        restore the edge here.
+        """
+
+        # Read concrete instance state rather than ``getattr`` so permissive
+        # test/proxy objects cannot synthesize an apparent authority value.
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if mandate is None:
+            return
+        if not isinstance(mandate, SpawnMandate):
+            raise TypeError("persisted spawn authority must be a SpawnMandate")
+
+        # Legacy spawned_by edges are unsigned attribution. They continue to
+        # re-apply restrictions on the child, but can never recreate parental
+        # governance. A signed receipt is restored only when its parent is
+        # loaded and the signature verifies against that parent's live,
+        # trusted identity.
+        if not mandate.parent_signature:
+            return
+        parent_matches = [
+            (candidate_name, candidate)
+            for candidate_name, candidate in self._agents.items()
+            if mandate.parent_did in _loaded_agent_bound_dids(candidate)
+        ]
+        if len(parent_matches) > 1:
+            raise RuntimeError(
+                "Persisted spawn mandate parent identity is ambiguous"
+            )
+        if not parent_matches:
+            raise PersistedSpawnParentUnavailableError(
+                "Refusing to publish a signed child before its parent authority "
+                "is loaded"
+            )
+        _parent_name, parent = parent_matches[0]
+        authority_parent_did = _loaded_agent_did(parent)
+        if authority_parent_did is None:
+            raise PersistedSpawnParentUnavailableError(
+                "Refusing to publish a signed child without stable parent authority"
+            )
+        parent_state = vars(parent)
+        parent_identity = parent_state.get("identity")
+        parent_private_key = parent_state.get("_private_key")
+        public_key = None
+        public_key_getter = getattr(parent_private_key, "public_key", None)
+        if callable(public_key_getter):
+            public_key = public_key_getter()
+        from kestrel_sovereign.spawn.mandate import verify_mandate
+
+        if not verify_mandate(
+            mandate,
+            public_key,
+            parent_identity=parent_identity,
+        ):
+            raise RuntimeError("Persisted spawn mandate signature is invalid")
+
+        if (
+            mandate.ttl_seconds > 0
+            and remaining_spawn_ttl_seconds(
+                mandate.created_at,
+                mandate.ttl_seconds,
+            ) <= 0
+        ):
+            raise RuntimeError("Persisted spawn mandate has expired")
+
+        admission = self._agent_operations.get(self._canonical_agent_name(name))
+        if (
+            admission is not None
+            and admission.kind == "spawn"
+            and not admission.committed
+        ):
+            return
+
+        if mandate.child_did != agent_id:
+            raise RuntimeError(
+                "Persisted spawn mandate child DID does not match the loaded agent"
+            )
+        parent_did = authority_parent_did
+        if not isinstance(parent_did, str) or not parent_did or parent_did == agent_id:
+            raise RuntimeError("Persisted spawn mandate has an invalid parent DID")
+
+        canonical_name = self._canonical_agent_name(name)
+        for recorded_parent, children in self._parent_children.items():
+            if recorded_parent == parent_did:
+                continue
+            if any(
+                self._canonical_agent_name(child) == canonical_name
+                for child in children
+            ):
+                raise RuntimeError(
+                    f"Agent {name!r} is already attached to a different parent"
+                )
+
+        existing = self._child_mandates.get(name)
+        if existing is not None:
+            existing_parent_did = existing.parent_did
+            existing_parent_matches = [
+                candidate
+                for candidate in self._agents.values()
+                if existing_parent_did in _loaded_agent_bound_dids(candidate)
+            ]
+            if len(existing_parent_matches) == 1:
+                existing_parent_did = (
+                    _loaded_agent_did(existing_parent_matches[0])
+                    or existing_parent_did
+                )
+            if (
+                existing_parent_did != parent_did
+                or existing.child_did != agent_id
+            ):
+                raise RuntimeError(
+                    f"Agent {name!r} has conflicting persisted spawn authority"
+                )
+
+        # Treat the durable child->parent edges as a directed forest.  Walk
+        # DIDs rather than routing names so load order and renames cannot hide
+        # a cycle (A spawned_by B, B spawned_by A).  Any already-corrupt loop
+        # is also refused instead of being extended into recursive control
+        # paths such as terminate_child and delegation-chain construction.
+        parent_by_child: dict[str, str] = {}
+        for recorded in self._child_mandates.values():
+            recorded_child = recorded.child_did
+            recorded_parent = recorded.parent_did
+            matches = [
+                candidate
+                for candidate in self._agents.values()
+                if recorded_parent in _loaded_agent_bound_dids(candidate)
+            ]
+            if len(matches) == 1:
+                recorded_parent = _loaded_agent_did(matches[0]) or recorded_parent
+            if not isinstance(recorded_child, str) or not recorded_child:
+                continue
+            prior_parent = parent_by_child.get(recorded_child)
+            if prior_parent is not None and prior_parent != recorded_parent:
+                raise RuntimeError(
+                    "Persisted spawn authority has conflicting parents for one DID"
+                )
+            parent_by_child[recorded_child] = recorded_parent
+        ancestor = parent_did
+        visited: set[str] = set()
+        while ancestor in parent_by_child:
+            if ancestor == agent_id or ancestor in visited:
+                raise RuntimeError("Persisted spawn authority contains a cycle")
+            visited.add(ancestor)
+            ancestor = parent_by_child[ancestor]
+        if ancestor == agent_id:
+            raise RuntimeError("Persisted spawn authority contains a cycle")
+
+        if existing is None and len(self._child_mandates) >= self._max_spawned_agents:
+            raise RuntimeError(
+                "Persisted spawn authority exceeds the configured spawned-agent cap"
+            )
+
+        children = self._parent_children.setdefault(parent_did, [])
+        if not any(
+            self._canonical_agent_name(child) == canonical_name for child in children
+        ):
+            children.append(name)
+        self._child_mandates[name] = mandate
+        self._ensure_spawn_lifecycle().restore_persisted_child(
+            name,
+            mandate,
+            authority_parent_did=parent_did,
+        )
+
+    def _ensure_spawn_lifecycle(self):
+        """Return the manager-owned lifecycle used by cold and live spawns.
+
+        Cold authority restoration is a startup responsibility. It cannot
+        wait for a later SpawnFeature tool call, because an expired child may
+        otherwise remain routable forever on a host that never invokes that
+        feature. Construction is synchronous and idempotent; TTL tasks arm
+        when the signed receipt is adopted inside the running startup loop.
+        """
+
+        from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+        lifecycle = getattr(self, "_lifecycle", None)
+        if not isinstance(lifecycle, SpawnedAgentLifecycle):
+            lifecycle = SpawnedAgentLifecycle(self)
+            self._lifecycle = lifecycle
+        return lifecycle
+
+    def _refuse_unrestored_delegated_budget(
+        self, name: str, agent: KestrelAgent
+    ) -> None:
+        """Fail closed before publishing a cold child without budget custody.
+
+        The live spawn path owns the hold from inception through governance
+        commit. A cold load currently has no async provider reconciliation
+        seam at this synchronous publication boundary, so accepting a positive
+        persisted allocation would give the child its ordinary wallet and
+        silently discard the signed spend ceiling. Refuse that load until a
+        durable delegated-wallet restoration protocol is implemented.
+        """
+
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if not isinstance(mandate, SpawnMandate):
+            return
+        try:
+            budget = Decimal(str(mandate.budget_allocation))
+        except (ArithmeticError, TypeError, ValueError):
+            raise RuntimeError("Persisted spawn budget is invalid") from None
+        if not budget.is_finite() or budget <= 0:
+            return
+
+        admission = self._agent_operations.get(self._canonical_agent_name(name))
+        live_spawn_owns_custody = (
+            admission is not None
+            and admission.kind in {"spawn", "direct-spawn-test"}
+            and not admission.committed
+        )
+        if not live_spawn_owns_custody:
+            raise RuntimeError(
+                "Refusing to publish a cold budgeted child before delegated "
+                "wallet custody is durably restored"
+            )
+
+    def _restore_all_verifiable_spawn_authority(self) -> None:
+        """Reconcile signed child receipts after either load order."""
+
+        for child_name, child in tuple(self._agents.items()):
+            child_id = _loaded_agent_did(child)
+            if child_id is not None:
+                self._restore_persisted_spawn_authority(
+                    child_name,
+                    child,
+                    child_id,
+                )
+
+    def _registration_order_for_initialized_agents(self, items):
+        """Return a stable parent-before-child order for one startup batch.
+
+        Initialization remains fully concurrent. Only publication is ordered,
+        using the signed receipt's parent DID as a dependency when that parent
+        is another successfully initialized member of this same batch.
+        Unknown parents stay in their original relative order and fail closed
+        at ``_register_agent``; cycles likewise reach the verifier rather than
+        being guessed into a relationship.
+        """
+
+        batch_dids = {
+            bound_did
+            for *_prefix, agent in items
+            for bound_did in _loaded_agent_bound_dids(agent)
+        }
+        emitted_dids = {
+            bound_did
+            for agent in self._agents.values()
+            for bound_did in _loaded_agent_bound_dids(agent)
+        }
+        pending = list(items)
+        ordered = []
+        while pending:
+            progress = False
+            deferred = []
+            for item in pending:
+                agent = item[-1]
+                mandate = vars(agent).get("_persisted_spawn_mandate")
+                parent_did = (
+                    mandate.parent_did
+                    if isinstance(mandate, SpawnMandate)
+                    and mandate.parent_signature
+                    else None
+                )
+                if (
+                    parent_did is not None
+                    and parent_did in batch_dids
+                    and parent_did not in emitted_dids
+                ):
+                    deferred.append(item)
+                    continue
+                ordered.append(item)
+                emitted_dids.update(_loaded_agent_bound_dids(agent))
+                progress = True
+            if not progress:
+                ordered.extend(deferred)
+                break
+            pending = deferred
+        return ordered
+
+    def _withdraw_restored_spawn_authority(
+        self, name: str, agent_id: Optional[str]
+    ) -> None:
+        """Roll back authority projected by a registration that did not commit."""
+
+        mandate = self._child_mandates.get(name)
+        if mandate is None or mandate.child_did != agent_id:
+            return
+        from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+        lifecycle = getattr(self, "_lifecycle", None)
+        if isinstance(lifecycle, SpawnedAgentLifecycle):
+            lifecycle.withdraw_persisted_child(name)
+        parent_ids = [
+            parent_did
+            for parent_did, children in self._parent_children.items()
+            if name in children
+        ]
+        if len(parent_ids) > 1:
+            raise RuntimeError(
+                f"Agent {name!r} is attached to multiple parent identities"
+            )
+        parent_did = parent_ids[0] if parent_ids else mandate.parent_did
+        self._prune_child_relationship_and_mandate(parent_did, name)
+
     def _register_agent(self, name: str, agent: KestrelAgent) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
         agent_id = _loaded_agent_did(agent)
@@ -1688,6 +2049,7 @@ class AgentManager:
             raise RuntimeError(
                 f"Cannot publish agent {name!r} without a concrete agent DID"
             )
+        self._refuse_unrestored_delegated_budget(name, agent)
         # The operation admission normally proves these are absent.  Keep the
         # publication seam defensive too: callers/tests may construct manager
         # state directly, and routing must never overwrite a different live
@@ -1708,8 +2070,43 @@ class AgentManager:
                 "Cannot publish an agent DID already routed under a different "
                 f"name: {agent_id!r} -> {bound_name!r}"
             )
+        attached_manager = vars(agent).get("_agent_manager")
+        if attached_manager is not None and attached_manager is not self:
+            raise RuntimeError("Cannot publish an agent attached to another manager")
+        was_published = self._agents.get(name) is agent
+        parent_children_before = {
+            parent: list(children)
+            for parent, children in self._parent_children.items()
+        }
+        child_mandates_before = dict(self._child_mandates)
         self._agents[name] = agent
         self._agent_names[agent_id] = name
+        try:
+            self._restore_persisted_spawn_authority(name, agent, agent_id)
+            self._restore_all_verifiable_spawn_authority()
+        except BaseException:
+            from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+
+            lifecycle = getattr(self, "_lifecycle", None)
+            if isinstance(lifecycle, SpawnedAgentLifecycle):
+                for restored_name in set(self._child_mandates).difference(
+                    child_mandates_before
+                ):
+                    lifecycle.withdraw_persisted_child(restored_name)
+            self._parent_children.clear()
+            self._parent_children.update(parent_children_before)
+            self._child_mandates.clear()
+            self._child_mandates.update(child_mandates_before)
+            if not was_published:
+                self._agents.pop(name, None)
+                if self._agent_names.get(agent_id) == name:
+                    self._agent_names.pop(agent_id, None)
+            raise
+        # SpawnFeature is agent-owned and has no request/app-state context.
+        # Give every hosted agent the same manager that published it so its
+        # control tools cannot silently manufacture a lineage-empty lightweight
+        # manager after restart.
+        agent._agent_manager = self
         # Publish the registered routing key as the human display name so the
         # observability emitter (and any other consumer) attributes events to
         # the real agent name instead of falling back to "unknown" (#2461).
@@ -2019,10 +2416,12 @@ class AgentManager:
         """Retire a spawn's cap slot and name admission as one terminal tail."""
 
         async def retire_spawn_slot() -> None:
-            if not spawn_slot_admitted:
+            if not spawn_slot_admitted or not admission.spawn_slot_active:
                 return
             async with self._lock:
-                self._pending_spawns -= 1
+                if admission.spawn_slot_active:
+                    self._pending_spawns -= 1
+                    admission.spawn_slot_active = False
 
         tasks: list["asyncio.Future[object]"] = [
             asyncio.create_task(
@@ -2321,6 +2720,7 @@ class AgentManager:
                 if not isinstance(result, BaseException)
             }
             try:
+                initialized_for_registration = []
                 for (name, _, admission), result in zip(admitted, results):
                     if isinstance(result, BaseException):
                         e = result
@@ -2340,6 +2740,15 @@ class AgentManager:
                             )
                         self._init_failures.append((name, e))
                         continue
+                    initialized_for_registration.append(
+                        (name, admission, result)
+                    )
+
+                for name, admission, result in (
+                    self._registration_order_for_initialized_agents(
+                        initialized_for_registration
+                    )
+                ):
                     try:
                         withdrawn_after_onboarding_failure = False
                         async with self._a2a_lifecycle_lock:
@@ -4211,6 +4620,8 @@ class AgentManager:
             self._agents.pop(name, None)
             self._agent_names.pop(agent.agent_id, None)
             self._revoke_a2a_hosted_policy(agent)
+            if vars(agent).get("_agent_manager") is self:
+                agent._agent_manager = None
             if shutdown_handed_off:
                 # Keep both quarantine handoffs under the same lock that
                 # linearizes terminal sealing.  This synchronous fence is
@@ -4919,6 +5330,23 @@ class AgentManager:
         Raises:
             ValueError: If an agent with this name already exists or inception fails.
         """
+        parent_did = _loaded_agent_did(parent_agent)
+        if (
+            parent_did is None
+            or mandate.parent_did not in _loaded_agent_bound_dids(parent_agent)
+        ):
+            raise ValueError(
+                "Spawn mandate parent DID does not match the requesting agent"
+            )
+        if mandate.child_did is not None:
+            raise ValueError(
+                "Spawn mandate child DID must be unset until inception"
+            )
+        # The caller may address a rotated parent by its successor signing DID.
+        # New receipts persist the manager's stable routing DID so graph edges,
+        # termination, and restart indexes retain one canonical parent key.
+        mandate.parent_did = parent_did
+
         # Subset-of-parent validation (F277): a mandate must only ever RESTRICT
         # the child relative to the parent — it may never grant features the
         # parent lacks or add constitution-weakening constraints. Enforce this
@@ -4965,6 +5393,7 @@ class AgentManager:
                         f"(mandate max_child_depth={getattr(parent_mandate, 'max_child_depth', 0)})."
                 )
                 self._pending_spawns += 1
+                admission.spawn_slot_active = True
                 spawn_slot_admitted = True
             # DECREMENT remaining depth on delegation (codex r2): a non-leaf
             # spawned parent's child must have strictly less depth, regardless of
@@ -5020,7 +5449,10 @@ class AgentManager:
                     raise asyncio.CancelledError()
 
         assert admission is not None
-        # Sign the mandate with the parent's keys if available.
+        # Resolve the parent's signing material now. The final signature is
+        # created only after inception returns the child's DID; signing before
+        # that point would bind ``child_did=None`` and cannot authorize the
+        # identity that was actually born.
         # Hybrid parents (post-rotation ceremony) get an additional
         # ``parent_identity`` arg so the mandate is signed with both
         # Ed25519 and ML-DSA-65; legacy parents fall through to the
@@ -5052,14 +5484,9 @@ class AgentManager:
         parent_identity = getattr(parent_agent, 'identity', None)
         # A hybrid parent (rotated or born-hybrid #2397) signs via its
         # hybrid keypair and needs no legacy private key; a legacy
-        # parent signs with its ECDSA key. Only a parent with neither
-        # (pre-inception construction) leaves the mandate unsigned.
+        # parent signs with its ECDSA key.
         parent_is_hybrid = bool(parent_identity is not None and parent_identity.is_hybrid)
-        if parent_private_key is not None or parent_is_hybrid:
-            sign_mandate(
-                mandate, parent_private_key,
-                parent_identity=parent_identity,
-            )
+        mandate.parent_signature = None
         child: Optional[KestrelAgent] = None
         try:
             child = await self.create_agent(
@@ -5075,6 +5502,39 @@ class AgentManager:
             # rollback below owns the live child if shutdown/delete fences this
             # operation before it can publish the parent relationship.
             mandate.child_did = child.agent_id
+            raw_storage = vars(child).get("_raw_storage")
+            if raw_storage is not None:
+                # A caller-created mandate is only a proposal until the final
+                # child DID exists. Establish the signed authority window here,
+                # after inception, so an old proposal or slow inception cannot
+                # publish a receipt that is already expired.
+                mandate.created_at = datetime.now(timezone.utc).isoformat()
+                sign_mandate(
+                    mandate,
+                    parent_private_key,
+                    parent_identity=parent_identity if parent_is_hybrid else None,
+                )
+                graph = getattr(raw_storage, "graph", None)
+                if graph is None:
+                    raise RuntimeError(
+                        "Spawned child has no durable graph for its signed mandate"
+                    )
+                admission.spawn_receipt_graph = graph
+                admission.spawn_receipt_source_id = child.agent_id
+                admission.spawn_receipt_target_id = parent_agent.agent_id
+                await graph.add_trusted_cross_agent_edge(
+                    child.agent_id,
+                    parent_agent.agent_id,
+                    "spawned_by",
+                    properties=mandate.to_edge_properties(),
+                )
+                child._persisted_spawn_mandate = mandate
+                # KestrelAgent.initialize() deliberately exposes an audit-safe
+                # runtime projection whose feature ceiling is empty after the
+                # loader already applied it. Keep the complete signed receipt
+                # private for manager authority restoration; replacing the
+                # runtime projection makes an unavailable optional feature
+                # look like a newly granted capability and forces Safe Mode.
 
             # Per-child budget (#2113): hold from the parent and route the
             # child's spend through a ceiling'd DelegatedWallet.  The operation
@@ -5093,6 +5553,45 @@ class AgentManager:
                         raise RuntimeError(
                             "Spawn was fenced before its budget and mandate could commit"
                         )
+                    if (
+                        mandate.ttl_seconds > 0
+                        and remaining_spawn_ttl_seconds(
+                            mandate.created_at,
+                            mandate.ttl_seconds,
+                        ) <= 0
+                    ):
+                        raise RuntimeError(
+                            "Spawn mandate expired before governance commit"
+                        )
+                    # A cold load may restore a persisted child while this
+                    # spawn is doing inception/provider I/O.  Convert our
+                    # reserved slot to the committed mandate atomically and
+                    # recheck the total so that restoration cannot drive the
+                    # fleet above the configured cap.  Successful concurrent
+                    # spawns each convert (rather than double-count) their own
+                    # pending slot at this same boundary.
+                    if admission.kind == "spawn":
+                        in_use = len(self._child_mandates) + self._pending_spawns
+                        if in_use > self._max_spawned_agents:
+                            # This spawn has definitively lost its reserved cap
+                            # slot. Retire it at the same linearization point as
+                            # the refusal, before slower child rollback begins,
+                            # so another pending spawn can consume the slot that
+                            # remains after the cold restoration.
+                            if admission.spawn_slot_active:
+                                self._pending_spawns -= 1
+                                admission.spawn_slot_active = False
+                            raise ValueError(
+                                f"Spawn refused: restored authority consumed the "
+                                f"last spawned-agent cap slot "
+                                f"({self._max_spawned_agents})."
+                            )
+                        if not admission.spawn_slot_active:
+                            raise RuntimeError(
+                                "Spawn cap reservation was lost before commit"
+                            )
+                        self._pending_spawns -= 1
+                        admission.spawn_slot_active = False
                     children = self._parent_children.setdefault(parent_did, [])
                     if name not in children:
                         children.append(name)
@@ -5200,6 +5699,69 @@ class AgentManager:
         Return cancellation only after that chosen owner and the inspection
         have both reached terminal state.
         """
+
+        receipt_cleanup = asyncio.create_task(
+            self._delete_uncommitted_spawn_receipt(admission, child),
+            name=f"rollback_spawn_receipt:{admission.name}",
+        )
+        receipt_cancelled, receipt_failure = (
+            await await_lifecycle_task_completion(receipt_cleanup)
+        )
+
+        runtime_cleanup = asyncio.create_task(
+            self._rollback_uncommitted_spawn_runtime(admission),
+            name=f"rollback_spawn_runtime:{admission.name}",
+        )
+        runtime_cancelled, runtime_failure = (
+            await await_lifecycle_task_completion(runtime_cleanup)
+        )
+        failures = [
+            failure
+            for failure in (receipt_failure, runtime_failure)
+            if failure is not None
+        ]
+        if failures:
+            admission.rollback_incomplete = True
+            _raise_lifecycle_outcomes(
+                "Spawn receipt and runtime rollback failed",
+                failures,
+            )
+        return (
+            receipt_cancelled
+            or runtime_cancelled
+            or receipt_cleanup.result()
+            or runtime_cleanup.result()
+        )
+
+    async def _delete_uncommitted_spawn_receipt(
+        self,
+        admission: AgentOperationAdmission,
+        child: KestrelAgent,
+    ) -> bool:
+        """Delete the exact signed receipt before an uncommitted child closes."""
+
+        graph = admission.spawn_receipt_graph
+        source_id = admission.spawn_receipt_source_id
+        target_id = admission.spawn_receipt_target_id
+        if graph is None:
+            return False
+        if not isinstance(source_id, str) or not isinstance(target_id, str):
+            raise RuntimeError("Uncommitted spawn receipt witness is incomplete")
+        delete_edge = getattr(graph, "delete_edge", None)
+        if not callable(delete_edge):
+            raise RuntimeError("Spawn receipt graph cannot delete its receipt")
+        await delete_edge(source_id, target_id, "spawned_by")
+        admission.spawn_receipt_graph = None
+        admission.spawn_receipt_source_id = None
+        admission.spawn_receipt_target_id = None
+        vars(child).pop("_persisted_spawn_mandate", None)
+        return False
+
+    async def _rollback_uncommitted_spawn_runtime(
+        self,
+        admission: AgentOperationAdmission,
+    ) -> bool:
+        """Remove the live child and budget after its receipt is withdrawn."""
 
         cleanup = asyncio.create_task(
             self.remove_agent(admission.name, offboard_runtime=True),

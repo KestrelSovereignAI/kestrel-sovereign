@@ -175,6 +175,115 @@ async def test_read_spawn_mandate_none_for_root_agent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reload_reconstructs_unconstrained_spawn_authority(tmp_path):
+    """A delegation edge is authority even when it has no tool restrictions."""
+
+    parent_private, _ = generate_secp256k1_keypair()
+    parent_did = "did:pkh:eip155:1:0xParentUnconstrained"
+    mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            purpose="unconstrained worker",
+            ttl_seconds=1200,
+            max_child_depth=2,
+        ),
+        parent_private,
+    )
+    creds = await create_kestrel_identity_async(
+        output_dir=str(tmp_path),
+        is_test_instance=True,
+        agent_name="UnconstrainedChild",
+        parent_did=parent_did,
+        spawn_mandate=mandate,
+    )
+
+    storage = AsyncStorage(os.path.join(str(tmp_path), "kestrel_prime.db"))
+    await storage.initialize()
+    try:
+        reconstructed = await read_spawn_mandate(storage, creds.agent_did)
+    finally:
+        await storage.close()
+
+    assert reconstructed is not None
+    assert reconstructed.parent_did == parent_did
+    assert reconstructed.child_did == creds.agent_did
+    assert reconstructed.additional_constraints == {}
+    assert reconstructed.max_child_depth == 2
+
+
+@pytest.mark.asyncio
+async def test_reload_accepts_negative_ttl_for_persistent_child(tmp_path):
+    """Non-positive TTLs are the documented persistent-child sentinel."""
+
+    parent_private, _ = generate_secp256k1_keypair()
+    parent_did = "did:pkh:eip155:1:0xPersistentParent"
+    mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            purpose="persistent worker",
+            ttl_seconds=-1,
+        ),
+        parent_private,
+    )
+    creds = await create_kestrel_identity_async(
+        output_dir=str(tmp_path),
+        is_test_instance=True,
+        agent_name="PersistentChild",
+        parent_did=parent_did,
+        spawn_mandate=mandate,
+    )
+
+    storage = AsyncStorage(os.path.join(str(tmp_path), "kestrel_prime.db"))
+    await storage.initialize()
+    try:
+        reconstructed = await read_spawn_mandate(storage, creds.agent_did)
+    finally:
+        await storage.close()
+
+    assert reconstructed is not None
+    assert reconstructed.ttl_seconds == -1
+
+
+@pytest.mark.asyncio
+async def test_reload_refuses_ambiguous_spawn_authority(tmp_path):
+    """Database iteration order must never choose between two authority parents."""
+
+    parent_private, _ = generate_secp256k1_keypair()
+    first_parent = "did:pkh:eip155:1:0xParentOne"
+    mandate = sign_mandate(
+        SpawnMandate(parent_did=first_parent, purpose="ambiguous child"),
+        parent_private,
+    )
+    creds = await create_kestrel_identity_async(
+        output_dir=str(tmp_path),
+        is_test_instance=True,
+        agent_name="AmbiguousChild",
+        parent_did=first_parent,
+        spawn_mandate=mandate,
+    )
+    db_path = os.path.join(str(tmp_path), "kestrel_prime.db")
+    db = await AsyncDatabase.sqlite(db_path)
+    try:
+        graph = AsyncGraphStore(db, agent_id=creds.agent_did)
+        await graph.add_trusted_cross_agent_edge(
+            creds.agent_did,
+            "did:pkh:eip155:1:0xParentTwo",
+            "spawned_by",
+            properties={},
+        )
+    finally:
+        await db.close()
+
+    storage = AsyncStorage(db_path)
+    await storage.initialize()
+    try:
+        with pytest.raises(ValueError, match="ambiguous delegation authority"):
+            await read_spawn_mandate(storage, creds.agent_did)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_initialize_reattaches_enforcement_on_any_boot_path(tmp_path):
     """End-to-end: a spawned child booted directly via KestrelAgent.initialize()
     (the shared path used by single-agent server + CLI, not just AgentManager)
@@ -189,6 +298,7 @@ async def test_initialize_reattaches_enforcement_on_any_boot_path(tmp_path):
             parent_did=parent_did,
             purpose="scoped worker",
             ttl_seconds=999,
+            features_allowed=["RetiredOptionalFeature"],
             additional_constraints={"restricted_tools": [RESTRICTED_TOOL]},
         ),
         parent_private,
@@ -214,6 +324,12 @@ async def test_initialize_reattaches_enforcement_on_any_boot_path(tmp_path):
     assert agent.spawn_mandate.additional_constraints["restricted_tools"] == [
         RESTRICTED_TOOL
     ]
+    assert agent._persisted_spawn_mandate.features_allowed == [
+        "RetiredOptionalFeature"
+    ]
+    assert agent.spawn_mandate.features_allowed == []
+    valid, message = await agent._verify_spawn_mandate_constraints()
+    assert valid is True, message
 
 
 @pytest.mark.asyncio
