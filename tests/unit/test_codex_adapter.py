@@ -1815,8 +1815,6 @@ class TestToolExecutorBridge:
         ``item/reasoning/textDelta`` and ``item/reasoning/summaryTextDelta``,
         not the generic ``/reasoning/delta`` suffix the earlier code
         guessed at."""
-        from kestrel_sovereign.llm.adapter import ThinkingDelta
-
         events = [
             {"method": "item/reasoning/textDelta",
              "params": {"delta": "thinking-one"}},
