@@ -32,8 +32,8 @@ async def _backend(tmp_path):
     return db
 
 
-def _request(db):
-    agent = SimpleNamespace(_raw_storage=SimpleNamespace(db=db))
+def _request(db, did="a"):
+    agent = SimpleNamespace(did=did, _raw_storage=SimpleNamespace(db=db))
     return SimpleNamespace(state=SimpleNamespace(agent=agent))
 
 
@@ -76,6 +76,35 @@ async def test_endpoint_scopes_to_origin_session(tmp_path):
     assert (
         result["events"][0]["payload"]["origin_session_id"] == "session-A"
     )
+
+
+@pytest.mark.asyncio
+async def test_endpoint_scopes_shared_history_to_routed_agent(tmp_path):
+    db = await _backend(tmp_path)
+    await record_event(
+        db,
+        request_id="owner-request",
+        state="pending",
+        agent_id="did:test:owner",
+        payload={"reason": "owner detail"},
+    )
+    await record_event(
+        db,
+        request_id="other-request",
+        state="pending",
+        agent_id="did:test:other",
+        payload={"reason": "other private detail"},
+    )
+
+    result = await get_restart_status_events(
+        _request(db, did="did:test:owner"),
+        session="",
+        limit=200,
+    )
+
+    assert result["count"] == 1
+    assert result["events"][0]["request_id"] == "owner-request"
+    assert "other private detail" not in str(result)
 
 
 @pytest.mark.asyncio
