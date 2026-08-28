@@ -6,6 +6,10 @@ from enum import Enum
 from typing import Optional
 
 
+LOCAL_PEER_TRANSPORT_HEADER = "X-Kestrel-Peer-Transport"
+LOCAL_PEER_TRANSPORT_VALUE = "local-host-v1"
+
+
 class AuthMethod(str, Enum):
     """How the caller authenticated."""
     API_KEY = "api_key"
@@ -38,6 +42,16 @@ class CallerContext:
     @staticmethod
     def authenticated(identity: str, auth_method: AuthMethod = AuthMethod.OAUTH_SESSION) -> "CallerContext":
         return CallerContext(role=CallerRole.AUTHENTICATED, auth_method=auth_method, identity=identity)
+
+    @staticmethod
+    def local_peer_transport() -> "CallerContext":
+        """Authenticated same-host transport without sovereign authority."""
+
+        return CallerContext(
+            role=CallerRole.AUTHENTICATED,
+            auth_method=AuthMethod.INTERNAL,
+            identity="local_host_peer_transport",
+        )
 
     @staticmethod
     def anonymous() -> "CallerContext":

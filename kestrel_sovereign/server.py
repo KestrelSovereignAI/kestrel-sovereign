@@ -3014,7 +3014,12 @@ async def auth_middleware(request: Request, call_next):
     # authenticated (or deliberately unauthenticated) request stays OUTSIDE
     # it, so an unhandled downstream application fault keeps FastAPI's
     # 500 semantics instead of masquerading as a 401 (#2490).
-    from kestrel_sovereign.auth import CallerContext, AuthMethod
+    from kestrel_sovereign.auth import (
+        LOCAL_PEER_TRANSPORT_HEADER,
+        LOCAL_PEER_TRANSPORT_VALUE,
+        AuthMethod,
+        CallerContext,
+    )
 
     caller = None
     unauthenticated_root_dispatch = False
@@ -3024,7 +3029,13 @@ async def auth_middleware(request: Request, call_next):
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
-            caller = CallerContext.sovereign(AuthMethod.API_KEY)
+            if (
+                request.headers.get(LOCAL_PEER_TRANSPORT_HEADER)
+                == LOCAL_PEER_TRANSPORT_VALUE
+            ):
+                caller = CallerContext.local_peer_transport()
+            else:
+                caller = CallerContext.sovereign(AuthMethod.API_KEY)
 
         # Check Bearer token (API key OR JWT)
         if caller is None:

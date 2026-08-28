@@ -1087,6 +1087,15 @@ class RestartCoordinatorFeature(Feature):
                                 deferral_reason=handled.get("reason", ""),
                             )
                     continue
+                # The update is the longest awaited mutation in this path.
+                # Recheck the seal before any safety-state write: if the key
+                # rotated, trying to reseal a new deferral timestamp would
+                # lose its CAS and strand the row in ``updating`` forever.
+                if await self._reject_invalid_authority(
+                    req,
+                    expected_current_status="updating",
+                ):
+                    continue
                 # Re-run the safety gate before the restart now that the
                 # (possibly slow) update has completed.
                 req, decision = await self._evaluate_and_track_safety(req)
