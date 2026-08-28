@@ -127,12 +127,14 @@ class SovereignHostContext:
         backplane: Any = None,
         config: Any = None,
         session_factory: Optional[FleetSessionFactory] = None,
+        hold_store: Any = None,
         backend_error: str = "",
     ) -> None:
         self._db = db
         self._backplane = backplane
         self._config = config if config is not None else {}
         self._session_factory = session_factory
+        self._hold_store = hold_store
         self._backend_error = str(backend_error or "")
 
     @property
@@ -151,6 +153,12 @@ class SovereignHostContext:
     def session_factory(self) -> Optional[FleetSessionFactory]:
         """Fleet tenant-scoped session factory on the host backend."""
         return self._session_factory
+
+    @property
+    def hold_store(self) -> Any:
+        """Durable host/agent Hold latches on the host control backend."""
+
+        return self._hold_store
 
     @property
     def backend_error(self) -> str:
@@ -189,6 +197,7 @@ async def build_host_context(
     """
     db = None
     session_factory: Optional[FleetSessionFactory] = None
+    hold_store = None
     backend_error = ""
     try:
         from kestrel_sovereign.host_features.storage import (
@@ -203,6 +212,10 @@ async def build_host_context(
         validate_sqlite_family_private(resolved)
         inner = make_session_factory(db)
         session_factory = FleetSessionFactory(inner)
+        from kestrel_sovereign.hold import HoldStore
+
+        hold_store = HoldStore(db)
+        await hold_store.ensure_schema()
         logger.info(
             "Host backend opened at %s (fleet tenant=%s)", resolved, FLEET_TENANT_ID
         )
@@ -220,6 +233,7 @@ async def build_host_context(
             except Exception as close_exc:  # noqa: BLE001 - preserve degradation
                 logger.warning("Could not close partial host backend: %s", close_exc)
         session_factory = None
+        hold_store = None
         db = None
         backend_error = f"{type(exc).__name__}: {exc}"
         # ERROR, not warning: everything that depends on the host store is
@@ -232,6 +246,7 @@ async def build_host_context(
         backplane=None,
         config=config,
         session_factory=session_factory,
+        hold_store=hold_store,
         backend_error=backend_error,
     )
 
