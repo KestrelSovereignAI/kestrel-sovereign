@@ -40,6 +40,7 @@ from kestrel_sovereign.features.enum_coerce import normalize_choice as _normaliz
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.storage.database_clock import database_clock
 
+from .authority import RestartAuthorityError, verify_restart_authority
 from .event_store import (
     ensure_restart_status_events_table,
     list_recent_events_for_history,
@@ -493,7 +494,13 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="request_restart",
         description=(
-            "File a durable restart request. The host coordinator "
+            "File a sovereign-authorized durable whole-host restart request. "
+            "This tool succeeds only inside a turn authenticated by the "
+            "sovereign API key; agent identity, peer status, causation, and "
+            "generic ASK/AUTO approval do not confer this authority. The exact "
+            "operation/update bounds are sealed durably and re-verified by "
+            "the host coordinator. "
+            "The host coordinator "
             "evaluates safety and executes when conditions are met.\n\n"
             "urgency: one of low|normal|high|critical (default 'normal'); "
             "common synonyms are accepted ('medium'→normal, 'urgent'→high, "
@@ -617,22 +624,29 @@ class RestartCoordinatorFeature(Feature):
         # query/header value and is not the turn's routing authority.
         # CLI/system/session-less requests remain explicitly unbound.
         origin_session_id = self._turn_session_id() or ""
-        req = await insert_request(
-            self._db,
-            requested_by_agent=str(agent_id),
-            reason=reason.strip(),
-            urgency=urgency,
-            policy=policy,
-            desired_window=desired_window,
-            operation=operation,
-            update_repo_path=update_repo_path,
-            update_target_ref=update_target_ref,
-            update_profile=(update_profile if operation == "update_then_restart"
-                            else ""),
-            update_allow_migrations=bool(allow_migrations),
-            requester_request_id=str(requester_request_id),
-            origin_session_id=origin_session_id,
-        )
+        try:
+            req = await insert_request(
+                self._db,
+                requested_by_agent=str(agent_id),
+                reason=reason.strip(),
+                urgency=urgency,
+                policy=policy,
+                desired_window=desired_window,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=(
+                    update_profile if operation == "update_then_restart" else ""
+                ),
+                update_allow_migrations=bool(allow_migrations),
+                requester_request_id=str(requester_request_id),
+                origin_session_id=origin_session_id,
+            )
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error),
+                data={"created": False, "authority": "required"},
+            )
         logger.info(
             "Restart request filed: id=%s op=%s urgency=%s policy=%s "
             "profile=%s ref=%s reason=%s",
@@ -937,6 +951,15 @@ class RestartCoordinatorFeature(Feature):
         executed: List[Dict[str, Any]] = []
         deferred: List[Dict[str, Any]] = []
         for req in candidates:
+            # Reject unsigned legacy, forged, tampered, or key-revoked rows
+            # before policy/safety can defer them indefinitely. This is the
+            # explicit legacy migration policy: no authority backfill and no
+            # inference from historical approval state.
+            if await self._reject_invalid_authority(
+                req,
+                expected_current_status=req.status,
+            ):
+                continue
             req, decision = await self._evaluate_and_track_safety(req)
             if not decision["safe"]:
                 if decision.get("deferable", True):
@@ -969,6 +992,15 @@ class RestartCoordinatorFeature(Feature):
                 await self._emit_status_event(
                     req, state="rejected", status_reason=decision["reason"],
                 )
+                continue
+
+            # Safety checks can await fleet state. Re-verify immediately before
+            # crossing into update/execution so key rotation during that wait
+            # revokes the request before any host mutation begins.
+            if await self._reject_invalid_authority(
+                req,
+                expected_current_status=req.status,
+            ):
                 continue
 
             # Move out of the pending state BEFORE doing work. A plain
@@ -1134,6 +1166,17 @@ class RestartCoordinatorFeature(Feature):
                     )
                 await self._emit_status_event(req, state="executing")
 
+            # Re-verify at the actual restart boundary. This catches key
+            # rotation/revocation during safety waits or a long update and
+            # prevents a check/use split from turning stale evidence into a
+            # fleet-wide process interruption.
+            if await self._reject_invalid_authority(
+                req,
+                expected_current_status="executing",
+            ):
+                self._executing_since.pop(req.id, None)
+                continue
+
             try:
                 proc = self._spawn_restart_subprocess()
             except Exception as e:
@@ -1181,6 +1224,34 @@ class RestartCoordinatorFeature(Feature):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _reject_invalid_authority(
+        self,
+        req,
+        *,
+        expected_current_status: str,
+    ) -> bool:
+        """Reject a row unless its exact sovereign seal verifies right now."""
+
+        verified, reason = verify_restart_authority(req)
+        if verified:
+            return False
+        landed = await update_status(
+            self._db,
+            req.id,
+            status="rejected",
+            status_reason=f"authority denied: {reason}",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            expected_current_status=expected_current_status,
+        )
+        if landed:
+            fresh = await get_request(self._db, req.id)
+            await self._emit_status_event(
+                fresh or req,
+                state="rejected",
+                status_reason=f"authority denied: {reason}",
+            )
+        return True
 
     async def _emit_status_event(
         self,

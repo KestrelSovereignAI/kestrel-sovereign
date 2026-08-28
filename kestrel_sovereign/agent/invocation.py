@@ -20,6 +20,8 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, T
 from urllib.parse import quote, unquote_to_bytes
 import uuid
 
+from kestrel_sovereign.auth import caller_context_scope
+
 
 MAX_INVOCATION_ID_LENGTH = 256
 _HEADER_UNRESERVED = frozenset(
@@ -277,7 +279,9 @@ def bind_async_invocation(
             with invocation_scope(
                 bound.arguments.get(parameter),
                 provenance=bound.arguments.get("invocation_provenance"),
-            ) as invocation_id:
+            ) as invocation_id, caller_context_scope(
+                bound.arguments.get("caller")
+            ):
                 bound.arguments[parameter] = invocation_id
                 lifecycle_owner = args[0] if args else None
                 registered = False
@@ -500,7 +504,7 @@ def bind_async_generator_invocation(
                     with _exact_invocation_scope(
                         effective_id,
                         effective_provenance,
-                    ):
+                    ), caller_context_scope(bound.arguments.get("caller")):
                         try:
                             item = await anext(iterator)
                         except StopAsyncIteration:
@@ -512,7 +516,7 @@ def bind_async_generator_invocation(
                     with _exact_invocation_scope(
                         effective_id,
                         effective_provenance,
-                    ):
+                    ), caller_context_scope(bound.arguments.get("caller")):
                         await close_iterator()
 
         return wrapped

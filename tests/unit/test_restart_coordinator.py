@@ -28,9 +28,13 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
+)
+from kestrel_sovereign.features.restart_coordinator.authority import (
+    verify_restart_authority,
 )
 from kestrel_sovereign.features.restart_coordinator.event_store import (
     list_events_for_request,
@@ -138,7 +142,7 @@ def _track_test_database(db: AsyncDatabase) -> AsyncDatabase:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _close_test_owned_resources():
+async def _close_test_owned_resources(monkeypatch):
     """Model production ownership: stop wakes before closing their database.
 
     ``SignalDispatcher`` owns the dispatch task through the agent and the
@@ -149,21 +153,25 @@ async def _close_test_owned_resources():
     """
     _test_databases.clear()
     _real_dispatch_lifecycles.clear()
-    try:
-        yield
-    finally:
-        for feature, agent in reversed(_real_dispatch_lifecycles):
-            await feature.shutdown()
-            await agent.shutdown()
+    monkeypatch.setenv("KESTREL_API_KEY", "restart-authority-test-key")
+    with caller_context_scope(
+        CallerContext.sovereign(identity="test-sovereign")
+    ):
+        try:
+            yield
+        finally:
+            for feature, agent in reversed(_real_dispatch_lifecycles):
+                await feature.shutdown()
+                await agent.shutdown()
 
-        for database, connection in reversed(_test_databases):
-            await database.close()
-            assert not _sqlite_worker_is_alive(connection), (
-                "test-owned aiosqlite worker survived database shutdown"
-            )
+            for database, connection in reversed(_test_databases):
+                await database.close()
+                assert not _sqlite_worker_is_alive(connection), (
+                    "test-owned aiosqlite worker survived database shutdown"
+                )
 
-        _test_databases.clear()
-        _real_dispatch_lifecycles.clear()
+            _test_databases.clear()
+            _real_dispatch_lifecycles.clear()
 
 
 async def _backend(tmp_path):
@@ -576,6 +584,52 @@ async def test_request_restart_creates_pending_row(tmp_path):
     # Persisted to the table.
     rows = await list_requests(backend)
     assert any(r.id == req["id"] for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_request_restart_requires_sovereign_caller(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        absent = await feat.request_restart(reason="agent decided autonomously")
+    with caller_context_scope(CallerContext.authenticated("oauth@example.test")):
+        oauth = await feat.request_restart(reason="generic authenticated user")
+
+    assert absent.status is ToolResultStatus.ERROR
+    assert oauth.status is ToolResultStatus.ERROR
+    assert absent.data["created"] is False
+    assert oauth.data["created"] is False
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_request_restart_persists_exact_nonpublic_sovereign_evidence(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+
+    result = await feat.request_restart(reason="authorized host restart")
+    row = await get_request(backend, result.data["request"]["id"])
+
+    assert verify_restart_authority(row) == (
+        True,
+        "verified sovereign-key authority",
+    )
+    assert row.authority_evidence
+    assert row.authority_signature
+    assert "authority_signature" not in row.to_public_dict()
+
+
+@pytest.mark.asyncio
+async def test_request_restart_fails_without_stable_sovereign_key(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    result = await feat.request_restart(reason="cannot seal this")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "no stable sovereign key" in result.error
+    assert await list_requests(backend) == []
 
 
 @pytest.mark.asyncio
@@ -1221,6 +1275,146 @@ async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
         if event["request_id"] == req.id
     ]
     assert all(event["state"] != "escalated" for event in request_events)
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_unsigned_legacy_request(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at) VALUES (?, ?, ?, ?)",
+        ("legacy-unsigned", feat.agent.did, "old row", datetime.now(timezone.utc).isoformat()),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, "legacy-unsigned")
+    assert row.status == "rejected"
+    assert "unsigned legacy" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_unsigned_manual_row_instead_of_deferring(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, policy) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            "legacy-manual-unsigned",
+            feat.agent.did,
+            "old manual row",
+            datetime.now(timezone.utc).isoformat(),
+            "manual_only",
+        ),
+    )
+
+    await feat.restart_coordinator()
+
+    row = await get_request(backend, "legacy-manual-unsigned")
+    assert row.status == "rejected"
+    assert "unsigned legacy" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_tampered_signed_request_bounds(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="signed restart")
+    request_id = created.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET policy = ? WHERE id = ?",
+        ("allow_busy_after_timeout", request_id),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "do not match signed authority bounds" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_authority_revoked_by_sovereign_key_rotation(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="revoke before poll")
+    request_id = created.data["request"]["id"]
+    monkeypatch.setenv("KESTREL_API_KEY", "rotated-sovereign-key")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_reverifies_after_awaited_safety_check(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="rotate during safety")
+    request_id = created.data["request"]["id"]
+
+    async def rotate_key_during_safety(req):
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-safety")
+        return req, {"safe": True, "reason": "fleet idle"}
+
+    feat._evaluate_and_track_safety = rotate_key_during_safety
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+    events = await feat.list_restart_status_events()
+    assert all(
+        event["state"] != "executing"
+        for event in events.data["events"]
+        if event["request_id"] == request_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_executor_reverifies_at_restart_boundary(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="rotate at execution boundary")
+    request_id = created.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def rotate_after_execution_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "executing":
+            monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-spawn")
+
+    feat._emit_status_event = rotate_after_execution_transition
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
 
 
 @pytest.mark.asyncio
