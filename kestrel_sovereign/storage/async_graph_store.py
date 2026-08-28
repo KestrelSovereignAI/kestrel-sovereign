@@ -16,6 +16,7 @@ All code paths that persist ``created_at`` MUST use
 ``datetime.now(timezone.utc).isoformat()`` (or an equivalent that
 produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
+import hashlib
 import json
 import logging
 import re
@@ -474,6 +475,34 @@ async def lock_graph_nodes_for_update(
     if db.backend_type != "postgres":
         return unique_node_ids
 
+    # Row locks do not cover absent identifiers. Reanchor and other composed
+    # writers may be about to INSERT the complete set, so take transaction-
+    # scoped advisory locks first. Derive and sort the keys independently of
+    # caller order; the hash namespace keeps them separate from other advisory
+    # lock protocols in this database. Hash collisions only serialize unrelated
+    # graph IDs and cannot weaken correctness.
+    advisory_keys = sorted(
+        {
+            int.from_bytes(
+                hashlib.sha256(
+                    f"kestrel:graph-node:{node_id}".encode("utf-8")
+                ).digest()[:8],
+                "big",
+                signed=True,
+            )
+            for node_id in unique_node_ids
+        }
+    )
+    for start in range(0, len(advisory_keys), _DELETE_ID_BATCH):
+        batch = advisory_keys[start:start + _DELETE_ID_BATCH]
+        values = ", ".join("(?::bigint)" for _ in batch)
+        await db.fetchall(
+            "SELECT pg_advisory_xact_lock(lock_key) "
+            f"FROM (VALUES {values}) AS graph_locks(lock_key) "
+            "ORDER BY lock_key",
+            tuple(batch),
+        )
+
     for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
         batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
         placeholders = ", ".join("?" for _ in batch)
@@ -731,7 +760,7 @@ class AsyncGraphStore:
             (node.node_type, node.label), node.properties, node.node_id
         )
         async with self.db.transaction():
-            await _acquire_sqlite_graph_writer_slot(self.db)
+            await lock_graph_nodes_for_update(self.db, [node.node_id])
             # A compatible fleet-shared row adds only an ownership witness.
             # Lock the physical row before deciding that on PostgreSQL: final-
             # owner deletion locks the same row first, so it cannot delete the
@@ -1367,11 +1396,10 @@ class AsyncGraphStore:
         # deferred transaction because SQLite's nested transaction scope is a
         # no-op. Acquire explicitly before reading identity so the composed
         # public ``AsyncStorage.transaction()`` path remains serialized too.
-        await _acquire_sqlite_graph_writer_slot(self.db)
-        lock_suffix = " FOR UPDATE" if self.db.backend_type == "postgres" else ""
+        await lock_graph_nodes_for_update(self.db, [node_id])
         return await self.db.fetchone(
             "SELECT node_type, label FROM graph_nodes "
-            f"WHERE node_id = ? AND {scope}{lock_suffix}",
+            f"WHERE node_id = ? AND {scope}",
             (node_id, *scope_params),
         )
 
@@ -1619,7 +1647,15 @@ class AsyncGraphStore:
             )
             source_exists = bool(endpoint_rows and endpoint_rows[0])
             target_exists = bool(endpoint_rows and endpoint_rows[1])
-            if not source_exists or (not trusted_cross_agent and not target_exists):
+            # Ordinary edges always require a materialized target. A bound
+            # bootstrap writer may use a provisionally-reserved source: avatar
+            # and backup workflows establish that source ownership witness
+            # before the physical agent root exists. The ownership checks below
+            # validate the reservation atomically. Unbound maintenance writers
+            # have no such proof and must present a physical source too.
+            if (not trusted_cross_agent and not target_exists) or (
+                not source_exists and not requested_owner
+            ):
                 raise ValueError("Graph edge endpoints do not both exist")
 
             if requested_owner:

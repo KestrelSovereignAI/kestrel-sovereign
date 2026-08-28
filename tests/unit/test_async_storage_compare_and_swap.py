@@ -782,6 +782,35 @@ class TestEdgeAdmission:
             (source_id, target_id, "references"),
         ) is None
 
+    async def test_bound_edge_accepts_a_provisionally_reserved_source(
+        self, graph_store
+    ):
+        """Bootstrap may reserve the agent owner before creating its root."""
+
+        agent_id = f"agent:{uuid.uuid4().hex}"
+        target_id = _nid("bootstrap-target")
+        bound = AsyncGraphStore(graph_store.db, agent_id=agent_id)
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (agent_id, agent_id),
+        )
+        await bound.add_node(
+            _node(
+                target_id,
+                {"agent_id": agent_id},
+                node_type="owned",
+                label="Target",
+            )
+        )
+
+        await bound.add_edge(agent_id, target_id, "bootstrap")
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges "
+            "WHERE source_id = ? AND target_id = ? AND label = ?",
+            (agent_id, target_id, "bootstrap"),
+        ) is not None
+
 
 # =====================================================================
 # Facade + privacy wrapper (SQLite; proves the delegation chain is atomic)

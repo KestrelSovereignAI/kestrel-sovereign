@@ -957,10 +957,9 @@ async def test_a_dangling_governing_target_is_refused_not_committed(
     """The edge is not the record — the node it names is.
 
     A bound ``get_node`` returns None for a node with no ownership witness as
-    well as for one that does not exist, so a target can be skipped while its
-    edge still lands (``add_trusted_cross_agent_edge`` needs only the source).
-    That commits an agent whose ``constitution_hash`` points at nothing, and a
-    check that only counted edges would then call it healthy forever.
+    well as for one that does not exist. Ordinary edge admission now refuses a
+    missing target directly; the whole copy must still roll back rather than
+    committing an agent whose ``constitution_hash`` points at nothing.
     """
     creds, anchor = await _incept(tmp_path, name="Dangling Target Bird")
     runtime = await _fresh_runtime(tmp_path)
@@ -978,7 +977,7 @@ async def test_a_dangling_governing_target_is_refused_not_committed(
 
         monkeypatch.setattr(AsyncGraphStore, "add_node", _lose_the_document_row)
 
-        with pytest.raises(Exception, match="not readable in the runtime database"):
+        with pytest.raises(Exception, match="endpoints do not both exist"):
             await replicate_birth_record(
                 runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
             )

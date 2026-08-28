@@ -30,6 +30,7 @@ from .async_graph_store import (
     GraphNode,
     NodeDeleteResult,
     NodeSwapResult,
+    record_graph_node_owner,
 )
 from .async_assertion_store import (
     AsyncAssertionStore,
@@ -2930,6 +2931,14 @@ class AsyncStorage:
             label="Backup Artifact",
             properties=properties
         )
-        await self.add_node(backup_node)
-        await self.add_edge(agent_id, backup_node.node_id, "backup")
+        async with self.db.transaction():
+            # Backup can run before the physical agent root is materialized.
+            # Reserve its canonical self-owner exactly like avatar bootstrap,
+            # then use a bound graph writer so edge admission can distinguish
+            # this provisional source from an arbitrary missing endpoint.
+            graph = AsyncGraphStore(self.db, agent_id=agent_id)
+            await graph.lock_nodes_for_update([agent_id, backup_node.node_id])
+            await record_graph_node_owner(self.db, agent_id, agent_id)
+            await graph.add_node(backup_node)
+            await graph.add_edge(agent_id, backup_node.node_id, "backup")
         return backup_node.node_id

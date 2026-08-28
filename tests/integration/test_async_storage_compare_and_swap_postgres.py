@@ -597,3 +597,46 @@ async def test_edge_admission_waits_for_endpoint_delete_on_backend(
         "WHERE source_id = ? AND target_id = ? AND label = ?",
         (source_id, target_id, "references"),
     ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_complete_write_set_locks_absent_node_ids_on_backend(graph_store):
+    """Canonical prelocking serializes IDs before either row is inserted."""
+
+    first_id = _nid("absent-lock-a")
+    second_id = _nid("absent-lock-b")
+    first_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+    second_acquired = asyncio.Event()
+
+    async def first_writer():
+        async with graph_store.db.transaction():
+            await graph_store.lock_nodes_for_update([second_id, first_id])
+            first_acquired.set()
+            await release_first.wait()
+
+    async def second_writer():
+        async with graph_store.db.transaction():
+            await graph_store.lock_nodes_for_update([first_id, second_id])
+            second_acquired.set()
+
+    first = asyncio.create_task(first_writer())
+    second = None
+    try:
+        await asyncio.wait_for(first_acquired.wait(), timeout=5)
+        second = asyncio.create_task(second_writer())
+        await asyncio.sleep(0.1)
+        assert not second_acquired.is_set(), (
+            "a complete write-set prelock did not cover absent graph IDs"
+        )
+        release_first.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+        assert second_acquired.is_set()
+    finally:
+        release_first.set()
+        pending = [task for task in (first, second) if task is not None]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)

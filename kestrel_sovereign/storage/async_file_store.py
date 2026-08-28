@@ -312,6 +312,9 @@ class AsyncFileStore:
             # Some bootstrap/test callers store an avatar before the physical
             # agent root is inserted. The DID is still the canonical self-owner,
             # so reserve that witness; later root creation uses the same owner.
+            # Lock both possibly-absent IDs first so source deletion and another
+            # bootstrap writer observe the same canonical serialization order.
+            await graph.lock_nodes_for_update([agent_id, avatar_node_id])
             await record_graph_node_owner(self.db, agent_id, agent_id)
             await graph.add_node(
                 GraphNode(
