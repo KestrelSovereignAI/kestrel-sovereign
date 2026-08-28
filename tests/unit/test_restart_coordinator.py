@@ -924,8 +924,11 @@ def _attach_lifecycle(agent):
     agent._current_request_id = None
     agent._active_request_started_at = {}
     agent._cancelled_requests = set()
+    agent._pending_request_cancellations = {}
     for name in (
         "register_active_request",
+        "_prune_pending_request_cancellations",
+        "_consume_pending_request_cancellation",
         "prune_stale_active_requests",
         "active_request_ages",
         "_cleanup_cancelled_request",
