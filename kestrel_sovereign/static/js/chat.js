@@ -107,6 +107,14 @@ function unconfirmedStopAgents() {
     return currentState.unconfirmedStopAgents;
 }
 
+function unconfirmedStopRequestIds() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopRequestIds instanceof Map)) {
+        currentState.unconfirmedStopRequestIds = new Map();
+    }
+    return currentState.unconfirmedStopRequestIds;
+}
+
 function isAgentBusy(agentName) {
     return deps().state.waitingAgents.has(agentName)
         || unconfirmedStopAgents().has(agentName);
@@ -2616,7 +2624,12 @@ export async function stopAgent(agentName) {
         try { abortController.abort(); } catch (_) { /* noop */ }
     }
 
-    const requestId = deps().api.getCurrentStreamRequestId(agentName);
+    const retainedRequestIds = unconfirmedStopRequestIds();
+    let requestId = retainedRequestIds.get(agentName) || null;
+    if (!requestId) {
+        requestId = deps().api.getCurrentStreamRequestId(agentName);
+        if (requestId) retainedRequestIds.set(agentName, requestId);
+    }
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
@@ -2643,6 +2656,7 @@ export async function stopAgent(agentName) {
     }
 
     unconfirmedStopAgents().delete(agentName);
+    retainedRequestIds.delete(agentName);
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === deps().api.getHostAgent()) {

@@ -165,6 +165,10 @@ export const state = {
     // separate fail-closed latch until /stop confirms STOPPED or
     // ALREADY_COMPLETE; the aborted stream's finally may clear waitingAgents.
     unconfirmedStopAgents: new Set(),
+    // Preserve the exact turn boundary across failed Stop retries. The stream
+    // client's finally clears its live request-id projection after aborting,
+    // but a retry must never silently widen into an agent-wide Stop.
+    unconfirmedStopRequestIds: new Map(),
     conversations: [],
     showDecrypted: true,
     encryptedAtRest: false,

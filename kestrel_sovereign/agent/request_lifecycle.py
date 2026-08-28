@@ -328,22 +328,48 @@ class RequestLifecycleMixin:
             and isinstance(abandoned_counts, dict)
             and abandoned_key in abandoned_counts
         ):
+            abandoned_dispositions = getattr(
+                self,
+                "_abandoned_request_dispositions",
+                None,
+            )
+            if not isinstance(abandoned_dispositions, dict):
+                abandoned_dispositions = {}
+                self._abandoned_request_dispositions = abandoned_dispositions
+            prior_disposition = abandoned_dispositions.get(
+                abandoned_key,
+                RequestCompletionDisposition.COMPLETED,
+            )
+            if disposition is RequestCompletionDisposition.ABANDONED:
+                abandoned_dispositions[abandoned_key] = disposition
+            else:
+                abandoned_dispositions.setdefault(
+                    abandoned_key,
+                    prior_disposition,
+                )
             remaining = abandoned_counts[abandoned_key]
             if remaining > 1:
                 abandoned_counts[abandoned_key] = remaining - 1
                 return
             abandoned_counts.pop(abandoned_key, None)
+            final_disposition = abandoned_dispositions.pop(
+                abandoned_key,
+                disposition,
+            )
             if isinstance(tombstones, dict):
                 abandoned = tombstones.get(request_id)
                 if isinstance(abandoned, set):
-                    if disposition is RequestCompletionDisposition.COMPLETED:
+                    if (
+                        final_disposition
+                        is RequestCompletionDisposition.COMPLETED
+                    ):
                         abandoned.discard(generation)
                     if not abandoned:
                         tombstones.pop(request_id, None)
             self._release_cancelled_generation(request_id, generation)
             self._resolve_request_completion(
                 request_id,
-                disposition,
+                final_disposition,
                 generation=generation,
             )
             return

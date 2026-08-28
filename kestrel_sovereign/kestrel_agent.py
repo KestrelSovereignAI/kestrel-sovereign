@@ -85,7 +85,10 @@ from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin,
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
-from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
+)
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.signals import OrderedLockManager
@@ -1388,6 +1391,9 @@ class KestrelAgent(
         self._active_request_generations: dict[str, int] = {}
         self._next_request_generation = 0
         self._abandoned_request_generations: dict[str, set[int]] = {}
+        self._abandoned_request_dispositions: dict[
+            tuple[str, int], RequestCompletionDisposition
+        ] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}

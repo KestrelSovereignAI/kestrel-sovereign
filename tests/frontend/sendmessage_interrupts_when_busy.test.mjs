@@ -260,10 +260,13 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
 
     state.waitingAgents.add(agent);
     apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
-    apiModule.default.getCurrentStreamRequestId = () => 'prior-request';
+    let currentRequestId = 'prior-request';
+    apiModule.default.getCurrentStreamRequestId = () => currentRequestId;
     let stopAttempts = 0;
-    apiModule.default.stop = async () => {
+    const stoppedRequestIds = [];
+    apiModule.default.stop = async (requestId) => {
         stopAttempts += 1;
+        stoppedRequestIds.push(requestId);
         throw new Error('stop_not_confirmed');
     };
     let replacementStarted = false;
@@ -286,14 +289,18 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
     // busy marker, then retry Send. The unconfirmed-Stop latch must still
     // route this through Stop and refuse to open a replacement stream.
     state.waitingAgents.delete(agent);
+    currentRequestId = null;
     messageInput.value = 'still do not overlap';
     await sendMessage();
     assert.equal(stopAttempts, 2,
         'a retry while Stop is unconfirmed must retry Stop first');
     assert.equal(replacementStarted, false,
         'clearing waitingAgents must not bypass the unconfirmed-Stop latch');
+    assert.deepEqual(stoppedRequestIds, ['prior-request', 'prior-request'],
+        'a failed Stop retry must retain the original turn ID');
 
     state.unconfirmedStopAgents.delete(agent);
+    state.unconfirmedStopRequestIds.delete(agent);
 });
 
 

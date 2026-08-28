@@ -777,6 +777,44 @@ class TestAgentCancellation:
         assert "duplicate-stale" not in mock_agent._active_request_counts
         assert "duplicate-stale" not in mock_agent._abandoned_request_generations
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "dispositions",
+        [
+            ("abandoned", "completed"),
+            ("completed", "abandoned"),
+        ],
+    )
+    async def test_pruned_duplicate_preserves_worst_cleanup_disposition(
+        self,
+        mock_agent,
+        dispositions,
+    ):
+        """A later successful cleanup cannot erase an earlier failed one."""
+
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+        )
+
+        request_id = "duplicate-pruned-worst"
+        mock_agent.register_active_request(request_id)
+        mock_agent.register_active_request(request_id)
+        assert mock_agent.cancel_current_request(request_id) is True
+        mock_agent._active_request_started_at[request_id] -= 1000
+        assert mock_agent.prune_stale_active_requests(900) == [request_id]
+
+        for disposition in dispositions:
+            mock_agent._cleanup_cancelled_request(
+                request_id,
+                disposition=RequestCompletionDisposition(disposition),
+            )
+
+        assert (
+            await mock_agent.wait_for_request_completion(request_id)
+            is RequestCompletionDisposition.ABANDONED
+        )
+        assert mock_agent._abandoned_generations(request_id)
+
     def test_prune_removes_stale_request(self, mock_agent):
         """A request older than the window is pruned and returned."""
         mock_agent.register_active_request("stale")
