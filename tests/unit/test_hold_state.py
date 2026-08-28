@@ -11,6 +11,7 @@ from kestrel_sovereign.hold import (
     HoldDisposition,
     HoldIdempotencyConflict,
     HoldScope,
+    HoldStateError,
     HoldStore,
 )
 from kestrel_sovereign.hold.state import HoldCorruptStateError
@@ -260,6 +261,56 @@ async def test_corrupt_active_latch_fails_closed(hold_db, monkeypatch):
     )
     with pytest.raises(HoldCorruptStateError, match="active flag"):
         await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["set", "release"])
+async def test_mutations_preserve_typed_corrupt_state_error(
+    hold_db,
+    monkeypatch,
+    operation,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_read_latch_row",
+        AsyncMock(
+            return_value=(
+                "agent",
+                "did:agent:kite",
+                2,
+                "receipt",
+                "reason",
+                "actor",
+                "2026-08-28T00:00:00+00:00",
+                1,
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="active flag"):
+        if operation == "set":
+            await store.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="replace corrupt latch",
+                operation_id="corrupt-set",
+            )
+        else:
+            await store.release_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="release corrupt latch",
+                operation_id="corrupt-release",
+                expected_hold_receipt_id="receipt",
+            )
+
+
+def test_package_exports_shared_hold_state_error() -> None:
+    assert issubclass(HoldCorruptStateError, HoldStateError)
+    assert issubclass(HoldIdempotencyConflict, HoldStateError)
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from .state import (
     HoldReceipt,
     HoldScope,
     HoldState,
+    HoldStateError,
     HoldStore,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "HoldReceipt",
     "HoldScope",
     "HoldState",
+    "HoldStateError",
     "HoldStore",
 ]

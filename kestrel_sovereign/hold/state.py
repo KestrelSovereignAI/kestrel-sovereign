@@ -58,6 +58,19 @@ class HoldCorruptStateError(HoldStateError):
     """Persisted Hold state cannot be interpreted safely."""
 
 
+def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:
+    """Recover a typed Hold failure wrapped by a transaction backend."""
+
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, HoldStateError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
 @dataclass(frozen=True)
 class HoldState:
     scope: HoldScope
@@ -379,10 +392,11 @@ class HoldStore:
             )
         except Exception as exc:
             # AsyncDatabase deliberately wraps transaction-body exceptions.
-            # Idempotency conflict is part of this store's public contract, so
-            # preserve its type across that backend boundary.
-            if isinstance(exc.__cause__, HoldIdempotencyConflict):
-                raise exc.__cause__ from exc
+            # Every Hold domain failure is part of this store's public
+            # contract, so preserve its type across that backend boundary.
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
             raise
 
     async def _set_hold(
@@ -492,8 +506,9 @@ class HoldStore:
                 target_id=target_id,
             )
         except Exception as exc:
-            if isinstance(exc.__cause__, HoldIdempotencyConflict):
-                raise exc.__cause__ from exc
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
             raise
 
     async def _release_hold(
