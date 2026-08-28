@@ -213,10 +213,20 @@ async def test_list_recent_events_for_history_returns_newest_first(tmp_path):
             db, request_id="r1", state=state,
             agent_id="a", payload={"state": state},
         )
-    rows = await list_recent_events_for_history(db, limit=10)
+    rows = await list_recent_events_for_history(db, agent_id="a", limit=10)
     assert [r.state for r in rows] == [
         "completed", "executing", "deferred", "pending",
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_recent_events_for_history_requires_concrete_principal(
+    tmp_path,
+):
+    db = await _backend(tmp_path)
+
+    with pytest.raises(ValueError, match="durable agent principal"):
+        await list_recent_events_for_history(db, agent_id=" ", limit=10)
 
 
 @pytest.mark.asyncio
@@ -232,7 +242,7 @@ async def test_list_recent_events_since_paging(tmp_path):
     )
     # Page newer than ``first.created_at`` should only return ``second``.
     rows = await list_recent_events_for_history(
-        db, limit=10, since=first.created_at,
+        db, agent_id="a", limit=10, since=first.created_at,
     )
     assert len(rows) == 1
     assert rows[0].id == second.id

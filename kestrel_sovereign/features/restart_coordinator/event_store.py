@@ -219,31 +219,31 @@ async def list_events_for_request(
 async def list_recent_events_for_history(
     db,
     *,
+    agent_id: str,
     limit: int = 100,
     since: Optional[str] = None,
-    agent_id: Optional[str] = None,
 ) -> List[RestartStatusEvent]:
-    """Most-recent events for an optional durable agent principal.
+    """Most-recent events for one required durable agent principal.
 
     Used by chat-history reload to repaint the visible bubble trail.
     ``since`` is an ISO timestamp; rows newer than that are returned
     (lets the frontend page lazily through history).
     """
-    where = []
-    params: list[Any] = []
+    principal = str(agent_id).strip()
+    if not principal:
+        raise ValueError("agent_id must identify a durable agent principal")
+
+    where = ["agent_id = ?"]
+    params: list[Any] = [principal]
     if since is not None:
         where.append("created_at > ?")
         params.append(str(since))
-    if agent_id is not None:
-        where.append("agent_id = ?")
-        params.append(str(agent_id))
     sql = (
         "SELECT id, request_id, state, agent_id, operation, urgency, "
         "policy, dedupe_signature, payload_json, created_at "
         "FROM restart_status_events"
     )
-    if where:
-        sql += " WHERE " + " AND ".join(where)
+    sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(int(limit))
     rows = await db.fetchall(sql, tuple(params))
