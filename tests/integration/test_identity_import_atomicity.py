@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -19,7 +20,10 @@ from kestrel_sovereign.identity.identity_package import (
 )
 from kestrel_sovereign.identity.importer import IdentityImporter
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db import TransactionError
 from kestrel_sovereign.storage.async_graph_store import (
+    AsyncGraphStore,
+    GraphNode,
     record_graph_edge_owner,
     record_graph_node_owner,
 )
@@ -450,8 +454,110 @@ async def test_replace_prelocks_complete_graph_cleanup_write_set(
 
         assert len(lock_calls) == 1
         assert set(lock_calls[0]) == {
+            inventory.agent_id,
             inventory.old_user_node,
             inventory.old_skill_node,
+        }
+    finally:
+        await _cleanup(db, inventory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_replace_refuses_component_added_between_snapshot_and_source_lock(
+    db_backend, monkeypatch
+):
+    """Replace cannot report success from a stale graph-component snapshot."""
+
+    db = await _database(db_backend)
+    if db.backend_type != "postgres":
+        await db.close()
+        pytest.skip("PostgreSQL permits the concurrent writer interleaving")
+
+    inventory = await _seed_old_inventory(db)
+    concurrent_node = f"{inventory.agent_id[:20]}_concurrent-user"
+    original_lock = importer_module.lock_graph_nodes_for_update
+    raced = False
+
+    async def add_component_before_lock(database, node_ids, *, agent_id=""):
+        nonlocal raced
+        if not raced:
+            raced = True
+
+            async def write_component():
+                writer = AsyncGraphStore(
+                    database, agent_id=inventory.agent_id
+                )
+                await writer.add_node(
+                    GraphNode(concurrent_node, "user", "Concurrent user", {})
+                )
+                await writer.add_edge(
+                    inventory.agent_id, concurrent_node, "knows"
+                )
+
+            await asyncio.create_task(write_component())
+        return await original_lock(database, node_ids, agent_id=agent_id)
+
+    monkeypatch.setattr(
+        importer_module,
+        "lock_graph_nodes_for_update",
+        add_component_before_lock,
+    )
+
+    try:
+        with pytest.raises(
+            TransactionError, match="component membership changed"
+        ):
+            async with db.transaction():
+                await IdentityImporter(db)._clear_existing_data(
+                    inventory.agent_id
+                )
+    finally:
+        await _cleanup(db, inventory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_merge_prelocks_complete_import_graph_write_set(
+    db_backend, monkeypatch
+):
+    """Direct import upserts inherit one complete graph reservation set."""
+
+    db = await _database(db_backend)
+    inventory = await _seed_old_inventory(db)
+    package = _replacement_package(inventory.agent_id)
+    lock_calls: list[tuple[str, ...]] = []
+    original_lock = importer_module.lock_graph_nodes_for_update
+
+    async def observe_lock(database, node_ids, *, agent_id=""):
+        materialized = tuple(node_ids)
+        lock_calls.append(materialized)
+        return await original_lock(
+            database, materialized, agent_id=agent_id
+        )
+
+    monkeypatch.setattr(
+        importer_module, "lock_graph_nodes_for_update", observe_lock
+    )
+
+    try:
+        result = await IdentityImporter(
+            db, target_agent_id=inventory.agent_id
+        ).import_package(
+            package,
+            verify_signature=False,
+            verify_constitution=False,
+            allow_unsigned=True,
+            merge_mode="merge",
+        )
+
+        assert result.success is True
+        assert len(lock_calls) == 1
+        assert set(lock_calls[0]) == {
+            inventory.agent_id,
+            namespace_imported_graph_node(inventory.agent_id, "new-user"),
+            namespace_imported_graph_node(inventory.agent_id, "new-skill"),
+            result.migration_id,
         }
     finally:
         await _cleanup(db, inventory)

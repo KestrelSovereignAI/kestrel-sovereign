@@ -34,6 +34,7 @@ from kestrel_sovereign.storage.async_graph_store import (
     GraphNode,
     NodeSwapResult,
     release_graph_node_owners,
+    reserve_provisional_agent_owner,
 )
 
 
@@ -975,3 +976,32 @@ async def test_postgres_reverse_incremental_shard_order_is_rejected_before_wait(
         asyncio.gather(high_then_low(), low_then_high()), timeout=5
     )
     assert results == ["rejected", "acquired"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_provisional_owner_adopts_valid_ownerless_agent_root(graph_store):
+    """Legacy agent roots reach validation before their self-owner is repaired."""
+
+    agent_id = _nid("ownerless-agent-root")
+    await graph_store.db.execute(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+        "VALUES (?, 'agent', 'Legacy agent', ?)",
+        (agent_id, '{"agent_id": "' + agent_id + '"}'),
+    )
+
+    try:
+        async with graph_store.db.transaction():
+            await reserve_provisional_agent_owner(graph_store.db, agent_id)
+
+        assert await graph_store.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            (agent_id,),
+        ) == [(agent_id,)]
+    finally:
+        await graph_store.db.execute(
+            "DELETE FROM graph_node_owners WHERE node_id = ?", (agent_id,)
+        )
+        await graph_store.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ?", (agent_id,)
+        )

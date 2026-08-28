@@ -371,7 +371,11 @@ async def reserve_provisional_agent_owner(
 
     if not agent_id:
         raise ValueError("Provisional agent ownership requires an agent_id")
-    await lock_graph_nodes_for_update(db, [agent_id], agent_id=agent_id)
+    # This infrastructure repair is deliberately privileged: an ownerless
+    # legacy root is invisible to a bound graph scope, but must be row-locked
+    # before it can be validated and given its canonical self-owner. The checks
+    # below still refuse every foreign owner and every non-agent collision.
+    await lock_graph_nodes_for_update(db, [agent_id])
     root = await db.fetchone(
         "SELECT node_type, properties FROM graph_nodes WHERE node_id = ?",
         (agent_id,),

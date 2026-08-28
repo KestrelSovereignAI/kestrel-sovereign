@@ -371,6 +371,9 @@ class IdentityImporter:
 
         # 3. Begin import
         migration_id = create_migration_id()
+        graph_write_ids = self._package_graph_write_ids(
+            agent_id, package, migration_id
+        )
 
         component = "transaction setup"
         try:
@@ -379,7 +382,17 @@ class IdentityImporter:
             async with self.db.transaction():
                 if merge_mode == "replace":
                     component = "replace cleanup"
-                    await self._clear_existing_data(agent_id)
+                    await self._clear_existing_data(
+                        agent_id,
+                        additional_graph_node_ids=graph_write_ids,
+                    )
+                else:
+                    # Merge/skip-existing writes graph rows directly below.
+                    # Reserve their complete set, including the shared source
+                    # and migration receipt, before the first identity read.
+                    await lock_graph_nodes_for_update(
+                        self.db, graph_write_ids, agent_id=agent_id
+                    )
 
                 component = "memory episodes"
                 await self._import_episodes(agent_id, package.episodes)
@@ -596,14 +609,34 @@ class IdentityImporter:
             return parsed
         return original if isinstance(original, str) else parsed.isoformat()
 
-    async def _clear_existing_data(self, agent_id: str):
-        """Clear the exact importer-owned inventory for replace mode."""
-        for table in self.REPLACE_ROW_TABLES:
-            await self.db.execute(
-                f"DELETE FROM {table} WHERE agent_id = ?",
-                (agent_id,),
-            )
+    def _package_graph_write_ids(
+        self,
+        agent_id: str,
+        package: AgentIdentityPackage,
+        migration_id: str,
+    ) -> tuple[str, ...]:
+        """Return the complete graph-node set written by one import."""
 
+        node_ids = [agent_id, migration_id]
+        for index, raw_record in enumerate(package.relationships):
+            record = self._record_dict(raw_record, "relationships", index)
+            node_ids.append(
+                self._namespace_node_id(agent_id, record["user_id"])
+            )
+        for index, raw_record in enumerate(package.skills):
+            record = self._record_dict(raw_record, "skills", index)
+            node_ids.append(
+                self._namespace_node_id(agent_id, record["skill_id"])
+            )
+        return tuple(dict.fromkeys(node_ids))
+
+    async def _clear_existing_data(
+        self,
+        agent_id: str,
+        *,
+        additional_graph_node_ids: Iterable[str] = (),
+    ):
+        """Clear the exact importer-owned inventory for replace mode."""
         user_node_ids = await self._graph_component_node_ids(agent_id, "user")
         skill_node_ids = await self._graph_component_node_ids(
             agent_id, "skill", label="has_skill"
@@ -614,9 +647,41 @@ class IdentityImporter:
         # retain one advisory lock while waiting for the other.
         await lock_graph_nodes_for_update(
             self.db,
-            (*user_node_ids, *skill_node_ids),
+            (
+                agent_id,
+                *user_node_ids,
+                *skill_node_ids,
+                *additional_graph_node_ids,
+            ),
             agent_id=agent_id,
         )
+
+        # Edge admission locks the source agent row in the same transaction as
+        # its target. Once the lock above returns, no later component edge can
+        # commit; re-reading therefore detects any writer that landed between
+        # the optimistic snapshots and source-lock acquisition. Refuse/retry
+        # instead of reporting a successful replace with stale rows retained.
+        locked_user_node_ids = await self._graph_component_node_ids(
+            agent_id, "user"
+        )
+        locked_skill_node_ids = await self._graph_component_node_ids(
+            agent_id, "skill", label="has_skill"
+        )
+        if (
+            set(locked_user_node_ids) != set(user_node_ids)
+            or set(locked_skill_node_ids) != set(skill_node_ids)
+        ):
+            raise RuntimeError(
+                "Importer graph component membership changed while acquiring "
+                "the source lock; retry replace"
+            )
+
+        for table in self.REPLACE_ROW_TABLES:
+            await self.db.execute(
+                f"DELETE FROM {table} WHERE agent_id = ?",
+                (agent_id,),
+            )
+
         await self._clear_graph_component(
             agent_id, "user", prelocked_node_ids=user_node_ids
         )
@@ -674,9 +739,20 @@ class IdentityImporter:
             # Graph writers take graph rows before ownership witnesses. Lock
             # the complete component before removing any edge witness;
             # release_graph_node_owners follows this order too.
-            node_ids = await lock_graph_nodes_for_update(
-                self.db, discovered_node_ids, agent_id=agent_id
+            await lock_graph_nodes_for_update(
+                self.db,
+                (agent_id, *discovered_node_ids),
+                agent_id=agent_id,
             )
+            locked_node_ids = await self._graph_component_node_ids(
+                agent_id, node_type, label=label
+            )
+            if set(locked_node_ids) != set(discovered_node_ids):
+                raise RuntimeError(
+                    "Importer graph component membership changed while "
+                    "acquiring the source lock; retry cleanup"
+                )
+            node_ids = discovered_node_ids
         else:
             node_ids = tuple(prelocked_node_ids)
 

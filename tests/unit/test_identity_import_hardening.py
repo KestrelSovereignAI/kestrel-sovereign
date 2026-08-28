@@ -118,7 +118,7 @@ async def test_replace_cleanup_locks_graph_before_removing_edge_ownership(
         agent_id, "skill", label="has_skill"
     )
 
-    assert events[0] == ("graph-lock", (skill_id,))
+    assert events[0] == ("graph-lock", (agent_id, skill_id))
     assert events[1][0] == "edge-owner-delete"
 
 
