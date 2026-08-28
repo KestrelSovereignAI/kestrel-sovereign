@@ -162,6 +162,12 @@ async def test_same_actor_cancel_retry_returns_existing_receipt_once(tmp_path):
             "cancellation_receipt"
         ]
         assert len(retry.history or []) == history_count
+        feature_retry = await _feature(manager, "did:test:creator").cancel_task(
+            "idempotent",
+            reason="a newer reason that was never persisted",
+        )
+        assert feature_retry.status is ToolResultStatus.OK
+        assert feature_retry.data["reason"] == "withdrawn"
         with pytest.raises(ValueError, match="Invalid state transition"):
             await manager.cancel_task(
                 "idempotent",
@@ -169,6 +175,34 @@ async def test_same_actor_cancel_retry_returns_existing_receipt_once(tmp_path):
                 agent_name="did:test:recipient",
                 recipient_agent_id="did:test:recipient",
             )
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_artifact_append_cannot_mutate_an_authoritatively_canceled_task(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "artifact-after-cancel.db"))
+    try:
+        await manager.create_task(
+            _params("artifact-after-cancel"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "artifact-after-cancel",
+            reason="work withdrawn",
+            agent_name="did:test:creator",
+        )
+
+        with pytest.raises(ValueError, match="terminal task"):
+            await manager.add_artifact(
+                "artifact-after-cancel",
+                Artifact(name="late", parts=[TextPart(text="must not land")]),
+            )
+
+        canceled = await manager.get_task("artifact-after-cancel")
+        assert canceled.status.state is TaskState.CANCELED
+        assert not canceled.artifacts
     finally:
         await manager.close()
 
@@ -1013,7 +1047,10 @@ async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
             return_value={
                 "id": "outbound-task",
                 "status": "canceled",
-                "cancellation_receipt": {"status_before": "working"},
+                "cancellation_receipt": {
+                    "status_before": "working",
+                    "reason": "durable original reason",
+                },
             }
         )
     )
@@ -1051,6 +1088,7 @@ async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
     result = await feature.cancel_task("outbound-task", reason="withdrawn")
 
     assert result.status is ToolResultStatus.OK
+    assert result.data["reason"] == "durable original reason"
     payload = router.cancel_a2a_task.await_args.args[3]
     assert payload["metadata"] == {
         "sender": "creator",

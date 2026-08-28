@@ -511,27 +511,61 @@ class TaskStore(UnifiedStoreBase):
         return await self.get(task_id)
 
     async def add_artifact(self, task_id: str, artifact: Artifact) -> None:
-        """Add artifact to task (transactional to prevent concurrent write races)."""
-        async with self._backend.transaction():
-            # Get current artifacts inside transaction
+        """Append an artifact without crossing a terminal-state transition.
+
+        Cancellation may merge a handler's partial payload into this same JSON
+        column.  The artifact writer therefore takes the same row lock (or the
+        SQLite immediate-writer lease) and predicates its update on a live
+        status.  Whichever operation wins first is preserved: cancellation
+        sees an already-appended artifact, or the later append is refused.
+        """
+
+        transaction = (
+            self._backend.transaction(immediate=True)
+            if self.is_sqlite
+            else self._backend.transaction()
+        )
+        terminal_status: Optional[str] = None
+        update_conflict = False
+        async with transaction:
+            lock_suffix = " FOR UPDATE" if self.is_postgres else ""
             row = await self._backend.fetch_one(
-                "SELECT artifacts FROM a2a_tasks WHERE id = ?",
+                "SELECT artifacts, status FROM a2a_tasks "
+                f"WHERE id = ?{lock_suffix}",
                 (task_id,),
             )
             if not row:
                 raise ValueError(f"Task not found: {task_id}")
+            if row[1] not in {
+                TaskState.SUBMITTED.value,
+                TaskState.WORKING.value,
+                TaskState.INPUT_REQUIRED.value,
+            }:
+                terminal_status = str(row[1])
+            else:
+                artifacts = (
+                    list(row[0])
+                    if isinstance(row[0], list)
+                    else json_loads(row[0]) or []
+                )
+                artifacts.append(artifact.model_dump())
 
-            artifacts = json_loads(row[0]) or []
-            artifacts.append(artifact.model_dump())
-
-            await self._backend.execute(
-                f"""
-                UPDATE a2a_tasks
-                SET artifacts = ?, updated_at = {self.now_sql()}
-                WHERE id = ?
-                """,
-                (json_dumps(artifacts), task_id),
+                rows_affected = await self._backend.execute(
+                    f"""
+                    UPDATE a2a_tasks
+                    SET artifacts = ?, updated_at = {self.now_sql()}
+                    WHERE id = ?
+                      AND status IN ('submitted', 'working', 'input-required')
+                    """,
+                    (json_dumps(artifacts), task_id),
+                )
+                update_conflict = rows_affected != 1
+        if terminal_status is not None:
+            raise ValueError(
+                f"Cannot add artifact to terminal task {task_id}: {terminal_status}"
             )
+        if update_conflict:
+            raise ValueError(f"Cannot add artifact to terminal task {task_id}")
 
     async def list_tasks(
         self,

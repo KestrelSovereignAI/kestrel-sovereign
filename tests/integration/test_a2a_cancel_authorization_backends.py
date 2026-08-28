@@ -1,5 +1,6 @@
 """SQLite/PostgreSQL parity for atomic A2A cancellation authority (#3134)."""
 
+import asyncio
 import os
 from uuid import uuid4
 
@@ -27,6 +28,7 @@ POSTGRES_URL = (
 async def _exercise_authorized_cancel(store: TaskStore) -> None:
     task_id = f"cancel-auth-{uuid4().hex}"
     payload_task_id = f"cancel-payload-{uuid4().hex}"
+    artifact_race_task_id = f"cancel-artifact-race-{uuid4().hex}"
     creator = f"did:test:creator:{uuid4().hex}"
     recipient = f"did:test:recipient:{uuid4().hex}"
     try:
@@ -127,9 +129,42 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
         ]
         assert "concurrent" in merged_history
         assert "handler" in merged_history
+
+        await store.save(
+            Task(
+                id=artifact_race_task_id,
+                status=TaskStatus(state=TaskState.WORKING),
+            ),
+            creator_agent_id=creator,
+            recipient_agent_id=recipient,
+        )
+        racing_artifact = Artifact(
+            name="racing-artifact",
+            parts=[TextPart(text="keep if append won")],
+        )
+        append_result, cancel_result = await asyncio.gather(
+            store.add_artifact(artifact_race_task_id, racing_artifact),
+            store.cancel_if_authorized(
+                artifact_race_task_id,
+                actor_agent_id=creator,
+                reason="raced artifact production",
+            ),
+            return_exceptions=True,
+        )
+        assert cancel_result is not None and not isinstance(cancel_result, Exception)
+        raced = await store.get(artifact_race_task_id)
+        assert raced.status.state is TaskState.CANCELED
+        if isinstance(append_result, Exception):
+            assert "terminal task" in str(append_result)
+            assert not raced.artifacts
+        else:
+            assert [artifact.name for artifact in raced.artifacts] == [
+                "racing-artifact"
+            ]
     finally:
         await store.delete(task_id)
         await store.delete(payload_task_id)
+        await store.delete(artifact_race_task_id)
 
 
 @pytest.mark.asyncio

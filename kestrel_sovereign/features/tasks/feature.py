@@ -1357,6 +1357,7 @@ class TaskFeature(Feature):
 
         receipt = (task.metadata or {}).get("cancellation_receipt") or {}
         current_state = receipt.get("status_before")
+        durable_reason = receipt.get("reason")
 
         return ToolResult.ok(
             confirmation=f"Cancelled task {task_id[:8]} (was: {current_state})",
@@ -1364,6 +1365,6 @@ class TaskFeature(Feature):
                 "task_id": task_id,
                 "status": "canceled",
                 "status_before": current_state,
-                "reason": reason,
+                "reason": durable_reason,
             },
         )

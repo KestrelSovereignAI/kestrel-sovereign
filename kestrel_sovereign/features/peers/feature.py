@@ -2073,6 +2073,7 @@ class PeersFeature(Feature):
                 "Peer returned an invalid cancellation receipt",
                 data={"task_id": task_id},
             )
+        durable_reason = receipt.get("reason", reason_text)
 
         try:
             from kestrel_sovereign.a2a.outbound_store import (
@@ -2121,7 +2122,7 @@ class PeersFeature(Feature):
                     "task_id": task_id,
                     "status": "canceled",
                     "status_before": receipt["status_before"],
-                    "reason": reason_text,
+                    "reason": durable_reason,
                 },
             )
         return ToolResult.ok(
@@ -2130,7 +2131,7 @@ class PeersFeature(Feature):
                 "task_id": task_id,
                 "status": "canceled",
                 "status_before": receipt["status_before"],
-                "reason": reason_text,
+                "reason": durable_reason,
             },
         )
 
