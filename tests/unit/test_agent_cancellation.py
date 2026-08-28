@@ -34,6 +34,7 @@ class TestAgentCancellation:
         agent.wait_for_request_completion = KestrelAgent.wait_for_request_completion.__get__(agent)
         agent._resolve_request_completion = KestrelAgent._resolve_request_completion.__get__(agent)
         agent._cleanup_cancelled_request = KestrelAgent._cleanup_cancelled_request.__get__(agent)
+        agent._release_cancelled_generation = KestrelAgent._release_cancelled_generation.__get__(agent)
         agent.active_request_ages = KestrelAgent.active_request_ages.__get__(agent)
         agent.prune_stale_active_requests = KestrelAgent.prune_stale_active_requests.__get__(agent)
 
@@ -721,6 +722,59 @@ class TestAgentCancellation:
         assert "retry-id" not in mock_agent._active_request_ids
         assert "retry-id" not in mock_agent._active_request_started_at
         assert "retry-id" not in mock_agent._cancelled_requests
+
+    @pytest.mark.asyncio
+    async def test_duplicate_cleanup_preserves_worst_abandoned_disposition(
+        self,
+        mock_agent,
+    ):
+        """One failed delivery makes shared-lifecycle completion unconfirmed."""
+
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+        )
+
+        mock_agent.register_active_request("duplicate-abandoned")
+        mock_agent.register_active_request("duplicate-abandoned")
+        assert mock_agent.cancel_current_request("duplicate-abandoned") is True
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("duplicate-abandoned")
+        )
+        await asyncio.sleep(0)
+
+        mock_agent._cleanup_cancelled_request(
+            "duplicate-abandoned",
+            disposition=RequestCompletionDisposition.ABANDONED,
+        )
+        assert not waiter.done()
+        mock_agent._cleanup_cancelled_request("duplicate-abandoned")
+
+        assert await waiter is RequestCompletionDisposition.ABANDONED
+
+    def test_pruned_duplicate_retains_cancel_until_every_delivery_exits(
+        self,
+        mock_agent,
+    ):
+        """A stale prune cannot let one retry clear its live sibling's Stop."""
+
+        mock_agent.register_active_request("duplicate-stale")
+        mock_agent.register_active_request("duplicate-stale")
+        assert mock_agent.cancel_current_request("duplicate-stale") is True
+        mock_agent._active_request_started_at["duplicate-stale"] -= 1000
+
+        assert mock_agent.prune_stale_active_requests(900) == ["duplicate-stale"]
+        mock_agent._cleanup_cancelled_request("duplicate-stale")
+
+        generation = next(
+            iter(mock_agent._abandoned_request_generations["duplicate-stale"])
+        )
+        assert mock_agent._abandoned_request_counts[
+            ("duplicate-stale", generation)
+        ] == 1
+        assert mock_agent.is_request_cancelled("duplicate-stale") is True
+
+        mock_agent._cleanup_cancelled_request("duplicate-stale")
+        assert "duplicate-stale" not in mock_agent._active_request_counts
 
     def test_prune_removes_stale_request(self, mock_agent):
         """A request older than the window is pruned and returned."""

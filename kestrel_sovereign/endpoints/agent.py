@@ -882,6 +882,9 @@ async def stop_agent_request(request: Request):
             actor_id = f"local-operator:{agent_id}"
 
         active_turns = set(getattr(agent, "_active_request_ids", set()) or set())
+        abandoned_turns = getattr(agent, "_abandoned_request_generations", None)
+        if isinstance(abandoned_turns, dict):
+            active_turns.update(abandoned_turns)
         current_turn = getattr(agent, "_current_request_id", None)
         if isinstance(current_turn, str) and current_turn:
             active_turns.add(current_turn)

@@ -662,6 +662,38 @@ async def test_live_stop_stale_prune_is_unreachable_not_stopped() -> None:
     assert "long-turn" in agent._cancelled_requests
 
 
+def test_agent_wide_stop_includes_pruned_unconfirmed_turns() -> None:
+    """Bodyless Stop must pull every abandoned generation's andon cord."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+
+    class LiveAgent(RequestLifecycleMixin):
+        agent_id = "did:test:long-running-agent"
+
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    agent = LiveAgent()
+    agent.register_active_request("pruned-turn")
+    agent._active_request_started_at["pruned-turn"] -= 1000
+    assert agent.prune_stale_active_requests(900) == ["pruned-turn"]
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
+    assert "pruned-turn" in agent._cancelled_requests
+
+
 def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
     from kestrel_sovereign.endpoints.agent import router
 

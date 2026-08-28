@@ -256,6 +256,50 @@ class RequestLifecycleMixin:
             if isinstance(active_generations, dict)
             else None
         )
+        tombstones = getattr(self, "_abandoned_request_generations", None)
+        if (
+            generation is not None
+            and disposition is RequestCompletionDisposition.ABANDONED
+        ):
+            if not isinstance(tombstones, dict):
+                tombstones = {}
+                self._abandoned_request_generations = tombstones
+            tombstones.setdefault(request_id, set()).add(generation)
+        generation_is_abandoned = (
+            generation is not None
+            and isinstance(tombstones, dict)
+            and generation in tombstones.get(request_id, set())
+        )
+        effective_disposition = (
+            RequestCompletionDisposition.ABANDONED
+            if generation_is_abandoned
+            else disposition
+        )
+
+        # Pruning removes an aged generation from the active projection so a
+        # redelivery of the same request ID receives a fresh generation.  Its
+        # still-running delivery count lives here until every old endpoint
+        # finally exits; no one old delivery may clear the shared Stop marker.
+        abandoned_counts = getattr(self, "_abandoned_request_counts", None)
+        abandoned_key = (request_id, generation)
+        if (
+            generation is not None
+            and isinstance(abandoned_counts, dict)
+            and abandoned_key in abandoned_counts
+        ):
+            remaining = abandoned_counts[abandoned_key]
+            if remaining > 1:
+                abandoned_counts[abandoned_key] = remaining - 1
+                return
+            abandoned_counts.pop(abandoned_key, None)
+            self._release_cancelled_generation(request_id, generation)
+            self._resolve_request_completion(
+                request_id,
+                effective_disposition,
+                generation=generation,
+            )
+            return
+
         cleans_active_generation = (
             generation is not None and generation == active_generation
         ) or (generation is None and active_generation is None)
@@ -276,19 +320,37 @@ class RequestLifecycleMixin:
         started = getattr(self, "_active_request_started_at", None)
         if cleans_active_generation and started is not None:
             started.pop(request_id, None)
-        tombstones = getattr(self, "_abandoned_request_generations", None)
         if generation is not None:
-            if disposition is RequestCompletionDisposition.ABANDONED:
-                if not isinstance(tombstones, dict):
-                    tombstones = {}
-                    self._abandoned_request_generations = tombstones
-                tombstones.setdefault(request_id, set()).add(generation)
-            elif isinstance(tombstones, dict):
+            if (
+                effective_disposition is RequestCompletionDisposition.COMPLETED
+                and isinstance(tombstones, dict)
+            ):
                 abandoned = tombstones.get(request_id)
                 if isinstance(abandoned, set):
                     abandoned.discard(generation)
                     if not abandoned:
                         tombstones.pop(request_id, None)
+        self._release_cancelled_generation(request_id, generation)
+        if cleans_active_generation and self._current_request_id == request_id:
+            self._current_request_id = (
+                next(iter(active_request_ids), None)
+                if active_request_ids
+                else None
+            )
+        if cleans_active_generation:
+            self._resolve_request_completion(
+                request_id,
+                effective_disposition,
+                generation=generation,
+            )
+
+    def _release_cancelled_generation(
+        self,
+        request_id: str,
+        generation: int | None,
+    ) -> None:
+        """Forget one completed generation without clearing live siblings."""
+
         cancelled_generations = getattr(
             self,
             "_cancelled_request_generations",
@@ -300,14 +362,6 @@ class RequestLifecycleMixin:
                 self._cancelled_requests.discard(request_id)
         else:
             self._cancelled_requests.discard(request_id)
-        if cleans_active_generation and self._current_request_id == request_id:
-            self._current_request_id = next(iter(active_request_ids), None) if active_request_ids else None
-        if cleans_active_generation:
-            self._resolve_request_completion(
-                request_id,
-                disposition,
-                generation=generation,
-            )
 
     def active_request_ages(self) -> Dict[str, float]:
         """Return ``{request_id: age_seconds}`` for each active request.
@@ -377,8 +431,18 @@ class RequestLifecycleMixin:
                 tombstones = {}
                 self._abandoned_request_generations = tombstones
             tombstones.setdefault(rid, set()).add(generation)
-            active.discard(rid)
             counts = getattr(self, "_active_request_counts", None)
+            delivery_count = (
+                counts.get(rid, 1)
+                if isinstance(counts, dict)
+                else 1
+            )
+            abandoned_counts = getattr(self, "_abandoned_request_counts", None)
+            if not isinstance(abandoned_counts, dict):
+                abandoned_counts = {}
+                self._abandoned_request_counts = abandoned_counts
+            abandoned_counts[(rid, generation)] = max(1, delivery_count)
+            active.discard(rid)
             if isinstance(counts, dict):
                 counts.pop(rid, None)
             if isinstance(generations, dict):
