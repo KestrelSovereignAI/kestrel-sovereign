@@ -45,6 +45,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerRequester,
     PeerSelfTargetError,
     PeerSubscriptionUnavailableError,
+    PeerTaskConflictError,
     PeerTransportError,
     PeerUnavailableError,
     iter_sse_events,
@@ -2032,6 +2033,11 @@ class PeersFeature(Feature):
             return ToolResult.failed(
                 "Task cancellation is not authorized",
                 data={"task_id": task_id},
+            )
+        except PeerTaskConflictError:
+            return ToolResult.failed(
+                "Task cancellation conflicts with the recipient's terminal state",
+                data={"task_id": task_id, "error_type": "lifecycle_conflict"},
             )
         except PeerTransportError:
             return ToolResult.failed(

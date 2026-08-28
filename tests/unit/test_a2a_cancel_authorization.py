@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kestrel_sdk.hooks.base import HookEvent, HookOutput, PermissionDecision
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.a2a.task_manager import (
     TaskCancellationAuthorizationError,
@@ -18,6 +19,7 @@ from kestrel_sovereign.a2a.agent_card import (
     AgentSkill,
 )
 from kestrel_sovereign.a2a.types import (
+    Artifact,
     Message,
     Task,
     TaskStatus,
@@ -26,7 +28,11 @@ from kestrel_sovereign.a2a.types import (
     TextPart,
 )
 from kestrel_sovereign.features.tasks.feature import TaskFeature
-from kestrel_sovereign.features.peers.directory import PeerIdentity, PeerRequester
+from kestrel_sovereign.features.peers.directory import (
+    PeerIdentity,
+    PeerRequester,
+    PeerTaskConflictError,
+)
 from kestrel_sovereign.features.peers.feature import PeersFeature
 
 
@@ -566,6 +572,13 @@ async def test_async_handler_cancellation_emits_one_terminal_notification(tmp_pa
         name = "canceling"
 
         async def handle_task(self, task):
+            task.artifacts = [
+                Artifact(name="partial", parts=[TextPart(text="partial output")])
+            ]
+            task.metadata["handler_state"] = "declined_after_partial_work"
+            task.history.append(
+                Message(role="agent", parts=[TextPart(text="Partial work retained")])
+            )
             task.status = TaskStatus(
                 state=TaskState.CANCELED,
                 message=Message(
@@ -602,8 +615,80 @@ async def test_async_handler_cancellation_emits_one_terminal_notification(tmp_pa
         )
         await manager.drain_execution_tasks()
 
-        assert (await manager.get_task(task.id)).status.state is TaskState.CANCELED
+        persisted = await manager.get_task(task.id)
+        assert persisted.status.state is TaskState.CANCELED
+        assert persisted.artifacts[0].name == "partial"
+        assert persisted.metadata["handler_state"] == "declined_after_partial_work"
+        assert [part.text for message in persisted.history for part in message.parts] == [
+            "Execute canceling-skill on canceling-agent",
+            "Partial work retained",
+            "Task canceled by did:test:host: Handler declined",
+        ]
         completion.assert_called_once()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_handler_cancellation_runs_post_hook_with_durable_payload(tmp_path):
+    host_did = "did:test:host"
+    manager = await create_task_manager(
+        str(tmp_path / "sync-handler-cancel.db"), host_agent_id=host_did
+    )
+
+    class CancelingHandler:
+        name = "canceling"
+
+        async def handle_task(self, task):
+            task.artifacts = [
+                Artifact(name="partial", parts=[TextPart(text="partial output")])
+            ]
+            task.metadata["handler_state"] = "canceled"
+            task.status = TaskStatus(
+                state=TaskState.CANCELED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="Handler declined")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    hooks = SimpleNamespace(
+        execute_hooks=AsyncMock(
+            return_value=HookOutput(permission_decision=PermissionDecision.ALLOW)
+        ),
+        execute_hooks_parallel=AsyncMock(),
+    )
+    manager.hooks_manager = hooks
+    manager.register_agent(
+        AgentCard(
+            name="canceling-agent",
+            url="/agents/canceling-agent",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="canceling-skill",
+                    name="canceling-skill",
+                    description="cancel",
+                )
+            ],
+        ),
+        CancelingHandler(),
+    )
+    try:
+        result = await manager.execute_skill(
+            "canceling-agent", "canceling-skill", {}, sync=True
+        )
+
+        assert result.status.state is TaskState.CANCELED
+        assert result.artifacts[0].name == "partial"
+        assert result.metadata["handler_state"] == "canceled"
+        hooks.execute_hooks_parallel.assert_awaited_once()
+        assert hooks.execute_hooks_parallel.await_args.args[0] is HookEvent.POST_TOOL_USE
     finally:
         await manager.close()
 
@@ -689,6 +774,51 @@ async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
         task_id="outbound-task",
         terminal_state="canceled",
     )
+
+
+@pytest.mark.asyncio
+async def test_outbound_cancel_reports_lifecycle_conflict_not_transport(monkeypatch):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:creator", identity=None)
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "creator"
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                recipient="Recipient",
+                recipient_agent_id="did:test:recipient",
+                route_state=outbound_store.ROUTE_STATE_ROUTABLE,
+            )
+        ),
+    )
+    router = SimpleNamespace(
+        cancel_a2a_task=AsyncMock(
+            side_effect=PeerTaskConflictError("already terminal")
+        )
+    )
+    peers._resolve_retained_automatic_peer = AsyncMock(
+        return_value=(
+            router,
+            PeerRequester(actor.did, object()),
+            PeerIdentity(
+                agent_id="did:test:recipient",
+                slug="recipient",
+                routing_key="recipient-route",
+            ),
+        )
+    )
+    peers._maybe_sign_outbound = MagicMock()
+
+    result = await peers.cancel_outbound_task("outbound-task")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["error_type"] == "lifecycle_conflict"
+    assert "terminal state" in result.error
 
 
 @pytest.mark.asyncio

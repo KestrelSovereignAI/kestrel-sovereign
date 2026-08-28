@@ -397,29 +397,31 @@ class TaskManager:
             # Execute synchronously with transaction safety
             task = await handler.handle_task(task)
             if task.status.state is TaskState.CANCELED:
-                return await self.cancel_task(
+                task = await self.cancel_task(
                     task.id,
                     reason=self._cancellation_reason(task),
                     agent_name=authority_agent_id,
+                    task_payload=task,
                 )
-            saved: Optional[bool] = None
-            try:
-                async with self.task_store._backend.transaction():
-                    saved = await self.task_store.save(task)
-            except Exception as save_err:
-                logger.error(
-                    f"Failed to save completed task {task.id}: {save_err}. "
-                    "Retrying outside transaction..."
-                )
+            else:
+                saved: Optional[bool] = None
                 try:
-                    saved = await self.task_store.save(task)
-                except Exception as retry_err:
-                    logger.critical(
-                        f"Task {task.id} completed but save failed permanently: {retry_err}. "
-                        f"Result lost for skill={skill_id}, agent={agent_id}"
+                    async with self.task_store._backend.transaction():
+                        saved = await self.task_store.save(task)
+                except Exception as save_err:
+                    logger.error(
+                        f"Failed to save completed task {task.id}: {save_err}. "
+                        "Retrying outside transaction..."
                     )
-            if saved is False:
-                task = await self.task_store.get(task.id) or task
+                    try:
+                        saved = await self.task_store.save(task)
+                    except Exception as retry_err:
+                        logger.critical(
+                            f"Task {task.id} completed but save failed permanently: {retry_err}. "
+                            f"Result lost for skill={skill_id}, agent={agent_id}"
+                        )
+                if saved is False:
+                    task = await self.task_store.get(task.id) or task
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
@@ -569,6 +571,7 @@ class TaskManager:
                     task.id,
                     reason=self._cancellation_reason(task),
                     agent_name=authority_agent_id,
+                    task_payload=task,
                 ),
                 False,
             )
@@ -984,6 +987,7 @@ class TaskManager:
         task_id: str,
         reason: Optional[str] = None,
         agent_name: Optional[str] = None,
+        task_payload: Optional[Task] = None,
     ) -> Task:
         """
         Cancel a task.
@@ -993,6 +997,9 @@ class TaskManager:
             reason: Optional cancellation reason
             agent_name: Durable DID of the agent performing the cancellation.
                 Display names and causation metadata are not authority.
+            task_payload: Optional canceled handler result whose artifacts,
+                history, and non-authority metadata must commit atomically with
+                the authorized terminal transition.
 
         Returns:
             Updated Task object
@@ -1002,11 +1009,13 @@ class TaskManager:
                 "Task cancellation requires a concrete agent identity"
             )
 
-        task = await self.task_store.cancel_if_authorized(
-            task_id,
-            actor_agent_id=agent_name,
-            reason=reason,
-        )
+        cancel_kwargs = {
+            "actor_agent_id": agent_name,
+            "reason": reason,
+        }
+        if task_payload is not None:
+            cancel_kwargs["task_payload"] = task_payload
+        task = await self.task_store.cancel_if_authorized(task_id, **cancel_kwargs)
         if task is None:
             current = await self.task_store.get(task_id)
             if current is None:

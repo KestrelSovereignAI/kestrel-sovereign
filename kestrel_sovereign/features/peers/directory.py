@@ -51,6 +51,10 @@ class PeerTransportError(PeerDirectoryError):
     """The transport failed without a peer authorization decision."""
 
 
+class PeerTaskConflictError(PeerDirectoryError):
+    """The peer rejected a task operation because its lifecycle already won."""
+
+
 class PeerProtocolError(PeerDirectoryError):
     """A router or peer returned an invalid protocol payload."""
 
@@ -278,6 +282,10 @@ class LocalHostPeerDirectory:
             raise PeerUnavailableError("Peer is unavailable")
         if status_code in (401, 403):
             raise PeerAccessDeniedError("Peer operation is not authorized")
+        if status_code == 409:
+            raise PeerTaskConflictError(
+                "Peer task state conflicts with the requested operation"
+            )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

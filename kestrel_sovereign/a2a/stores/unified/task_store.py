@@ -285,6 +285,7 @@ class TaskStore(UnifiedStoreBase):
         *,
         actor_agent_id: str,
         reason: Optional[str] = None,
+        task_payload: Optional[Task] = None,
     ) -> Optional[Task]:
         """Atomically cancel one live task owned by or delegated to ``actor``.
 
@@ -297,6 +298,13 @@ class TaskStore(UnifiedStoreBase):
         """
         if not isinstance(actor_agent_id, str) or not actor_agent_id:
             raise ValueError("Cancellation actor must be a concrete agent identity")
+        if task_payload is not None and (
+            task_payload.id != task_id
+            or task_payload.status.state is not TaskState.CANCELED
+        ):
+            raise ValueError(
+                "Cancellation payload must be the canceled form of the same task"
+            )
 
         message = Message(
             role="agent",
@@ -313,21 +321,36 @@ class TaskStore(UnifiedStoreBase):
                 )
             ],
         )
-        if self.is_postgres:
-            history_assignment = "history = COALESCE(history, '[]'::jsonb) || ?::jsonb,"
-            history_value = json_dumps([message.model_dump()])
+        if task_payload is not None:
+            payload_metadata = dict(task_payload.metadata or {})
+            payload_metadata.pop("cancellation_receipt", None)
+            history = [item.model_dump() for item in (task_payload.history or [])]
+            history.append(message.model_dump())
+            payload_assignment = "artifacts = ?, history = ?, metadata = ?,"
+            payload_values = (
+                json_dumps(
+                    [artifact.model_dump() for artifact in (task_payload.artifacts or [])]
+                ),
+                json_dumps(history),
+                json_dumps(payload_metadata),
+            )
+        elif self.is_postgres:
+            payload_assignment = (
+                "history = COALESCE(history, '[]'::jsonb) || ?::jsonb,"
+            )
+            payload_values = (json_dumps([message.model_dump()]),)
         else:
-            history_assignment = (
+            payload_assignment = (
                 "history = json_insert(COALESCE(history, '[]'), '$[#]', json(?)),"
             )
-            history_value = message.model_dump_json()
+            payload_values = (message.model_dump_json(),)
         rows_affected = await self._backend.execute(
             f"""
             UPDATE a2a_tasks
             SET cancel_previous_status = status,
                 status = 'canceled',
                 message = ?,
-                {history_assignment}
+                {payload_assignment}
                 canceled_by = ?,
                 cancel_reason = ?,
                 updated_at = {self.now_sql()}
@@ -337,7 +360,7 @@ class TaskStore(UnifiedStoreBase):
             """,
             (
                 message.model_dump_json(),
-                history_value,
+                *payload_values,
                 actor_agent_id,
                 reason,
                 task_id,
