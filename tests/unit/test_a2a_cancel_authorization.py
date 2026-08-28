@@ -383,6 +383,53 @@ async def test_cancellation_suppresses_an_already_queued_submission_wake(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_recipient_decline_does_not_cancel_its_current_dispatch(tmp_path):
+    """The signal-driven decline must finish projection and return normally."""
+
+    manager = await create_task_manager(str(tmp_path / "self-decline.db"))
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+        def __init__(self):
+            self._a2a_submitted_signal_handles = {}
+
+    recipient = Recipient()
+    manager._on_task_cancelled = recipient._on_task_cancelled
+    manager._project_status_transition = AsyncMock()
+    try:
+        created = await manager.create_task(
+            _params("self-decline"),
+            agent_name=recipient.did,
+            creator_agent_id="did:test:creator",
+        )
+
+        async def decline_inside_dispatch():
+            current = asyncio.current_task()
+            recipient._a2a_submitted_signal_handles[created.id] = (
+                SimpleNamespace(task=current)
+            )
+            result = await manager.cancel_task(
+                created.id,
+                reason="recipient cannot continue",
+                agent_name=recipient.did,
+            )
+            # This await is where the old callback injected CancelledError.
+            await asyncio.sleep(0)
+            return result
+
+        dispatch = asyncio.create_task(decline_inside_dispatch())
+        result = await asyncio.wait_for(dispatch, timeout=1)
+
+        assert result.status.state is TaskState.CANCELED
+        assert dispatch.cancelled() is False
+        manager._project_status_transition.assert_awaited_once()
+        assert created.id not in recipient._a2a_submitted_signal_handles
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_post_registration_gate_does_not_cancel_working_dispatch(tmp_path):
     """A legitimate SUBMITTED→WORKING transition is not cancellation."""
 

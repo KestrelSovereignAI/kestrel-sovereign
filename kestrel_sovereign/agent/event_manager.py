@@ -5,6 +5,7 @@ Extracted from kestrel_agent.py — provides SSE event emission,
 listener management, and background task notification queuing.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -500,7 +501,17 @@ class EventManagerMixin:
         pending = vars(self).get("_a2a_submitted_signal_handles", {})
         handle = pending.pop(task_id, None)
         dispatch_task = getattr(handle, "task", None)
-        if dispatch_task is not None and not dispatch_task.done():
+        # A recipient may decline from inside the cognition dispatch that this
+        # very handle represents. Cancelling it here would interrupt
+        # TaskManager.cancel_task at its next await, after the durable state
+        # transition but before status projection and the tool response. Only
+        # suppress a queued/different delivery; the current dispatch is already
+        # consuming the cancellation and must finish publishing it.
+        if (
+            dispatch_task is not None
+            and dispatch_task is not asyncio.current_task()
+            and not dispatch_task.done()
+        ):
             dispatch_task.cancel()
 
     def get_pending_notifications(self) -> List[str]:
