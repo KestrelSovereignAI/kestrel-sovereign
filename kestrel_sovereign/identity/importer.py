@@ -604,17 +604,35 @@ class IdentityImporter:
                 (agent_id,),
             )
 
-        await self._clear_graph_component(agent_id, "user")
-        await self._clear_graph_component(agent_id, "skill", label="has_skill")
+        user_node_ids = await self._graph_component_node_ids(agent_id, "user")
+        skill_node_ids = await self._graph_component_node_ids(
+            agent_id, "skill", label="has_skill"
+        )
+        # Replace holds one outer transaction. Acquire its complete graph
+        # cleanup write set in the same global order as whole-agent purge,
+        # before removing either component, so the two operations cannot each
+        # retain one advisory lock while waiting for the other.
+        await lock_graph_nodes_for_update(
+            self.db, (*user_node_ids, *skill_node_ids)
+        )
+        await self._clear_graph_component(
+            agent_id, "user", prelocked_node_ids=user_node_ids
+        )
+        await self._clear_graph_component(
+            agent_id,
+            "skill",
+            label="has_skill",
+            prelocked_node_ids=skill_node_ids,
+        )
 
-    async def _clear_graph_component(
+    async def _graph_component_node_ids(
         self,
         agent_id: str,
         node_type: str,
         *,
         label: Optional[str] = None,
-    ) -> None:
-        """Remove this agent's component edges and reclaim orphaned nodes."""
+    ) -> tuple[str, ...]:
+        """Return nodes in an importer-owned graph component."""
         query = (
             "SELECT DISTINCT gn.node_id FROM graph_nodes gn "
             "JOIN graph_edges ge ON gn.node_id = ge.target_id "
@@ -636,12 +654,29 @@ class IdentityImporter:
             query += " AND ge.label = ?"
             query_params += (label,)
         rows = await self.db.fetchall(query, query_params)
-        # Graph writers take graph rows before ownership witnesses. Lock the
-        # entire component in the same order before removing any edge witness;
-        # release_graph_node_owners follows this order too.
-        node_ids = await lock_graph_nodes_for_update(
-            self.db, (row[0] for row in rows)
-        )
+        return tuple(row[0] for row in rows)
+
+    async def _clear_graph_component(
+        self,
+        agent_id: str,
+        node_type: str,
+        *,
+        label: Optional[str] = None,
+        prelocked_node_ids: Optional[Iterable[str]] = None,
+    ) -> None:
+        """Remove this agent's component edges and reclaim orphaned nodes."""
+        if prelocked_node_ids is None:
+            discovered_node_ids = await self._graph_component_node_ids(
+                agent_id, node_type, label=label
+            )
+            # Graph writers take graph rows before ownership witnesses. Lock
+            # the complete component before removing any edge witness;
+            # release_graph_node_owners follows this order too.
+            node_ids = await lock_graph_nodes_for_update(
+                self.db, discovered_node_ids
+            )
+        else:
+            node_ids = tuple(prelocked_node_ids)
 
         for node_id in node_ids:
             delete_condition = "source_id = ? AND target_id = ?"

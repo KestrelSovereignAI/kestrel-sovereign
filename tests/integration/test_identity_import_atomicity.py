@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from kestrel_sovereign.identity import importer as importer_module
 from kestrel_sovereign.identity.graph_namespace import (
     namespace_imported_graph_node,
     namespace_imported_record,
@@ -418,6 +419,38 @@ async def test_replace_exact_inventory_and_preserves_audit_nodes(db_backend):
             (inventory.other_agent_id,),
         )
         assert other[0] == "other episode"
+    finally:
+        await _cleanup(db, inventory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_replace_prelocks_complete_graph_cleanup_write_set(
+    db_backend, monkeypatch
+):
+    """Replace cleanup cannot invert graph locks against whole-agent purge."""
+    db = await _database(db_backend)
+    inventory = await _seed_old_inventory(db)
+    lock_calls: list[tuple[str, ...]] = []
+    original_lock = importer_module.lock_graph_nodes_for_update
+
+    async def observe_lock(database, node_ids):
+        materialized = tuple(node_ids)
+        lock_calls.append(materialized)
+        return await original_lock(database, materialized)
+
+    monkeypatch.setattr(
+        importer_module, "lock_graph_nodes_for_update", observe_lock
+    )
+
+    try:
+        await IdentityImporter(db)._clear_existing_data(inventory.agent_id)
+
+        assert len(lock_calls) == 1
+        assert set(lock_calls[0]) == {
+            inventory.old_user_node,
+            inventory.old_skill_node,
+        }
     finally:
         await _cleanup(db, inventory)
 
