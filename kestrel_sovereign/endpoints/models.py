@@ -200,6 +200,10 @@ async def get_agents(request: Request):
     can render a DEMO MODE banner — the browser-side defence in #868.
     """
     server_demo_mode = bool(getattr(request.app.state, "demo_mode", False))
+    caller = get_caller(request)
+    can_manage_host_lifecycle = (
+        getattr(caller, "is_sovereign", False) is True
+    )
 
     def _is_demo(a) -> bool:
         return getattr(a, "is_demo", False) is True
@@ -244,7 +248,8 @@ async def get_agents(request: Request):
             # POST /api/agents works on this in-process manager. Keep the
             # capability explicit so older clients can safely treat absence as
             # false instead of attempting a route the host may not expose.
-            "can_create_agents": True,
+            "can_create_agents": can_manage_host_lifecycle,
+            "can_delete_agents": can_manage_host_lifecycle,
         }
 
     # Single-agent mode
@@ -260,6 +265,7 @@ async def get_agents(request: Request):
             "mode": "standalone",
             "server_demo_mode": server_demo_mode,
             "can_create_agents": False,
+            "can_delete_agents": False,
         }
     except HTTPException:
         raise

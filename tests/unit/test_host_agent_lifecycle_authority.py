@@ -119,3 +119,23 @@ def test_read_only_agent_discovery_does_not_inherit_mutation_gate():
 
     assert response.status_code == 200
     assert response.json()["mode"] == "multi_agent"
+
+
+@pytest.mark.parametrize(
+    ("authority", "expected"),
+    [("oauth", False), ("jwt", False), ("api-key", True)],
+)
+def test_agent_discovery_advertises_caller_scoped_lifecycle_authority(
+    authority,
+    expected,
+):
+    app, _manager = _app()
+
+    response = TestClient(app).get(
+        "/api/agents",
+        headers={"x-test-authority": authority},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["can_create_agents"] is expected
+    assert response.json()["can_delete_agents"] is expected

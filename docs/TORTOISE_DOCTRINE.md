@@ -105,17 +105,19 @@ axes, and code must name which one it is consulting:
 - **Causation** is the runtime `CausationFrame` chain: who caused this work.
   It crosses peers and supports attribution, loop control, and observability.
   It is never a permission.
-- **Authority** is a verified, parent-signed durable lineage receipt (the
-  spawn mandate): who may govern a descendant. It flows downward only and is
-  never inferred from runtime context. The durable `spawned_by` graph edge is
-  unsigned attribution today; it is evidence for routing and discovery. The
-  graph is not authority unless a verified receipt corroborates it.
+- **Authority** is intended to be a verified, parent-signed durable lineage
+  receipt: who may govern a descendant. It flows downward only and is never
+  inferred from runtime context. Today the signed spawn mandate is ephemeral
+  and the durable `spawned_by` graph edge is unsigned attribution. Until the
+  signed receipt is durably persisted and re-verified, the graph is evidence
+  for routing and discovery—not sufficient authority for descendant governance.
 
 Consequently, `CausationFrame`, the display-derived `kestrel.orchestrator`
 projection, and A2A task metadata may explain or render a relationship but may
-not authorize an action. Descendant governance must verify the parent's signed
-lineage receipt and its consistency with the durable `spawned_by` graph rather
-than trusting the graph edge alone, a display edge, cached ancestry, or a
+not authorize an action. The target invariant is that descendant governance
+verifies the parent's signed durable lineage receipt and its consistency with
+the durable `spawned_by` graph. A path that cannot do so must fail closed rather
+than trust the graph edge alone, a display edge, cached ancestry, or a
 caller-supplied claim.
 
 A capability available to every agent is not a third axis. Peer Stop, for

@@ -615,6 +615,15 @@ export function createApiClient({
         // map existed the frontend pane never learned its durable
         // session id and stayed anchored on null indefinitely.
         effectiveSessionIds: new Map(),
+        // Caller-scoped host lifecycle authority learned from the most recent
+        // authenticated /api/agents response. These are reset before every
+        // refresh, so a failed request or auth change fails closed instead of
+        // retaining a prior sovereign session's controls.
+        hostLifecycleAuthority: {
+            classified: false,
+            create: false,
+            delete: false,
+        },
         // Cached double-submit CSRF token for host-scoped state-changing
         // requests (#2293). Fetched lazily from GET /api/host/csrf (which also
         // sets the matching cookie) and reused for the page's lifetime. Only
@@ -789,7 +798,24 @@ export function createApiClient({
 
         health: () => client.request('/health'),
         getAgentInfo: () => client.request('/api/agent/info'),
-        getAgents: () => client.request('/api/agents'),
+        async getAgents() {
+            state.hostLifecycleAuthority = {
+                classified: false,
+                create: false,
+                delete: false,
+            };
+            const data = await client.request('/api/agents');
+            state.hostLifecycleAuthority = {
+                classified: true,
+                create: data.can_create_agents === true,
+                delete: data.can_delete_agents === true,
+            };
+            return data;
+        },
+        canManageHostAgentLifecycle(operation) {
+            const authority = state.hostLifecycleAuthority;
+            return authority.classified === true && authority[operation] === true;
+        },
         // Create a fresh top-level (parentless) agent (#2351) — the
         // multi-agent manager's ``POST /api/agents`` (see
         // endpoints/models.py::create_agent). Runs inception + load and returns
