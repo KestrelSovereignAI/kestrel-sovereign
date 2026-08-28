@@ -269,11 +269,13 @@ async def test_cancel_task_does_not_trust_stale_or_spoofed_sender_metadata(tmp_p
 
 @pytest.mark.asyncio
 async def test_task_creation_strips_sender_authored_cancellation_receipt(tmp_path):
-    """Only the atomic cancellation transition may persist its receipt."""
+    """Only the atomic transition may publish or persist its receipt."""
 
     manager = await create_task_manager(str(tmp_path / "forged-receipt.db"))
     try:
-        await manager.create_task(
+        submitted = []
+        manager._on_task_submitted = submitted.append
+        created = await manager.create_task(
             _params(
                 "forged-receipt",
                 metadata={
@@ -289,10 +291,47 @@ async def test_task_creation_strips_sender_authored_cancellation_receipt(tmp_pat
             creator_agent_id="did:test:creator",
         )
 
+        assert "cancellation_receipt" not in (created.metadata or {})
+        assert len(submitted) == 1
+        assert "cancellation_receipt" not in (submitted[0].metadata or {})
         persisted = await manager.get_task("forged-receipt")
         assert persisted.status.state is TaskState.SUBMITTED
         assert "cancellation_receipt" not in (persisted.metadata or {})
         assert persisted.metadata["sender"] == "did:test:creator"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
+    """Rows without durable receipt columns cannot retain old metadata claims."""
+
+    manager = await create_task_manager(str(tmp_path / "legacy-forged-receipt.db"))
+    try:
+        await manager.task_store._backend.execute(
+            """
+            INSERT INTO a2a_tasks (
+                id, task_type, status, metadata,
+                creator_agent_id, recipient_agent_id,
+                canceled_by, cancel_reason, cancel_previous_status
+            ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (
+                "legacy-forged-receipt",
+                "generic",
+                "canceled",
+                '{"cancellation_receipt":{"actor_agent_id":"did:test:evil",'
+                '"reason":"forged","status_before":"working"}}',
+            ),
+        )
+
+        legacy = await manager.get_task("legacy-forged-receipt")
+        assert "cancellation_receipt" not in (legacy.metadata or {})
+        with pytest.raises(ValueError, match="Invalid state transition"):
+            await manager.cancel_task(
+                "legacy-forged-receipt",
+                agent_name="did:test:evil",
+            )
     finally:
         await manager.close()
 

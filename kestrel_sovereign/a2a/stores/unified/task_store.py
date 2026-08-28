@@ -6,6 +6,7 @@ Works with both SQLite and PostgreSQL backends.
 """
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -28,6 +29,16 @@ class TaskAlreadyExistsError(ValueError):
     """A caller attempted to create a second task under an occupied ID."""
 
 
+def without_reserved_cancellation_receipt(
+    metadata: Mapping[str, object] | None,
+) -> dict:
+    """Copy caller metadata without authority minted by cancellation."""
+
+    sanitized = dict(metadata or {})
+    sanitized.pop("cancellation_receipt", None)
+    return sanitized
+
+
 class TaskStore(UnifiedStoreBase):
     """
     Backend-agnostic task store.
@@ -44,14 +55,6 @@ class TaskStore(UnifiedStoreBase):
             backend: DatabaseBackend instance (SQLite or PostgreSQL)
         """
         super().__init__(backend)
-
-    @staticmethod
-    def _without_reserved_cancellation_metadata(task: Task) -> dict:
-        """Return caller metadata without state minted by cancellation."""
-
-        metadata = dict(task.metadata or {})
-        metadata.pop("cancellation_receipt", None)
-        return metadata
 
     async def initialize(self) -> None:
         """Create tables if not exists."""
@@ -200,7 +203,7 @@ class TaskStore(UnifiedStoreBase):
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
         history_json = json_dumps([m.model_dump() for m in (task.history or [])])
         metadata_json = json_dumps(
-            self._without_reserved_cancellation_metadata(task)
+            without_reserved_cancellation_receipt(task.metadata)
         )
 
         rows_affected = await self._backend.execute(
@@ -245,7 +248,7 @@ class TaskStore(UnifiedStoreBase):
         )
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
         history_json = json_dumps([m.model_dump() for m in (task.history or [])])
-        metadata = self._without_reserved_cancellation_metadata(task)
+        metadata = without_reserved_cancellation_receipt(task.metadata)
         # Cancellation receipts are reserved durable state. A sender may put
         # arbitrary metadata on a new envelope, but only the authorized atomic
         # cancellation transition below may mint this field.
@@ -671,7 +674,9 @@ class TaskStore(UnifiedStoreBase):
         """
         artifacts_data = json_loads(row[6]) if row[6] else []
         history_data = json_loads(row[7]) if row[7] else []
-        metadata = json_loads(row[8]) if row[8] else {}
+        metadata = without_reserved_cancellation_receipt(
+            json_loads(row[8]) if row[8] else {}
+        )
         if len(row) > 13 and row[13]:
             metadata = dict(metadata)
             metadata["cancellation_receipt"] = {

@@ -36,6 +36,9 @@ from kestrel_sovereign.a2a.stores import (
     ObservabilityStore,
     FeedbackStore,
 )
+from kestrel_sovereign.a2a.stores.unified.task_store import (
+    without_reserved_cancellation_receipt,
+)
 from typing import Protocol, runtime_checkable, TYPE_CHECKING
 from uuid import uuid4
 
@@ -749,7 +752,7 @@ class TaskManager:
             sessionId=params.sessionId,
             status=TaskStatus(state=TaskState.SUBMITTED),
             history=[params.message],
-            metadata=outbound_metadata,
+            metadata=without_reserved_cancellation_receipt(outbound_metadata),
             artifacts=list(artifacts) if artifacts else None,
         )
 
