@@ -231,11 +231,16 @@ class TaskStore(UnifiedStoreBase):
         )
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
         history_json = json_dumps([m.model_dump() for m in (task.history or [])])
-        metadata_json = json_dumps(task.metadata or {})
+        metadata = dict(task.metadata or {})
+        # Cancellation receipts are reserved durable state. A sender may put
+        # arbitrary metadata on a new envelope, but only the authorized atomic
+        # cancellation transition below may mint this field.
+        metadata.pop("cancellation_receipt", None)
+        metadata_json = json_dumps(metadata)
         task_type = (
-            task.metadata.get("task_type", "generic") if task.metadata else "generic"
+            metadata.get("task_type", "generic")
         )
-        user_id = task.metadata.get("user_id") if task.metadata else None
+        user_id = metadata.get("user_id")
 
         rows_affected = await self._backend.execute(
             f"""

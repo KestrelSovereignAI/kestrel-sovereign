@@ -268,6 +268,36 @@ async def test_cancel_task_does_not_trust_stale_or_spoofed_sender_metadata(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_task_creation_strips_sender_authored_cancellation_receipt(tmp_path):
+    """Only the atomic cancellation transition may persist its receipt."""
+
+    manager = await create_task_manager(str(tmp_path / "forged-receipt.db"))
+    try:
+        await manager.create_task(
+            _params(
+                "forged-receipt",
+                metadata={
+                    "sender": "did:test:creator",
+                    "cancellation_receipt": {
+                        "actor_agent_id": "did:test:creator",
+                        "reason": "forged",
+                        "status_before": "working",
+                    },
+                },
+            ),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        persisted = await manager.get_task("forged-receipt")
+        assert persisted.status.state is TaskState.SUBMITTED
+        assert "cancellation_receipt" not in (persisted.metadata or {})
+        assert persisted.metadata["sender"] == "did:test:creator"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_task_save_cannot_reassign_cancellation_authority(tmp_path):
     """A stale/replayed lifecycle write cannot mint a new delegate."""
 
