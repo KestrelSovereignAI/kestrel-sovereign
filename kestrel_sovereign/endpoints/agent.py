@@ -30,6 +30,7 @@ from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
     new_stream_delivery_id,
 )
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
@@ -699,9 +700,10 @@ async def stream_agent_response(request: Request):
             # chunk but BEFORE this async generator exits must not retroactively
             # append "Request stopped" to an already-delivered answer.
             response_chunk_yielded = False
+            agent_stream = None
             try:
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                async for chunk in agent.process_input_streaming(
+                agent_stream = agent.process_input_streaming(
                     user_input,
                     model_override=model_override,
                     session_id=effective_session_id,
@@ -710,7 +712,8 @@ async def stream_agent_response(request: Request):
                     request_id=request_id,
                     invocation_provenance=invocation_provenance,
                     attachments=attachments,
-                ):
+                )
+                async for chunk in agent_stream:
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
                         yield stop_notice
@@ -773,10 +776,29 @@ async def stream_agent_response(request: Request):
                 )
                 yield agent_stream_error_block(e)
             finally:
-                # Signal stream completion for TTS consumers
-                await stream_tap.finish(stream_delivery_id)
-                # Cleanup request tracking
-                agent._cleanup_cancelled_request(request_id)
+                try:
+                    # Breaking an ``async for`` does not synchronously close
+                    # its inner async generator. Await that generator's
+                    # ``finally`` (turn locks, tools, adapters) before endpoint
+                    # cleanup can wake a Stop acknowledgement waiter.
+                    close_agent_stream = getattr(agent_stream, "aclose", None)
+                    if callable(close_agent_stream):
+                        async def close_owned_agent_stream() -> None:
+                            await close_agent_stream()
+
+                        close_outcome = await await_owned_task(
+                            asyncio.create_task(close_owned_agent_stream())
+                        )
+                        raise_owned_outcome(
+                            close_outcome,
+                            operation="agent stream cleanup",
+                        )
+                finally:
+                    # Signal stream completion for TTS consumers
+                    await stream_tap.finish(stream_delivery_id)
+                    # Cleanup request tracking only after the inner stream has
+                    # completed its own cooperative cleanup.
+                    agent._cleanup_cancelled_request(request_id)
 
         headers = {
             "Cache-Control": "no-cache",

@@ -122,6 +122,11 @@ const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 chatModule.initChat();
 
+const confirmedStopResponse = () => ({
+    success: true,
+    stop_outcomes: [{ disposition: 'stopped' }],
+});
+
 
 function controlledStream() {
     let resolveNext = null;
@@ -206,7 +211,7 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
     // Stop ack: pretend the server returns 200.
     apiModule.default.stop = async (requestId, agent) => {
         eventLog.push(`stop:${requestId}:${agent}`);
-        return { ok: true };
+        return confirmedStopResponse();
     };
 
     // New stream: capture that we got there, then end cleanly so
@@ -332,6 +337,35 @@ test('queue mode preserves composer input behind an unconfirmed Stop', async () 
 });
 
 
+test('missing Stop response cannot clear the unconfirmed latch', async () => {
+    const agent = 'agent-stop-no-response';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-request';
+    apiModule.default.stop = async () => undefined;
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return (async function* () {})();
+    };
+
+    messageInput.value = 'preserve after auth redirect';
+    await sendMessage();
+
+    assert.equal(replacementStarted, false);
+    assert.equal(messageInput.value, 'preserve after auth redirect');
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'undefined/malformed responses are not Stop acknowledgements');
+
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
+});
+
+
 test('sendMessage does NOT call stopAgent when the agent is idle (#1255)', async () => {
     getOrCreateChatPane('agent-idle');
     apiModule.default.setHostAgent('agent-idle');
@@ -345,7 +379,7 @@ test('sendMessage does NOT call stopAgent when the agent is idle (#1255)', async
     apiModule.default.getCurrentStreamRequestId = () => null;
     apiModule.default.stop = async () => {
         eventLog.push('stop-should-not-fire');
-        return { ok: true };
+        return confirmedStopResponse();
     };
 
     const ctrl = controlledStream();
@@ -432,7 +466,7 @@ test('concurrent sendMessage: prior turn\'s finally cannot un-mark the new turn 
         signal: {},
     });
     apiModule.default.getCurrentStreamRequestId = () => 'prior-req';
-    apiModule.default.stop = async () => ({ ok: true });
+    apiModule.default.stop = async () => confirmedStopResponse();
 
     // New turn: a fresh controllable stream so we can hold the new
     // dispatch in its streamInvoke await.
@@ -484,7 +518,7 @@ test('sendMessage with empty text returns early regardless of busy state (#1255)
     apiModule.default.getCurrentStreamRequestId = () => 'rid';
     apiModule.default.stop = async () => {
         eventLog.push('stop');
-        return { ok: true };
+        return confirmedStopResponse();
     };
     apiModule.default.streamInvoke = () => {
         eventLog.push('streamInvoke');

@@ -3,6 +3,7 @@ Unit tests for agent request cancellation (stop button).
 """
 
 import asyncio
+import json
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock
@@ -122,6 +123,93 @@ class TestAgentCancellation:
 
         mock_agent._cleanup_cancelled_request("retry-id")
         await asyncio.wait_for(waiter, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_stream_closes_inner_generator_before_completion_ack(self):
+        """Stop cannot acknowledge before the turn iterator releases its locks."""
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        inner_cleanup_started = asyncio.Event()
+        release_inner_cleanup = asyncio.Event()
+
+        class LiveAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+
+            async def process_input_streaming(self, *_args, **_kwargs):
+                try:
+                    yield "first"
+                    yield "second"
+                finally:
+                    inner_cleanup_started.set()
+                    await release_inner_cleanup.wait()
+
+        agent = LiveAgent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "inner-cleanup"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+        stream = response.body_iterator
+
+        assert await anext(stream) == "first"
+        assert agent.cancel_current_request("inner-cleanup") is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion("inner-cleanup")
+        )
+        assert "Request stopped" in await anext(stream)
+
+        eof = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(inner_cleanup_started.wait(), timeout=1)
+        assert completion.done() is False
+
+        # Client disconnect cancels the outer StreamingResponse task. The
+        # inner turn cleanup still owns completion and must finish first.
+        eof.cancel()
+        await asyncio.sleep(0)
+        assert completion.done() is False
+        release_inner_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await eof
+        await asyncio.wait_for(completion, timeout=1)
 
     def test_multiple_cancellations_tracked(self, mock_agent):
         """Multiple requests can be cancelled and tracked."""

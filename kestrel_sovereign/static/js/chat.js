@@ -2624,10 +2624,13 @@ export async function stopAgent(agentName) {
         const stopOutcomes = Array.isArray(response?.stop_outcomes)
             ? response.stop_outcomes
             : [];
-        if (response?.success === false || stopOutcomes.some(
-            (outcome) => outcome?.disposition === 'refused'
-                || outcome?.disposition === 'unreachable'
-        )) {
+        const confirmed = response?.success === true
+            && stopOutcomes.length > 0
+            && stopOutcomes.every(
+                (outcome) => outcome?.disposition === 'stopped'
+                    || outcome?.disposition === 'already_complete'
+            );
+        if (!confirmed) {
             throw new Error('Cooperative Stop was not confirmed');
         }
     } catch (e) {

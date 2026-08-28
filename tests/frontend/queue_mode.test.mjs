@@ -174,7 +174,10 @@ test('queue mode: Enter-while-busy stores the message and renders a chip, no int
         abort() { stopCalled = true; }, signal: {},
     });
     apiModule.default.getCurrentStreamRequestId = () => 'rid';
-    apiModule.default.stop = async () => { stopCalled = true; return { ok: true }; };
+    apiModule.default.stop = async () => {
+        stopCalled = true;
+        return { success: true, stop_outcomes: [{ disposition: 'stopped' }] };
+    };
 
     // Simulate the agent already streaming.
     state.waitingAgents.add(agent);
@@ -273,7 +276,7 @@ test('Stop with a SLOW /stop POST and a normally-completing turn still cancels t
     // finally would have run.
     apiModule.default.stop = async () => {
         await new Promise((r) => setTimeout(r, 30));
-        return { ok: true };
+        return { success: true, stop_outcomes: [{ disposition: 'stopped' }] };
     };
 
     messageInput.value = 'in-flight turn';
@@ -369,7 +372,10 @@ test('Stop while queued = stop everything: queue cleared, nothing dispatches', a
         signal: {},
     });
     apiModule.default.getCurrentStreamRequestId = () => 'rid';
-    apiModule.default.stop = async () => ({ ok: true });
+    apiModule.default.stop = async () => ({
+        success: true,
+        stop_outcomes: [{ disposition: 'stopped' }],
+    });
 
     messageInput.value = 'turn one';
     const firstPromise = sendMessage();
@@ -473,7 +479,10 @@ test('interrupt mode (default) still interrupts — regression guard', async () 
         abort() { stopCalled = true; }, signal: {},
     });
     apiModule.default.getCurrentStreamRequestId = () => 'rid';
-    apiModule.default.stop = async () => { stopCalled = true; return { ok: true }; };
+    apiModule.default.stop = async () => {
+        stopCalled = true;
+        return { success: true, stop_outcomes: [{ disposition: 'stopped' }] };
+    };
     const ctrl = controlledStream();
     apiModule.default.streamInvoke = () => ctrl.iter;
     apiModule.default.invoke = async () => ({ response: '' });
