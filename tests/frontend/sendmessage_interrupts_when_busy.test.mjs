@@ -247,6 +247,51 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
 });
 
 
+test('sendMessage does not dispatch a replacement when Stop is unconfirmed', async () => {
+    const agent = 'agent-stop-failed';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-request';
+    let stopAttempts = 0;
+    apiModule.default.stop = async () => {
+        stopAttempts += 1;
+        throw new Error('stop_not_confirmed');
+    };
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return (async function* () {})();
+    };
+
+    messageInput.value = 'do not overlap this turn';
+    await sendMessage();
+
+    assert.equal(replacementStarted, false,
+        'an unconfirmed Stop must not open a concurrent replacement turn');
+    assert.equal(messageInput.value, 'do not overlap this turn',
+        'the unsent redirect remains available for retry');
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'failed Stop must leave a guard that abort cleanup cannot erase');
+
+    // Simulate the aborted prior stream's finally clearing its own ordinary
+    // busy marker, then retry Send. The unconfirmed-Stop latch must still
+    // route this through Stop and refuse to open a replacement stream.
+    state.waitingAgents.delete(agent);
+    messageInput.value = 'still do not overlap';
+    await sendMessage();
+    assert.equal(stopAttempts, 2,
+        'a retry while Stop is unconfirmed must retry Stop first');
+    assert.equal(replacementStarted, false,
+        'clearing waitingAgents must not bypass the unconfirmed-Stop latch');
+
+    state.unconfirmedStopAgents.delete(agent);
+});
+
+
 test('sendMessage does NOT call stopAgent when the agent is idle (#1255)', async () => {
     getOrCreateChatPane('agent-idle');
     apiModule.default.setHostAgent('agent-idle');

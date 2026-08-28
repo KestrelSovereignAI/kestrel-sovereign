@@ -34,6 +34,14 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
 )
+from kestrel_sovereign.stop import (
+    CancellationAuthority,
+    CooperativeStopTarget,
+    StopDisposition,
+    StopCleanupRegistry,
+    StopRequest,
+    StopScope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -823,12 +831,96 @@ async def stop_agent_request(request: Request):
             else None
         )
         agent = get_agent(request)
-        cancelled = agent.cancel_current_request(request_id=request_id)
+        agent_id = getattr(agent, "agent_id", None)
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            # Compatibility for pre-inception/test agents. This is an address,
+            # not a grant; HTTP caller authorization remains at the route.
+            agent_id = "local-agent"
+        caller = getattr(request.state, "caller", None)
+        actor_id = getattr(caller, "identity", None)
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            actor_id = f"local-operator:{agent_id}"
+
+        active_turns = set(getattr(agent, "_active_request_ids", set()) or set())
+        current_turn = getattr(agent, "_current_request_id", None)
+        if isinstance(current_turn, str) and current_turn:
+            active_turns.add(current_turn)
+        if request_id is not None:
+            active_turns.add(request_id)
+
+        async def cancel_request(stop_request: StopRequest) -> StopDisposition:
+            if stop_request.scope is StopScope.TURN:
+                canceled = agent.cancel_current_request(
+                    request_id=stop_request.target
+                )
+            else:
+                canceled = False
+                for active_request_id in sorted(active_turns):
+                    canceled = (
+                        agent.cancel_current_request(
+                            request_id=active_request_id
+                        )
+                        or canceled
+                    )
+                if not active_turns:
+                    canceled = agent.cancel_current_request(request_id=None)
+            return (
+                StopDisposition.STOPPED
+                if canceled
+                else StopDisposition.ALREADY_COMPLETE
+            )
+
+        cleanup_registry = getattr(
+            request.app.state,
+            "stop_cleanup_registry",
+            None,
+        )
+        if cleanup_registry is None:
+            cleanup_registry = StopCleanupRegistry()
+            request.app.state.stop_cleanup_registry = cleanup_registry
+        elif not isinstance(cleanup_registry, StopCleanupRegistry):
+            raise TypeError("app Stop cleanup registry has an invalid type")
+
+        authority = CancellationAuthority(
+            lambda: (
+                CooperativeStopTarget(
+                    target_id=agent_id,
+                    agent_id=agent_id,
+                    cancel=cancel_request,
+                    turn_ids=frozenset(active_turns),
+                ),
+            ),
+            cleanup_registry=cleanup_registry,
+        )
+        stop_request = StopRequest(
+            scope=StopScope.TURN if request_id is not None else StopScope.AGENT,
+            actor_id=actor_id,
+            target=request_id if request_id is not None else agent_id,
+            target_agent_id=agent_id if request_id is not None else None,
+        )
+        outcomes = await authority.stop(stop_request)
+        failed_outcomes = tuple(
+            outcome
+            for outcome in outcomes
+            if outcome.disposition
+            in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
+        )
+        if failed_outcomes:
+            raise ApiHTTPException(
+                status_code=503,
+                code="stop_not_confirmed",
+                message="Cooperative Stop could not be confirmed.",
+                details=[outcome.to_dict() for outcome in failed_outcomes],
+            )
+        cancelled = any(
+            outcome.disposition is StopDisposition.STOPPED for outcome in outcomes
+        )
         return {
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
-            "message": "Request cancelled" if cancelled else "No active request to cancel"
+            "message": "Request cancelled" if cancelled else "No active request to cancel",
+            "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }
     except HTTPException:
         raise

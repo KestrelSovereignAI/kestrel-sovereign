@@ -99,6 +99,19 @@ function deps() {
     };
 }
 
+function unconfirmedStopAgents() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopAgents instanceof Set)) {
+        currentState.unconfirmedStopAgents = new Set();
+    }
+    return currentState.unconfirmedStopAgents;
+}
+
+function isAgentBusy(agentName) {
+    return deps().state.waitingAgents.has(agentName)
+        || unconfirmedStopAgents().has(agentName);
+}
+
 // Wave 5E in-band revising sentinel — pairs with kestrel_sovereign/
 // agent/streaming.py:_build_revise_sentinel. Format:
 //   \x1eKESTREL:REVISE:<json>\x1e
@@ -2507,7 +2520,7 @@ export function disconnectNotifications() {
  */
 export function updateThinkingIndicator() {
     const current = deps().api.getHostAgent();
-    const busy = deps().state.waitingAgents.has(current);
+    const busy = isAgentBusy(current);
     if (thinkingIndicator) {
         thinkingIndicator.style.display = busy ? 'flex' : 'none';
         // Drive the one-word status from the visible agent's current
@@ -2541,7 +2554,7 @@ export function refreshAgentThinkingDot(agentName) {
     if (typeof document === 'undefined') return;
     const row = document.querySelector(`.agent-item[data-agent-name="${CSS.escape(String(agentName))}"]`);
     if (!row) return;
-    const busy = deps().state.waitingAgents.has(agentName);
+    const busy = isAgentBusy(agentName);
     row.classList.toggle('agent-thinking', busy);
 }
 
@@ -2589,6 +2602,15 @@ export async function stopAgent(agentName) {
         clearQueuedChip(pane);
     }
 
+    // The server-side turn may outlive the locally aborted response stream.
+    // Set this before abort() so the prior stream's microtask/finally cannot
+    // erase the only guard against opening an overlapping backend turn.
+    unconfirmedStopAgents().add(agentName);
+    refreshAgentThinkingDot(agentName);
+    if (agentName === deps().api.getHostAgent()) {
+        updateThinkingIndicator();
+    }
+
     const abortController = deps().api.getStreamAbortController(agentName);
     if (abortController) {
         try { abortController.abort(); } catch (_) { /* noop */ }
@@ -2598,16 +2620,32 @@ export async function stopAgent(agentName) {
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
-        await deps().api.stop(requestId, agentName);
+        const response = await deps().api.stop(requestId, agentName);
+        const stopOutcomes = Array.isArray(response?.stop_outcomes)
+            ? response.stop_outcomes
+            : [];
+        if (response?.success === false || stopOutcomes.some(
+            (outcome) => outcome?.disposition === 'refused'
+                || outcome?.disposition === 'unreachable'
+        )) {
+            throw new Error('Cooperative Stop was not confirmed');
+        }
     } catch (e) {
         console.error(`Error stopping request on ${agentName}:`, e);
+        refreshAgentThinkingDot(agentName);
+        if (agentName === deps().api.getHostAgent()) {
+            updateThinkingIndicator();
+        }
+        return false;
     }
 
+    unconfirmedStopAgents().delete(agentName);
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === deps().api.getHostAgent()) {
         updateThinkingIndicator();
     }
+    return true;
 }
 
 // ============================================================================
@@ -2725,7 +2763,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     if (fromComposer) await awaitPendingUploads(pane);
 
     // Send-while-busy. Behavior depends on the pane's composerMode.
-    if (deps().state.waitingAgents.has(dispatchAgent)) {
+    if (isAgentBusy(dispatchAgent)) {
         if (pane.composerMode === 'queue') {
             // #1257 queue mode: stash the message and surface it as a
             // pending chip. The completing turn's finally dispatches
@@ -2755,7 +2793,8 @@ export async function sendMessage(overrideText, overrideAgent) {
         // rendered. Note: ``stopAgent`` removes the agent from
         // ``state.waitingAgents`` itself, so the subsequent ``add``
         // below is the correct next state.
-        await stopAgent(dispatchAgent);
+        const stopConfirmed = await stopAgent(dispatchAgent);
+        if (!stopConfirmed) return;
     }
 
     // #1573: claim this turn's ownership of the pane's stream paint
