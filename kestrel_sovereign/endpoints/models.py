@@ -1,5 +1,5 @@
 """Model, wallet, and IPFS status endpoints."""
-from fastapi import APIRouter, HTTPException, Request, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
@@ -41,6 +41,18 @@ router = APIRouter(tags=["models"])
 
 # Validation: agent names must be alphanumeric + hyphens/underscores, 1-64 chars
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+
+
+def require_sovereign_host_lifecycle(request: Request):
+    """Admit only the sovereign-key principal to host lifecycle mutations."""
+
+    caller = get_caller(request)
+    if getattr(caller, "is_sovereign", False) is not True:
+        raise HTTPException(
+            status_code=403,
+            detail="Sovereign authority is required.",
+        )
+    return caller
 
 
 def _key_storage_privacy_detail() -> str:
@@ -256,7 +268,10 @@ async def get_agents(request: Request):
         raise HTTPException(status_code=500, detail="Error retrieving agents.")
 
 
-@router.post("/api/agents")
+@router.post(
+    "/api/agents",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 @limiter.limit("5/minute")
 async def create_agent(request: Request, body: CreateAgentRequest):
     """Create a new agent via inception.
@@ -592,7 +607,10 @@ def _annotate_custody_registration_detail(
     return detail
 
 
-@router.delete("/api/agents/{agent_name}")
+@router.delete(
+    "/api/agents/{agent_name}",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 @limiter.limit("10/minute")
 async def delete_agent(
     request: Request,
