@@ -2172,6 +2172,7 @@ class KestrelAgent(
             # See #905 review P1 — without this, A→B→A loops would
             # restart at depth 1 every iteration.
             causation_chain_provider=self._provide_causation_chain,
+            host_agent_id=self.did,
         )
         # Register teardown BEFORE initialize: ``TaskManager.initialize()`` opens
         # its A2A store connections (task/session/observability/memory/feedback)

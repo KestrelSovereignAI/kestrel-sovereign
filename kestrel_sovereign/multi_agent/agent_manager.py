@@ -937,7 +937,7 @@ class AgentManager:
         recipient: object,
         claimed_sender: str,
         policy: A2AHostedPolicy,
-    ) -> bool:
+    ) -> Optional[str]:
         """Authorize the sole hosted unsigned compatibility path.
 
         A pre-ceremony sender has no cryptographic signing DID, so accepting
@@ -957,7 +957,7 @@ class AgentManager:
             or not claimed_sender
             or self.a2a_hosted_policy_for(recipient) is not policy
         ):
-            return False
+            return None
         matches: list[tuple[str, KestrelAgent, str]] = []
         for routing_name, candidate in self._agents.items():
             sender_id = _loaded_agent_did(candidate)
@@ -974,13 +974,13 @@ class AgentManager:
         # unsigned compatibility sender may be accepted only when the current
         # hosted fleet has exactly one matching published display identity.
         if len(matches) != 1:
-            return False
+            return None
         routing_name, sender, sender_id = matches[0]
         if sender is recipient or (
             self._agent_names.get(sender_id) != routing_name
             or self._agents.get(routing_name) is not sender
         ):
-            return False
+            return None
 
         identity = getattr(sender, "identity", None)
         # A loaded hybrid identity must never deliberately downgrade to the
@@ -991,7 +991,7 @@ class AgentManager:
             or getattr(identity, "hybrid_keypair", None) is not None
             or bool(getattr(identity, "new_verification_methods", None))
         ):
-            return False
+            return None
 
         authorize = getattr(
             policy.authorizer,
@@ -999,7 +999,7 @@ class AgentManager:
             None,
         )
         if not callable(authorize):
-            return False
+            return None
         try:
             result = authorize(
                 sender_id,
@@ -1013,8 +1013,8 @@ class AgentManager:
                 "Hosted legacy A2A sender authorization failed",
                 exc_info=True,
             )
-            return False
-        return result is True
+            return None
+        return sender_id if result is True else None
 
     @staticmethod
     def _published_a2a_display_identity(agent: object) -> Optional[str]:

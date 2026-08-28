@@ -1,0 +1,944 @@
+"""Authority and atomicity regressions for A2A task cancellation (#3134)."""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.a2a.task_manager import (
+    TaskCancellationAuthorizationError,
+    create_task_manager,
+)
+from kestrel_sovereign.a2a.outbound_store import OutboundTaskRouteAmbiguousError
+from kestrel_sovereign.a2a.agent_card import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+)
+from kestrel_sovereign.a2a.types import (
+    Message,
+    Task,
+    TaskStatus,
+    TaskSendParams,
+    TaskState,
+    TextPart,
+)
+from kestrel_sovereign.features.tasks.feature import TaskFeature
+from kestrel_sovereign.features.peers.directory import PeerIdentity, PeerRequester
+from kestrel_sovereign.features.peers.feature import PeersFeature
+
+
+def _params(task_id: str, *, metadata=None) -> TaskSendParams:
+    return TaskSendParams(
+        id=task_id,
+        sessionId=f"session-{task_id}",
+        message=Message(role="user", parts=[TextPart(text="Do the work")]),
+        metadata=metadata or {},
+    )
+
+
+def _feature(manager, agent_did: str) -> TaskFeature:
+    feature = TaskFeature(SimpleNamespace(did=agent_did))
+    feature.set_task_manager(manager)
+    return feature
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_creator_and_execution_delegate_are_authorized(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "tasks.db"))
+    try:
+        await manager.create_task(
+            _params("by-owner"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        assert await manager.is_task_recipient(
+            "by-owner", "did:test:recipient"
+        )
+        assert not await manager.is_task_recipient(
+            "by-owner", "did:test:creator"
+        )
+        await manager.create_task(
+            _params("by-delegate"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        owner_result = await _feature(manager, "did:test:creator").cancel_task(
+            "by-owner", reason="assignment withdrawn"
+        )
+        delegate_result = await _feature(manager, "did:test:recipient").cancel_task(
+            "by-delegate", reason="cannot continue"
+        )
+
+        assert owner_result.status is ToolResultStatus.OK
+        assert delegate_result.status is ToolResultStatus.OK
+        owner_task = await manager.get_task("by-owner")
+        delegate_task = await manager.get_task("by-delegate")
+        assert owner_task.metadata["cancellation_receipt"] == {
+            "actor_agent_id": "did:test:creator",
+            "reason": "assignment withdrawn",
+            "status_before": "submitted",
+        }
+        assert delegate_task.metadata["cancellation_receipt"] == {
+            "actor_agent_id": "did:test:recipient",
+            "reason": "cannot continue",
+            "status_before": "submitted",
+        }
+        assert owner_task.history[-1].parts[0].text == (
+            "Task canceled by did:test:creator: assignment withdrawn"
+        )
+        assert delegate_task.history[-1].parts[0].text == (
+            "Task canceled by did:test:recipient: cannot continue"
+        )
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,metadata",
+    [
+        ("did:test:peer", {}),
+        ("did:test:child", {"parent_did": "did:test:creator"}),
+        (
+            "did:test:causal-agent",
+            {"causation_chain": [{"agent_id": "did:test:causal-agent"}]},
+        ),
+    ],
+)
+async def test_cancel_task_refuses_peer_lineage_and_causation(
+    tmp_path, caller, metadata
+):
+    manager = await create_task_manager(str(tmp_path / f"{caller.rsplit(':', 1)[-1]}.db"))
+    try:
+        await manager.create_task(
+            _params("protected", metadata=metadata),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        result = await _feature(manager, caller).cancel_task("protected")
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "not authorized" in result.error
+        unchanged = await manager.get_task("protected")
+        assert unchanged.status.state is TaskState.SUBMITTED
+        assert "cancellation_receipt" not in (unchanged.metadata or {})
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_does_not_trust_stale_or_spoofed_sender_metadata(tmp_path):
+    """Only the verified creator parameter may mint creator authority."""
+
+    manager = await create_task_manager(str(tmp_path / "spoof.db"))
+    try:
+        await manager.create_task(
+            _params(
+                "spoofed",
+                metadata={
+                    "sender": "did:test:revoked",
+                    "sender_verified": True,
+                    "signature": {"stale": "untrusted task metadata"},
+                },
+            ),
+            agent_name="did:test:recipient",
+        )
+
+        result = await _feature(manager, "did:test:revoked").cancel_task("spoofed")
+
+        assert result.status is ToolResultStatus.ERROR
+        assert (await manager.get_task("spoofed")).status.state is TaskState.SUBMITTED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_task_save_cannot_reassign_cancellation_authority(tmp_path):
+    """A stale/replayed lifecycle write cannot mint a new delegate."""
+
+    manager = await create_task_manager(str(tmp_path / "immutable-authority.db"))
+    try:
+        task = await manager.create_task(
+            _params("immutable"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            await manager.task_store.save(
+                task,
+                creator_agent_id="did:test:stale-creator",
+                recipient_agent_id="did:test:revoked-delegate",
+            )
+
+        stale = await _feature(manager, "did:test:stale-creator").cancel_task(
+            "immutable"
+        )
+        revoked = await _feature(manager, "did:test:revoked-delegate").cancel_task(
+            "immutable"
+        )
+
+        assert stale.status is ToolResultStatus.ERROR
+        assert revoked.status is ToolResultStatus.ERROR
+        assert (await manager.get_task("immutable")).status.state is TaskState.SUBMITTED
+        assert (
+            await _feature(manager, "did:test:creator").cancel_task("immutable")
+        ).status is ToolResultStatus.OK
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_terminal_state_is_unchanged(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "terminal.db"))
+    try:
+        task = await manager.create_task(
+            _params("finished"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.update_status(
+            task.id,
+            TaskState.WORKING,
+            agent_name="did:test:recipient",
+        )
+        await manager.update_status(
+            task.id,
+            TaskState.COMPLETED,
+            agent_name="did:test:recipient",
+        )
+
+        result = await _feature(manager, "did:test:creator").cancel_task("finished")
+
+        assert result.status is ToolResultStatus.ERROR
+        unchanged = await manager.get_task("finished")
+        assert unchanged.status.state is TaskState.COMPLETED
+        assert "cancellation_receipt" not in (unchanged.metadata or {})
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_authorization_and_transition_are_one_winner(tmp_path):
+    """Creator and recipient racing cannot both write a cancellation receipt."""
+
+    manager = await create_task_manager(str(tmp_path / "race.db"))
+    try:
+        await manager.create_task(
+            _params("race"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        results = await asyncio.gather(
+            _feature(manager, "did:test:creator").cancel_task("race", reason="creator"),
+            _feature(manager, "did:test:recipient").cancel_task(
+                "race", reason="recipient"
+            ),
+        )
+
+        assert sorted(result.status.value for result in results) == ["error", "ok"]
+        task = await manager.get_task("race")
+        assert task.status.state is TaskState.CANCELED
+        receipt = task.metadata["cancellation_receipt"]
+        assert (receipt["actor_agent_id"], receipt["reason"]) in {
+            ("did:test:creator", "creator"),
+            ("did:test:recipient", "recipient"),
+        }
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_manager_requires_concrete_actor(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "missing-actor.db"))
+    try:
+        await manager.create_task(_params("owned"), agent_name="did:test:owner")
+        with pytest.raises(TaskCancellationAuthorizationError, match="concrete"):
+            await manager.cancel_task("owned", reason="anonymous")
+        assert (await manager.get_task("owned")).status.state is TaskState.SUBMITTED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_respond_canceled_cannot_bypass_task_authority(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "respond-bypass.db"))
+    try:
+        await manager.create_task(
+            _params("respond-protected"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        result = await _feature(manager, "did:test:unrelated").respond_to_a2a_task(
+            "respond-protected",
+            content="I decline someone else's task",
+            state="canceled",
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "not authorized" in result.error
+        assert (
+            await manager.get_task("respond-protected")
+        ).status.state is TaskState.SUBMITTED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_duplicate_id_without_mutating_owner_or_payload(
+    tmp_path,
+):
+    manager = await create_task_manager(str(tmp_path / "duplicate.db"))
+    try:
+        await manager.create_task(
+            _params("same-id", metadata={"payload": "original"}),
+            agent_name="did:test:recipient-a",
+            creator_agent_id="did:test:creator-a",
+        )
+        session_before = await manager.session_service.get_session(
+            "session-same-id"
+        )
+
+        with pytest.raises(ValueError, match="already exists"):
+            await manager.create_task(
+                _params("same-id", metadata={"payload": "replacement"}),
+                agent_name="did:test:recipient-b",
+                creator_agent_id="did:test:creator-b",
+            )
+
+        original = await manager.get_task("same-id")
+        assert original.metadata["payload"] == "original"
+        assert original.history[0].parts[0].text == "Do the work"
+        session_after = await manager.session_service.get_session("session-same-id")
+        assert session_after.events == session_before.events
+        assert (
+            await _feature(manager, "did:test:creator-a").cancel_task("same-id")
+        ).status is ToolResultStatus.OK
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projection", ["session", "observability"])
+async def test_create_task_projection_failure_does_not_report_durable_commit_as_failed(
+    tmp_path,
+    projection,
+):
+    manager = await create_task_manager(str(tmp_path / f"{projection}.db"))
+    try:
+        if projection == "session":
+            manager.session_service.append_event = AsyncMock(
+                side_effect=RuntimeError("session projection unavailable")
+            )
+        else:
+            manager.observability_store.log_tool_call = AsyncMock(
+                side_effect=RuntimeError("observability unavailable")
+            )
+
+        created = await manager.create_task(
+            _params(f"accepted-{projection}"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        assert created.id == f"accepted-{projection}"
+        assert (await manager.get_task(created.id)).status.state is TaskState.SUBMITTED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_async_internal_skill_task_is_owned_by_host_did(tmp_path):
+    host_did = "did:test:host"
+    manager = await create_task_manager(
+        str(tmp_path / "internal-skill.db"), host_agent_id=host_did
+    )
+
+    class BlockingHandler:
+        name = "feature-handler"
+
+        async def handle_task(self, task):
+            await asyncio.Event().wait()
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="model_agent",
+            url="/agents/model_agent",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="slow_skill",
+                    name="slow_skill",
+                    description="Slow skill",
+                )
+            ],
+        ),
+        BlockingHandler(),
+    )
+    try:
+        task = await manager.execute_skill(
+            "model_agent",
+            "slow_skill",
+            {},
+            sync=False,
+        )
+
+        result = await _feature(manager, host_did).cancel_task(task.id)
+
+        assert result.status is ToolResultStatus.OK
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_save_cannot_overwrite_authorized_cancellation(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "stale-worker.db"))
+    try:
+        await manager.create_task(
+            _params("stale-worker"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        stale_worker_copy = await manager.get_task("stale-worker")
+        await manager.cancel_task(
+            "stale-worker",
+            reason="withdrawn",
+            agent_name="did:test:creator",
+        )
+
+        stale_worker_copy.status = TaskStatus(state=TaskState.COMPLETED)
+        await manager.task_store.save(stale_worker_copy)
+
+        persisted = await manager.get_task("stale-worker")
+        assert persisted.status.state is TaskState.CANCELED
+        assert persisted.metadata["cancellation_receipt"]["reason"] == "withdrawn"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_save_without_authority_cannot_create_task(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "update-only.db"))
+    try:
+        inserted = await manager.task_store.save(
+            Task(
+                id="authority-less",
+                status=TaskStatus(state=TaskState.SUBMITTED),
+            )
+        )
+
+        assert inserted is False
+        assert await manager.get_task("authority-less") is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_generic_status_and_store_writes_cannot_cancel_task(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "canonical-cancel.db"))
+    try:
+        task = await manager.create_task(
+            _params("canonical-cancel"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        with pytest.raises(
+            TaskCancellationAuthorizationError, match="use cancel_task"
+        ):
+            await manager.update_status(task.id, TaskState.CANCELED)
+
+        task.status = TaskStatus(state=TaskState.CANCELED)
+        with pytest.raises(ValueError, match="cancel_if_authorized"):
+            await manager.task_store.save(task)
+        with pytest.raises(ValueError, match="cancel_if_authorized"):
+            await manager.task_store.update_status(
+                task.id, TaskStatus(state=TaskState.CANCELED)
+            )
+
+        assert (await manager.get_task(task.id)).status.state is TaskState.SUBMITTED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancellation_uses_authorized_host_identity(tmp_path):
+    host_did = "did:test:host"
+    manager = await create_task_manager(
+        str(tmp_path / "shutdown-cancel.db"), host_agent_id=host_did
+    )
+
+    class BlockingHandler:
+        name = "blocking"
+
+        async def handle_task(self, task):
+            await asyncio.Event().wait()
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="shutdown-agent",
+            url="/agents/shutdown-agent",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="shutdown-skill",
+                    name="shutdown-skill",
+                    description="wait",
+                )
+            ],
+        ),
+        BlockingHandler(),
+    )
+    try:
+        task = await manager.execute_skill(
+            "shutdown-agent", "shutdown-skill", {}, sync=False
+        )
+        await manager.drain_execution_tasks(cancel=True)
+
+        persisted = await manager.get_task(task.id)
+        assert persisted.status.state is TaskState.CANCELED
+        assert persisted.metadata["cancellation_receipt"] == {
+            "actor_agent_id": host_did,
+            "reason": "Task canceled during shutdown",
+            "status_before": "submitted",
+        }
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_worker_when_receipt_persistence_fails(tmp_path):
+    manager = await create_task_manager(
+        str(tmp_path / "shutdown-persistence-failure.db"),
+        host_agent_id="did:test:host",
+    )
+    worker_started = asyncio.Event()
+    worker_stopped = asyncio.Event()
+
+    async def worker():
+        worker_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            worker_stopped.set()
+
+    task = manager._track_execution_task(
+        worker(),
+        "shutdown-task",
+        "did:test:host",
+    )
+    await worker_started.wait()
+    manager.cancel_task = AsyncMock(side_effect=RuntimeError("database unavailable"))
+
+    await asyncio.wait_for(
+        manager.drain_execution_tasks(cancel=True),
+        timeout=0.2,
+    )
+
+    assert task.done()
+    assert worker_stopped.is_set()
+    assert manager._execution_tasks == set()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_async_handler_cancellation_emits_one_terminal_notification(tmp_path):
+    host_did = "did:test:host"
+    manager = await create_task_manager(
+        str(tmp_path / "handler-cancel.db"), host_agent_id=host_did
+    )
+
+    class CancelingHandler:
+        name = "canceling"
+
+        async def handle_task(self, task):
+            task.status = TaskStatus(
+                state=TaskState.CANCELED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="Handler declined")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="canceling-agent",
+            url="/agents/canceling-agent",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="canceling-skill",
+                    name="canceling-skill",
+                    description="cancel",
+                )
+            ],
+        ),
+        CancelingHandler(),
+    )
+    completion = MagicMock()
+    manager._on_task_complete = completion
+    try:
+        task = await manager.execute_skill(
+            "canceling-agent", "canceling-skill", {}, sync=False
+        )
+        await manager.drain_execution_tasks()
+
+        assert (await manager.get_task(task.id)).status.state is TaskState.CANCELED
+        completion.assert_called_once()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_creator_routes_cancellation_to_durable_recipient(monkeypatch):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:creator", identity=None, features={})
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "creator"
+    requester = PeerRequester(actor.did, object())
+    peer = PeerIdentity(
+        agent_id="did:test:recipient",
+        slug="recipient",
+        routing_key="recipient-route",
+        name="Recipient",
+    )
+    router = SimpleNamespace(
+        cancel_a2a_task=AsyncMock(
+            return_value={
+                "id": "outbound-task",
+                "status": "canceled",
+                "cancellation_receipt": {"status_before": "working"},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                recipient="Recipient",
+                recipient_agent_id="did:test:recipient",
+                route_state=outbound_store.ROUTE_STATE_ROUTABLE,
+            )
+        ),
+    )
+    terminal_stamp = AsyncMock(return_value=1)
+    monkeypatch.setattr(
+        outbound_store,
+        "update_outbound_terminal_state",
+        terminal_stamp,
+    )
+    peers._resolve_retained_automatic_peer = AsyncMock(
+        return_value=(router, requester, peer)
+    )
+    peers._maybe_sign_outbound = MagicMock()
+    actor.features["PeersFeature"] = peers
+
+    local_manager = MagicMock()
+    # A shared PostgreSQL TaskStore can see the recipient's task row.  The
+    # durable sender-owned route must win before that local visibility is used.
+    local_manager.cancel_task = AsyncMock()
+    local_manager.is_task_recipient = AsyncMock(return_value=False)
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.cancel_task("outbound-task", reason="withdrawn")
+
+    assert result.status is ToolResultStatus.OK
+    payload = router.cancel_a2a_task.await_args.args[3]
+    assert payload["metadata"] == {
+        "sender": "creator",
+        "a2a_verb": "cancel_task",
+    }
+    assert payload["reason"] == "withdrawn"
+    peers._maybe_sign_outbound.assert_called_once_with(
+        payload,
+        task_id="outbound-task",
+        sess_id="a2a-cancel:outbound-task",
+        message="withdrawn",
+    )
+    router.cancel_a2a_task.assert_awaited_once_with(
+        requester, peer, "outbound-task", payload
+    )
+    local_manager.cancel_task.assert_not_awaited()
+    terminal_stamp.assert_awaited_once_with(
+        peers._db,
+        agent_id=actor.did,
+        task_id="outbound-task",
+        terminal_state="canceled",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_inbound_outbound_task_id_collision(monkeypatch):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:agent", identity=None, features={})
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "agent"
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                recipient="Other",
+                recipient_agent_id="did:test:other",
+                route_state=outbound_store.ROUTE_STATE_ROUTABLE,
+            )
+        ),
+    )
+    peers._resolve_retained_automatic_peer = AsyncMock()
+    actor.features["PeersFeature"] = peers
+    local_manager = MagicMock(
+        is_task_recipient=AsyncMock(return_value=True),
+        cancel_task=AsyncMock(),
+    )
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.cancel_task("colliding-task")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["error_type"] == "ambiguous_direction"
+    peers._resolve_retained_automatic_peer.assert_not_awaited()
+    local_manager.cancel_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_outbound_route_cannot_fall_through_shared_task_row(monkeypatch):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:creator", identity=None, features={})
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "creator"
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(return_value=None),
+    )
+    actor.features["PeersFeature"] = peers
+    local_manager = MagicMock(
+        is_task_recipient=AsyncMock(return_value=False),
+        cancel_task=AsyncMock(),
+    )
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.cancel_task("delivered-without-route")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "unambiguous" in result.error
+    local_manager.cancel_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_outbound_route_allows_exact_inbound_recipient(monkeypatch):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:recipient", identity=None, features={})
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "recipient"
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(return_value=None),
+    )
+    actor.features["PeersFeature"] = peers
+    canceled = Task(
+        id="inbound-task",
+        status=TaskStatus(state=TaskState.CANCELED),
+        metadata={
+            "cancellation_receipt": {
+                "status_before": "working",
+            }
+        },
+    )
+    local_manager = MagicMock(
+        is_task_recipient=AsyncMock(return_value=True),
+        cancel_task=AsyncMock(return_value=canceled),
+    )
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.cancel_task("inbound-task")
+
+    assert result.status is ToolResultStatus.OK
+    local_manager.cancel_task.assert_awaited_once_with(
+        "inbound-task",
+        reason=None,
+        agent_name=actor.did,
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbound_cancel_accepts_audit_stamp_won_by_terminal_sse(monkeypatch):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:creator", identity=None)
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "creator"
+    initial = SimpleNamespace(
+        recipient="Recipient",
+        recipient_agent_id="did:test:recipient",
+        route_state=outbound_store.ROUTE_STATE_ROUTABLE,
+        terminal_state=None,
+    )
+    canceled = SimpleNamespace(**{**vars(initial), "terminal_state": "canceled"})
+    route_lookup = AsyncMock(side_effect=[initial, canceled])
+    monkeypatch.setattr(outbound_store, "get_outbound_task", route_lookup)
+    terminal_stamp = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        outbound_store,
+        "update_outbound_terminal_state",
+        terminal_stamp,
+    )
+    peers._resolve_retained_automatic_peer = AsyncMock(
+        return_value=(
+            SimpleNamespace(
+                cancel_a2a_task=AsyncMock(
+                    return_value={
+                        "id": "outbound-task",
+                        "status": "canceled",
+                        "cancellation_receipt": {"status_before": "working"},
+                    }
+                )
+            ),
+            PeerRequester(actor.did, object()),
+            PeerIdentity(
+                agent_id="did:test:recipient",
+                slug="recipient",
+                routing_key="recipient-route",
+            ),
+        )
+    )
+    peers._maybe_sign_outbound = MagicMock()
+
+    result = await peers.cancel_outbound_task("outbound-task")
+
+    assert result is not None
+    assert result.status is ToolResultStatus.OK
+    assert route_lookup.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"id": "other", "status": "canceled", "cancellation_receipt": {}},
+        {"id": "outbound-task", "status": "working", "cancellation_receipt": {}},
+        {
+            "id": "outbound-task",
+            "status": "canceled",
+            "cancellation_receipt": "not-an-object",
+        },
+    ],
+)
+async def test_outbound_cancellation_rejects_malformed_peer_receipts(
+    monkeypatch,
+    response,
+):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:creator", identity=None)
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "creator"
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                recipient="Recipient",
+                recipient_agent_id="did:test:recipient",
+                route_state=outbound_store.ROUTE_STATE_ROUTABLE,
+            )
+        ),
+    )
+    stamp = AsyncMock(return_value=1)
+    monkeypatch.setattr(outbound_store, "update_outbound_terminal_state", stamp)
+    router = SimpleNamespace(cancel_a2a_task=AsyncMock(return_value=response))
+    peers._resolve_retained_automatic_peer = AsyncMock(
+        return_value=(
+            router,
+            PeerRequester(actor.did, object()),
+            PeerIdentity(
+                agent_id="did:test:recipient",
+                slug="recipient",
+                routing_key="recipient-route",
+            ),
+        )
+    )
+    peers._maybe_sign_outbound = MagicMock()
+
+    result = await peers.cancel_outbound_task("outbound-task")
+
+    assert result is not None
+    assert result.status is ToolResultStatus.ERROR
+    stamp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("backend unavailable"),
+        OutboundTaskRouteAmbiguousError("duplicate route"),
+    ],
+)
+async def test_outbound_route_lookup_failure_never_falls_back_local(
+    monkeypatch,
+    failure,
+):
+    from kestrel_sovereign.a2a import outbound_store
+
+    actor = SimpleNamespace(did="did:test:creator", identity=None, features={})
+    peers = PeersFeature(actor)
+    peers._db = object()
+    peers._outbound_route_store_ready = True
+    peers._own_name = "creator"
+    monkeypatch.setattr(
+        outbound_store,
+        "get_outbound_task",
+        AsyncMock(side_effect=failure),
+    )
+    actor.features["PeersFeature"] = peers
+    local_manager = MagicMock(cancel_task=AsyncMock())
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.cancel_task("outbound-task")
+
+    assert result.status is ToolResultStatus.ERROR
+    local_manager.cancel_task.assert_not_awaited()

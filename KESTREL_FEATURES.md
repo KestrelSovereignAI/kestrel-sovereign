@@ -744,6 +744,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `GET /api/agent/tasks`
   - `POST /api/agent/tasks/send`
   - `GET /api/agent/tasks/{task_id}`
+  - `POST /api/agent/tasks/{task_id}/cancel`
   - `GET /api/agent/tasks/{task_id}/subscribe`
 - [`kestrel_sovereign/endpoints/auth_oauth.py`](kestrel_sovereign/endpoints/auth_oauth.py)
   - `GET /auth/callback`
@@ -1111,6 +1112,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 

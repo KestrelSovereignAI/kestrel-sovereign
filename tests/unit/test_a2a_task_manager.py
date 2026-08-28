@@ -121,13 +121,39 @@ class TestTaskManager:
 
         task_store = MagicMock()
 
-        async def save_task(task):
+        async def save_task(task, **_authority):
             call_order.append(f"save:{task.status.state.value}")
 
         async def close_task_store():
             call_order.append("close:task_store")
 
+        canceled_task = None
+
+        async def cancel_if_authorized(
+            task_id, *, actor_agent_id, reason=None
+        ):
+            nonlocal canceled_task
+            if canceled_task is not None:
+                return None
+            call_order.append("save:canceled")
+            canceled_task = Task(
+                id=task_id,
+                status=TaskStatus(state=TaskState.CANCELED),
+                metadata={
+                    "cancellation_receipt": {
+                        "actor_agent_id": actor_agent_id,
+                        "reason": reason,
+                        "status_before": "submitted",
+                    }
+                },
+            )
+            return canceled_task
+
         task_store.save = AsyncMock(side_effect=save_task)
+        task_store.cancel_if_authorized = AsyncMock(
+            side_effect=cancel_if_authorized
+        )
+        task_store.get = AsyncMock(side_effect=lambda _task_id: canceled_task)
         task_store.close = AsyncMock(side_effect=close_task_store)
         session_service = MagicMock()
         session_service.close = AsyncMock()
