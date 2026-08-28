@@ -685,6 +685,74 @@ class TestCompareAndDelete:
             await first_storage.close()
             await second.close()
 
+    async def test_bound_delete_nested_in_deferred_transaction_locks_before_probe(
+        self, tmp_path, monkeypatch
+    ):
+        """A bound delete must not establish a stale SQLite snapshot first."""
+
+        import kestrel_sovereign.storage.async_graph_store as graph_module
+
+        db_path = str(tmp_path / "nested-bound-delete.db")
+        first_storage = await AsyncStorage.create_sqlite(db_path)
+        second_storage = await AsyncStorage.create_sqlite(db_path)
+        first = AsyncGraphStore(first_storage.db, agent_id="agent-a")
+        second = AsyncGraphStore(second_storage.db, agent_id="agent-a")
+        nid = _nid("nested-bound-delete")
+        await first.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Before")
+        )
+
+        original_lock = graph_module.lock_graph_nodes_for_update
+        replacement = None
+        raced = False
+
+        async def race_after_visibility(db, node_ids, *, agent_id=""):
+            nonlocal raced, replacement
+            if db is first.db and not raced:
+                raced = True
+                replacement = asyncio.create_task(
+                    second.add_node(
+                        _node(
+                            nid,
+                            {"status": "replacement", "sentinel": "must survive"},
+                            node_type="owned",
+                            label="After",
+                        )
+                    )
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(replacement), timeout=0.25
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            return await original_lock(db, node_ids, agent_id=agent_id)
+
+        monkeypatch.setattr(
+            graph_module, "lock_graph_nodes_for_update", race_after_visibility
+        )
+        try:
+            async with first.db.transaction():
+                result = await first.compare_and_delete_node(
+                    nid,
+                    expected_node_type="owned",
+                    expected_label="Before",
+                )
+            assert result == NodeDeleteResult.DELETED
+
+            assert replacement is not None
+            await asyncio.wait_for(replacement, timeout=5)
+            after = await second.get_node(nid)
+            assert after is not None
+            assert after.label == "After"
+            assert after.properties["sentinel"] == "must survive"
+        finally:
+            if replacement is not None and not replacement.done():
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+            await first_storage.close()
+            await second_storage.close()
+
     async def test_ordinary_unbound_delete_cleans_dangling_graph_records(
         self, graph_store
     ):

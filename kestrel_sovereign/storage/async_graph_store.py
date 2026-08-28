@@ -1640,6 +1640,12 @@ class AsyncGraphStore:
         """Read and lock one tenant-visible graph identity inside a transaction."""
 
         scope, scope_params = self._node_scope()
+        if self.db.backend_type == "sqlite":
+            # A same-task nested ``transaction(immediate=True)`` inherits its
+            # caller's deferred BEGIN. Take SQLite's writer slot before even
+            # the ownership probe so no competing connection can commit and
+            # leave this transaction trying to upgrade a stale read snapshot.
+            await _acquire_sqlite_graph_writer_slot(self.db)
         if self.agent_id:
             # Scope before taking either the PostgreSQL advisory lock or the
             # physical row lock. An invisible id must behave exactly like an
