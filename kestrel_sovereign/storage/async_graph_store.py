@@ -563,6 +563,18 @@ class AsyncGraphStore:
             raise ValueError("Graph store is already bound to a different agent")
         self.agent_id = agent_id
 
+    async def lock_nodes_for_update(self, node_ids: Iterable[str]) -> List[str]:
+        """Lock a complete multi-node write set in canonical order.
+
+        The caller must own the surrounding transaction. Single-node writers
+        lock internally, but a workflow that will touch several nodes must take
+        the whole set first so two semantic write orders cannot become opposite
+        PostgreSQL lock orders. SQLite uses the same call to acquire its writer
+        slot before any read in the composed operation.
+        """
+
+        return await lock_graph_nodes_for_update(self.db, node_ids)
+
     def _node_owner(self, node: GraphNode) -> str:
         declared = node.properties.get("agent_id") if node.properties else None
         if node.node_type == "agent":
@@ -1593,6 +1605,23 @@ class AsyncGraphStore:
         requested_owner = self.agent_id or declared or ""
 
         async with self.db.transaction():
+            # Node deletion and ownership release take graph rows before any
+            # edge ledger row. Edge admission must use the same order and lock
+            # both endpoints together (sorted by the shared helper), otherwise
+            # PostgreSQL can validate a soon-to-be-deleted witness through MVCC
+            # and commit a dangling edge after node cleanup has passed it.
+            await lock_graph_nodes_for_update(self.db, [source_id, target_id])
+            endpoint_rows = await self.db.fetchone(
+                "SELECT "
+                "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?), "
+                "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?)",
+                (source_id, target_id),
+            )
+            source_exists = bool(endpoint_rows and endpoint_rows[0])
+            target_exists = bool(endpoint_rows and endpoint_rows[1])
+            if not source_exists or (not trusted_cross_agent and not target_exists):
+                raise ValueError("Graph edge endpoints do not both exist")
+
             if requested_owner:
                 endpoint_owners = await self.db.fetchone(
                     "SELECT "

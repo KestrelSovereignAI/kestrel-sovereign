@@ -757,6 +757,33 @@ class TestCompareAndDelete:
 
 
 # =====================================================================
+# Edge admission and endpoint deletion serialization
+# =====================================================================
+
+
+class TestEdgeAdmission:
+    @pytest.mark.parametrize("missing", ["source", "target"])
+    async def test_unbound_edge_rejects_a_missing_endpoint(
+        self, graph_store, missing
+    ):
+        """Maintenance callers cannot introduce a newly dangling edge."""
+
+        source_id = _nid("edge-source")
+        target_id = _nid("edge-target")
+        existing_id = target_id if missing == "source" else source_id
+        await graph_store.add_node(_node(existing_id, {"status": "present"}))
+
+        with pytest.raises(Exception, match="endpoints"):
+            await graph_store.add_edge(source_id, target_id, "references")
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges "
+            "WHERE source_id = ? AND target_id = ? AND label = ?",
+            (source_id, target_id, "references"),
+        ) is None
+
+
+# =====================================================================
 # Facade + privacy wrapper (SQLite; proves the delegation chain is atomic)
 # =====================================================================
 

@@ -1858,6 +1858,12 @@ class ConstitutionMixin:
                         "created_at": amendment_artifact.get("created_at"),
                     },
                 )
+                # The runtime and setup reanchor writers touch these shared
+                # rows in different semantic order. Take the complete set first
+                # so PostgreSQL always observes one canonical lock order.
+                await self.storage.lock_nodes_for_update(
+                    [artifact_hash, stored_hash]
+                )
                 await self.storage.add_node(
                     artifact_node,
                     capability=acquire_control_plane_capability(),

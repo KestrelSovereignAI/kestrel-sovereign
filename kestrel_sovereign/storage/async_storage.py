@@ -1414,6 +1414,17 @@ class AsyncStorage:
             await self.initialize()
         await self.graph.add_node(node)
 
+    async def lock_nodes_for_update(self, node_ids) -> List[str]:
+        """Lock a complete graph write set in canonical order.
+
+        Call inside :meth:`transaction` before the first graph read/write in a
+        multi-node operation. The graph store owns backend-specific locking.
+        """
+
+        if not self._initialized:
+            await self.initialize()
+        return await self.graph.lock_nodes_for_update(node_ids)
+
     async def compare_and_swap_node(
         self,
         node_id: str,

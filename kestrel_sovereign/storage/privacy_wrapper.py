@@ -3188,6 +3188,11 @@ class PrivacyEnforcingStorage:
         """Get a graph node. Read — never privacy-gated."""
         return await self._storage.get_node(node_id)
 
+    async def lock_nodes_for_update(self, node_ids):
+        """Forward canonical graph locking without granting write authority."""
+
+        return await self._storage.lock_nodes_for_update(node_ids)
+
     async def add_edge(self, source_id: str, target_id: str, label: str, properties: Optional[Dict] = None,
                         *, capability: Any = None):
         """Add a graph edge, governed by the volatile-mode write policy.
@@ -5478,6 +5483,7 @@ class _PrivacyGoverningGraphStore:
         "compare_and_delete_node",
         "delete_edge",
         "purge_agent_nodes",
+        "lock_nodes_for_update",
         "bind_agent",
         "agent_id",
     })

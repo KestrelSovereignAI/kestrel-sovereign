@@ -489,3 +489,111 @@ async def test_shared_owner_admission_waits_for_final_owner_delete_on_backend(
         "SELECT agent_id FROM graph_node_owners WHERE node_id = ?", (node_id,)
     )
     assert {row[0] for row in owners} == {agent_b}
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_edge_admission_waits_for_endpoint_delete_on_backend(
+    graph_store, monkeypatch
+):
+    """An ordinary edge cannot be admitted from a soon-deleted endpoint."""
+
+    agent_id = f"agent:{uuid.uuid4().hex}"
+    bound = AsyncGraphStore(graph_store.db, agent_id=agent_id)
+    source_id = _nid("edge-source")
+    target_id = _nid("edge-target")
+    await bound.add_node(
+        _node(
+            source_id,
+            {"agent_id": agent_id},
+            node_type="owned",
+            label="Source",
+        )
+    )
+    await bound.add_node(
+        _node(
+            target_id,
+            {"agent_id": agent_id},
+            node_type="owned",
+            label="Target",
+        )
+    )
+
+    delete_entered = asyncio.Event()
+    release_delete = asyncio.Event()
+    original_delete = bound._delete_node_in_transaction
+
+    async def pause_before_delete(candidate_id):
+        delete_entered.set()
+        await release_delete.wait()
+        return await original_delete(candidate_id)
+
+    monkeypatch.setattr(bound, "_delete_node_in_transaction", pause_before_delete)
+
+    edge_owner_entered = asyncio.Event()
+    release_edge_owner = asyncio.Event()
+    original_record_edge = graph_store_module.record_graph_edge_owner
+
+    async def pause_before_edge_owner(
+        db, candidate_source, candidate_target, candidate_label, candidate_agent
+    ):
+        if (
+            candidate_source == source_id
+            and candidate_target == target_id
+            and candidate_agent == agent_id
+        ):
+            edge_owner_entered.set()
+            await release_edge_owner.wait()
+        await original_record_edge(
+            db,
+            candidate_source,
+            candidate_target,
+            candidate_label,
+            candidate_agent,
+        )
+
+    monkeypatch.setattr(
+        graph_store_module, "record_graph_edge_owner", pause_before_edge_owner
+    )
+
+    deletion = asyncio.create_task(
+        bound.compare_and_delete_node(
+            source_id,
+            expected_node_type="owned",
+            expected_label="Source",
+        )
+    )
+    admission = None
+    try:
+        await asyncio.wait_for(delete_entered.wait(), timeout=5)
+        admission = asyncio.create_task(
+            bound.add_edge(source_id, target_id, "references")
+        )
+        await asyncio.sleep(0.1)
+        assert not edge_owner_entered.is_set(), (
+            "edge admission passed an in-flight endpoint delete"
+        )
+
+        release_delete.set()
+        assert await asyncio.wait_for(deletion, timeout=5) == "deleted"
+        with pytest.raises(Exception, match="endpoints"):
+            await asyncio.wait_for(admission, timeout=5)
+    finally:
+        release_delete.set()
+        release_edge_owner.set()
+        pending = [task for task in (deletion, admission) if task is not None]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    assert await graph_store.db.fetchone(
+        "SELECT 1 FROM graph_edges "
+        "WHERE source_id = ? AND target_id = ? AND label = ?",
+        (source_id, target_id, "references"),
+    ) is None
+    assert await graph_store.db.fetchone(
+        "SELECT 1 FROM graph_edge_owners "
+        "WHERE source_id = ? AND target_id = ? AND label = ?",
+        (source_id, target_id, "references"),
+    ) is None
