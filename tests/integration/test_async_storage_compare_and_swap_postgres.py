@@ -674,6 +674,38 @@ async def test_postgres_bound_edge_preflights_foreign_target_before_lock(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_postgres_bound_add_preflights_foreign_ordinary_node_before_lock(
+    graph_store, monkeypatch
+):
+    """A known-invalid tenant node write never queues on a foreign row."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL has per-row locks; SQLite has one writer slot")
+    owner = f"agent:{uuid.uuid4().hex}"
+    foreign_owner = f"agent:{uuid.uuid4().hex}"
+    foreign_id = _nid("foreign-ordinary-node")
+    bound = AsyncGraphStore(graph_store.db, agent_id=owner)
+    foreign = AsyncGraphStore(graph_store.db, agent_id=foreign_owner)
+    await foreign.add_node(
+        _node(foreign_id, {"agent_id": foreign_owner}, node_type="owned")
+    )
+
+    lock = AsyncMock(return_value=[foreign_id])
+    monkeypatch.setattr(graph_store_module, "lock_graph_nodes_for_update", lock)
+
+    with pytest.raises(Exception, match="owned by another agent"):
+        await bound.add_node(
+            _node(foreign_id, {"agent_id": owner}, node_type="owned")
+        )
+
+    lock.assert_not_awaited()
+    assert (await foreign.get_node(foreign_id)).properties == {
+        "agent_id": foreign_owner
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_postgres_trusted_edge_locks_only_owned_source(
     graph_store, monkeypatch
 ):

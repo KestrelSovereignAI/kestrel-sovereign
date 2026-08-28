@@ -817,6 +817,33 @@ class AsyncGraphStore:
         self._refuse_unshareable_properties(
             (node.node_type, node.label), node.properties, node.node_id
         )
+        if self.db.backend_type == "postgres" and owner:
+            # Establish whether this ID is already known to be outside the
+            # tenant before taking either its advisory reservation or physical
+            # row lock. Ordinary rows can never acquire a second owner, and a
+            # caller presenting a shared shape can proceed only when the stored
+            # identity is that same shared shape. Everything is re-read under
+            # lock below; this cheap preflight rejects only writes that are
+            # already guaranteed to fail and keeps an invalid tenant request
+            # from queueing behind a foreign transaction.
+            preflight_rows = await self.db.fetchall(
+                "SELECT owners.agent_id, nodes.node_type, nodes.label "
+                "FROM graph_node_owners AS owners "
+                "LEFT JOIN graph_nodes AS nodes ON nodes.node_id = owners.node_id "
+                "WHERE owners.node_id = ?",
+                (node.node_id,),
+            )
+            preflight_owners = {row[0] for row in preflight_rows}
+            has_foreign_owner = bool(preflight_owners - {owner})
+            stored_shapes = {(row[1], row[2]) for row in preflight_rows}
+            can_attempt_shared_admission = bool(
+                shape is not None
+                and stored_shapes == {(node.node_type, node.label)}
+            )
+            if has_foreign_owner and not can_attempt_shared_admission:
+                raise ValueError(
+                    "Cannot overwrite a graph node owned by another agent"
+                )
         async with self.db.transaction():
             await lock_graph_nodes_for_update(self.db, [node.node_id])
             # A compatible fleet-shared row adds only an ownership witness.
