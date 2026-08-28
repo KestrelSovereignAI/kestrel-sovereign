@@ -57,6 +57,8 @@ def _request_claims(
     update_allow_migrations: bool,
     requester_request_id: str,
     origin_session_id: str,
+    requested_at: str,
+    first_blocked_at: str,
 ) -> dict[str, Any]:
     return {
         "id": request_id,
@@ -72,6 +74,8 @@ def _request_claims(
         "update_allow_migrations": bool(update_allow_migrations),
         "requester_request_id": requester_request_id,
         "origin_session_id": origin_session_id,
+        "requested_at": requested_at,
+        "first_blocked_at": first_blocked_at,
     }
 
 
@@ -107,6 +111,8 @@ def issue_restart_authority(
     update_allow_migrations: bool,
     requester_request_id: str,
     origin_session_id: str,
+    requested_at: str,
+    first_blocked_at: str = "",
 ) -> tuple[str, str]:
     """Seal exact request bounds for the current sovereign caller."""
 
@@ -137,8 +143,51 @@ def issue_restart_authority(
             update_allow_migrations=update_allow_migrations,
             requester_request_id=requester_request_id,
             origin_session_id=origin_session_id,
+            requested_at=requested_at,
+            first_blocked_at=first_blocked_at,
         ),
     }
+    evidence = _canonical(document).decode("utf-8")
+    return evidence, _signature(document)
+
+
+def reseal_restart_safety_state(
+    request: Any,
+    *,
+    first_blocked_at: str,
+) -> tuple[str, str]:
+    """Authenticate a host-owned deferral-clock transition.
+
+    This is deliberately not a new request-authority door: the existing seal
+    must verify first, and every immutable request claim and sovereign actor is
+    preserved. The coordinator uses it only while atomically changing the
+    safety timestamp whose age may release an idle-only gate.
+    """
+
+    verified, reason = verify_restart_authority(request)
+    if not verified:
+        raise RestartAuthorityError(reason)
+    document = json.loads(getattr(request, "authority_evidence"))
+    document["safety_state_updated_at"] = datetime.now(timezone.utc).isoformat()
+    document["request"] = _request_claims(
+        request_id=str(getattr(request, "id", "")),
+        requested_by_agent=str(getattr(request, "requested_by_agent", "")),
+        reason=str(getattr(request, "reason", "")),
+        urgency=str(getattr(request, "urgency", "")),
+        policy=str(getattr(request, "policy", "")),
+        desired_window=str(getattr(request, "desired_window", "")),
+        operation=str(getattr(request, "operation", "")),
+        update_repo_path=str(getattr(request, "update_repo_path", "")),
+        update_target_ref=str(getattr(request, "update_target_ref", "")),
+        update_profile=str(getattr(request, "update_profile", "")),
+        update_allow_migrations=bool(
+            getattr(request, "update_allow_migrations", False)
+        ),
+        requester_request_id=str(getattr(request, "requester_request_id", "")),
+        origin_session_id=str(getattr(request, "origin_session_id", "")),
+        requested_at=str(getattr(request, "requested_at", "")),
+        first_blocked_at=first_blocked_at,
+    )
     evidence = _canonical(document).decode("utf-8")
     return evidence, _signature(document)
 
@@ -182,6 +231,8 @@ def verify_restart_authority(request: Any) -> tuple[bool, str]:
         ),
         requester_request_id=str(getattr(request, "requester_request_id", "")),
         origin_session_id=str(getattr(request, "origin_session_id", "")),
+        requested_at=str(getattr(request, "requested_at", "")),
+        first_blocked_at=str(getattr(request, "first_blocked_at", "")),
     )
     if document.get("request") != expected_claims:
         return False, "restart request fields do not match signed authority bounds"

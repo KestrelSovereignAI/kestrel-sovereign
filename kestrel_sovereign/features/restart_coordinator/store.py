@@ -19,9 +19,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-from kestrel_sovereign.storage.database_clock import database_now_sql
+from kestrel_sovereign.storage.database_clock import database_clock
 
-from .authority import issue_restart_authority
+from .authority import (
+    RestartAuthorityError,
+    issue_restart_authority,
+    reseal_restart_safety_state,
+    verify_restart_authority,
+)
 
 
 # Terminal states — a request in any of these is locked. The
@@ -395,6 +400,7 @@ async def insert_request(
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
+    requested_at = (await database_clock(db)).isoformat()
     authority_evidence, authority_signature = issue_restart_authority(
         request_id=req_id,
         requested_by_agent=requested_by_agent,
@@ -409,10 +415,10 @@ async def insert_request(
         update_allow_migrations=update_allow_migrations,
         requester_request_id=requester_request_id,
         origin_session_id=origin_session_id,
+        requested_at=requested_at,
     )
-    now_sql = database_now_sql(db)
     await db.execute(
-        f"""
+        """
         INSERT INTO restart_requests (
             id, requested_by_agent, reason, requested_at,
             desired_window, urgency, policy, status, status_reason,
@@ -421,10 +427,10 @@ async def insert_request(
             requester_request_id, origin_session_id, escalation_acknowledged,
             authority_evidence, authority_signature
         )
-        VALUES (?, ?, ?, {now_sql}, ?, ?, ?, 'pending', '', NULL,
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL,
                 ?, ?, ?, ?, ?, '', ?, ?, 1, ?, ?)
         """,
-        (req_id, requested_by_agent, reason, desired_window,
+        (req_id, requested_by_agent, reason, requested_at, desired_window,
          urgency, policy, operation, update_repo_path, update_target_ref,
          update_profile, 1 if update_allow_migrations else 0,
          requester_request_id, origin_session_id, authority_evidence,
@@ -609,17 +615,36 @@ async def mark_deferral_started(
     from a lost lifecycle race.
     """
 
-    stamp_sql = "?" if blocked_at is not None else database_now_sql(db)
-    params = (
-        (blocked_at, request_id, expected_current_status)
-        if blocked_at is not None
-        else (request_id, expected_current_status)
-    )
+    current = await get_request(db, request_id)
+    if current is None:
+        return None
+    verified, _ = verify_restart_authority(current)
+    if not verified:
+        return None
+    if current.first_blocked_at:
+        return current
+    stamped_at = blocked_at or (await database_clock(db)).isoformat()
+    try:
+        authority_evidence, authority_signature = reseal_restart_safety_state(
+            current,
+            first_blocked_at=stamped_at,
+        )
+    except RestartAuthorityError:
+        return None
     await db.execute(
-        f"UPDATE restart_requests SET first_blocked_at = {stamp_sql} "
+        "UPDATE restart_requests SET first_blocked_at = ?, "
+        "authority_evidence = ?, authority_signature = ? "
         "WHERE id = ? AND status = ? "
-        "AND (first_blocked_at IS NULL OR first_blocked_at = '')",
-        params,
+        "AND (first_blocked_at IS NULL OR first_blocked_at = '') "
+        "AND authority_signature = ?",
+        (
+            stamped_at,
+            authority_evidence,
+            authority_signature,
+            request_id,
+            expected_current_status,
+            current.authority_signature,
+        ),
     )
     return await get_request(db, request_id)
 
@@ -629,10 +654,32 @@ async def clear_deferral_started(
 ) -> bool:
     """Clear a busy interval after fleet quiescence is observed."""
 
+    current = await get_request(db, request_id)
+    if current is None:
+        return False
+    verified, _ = verify_restart_authority(current)
+    if not verified:
+        return False
+    try:
+        authority_evidence, authority_signature = reseal_restart_safety_state(
+            current,
+            first_blocked_at="",
+        )
+    except RestartAuthorityError:
+        return False
     result = await db.execute(
-        "UPDATE restart_requests SET first_blocked_at = '' "
-        "WHERE id = ? AND status = ?",
-        (request_id, expected_current_status),
+        "UPDATE restart_requests SET first_blocked_at = '', "
+        "authority_evidence = ?, authority_signature = ? "
+        "WHERE id = ? AND status = ? AND first_blocked_at = ? "
+        "AND authority_signature = ?",
+        (
+            authority_evidence,
+            authority_signature,
+            request_id,
+            expected_current_status,
+            current.first_blocked_at,
+            current.authority_signature,
+        ),
     )
     return await _write_landed(
         db, result, request_id, lambda row: row.first_blocked_at == "",
