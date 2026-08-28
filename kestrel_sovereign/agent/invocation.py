@@ -217,6 +217,22 @@ def current_invocation_provenance() -> InvocationProvenance | None:
 
 
 @contextmanager
+def _exact_invocation_scope(
+    invocation_id: str,
+    provenance: InvocationProvenance | None,
+) -> Iterator[str]:
+    """Bind an already-resolved identity and an exact provenance value."""
+
+    id_token = _current_invocation_id.set(invocation_id)
+    provenance_token = _current_invocation_provenance.set(provenance)
+    try:
+        yield invocation_id
+    finally:
+        _current_invocation_provenance.reset(provenance_token)
+        _current_invocation_id.reset(id_token)
+
+
+@contextmanager
 def invocation_scope(
     invocation_id: object = None,
     *,
@@ -231,13 +247,8 @@ def invocation_scope(
         if provenance is not None
         else _current_invocation_provenance.get()
     )
-    id_token = _current_invocation_id.set(effective_id)
-    provenance_token = _current_invocation_provenance.set(effective_provenance)
-    try:
+    with _exact_invocation_scope(effective_id, effective_provenance):
         yield effective_id
-    finally:
-        _current_invocation_provenance.reset(provenance_token)
-        _current_invocation_id.reset(id_token)
 
 
 def bind_async_invocation(
@@ -280,12 +291,47 @@ def bind_async_generator_invocation(
         @wraps(function)
         async def wrapped(*args: Any, **kwargs: Any) -> AsyncIterator[_T]:
             bound = signature.bind_partial(*args, **kwargs)
-            with invocation_scope(
-                bound.arguments.get(parameter),
-                provenance=bound.arguments.get("invocation_provenance"),
+            # Do not hold ContextVar tokens across an outward ``yield``. The
+            # consumer is allowed to close this iterator from a cancellation-
+            # safe owner task; resetting a token created by the original task
+            # from that closer's Context raises ValueError and can falsely make
+            # request cleanup look complete. Bind only while advancing or
+            # closing the underlying generator, and retain one effective id and
+            # provenance for every advance even if different tasks drive it.
+            effective_id = ensure_invocation_id(bound.arguments.get(parameter))
+            supplied_provenance = bound.arguments.get("invocation_provenance")
+            if supplied_provenance is not None and not isinstance(
+                supplied_provenance, InvocationProvenance
             ):
-                async for item in function(*bound.args, **bound.kwargs):
+                raise TypeError(
+                    "invocation provenance must be endpoint-owned "
+                    "InvocationProvenance"
+                )
+            effective_provenance = (
+                supplied_provenance
+                if supplied_provenance is not None
+                else _current_invocation_provenance.get()
+            )
+            iterator = function(*bound.args, **bound.kwargs)
+            try:
+                while True:
+                    with _exact_invocation_scope(
+                        effective_id,
+                        effective_provenance,
+                    ):
+                        try:
+                            item = await anext(iterator)
+                        except StopAsyncIteration:
+                            return
                     yield item
+            finally:
+                close_iterator = getattr(iterator, "aclose", None)
+                if callable(close_iterator):
+                    with _exact_invocation_scope(
+                        effective_id,
+                        effective_provenance,
+                    ):
+                        await close_iterator()
 
         return wrapped
 

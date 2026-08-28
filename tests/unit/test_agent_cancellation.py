@@ -2,6 +2,9 @@
 Unit tests for agent request cancellation (stop button).
 """
 
+import asyncio
+import json
+
 import pytest
 from unittest.mock import MagicMock, AsyncMock
 
@@ -20,12 +23,18 @@ class TestAgentCancellation:
         agent._active_request_ids = set()
         agent._active_request_started_at = {}
         agent._cancelled_requests = set()
+        agent._request_completion_events = {}
 
         # Bind actual methods
         agent.register_active_request = KestrelAgent.register_active_request.__get__(agent)
+        agent._request_generation_for_current_task = KestrelAgent._request_generation_for_current_task.__get__(agent)
+        agent._abandoned_generations = KestrelAgent._abandoned_generations.__get__(agent)
         agent.cancel_current_request = KestrelAgent.cancel_current_request.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)
+        agent.wait_for_request_completion = KestrelAgent.wait_for_request_completion.__get__(agent)
+        agent._resolve_request_completion = KestrelAgent._resolve_request_completion.__get__(agent)
         agent._cleanup_cancelled_request = KestrelAgent._cleanup_cancelled_request.__get__(agent)
+        agent._release_cancelled_generation = KestrelAgent._release_cancelled_generation.__get__(agent)
         agent.active_request_ages = KestrelAgent.active_request_ages.__get__(agent)
         agent.prune_stale_active_requests = KestrelAgent.prune_stale_active_requests.__get__(agent)
 
@@ -87,6 +96,586 @@ class TestAgentCancellation:
         assert "test-req" not in mock_agent._cancelled_requests
         assert mock_agent._current_request_id == "different-req"  # Not cleared
 
+    @pytest.mark.asyncio
+    async def test_completion_waiter_does_not_acknowledge_cancel_marker(self, mock_agent):
+        """A cooperative cancel marker is not proof that execution stopped."""
+        mock_agent.register_active_request("still-running")
+        assert mock_agent.cancel_current_request("still-running") is True
+
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("still-running")
+        )
+        await asyncio.sleep(0)
+
+        assert waiter.done() is False
+        mock_agent._cleanup_cancelled_request("still-running")
+        await asyncio.wait_for(waiter, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_completion_waiter_requires_final_duplicate_cleanup(self, mock_agent):
+        """One retry cleanup cannot acknowledge a same-id sibling still running."""
+        mock_agent.register_active_request("retry-id")
+        mock_agent.register_active_request("retry-id")
+        assert mock_agent.cancel_current_request("retry-id") is True
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("retry-id")
+        )
+
+        mock_agent._cleanup_cancelled_request("retry-id")
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+
+        mock_agent._cleanup_cancelled_request("retry-id")
+        await asyncio.wait_for(waiter, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_stream_closes_inner_generator_before_completion_ack(self):
+        """Stop cannot acknowledge before the turn iterator releases its locks."""
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+        )
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        inner_cleanup_started = asyncio.Event()
+        release_inner_cleanup = asyncio.Event()
+
+        class LiveAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+
+            @bind_async_generator_invocation("request_id")
+            async def process_input_streaming(
+                self,
+                *_args,
+                request_id=None,
+                invocation_provenance=None,
+                **_kwargs,
+            ):
+                try:
+                    yield "first"
+                    yield "second"
+                finally:
+                    inner_cleanup_started.set()
+                    await release_inner_cleanup.wait()
+
+        agent = LiveAgent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "inner-cleanup"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+        stream = response.body_iterator
+
+        assert await anext(stream) == "first"
+        assert agent.cancel_current_request("inner-cleanup") is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion("inner-cleanup")
+        )
+        assert "Request stopped" in await anext(stream)
+
+        eof = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(inner_cleanup_started.wait(), timeout=1)
+        assert completion.done() is False
+
+        # Client disconnect cancels the outer StreamingResponse task. The
+        # inner turn cleanup still owns completion and must finish first.
+        eof.cancel()
+        await asyncio.sleep(0)
+        assert completion.done() is False
+        release_inner_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await eof
+        await asyncio.wait_for(completion, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_stream_closes_context_bound_turn_in_its_owner_task(self):
+        """Nested turn ContextVars must be reset in the task that bound them."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+        )
+        from kestrel_sovereign.agent.parts import part_collector
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
+        from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        class ContextBoundAgent(RequestLifecycleMixin, TurnLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self._live_turn_id = None
+                self._active_session_id = None
+                self._lock_manager = None
+                self.agent_name = "context-bound"
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+
+            @bind_async_generator_invocation("request_id")
+            async def process_input_streaming(
+                self,
+                *_args,
+                request_id=None,
+                invocation_provenance=None,
+                **_kwargs,
+            ):
+                with part_collector():
+                    async with self._turn_lifecycle():
+                        yield "first"
+                        yield "second"
+
+        agent = ContextBoundAgent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "context-bound"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+        stream = response.body_iterator
+
+        assert await anext(stream) == "first"
+        assert agent.cancel_current_request("context-bound") is True
+        assert "Request stopped" in await anext(stream)
+        eof = asyncio.create_task(anext(stream))
+        with pytest.raises(StopAsyncIteration):
+            await eof
+
+        assert agent._live_turn_id is None
+        assert agent._active_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_stream_cleanup_failure_releases_stop_as_abandoned(self):
+        """A nested cleanup error cannot be acknowledged as a successful Stop."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+        )
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        class FailingCleanupAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+
+            @bind_async_generator_invocation("request_id")
+            async def process_input_streaming(
+                self,
+                *_args,
+                request_id=None,
+                invocation_provenance=None,
+                **_kwargs,
+            ):
+                try:
+                    yield "first"
+                    yield "second"
+                finally:
+                    raise RuntimeError("nested cleanup failed")
+
+        agent = FailingCleanupAgent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "cleanup-failure"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+        stream = response.body_iterator
+
+        assert await anext(stream) == "first"
+        assert agent.cancel_current_request("cleanup-failure") is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion("cleanup-failure")
+        )
+        assert "Request stopped" in await anext(stream)
+        with pytest.raises(RuntimeError, match="nested cleanup failed"):
+            await anext(stream)
+
+        assert await completion is RequestCompletionDisposition.ABANDONED
+        assert agent.cancel_current_request("cleanup-failure") is True
+        assert (
+            await agent.wait_for_request_completion("cleanup-failure")
+            is RequestCompletionDisposition.ABANDONED
+        )
+
+    @pytest.mark.asyncio
+    async def test_decorated_stream_can_close_from_its_owned_cleanup_task(self):
+        """Cross-task close awaits the underlying generator without token drift."""
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+            current_invocation_id,
+        )
+
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        observed_ids = []
+
+        @bind_async_generator_invocation("request_id")
+        async def decorated(*, request_id=None):
+            try:
+                observed_ids.append(current_invocation_id())
+                yield "chunk"
+            finally:
+                observed_ids.append(current_invocation_id())
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+        stream = decorated(request_id="owned-close")
+        assert await anext(stream) == "chunk"
+        close = asyncio.create_task(stream.aclose())
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        assert close.done() is False
+        release_cleanup.set()
+        await asyncio.wait_for(close, timeout=1)
+
+        assert observed_ids == ["owned-close", "owned-close"]
+
+    @pytest.mark.asyncio
+    async def test_decorated_stream_pins_absent_provenance_across_task_handoffs(self):
+        """Another task's trusted actor cannot drift into an unbound stream."""
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+            current_invocation_provenance,
+            invocation_scope,
+            request_provenance,
+        )
+
+        observed = []
+
+        @bind_async_generator_invocation("request_id")
+        async def decorated(*, request_id=None):
+            observed.append(current_invocation_provenance())
+            yield "first"
+            observed.append(current_invocation_provenance())
+            yield "second"
+
+        stream = decorated(request_id="absent-provenance")
+        assert await anext(stream) == "first"
+        foreign = request_provenance(
+            actor="did:test:other",
+            source_kind="http",
+            source_locator="/other",
+        )
+        with invocation_scope("other-request", provenance=foreign):
+            assert await anext(stream) == "second"
+        await stream.aclose()
+
+        assert observed == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_bridge_disconnect_closes_inner_generator_before_completion_ack(
+        self,
+    ):
+        """Bridge SSE cannot release Stop while its nested turn still cleans up."""
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+        )
+        from kestrel_sovereign.agent.parts import part_collector
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
+        from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+        from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        inner_cleanup_started = asyncio.Event()
+        release_inner_cleanup = asyncio.Event()
+
+        class LiveAgent(RequestLifecycleMixin, TurnLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self._live_turn_id = None
+                self._active_session_id = None
+                self._lock_manager = None
+                self.agent_name = "bridge-context-bound"
+
+            @bind_async_generator_invocation("request_id")
+            async def process_input_streaming(
+                self,
+                *_args,
+                request_id=None,
+                invocation_provenance=None,
+                **_kwargs,
+            ):
+                with part_collector():
+                    async with self._turn_lifecycle():
+                        try:
+                            yield "first"
+                            yield "second"
+                        finally:
+                            inner_cleanup_started.set()
+                            await release_inner_cleanup.wait()
+
+        agent = LiveAgent()
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent.features = {"BridgeFeature": bridge}
+        app = FastAPI()
+        app.state.agent = agent
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/bridge/stream",
+                "raw_path": b"/api/bridge/stream",
+                "query_string": b"",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            }
+        )
+        route = next(
+            route
+            for route in get_router().routes
+            if route.path == "/api/bridge/stream"
+        )
+        endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+        response = await endpoint(
+            request,
+            BridgeRequest(
+                message="work",
+                request_id="bridge-inner-cleanup",
+            ),
+        )
+        stream = response.body_iterator
+
+        assert "first" in await anext(stream)
+        assert agent.cancel_current_request("bridge-inner-cleanup") is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion("bridge-inner-cleanup")
+        )
+        close = asyncio.create_task(stream.aclose())
+        await asyncio.wait_for(inner_cleanup_started.wait(), timeout=1)
+        assert completion.done() is False
+
+        close.cancel()
+        await asyncio.sleep(0)
+        assert completion.done() is False
+        release_inner_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close
+        assert (
+            await asyncio.wait_for(completion, timeout=1)
+            is RequestCompletionDisposition.COMPLETED
+        )
+        assert agent._live_turn_id is None
+        assert agent._active_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_bridge_cleanup_failure_releases_stop_as_abandoned(self):
+        """Bridge nested-cleanup failure cannot acknowledge Stop either."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.invocation import (
+            bind_async_generator_invocation,
+        )
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
+        from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        class FailingBridgeAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+
+            @bind_async_generator_invocation("request_id")
+            async def process_input_streaming(
+                self,
+                *_args,
+                request_id=None,
+                invocation_provenance=None,
+                **_kwargs,
+            ):
+                try:
+                    yield "first"
+                    yield "second"
+                finally:
+                    raise RuntimeError("bridge nested cleanup failed")
+
+        agent = FailingBridgeAgent()
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent.features = {"BridgeFeature": bridge}
+        app = FastAPI()
+        app.state.agent = agent
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/bridge/stream",
+                "raw_path": b"/api/bridge/stream",
+                "query_string": b"",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            }
+        )
+        route = next(
+            route
+            for route in get_router().routes
+            if route.path == "/api/bridge/stream"
+        )
+        endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+        response = await endpoint(
+            request,
+            BridgeRequest(message="work", request_id="bridge-cleanup-failure"),
+        )
+        stream = response.body_iterator
+
+        assert "first" in await anext(stream)
+        assert agent.cancel_current_request("bridge-cleanup-failure") is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion("bridge-cleanup-failure")
+        )
+        with pytest.raises(RuntimeError, match="bridge nested cleanup failed"):
+            await stream.aclose()
+
+        assert await completion is RequestCompletionDisposition.ABANDONED
+
     def test_multiple_cancellations_tracked(self, mock_agent):
         """Multiple requests can be cancelled and tracked."""
         mock_agent._cancelled_requests.add("req-1")
@@ -134,6 +723,59 @@ class TestAgentCancellation:
         assert "retry-id" not in mock_agent._active_request_started_at
         assert "retry-id" not in mock_agent._cancelled_requests
 
+    @pytest.mark.asyncio
+    async def test_duplicate_cleanup_preserves_worst_abandoned_disposition(
+        self,
+        mock_agent,
+    ):
+        """One failed delivery makes shared-lifecycle completion unconfirmed."""
+
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+        )
+
+        mock_agent.register_active_request("duplicate-abandoned")
+        mock_agent.register_active_request("duplicate-abandoned")
+        assert mock_agent.cancel_current_request("duplicate-abandoned") is True
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("duplicate-abandoned")
+        )
+        await asyncio.sleep(0)
+
+        mock_agent._cleanup_cancelled_request(
+            "duplicate-abandoned",
+            disposition=RequestCompletionDisposition.ABANDONED,
+        )
+        assert not waiter.done()
+        mock_agent._cleanup_cancelled_request("duplicate-abandoned")
+
+        assert await waiter is RequestCompletionDisposition.ABANDONED
+
+    def test_pruned_duplicate_retains_cancel_until_every_delivery_exits(
+        self,
+        mock_agent,
+    ):
+        """A stale prune cannot let one retry clear its live sibling's Stop."""
+
+        mock_agent.register_active_request("duplicate-stale")
+        mock_agent.register_active_request("duplicate-stale")
+        assert mock_agent.cancel_current_request("duplicate-stale") is True
+        mock_agent._active_request_started_at["duplicate-stale"] -= 1000
+
+        assert mock_agent.prune_stale_active_requests(900) == ["duplicate-stale"]
+        mock_agent._cleanup_cancelled_request("duplicate-stale")
+
+        generation = next(
+            iter(mock_agent._abandoned_request_generations["duplicate-stale"])
+        )
+        assert mock_agent._abandoned_request_counts[
+            ("duplicate-stale", generation)
+        ] == 1
+        assert mock_agent.is_request_cancelled("duplicate-stale") is True
+
+        mock_agent._cleanup_cancelled_request("duplicate-stale")
+        assert "duplicate-stale" not in mock_agent._active_request_counts
+
     def test_prune_removes_stale_request(self, mock_agent):
         """A request older than the window is pruned and returned."""
         mock_agent.register_active_request("stale")
@@ -147,6 +789,111 @@ class TestAgentCancellation:
         assert "stale" not in mock_agent._active_request_started_at
         # current_request_id pointed at the pruned id → cleared.
         assert mock_agent._current_request_id is None
+
+    @pytest.mark.asyncio
+    async def test_prune_releases_waiter_as_abandoned_without_stop_ack(self, mock_agent):
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+        )
+
+        mock_agent.register_active_request("stale-waiter")
+        mock_agent.cancel_current_request("stale-waiter")
+        mock_agent._active_request_started_at["stale-waiter"] -= 1000
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("stale-waiter")
+        )
+        await asyncio.sleep(0)
+        assert any(
+            key[0] == "stale-waiter"
+            for key in mock_agent._request_completion_events
+        )
+
+        assert mock_agent.prune_stale_active_requests(900) == ["stale-waiter"]
+
+        outcome = await asyncio.wait_for(waiter, timeout=1.0)
+        assert outcome is RequestCompletionDisposition.ABANDONED
+        assert not mock_agent._request_completion_events
+        # The still-running turn must retain its cooperative cancellation marker
+        # until its real endpoint cleanup executes.
+        assert "stale-waiter" in mock_agent._cancelled_requests
+
+    @pytest.mark.asyncio
+    async def test_abandoned_generation_does_not_poison_same_id_redelivery(
+        self,
+        mock_agent,
+    ):
+        """The old turn stays canceled while a fresh retry gets a clean key."""
+
+        old_registered = asyncio.Event()
+        inspect_old = asyncio.Event()
+        old_observation: list[bool] = []
+
+        async def old_delivery() -> None:
+            mock_agent.register_active_request("reused-id")
+            old_registered.set()
+            await inspect_old.wait()
+            old_observation.append(
+                mock_agent.is_request_cancelled("reused-id")
+            )
+            mock_agent._cleanup_cancelled_request("reused-id")
+
+        old_task = asyncio.create_task(old_delivery())
+        await old_registered.wait()
+        assert mock_agent.cancel_current_request("reused-id") is True
+        mock_agent._active_request_started_at["reused-id"] -= 1000
+        assert mock_agent.prune_stale_active_requests(900) == ["reused-id"]
+
+        mock_agent.register_active_request("reused-id")
+        assert mock_agent.is_request_cancelled("reused-id") is False
+
+        inspect_old.set()
+        await old_task
+        assert old_observation == [True]
+        assert "reused-id" in mock_agent._active_request_ids
+        mock_agent._cleanup_cancelled_request("reused-id")
+
+    @pytest.mark.asyncio
+    async def test_abandoned_old_generation_does_not_poison_fresh_stop_waiter(
+        self,
+        mock_agent,
+    ):
+        """Completion disposition is scoped to the delivery generation."""
+
+        old_registered = asyncio.Event()
+        release_old = asyncio.Event()
+
+        async def old_delivery() -> None:
+            mock_agent.register_active_request("waiter-reuse")
+            old_registered.set()
+            await release_old.wait()
+            mock_agent._cleanup_cancelled_request("waiter-reuse")
+
+        old_task = asyncio.create_task(old_delivery())
+        await old_registered.wait()
+        assert mock_agent.cancel_current_request("waiter-reuse") is True
+        mock_agent._active_request_started_at["waiter-reuse"] -= 1000
+        assert mock_agent.prune_stale_active_requests(900) == ["waiter-reuse"]
+
+        mock_agent.register_active_request("waiter-reuse")
+        assert mock_agent.cancel_current_request("waiter-reuse") is True
+        fresh_waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("waiter-reuse")
+        )
+        await asyncio.sleep(0)
+        mock_agent._cleanup_cancelled_request("waiter-reuse")
+
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+        )
+
+        try:
+            assert (
+                await fresh_waiter
+                is RequestCompletionDisposition.COMPLETED
+            )
+        finally:
+            release_old.set()
+            await old_task
 
     def test_prune_keeps_fresh_request(self, mock_agent):
         """A fresh request is not pruned."""
@@ -186,6 +933,7 @@ class TestStopEndpoint:
         # Mock agent
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
         
         client = TestClient(app)
@@ -232,6 +980,7 @@ class TestStopEndpoint:
 
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
 
         client = TestClient(app)
@@ -259,6 +1008,7 @@ class TestStopEndpoint:
         app.include_router(router)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
 
         response = TestClient(app).post(
@@ -282,6 +1032,7 @@ class TestStopEndpoint:
         app.include_router(router)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
+        mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
         app.state.agent = mock_agent
 
         response = TestClient(app).post(
@@ -664,6 +1415,25 @@ class TestStreamEndpointErrorContract:
         assert marker not in response.text
         # ...and a stable, constant safe failure body is present instead.
         assert "Error generating response." in response.text
+
+    @pytest.mark.asyncio
+    async def test_source_failure_is_not_recorded_as_abandoned_cleanup(self):
+        """A provider failure is terminal execution, not failed cleanup."""
+        from fastapi.testclient import TestClient
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("provider failed")
+            yield  # pragma: no cover
+
+        app = self._app_with_stream(_boom)
+        response = TestClient(app).post(
+            "/api/agent/stream",
+            json={"input": "hi", "request_id": "provider-failure"},
+        )
+
+        assert response.status_code == 200
+        cleanup = app.state.agent._cleanup_cancelled_request
+        cleanup.assert_called_once_with("provider-failure")
 
     @pytest.mark.asyncio
     async def test_generic_exception_body_is_constant_across_errors(self):

@@ -22,6 +22,7 @@ Usage:
         app.include_router(get_router())
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -36,6 +37,10 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     resolve_request_invocation_id,
 )
 from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+)
+from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -212,6 +217,7 @@ def get_router() -> APIRouter:
         async def event_generator():
             full_response = []
             request_lifecycle_registered = False
+            agent_stream = None
             try:
                 if hasattr(agent, "register_active_request"):
                     agent.register_active_request(request_id)
@@ -223,14 +229,18 @@ def get_router() -> APIRouter:
                 # strip it before serializing each chunk into the
                 # bridge SSE event payload.
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                async for chunk in agent.process_input_streaming(
-                    user_input,
-                    model_override=body.model_override,
-                    session_id=session.id,
-                    caller=get_caller(request),
-                    request_id=request_id,
-                    invocation_provenance=invocation_provenance,
-                ):
+                agent_stream = OwnedAsyncIterator(
+                    lambda: agent.process_input_streaming(
+                        user_input,
+                        model_override=body.model_override,
+                        session_id=session.id,
+                        caller=get_caller(request),
+                        request_id=request_id,
+                        invocation_provenance=invocation_provenance,
+                    ),
+                    operation="bridge agent stream cleanup",
+                )
+                async for chunk in agent_stream:
                     chunk = strip_revise_sentinels(chunk)
                     if not chunk:
                         continue
@@ -272,12 +282,36 @@ def get_router() -> APIRouter:
                 )
                 yield bridge_sse_error_event(e)
             finally:
-                # Bridge streams use the same counted lifecycle contract as
-                # /api/agent/stream.  Duplicate retry ids deliberately share
-                # a cancellation key; each generator releases only its own
-                # registration in this finally block.
-                if request_lifecycle_registered:
-                    agent._cleanup_cancelled_request(request_id)
+                agent_stream_cleanup_failed = False
+                try:
+                    if agent_stream is not None:
+                        await agent_stream.aclose()
+                except BaseException:
+                    agent_stream_cleanup_failed = (
+                        agent_stream is not None
+                        and agent_stream.cleanup_error is not None
+                    )
+                    raise
+                else:
+                    agent_stream_cleanup_failed = (
+                        agent_stream is not None
+                        and agent_stream.cleanup_error is not None
+                    )
+                finally:
+                    # Bridge streams use the same counted lifecycle contract as
+                    # /api/agent/stream. Duplicate retry ids deliberately share
+                    # a cancellation key; each generator releases only its own
+                    # registration after nested stream cleanup is terminal.
+                    if request_lifecycle_registered:
+                        if agent_stream_cleanup_failed:
+                            agent._cleanup_cancelled_request(
+                                request_id,
+                                disposition=(
+                                    RequestCompletionDisposition.ABANDONED
+                                ),
+                            )
+                        else:
+                            agent._cleanup_cancelled_request(request_id)
 
         return StreamingResponse(
             event_generator(),

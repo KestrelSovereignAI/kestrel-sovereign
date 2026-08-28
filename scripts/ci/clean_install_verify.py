@@ -274,7 +274,7 @@ def cmd_start_and_health(args: argparse.Namespace) -> int:
     finally:
         # Always try to stop, even if the health check failed — leaves
         # the runner clean for the DID-persistence step.
-        stop = _kestrel("stop", args.agent_name)
+        stop = _kestrel("terminate", args.agent_name)
         _write_captured(sys.stdout, stop.stdout)
         _write_captured(sys.stderr, stop.stderr)
 
@@ -374,7 +374,7 @@ def cmd_host_and_chat_503(args: argparse.Namespace) -> int:
                 "pre-#1110 misleading body. Body: " + body[:200]
             )
     finally:
-        stop = _kestrel("stop")
+        stop = _kestrel("terminate")
         _write_captured(sys.stdout, stop.stdout)
         _write_captured(sys.stderr, stop.stderr)
 

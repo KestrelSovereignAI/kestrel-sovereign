@@ -1385,6 +1385,9 @@ class KestrelAgent(
         # running. Keep lifecycle registration ownership per delivery so one
         # completion cannot unregister the other.
         self._active_request_counts: dict[str, int] = {}
+        self._active_request_generations: dict[str, int] = {}
+        self._next_request_generation = 0
+        self._abandoned_request_generations: dict[str, set[int]] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
@@ -1392,6 +1395,12 @@ class KestrelAgent(
         # that the cooperative Stop loop already understands (#3141).
         self._turn_request_ids: dict[str, str] = {}
         self._cancelled_requests: set = set()
+        self._cancelled_request_generations: set[tuple[str, int]] = set()
+        # Stop is acknowledged only after endpoint cleanup has observed the
+        # request leave execution. RequestLifecycleMixin owns these waiters.
+        self._request_completion_events: dict[
+            tuple[str, int], asyncio.Future[object]
+        ] = {}
         # Task-reentrant so a durable-identity write (rename / description /
         # discovery / user-name / SOUL) invoked as a TOOL inside a streamed turn
         # — which already holds this lock across the whole turn — re-enters
@@ -7002,6 +7011,7 @@ Expected Duration: {expected_duration}
     # - register_active_request
     # - cancel_current_request
     # - is_request_cancelled
+    # - wait_for_request_completion
     # - _cleanup_cancelled_request
 
     def resolve_effective_name(

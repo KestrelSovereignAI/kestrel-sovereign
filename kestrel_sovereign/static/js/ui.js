@@ -161,6 +161,10 @@ export const state = {
     // standalone mode). Replaced the single `isWaiting` bool so a stream
     // on Agent A doesn't make Agent B's input look "Thinking" too.
     waitingAgents: new Set(),
+    // A local stream abort is not proof that the backend turn stopped. Keep a
+    // separate fail-closed latch until /stop confirms STOPPED or
+    // ALREADY_COMPLETE; the aborted stream's finally may clear waitingAgents.
+    unconfirmedStopAgents: new Set(),
     conversations: [],
     showDecrypted: true,
     encryptedAtRest: false,
