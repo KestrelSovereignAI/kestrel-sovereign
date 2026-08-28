@@ -5749,8 +5749,12 @@ class AgentManager:
         )
 
         if receipt_failure is not None:
-            if admission.unpublished_cleanup_deferred_to_spawn:
-                self._handoff_unpublished_spawn_cleanup(admission, child)
+            # A failed revocation is ambiguous whether the signed edge remains
+            # durable.  Publication does not make that ambiguity safe: the
+            # failed spawn still owns the child until an idempotent revocation
+            # succeeds and the matching runtime is withdrawn.  Retain that
+            # cleanup owner for both prepublication and published children.
+            self._handoff_failed_spawn_cleanup(admission, child)
             admission.rollback_incomplete = True
             raise receipt_failure
 
@@ -5888,19 +5892,20 @@ class AgentManager:
             )
         return cancelled or inspection_cancelled
 
-    def _handoff_unpublished_spawn_cleanup(
+    def _handoff_failed_spawn_cleanup(
         self,
         admission: AgentOperationAdmission,
         child: KestrelAgent,
     ) -> None:
         """Retain an ambiguous receipt and its live storage until revocation.
 
-        This is the last-resort owner after both the nested load and outer spawn
-        observed a receipt-write failure. It deliberately retries the
-        idempotent restrictive replacement before closing storage. The normal
-        post-commit transport-error path settles on the first retry; a durable
-        backend outage remains visible in the existing quarantine registry and
-        keeps the routing name reserved instead of resurrecting signed power.
+        This is the last-resort owner after a prepublication receipt write or a
+        published spawn's later governance commit failed. It deliberately
+        retries the idempotent restrictive replacement before withdrawing the
+        exact runtime through the rollback path appropriate to its publication
+        state. A durable backend outage remains visible in the quarantine
+        registry and keeps the routing name reserved instead of abandoning
+        signed power.
         """
 
         async def revoke_then_shutdown() -> None:
@@ -5912,19 +5917,15 @@ class AgentManager:
                     )
                 except Exception:
                     logger.exception(
-                        "Unpublished spawn receipt revocation remains pending for %r",
+                        "Failed spawn receipt revocation remains pending for %r",
                         admission.name,
                     )
                     await asyncio.sleep(1.0)
-            await self._discard_unpublished_initialized_agent(
-                admission.name,
-                child,
-            )
-            admission.unpublished_cleanup_deferred_to_spawn = False
+            await self._rollback_uncommitted_spawn_runtime(admission, child)
 
         cleanup = asyncio.create_task(
             revoke_then_shutdown(),
-            name=f"unpublished_spawn_receipt_cleanup:{admission.name}",
+            name=f"failed_spawn_receipt_cleanup:{admission.name}",
         )
         self._retain_quarantined_cleanup(
             name=admission.name,

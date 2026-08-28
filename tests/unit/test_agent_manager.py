@@ -246,6 +246,70 @@ async def test_spawn_revokes_ambiguous_receipt_before_child_storage_closes(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_failed_published_spawn_retains_cleanup_when_receipt_revocation_fails(
+    tmp_path,
+):
+    """A signed published child keeps an owner until revocation and shutdown."""
+
+    events: list[str] = []
+
+    class TransientRevocationFailureGraph:
+        def __init__(self) -> None:
+            self.write_count = 0
+
+        async def add_trusted_cross_agent_edge(
+            self, _source, _target, _label, *, properties
+        ) -> None:
+            self.write_count += 1
+            if properties.get("parent_signature"):
+                events.append("signed")
+                return
+            if self.write_count == 2:
+                events.append("revocation-failed")
+                raise RuntimeError("revocation unavailable")
+            events.append("revoked")
+
+    graph = TransientRevocationFailureGraph()
+    child = _make_mock_agent("did:test:published-revocation-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    parent = _make_mock_agent("did:test:published-revocation-parent")
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+
+    async def create_child(name, **_kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        events.append("shutdown")
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+    manager._apply_delegated_budget = AsyncMock(
+        side_effect=RuntimeError("budget provider failed")
+    )
+
+    with pytest.raises(ExceptionGroup, match="owned rollback failed"):
+        await manager.spawn_agent(
+            "PublishedRevocationChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id),
+        )
+
+    quarantined = manager.quarantined_shutdowns()
+    assert len(quarantined) == 1
+    await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1.0)
+
+    assert events == ["signed", "revocation-failed", "revoked", "shutdown"]
+    assert manager.get_agent("PublishedRevocationChild") is None
+
+
+@pytest.mark.asyncio
 async def test_registration_rehydrates_parent_authority_after_restart(tmp_path):
     """A fresh manager derives control from the child's durable mandate projection."""
 
