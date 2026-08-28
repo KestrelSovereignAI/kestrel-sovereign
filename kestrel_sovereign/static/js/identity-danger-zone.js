@@ -41,7 +41,7 @@ export function readDangerZoneConfig(config) {
  * Resolution order:
  *   1. `delete.enabled === false`            → hidden (explicit host opt-out).
  *   2. `delete.handler` is a function        → host-mapped delete.
- *   3. native capability (`multi_agent`) + a
+ *   3. caller-scoped native delete authority + a
  *      resolvable agent name                 → Kestrel-native delete.
  *   4. otherwise                             → hidden.
  *
@@ -71,10 +71,9 @@ export function resolveDeleteAction({ identity, api, dz }) {
 
     const hostHandler = typeof del.handler === 'function' ? del.handler : null;
     // Native deletion targets the multi-agent manager's `DELETE /api/agents/{name}`
-    // endpoint, which only exists when the host runs in multi-agent mode. Gate it
-    // on the `multi_agent` capability so a pure single-agent standalone (where the
-    // endpoint 400s and self-deleting the only agent is meaningless) hides the
-    // section instead of offering a broken button.
+    // endpoint. Its GET /api/agents payload advertises this CALLER's authority;
+    // feature presence alone is not permission. Fail closed until that payload
+    // has classified the current authenticated principal.
     //
     // The manager is keyed by the ROUTING key (the selected agent name from
     // `/api/agents`, tracked by `api.getHostAgent()`), NOT the identity panel's
@@ -85,8 +84,8 @@ export function resolveDeleteAction({ identity, api, dz }) {
     ) || name;
     const canNative = !!(
         api
-        && typeof api.hasCapability === 'function'
-        && api.hasCapability('multi_agent')
+        && typeof api.canManageHostAgentLifecycle === 'function'
+        && api.canManageHostAgentLifecycle('delete')
         && agentKey
         && typeof api.deleteAgent === 'function'
     );
@@ -96,7 +95,15 @@ export function resolveDeleteAction({ identity, api, dz }) {
     const native = !hostHandler && canNative;
     const handler = hostHandler
         ? () => hostHandler(identity)
-        : () => api.deleteAgent(agentKey);
+        : () => {
+            // Authority is caller-scoped and can be revoked while the panel or
+            // confirm modal remains mounted. Re-check at the irreversible
+            // boundary rather than trusting the render-time snapshot.
+            if (!api.canManageHostAgentLifecycle('delete')) {
+                throw new Error('Delete authority is no longer available. Refresh and try again.');
+            }
+            return api.deleteAgent(agentKey);
+        };
 
     // The name the user must type to arm the button. Hosts may override it (e.g.
     // a companion display name that differs from the Kestrel agent name).
@@ -166,7 +173,14 @@ export function renderIdentityDangerZone({ container, identity, api, Modal, Toas
     const btn = container.querySelector('#danger-zone-delete-btn');
     if (btn) {
         btn.addEventListener('click', () => {
-            _openConfirmModal({ action, identity, Modal, Toast });
+            // Re-resolve after any intervening authentication or discovery
+            // refresh. A stale button must not open an actionable modal.
+            const currentAction = resolveDeleteAction({ identity, api, dz });
+            if (!currentAction.show) {
+                container.innerHTML = '';
+                return;
+            }
+            _openConfirmModal({ action: currentAction, identity, Modal, Toast });
         });
     }
     return true;

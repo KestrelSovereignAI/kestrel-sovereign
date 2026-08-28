@@ -151,6 +151,65 @@ test('request hits canonical paths — no companion-prefix rewriting (#863)', as
     assert.equal(client.isMultiAgentMode(), false);
 });
 
+test('host lifecycle controls follow caller-scoped discovery and fail closed on refresh error', async () => {
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            mode: 'multi_agent',
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(403, { detail: 'forbidden' }),
+    );
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-secret' },
+    });
+
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('create'), true);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    await assert.rejects(() => client.getAgents(), /forbidden/i);
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
+test('older lifecycle discovery cannot overwrite a newer principal classification', async () => {
+    let resolveOlder;
+    let resolveNewer;
+    const older = new Promise((resolve) => { resolveOlder = resolve; });
+    const newer = new Promise((resolve) => { resolveNewer = resolve; });
+    let call = 0;
+    const fetchFn = async () => (++call === 1 ? older : newer);
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-secret' },
+    });
+
+    const olderRefresh = client.getAgents();
+    const newerRefresh = client.getAgents();
+    resolveNewer(jsonResponse(200, {
+        agents: [],
+        can_create_agents: false,
+        can_delete_agents: false,
+    }));
+    await newerRefresh;
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+
+    resolveOlder(jsonResponse(200, {
+        agents: [],
+        can_create_agents: true,
+        can_delete_agents: true,
+    }));
+    await olderRefresh;
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
 test('renameConversation patches the conversation display name', async () => {
     const fetchFn = createFetchQueue(jsonResponse(200, {
         success: true,

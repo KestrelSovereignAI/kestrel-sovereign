@@ -221,6 +221,38 @@ test('default adapter routes by routing_name but displays the live name (#2672 P
     assert.equal(items[0].displayName, 'RenamedLive', 'the visible name is the live rename');
 });
 
+test('default adapter ignores an older discovery that resolves after a newer one', async () => {
+    let resolveOlder;
+    let resolveNewer;
+    const older = new Promise((resolve) => { resolveOlder = resolve; });
+    const newer = new Promise((resolve) => { resolveNewer = resolve; });
+    let call = 0;
+    const adapter = createDefaultAgentAdapter({
+        getAgents: async () => (++call === 1 ? older : newer),
+    });
+
+    const olderRefresh = adapter.listAgents();
+    const newerRefresh = adapter.listAgents();
+    resolveNewer({
+        mode: 'multi_agent',
+        can_create_agents: false,
+        agents: [{ name: 'OAuthAgent' }],
+    });
+    await newerRefresh;
+    assert.equal(adapter.classificationLoaded, true);
+    assert.equal(adapter.canCreateAgents, false);
+
+    resolveOlder({
+        mode: 'multi_agent',
+        can_create_agents: true,
+        agents: [{ name: 'SovereignAgent' }],
+    });
+    await olderRefresh;
+    assert.equal(adapter.canCreateAgents, false,
+        'stale sovereign capability cannot replace newer classification');
+    assert.equal(adapter.lastPayload.agents[0].name, 'OAuthAgent');
+});
+
 test('source-contract: identity.js drives mountAgentListPane, no hand-rolled agent loop', () => {
     const src = readFileSync(
         resolve(here, '../../kestrel_sovereign/static/js/identity.js'),
