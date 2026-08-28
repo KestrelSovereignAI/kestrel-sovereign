@@ -781,29 +781,43 @@ async def test_postgres_bound_add_preflights_foreign_ordinary_node_before_lock(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_postgres_bound_prelock_refuses_foreign_ordinary_node_before_lock(
-    graph_store, monkeypatch
+async def test_postgres_bound_prelock_treats_foreign_as_absent_without_row_lock(
+    graph_store,
 ):
-    """The public composed-write surface cannot lock another tenant's row."""
+    """Public prelocking neither reveals nor physically locks a foreign row."""
 
     if graph_store.db.backend_type != "postgres":
         pytest.skip("PostgreSQL has per-row locks; SQLite has one writer slot")
     owner = f"agent:{uuid.uuid4().hex}"
     foreign_owner = f"agent:{uuid.uuid4().hex}"
     foreign_id = _nid("foreign-prelock-node")
+    absent_id = _nid("absent-prelock-node")
     bound = AsyncGraphStore(graph_store.db, agent_id=owner)
     foreign = AsyncGraphStore(graph_store.db, agent_id=foreign_owner)
     await foreign.add_node(
         _node(foreign_id, {"agent_id": foreign_owner}, node_type="owned")
     )
 
-    lock = AsyncMock(return_value=[foreign_id])
-    monkeypatch.setattr(graph_store_module, "lock_graph_nodes_for_update", lock)
+    try:
+        async with graph_store.db.transaction():
+            assert await bound.lock_nodes_for_update([foreign_id]) == [foreign_id]
+            direct_foreign_update = asyncio.create_task(
+                graph_store.db.execute(
+                    "UPDATE graph_nodes SET label = ? WHERE node_id = ?",
+                    ("Foreign update completed", foreign_id),
+                )
+            )
+            await asyncio.wait_for(direct_foreign_update, timeout=1)
 
-    with pytest.raises(ValueError, match="outside the bound agent"):
-        await bound.lock_nodes_for_update([foreign_id])
-
-    lock.assert_not_awaited()
+        async with graph_store.db.transaction():
+            assert await bound.lock_nodes_for_update([absent_id]) == [absent_id]
+    finally:
+        await graph_store.db.execute(
+            "DELETE FROM graph_node_owners WHERE node_id = ?", (foreign_id,)
+        )
+        await graph_store.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ?", (foreign_id,)
+        )
 
 
 @pytest.mark.asyncio

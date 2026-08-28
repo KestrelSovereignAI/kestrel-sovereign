@@ -770,11 +770,13 @@ async def lock_graph_nodes_for_update(
     absent_ids = [
         node_id for node_id in unique_node_ids if node_id not in existing_ids
     ]
-    if agent_id:
+    if agent_id and provisional_agent_id:
         # Recheck after waiting on an absent-id reservation. A foreign writer
         # may have won the identifier between the caller's cheap preflight and
-        # this transaction's reservation, but it must never make us take that
-        # tenant's row lock.
+        # this transaction's reservation. Only the privileged legacy-root
+        # repair needs to classify that state; ordinary public prelocking must
+        # treat a foreign row exactly like an absent row and the scoped SELECT
+        # below must take no physical lock on it.
         await _preflight_bound_graph_node_locks(
             db,
             absent_ids,
@@ -882,13 +884,13 @@ class AsyncGraphStore:
         lock internally, but a workflow that will touch several nodes must take
         the whole set first so two semantic write orders cannot become opposite
         PostgreSQL lock orders. SQLite uses the same call to acquire its writer
-        slot before any read in the composed operation.
+        slot before any read in the composed operation. A bound PostgreSQL
+        store treats foreign rows exactly like absent rows: it returns the same
+        canonical identifiers while its scoped SELECT takes no physical lock
+        on rows outside the tenant.
         """
 
         materialized = tuple(node_ids)
-        await _preflight_bound_graph_node_locks(
-            self.db, materialized, self.agent_id
-        )
         return await lock_graph_nodes_for_update(
             self.db, materialized, agent_id=self.agent_id
         )
