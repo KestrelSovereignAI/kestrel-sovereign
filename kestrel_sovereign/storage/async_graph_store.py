@@ -358,7 +358,7 @@ async def reserve_provisional_agent_owner(
 
     if not agent_id:
         raise ValueError("Provisional agent ownership requires an agent_id")
-    await lock_graph_nodes_for_update(db, [agent_id])
+    await lock_graph_nodes_for_update(db, [agent_id], agent_id=agent_id)
     root = await db.fetchone(
         "SELECT node_type, properties FROM graph_nodes WHERE node_id = ?",
         (agent_id,),
@@ -424,7 +424,9 @@ async def release_graph_node_owners(
     if not agent_id:
         raise ValueError("Graph node ownership release requires an agent_id")
 
-    unique_node_ids = await lock_graph_nodes_for_update(db, node_ids)
+    unique_node_ids = await lock_graph_nodes_for_update(
+        db, node_ids, agent_id=agent_id
+    )
     affected = 0
     for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
         batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
@@ -515,6 +517,8 @@ async def _lock_graph_node_ids_for_insert(
         return unique_node_ids
     if db.backend_type != "postgres":
         return unique_node_ids
+    if not unique_node_ids:
+        return unique_node_ids
 
     if len(unique_node_ids) > _MAX_ABSENT_NODE_ADVISORY_LOCKS:
         raise ValueError(
@@ -534,6 +538,30 @@ async def _lock_graph_node_ids_for_insert(
             for node_id in unique_node_ids
         }
     )
+    # The per-call cardinality check above is not enough: nested graph writes
+    # join their caller's outer transaction, and transaction advisory locks do
+    # not release when a successful savepoint exits. Count the locks already
+    # retained by this PostgreSQL transaction and charge only genuinely new
+    # bigint keys, so 129 singleton calls cannot bypass the same 128-lock cap.
+    held_rows = await db.fetchall(
+        "SELECT classid::bigint, objid::bigint, objsubid "
+        "FROM pg_locks WHERE pid = pg_backend_pid() "
+        "AND locktype = 'advisory' AND granted"
+    )
+    held_locks = {
+        (int(row[0]), int(row[1]), int(row[2])) for row in held_rows
+    }
+    candidate_locks = set()
+    for key in advisory_keys:
+        unsigned_key = key & ((1 << 64) - 1)
+        candidate_locks.add(
+            (unsigned_key >> 32, unsigned_key & 0xFFFFFFFF, 1)
+        )
+    if len(held_locks | candidate_locks) > _MAX_ABSENT_NODE_ADVISORY_LOCKS:
+        raise ValueError(
+            "A graph write may reserve at most "
+            f"{_MAX_ABSENT_NODE_ADVISORY_LOCKS} absent node ids per transaction"
+        )
     for start in range(0, len(advisory_keys), _DELETE_ID_BATCH):
         batch = advisory_keys[start:start + _DELETE_ID_BATCH]
         values = ", ".join("(?::bigint)" for _ in batch)
@@ -546,16 +574,58 @@ async def _lock_graph_node_ids_for_insert(
     return unique_node_ids
 
 
+async def _preflight_bound_graph_node_locks(
+    db: AsyncDatabase,
+    node_ids: Iterable[str],
+    agent_id: str,
+) -> None:
+    """Reject rows outside a bound tenant before any physical lock is taken."""
+
+    if db.backend_type != "postgres" or not agent_id:
+        return
+    unique_node_ids = sorted(
+        dict.fromkeys(node_id for node_id in node_ids if node_id)
+    )
+    for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
+        batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = await db.fetchall(
+            "SELECT nodes.node_id, nodes.node_type, nodes.label, "
+            "nodes.properties, EXISTS("
+            "  SELECT 1 FROM graph_node_owners AS owner "
+            "  WHERE owner.node_id = nodes.node_id AND owner.agent_id = ?"
+            ") FROM graph_nodes AS nodes "
+            f"WHERE nodes.node_id IN ({placeholders})",
+            (agent_id, *batch),
+        )
+        for node_id, node_type, label, raw_properties, owned in rows:
+            if owned:
+                continue
+            shape = _SHARED_CONTENT_SHAPES.get((node_type, label))
+            try:
+                properties = json.loads(raw_properties) if raw_properties else {}
+            except (TypeError, ValueError):
+                properties = {}
+            if shape is not None and shape.is_shareable(properties, node_id):
+                continue
+            raise ValueError(
+                "Cannot lock a graph node outside the bound agent"
+            )
+
+
 async def lock_graph_nodes_for_update(
     db: AsyncDatabase,
     node_ids: Iterable[str],
+    *,
+    agent_id: str = "",
 ) -> List[str]:
     """Lock graph rows in the canonical order before ownership mutation.
 
     Callers own the surrounding transaction. SQLite obtains serialization from
-    that transaction's writer lock; PostgreSQL needs explicit row locks. The
-    sorted return value lets every caller process overlapping batches in the
-    same order.
+    that transaction's writer lock; PostgreSQL needs explicit row locks. When
+    ``agent_id`` is supplied, physical locks are limited to that tenant's rows
+    and valid fleet-shared content shapes. The sorted return value lets every
+    caller process overlapping batches in the same order.
     """
 
     unique_node_ids = sorted(
@@ -574,6 +644,27 @@ async def lock_graph_nodes_for_update(
     # reserve only the identifiers that are genuinely absent. All callers use
     # that same row-before-absent order, while the absent helper enforces a hard
     # bound suitable for the small composed creation sets that need it.
+    if agent_id:
+        shared_clause = " OR ".join(
+            "(graph_nodes.node_type = ? AND graph_nodes.label = ?)"
+            for _ in _SHARED_CONTENT_SHAPES
+        )
+        shared_params = tuple(
+            value for key in _SHARED_CONTENT_SHAPES for value in key
+        )
+        lock_scope = (
+            "EXISTS(SELECT 1 FROM graph_node_owners AS lock_owner "
+            "WHERE lock_owner.node_id = graph_nodes.node_id "
+            "AND lock_owner.agent_id = ?)"
+        )
+        lock_scope_params: tuple[str, ...] = (agent_id,)
+        if shared_clause:
+            lock_scope = f"({lock_scope} OR {shared_clause})"
+            lock_scope_params += shared_params
+    else:
+        lock_scope = "1 = 1"
+        lock_scope_params = ()
+
     existing_ids: set[str] = set()
     for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
         batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
@@ -581,8 +672,9 @@ async def lock_graph_nodes_for_update(
         rows = await db.fetchall(
             "SELECT node_id FROM graph_nodes "
             f"WHERE node_id IN ({placeholders}) "
+            f"AND {lock_scope} "
             "ORDER BY node_id FOR UPDATE",
-            tuple(batch),
+            (*batch, *lock_scope_params),
         )
         existing_ids.update(row[0] for row in rows)
 
@@ -590,6 +682,12 @@ async def lock_graph_nodes_for_update(
         node_id for node_id in unique_node_ids if node_id not in existing_ids
     ]
     await _lock_graph_node_ids_for_insert(db, absent_ids)
+    if agent_id:
+        # Recheck after waiting on an absent-id reservation. A foreign writer
+        # may have won the identifier between the caller's cheap preflight and
+        # this transaction's reservation, but it must never make us take that
+        # tenant's row lock.
+        await _preflight_bound_graph_node_locks(db, absent_ids, agent_id)
 
     # A creator may have committed while this transaction waited for an absent-
     # id reservation. Re-lock any such newly-present row while the reservation
@@ -600,8 +698,9 @@ async def lock_graph_nodes_for_update(
         await db.fetchall(
             "SELECT node_id FROM graph_nodes "
             f"WHERE node_id IN ({placeholders}) "
+            f"AND {lock_scope} "
             "ORDER BY node_id FOR UPDATE",
-            tuple(batch),
+            (*batch, *lock_scope_params),
         )
     return unique_node_ids
 
@@ -693,7 +792,13 @@ class AsyncGraphStore:
         slot before any read in the composed operation.
         """
 
-        return await lock_graph_nodes_for_update(self.db, node_ids)
+        materialized = tuple(node_ids)
+        await _preflight_bound_graph_node_locks(
+            self.db, materialized, self.agent_id
+        )
+        return await lock_graph_nodes_for_update(
+            self.db, materialized, agent_id=self.agent_id
+        )
 
     def _node_owner(self, node: GraphNode) -> str:
         declared = node.properties.get("agent_id") if node.properties else None
@@ -878,7 +983,9 @@ class AsyncGraphStore:
                     "Cannot overwrite a graph node owned by another agent"
                 )
         async with self.db.transaction():
-            await lock_graph_nodes_for_update(self.db, [node.node_id])
+            await lock_graph_nodes_for_update(
+                self.db, [node.node_id], agent_id=owner
+            )
             # A compatible fleet-shared row adds only an ownership witness.
             # Lock the physical row before deciding that on PostgreSQL: final-
             # owner deletion locks the same row first, so it cannot delete the
@@ -1551,7 +1658,9 @@ class AsyncGraphStore:
         # public ``AsyncStorage.transaction()`` path remains serialized too.
         # The scoped read below is deliberately repeated after locking: an
         # ownership witness can disappear between the cheap probe and the lock.
-        await lock_graph_nodes_for_update(self.db, [node_id])
+        await lock_graph_nodes_for_update(
+            self.db, [node_id], agent_id=self.agent_id
+        )
         return await self.db.fetchone(
             "SELECT node_type, label FROM graph_nodes "
             f"WHERE node_id = ? AND {scope}",
@@ -1843,7 +1952,9 @@ class AsyncGraphStore:
                 if self.db.backend_type == "postgres" and trusted_cross_agent
                 else [source_id, target_id]
             )
-            await lock_graph_nodes_for_update(self.db, lock_ids)
+            await lock_graph_nodes_for_update(
+                self.db, lock_ids, agent_id=requested_owner
+            )
             endpoint_rows = await self.db.fetchone(
                 "SELECT "
                 "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?), "

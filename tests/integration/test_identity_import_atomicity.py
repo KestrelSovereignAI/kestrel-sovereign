@@ -434,10 +434,12 @@ async def test_replace_prelocks_complete_graph_cleanup_write_set(
     lock_calls: list[tuple[str, ...]] = []
     original_lock = importer_module.lock_graph_nodes_for_update
 
-    async def observe_lock(database, node_ids):
+    async def observe_lock(database, node_ids, *, agent_id=""):
         materialized = tuple(node_ids)
         lock_calls.append(materialized)
-        return await original_lock(database, materialized)
+        return await original_lock(
+            database, materialized, agent_id=agent_id
+        )
 
     monkeypatch.setattr(
         importer_module, "lock_graph_nodes_for_update", observe_lock

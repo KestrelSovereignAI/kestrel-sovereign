@@ -613,7 +613,9 @@ class IdentityImporter:
         # before removing either component, so the two operations cannot each
         # retain one advisory lock while waiting for the other.
         await lock_graph_nodes_for_update(
-            self.db, (*user_node_ids, *skill_node_ids)
+            self.db,
+            (*user_node_ids, *skill_node_ids),
+            agent_id=agent_id,
         )
         await self._clear_graph_component(
             agent_id, "user", prelocked_node_ids=user_node_ids
@@ -673,7 +675,7 @@ class IdentityImporter:
             # the complete component before removing any edge witness;
             # release_graph_node_owners follows this order too.
             node_ids = await lock_graph_nodes_for_update(
-                self.db, discovered_node_ids
+                self.db, discovered_node_ids, agent_id=agent_id
             )
         else:
             node_ids = tuple(prelocked_node_ids)

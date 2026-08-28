@@ -100,9 +100,9 @@ async def test_replace_cleanup_locks_graph_before_removing_edge_ownership(
     real_lock = importer_module.lock_graph_nodes_for_update
     real_execute = graph_db.execute
 
-    async def observe_lock(db, node_ids):
+    async def observe_lock(db, node_ids, *, agent_id=""):
         events.append(("graph-lock", tuple(node_ids)))
-        return await real_lock(db, events[-1][1])
+        return await real_lock(db, events[-1][1], agent_id=agent_id)
 
     async def observe_execute(query, params=()):
         if query.startswith("DELETE FROM graph_edge_owners"):

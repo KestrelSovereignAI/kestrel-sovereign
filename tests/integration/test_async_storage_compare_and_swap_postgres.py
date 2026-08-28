@@ -706,6 +706,33 @@ async def test_postgres_bound_add_preflights_foreign_ordinary_node_before_lock(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_postgres_bound_prelock_refuses_foreign_ordinary_node_before_lock(
+    graph_store, monkeypatch
+):
+    """The public composed-write surface cannot lock another tenant's row."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL has per-row locks; SQLite has one writer slot")
+    owner = f"agent:{uuid.uuid4().hex}"
+    foreign_owner = f"agent:{uuid.uuid4().hex}"
+    foreign_id = _nid("foreign-prelock-node")
+    bound = AsyncGraphStore(graph_store.db, agent_id=owner)
+    foreign = AsyncGraphStore(graph_store.db, agent_id=foreign_owner)
+    await foreign.add_node(
+        _node(foreign_id, {"agent_id": foreign_owner}, node_type="owned")
+    )
+
+    lock = AsyncMock(return_value=[foreign_id])
+    monkeypatch.setattr(graph_store_module, "lock_graph_nodes_for_update", lock)
+
+    with pytest.raises(ValueError, match="outside the bound agent"):
+        await bound.lock_nodes_for_update([foreign_id])
+
+    lock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_postgres_trusted_edge_locks_only_owned_source(
     graph_store, monkeypatch
 ):
@@ -729,9 +756,9 @@ async def test_postgres_trusted_edge_locks_only_owned_source(
     original_lock = graph_store_module.lock_graph_nodes_for_update
     locked = []
 
-    async def observe_lock(db, node_ids):
+    async def observe_lock(db, node_ids, *, agent_id=""):
         locked.append(list(node_ids))
-        return await original_lock(db, node_ids)
+        return await original_lock(db, node_ids, agent_id=agent_id)
 
     monkeypatch.setattr(
         graph_store_module,
@@ -845,3 +872,36 @@ async def test_postgres_absent_write_set_advisory_reservations_are_capped(
             "WHERE pid = pg_backend_pid() AND locktype = 'advisory'"
         )
         assert held == (0,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_nested_single_node_writes_share_one_advisory_budget(
+    graph_store,
+):
+    """Singleton nested writes cannot bypass the per-transaction lock cap."""
+
+    if graph_store.db.backend_type != "postgres":
+        pytest.skip("PostgreSQL exposes transaction advisory locks")
+
+    prefix = _nid("nested-advisory-cap") + ":"
+    try:
+        async with graph_store.db.transaction():
+            for index in range(128):
+                await graph_store.add_node(
+                    _node(f"{prefix}{index}", {"index": index})
+                )
+            with pytest.raises(ValueError, match="at most 128 absent node ids"):
+                await graph_store.add_node(
+                    _node(f"{prefix}128", {"index": 128})
+                )
+            held = await graph_store.db.fetchone(
+                "SELECT COUNT(*) FROM pg_locks "
+                "WHERE pid = pg_backend_pid() AND locktype = 'advisory'"
+            )
+            assert held == (128,)
+    finally:
+        await graph_store.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id LIKE ?",
+            (f"{prefix}%",),
+        )
