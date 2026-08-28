@@ -1399,6 +1399,10 @@ class KestrelAgent(
         self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
         self._cancelled_request_generations: set[tuple[str, int]] = set()
+        # An exact Stop can race ahead of the matching HTTP request's lifecycle
+        # registration. The short-lived entry is consumed by that first
+        # generation so an acknowledged Stop cannot be followed by late work.
+        self._pending_request_cancellations: dict[str, float] = {}
         # Stop is acknowledged only after endpoint cleanup has observed the
         # request leave execution. RequestLifecycleMixin owns these waiters.
         self._request_completion_events: dict[

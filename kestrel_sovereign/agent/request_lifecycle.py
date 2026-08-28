@@ -19,6 +19,10 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 
+_PENDING_REQUEST_CANCELLATION_TTL_SECONDS = 30.0
+_PENDING_REQUEST_CANCELLATION_LIMIT = 1024
+
+
 class RequestCompletionDisposition(str, Enum):
     """What released a cooperative Stop lifecycle waiter."""
 
@@ -67,7 +71,68 @@ class RequestLifecycleMixin:
         # do not yet pass an explicit request ID.
         self._current_request_id = request_id
         _current_request_generation.set((id(self), request_id, generation))
+        self._consume_pending_request_cancellation(request_id, generation)
         return generation
+
+    def _prune_pending_request_cancellations(self, now: float) -> None:
+        pending = getattr(self, "_pending_request_cancellations", None)
+        if not isinstance(pending, dict):
+            self._pending_request_cancellations = {}
+            return
+        cutoff = now - _PENDING_REQUEST_CANCELLATION_TTL_SECONDS
+        for request_id, reserved_at in tuple(pending.items()):
+            if not isinstance(reserved_at, (int, float)) or reserved_at <= cutoff:
+                pending.pop(request_id, None)
+
+    def reserve_request_cancellation(self, request_id: str) -> None:
+        """Fence an exact request ID that may still be entering registration.
+
+        Stop and request registration are separate HTTP requests.  A Stop can
+        therefore arrive after the client dispatched a request but before its
+        handler has registered the lifecycle.  This short-lived tombstone is
+        consumed by that first registration, which cannot begin cognition even
+        if Stop already returned ``already_complete`` for the empty snapshot.
+        """
+
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("pending request cancellation requires an exact id")
+        now = time.monotonic()
+        self._prune_pending_request_cancellations(now)
+        pending = self._pending_request_cancellations
+        pending[request_id] = now
+        while len(pending) > _PENDING_REQUEST_CANCELLATION_LIMIT:
+            oldest = min(pending, key=pending.__getitem__)
+            pending.pop(oldest, None)
+
+    def _consume_pending_request_cancellation(
+        self,
+        request_id: str,
+        generation: int,
+    ) -> bool:
+        now = time.monotonic()
+        self._prune_pending_request_cancellations(now)
+        pending = self._pending_request_cancellations
+        if pending.pop(request_id, None) is None:
+            return False
+        cancelled_generations = getattr(
+            self,
+            "_cancelled_request_generations",
+            None,
+        )
+        if not isinstance(cancelled_generations, set):
+            cancelled_generations = set()
+            self._cancelled_request_generations = cancelled_generations
+        cancelled_generations.add((request_id, generation))
+        cancelled_requests = getattr(self, "_cancelled_requests", None)
+        if not isinstance(cancelled_requests, set):
+            cancelled_requests = set()
+            self._cancelled_requests = cancelled_requests
+        cancelled_requests.add(request_id)
+        logging.info(
+            "Consumed pre-registration cancellation for request lifecycle: %s",
+            request_id,
+        )
+        return True
 
     def _request_generation_for_current_task(
         self,

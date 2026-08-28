@@ -229,6 +229,19 @@ def get_router() -> APIRouter:
                 else:
                     agent._current_request_id = request_id
                 request_lifecycle_registered = True
+                request_cancelled = getattr(agent, "is_request_cancelled", None)
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    stopped_data = json.dumps(
+                        {
+                            "type": "stopped",
+                            "request_id": request_id,
+                        }
+                    )
+                    yield f"data: {stopped_data}\n\n"
+                    return
                 # Wave 5E: bridge consumers (Slack/Discord/email/etc.)
                 # don't speak the chat-protocol revise sentinel —
                 # strip it before serializing each chunk into the
@@ -244,6 +257,9 @@ def get_router() -> APIRouter:
                         invocation_provenance=invocation_provenance,
                     ),
                     operation="bridge agent stream cleanup",
+                    cleanup_requested=lambda: agent.is_request_cancelled(
+                        request_id
+                    ),
                 )
                 async for chunk in agent_stream:
                     chunk = strip_revise_sentinels(chunk)

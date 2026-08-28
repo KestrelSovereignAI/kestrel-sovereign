@@ -558,6 +558,66 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     ]
 
 
+def test_stop_before_registration_fences_the_late_request_generation() -> None:
+    """An empty Stop snapshot must still prevent its in-transit turn starting."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+
+    class LiveAgent(RequestLifecycleMixin):
+        agent_id = "did:test:registration-race"
+
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    agent = LiveAgent()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": "in-transit-turn"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stop_outcomes"][0]["disposition"] == (
+        "already_complete"
+    )
+    assert "in-transit-turn" in agent._pending_request_cancellations
+
+    generation = agent.register_active_request("in-transit-turn")
+
+    assert agent.is_request_cancelled("in-transit-turn") is True
+    assert ("in-transit-turn", generation) in agent._cancelled_request_generations
+    assert "in-transit-turn" not in agent._pending_request_cancellations
+
+
+def test_expired_pre_registration_stop_does_not_poison_a_future_reuse() -> None:
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    class LiveAgent(RequestLifecycleMixin):
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+
+    agent = LiveAgent()
+    agent.reserve_request_cancellation("eventual-reuse")
+    agent._pending_request_cancellations["eventual-reuse"] -= 31
+
+    agent.register_active_request("eventual-reuse")
+
+    assert agent.is_request_cancelled("eventual-reuse") is False
+
+
 @pytest.mark.asyncio
 async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     """The endpoint must not confuse a cancel marker with completed execution."""
