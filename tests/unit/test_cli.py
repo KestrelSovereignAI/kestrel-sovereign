@@ -928,7 +928,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
             _repoint_ports(multi_agent_env, claw=port)
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env), \
-                 patch.object(ProcessManager, "stop_agent", return_value=True), \
+                 patch.object(ProcessManager, "terminate_agent", return_value=True), \
                  patch.object(ProcessManager, "read_pid", return_value=4242), \
                  patch.object(ProcessManager, "is_process_running", return_value=True):
                 rc = cmd_stop(args)
@@ -1430,8 +1430,6 @@ class TestCmdCreate:
         """Create should assign the next available port."""
         parser = build_parser()
         args = parser.parse_args(["create", "newagent"])
-
-        agent_dir = multi_agent_env / "agent_data" / "newagent"
 
         async def fake_inception(*, output_dir, agent_name, **_kwargs):
             out = Path(output_dir)

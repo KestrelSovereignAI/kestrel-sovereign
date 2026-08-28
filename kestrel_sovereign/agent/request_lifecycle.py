@@ -94,6 +94,16 @@ class RequestLifecycleMixin:
             waiters[target_request_id] = completion
         await completion.wait()
 
+    def _resolve_request_completion(self, request_id: str) -> None:
+        """Terminally release and forget waiters for one request lifecycle."""
+
+        waiters = getattr(self, "_request_completion_events", None)
+        if not isinstance(waiters, dict):
+            return
+        completion = waiters.pop(request_id, None)
+        if completion is not None:
+            completion.set()
+
     def _cleanup_cancelled_request(self, request_id: str):
         """Remove a request from the cancelled set after it's been handled."""
         active_request_ids = getattr(self, "_active_request_ids", None)
@@ -111,11 +121,7 @@ class RequestLifecycleMixin:
         self._cancelled_requests.discard(request_id)
         if self._current_request_id == request_id:
             self._current_request_id = next(iter(active_request_ids), None) if active_request_ids else None
-        waiters = getattr(self, "_request_completion_events", None)
-        if isinstance(waiters, dict):
-            completion = waiters.pop(request_id, None)
-            if completion is not None:
-                completion.set()
+        self._resolve_request_completion(request_id)
 
     def active_request_ages(self) -> Dict[str, float]:
         """Return ``{request_id: age_seconds}`` for each active request.
@@ -176,6 +182,7 @@ class RequestLifecycleMixin:
             cancelled = getattr(self, "_cancelled_requests", None)
             if cancelled is not None:
                 cancelled.discard(rid)
+            self._resolve_request_completion(rid)
         if stale and getattr(self, "_current_request_id", None) in stale:
             self._current_request_id = (
                 next(iter(active), None) if active else None

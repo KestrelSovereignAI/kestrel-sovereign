@@ -30,6 +30,7 @@ class TestAgentCancellation:
         agent.cancel_current_request = KestrelAgent.cancel_current_request.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)
         agent.wait_for_request_completion = KestrelAgent.wait_for_request_completion.__get__(agent)
+        agent._resolve_request_completion = KestrelAgent._resolve_request_completion.__get__(agent)
         agent._cleanup_cancelled_request = KestrelAgent._cleanup_cancelled_request.__get__(agent)
         agent.active_request_ages = KestrelAgent.active_request_ages.__get__(agent)
         agent.prune_stale_active_requests = KestrelAgent.prune_stale_active_requests.__get__(agent)
@@ -411,6 +412,21 @@ class TestAgentCancellation:
         assert "stale" not in mock_agent._active_request_started_at
         # current_request_id pointed at the pruned id → cleared.
         assert mock_agent._current_request_id is None
+
+    @pytest.mark.asyncio
+    async def test_prune_resolves_and_forgets_completion_waiter(self, mock_agent):
+        mock_agent.register_active_request("stale-waiter")
+        mock_agent._active_request_started_at["stale-waiter"] -= 1000
+        waiter = asyncio.create_task(
+            mock_agent.wait_for_request_completion("stale-waiter")
+        )
+        await asyncio.sleep(0)
+        assert "stale-waiter" in mock_agent._request_completion_events
+
+        assert mock_agent.prune_stale_active_requests(900) == ["stale-waiter"]
+
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert "stale-waiter" not in mock_agent._request_completion_events
 
     def test_prune_keeps_fresh_request(self, mock_agent):
         """A fresh request is not pruned."""

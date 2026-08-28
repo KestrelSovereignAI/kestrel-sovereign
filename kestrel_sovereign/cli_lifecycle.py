@@ -245,7 +245,7 @@ def cmd_start(args) -> int:
         try:
             pm.start_agent(args.name, agent_cfg, multi_agent.host.bind, standalone=True)
         except RuntimeError as e:
-            print(f"          \u274c")
+            print("          \u274c")
             print(f"   {e}")
             return 1
 
@@ -330,7 +330,7 @@ def _start_inprocess_mode(
         orphans = pm.find_pids_on_port(multi_agent.host.port)
         print(f"   Port {multi_agent.host.port} already in use"
               + (f" by PID(s) {orphans}" if orphans else ""))
-        print(f"   Run: kestrel stop   (add --force if it doesn't die)")
+        print("   Run: kestrel stop   (add --force if it doesn't die)")
         return 1
 
     env = pm._load_env()
@@ -471,7 +471,7 @@ def cmd_stop(args) -> int:
         ap = pm._agents.get(args.name)
         if ap and ap.pid:
             print(f"   Stopping {args.name} (PID: {ap.pid})...")
-            if not pm.stop_agent(args.name):
+            if not pm.terminate_agent(args.name):
                 print(
                     f"   {args.name}: PID {ap.pid} is still running after "
                     f"SIGKILL — not reporting {args.name} as stopped"
@@ -510,7 +510,7 @@ def cmd_stop(args) -> int:
         ap = pm._agents.get(name)
         if ap and ap.pid:
             print(f"   Stopping {name} (PID: {ap.pid})...")
-            if not pm.stop_agent(name):
+            if not pm.terminate_agent(name):
                 print(
                     f"   {name}: PID {ap.pid} is still running after SIGKILL"
                 )
