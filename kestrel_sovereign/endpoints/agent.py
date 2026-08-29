@@ -1058,17 +1058,25 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        active_request_ids = set(
-            getattr(agent, "_active_request_ids", set()) or set()
-        )
-        abandoned_turns = getattr(agent, "_abandoned_request_generations", None)
-        if isinstance(abandoned_turns, dict):
-            active_request_ids.update(abandoned_turns)
-        current_turn = getattr(agent, "_current_request_id", None)
-        if isinstance(current_turn, str) and current_turn:
-            active_request_ids.add(current_turn)
-        if request_id is not None:
-            active_request_ids.add(request_id)
+        def live_request_ids() -> set[str]:
+            live_ids = set(
+                getattr(agent, "_active_request_ids", set()) or set()
+            )
+            abandoned_turns = getattr(
+                agent,
+                "_abandoned_request_generations",
+                None,
+            )
+            if isinstance(abandoned_turns, dict):
+                live_ids.update(abandoned_turns)
+            current_turn = getattr(agent, "_current_request_id", None)
+            if isinstance(current_turn, str) and current_turn:
+                live_ids.add(current_turn)
+            if request_id is not None:
+                live_ids.add(request_id)
+            return live_ids
+
+        active_request_ids = live_request_ids()
         instance_binding_accessor = vars(agent).get(
             "active_turn_request_bindings"
         )
@@ -1159,15 +1167,20 @@ async def stop_agent_request(request: Request):
                     ):
                         reserve(agent, stop_request.target)
             else:
+                # Receipt load/claim may await after the endpoint's inventory
+                # snapshot. Re-read at the cancellation linearization point so
+                # a turn registered during those awaits cannot outlive an
+                # agent-wide STOPPED receipt.
+                turns_to_cancel = active_request_ids | live_request_ids()
                 canceled = False
-                for active_request_id in sorted(active_request_ids):
+                for active_request_id in sorted(turns_to_cancel):
                     request_cancelled = agent.cancel_current_request(
                         request_id=active_request_id
                     )
                     if request_cancelled:
                         cancelled_request_ids.append(active_request_id)
                     canceled = request_cancelled or canceled
-                if not active_request_ids:
+                if not turns_to_cancel:
                     canceled = agent.cancel_current_request(request_id=None)
                     if canceled:
                         cancelled_request_ids.append(None)
