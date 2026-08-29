@@ -903,14 +903,19 @@ async def stop_agent_request(request: Request):
         # remain literal values.  Only X-Request-ID is a percent-encoded wire
         # form, so a client can copy an invoke/stream response header here
         # verbatim without forking the cancellation key.
+        body_has_request_id = "request_id" in data
+        query_has_request_id = "request_id" in request.query_params
         explicit_request_id = (
-            data.get("request_id") or request.query_params.get("request_id")
+            data["request_id"]
+            if body_has_request_id
+            else request.query_params.get("request_id")
         )
         explicit_turn_id = data.get("turn_id")
         if explicit_turn_id is None:
             explicit_turn_id = request.query_params.get("turn_id")
         has_request_address = (
-            explicit_request_id is not None
+            body_has_request_id
+            or query_has_request_id
             or request.headers.get("X-Request-ID") is not None
         )
         if explicit_turn_id is not None and has_request_address:
@@ -930,17 +935,22 @@ async def stop_agent_request(request: Request):
                 ) from error
         else:
             turn_id = None
-        request_id = (
-            resolve_request_invocation_id(
-                request,
-                {"request_id": explicit_request_id}
-                if explicit_request_id is not None
-                else {},
-            )
-            if explicit_request_id is not None
-            or request.headers.get("X-Request-ID") is not None
-            else None
-        )
+        if body_has_request_id or query_has_request_id:
+            try:
+                request_id = validate_invocation_id(explicit_request_id)
+            except ValueError as error:
+                raise ApiHTTPException(
+                    status_code=400,
+                    code="invalid_request_id",
+                    message=(
+                        "request_id must be a non-empty valid Unicode string no "
+                        f"longer than 256 characters: {error}"
+                    ),
+                ) from error
+        elif request.headers.get("X-Request-ID") is not None:
+            request_id = resolve_request_invocation_id(request, {})
+        else:
+            request_id = None
         agent = get_agent(request)
         agent_id = getattr(agent, "agent_id", None)
         if not isinstance(agent_id, str) or not agent_id.strip():
@@ -1075,7 +1085,11 @@ async def stop_agent_request(request: Request):
                 else StopScope.AGENT
             ),
             actor_id=actor_id,
-            target=turn_id or request_id or agent_id,
+            target=(
+                turn_id
+                if turn_id is not None
+                else request_id if request_id is not None else agent_id
+            ),
             target_agent_id=(
                 agent_id
                 if request_id is not None or turn_id is not None
