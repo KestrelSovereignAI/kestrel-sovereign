@@ -42,6 +42,10 @@ class SpawnMandate:
     features_allowed: list[str] = field(default_factory=list)
     purpose: str = ""
     max_child_depth: int = 0
+    # A final-DID receipt is written before routing publication so rollback
+    # always has an exact durable witness.  It is deliberately non-authoritative
+    # until budget and governance admission have both succeeded.
+    authority_committed: bool = True
     parent_signature: Optional[str] = None
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -100,6 +104,12 @@ class SpawnMandate:
             "max_child_depth": self.max_child_depth,
             "created_at": self.created_at,
         }
+        # Committed receipts omit the marker to preserve verification of every
+        # receipt written before this two-phase admission field existed.  A
+        # pending receipt binds ``False`` into its signature, so deleting or
+        # flipping the stored marker invalidates that signature.
+        if not self.authority_committed:
+            payload["authority_committed"] = False
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
         )
@@ -116,7 +126,7 @@ class SpawnMandate:
         receipt cannot be verified after restart.
         """
 
-        return {
+        properties = {
             "constitution_hash": self.constitution_hash,
             "additional_constraints": dict(self.additional_constraints),
             "budget_allocation": self._wire_budget_allocation(),
@@ -127,6 +137,9 @@ class SpawnMandate:
             "parent_signature": self.parent_signature,
             "created_at": self.created_at,
         }
+        if not self.authority_committed:
+            properties["authority_committed"] = False
+        return properties
 
 
 def remaining_spawn_ttl_seconds(

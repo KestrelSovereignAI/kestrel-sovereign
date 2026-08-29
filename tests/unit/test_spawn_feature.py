@@ -38,6 +38,11 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
     return agent
 
 
+def _register_spawn_parent(manager: AgentManager, parent) -> None:
+    manager._agents["Parent"] = parent
+    manager._agent_names[parent.agent_id] = "Parent"
+
+
 async def _persist_and_publish_spawn_test_child(manager, name, child) -> None:
     child._raw_storage = SimpleNamespace(
         graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
@@ -1171,6 +1176,7 @@ class TestSpawnFeatureWithManager:
         parent = _make_mock_agent("did:parent")
         child = HostileChild()
         manager = AgentManager()
+        _register_spawn_parent(manager, parent)
         manager._agents["helper"] = child
         manager._agent_names[child.agent_id] = "helper"
         manager._parent_children[parent.agent_id] = ["helper"]
@@ -2104,6 +2110,7 @@ class TestAgentManagerSpawn:
         child = _make_mock_agent("did:child")
 
         manager = AgentManager()
+        _register_spawn_parent(manager, parent)
 
         # No budget here — this test covers spawn tracking, not budget
         # enforcement (which requires a funded parent wallet; see
@@ -2135,6 +2142,7 @@ class TestAgentManagerSpawn:
         parent._private_key, _ = generate_secp256k1_keypair()
 
         manager = AgentManager()
+        _register_spawn_parent(manager, parent)
         manager._agents["helper"] = _make_mock_agent("did:existing")
 
         mandate = SpawnMandate(parent_did="did:parent", purpose="test")
@@ -2151,6 +2159,7 @@ class TestAgentManagerSpawn:
         child = _make_mock_agent("did:child")
         child.shutdown.side_effect = RuntimeError("shutdown refused")
         manager = AgentManager()
+        _register_spawn_parent(manager, parent)
         mandate = SpawnMandate(parent_did="did:parent", purpose="test")
 
         async def create_and_publish(name, **_kwargs):
@@ -2186,6 +2195,7 @@ class TestAgentManagerSpawn:
         child = _make_mock_agent("did:child")
         child.shutdown.side_effect = RuntimeError("shutdown refused")
         manager = AgentManager()
+        _register_spawn_parent(manager, parent)
         mandate = SpawnMandate(parent_did="did:parent", purpose="test")
 
         async def create_and_publish(name, **_kwargs):
@@ -2226,6 +2236,7 @@ class TestAgentManagerSpawn:
         parent._private_key, _ = generate_secp256k1_keypair()
         child = _make_mock_agent("did:child")
         manager = AgentManager()
+        _register_spawn_parent(manager, parent)
         mandate = SpawnMandate(parent_did="did:parent", purpose="test")
         budget_entry = (object(), object())
         budget_started = asyncio.Event()

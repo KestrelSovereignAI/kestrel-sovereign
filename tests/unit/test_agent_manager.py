@@ -35,6 +35,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     AgentOperationAdmission,
     AgentManager,
     ChildTerminationReconciliationError,
+    QuarantinedShutdownHistory,
     RUNTIME_OFFBOARD_TIMEOUT_S,
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
@@ -149,6 +150,39 @@ async def test_signed_receipt_round_trip_preserves_integer_budget_signature():
     assert restored is not None
     assert type(restored.budget_allocation) is int
     assert verify_mandate(restored, public_key)
+
+
+def test_pending_signed_receipt_cannot_restore_governance(tmp_path):
+    """A crash between publication and governance commit restores no authority."""
+
+    parent_did = "did:pkh:eip155:1:0xPendingParent"
+    child_did = "did:pkh:eip155:1:0xPendingChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    mandate.authority_committed = False
+    sign_mandate(mandate, parent._private_key)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("PendingParent", parent)
+
+    with pytest.raises(RuntimeError, match="never completed governance"):
+        manager._register_agent("PendingChild", child)
+
+    assert manager.get_agent("PendingChild") is None
+    assert manager.get_children(parent_did) == []
+
+
+def test_pending_receipt_marker_is_bound_by_parent_signature():
+    private_key, public_key = generate_secp256k1_keypair()
+    mandate = SpawnMandate(
+        parent_did="did:parent-pending",
+        child_did="did:child-pending",
+        authority_committed=False,
+    )
+    sign_mandate(mandate, private_key)
+    mandate.authority_committed = True
+
+    assert verify_mandate(mandate, public_key) is False
 
 
 @pytest.mark.asyncio
@@ -525,6 +559,42 @@ async def test_delete_refuses_spawn_cleanup_owned_by_quarantine(tmp_path):
         release_cleanup.set()
         await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1)
     assert graph.closed is True
+
+
+@pytest.mark.asyncio
+async def test_settled_quarantine_failure_allows_exact_cleanup_retry(tmp_path):
+    """Unsafe history reserves name reuse without denying remediation."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    child_name = "RetainedRefund"
+    canonical = manager._canonical_agent_name(child_name)
+    manager._unsafe_quarantined_shutdown_failures["1:RetainedRefund"] = (
+        QuarantinedShutdownHistory(
+            reaper_id="1:RetainedRefund",
+            agent_name=child_name,
+            canonical_agent_name=canonical,
+            agent_id="did:test:retained-refund",
+            started_monotonic=1.0,
+            completed_monotonic=2.0,
+            failure="RuntimeError: refund failed",
+        )
+    )
+    delegated = SimpleNamespace(
+        allocation=SimpleNamespace(child_did="did:test:retained-refund")
+    )
+    manager._child_budgets[child_name] = (delegated, object())
+
+    async def succeed_on_retry(name):
+        assert name == child_name
+        manager._child_budgets.pop(name)
+        return False
+
+    manager._release_child_budget_cancellation_safe = succeed_on_retry
+
+    assert await manager.remove_agent(child_name) is True
+    assert child_name not in manager._child_budgets
+    with pytest.raises(RuntimeError, match="unresolved quarantined cleanup"):
+        await manager._admit_agent_operation(child_name, kind="create")
 
 
 @pytest.mark.asyncio
@@ -7186,18 +7256,43 @@ class TestSpawnAgent:
         manager = AgentManager(base_data_dir=tmp_path)
         _register_spawn_parent(manager, parent)
         mandate = SpawnMandate(parent_did=parent.agent_id, purpose="signed")
+        events = []
+
+        async def record_receipt(*_args, properties):
+            events.append(
+                (
+                    "receipt",
+                    properties.get("authority_committed", True),
+                    properties["parent_signature"],
+                )
+            )
+
+        graph.add_trusted_cross_agent_edge.side_effect = record_receipt
+
+        async def apply_budget(*_args, **_kwargs):
+            events.append(("budget", None, None))
+
+        manager._apply_delegated_budget = AsyncMock(side_effect=apply_budget)
 
         with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
             await manager.spawn_agent("SignedChild", parent, mandate)
 
         assert mandate.child_did == child.agent_id
         assert verify_mandate(mandate, public_key)
-        graph.add_trusted_cross_agent_edge.assert_awaited_once_with(
+        assert [event[:2] for event in events] == [
+            ("receipt", False),
+            ("budget", None),
+            ("receipt", True),
+        ]
+        assert events[0][2] != events[2][2]
+        assert graph.add_trusted_cross_agent_edge.await_count == 2
+        final_write = graph.add_trusted_cross_agent_edge.await_args
+        assert final_write.args == (
             child.agent_id,
             parent.agent_id,
             "spawned_by",
-            properties=mandate.to_edge_properties(),
         )
+        assert final_write.kwargs["properties"] == mandate.to_edge_properties()
         assert child._persisted_spawn_mandate is mandate
         assert child.spawn_mandate is runtime_projection
 

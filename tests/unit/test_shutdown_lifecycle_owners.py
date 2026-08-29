@@ -3220,7 +3220,10 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
         identity=None,
         features={},
         wallet=None,
+        shutdown=AsyncMock(),
     )
+    manager._agents["spawn-fenced-parent"] = parent
+    manager._agent_names[parent.agent_id] = "spawn-fenced-parent"
     budget_entered = asyncio.Event()
     allow_budget = asyncio.Event()
 

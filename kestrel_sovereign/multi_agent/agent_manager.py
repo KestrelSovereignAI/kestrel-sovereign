@@ -1817,6 +1817,10 @@ class AgentManager:
         # trusted identity.
         if not mandate.parent_signature:
             return
+        if not mandate.authority_committed:
+            raise RuntimeError(
+                "Refusing to restore a spawn receipt that never completed governance"
+            )
         parent_matches = [
             (candidate_name, candidate)
             for candidate_name, candidate in self._agents.items()
@@ -2405,15 +2409,23 @@ class AgentManager:
 
         retained_name_key = _bounded_shutdown_metadata(canonical_name)
         return (
-            any(
-                record.canonical_agent_name == retained_name_key
-                for record in self._quarantined_shutdown_reapers.values()
-            )
+            self._active_quarantined_cleanup_name_is_reserved(canonical_name)
             or any(
                 record.canonical_agent_name == retained_name_key
                 for record in self._unsafe_quarantined_shutdown_failures.values()
             )
             or self._unsafe_quarantined_shutdown_failure_overflow_reserved
+        )
+
+    def _active_quarantined_cleanup_name_is_reserved(
+        self, canonical_name: str
+    ) -> bool:
+        """Whether a live quarantine owner is already cleaning this name."""
+
+        retained_name_key = _bounded_shutdown_metadata(canonical_name)
+        return any(
+            record.canonical_agent_name == retained_name_key
+            for record in self._quarantined_shutdown_reapers.values()
         )
 
     def _retained_child_tracking_name_is_reserved(
@@ -3370,7 +3382,7 @@ class AgentManager:
             if join_cancelled:
                 raise asyncio.CancelledError()
             async with self._lock:
-                if self._quarantined_cleanup_name_is_reserved(
+                if self._active_quarantined_cleanup_name_is_reserved(
                     self._canonical_agent_name(name)
                 ):
                     raise RuntimeError(
@@ -5889,6 +5901,7 @@ class AgentManager:
             # DID exists. Establish the signed window at this last prepublication
             # seam so slow inception cannot consume the child's authority TTL.
             mandate.created_at = datetime.now(timezone.utc).isoformat()
+            mandate.authority_committed = False
             sign_mandate(
                 mandate,
                 parent_private_key,
@@ -6009,10 +6022,36 @@ class AgentManager:
                                     raise RuntimeError(
                                         "Spawn cap reservation was lost before commit"
                                     )
+                    if capacity_waiter is None:
+                        # Only after provider custody and every governance/cap
+                        # check have succeeded may the durable receipt become
+                        # authoritative.  The A2A lifecycle writer prevents a
+                        # cold restore or DELETE from crossing this two-phase
+                        # transition.
+                        await self._commit_spawn_receipt_authority(
+                            admission,
+                            child,
+                            mandate,
+                            parent_private_key=parent_private_key,
+                            parent_identity=(
+                                parent_identity if parent_is_hybrid else None
+                            ),
+                        )
+                        async with self._lock:
+                            if not self._spawn_operation_is_admitted(
+                                admission, child
+                            ):
+                                raise RuntimeError(
+                                    "Spawn was fenced while its durable receipt committed"
+                                )
+                            if admission.kind == "spawn":
+                                if not admission.spawn_slot_active:
+                                    raise RuntimeError(
+                                        "Spawn cap reservation was lost before commit"
+                                    )
                                 self._pending_spawns -= 1
                                 admission.spawn_slot_active = False
                                 self._resolve_spawn_slot_terminal(admission)
-                        if capacity_waiter is None:
                             children = self._parent_children.setdefault(
                                 parent_did,
                                 [],
@@ -6076,6 +6115,49 @@ class AgentManager:
                         )
                     raise cleanup_failure
             raise
+
+    async def _commit_spawn_receipt_authority(
+        self,
+        admission: AgentOperationAdmission,
+        child: KestrelAgent,
+        mandate: SpawnMandate,
+        *,
+        parent_private_key: object,
+        parent_identity: object | None,
+    ) -> None:
+        """Promote one pending final-DID receipt after governance admission."""
+
+        graph = admission.spawn_receipt_graph
+        if graph is None:
+            if admission.kind == "direct-spawn-test":
+                return
+            raise RuntimeError("Spawn authority receipt witness is unavailable")
+        source_id = admission.spawn_receipt_source_id
+        target_id = admission.spawn_receipt_target_id
+        if not isinstance(source_id, str) or not isinstance(target_id, str):
+            raise RuntimeError("Spawn authority receipt witness is incomplete")
+        replace_edge = getattr(graph, "add_trusted_cross_agent_edge", None)
+        if not callable(replace_edge):
+            raise RuntimeError("Spawn authority receipt graph is not writable")
+
+        mandate.authority_committed = True
+        sign_mandate(
+            mandate,
+            parent_private_key,
+            parent_identity=parent_identity,
+        )
+        properties = mandate.to_edge_properties()
+        admission.spawn_receipt_unsigned_properties = {
+            **properties,
+            "parent_signature": None,
+        }
+        await replace_edge(
+            source_id,
+            target_id,
+            "spawned_by",
+            properties=properties,
+        )
+        child._persisted_spawn_mandate = mandate
 
     def _spawn_operation_is_admitted(
         self, admission: AgentOperationAdmission, child: KestrelAgent
@@ -6655,6 +6737,7 @@ class AgentManager:
             if (
                 not isinstance(mandate, SpawnMandate)
                 or not mandate.parent_signature
+                or not mandate.authority_committed
                 or not isinstance(mandate.child_did, str)
                 or not mandate.child_did
             ):
@@ -6682,7 +6765,11 @@ class AgentManager:
                     raise SpawnAuthorityGraphError(
                         "Signed spawn authority durable receipt is unreadable"
                     ) from error
-                if durable is None or not durable.parent_signature:
+                if (
+                    durable is None
+                    or not durable.parent_signature
+                    or not durable.authority_committed
+                ):
                     # Another host may revoke or downgrade the edge while this
                     # process still has a cache projection. Absence is the
                     # immediate absence of authority.

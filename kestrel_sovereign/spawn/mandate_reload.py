@@ -96,6 +96,7 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
     parent_signature = props.get("parent_signature")
     ttl_seconds = props.get("ttl_seconds", 3600)
     max_child_depth = props.get("max_child_depth", 0)
+    authority_committed = props.get("authority_committed", True)
     if not isinstance(purpose, str):
         raise TypeError("spawned_by purpose must be a string")
     if not isinstance(constitution_hash, str):
@@ -110,6 +111,8 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
         raise TypeError("spawned_by ttl_seconds must be an integer")
     if not isinstance(max_child_depth, int) or isinstance(max_child_depth, bool):
         raise TypeError("spawned_by max_child_depth must be an integer")
+    if not isinstance(authority_committed, bool):
+        raise TypeError("spawned_by authority_committed must be a boolean")
     # ``ttl_seconds <= 0`` is the documented persistent-child sentinel.  Keep
     # its exact value on the authority projection; only delegation depth is a
     # non-negative bound.
@@ -129,6 +132,7 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
         # compare numerically but serialize differently in the signed payload.
         "budget_allocation": budget_allocation,
         "parent_signature": parent_signature,
+        "authority_committed": authority_committed,
         # Legacy parent-only edges predate mandate timestamps.  Preserve that
         # absence instead of manufacturing a fresh validity window at boot.
         "created_at": created_at,
