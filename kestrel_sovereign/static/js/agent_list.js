@@ -28,6 +28,12 @@ import { escapeHtml as sharedEscapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import { storeGet, storeSet } from './ui_state.mjs';
 
+// One pane owns one set of component listeners. A host may remount into
+// adopted chrome without first retaining/destroying the old handle; carrying
+// ownership on the container lets the new mount retire the old listeners
+// before adopting the same buttons (#3155).
+const AGENT_LIST_PANE_OWNER = Symbol.for('kestrel.agentListPane.owner');
+
 // ============================================================================
 // Default adapter — the standalone console's `/api/agents` data source
 // ============================================================================
@@ -462,7 +468,13 @@ export function mountAgentListPane(containerEl, config = {}) {
         || (typeof document !== 'undefined' ? document : null);
     if (!doc) throw new Error('mountAgentListPane requires a document');
 
+    const priorOwner = containerEl[AGENT_LIST_PANE_OWNER];
+    if (priorOwner && typeof priorOwner.destroy === 'function') {
+        priorOwner.destroy();
+    }
+
     const storageKey = config.storageKey || 'kestrel:agents-pane';
+    const api = config.api || API;
     const KEY_WIDTH = `${storageKey}:width`;
     const KEY_COLLAPSED = `${storageKey}:collapsed`;
     const minWidth = Number.isFinite(config.minWidth) ? config.minWidth : 200;
@@ -544,6 +556,8 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
 
     // --- Mount the shared list surface into the body -----------------------
+    let loadedItems = [];
+    let updateStopAllState = () => {};
     const listHandle = mountAgentList(body, {
         api: config.api,
         adapter: config.adapter,
@@ -552,7 +566,11 @@ export function mountAgentListPane(containerEl, config = {}) {
         isThinking: config.isThinking,
         onStop: config.onStop,
         onSelect: config.onSelect,
-        onLoaded: config.onLoaded,
+        onLoaded: (items, meta) => {
+            loadedItems = Array.isArray(items) ? items : [];
+            updateStopAllState();
+            if (typeof config.onLoaded === 'function') config.onLoaded(items, meta);
+        },
         onError: config.onError,
         autoLoad: config.autoLoad,
         autoSelectFirst: config.autoSelectFirst,
@@ -561,6 +579,142 @@ export function mountAgentListPane(containerEl, config = {}) {
         emptyText: config.emptyText,
         errorText: config.errorText,
     });
+
+    // --- Fleet cooperative Stop (andon cord) -------------------------------
+    // This control belongs to the shared pane, not identity.js, so every host
+    // that adopts or embeds mountAgentListPane receives the same behavior. The
+    // server owns target resolution and fan-out; this component submits one
+    // host request and renders every typed result without collapsing partial
+    // refusal/unreachability into success.
+    let stopAllBtn = header.querySelector('.agent-stop-all-btn');
+    const builtStopAllBtn = !stopAllBtn;
+    if (!stopAllBtn) {
+        stopAllBtn = doc.createElement('button');
+        stopAllBtn.type = 'button';
+        stopAllBtn.className = 'agent-stop-all-btn';
+        stopAllBtn.textContent = 'Stop all';
+        header.insertBefore(stopAllBtn, collapseBtn);
+    }
+    stopAllBtn.title = 'Cooperatively stop all in-flight agent work';
+    stopAllBtn.setAttribute('aria-label', 'Stop all in-flight agents');
+
+    const stopAllResults = doc.createElement('div');
+    stopAllResults.className = 'agent-stop-all-results';
+    stopAllResults.setAttribute('role', 'status');
+    stopAllResults.setAttribute('aria-live', 'polite');
+    stopAllResults.hidden = true;
+    body.insertBefore(stopAllResults, listHandle.element);
+
+    let stopAllPending = false;
+    function inFlightCount() {
+        return listHandle.element.querySelectorAll('.agent-card.agent-thinking').length;
+    }
+    updateStopAllState = () => {
+        const count = inFlightCount();
+        const seamAvailable = !!(api && typeof api.stopHost === 'function');
+        stopAllBtn.disabled = stopAllPending || count === 0 || !seamAvailable;
+        stopAllBtn.dataset.inFlightCount = String(count);
+        stopAllBtn.title = count > 0
+            ? `Cooperatively stop ${count} in-flight agent${count === 1 ? '' : 's'}`
+            : 'No agent work is currently in flight';
+    };
+
+    function displayTarget(outcome) {
+        const ids = [outcome && outcome.agent_id, outcome && outcome.resolved_target]
+            .filter((value) => typeof value === 'string' && value);
+        const item = loadedItems.find((candidate) => {
+            if (!candidate) return false;
+            const candidateIds = [
+                candidate.id,
+                candidate.name,
+                candidate.raw && candidate.raw.did,
+                candidate.raw && candidate.raw.id,
+            ];
+            return candidateIds.some((value) => ids.includes(value));
+        });
+        return (item && (item.displayName || item.name)) || ids[0] || 'Unknown target';
+    }
+
+    function renderStopAllOutcomes(response) {
+        const outcomes = Array.isArray(response)
+            ? response
+            : (response && Array.isArray(response.outcomes) ? response.outcomes : null);
+        stopAllResults.hidden = false;
+        stopAllResults.textContent = '';
+        if (!outcomes || outcomes.length === 0) {
+            stopAllResults.textContent = 'No cooperative Stop target resolved; outcome is indeterminate.';
+            return;
+        }
+
+        const counts = new Map();
+        const list = doc.createElement('ul');
+        for (const outcome of outcomes) {
+            const disposition = outcome && typeof outcome.disposition === 'string'
+                ? outcome.disposition
+                : 'indeterminate';
+            counts.set(disposition, (counts.get(disposition) || 0) + 1);
+            const row = doc.createElement('li');
+            row.dataset.disposition = disposition;
+            row.textContent = `${displayTarget(outcome)}: ${disposition}`;
+            if (outcome && typeof outcome.detail === 'string' && outcome.detail) {
+                row.textContent += ` — ${outcome.detail}`;
+            }
+            list.appendChild(row);
+        }
+        const summary = doc.createElement('p');
+        summary.textContent = `Stop All results: ${Array.from(counts.entries())
+            .map(([name, count]) => `${count} ${name}`)
+            .join(', ')}.`;
+        stopAllResults.appendChild(summary);
+        stopAllResults.appendChild(list);
+    }
+
+    const confirmStopAll = typeof config.confirmStopAll === 'function'
+        ? config.confirmStopAll
+        : ((message) => (
+            typeof window !== 'undefined' && typeof window.confirm === 'function'
+                ? window.confirm(message)
+                : false
+        ));
+    const onStopAllClick = async () => {
+        const count = inFlightCount();
+        updateStopAllState();
+        if (count === 0 || stopAllPending || !api || typeof api.stopHost !== 'function') return;
+        const noun = count === 1 ? 'agent' : 'agents';
+        if (!confirmStopAll(`Stop all ${count} in-flight ${noun}?`)) return;
+        stopAllPending = true;
+        updateStopAllState();
+        try {
+            const response = await api.stopHost({
+                reason: config.stopAllReason || 'Stopped from the agents banner',
+            });
+            renderStopAllOutcomes(response);
+            if (typeof config.onStopAllOutcomes === 'function') {
+                config.onStopAllOutcomes(response);
+            }
+        } catch (error) {
+            stopAllResults.hidden = false;
+            stopAllResults.textContent = `Stop All failed: ${error && error.message ? error.message : 'request failed'}`;
+        } finally {
+            stopAllPending = false;
+            updateStopAllState();
+        }
+    };
+    stopAllBtn.addEventListener('click', onStopAllClick);
+
+    const MutationObserverCtor = doc.defaultView && doc.defaultView.MutationObserver;
+    const busyObserver = MutationObserverCtor
+        ? new MutationObserverCtor(() => updateStopAllState())
+        : null;
+    if (busyObserver) {
+        busyObserver.observe(listHandle.element, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+    }
+    updateStopAllState();
 
     // --- "+ New" header action (adopt existing, else build) ----------------
     // Component-owned so embed hosts — which never run the console's
@@ -665,8 +819,17 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
     resizeHandle.addEventListener('mousedown', onResizeDown);
 
+    let destroyed = false;
+    let handle = null;
     function destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        if (paneEl[AGENT_LIST_PANE_OWNER] === handle) {
+            delete paneEl[AGENT_LIST_PANE_OWNER];
+        }
         collapseBtn.removeEventListener('click', onCollapseClick);
+        stopAllBtn.removeEventListener('click', onStopAllClick);
+        if (busyObserver) busyObserver.disconnect();
         if (newBtn && onNewClick) newBtn.removeEventListener('click', onNewClick);
         resizeHandle.removeEventListener('mousedown', onResizeDown);
         doc.removeEventListener('mousemove', onMouseMove);
@@ -675,13 +838,14 @@ export function mountAgentListPane(containerEl, config = {}) {
         // Remove only chrome this mount built; adopted chrome is left in place.
         if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
         if (builtNewBtn && newBtn) newBtn.remove();
+        if (builtStopAllBtn && stopAllBtn) stopAllBtn.remove();
         // The built resize handle too (codex P2): a leaked absolutely-positioned
         // .resize-handle overlays the container edge and gets ADOPTED by the
         // next mount into the same container, doubling listeners over time.
         if (builtResizeHandle && resizeHandle) resizeHandle.remove();
     }
 
-    return {
+    handle = {
         element: paneEl,
         list: listHandle,
         refresh: (...a) => listHandle.refresh(...a),
@@ -691,7 +855,10 @@ export function mountAgentListPane(containerEl, config = {}) {
         open,
         close,
         toggle,
+        refreshStopAllState: updateStopAllState,
         get collapsed() { return isCollapsed(); },
         destroy,
     };
+    paneEl[AGENT_LIST_PANE_OWNER] = handle;
+    return handle;
 }

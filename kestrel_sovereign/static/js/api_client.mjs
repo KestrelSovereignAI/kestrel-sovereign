@@ -1405,6 +1405,15 @@ export function createApiClient({
                 ? client.requestForAgent('/api/agent/stop', opts, agent)
                 : client.request('/api/agent/stop', opts);
         },
+        // Fleet cooperative Stop is a host control-plane operation. It must
+        // never inherit the currently selected agent prefix and it never calls
+        // the process lifecycle API; the host resolves the live targets and
+        // returns one typed outcome for each of them (#3155).
+        stopHost: (payload = {}) => client.requestHost('/api/host/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
         getModels: (options = {}) => {
             const params = new URLSearchParams();
             if (options.featuredOnly !== undefined) params.append('featured_only', options.featuredOnly);

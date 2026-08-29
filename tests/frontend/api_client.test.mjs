@@ -808,6 +808,28 @@ test('requestHost sends no CSRF token on safe (GET) host requests (#2293)', asyn
     assert.equal(fetchFn.calls[0].options.headers['X-CSRF-Token'], undefined);
 });
 
+test('stopHost is wired to the host-root cooperative Stop door', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        outcomes: [{ agent_id: 'did:agent:emma', disposition: 'stopped' }],
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'machine-key' },
+    });
+    await client.init();
+
+    const result = await client.stopHost({ reason: 'operator andon cord' });
+
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(fetchFn.calls[0].url, '/api/host/stop', 'never agent-prefixed');
+    assert.equal(fetchFn.calls[0].options.method, 'POST');
+    assert.deepEqual(
+        JSON.parse(fetchFn.calls[0].options.body),
+        { reason: 'operator andon cord' },
+    );
+    assert.equal(result.outcomes[0].disposition, 'stopped');
+});
+
 test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
     const { client } = createClient({ fetchFn: createFetchQueue() });
 

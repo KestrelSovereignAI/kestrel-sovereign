@@ -361,6 +361,42 @@ nav {
     color: rgba(255, 255, 255, 0.85);
 }
 
+/* Fleet cooperative Stop belongs to the shared agents-pane banner. It is
+   intentionally styled apart from process shutdown controls: this button asks
+   live turns to stop and renders the typed per-target receipt outcomes below. */
+.agent-stop-all-btn {
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: 0.2rem 0.45rem;
+}
+.agent-stop-all-btn:not(:disabled):hover {
+    background: var(--error, #dc2626);
+    border-color: var(--error, #dc2626);
+    color: white;
+}
+.agent-stop-all-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+.agent-stop-all-results {
+    border-bottom: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    padding: 0.5rem 0.75rem;
+}
+.agent-stop-all-results p,
+.agent-stop-all-results ul {
+    margin: 0;
+}
+.agent-stop-all-results ul {
+    margin-top: 0.25rem;
+    padding-left: 1rem;
+}
+
 /* mountAgentList (#2278, design §3.2): the shared list surface budgets vertical
    room for a per-card actions row by DEFAULT so a host's portrait-card renderer
    has real space for buttons under the portrait — that budget is a component

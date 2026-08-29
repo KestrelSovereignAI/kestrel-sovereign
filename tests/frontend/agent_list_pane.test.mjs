@@ -354,3 +354,130 @@ test('adopted body nested inside foreign chrome does not throw (built-header rep
     assert.ok(nestedBody.querySelector('.agent-list-root'), 'list mounts into the adopted nested body');
     handle.destroy();
 });
+
+test('Stop All is disabled without live work and confirms the exact in-flight count', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const busy = new Set(['Emma', 'Kite']);
+    const confirmations = [];
+    const stopCalls = [];
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([
+            { name: 'Emma', id: 'did:agent:emma', status: 'online' },
+            { name: 'Kite', id: 'did:agent:kite', status: 'online' },
+            { name: 'Talon', id: 'did:agent:talon', status: 'online' },
+        ]),
+        isThinking: (name) => busy.has(name),
+        api: {
+            stopHost: async (payload) => {
+                stopCalls.push(payload);
+                return {
+                    outcomes: [
+                        {
+                            agent_id: 'did:agent:emma',
+                            resolved_target: 'did:agent:emma',
+                            disposition: 'stopped',
+                        },
+                        {
+                            agent_id: 'did:agent:kite',
+                            resolved_target: 'did:agent:kite',
+                            disposition: 'refused',
+                            detail: 'target declined cooperative Stop',
+                        },
+                    ],
+                };
+            },
+        },
+        confirmStopAll: (message) => {
+            confirmations.push(message);
+            return true;
+        },
+        storageKey: 'a:test-stop-all-count',
+    });
+    await tick();
+
+    const button = el.querySelector('.agent-stop-all-btn');
+    assert.ok(button, 'pane owns a visible Stop All control');
+    assert.equal(button.disabled, false, 'control is enabled while work is live');
+    button.click();
+    await tick();
+
+    assert.equal(stopCalls.length, 1, 'one host Stop request fan-outs server-side');
+    assert.match(confirmations[0], /2 in-flight agents/, 'confirmation names the live count');
+    const report = el.querySelector('.agent-stop-all-results');
+    assert.match(report.textContent, /Emma: stopped/, 'successful target remains visible');
+    assert.match(report.textContent, /Kite: refused/, 'partial refusal remains visible');
+    assert.match(report.textContent, /target declined cooperative Stop/, 'typed detail is not collapsed');
+    handle.destroy();
+});
+
+test('Stop All never calls the host seam when no agent is in flight', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    let calls = 0;
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
+        isThinking: () => false,
+        api: { stopHost: async () => { calls += 1; return { outcomes: [] }; } },
+        confirmStopAll: () => true,
+        storageKey: 'a:test-stop-all-idle',
+    });
+    await tick();
+
+    const button = el.querySelector('.agent-stop-all-btn');
+    assert.equal(button.disabled, true, 'idle fleet cannot issue Stop All');
+    button.click();
+    await tick();
+    assert.equal(calls, 0, 'disabled action never calls lifecycle or Stop APIs');
+    handle.destroy();
+});
+
+test('Stop All reports an empty or malformed fan-out as indeterminate, never success', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
+        isThinking: () => true,
+        api: { stopHost: async () => ({ outcomes: [] }) },
+        confirmStopAll: () => true,
+        storageKey: 'a:test-stop-all-empty',
+    });
+    await tick();
+
+    el.querySelector('.agent-stop-all-btn').click();
+    await tick();
+    const report = el.querySelector('.agent-stop-all-results');
+    assert.match(report.textContent, /No cooperative Stop target resolved/);
+    assert.doesNotMatch(report.textContent, /all stopped/i);
+    handle.destroy();
+});
+
+test('re-mounting an adopted pane replaces Stop All ownership without duplicate controls or handlers', async () => {
+    const el = makeConsolePane();
+    let firstCalls = 0;
+    let secondCalls = 0;
+    mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
+        isThinking: () => true,
+        api: { stopHost: async () => { firstCalls += 1; return { outcomes: [] }; } },
+        confirmStopAll: () => true,
+        storageKey: 'a:test-stop-all-remount-one',
+    });
+    await tick();
+
+    const second = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
+        isThinking: () => true,
+        api: { stopHost: async () => { secondCalls += 1; return { outcomes: [] }; } },
+        confirmStopAll: () => true,
+        storageKey: 'a:test-stop-all-remount-two',
+    });
+    await tick();
+
+    assert.equal(el.querySelectorAll('.agent-stop-all-btn').length, 1, 'one adopted control');
+    el.querySelector('.agent-stop-all-btn').click();
+    await tick();
+    assert.equal(firstCalls, 0, 'prior mount no longer owns a click handler');
+    assert.equal(secondCalls, 1, 'current mount owns exactly one handler');
+    second.destroy();
+});
