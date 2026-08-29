@@ -80,6 +80,10 @@ class StopRequest:
             or not self.correlation_id.strip()
         ):
             raise ValueError("correlation_id must be a concrete string")
+        try:
+            self.correlation_id.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("correlation_id must be valid Unicode text") from error
         if self.scope is StopScope.TURN:
             if self.turn_id is None:
                 object.__setattr__(self, "turn_id", self.target)

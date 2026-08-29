@@ -946,13 +946,21 @@ async def stop_agent_request(request: Request):
             correlation_id = request.query_params.get("correlation_id")
         if correlation_id is None:
             correlation_id = request.headers.get("X-Stop-Correlation-ID")
-        if correlation_id is not None and (
+        invalid_correlation_id = correlation_id is not None and (
             not isinstance(correlation_id, str) or not correlation_id.strip()
-        ):
+        )
+        if isinstance(correlation_id, str):
+            try:
+                correlation_id.encode("utf-8")
+            except UnicodeEncodeError:
+                invalid_correlation_id = True
+        if invalid_correlation_id:
             raise ApiHTTPException(
                 status_code=400,
                 code="invalid_stop_correlation_id",
-                message="Stop correlation_id must be a non-empty string.",
+                message=(
+                    "Stop correlation_id must be a non-empty valid Unicode string."
+                ),
             )
         agent = get_agent(request)
         agent_id = getattr(agent, "agent_id", None)

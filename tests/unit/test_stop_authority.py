@@ -134,6 +134,16 @@ def test_addressed_scopes_require_a_target(scope: StopScope) -> None:
         StopRequest(scope=scope, actor_id="did:test:operator")
 
 
+def test_stop_request_rejects_non_utf8_correlation_identity() -> None:
+    with pytest.raises(ValueError, match="valid Unicode"):
+        StopRequest(
+            scope=StopScope.AGENT,
+            actor_id="did:test:operator",
+            target="did:test:target",
+            correlation_id="\ud800",
+        )
+
+
 def test_host_scope_rejects_a_target() -> None:
     with pytest.raises(ValueError, match="cannot carry a target"):
         StopRequest(
