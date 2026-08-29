@@ -525,6 +525,7 @@ async def test_orchestrator_loop_runs_normally_without_request_id():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
