@@ -123,6 +123,13 @@ class TaskStore(UnifiedStoreBase):
         for column in authority_columns:
             await self.add_column_if_missing("a2a_tasks", column, "TEXT")
 
+        # Cancellation is terminal at the storage boundary, including for
+        # pre-upgrade writers still running during a PostgreSQL rollout. The
+        # application predicates below protect current code, while this fence
+        # prevents an older unconditional UPDATE/upsert from resurrecting a
+        # row after a new worker has committed its cancellation receipt.
+        await self._install_canceled_terminal_fence()
+
         # Pre-#3134 live rows have no trustworthy creator/recipient columns.
         # Metadata was caller-controlled and a shared PostgreSQL table contains
         # multiple recipients, so guessing either principal would mint power.
@@ -179,6 +186,46 @@ class TaskStore(UnifiedStoreBase):
         )
 
         logger.info(f"TaskStore initialized ({self._backend.backend_type})")
+
+    async def _install_canceled_terminal_fence(self) -> None:
+        """Install an idempotent database guard against canceled resurrection."""
+
+        if self.is_postgres:
+            await self._backend.execute_script("""
+                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_canceled_terminal()
+                RETURNS trigger AS $a2a_fence_function$
+                BEGIN
+                    IF OLD.status = 'canceled'
+                       AND NEW.status IS DISTINCT FROM 'canceled' THEN
+                        RAISE EXCEPTION 'canceled A2A task is terminal'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $a2a_fence_function$ LANGUAGE plpgsql;
+
+                DO $a2a_fence_install$
+                BEGIN
+                    CREATE TRIGGER a2a_tasks_canceled_terminal_v1
+                    BEFORE UPDATE OF status ON a2a_tasks
+                    FOR EACH ROW
+                    EXECUTE FUNCTION a2a_tasks_enforce_canceled_terminal();
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                END;
+                $a2a_fence_install$;
+            """)
+            return
+
+        await self._backend.execute_script("""
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_terminal_v1
+            BEFORE UPDATE OF status ON a2a_tasks
+            FOR EACH ROW
+            WHEN OLD.status = 'canceled' AND NEW.status IS NOT 'canceled'
+            BEGIN
+                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+            END;
+        """)
 
     async def save(
         self,

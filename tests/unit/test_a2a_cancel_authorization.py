@@ -2321,6 +2321,91 @@ async def test_respond_canceled_uses_outbound_route_before_shared_task_row():
 
 
 @pytest.mark.asyncio
+async def test_respond_canceled_routes_outbound_when_local_task_row_is_absent():
+    """Per-agent SQLite keeps sender audit and recipient rows in different DBs."""
+
+    routed_result = MagicMock(status=ToolResultStatus.OK)
+    route_feature = SimpleNamespace(
+        cancel_outbound_task=AsyncMock(return_value=routed_result)
+    )
+    actor = SimpleNamespace(
+        did="did:test:creator",
+        features={"PeersFeature": route_feature},
+    )
+    local_manager = MagicMock(
+        get_task=AsyncMock(return_value=None),
+        is_task_recipient=AsyncMock(return_value=False),
+        cancel_task=AsyncMock(),
+    )
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.respond_to_a2a_task(
+        "outbound-only-task",
+        content="withdrawn from sender-side storage",
+        state="canceled",
+    )
+
+    assert result is routed_result
+    route_feature.cancel_outbound_task.assert_awaited_once_with(
+        "outbound-only-task",
+        reason="withdrawn from sender-side storage",
+        local_recipient_match=False,
+    )
+    local_manager.get_task.assert_not_awaited()
+    local_manager.cancel_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
+    tmp_path,
+):
+    """An unconditional pre-upgrade UPDATE cannot undo committed cancellation."""
+
+    manager = await create_task_manager(str(tmp_path / "legacy-writer-fence.db"))
+    try:
+        await manager.create_task(
+            _params("terminal-cancel"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "terminal-cancel",
+            agent_name="did:test:creator",
+        )
+
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await manager.task_store.backend.execute(
+                "UPDATE a2a_tasks SET status = 'completed' WHERE id = ?",
+                ("terminal-cancel",),
+            )
+
+        assert (
+            await manager.get_task("terminal-cancel")
+        ).status.state is TaskState.CANCELED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_initialization_installs_canceled_terminal_trigger():
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        execute_script=AsyncMock(),
+        execute=AsyncMock(return_value=0),
+    )
+
+    await TaskStore(backend).initialize()
+
+    scripts = "\n".join(
+        call.args[0] for call in backend.execute_script.await_args_list
+    )
+    assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_canceled_terminal" in scripts
+    assert "NEW.status IS DISTINCT FROM 'canceled'" in scripts
+    assert "CREATE TRIGGER a2a_tasks_canceled_terminal_v1" in scripts
+
+
+@pytest.mark.asyncio
 async def test_outbound_cancel_reports_lifecycle_conflict_not_transport(monkeypatch):
     from kestrel_sovereign.a2a import outbound_store
 
