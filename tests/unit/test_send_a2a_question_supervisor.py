@@ -32,7 +32,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from kestrel_sdk.signals import SignalMode, SignalResult, Status
 
+from kestrel_sovereign.features.peers.directory import (
+    PeerDirectoryError,
+    PeerSubscriptionUnavailableError,
+    PeerTransportError,
+    iter_sse_events,
+)
 from kestrel_sovereign.features.peers.feature import PeersFeature
 
 
@@ -103,6 +110,18 @@ class _FakeAsyncClient:
         return nxt
 
 
+class _DeliveredSignalHandle:
+    """Terminal dispatcher handle used by the successful fixture path."""
+
+    async def wait(self) -> SignalResult:
+        return SignalResult(
+            signal_id="sig-a2a-question-answered",
+            status=Status.OK,
+            mode=SignalMode.COGNITION,
+            duration_ms=1,
+        )
+
+
 def _make_feature(
     *,
     sse_responses: List[Any],
@@ -122,13 +141,36 @@ def _make_feature(
 
     fake_client = _FakeAsyncClient(sse_responses)
 
+    async def _local_subscribe(_requester, peer, task_id):
+        """Model the host-attested process-local subscription capability."""
+
+        try:
+            response_context = fake_client.stream(
+                "GET", f"local://{peer.routing_key}/tasks/{task_id}/subscribe"
+            )
+            async with response_context as response:
+                if response.status_code == 404:
+                    raise PeerSubscriptionUnavailableError(
+                        "Peer does not expose task subscriptions"
+                    )
+                async for event in iter_sse_events(response):
+                    yield event
+        except PeerDirectoryError:
+            raise
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            raise PeerTransportError(
+                "Could not reach local task subscription"
+            ) from exc
+
+    feature._local_host_subscribe = _local_subscribe
+
     agent = MagicMock()
     agent.did = "did:test:sender"
     agent.pending_a2a_questions = MagicMock()
     agent.pending_a2a_questions.mark_resolved = AsyncMock(
         return_value=mark_resolved_returns,
     )
-    dispatcher_enqueue = AsyncMock()
+    dispatcher_enqueue = AsyncMock(return_value=_DeliveredSignalHandle())
     agent.dispatcher = MagicMock()
     agent.dispatcher.enqueue_signal = dispatcher_enqueue
     agent.tracked_background = []
