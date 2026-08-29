@@ -229,6 +229,16 @@ def get_router() -> APIRouter:
             full_response = []
             request_lifecycle_registered = False
             agent_stream = None
+
+            def stopped_event() -> str:
+                stopped_data = json.dumps(
+                    {
+                        "type": "stopped",
+                        "request_id": request_id,
+                    }
+                )
+                return f"data: {stopped_data}\n\n"
+
             try:
                 if hasattr(agent, "register_active_request"):
                     agent.register_active_request(request_id)
@@ -240,13 +250,7 @@ def get_router() -> APIRouter:
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 ):
-                    stopped_data = json.dumps(
-                        {
-                            "type": "stopped",
-                            "request_id": request_id,
-                        }
-                    )
-                    yield f"data: {stopped_data}\n\n"
+                    yield stopped_event()
                     return
                 # Wave 5E: bridge consumers (Slack/Discord/email/etc.)
                 # don't speak the chat-protocol revise sentinel —
@@ -273,13 +277,7 @@ def get_router() -> APIRouter:
                         callable(request_cancelled)
                         and request_cancelled(request_id) is True
                     ):
-                        stopped_data = json.dumps(
-                            {
-                                "type": "stopped",
-                                "request_id": request_id,
-                            }
-                        )
-                        yield f"data: {stopped_data}\n\n"
+                        yield stopped_event()
                         return
                     chunk = strip_revise_sentinels(chunk)
                     if not chunk:
@@ -296,13 +294,7 @@ def get_router() -> APIRouter:
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 ):
-                    stopped_data = json.dumps(
-                        {
-                            "type": "stopped",
-                            "request_id": request_id,
-                        }
-                    )
-                    yield f"data: {stopped_data}\n\n"
+                    yield stopped_event()
                     return
 
                 # Send completion event with metadata
