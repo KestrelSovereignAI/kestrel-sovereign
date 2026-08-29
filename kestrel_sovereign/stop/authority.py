@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Any
 
+from .receipt import StopReceipt, StopReceiptConflict
 from .types import StopDisposition, StopOutcome, StopRequest, StopScope
 
 StopOperation = Callable[[StopRequest], Awaitable[StopDisposition]]
@@ -79,14 +81,20 @@ class CancellationAuthority:
         target_inventory: Callable[[], Iterable[CooperativeStopTarget]],
         *,
         cleanup_registry: StopCleanupRegistry,
+        receipt_store: Any,
         target_timeout_seconds: float = DEFAULT_STOP_TARGET_TIMEOUT_SECONDS,
     ) -> None:
         if not callable(target_inventory):
             raise TypeError("target_inventory must be callable")
         if not isinstance(cleanup_registry, StopCleanupRegistry):
             raise TypeError("cleanup_registry must be a StopCleanupRegistry")
+        if not callable(getattr(receipt_store, "load", None)) or not callable(
+            getattr(receipt_store, "persist", None)
+        ):
+            raise TypeError("receipt_store must provide load and persist")
         self._target_inventory = target_inventory
         self._cleanup_registry = cleanup_registry
+        self._receipt_store = receipt_store
         if (
             not isinstance(target_timeout_seconds, (int, float))
             or isinstance(target_timeout_seconds, bool)
@@ -98,14 +106,38 @@ class CancellationAuthority:
 
     async def stop(self, request: StopRequest) -> tuple[StopOutcome, ...]:
         request = self._validated_request(request)
+        try:
+            replay = await self._receipt_store.load(request)
+        except StopReceiptConflict:
+            return self._receipt_preflight_refusal(
+                request,
+                self._resolve(request),
+                detail="Stop operation identity conflicts with durable evidence",
+            )
+        except Exception:  # noqa: BLE001 - durable evidence boundary
+            return self._receipt_preflight_refusal(
+                request,
+                self._resolve(request),
+                detail="Stop receipt storage is unavailable; cancellation not attempted",
+            )
+        if replay is not None:
+            if not isinstance(replay, StopReceipt):
+                return self._receipt_preflight_refusal(
+                    request,
+                    self._resolve(request),
+                    detail="Stop receipt storage returned invalid evidence",
+                )
+            return replay.outcomes
+
         targets = self._resolve(request)
         if not targets:
             if request.scope is StopScope.HOST:
                 # HOST fan-out has one outcome per resolved agent.  An empty
                 # inventory is a successful empty fan-out, not a fabricated
                 # agent with an empty DID.
-                return ()
-            return (
+                outcomes: tuple[StopOutcome, ...] = ()
+            else:
+                outcomes = (
                 StopOutcome(
                     scope=request.scope,
                     requested_target=request.target,
@@ -116,7 +148,34 @@ class CancellationAuthority:
                     detail="No cooperative Stop target resolved",
                 ),
             )
+        else:
+            outcomes = await self._stop_targets(request, targets)
 
+        try:
+            receipt = await self._receipt_store.persist(request, outcomes)
+            if not isinstance(receipt, StopReceipt):
+                raise TypeError("Stop receipt storage returned invalid evidence")
+            return receipt.outcomes
+        except Exception:  # noqa: BLE001 - report only typed indeterminacy
+            return tuple(
+                replace(
+                    outcome,
+                    disposition=StopDisposition.REFUSED,
+                    detail=(
+                        "Cancellation may have completed, but its durable "
+                        "Stop receipt could not be persisted"
+                    ),
+                )
+                if outcome.disposition is StopDisposition.STOPPED
+                else outcome
+                for outcome in outcomes
+            )
+
+    async def _stop_targets(
+        self,
+        request: StopRequest,
+        targets: tuple[CooperativeStopTarget, ...],
+    ) -> tuple[StopOutcome, ...]:
         async def stop_one(target: CooperativeStopTarget) -> StopOutcome:
             detail = None
             try:
@@ -127,10 +186,6 @@ class CancellationAuthority:
                 disposition = StopDisposition.UNREACHABLE
                 detail = "Cooperative Stop target was canceled"
             except Exception as error:  # noqa: BLE001 - target boundary
-                # A host Stop is an andon cord, so one broken or remote target
-                # cannot prevent later targets from observing it. Preserve one
-                # truthful outcome per resolved target without exposing an
-                # exception message that may contain provider or request data.
                 disposition = StopDisposition.UNREACHABLE
                 detail = f"Cooperative Stop target failed ({type(error).__name__})"
             return StopOutcome(
@@ -164,10 +219,6 @@ class CancellationAuthority:
         completed = {tasks[task].target_id: task.result() for task in done}
         for task in pending:
             task.cancel()
-            # Cooperative cancellation is advisory: a target may catch
-            # CancelledError and wedge during cleanup.  Stop's deadline still
-            # bounds the authority call, so ownership of that cleanup tail is
-            # detached with exception consumption instead of awaited here.
             self._detach_cleanup(task)
         for task in pending:
             target = tasks[task]
@@ -183,6 +234,42 @@ class CancellationAuthority:
         return tuple(completed[target.target_id] for target in targets)
 
     @staticmethod
+    def _receipt_preflight_refusal(
+        request: StopRequest,
+        targets: tuple[CooperativeStopTarget, ...],
+        *,
+        detail: str,
+    ) -> tuple[StopOutcome, ...]:
+        if not targets and request.scope is StopScope.HOST:
+            return ()
+        if not targets:
+            return (
+                StopOutcome(
+                    scope=request.scope,
+                    requested_target=request.target,
+                    resolved_target=request.target or StopScope.HOST.value,
+                    agent_id=request.target_agent_id
+                    or request.target
+                    or "unresolved",
+                    disposition=StopDisposition.REFUSED,
+                    correlation_id=request.correlation_id,
+                    detail=detail,
+                ),
+            )
+        return tuple(
+            StopOutcome(
+                scope=request.scope,
+                requested_target=request.target,
+                resolved_target=target.target_id,
+                agent_id=target.agent_id,
+                disposition=StopDisposition.REFUSED,
+                correlation_id=request.correlation_id,
+                detail=detail,
+            )
+            for target in targets
+        )
+
+    @staticmethod
     def _validated_request(request: StopRequest) -> StopRequest:
         """Rebuild the request before inventory lookup or target side effects."""
 
@@ -196,6 +283,9 @@ class CancellationAuthority:
             reason=request.reason,
             cascade=request.cascade,
             correlation_id=request.correlation_id,
+            turn_id=request.turn_id,
+            span_id=request.span_id,
+            trace_id=request.trace_id,
         )
 
     def _detach_cleanup(self, task: asyncio.Task[StopOutcome]) -> None:

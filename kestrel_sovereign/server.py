@@ -1553,6 +1553,51 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
         raise asyncio.CancelledError()
 
 
+async def _initialize_stop_receipts(app: FastAPI) -> None:
+    """Open the host-owned evidence store before any agent can accept work."""
+
+    app.state.stop_receipt_store = None
+    app.state.stop_receipt_db = None
+    app.state.stop_receipt_store_error = ""
+    db = None
+    try:
+        from kestrel_sovereign.host_features.storage import (
+            prepare_host_database,
+            validate_sqlite_family_private,
+        )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.stop import StopReceiptStore
+
+        path = prepare_host_database()
+        db = await AsyncDatabase.sqlite(str(path))
+        validate_sqlite_family_private(path)
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        app.state.stop_receipt_db = db
+        app.state.stop_receipt_store = store
+    except Exception as error:  # noqa: BLE001 - host remains diagnosable
+        if db is not None:
+            try:
+                await db.close()
+            except Exception:  # noqa: BLE001 - preserve the primary failure
+                pass
+        app.state.stop_receipt_store_error = type(error).__name__
+        logger.error(
+            "Durable Stop receipt storage is unavailable (%s); "
+            "cooperative Stop will fail closed",
+            type(error).__name__,
+            exc_info=True,
+        )
+
+
+async def _shutdown_stop_receipts(app: FastAPI) -> None:
+    db = getattr(app.state, "stop_receipt_db", None)
+    app.state.stop_receipt_store = None
+    app.state.stop_receipt_db = None
+    if db is not None:
+        await db.close()
+
+
 async def _shutdown_phoenix(app: FastAPI) -> bool:
     """Release all server-owned Phoenix work before lifespan teardown returns.
 
@@ -2129,6 +2174,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # onboarding can remount routes or UI after their only teardown pass.
         ("host-features", lambda: _shutdown_host_features(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        ("stop-receipts", lambda: _shutdown_stop_receipts(app)),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
         phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
@@ -2182,6 +2228,7 @@ async def _lifespan_startup(app: FastAPI):
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
+    await _initialize_stop_receipts(app)
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when

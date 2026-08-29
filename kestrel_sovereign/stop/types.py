@@ -40,6 +40,9 @@ class StopRequest:
     reason: str | None = None
     cascade: bool = True
     correlation_id: str = field(default_factory=lambda: uuid4().hex)
+    turn_id: str | None = None
+    span_id: str | None = None
+    trace_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, StopScope):
@@ -75,6 +78,22 @@ class StopRequest:
             or not self.correlation_id.strip()
         ):
             raise ValueError("correlation_id must be a concrete string")
+        if self.scope is StopScope.TURN:
+            if self.turn_id is None:
+                object.__setattr__(self, "turn_id", self.target)
+            elif self.turn_id != self.target:
+                raise ValueError("turn Stop identity must match its target")
+        for field_name, value in (
+            ("turn_id", self.turn_id),
+            ("span_id", self.span_id),
+            ("trace_id", self.trace_id),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(
+                    f"{field_name} must be a non-empty string when supplied"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -85,6 +104,9 @@ class StopRequest:
             "reason": self.reason,
             "cascade": self.cascade,
             "correlation_id": self.correlation_id,
+            "turn_id": self.turn_id,
+            "span_id": self.span_id,
+            "trace_id": self.trace_id,
         }
 
     @classmethod
@@ -97,6 +119,9 @@ class StopRequest:
             reason=value.get("reason"),
             cascade=value.get("cascade", True),
             correlation_id=value["correlation_id"],
+            turn_id=value.get("turn_id"),
+            span_id=value.get("span_id"),
+            trace_id=value.get("trace_id"),
         )
 
 

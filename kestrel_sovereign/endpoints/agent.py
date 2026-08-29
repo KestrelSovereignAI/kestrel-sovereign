@@ -47,7 +47,9 @@ from kestrel_sovereign.stop import (
     StopCleanupRegistry,
     StopRequest,
     StopScope,
+    UnavailableStopReceiptStore,
 )
+from kestrel_sovereign.telemetry import current_trace_identity
 
 logger = logging.getLogger(__name__)
 
@@ -923,6 +925,19 @@ async def stop_agent_request(request: Request):
             or request.headers.get("X-Request-ID") is not None
             else None
         )
+        correlation_id = data.get("correlation_id")
+        if correlation_id is None:
+            correlation_id = request.query_params.get("correlation_id")
+        if correlation_id is None:
+            correlation_id = request.headers.get("X-Stop-Correlation-ID")
+        if correlation_id is not None and (
+            not isinstance(correlation_id, str) or not correlation_id.strip()
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="invalid_stop_correlation_id",
+                message="Stop correlation_id must be a non-empty string.",
+            )
         agent = get_agent(request)
         agent_id = getattr(agent, "agent_id", None)
         if not isinstance(agent_id, str) or not agent_id.strip():
@@ -1030,12 +1045,24 @@ async def stop_agent_request(request: Request):
                 ),
             ),
             cleanup_registry=cleanup_registry,
+            receipt_store=(
+                getattr(request.app.state, "stop_receipt_store", None)
+                or UnavailableStopReceiptStore()
+            ),
         )
+        trace_id, span_id = current_trace_identity()
         stop_request = StopRequest(
             scope=StopScope.TURN if request_id is not None else StopScope.AGENT,
             actor_id=actor_id,
             target=request_id if request_id is not None else agent_id,
             target_agent_id=agent_id if request_id is not None else None,
+            trace_id=trace_id,
+            span_id=span_id,
+            **(
+                {"correlation_id": correlation_id}
+                if correlation_id is not None
+                else {}
+            ),
         )
         outcomes = await authority.stop(stop_request)
         failed_outcomes = tuple(

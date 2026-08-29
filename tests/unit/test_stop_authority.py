@@ -5,6 +5,7 @@ import gc
 import inspect
 import time
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -21,14 +22,58 @@ from kestrel_sovereign.stop import (
     StopDisposition,
     StopOutcome,
     StopRequest,
+    StopReceipt,
+    StopReceiptConflict,
     StopScope,
 )
+
+
+class _MemoryReceiptStore:
+    def __init__(self):
+        self.records = {}
+
+    async def load(self, request):
+        record = self.records.get(request.correlation_id)
+        if record is None:
+            return None
+        prior_request, receipt = record
+        if prior_request != request:
+            raise StopReceiptConflict("conflicting replay")
+        return receipt
+
+    async def persist(self, request, outcomes):
+        replay = await self.load(request)
+        if replay is not None:
+            return replay
+        receipt_id = f"receipt-{request.correlation_id}"
+        receipted = tuple(
+            replace(outcome, receipt_id=receipt_id) for outcome in outcomes
+        )
+        receipt = StopReceipt(
+            receipt_id=receipt_id,
+            operation_id=request.correlation_id,
+            request_fingerprint="test-fingerprint",
+            scope=request.scope.value,
+            actor_id=request.actor_id,
+            requested_target=request.target,
+            target_agent_id=request.target_agent_id,
+            reason=request.reason,
+            cascade=request.cascade,
+            occurred_at="2026-08-28T00:00:00+00:00",
+            turn_id=(request.target if request.scope is StopScope.TURN else None),
+            span_id=None,
+            trace_id=None,
+            outcomes=receipted,
+        )
+        self.records[request.correlation_id] = (request, receipt)
+        return receipt
 
 
 def _authority(target_inventory, **kwargs) -> CancellationAuthority:
     return CancellationAuthority(
         target_inventory,
         cleanup_registry=StopCleanupRegistry(),
+        receipt_store=kwargs.pop("receipt_store", _MemoryReceiptStore()),
         **kwargs,
     )
 
@@ -231,6 +276,7 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
             )
         ],
         cleanup_registry=cleanup_registry,
+        receipt_store=_MemoryReceiptStore(),
         target_timeout_seconds=0.01,
     )
 
@@ -498,6 +544,7 @@ def test_live_stop_endpoint_routes_request_through_typed_authority() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -535,6 +582,7 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -577,6 +625,7 @@ def test_stop_before_registration_fences_the_late_request_generation() -> None:
 
     agent = LiveAgent()
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -649,6 +698,7 @@ async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     agent = LiveAgent()
     agent.register_active_request("turn-live")
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -730,6 +780,7 @@ async def test_live_stop_stale_prune_is_unreachable_not_stopped() -> None:
     agent.register_active_request("long-turn")
     agent._active_request_started_at["long-turn"] -= 1000
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -779,6 +830,7 @@ def test_agent_wide_stop_includes_pruned_unconfirmed_turns() -> None:
     assert agent.prune_stale_active_requests(900) == ["pruned-turn"]
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
     response = TestClient(app).post("/api/agent/stop")
@@ -824,6 +876,7 @@ def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"

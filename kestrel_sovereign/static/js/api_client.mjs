@@ -1077,10 +1077,13 @@ export function createApiClient({
         // viewing Agent B would route the stop to B's backend (because
         // request() pins to state.selectedHostAgent), aborting client-
         // side but never telling A's server to halt.
-        stop: (requestId = null, agent) => {
+        stop: (requestId = null, agent, correlationId = null) => {
             const opts = {
                 method: 'POST',
-                body: JSON.stringify(requestId ? { request_id: requestId } : {}),
+                body: JSON.stringify({
+                    ...(requestId ? { request_id: requestId } : {}),
+                    ...(correlationId ? { correlation_id: correlationId } : {}),
+                }),
             };
             return agent !== undefined
                 ? client.requestForAgent('/api/agent/stop', opts, agent)

@@ -8,6 +8,14 @@ from .authority import (
     CooperativeStopTarget,
     StopCleanupRegistry,
 )
+from .receipt import (
+    StopReceipt,
+    StopReceiptConflict,
+    StopReceiptCorruptError,
+    StopReceiptError,
+    StopReceiptStore,
+    UnavailableStopReceiptStore,
+)
 from .types import StopDisposition, StopOutcome, StopRequest, StopScope
 
 __all__ = [
@@ -16,6 +24,12 @@ __all__ = [
     "StopDisposition",
     "StopCleanupRegistry",
     "StopOutcome",
+    "StopReceipt",
+    "StopReceiptConflict",
+    "StopReceiptCorruptError",
+    "StopReceiptError",
+    "StopReceiptStore",
     "StopRequest",
     "StopScope",
+    "UnavailableStopReceiptStore",
 ]

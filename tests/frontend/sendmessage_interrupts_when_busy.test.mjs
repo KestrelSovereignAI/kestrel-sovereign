@@ -269,9 +269,11 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
     apiModule.default.getCurrentStreamRequestId = () => currentRequestId;
     let stopAttempts = 0;
     const stoppedRequestIds = [];
-    apiModule.default.stop = async (requestId) => {
+    const stopCorrelationIds = [];
+    apiModule.default.stop = async (requestId, _agent, correlationId) => {
         stopAttempts += 1;
         stoppedRequestIds.push(requestId);
+        stopCorrelationIds.push(correlationId);
         throw new Error('stop_not_confirmed');
     };
     let replacementStarted = false;
@@ -303,9 +305,13 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
         'clearing waitingAgents must not bypass the unconfirmed-Stop latch');
     assert.deepEqual(stoppedRequestIds, ['prior-request', 'prior-request'],
         'a failed Stop retry must retain the original turn ID');
+    assert.equal(typeof stopCorrelationIds[0], 'string');
+    assert.equal(stopCorrelationIds[1], stopCorrelationIds[0],
+        'a failed Stop retry must replay the original durable operation ID');
 
     state.unconfirmedStopAgents.delete(agent);
     state.unconfirmedStopRequestIds.delete(agent);
+    state.unconfirmedStopCorrelationIds.delete(agent);
 });
 
 

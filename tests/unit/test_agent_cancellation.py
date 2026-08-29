@@ -5,9 +5,61 @@ Unit tests for agent request cancellation (stop button).
 import asyncio
 import json
 from contextvars import ContextVar
+from dataclasses import replace
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock
+
+
+class _MemoryStopReceiptStore:
+    """Endpoint-test receipt store with the production replay contract."""
+
+    def __init__(self):
+        self.records = {}
+
+    async def load(self, request):
+        from kestrel_sovereign.stop import StopReceiptConflict
+
+        record = self.records.get(request.correlation_id)
+        if record is None:
+            return None
+        prior_request, receipt = record
+        if prior_request != request:
+            raise StopReceiptConflict("conflicting replay")
+        return receipt
+
+    async def persist(self, request, outcomes):
+        from kestrel_sovereign.stop import StopReceipt, StopScope
+
+        replay = await self.load(request)
+        if replay is not None:
+            return replay
+        receipt_id = f"test-receipt-{request.correlation_id}"
+        receipted = tuple(
+            replace(outcome, receipt_id=receipt_id) for outcome in outcomes
+        )
+        receipt = StopReceipt(
+            receipt_id=receipt_id,
+            operation_id=request.correlation_id,
+            request_fingerprint="test-fingerprint",
+            scope=request.scope.value,
+            actor_id=request.actor_id,
+            requested_target=request.target,
+            target_agent_id=request.target_agent_id,
+            reason=request.reason,
+            cascade=request.cascade,
+            occurred_at="2026-08-28T00:00:00+00:00",
+            turn_id=(request.target if request.scope is StopScope.TURN else None),
+            span_id=None,
+            trace_id=None,
+            outcomes=receipted,
+        )
+        self.records[request.correlation_id] = (request, receipt)
+        return receipt
+
+
+def _attach_test_stop_receipts(app):
+    app.state.stop_receipt_store = _MemoryStopReceiptStore()
 
 
 @pytest.mark.asyncio
@@ -1365,6 +1417,7 @@ class TestStopEndpoint:
         app = FastAPI()
         app.include_router(router)
         app.state.agent = agent
+        _attach_test_stop_receipts(app)
         try:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
@@ -1402,6 +1455,7 @@ class TestStopEndpoint:
         
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         
         # Mock agent
         mock_agent = MagicMock()
@@ -1427,6 +1481,7 @@ class TestStopEndpoint:
         
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         
         # Mock agent with no active request
         mock_agent = MagicMock()
@@ -1450,6 +1505,7 @@ class TestStopEndpoint:
 
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
 
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
@@ -1479,6 +1535,7 @@ class TestStopEndpoint:
         header_echo = invocation_id_response_header(request_id)
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
         mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
@@ -1503,6 +1560,7 @@ class TestStopEndpoint:
 
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
         mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
