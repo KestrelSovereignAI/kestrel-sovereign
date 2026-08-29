@@ -320,11 +320,15 @@ async def test_server_lifespan_wires_and_closes_host_features(
     class FakeManager:
         init_failures = []
 
+        def set_host_context_publication_gate(self, gate) -> None:
+            self.host_context_publication_gate = gate
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
         async def load_from_config(self, config):
             assert config is fake_config
+            assert not self.host_context_publication_gate.is_set()
             events.append("agents-load")
             return 1
 
@@ -372,6 +376,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
     def bind_host_context(registry):
         assert registry is host_context_registry
+        assert not fake_manager.host_context_publication_gate.is_set()
         validate_host_context(registry)
         events.append("host-context-bind")
 
@@ -386,6 +391,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
     async def start_features(features, supplied_ctx):
         assert features == [feature]
         assert supplied_ctx is ctx
+        assert not fake_manager.host_context_publication_gate.is_set()
         events.append("host-start")
 
     async def stop_features(features, supplied_ctx):
@@ -442,12 +448,14 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "host-unmount",
             "agents-stop",
         ]
+        assert not fake_manager.host_context_publication_gate.is_set()
         return
 
     async with server.lifespan(test_app):
         assert fake_config.host.port == 9090
         assert test_app.state.host_features == [feature]
         assert test_app.state.host_context is ctx
+        assert fake_manager.host_context_publication_gate.is_set()
         assert events == [
             "agents-load",
             "context-build",

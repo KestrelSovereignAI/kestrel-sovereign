@@ -369,6 +369,36 @@ class TurnLifecycleMixin:
         else:
             _CURRENT_CHAIN.set([])
 
+    async def _await_host_context_publication(self) -> None:
+        """Wait until server startup has published host-owned prompt policy.
+
+        A standalone scheduler (and other ready hooks) can wake during
+        ``KestrelAgent.initialize()`` while the host feature lifecycle is still
+        being assembled by the server.  The server installs one shared event
+        before initialization and sets it only after the host context registry
+        has been bound.  Directly-created/test agents have no event and retain
+        their established behavior.
+        """
+
+        gate = getattr(self, "_host_context_publication_gate", None)
+        if gate is not None and not gate.is_set():
+            await gate.wait()
+
+    @asynccontextmanager
+    async def feature_config_transition(self) -> AsyncIterator[None]:
+        """Serialize one config/context transition with cognition turns.
+
+        Prompts consume an immutable rendered clause snapshot while feature
+        tools consume the feature's live config.  Holding the same
+        ``CONVERSATION`` resource as a turn prevents either half of a turn from
+        observing a different config generation.
+        """
+
+        mgr = self._get_lock_manager()
+        label = f"{getattr(self, 'agent_name', None) or 'agent'} feature-config"
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
+            yield
+
     @asynccontextmanager
     async def _turn_lifecycle(self) -> AsyncIterator[str]:
         """Enter a turn: acquire CONVERSATION, yield a fresh turn_id,
@@ -387,6 +417,7 @@ class TurnLifecycleMixin:
         production. Two INFO lines per turn is a deliberate trade for a bounded
         region that can otherwise silently hold an agent hostage for minutes.
         """
+        await self._await_host_context_publication()
         turn_id = f"turn_{uuid4().hex[:12]}"
         mgr = self._get_lock_manager()
         label = f"{getattr(self, 'agent_name', None) or 'agent'} {turn_id}"

@@ -5,6 +5,7 @@ import inspect
 import logging
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -858,7 +859,26 @@ async def update_feature_config(
     feature = _get_feature_or_404(agent, name)
 
     async with _FEATURE_CONFIG_UPDATE_LOCK:
-        return await _update_feature_config_locked(agent, feature, name, body)
+        async with _agent_feature_config_transition(agent):
+            return await _update_feature_config_locked(agent, feature, name, body)
+
+
+@asynccontextmanager
+async def _agent_feature_config_transition(agent: object):
+    """Share the agent's turn lock when that lifecycle surface is available."""
+
+    # ``getattr`` alone fabricates arbitrary attributes on common test doubles.
+    # Static lookup proves this is a surface the concrete agent actually owns.
+    transition_descriptor = inspect.getattr_static(
+        agent, "feature_config_transition", None
+    )
+    if transition_descriptor is None:
+        yield
+        return
+
+    transition = getattr(agent, "feature_config_transition")
+    async with transition():
+        yield
 
 
 async def _update_feature_config_locked(
@@ -882,12 +902,13 @@ async def _update_feature_config_locked(
     secret_fields = _secret_field_names(schema)
     atomic_secret_update = getattr(feature, "set_config_with_secret_preservation", None)
     has_atomic_secret_update = inspect.iscoroutinefunction(atomic_secret_update)
+    commit_receipt = None
     if secret_fields and has_atomic_secret_update:
         # Isolated hosted features preserve omitted write-only fields from the
         # same durable snapshot used by their transition CAS.  Reading here and
         # reinjecting later would let a stale replica overwrite a concurrent
         # credential rotation.
-        await atomic_secret_update(
+        commit_receipt = await atomic_secret_update(
             incoming,
             secret_fields,
             lambda effective: _validate_config(effective, schema)
@@ -905,7 +926,7 @@ async def _update_feature_config_locked(
         if schema is not None:
             _validate_config(incoming, schema)
 
-        await feature.set_config(incoming)
+        commit_receipt = await feature.set_config(incoming)
 
     refresh_context = getattr(agent, "refresh_feature_context_clauses", None)
     if bool(getattr(feature, "enabled", True)) and callable(refresh_context):
@@ -913,7 +934,14 @@ async def _update_feature_config_locked(
             await _refresh_feature_context(refresh_context, feature)
         except BaseException as refresh_exc:
             try:
-                await feature.set_config(previous)
+                rollback_descriptor = inspect.getattr_static(
+                    feature, "rollback_config_transition", None
+                )
+                if rollback_descriptor is not None and commit_receipt is not None:
+                    rollback = getattr(feature, "rollback_config_transition")
+                    await rollback(commit_receipt)
+                else:
+                    await feature.set_config(previous)
                 await _refresh_feature_context(refresh_context, feature)
             except BaseException:
                 # The old prompt bytes cannot safely coexist with a config we

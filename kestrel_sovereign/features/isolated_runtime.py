@@ -1746,6 +1746,21 @@ class _ConfigTransition:
 
 
 @dataclass(frozen=True)
+class _ConfigCommitReceipt:
+    """Exact durable generation committed by one proxy config update."""
+
+    persistent: bool
+    generation: Optional[str]
+    node_id: Optional[str]
+    config: Dict[str, Any] = field(repr=False)
+    previous_config: Dict[str, Any] = field(repr=False)
+
+
+class _ConfigRevisionSuperseded(RuntimeError):
+    """A conditional rollback's config generation is no longer active."""
+
+
+@dataclass(frozen=True)
 class _ExternalIngressQuiesce:
     """One acknowledged external-producer pause owned by a config transition."""
 
@@ -7475,7 +7490,8 @@ class ProxyFeature(Feature):
         *,
         _preserve_secret_fields: set[str] | None = None,
         _validate_effective_config: Callable[[Dict[str, Any]], None] | None = None,
-    ) -> None:
+        _expected_commit: _ConfigCommitReceipt | None = None,
+    ) -> _ConfigCommitReceipt:
         """Persist an effective config and apply it to the running service.
 
         The previous implementation forwarded to ``self._client.set_config`` —
@@ -7510,12 +7526,12 @@ class ProxyFeature(Feature):
         cfg = dict(config) if isinstance(config, dict) else {}
         async with self._reload_lock:
             if self._terminal_lifecycle_latched:
-                await self._persist_terminal_config(
+                return await self._persist_terminal_config(
                     cfg,
                     preserve_secret_fields=_preserve_secret_fields,
                     validate_effective_config=_validate_effective_config,
+                    expected_commit=_expected_commit,
                 )
-                return
             self._begin_reload()
             # The gate closes only after an opt-in external producer has
             # acknowledged that it cannot emit another callback. A cancelled
@@ -7547,6 +7563,7 @@ class ProxyFeature(Feature):
                     cfg,
                     preserve_secret_fields=_preserve_secret_fields,
                     validate_effective_config=_validate_effective_config,
+                    expected_commit=_expected_commit,
                 )
                 # A scoped compare-and-create cannot atomically exclude an old
                 # binary's independent legacy write.  Fence the exact staged
@@ -7582,7 +7599,7 @@ class ProxyFeature(Feature):
                     local_authoritative = True
                     if promotion.error is not None:
                         self._raise_promotion_failure(promotion)
-                    return
+                    return self._config_commit_receipt(transition)
 
                 # Quiesce the exact external producer while Core admission is
                 # still open. A callback already written into the bridge may
@@ -7622,7 +7639,7 @@ class ProxyFeature(Feature):
                     local_authoritative = True
                     if promotion.error is not None:
                         self._raise_promotion_failure(promotion)
-                    return
+                    return self._config_commit_receipt(transition)
 
                 if self._supports_config_transition():
                     # Staging precedes local reconciliation so every replica
@@ -7790,6 +7807,22 @@ class ProxyFeature(Feature):
                     self._end_reload()
                 if finalizer_error is not None and body_error is None:
                     raise finalizer_error
+            assert transition is not None
+            return self._config_commit_receipt(transition)
+
+    @staticmethod
+    def _config_commit_receipt(
+        transition: _ConfigTransition,
+    ) -> _ConfigCommitReceipt:
+        """Create the rollback capability for one successfully promoted write."""
+
+        return _ConfigCommitReceipt(
+            persistent=transition.persistent,
+            generation=transition.generation,
+            node_id=transition.config_node_id,
+            config=dict(transition.next_config),
+            previous_config=dict(transition.active_config),
+        )
 
     async def _persist_terminal_config(
         self,
@@ -7797,7 +7830,8 @@ class ProxyFeature(Feature):
         *,
         preserve_secret_fields: set[str] | None,
         validate_effective_config: Callable[[Dict[str, Any]], None] | None,
-    ) -> None:
+        expected_commit: _ConfigCommitReceipt | None,
+    ) -> _ConfigCommitReceipt:
         """Durably repair config without reviving a terminal enable cycle.
 
         A loaded soft-disabled feature retains its proxy so the config API can
@@ -7820,6 +7854,7 @@ class ProxyFeature(Feature):
                 config,
                 preserve_secret_fields=preserve_secret_fields,
                 validate_effective_config=validate_effective_config,
+                expected_commit=expected_commit,
             )
             promotion = await self._promote_config(transition)
             if not promotion.committed:
@@ -7838,6 +7873,7 @@ class ProxyFeature(Feature):
             self._host_config_loaded = True
             if promotion.error is not None:
                 self._raise_promotion_failure(promotion)
+            return self._config_commit_receipt(transition)
         except BaseException:
             if transition is not None and not transition_settled:
                 await self._run_owned_transition_cleanup(
@@ -7852,7 +7888,7 @@ class ProxyFeature(Feature):
         incoming: Dict[str, Any],
         secret_fields: set[str],
         validate: Callable[[Dict[str, Any]], None],
-    ) -> None:
+    ) -> _ConfigCommitReceipt:
         """Atomically preserve omitted write-only fields for the generic API.
 
         The endpoint must not read a secret on one hosted replica and later
@@ -7862,10 +7898,31 @@ class ProxyFeature(Feature):
         value before the lifecycle hook can observe it.
         """
 
-        await self.set_config(
+        return await self.set_config(
             incoming,
             _preserve_secret_fields=set(secret_fields),
             _validate_effective_config=validate,
+        )
+
+    async def rollback_config_transition(
+        self,
+        commit: _ConfigCommitReceipt,
+    ) -> _ConfigCommitReceipt:
+        """Restore this commit's CAS predecessor only while it is still active.
+
+        Another hosted replica may publish a newer config while the endpoint
+        renders context for this one.  Passing the original generation into
+        the stage CAS makes that newer durable winner a hard fence rather than
+        data that an unconditional rollback can overwrite.  The predecessor
+        comes from this transition's fresh stage snapshot, never the endpoint's
+        potentially stale read.
+        """
+
+        if not isinstance(commit, _ConfigCommitReceipt):
+            raise TypeError("isolated config rollback requires a commit receipt")
+        return await self.set_config(
+            commit.previous_config,
+            _expected_commit=commit,
         )
 
     async def _run_owned_transition_cleanup(
@@ -8174,6 +8231,7 @@ class ProxyFeature(Feature):
         *,
         preserve_secret_fields: set[str] | None = None,
         validate_effective_config: Callable[[Dict[str, Any]], None] | None = None,
+        expected_commit: _ConfigCommitReceipt | None = None,
     ) -> _ConfigTransition:
         """CAS-stage one candidate from a fresh authoritative graph snapshot.
 
@@ -8201,6 +8259,14 @@ class ProxyFeature(Feature):
                     effective_pending_config[key] = self._host_config[key]
             if validate_effective_config is not None:
                 validate_effective_config(dict(effective_pending_config))
+            if expected_commit is not None and (
+                expected_commit.persistent
+                or self._host_config != expected_commit.config
+            ):
+                raise _ConfigRevisionSuperseded(
+                    f"Cannot roll back config for isolated feature {self.name}: "
+                    "the active config changed"
+                )
             return _ConfigTransition(
                 active_config=dict(self._host_config),
                 next_config=effective_pending_config,
@@ -8222,6 +8288,22 @@ class ProxyFeature(Feature):
                     storage,
                     fence_cached_scoped_authority=True,
                 )
+                if expected_commit is not None and (
+                    not expected_commit.persistent
+                    or state.has_pending
+                    or state.node_id != expected_commit.node_id
+                    or (state.properties or {}).get(_CONFIG_GENERATION_KEY)
+                    != expected_commit.generation
+                    or state.config != expected_commit.config
+                ):
+                    await self._reconcile_client_to_authoritative_config(
+                        state.config,
+                        force=False,
+                    )
+                    raise _ConfigRevisionSuperseded(
+                        f"Cannot roll back config for isolated feature {self.name}: "
+                        "a newer durable config transition is visible"
+                    )
                 if state.has_pending:
                     if not self._pending_lease_is_expired(state):
                         await self._reconcile_client_to_authoritative_config(

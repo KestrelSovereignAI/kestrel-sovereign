@@ -10341,6 +10341,96 @@ async def test_replica_get_does_not_mask_stale_child_before_next_patch(
 
 
 @pytest.mark.asyncio
+async def test_context_refresh_rollback_cannot_overwrite_newer_replica_generation(
+    monkeypatch, tmp_path
+):
+    """A failed renderer's rollback is fenced by its exact committed generation."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    failed_context_config = {"enabled": True, "revision": "bad-context"}
+    winner_config = {"enabled": True, "revision": "newer-winner"}
+    storage = _CASStorage()
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    stale_agent = Mock(did=_TEST_AGENT_DID, features={})
+    stale_agent.storage = storage
+    stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
+    winner_agent = Mock(did=_TEST_AGENT_DID, features={})
+    winner_agent.storage = storage
+    winner_agent.storage_path = str(tmp_path / "winner" / "kestrel_prime.db")
+    stale = ProxyFeature(
+        stale_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    winner = ProxyFeature(
+        winner_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    try:
+        await stale.persist_config(old_config)
+        await stale.initialize()
+        await winner.initialize()
+
+        failed_commit = await stale.set_config(failed_context_config)
+        await winner.set_config(winner_config)
+        winner_properties = dict(storage.nodes[_TEST_CONFIG_NODE_ID].properties)
+
+        with pytest.raises(
+            isolated_runtime._ConfigRevisionSuperseded,
+            match="newer durable config transition",
+        ):
+            await stale.rollback_config_transition(failed_commit)
+
+        assert storage.nodes[_TEST_CONFIG_NODE_ID].properties == winner_properties
+        assert storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == winner_config
+        assert stale._host_config == winner_config
+    finally:
+        await winner.shutdown()
+        await stale.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_context_refresh_rollback_restores_transition_snapshot_not_stale_get(
+    monkeypatch, tmp_path
+):
+    """Rollback uses the predecessor read by the winning stage CAS."""
+
+    old_config = {"enabled": True, "revision": "endpoint-snapshot"}
+    intermediate = {"enabled": True, "revision": "concurrent-winner"}
+    failed_context_config = {"enabled": True, "revision": "bad-context"}
+    storage = _CASStorage()
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    stale_agent = Mock(did=_TEST_AGENT_DID, features={})
+    stale_agent.storage = storage
+    stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
+    writer_agent = Mock(did=_TEST_AGENT_DID, features={})
+    writer_agent.storage = storage
+    writer_agent.storage_path = str(tmp_path / "writer" / "kestrel_prime.db")
+    stale = ProxyFeature(
+        stale_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    writer = ProxyFeature(
+        writer_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    try:
+        await stale.persist_config(old_config)
+        await stale.initialize()
+        await writer.initialize()
+        endpoint_previous = await stale.get_config()
+        assert endpoint_previous == old_config
+
+        await writer.set_config(intermediate)
+        failed_commit = await stale.set_config(failed_context_config)
+        await stale.rollback_config_transition(failed_commit)
+
+        properties = storage.nodes[_TEST_CONFIG_NODE_ID].properties
+        assert properties["config"] == intermediate
+        assert properties["config"] != endpoint_previous
+    finally:
+        await writer.shutdown()
+        await stale.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_stale_equal_config_reconciles_only_after_external_ingress_fence(
     monkeypatch, tmp_path
 ):

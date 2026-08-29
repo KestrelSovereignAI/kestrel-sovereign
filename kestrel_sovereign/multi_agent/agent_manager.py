@@ -618,6 +618,7 @@ class AgentManager:
         self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = (base_data_dir or Path.cwd()).expanduser().resolve()
         self._host_context_clause_registry = None
+        self._host_context_publication_gate: asyncio.Event | None = None
         # A multi-agent host owns one mutable isolated-feature root.  The
         # per-agent namespace is derived below from the stable DID rather than
         # accepting the routing name as a path component.
@@ -1607,6 +1608,9 @@ class AgentManager:
             # manager's live authority and per-DID lifecycle lock.
             agent._scheduler_polling_managed_by_host = (
                 self._scheduler_polling_managed_by_host
+            )
+            agent._host_context_publication_gate = (
+                self._host_context_publication_gate
             )
             if scheduler_registration is not None:
                 agent._dynamic_scheduler_tenant_registration = (
@@ -2629,6 +2633,13 @@ class AgentManager:
         for agent in self._agents.values():
             agent.bind_host_context_clause_registry(registry)
         self._host_context_clause_registry = registry
+
+    def set_host_context_publication_gate(self, gate: asyncio.Event) -> None:
+        """Gate current and future agent turns until host policy is published."""
+
+        self._host_context_publication_gate = gate
+        for agent in self._agents.values():
+            agent._host_context_publication_gate = gate
 
     async def local_agent_configs_by_did(
         self,

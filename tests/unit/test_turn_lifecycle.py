@@ -112,6 +112,48 @@ async def test_three_concurrent_turns_serialize_in_order():
         assert order[i].split(":")[1] == order[i + 1].split(":")[1]
 
 
+@pytest.mark.asyncio
+async def test_turn_waits_for_host_context_publication_before_lock_entry():
+    """An overdue startup wake cannot assemble an agent-only prompt."""
+
+    agent = _StubAgent()
+    agent._host_context_publication_gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def turn() -> None:
+        async with agent._turn_lifecycle():
+            entered.set()
+
+    task = asyncio.create_task(turn())
+    await asyncio.sleep(0)
+    assert not entered.is_set()
+    assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
+
+    agent._host_context_publication_gate.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_feature_config_transition_serializes_with_turns():
+    """Config/context publication and a prompt/tool turn never overlap."""
+
+    agent = _StubAgent()
+    config_entered = asyncio.Event()
+
+    async def update() -> None:
+        async with agent.feature_config_transition():
+            config_entered.set()
+
+    async with agent._turn_lifecycle():
+        task = asyncio.create_task(update())
+        await asyncio.sleep(0)
+        assert not config_entered.is_set()
+
+    await asyncio.wait_for(task, timeout=1)
+    assert config_entered.is_set()
+
+
 # ---------------------------------------------------------------------------
 # Exception safety
 # ---------------------------------------------------------------------------

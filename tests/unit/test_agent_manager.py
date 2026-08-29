@@ -4188,10 +4188,19 @@ class TestLoadFromConfig:
         tmp_path,
     ):
         mock_get_did.return_value = "did:future"
-        mock_agent_cls.return_value = _make_mock_agent("did:future")
+        future_agent = _make_mock_agent("did:future")
+        mock_agent_cls.return_value = future_agent
         manager = AgentManager(base_data_dir=tmp_path)
         registry = object()
+        publication_gate = asyncio.Event()
         manager.bind_host_context_clause_registry(registry)
+        manager.set_host_context_publication_gate(publication_gate)
+
+        async def initialize_with_gate_bound():
+            assert future_agent._host_context_publication_gate is publication_gate
+            assert not publication_gate.is_set()
+
+        future_agent.initialize.side_effect = initialize_with_gate_bound
 
         with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
             await manager._initialize_agent(
@@ -4203,6 +4212,7 @@ class TestLoadFromConfig:
             mock_agent_cls.call_args.kwargs["host_context_clause_registry"]
             is registry
         )
+        assert future_agent._host_context_publication_gate is publication_gate
 
     @pytest.mark.asyncio
     async def test_load_from_config_initializes_concurrently_and_registers_in_order(self):

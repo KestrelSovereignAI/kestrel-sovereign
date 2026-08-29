@@ -1,17 +1,17 @@
 """Tests for the Feature Store API endpoints (endpoints/features.py)."""
 
+import asyncio
 import shlex
 import sys
-from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from fastapi import FastAPI
-from types import SimpleNamespace
-
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign import cli
+from kestrel_sovereign.endpoints import features as features_endpoint
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
@@ -996,6 +996,65 @@ class TestUpdateFeatureConfig:
             {"mode": "old"},
         ]
         assert agent.refresh_feature_context_clauses.call_count == 2
+
+    def test_refresh_failure_uses_generation_owned_rollback_when_available(self):
+        """Hosted rollback receives the exact commit receipt, not a blind write."""
+
+        receipt = object()
+        feature = _make_feature(config={"mode": "old"})
+        feature.set_config.return_value = receipt
+        feature.rollback_config_transition = AsyncMock()
+        agent = _make_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses.side_effect = [
+            RuntimeError("new clause renderer failed"),
+            None,
+        ]
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "new"}},
+            )
+
+        assert resp.status_code == 500
+        feature.rollback_config_transition.assert_awaited_once_with(receipt)
+        feature.set_config.assert_awaited_once_with({"mode": "new"})
+
+    @pytest.mark.asyncio
+    async def test_endpoint_config_transition_waits_for_active_turn(self):
+        """The HTTP transition shares the production conversation lock."""
+
+        feature = _make_feature(config={"mode": "old"})
+        applied = asyncio.Event()
+
+        async def set_config(_config):
+            applied.set()
+
+        feature.set_config.side_effect = set_config
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            update = asyncio.create_task(
+                features_endpoint.update_feature_config(
+                    request,
+                    "TestFeature",
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                )
+            )
+            await asyncio.sleep(0)
+            assert not applied.is_set()
+
+        response = await asyncio.wait_for(update, timeout=1)
+        assert response["config"] == {"mode": "old"}
+        assert applied.is_set()
 
     def test_failed_refresh_and_rollback_disables_feature_runtime(self):
         """A doubly-failed transition is quarantined instead of split-brain."""

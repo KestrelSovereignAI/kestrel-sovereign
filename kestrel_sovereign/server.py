@@ -2312,6 +2312,13 @@ async def _lifespan_startup(app: FastAPI):
             _apply_platform_host_port(config, os.environ)
             manager = AgentManager(base_data_dir=Path.cwd())
             app.state.agent_manager = manager
+            host_context_publication_gate = asyncio.Event()
+            app.state.host_context_publication_gate = host_context_publication_gate
+            set_host_context_gate = getattr(
+                manager, "set_host_context_publication_gate", None
+            )
+            if callable(set_host_context_gate):
+                set_host_context_gate(host_context_publication_gate)
             # Persistence context for runtime agent creation (#2358): when the
             # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent
             # must be appended there or it vanishes on restart (startup loads
@@ -2463,6 +2470,12 @@ async def _lifespan_startup(app: FastAPI):
                     llm_service=llm_service,
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+
+            host_context_publication_gate = asyncio.Event()
+            app.state.host_context_publication_gate = host_context_publication_gate
+            app.state.agent._host_context_publication_gate = (
+                host_context_publication_gate
+            )
 
             # Lifecycle hardening: provider availability (#377) is verified
             # inside KestrelAgent.initialize so every boot path — including
@@ -2632,6 +2645,16 @@ async def _lifespan_startup(app: FastAPI):
                     await _hf.stop_host_features(candidate_started, candidate_ctx)
             finally:
                 await _hf.close_host_context(candidate_ctx)
+
+    # No cognition turn may cross startup with the agent-only clause view.
+    # This includes overdue standalone schedules armed from on_agent_ready and
+    # the shared PostgreSQL runner, which may already have claimed work.  Host
+    # contribution validation/binding above is the publication boundary.
+    host_context_publication_gate = getattr(
+        app.state, "host_context_publication_gate", None
+    )
+    if host_context_publication_gate is not None:
+        host_context_publication_gate.set()
 
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
