@@ -2123,6 +2123,48 @@ class TestTaskExecutor:
         assert signal.payload == {"mode": "execute"}
 
     @pytest.mark.asyncio
+    async def test_dynamic_feature_tool_schedule_is_skipped_while_held(
+        self, feature,
+    ):
+        """A supported unregistered tool cannot bypass either Hold latch."""
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+        )
+
+        class _HeldStore:
+            async def get_effective(self, _agent_id):
+                return EffectiveHoldState(
+                    host=None,
+                    agent=HoldState(
+                        scope=HoldScope.AGENT,
+                        target_id="did:test:scheduler-agent",
+                        reason="operator hold",
+                        actor_id="did:test:operator",
+                        set_at="2026-08-29T00:00:00+00:00",
+                        hold_receipt_id="hold:scheduler",
+                        revision=1,
+                    ),
+                )
+
+        mock_tool = MagicMock()
+        mock_tool.name = "wellness_check"
+        mock_tool.execute = AsyncMock(return_value={"success": True})
+        mock_feature = MagicMock()
+        mock_feature.get_tools.return_value = [mock_tool]
+        feature.agent.did = "did:test:scheduler-agent"
+        feature.agent._hold_store = _HeldStore()
+        feature.agent.features = {"WellnessFeature": mock_feature}
+        feature.agent.dispatcher = MagicMock()
+
+        result = await feature._dispatch_scheduled_task("wellness_check", {})
+
+        assert result == "skipped: dropped_quiet_hours (hold_skipped)"
+        mock_tool.execute.assert_not_awaited()
+        feature.agent.dispatcher.dispatch_signal.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_training_cycle_requires_current_durable_semantic_maintenance(
         self, feature,
     ):
