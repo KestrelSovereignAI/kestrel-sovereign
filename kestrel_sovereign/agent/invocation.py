@@ -291,6 +291,7 @@ def bind_async_invocation(
                     if callable(register):
                         register(lifecycle_owner, invocation_id)
                         registered = True
+                caller_cancellation_baseline = 0
                 try:
                     if registered:
                         bind_operation = getattr(
@@ -300,6 +301,9 @@ def bind_async_invocation(
                         )
                         parent_context = copy_context()
                         operation_context = parent_context.copy()
+                        caller = asyncio.current_task()
+                        if caller is not None:
+                            caller_cancellation_baseline = caller.cancelling()
                         operation = asyncio.create_task(
                             function(*bound.args, **bound.kwargs),
                             name=(
@@ -339,7 +343,11 @@ def bind_async_invocation(
                             return result
                         except asyncio.CancelledError as error:
                             caller = asyncio.current_task()
-                            if caller is not None and caller.cancelling():
+                            if (
+                                caller is not None
+                                and caller.cancelling()
+                                > caller_cancellation_baseline
+                            ):
                                 raise
                             raise InvocationCancelledError(
                                 "isolated invocation was cancelled "
@@ -370,7 +378,7 @@ def bind_async_invocation(
                     # cancellation is a successful lifecycle completion, not a
                     # cleanup failure.
                     raise
-                except BaseException:
+                except BaseException as error:
                     if registered:
                         request_cancelled = getattr(
                             type(lifecycle_owner),
@@ -378,8 +386,16 @@ def bind_async_invocation(
                             None,
                         )
                         try:
+                            caller = asyncio.current_task()
+                            caller_cancelled = bool(
+                                isinstance(error, asyncio.CancelledError)
+                                and caller is not None
+                                and caller.cancelling()
+                                > caller_cancellation_baseline
+                            )
                             cleanup_abandoned = bool(
-                                callable(request_cancelled)
+                                not caller_cancelled
+                                and callable(request_cancelled)
                                 and request_cancelled(
                                     lifecycle_owner, invocation_id
                                 )

@@ -42,8 +42,19 @@ def test_stop_request_and_outcome_round_trip_exact_wire_values() -> None:
         reason="unsafe loop",
         cascade=False,
         correlation_id="stop-7",
+        target_is_turn_id=True,
     )
     assert StopRequest.from_dict(request.to_dict()) == request
+
+    resolved_request = StopRequest(
+        scope=StopScope.TURN,
+        target="request-private",
+        target_agent_id="did:test:target",
+        actor_id="did:test:operator",
+        correlation_id="stop-resolved",
+        request_generation=7,
+    )
+    assert StopRequest.from_dict(resolved_request.to_dict()) == resolved_request
 
     outcome = StopOutcome(
         scope=request.scope,
@@ -370,6 +381,13 @@ def test_stop_outcome_rejects_scope_target_contradictions(payload) -> None:
         {"target_id": " "},
         {"agent_id": "\t"},
         {"turn_ids": "turn-10"},
+        {"turn_request_ids": {"": "request-10"}},
+        {"turn_request_ids": {"turn-10": ""}},
+        {"turn_request_generations": {"turn-10": 1}},
+        {
+            "turn_request_ids": {"turn-10": "request-10"},
+            "turn_request_generations": {"turn-10": 0},
+        },
         {"tool_call_ids": frozenset({""})},
     ],
 )
@@ -431,6 +449,98 @@ async def test_authority_resolves_turn_and_tool_addresses() -> None:
     assert turn[0].agent_id == "did:test:a"
     assert tool[0].agent_id == "did:test:a"
     assert missing[0].disposition is StopDisposition.UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_authority_resolves_turn_address_to_live_cancellation_key() -> None:
+    observed_targets: list[tuple[str | None, int | None]] = []
+
+    async def stop(request: StopRequest) -> StopDisposition:
+        observed_targets.append((request.target, request.request_generation))
+        return StopDisposition.STOPPED
+
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget(
+                "agent-a",
+                "did:test:a",
+                stop,
+                turn_ids=frozenset({"turn-visible"}),
+                turn_request_ids={"turn-visible": "request-private"},
+                turn_request_generations={"turn-visible": 7},
+            )
+        ]
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(
+            StopScope.TURN,
+            "did:test:operator",
+            "turn-visible",
+            target_agent_id="did:test:a",
+            target_is_turn_id=True,
+        )
+    )
+
+    assert observed_targets == [("request-private", 7)]
+    assert outcomes[0].requested_target == "turn-visible"
+    assert outcomes[0].resolved_target == "request-private"
+
+
+@pytest.mark.asyncio
+async def test_request_address_collision_is_not_remapped_as_public_turn() -> None:
+    """Address kind, not string membership, selects turn-ID remapping."""
+
+    observed_targets: list[str | None] = []
+
+    async def stop(request: StopRequest) -> StopDisposition:
+        observed_targets.append(request.target)
+        return StopDisposition.STOPPED
+
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget(
+                "agent-a",
+                "did:test:a",
+                stop,
+                turn_ids=frozenset({"collision"}),
+                turn_request_ids={"collision": "another-request"},
+            )
+        ]
+    )
+
+    outcome = await authority.stop(
+        StopRequest(
+            StopScope.TURN,
+            "did:test:operator",
+            "collision",
+            target_agent_id="did:test:a",
+            target_is_turn_id=False,
+        )
+    )
+
+    assert observed_targets == ["collision"]
+    assert outcome[0].resolved_target == "agent-a"
+
+
+def test_turn_stop_preserves_accepted_opaque_whitespace_request_id() -> None:
+    request = StopRequest(
+        StopScope.TURN,
+        "did:test:operator",
+        " ",
+        target_agent_id="did:test:a",
+    )
+    outcome = StopOutcome(
+        scope=StopScope.TURN,
+        requested_target=" ",
+        resolved_target=" ",
+        agent_id="did:test:a",
+        disposition=StopDisposition.STOPPED,
+        correlation_id="opaque-whitespace",
+    )
+
+    assert StopRequest.from_dict(request.to_dict()) == request
+    assert StopOutcome.from_dict(outcome.to_dict()) == outcome
 
 
 @pytest.mark.asyncio
@@ -540,6 +650,9 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     agent.agent_id = "did:test:live-agent"
     agent._active_request_ids = {"turn-b", "turn-a"}
     agent._current_request_id = "turn-b"
+    agent.active_turn_request_ids = MagicMock(
+        return_value={"observable-turn": "turn-a"}
+    )
     agent.cancel_current_request = MagicMock(return_value=True)
     agent.wait_for_request_completion = AsyncMock(return_value=None)
     app.state.agent = agent
@@ -556,6 +669,202 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
         call("turn-a"),
         call("turn-b"),
     ]
+
+
+def test_live_stop_endpoint_accepts_turn_id_and_resolves_inside_authority() -> None:
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+    )
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"request-private"}
+    agent._current_request_id = "request-private"
+    agent.active_turn_request_ids = MagicMock(
+        return_value={"turn-visible": "request-private"}
+    )
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(
+        return_value=RequestCompletionDisposition.COMPLETED
+    )
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "turn-visible"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["turn_id"] == "turn-visible"
+    assert response.json()["request_id"] is None
+    outcome = response.json()["stop_outcomes"][0]
+    assert outcome["requested_target"] == "turn-visible"
+    assert outcome["resolved_target"] == "request-private"
+    agent.cancel_current_request.assert_called_once_with(
+        request_id="request-private"
+    )
+    agent.wait_for_request_completion.assert_awaited_once_with("request-private")
+
+
+def test_turn_stop_cannot_cancel_a_reused_request_generation() -> None:
+    """A stale turn snapshot must not widen onto a fresh same-ID delivery."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+
+    class LiveAgent(RequestLifecycleMixin):
+        agent_id = "did:test:generation-race"
+
+        def __init__(self) -> None:
+            self._current_request_id = "reused-request"
+            self._active_request_ids = {"reused-request"}
+            self._active_request_counts = {"reused-request": 1}
+            self._active_request_started_at = {
+                "reused-request": time.monotonic()
+            }
+            self._active_request_generations = {"reused-request": 2}
+            self._next_request_generation = 2
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._request_completion_events = {}
+
+        def active_turn_request_bindings(self):
+            # Inventory captured turn generation 1 immediately before that
+            # turn completed and generation 2 reused its request ID.
+            return {"old-public-turn": ("reused-request", 1)}
+
+    agent = LiveAgent()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "old-public-turn"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stop_outcomes"][0]["disposition"] == (
+        "already_complete"
+    )
+    assert ("reused-request", 2) not in agent._cancelled_request_generations
+    assert "reused-request" not in getattr(
+        agent, "_pending_request_cancellations", {}
+    )
+
+
+def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+    )
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"collision", "another-request"}
+    agent._current_request_id = "another-request"
+    agent.active_turn_request_ids = MagicMock(
+        return_value={"collision": "another-request"}
+    )
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(
+        return_value=RequestCompletionDisposition.COMPLETED
+    )
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": "collision"},
+    )
+
+    assert response.status_code == 200
+    agent.cancel_current_request.assert_called_once_with(request_id="collision")
+    agent.wait_for_request_completion.assert_awaited_once_with("collision")
+
+
+def test_unknown_turn_does_not_fall_back_to_agent_wide_stop() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"unrelated-request"}
+    agent._current_request_id = "unrelated-request"
+    agent.active_turn_request_ids = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "already-finished-turn"},
+    )
+
+    assert response.status_code == 503
+    agent.cancel_current_request.assert_not_called()
+
+
+def test_stop_endpoint_rejects_request_and_turn_id_together() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = MagicMock(agent_id="did:test:live-agent")
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": "request-key", "turn_id": "turn-key"},
+    )
+
+    assert response.status_code == 400
+    assert "either request_id or turn_id" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("request_id", ["", None, 0, False])
+def test_stop_endpoint_rejects_explicit_falsey_request_id(request_id) -> None:
+    """A malformed exact address cannot widen into agent-wide Stop."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:falsey-stop-address"
+    agent._active_request_ids = {"unrelated-live-turn"}
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": request_id},
+    )
+
+    assert response.status_code == 400
+    agent.cancel_current_request.assert_not_called()
+
+
+def test_stop_endpoint_rejects_empty_query_request_id() -> None:
+    """Query-field presence is preserved even when its value is empty."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:falsey-query-stop-address"
+    agent._active_request_ids = {"unrelated-live-turn"}
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+
+    response = TestClient(app).post("/api/agent/stop?request_id=")
+
+    assert response.status_code == 400
+    agent.cancel_current_request.assert_not_called()
 
 
 def test_stop_before_registration_fences_the_late_request_generation() -> None:

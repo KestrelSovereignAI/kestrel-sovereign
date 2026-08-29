@@ -40,6 +40,8 @@ class StopRequest:
     reason: str | None = None
     cascade: bool = True
     correlation_id: str = field(default_factory=lambda: uuid4().hex)
+    target_is_turn_id: bool = False
+    request_generation: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, StopScope):
@@ -49,8 +51,10 @@ class StopRequest:
         if self.scope is StopScope.HOST:
             if self.target is not None:
                 raise ValueError("host Stop cannot carry a target")
-        elif not isinstance(self.target, str) or not self.target.strip():
+        elif not isinstance(self.target, str) or not self.target:
             raise ValueError(f"{self.scope.value} Stop requires a target")
+        elif self.scope is StopScope.AGENT and not self.target.strip():
+            raise ValueError("agent Stop requires a concrete identity")
         if self.scope in {StopScope.TURN, StopScope.TOOL_CALL} and (
             not isinstance(self.target_agent_id, str)
             or not self.target_agent_id.strip()
@@ -70,6 +74,21 @@ class StopRequest:
             raise ValueError("reason must be a non-empty string when supplied")
         if not isinstance(self.cascade, bool):
             raise TypeError("cascade must be boolean")
+        if not isinstance(self.target_is_turn_id, bool):
+            raise TypeError("target_is_turn_id must be boolean")
+        if self.target_is_turn_id and self.scope is not StopScope.TURN:
+            raise ValueError("only turn Stop may carry a public turn address")
+        if self.request_generation is not None and (
+            self.scope is not StopScope.TURN
+            or self.target_is_turn_id
+            or not isinstance(self.request_generation, int)
+            or isinstance(self.request_generation, bool)
+            or self.request_generation <= 0
+        ):
+            raise ValueError(
+                "request_generation requires a resolved turn request and a "
+                "positive integer"
+            )
         if (
             not isinstance(self.correlation_id, str)
             or not self.correlation_id.strip()
@@ -85,6 +104,8 @@ class StopRequest:
             "reason": self.reason,
             "cascade": self.cascade,
             "correlation_id": self.correlation_id,
+            "target_is_turn_id": self.target_is_turn_id,
+            "request_generation": self.request_generation,
         }
 
     @classmethod
@@ -97,6 +118,8 @@ class StopRequest:
             reason=value.get("reason"),
             cascade=value.get("cascade", True),
             correlation_id=value["correlation_id"],
+            target_is_turn_id=value.get("target_is_turn_id", False),
+            request_generation=value.get("request_generation"),
         )
 
 
@@ -125,13 +148,14 @@ class StopOutcome:
             )
         if self.requested_target is not None and (
             not isinstance(self.requested_target, str)
-            or not self.requested_target.strip()
+            or not self.requested_target
         ):
             raise ValueError(
                 "requested_target must be a non-empty string when supplied"
             )
+        if not isinstance(self.resolved_target, str) or not self.resolved_target:
+            raise ValueError("resolved_target must be a non-empty string")
         for field_name, value in (
-            ("resolved_target", self.resolved_target),
             ("agent_id", self.agent_id),
             ("correlation_id", self.correlation_id),
         ):
