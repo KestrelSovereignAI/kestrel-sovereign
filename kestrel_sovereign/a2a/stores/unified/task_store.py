@@ -25,6 +25,8 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
+_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v2"
+
 
 class TaskAlreadyExistsError(ValueError):
     """A caller attempted to create a second task under an occupied ID."""
@@ -93,7 +95,8 @@ class TaskStore(UnifiedStoreBase):
                 recipient_agent_id TEXT,
                 canceled_by TEXT,
                 cancel_reason TEXT,
-                cancel_previous_status TEXT
+                cancel_previous_status TEXT,
+                cancel_operation_id TEXT
             )
         """)
 
@@ -114,18 +117,21 @@ class TaskStore(UnifiedStoreBase):
         except Exception as e:
             logger.debug(f"Migration check for user_id: {e}")
 
-        # Durable task authority and cancellation receipt (#3134).  These are
-        # separate columns rather than caller-controlled metadata so a shared
-        # PostgreSQL table has the same security boundary as per-agent SQLite.
-        authority_columns = (
-            "creator_agent_id",
-            "recipient_agent_id",
-            "canceled_by",
-            "cancel_reason",
-            "cancel_previous_status",
-        )
-        for column in authority_columns:
-            await self.add_column_if_missing("a2a_tasks", column, "TEXT")
+        # Durable task authority and cancellation receipt (#3134). PostgreSQL
+        # hosts initialize several agents concurrently, so serialize the whole
+        # schema bundle and re-probe after acquiring the database-wide lock.
+        # Without that second probe, every waiter would still replay DDL based
+        # on the stale pre-lock schema it observed.
+        if self.is_postgres:
+            async with self._backend.transaction():
+                await self._backend.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                    (_CANCELLATION_SCHEMA_LOCK,),
+                )
+                if not await self._postgres_cancellation_schema_ready():
+                    await self._ensure_cancellation_schema_objects()
+        else:
+            await self._ensure_cancellation_schema_objects()
 
         # Pre-#3134 live rows have no trustworthy creator/recipient columns.
         # Metadata was caller-controlled and a shared PostgreSQL table contains
@@ -161,6 +167,91 @@ class TaskStore(UnifiedStoreBase):
                 settled,
             )
 
+        logger.info(f"TaskStore initialized ({self._backend.backend_type})")
+
+    async def _postgres_cancellation_schema_ready(self) -> bool:
+        """Re-probe every PostgreSQL object protected by the migration lock."""
+
+        row = await self._backend.fetch_one("""
+            SELECT
+                (
+                    SELECT COUNT(*) = 6
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'a2a_tasks'
+                      AND column_name IN (
+                          'creator_agent_id',
+                          'recipient_agent_id',
+                          'canceled_by',
+                          'cancel_reason',
+                          'cancel_previous_status',
+                          'cancel_operation_id'
+                      )
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = procedure.pronamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND procedure.proname =
+                          'a2a_tasks_enforce_authority_fence'
+                      AND pg_get_function_identity_arguments(procedure.oid) = ''
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_trigger trigger
+                    JOIN pg_class relation
+                      ON relation.oid = trigger.tgrelid
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND relation.relname = 'a2a_tasks'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
+                      AND NOT trigger.tgisinternal
+                )
+                AND (
+                    SELECT COUNT(*) = 5
+                    FROM pg_class index_relation
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = index_relation.relnamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND index_relation.relkind = 'i'
+                      AND index_relation.relname IN (
+                          'idx_tasks_status',
+                          'idx_tasks_session',
+                          'idx_tasks_user',
+                          'idx_tasks_creator',
+                          'idx_tasks_recipient'
+                      )
+                )
+        """)
+        return bool(row and row[0])
+
+    async def _ensure_cancellation_schema_objects(self) -> None:
+        """Install the authority columns, terminal fence, and query indexes."""
+
+        # Separate columns rather than caller-controlled metadata give a
+        # shared PostgreSQL table the same security boundary as per-agent
+        # SQLite.
+        authority_columns = (
+            "creator_agent_id",
+            "recipient_agent_id",
+            "canceled_by",
+            "cancel_reason",
+            "cancel_previous_status",
+            "cancel_operation_id",
+        )
+        for column in authority_columns:
+            await self.add_column_if_missing("a2a_tasks", column, "TEXT")
+
+        # Cancellation is terminal at the storage boundary, including for
+        # pre-upgrade writers still running during a PostgreSQL rollout. The
+        # application predicates below protect current code, while this fence
+        # prevents an older unconditional UPDATE/upsert from resurrecting a
+        # row after a new worker has committed its cancellation receipt.
+        await self._install_canceled_terminal_fence()
+
         # Create indexes
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_status ON a2a_tasks(status)"
@@ -182,7 +273,69 @@ class TaskStore(UnifiedStoreBase):
             "ON a2a_tasks(recipient_agent_id)"
         )
 
-        logger.info(f"TaskStore initialized ({self._backend.backend_type})")
+    async def _install_canceled_terminal_fence(self) -> None:
+        """Fence legacy writers from live authority gaps and canceled mutation."""
+
+        if self.is_postgres:
+            await self._backend.execute_script("""
+                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence()
+                RETURNS trigger AS $a2a_fence_function$
+                BEGIN
+                    IF TG_OP = 'UPDATE' AND OLD.status = 'canceled' THEN
+                        RAISE EXCEPTION 'canceled A2A task is terminal'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    IF NEW.status IN ('submitted', 'working', 'input-required')
+                       AND (NEW.creator_agent_id IS NULL
+                            OR NEW.recipient_agent_id IS NULL) THEN
+                        RAISE EXCEPTION 'live A2A task requires durable authority'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $a2a_fence_function$ LANGUAGE plpgsql;
+
+                DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1
+                    ON a2a_tasks;
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v2
+                    ON a2a_tasks;
+                CREATE TRIGGER a2a_tasks_authority_fence_v2
+                BEFORE INSERT OR UPDATE ON a2a_tasks
+                FOR EACH ROW
+                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence();
+            """)
+            return
+
+        await self._backend.execute_script("""
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_terminal_v2
+            BEFORE UPDATE ON a2a_tasks
+            FOR EACH ROW
+            WHEN OLD.status = 'canceled'
+            BEGIN
+                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
+            BEFORE INSERT ON a2a_tasks
+            FOR EACH ROW
+            WHEN NEW.status IN ('submitted', 'working', 'input-required')
+              AND (NEW.creator_agent_id IS NULL
+                   OR NEW.recipient_agent_id IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_update_v2
+            BEFORE UPDATE ON a2a_tasks
+            FOR EACH ROW
+            WHEN NEW.status IN ('submitted', 'working', 'input-required')
+              AND (NEW.creator_agent_id IS NULL
+                   OR NEW.recipient_agent_id IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
+            END;
+        """)
 
     async def save(
         self,
@@ -399,6 +552,15 @@ class TaskStore(UnifiedStoreBase):
             actor_agent_id=row[1],
         )
 
+    async def get_cancellation_operation_id(self, task_id: str) -> Optional[str]:
+        """Return the private attempt token proving which cancel committed."""
+
+        row = await self._backend.fetch_one(
+            "SELECT cancel_operation_id FROM a2a_tasks WHERE id = ?",
+            (task_id,),
+        )
+        return row[0] if row else None
+
     async def is_task_recipient(self, task_id: str, agent_id: str) -> bool:
         """Whether ``agent_id`` is the durable execution recipient of ``task_id``."""
 
@@ -420,7 +582,7 @@ class TaskStore(UnifiedStoreBase):
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
             raise ValueError("Pending-task reads require a concrete recipient")
         rows = await self._backend.fetch_all(
-            """
+            f"""
             SELECT * FROM a2a_tasks
             WHERE status = 'submitted' AND recipient_agent_id = ?
             ORDER BY created_at ASC
@@ -465,6 +627,7 @@ class TaskStore(UnifiedStoreBase):
         expected_recipient_agent_id: Optional[str] = None,
         reason: Optional[str] = None,
         task_payload: Optional[Task] = None,
+        operation_id: Optional[str] = None,
     ) -> Optional[Task]:
         """Atomically cancel one live task owned by or delegated to ``actor``.
 
@@ -477,6 +640,10 @@ class TaskStore(UnifiedStoreBase):
         """
         if not isinstance(actor_agent_id, str) or not actor_agent_id:
             raise ValueError("Cancellation actor must be a concrete agent identity")
+        if operation_id is not None and (
+            not isinstance(operation_id, str) or not operation_id
+        ):
+            raise ValueError("Cancellation operation ID must be a concrete string")
         if expected_recipient_agent_id is not None and (
             not isinstance(expected_recipient_agent_id, str)
             or not expected_recipient_agent_id
@@ -507,113 +674,11 @@ class TaskStore(UnifiedStoreBase):
                 )
             ],
         )
-        if task_payload is not None:
-            transaction = (
-                self._backend.transaction(immediate=True)
-                if self.is_sqlite
-                else self._backend.transaction()
-            )
-            async with transaction:
-                lock_suffix = " FOR UPDATE" if self.is_postgres else ""
-                current = await self._backend.fetch_one(
-                    "SELECT artifacts, history, metadata FROM a2a_tasks "
-                    f"WHERE id = ?{lock_suffix}",
-                    (task_id,),
-                )
-                if current is None:
-                    return None
-
-                def decode_json(value, default):
-                    if value is None:
-                        return default
-                    if isinstance(value, (list, dict)):
-                        return value
-                    return json_loads(value) or default
-
-                def merge_sequence(current_items, payload_items):
-                    merged = list(current_items)
-                    for item in payload_items:
-                        if item not in merged:
-                            merged.append(item)
-                    return merged
-
-                current_artifacts = decode_json(current[0], [])
-                current_history = decode_json(current[1], [])
-                current_metadata = decode_json(current[2], {})
-                payload_artifacts = [
-                    artifact.model_dump()
-                    for artifact in (task_payload.artifacts or [])
-                ]
-                payload_history = [
-                    item.model_dump() for item in (task_payload.history or [])
-                ]
-                payload_metadata = dict(task_payload.metadata or {})
-                payload_metadata.pop("cancellation_receipt", None)
-                merged_metadata = {
-                    **current_metadata,
-                    **payload_metadata,
-                }
-                merged_history = merge_sequence(
-                    current_history,
-                    payload_history,
-                )
-                merged_history.append(message.model_dump())
-                recipient_predicate = (
-                    " AND recipient_agent_id = ?"
-                    if expected_recipient_agent_id is not None
-                    else ""
-                )
-                recipient_values = (
-                    (expected_recipient_agent_id,)
-                    if expected_recipient_agent_id is not None
-                    else ()
-                )
-                rows_affected = await self._backend.execute(
-                    f"""
-                    UPDATE a2a_tasks
-                    SET cancel_previous_status = status,
-                        status = 'canceled',
-                        message = ?,
-                        artifacts = ?,
-                        history = ?,
-                        metadata = ?,
-                        canceled_by = ?,
-                        cancel_reason = ?,
-                        updated_at = {self.now_sql()}
-                    WHERE id = ?
-                      AND status IN ('submitted', 'working', 'input-required')
-                      AND (creator_agent_id = ? OR recipient_agent_id = ?)
-                      {recipient_predicate}
-                    """,
-                    (
-                        message.model_dump_json(),
-                        json_dumps(
-                            merge_sequence(current_artifacts, payload_artifacts)
-                        ),
-                        json_dumps(merged_history),
-                        json_dumps(merged_metadata),
-                        actor_agent_id,
-                        reason,
-                        task_id,
-                        actor_agent_id,
-                        actor_agent_id,
-                        *recipient_values,
-                    ),
-                )
-            if rows_affected != 1:
-                return None
-            return await self.get_for_principal(task_id, actor_agent_id)
-
-        if self.is_postgres:
-            payload_assignment = (
-                "history = COALESCE(history, '[]'::jsonb) || ?::jsonb,"
-            )
-            payload_values = (json_dumps([message.model_dump()]),)
-        else:
-            payload_assignment = (
-                "history = json_insert(COALESCE(history, '[]'), '$[#]', json(?)),"
-            )
-            payload_values = (message.model_dump_json(),)
+        transaction = (
+            self._backend.transaction(immediate=True)
+            if self.is_sqlite
+            else self._backend.transaction()
+        )
         recipient_predicate = (
             " AND recipient_agent_id = ?"
             if expected_recipient_agent_id is not None
@@ -624,35 +689,106 @@ class TaskStore(UnifiedStoreBase):
             if expected_recipient_agent_id is not None
             else ()
         )
-        rows_affected = await self._backend.execute(
-            f"""
-            UPDATE a2a_tasks
-            SET cancel_previous_status = status,
-                status = 'canceled',
-                message = ?,
-                {payload_assignment}
-                canceled_by = ?,
-                cancel_reason = ?,
-                updated_at = {self.now_sql()}
-            WHERE id = ?
-              AND status IN ('submitted', 'working', 'input-required')
-              AND (creator_agent_id = ? OR recipient_agent_id = ?)
-              {recipient_predicate}
-            """,
-            (
-                message.model_dump_json(),
-                *payload_values,
-                actor_agent_id,
-                reason,
-                task_id,
-                actor_agent_id,
-                actor_agent_id,
-                *recipient_values,
-            ),
-        )
-        if rows_affected != 1:
-            return None
-        return await self.get_for_principal(task_id, actor_agent_id)
+        def decode_json(value, default):
+            if value is None:
+                return default
+            if isinstance(value, (list, dict)):
+                return value
+            return json_loads(value) or default
+
+        def merge_sequence(current_items, payload_items):
+            merged = list(current_items)
+            for item in payload_items:
+                if item not in merged:
+                    merged.append(item)
+            return merged
+
+        async with transaction:
+            lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+            current = await self._backend.fetch_one(
+                f"SELECT * FROM a2a_tasks WHERE id = ?{lock_suffix}",
+                (task_id,),
+            )
+            if current is None:
+                return None
+
+            current_artifacts = decode_json(current[6], [])
+            current_history = decode_json(current[7], [])
+            current_metadata = decode_json(current[8], {})
+            if task_payload is not None:
+                payload_artifacts = [
+                    artifact.model_dump()
+                    for artifact in (task_payload.artifacts or [])
+                ]
+                payload_history = [
+                    item.model_dump() for item in (task_payload.history or [])
+                ]
+                payload_metadata = dict(task_payload.metadata or {})
+                payload_metadata.pop("cancellation_receipt", None)
+                merged_artifacts = merge_sequence(
+                    current_artifacts, payload_artifacts
+                )
+                merged_history = merge_sequence(current_history, payload_history)
+                merged_metadata = {**current_metadata, **payload_metadata}
+            else:
+                merged_artifacts = current_artifacts
+                merged_history = list(current_history)
+                merged_metadata = current_metadata
+            merged_history.append(message.model_dump())
+            artifacts_json = json_dumps(merged_artifacts)
+            history_json = json_dumps(merged_history)
+            metadata_json = json_dumps(merged_metadata)
+            message_json = message.model_dump_json()
+            rows_affected = await self._backend.execute(
+                f"""
+                UPDATE a2a_tasks
+                SET cancel_previous_status = status,
+                    status = 'canceled',
+                    message = ?,
+                    artifacts = ?,
+                    history = ?,
+                    metadata = ?,
+                    canceled_by = ?,
+                    cancel_reason = ?,
+                    cancel_operation_id = ?,
+                    updated_at = {self.now_sql()}
+                WHERE id = ?
+                  AND status IN ('submitted', 'working', 'input-required')
+                  AND (creator_agent_id = ? OR recipient_agent_id = ?)
+                  {recipient_predicate}
+                """,
+                (
+                    message_json,
+                    artifacts_json,
+                    history_json,
+                    metadata_json,
+                    actor_agent_id,
+                    reason,
+                    operation_id,
+                    task_id,
+                    actor_agent_id,
+                    actor_agent_id,
+                    *recipient_values,
+                ),
+            )
+            if rows_affected != 1:
+                return None
+
+            # Materialize the exact committed payload from the locked row and
+            # the values written above.  A second read after commit can fail or
+            # be canceled after authority has already changed, which would
+            # wrongly roll back local intent and abandon every projection.
+            canceled_row = list(current)
+            canceled_row[4] = TaskState.CANCELED.value
+            canceled_row[5] = message_json
+            canceled_row[6] = artifacts_json
+            canceled_row[7] = history_json
+            canceled_row[8] = metadata_json
+            canceled_row[13] = actor_agent_id
+            canceled_row[14] = reason
+            canceled_row[15] = current[4]
+            canceled_row[16] = operation_id
+            return self._row_to_task(tuple(canceled_row))
 
     async def add_artifact(
         self,
@@ -812,7 +948,7 @@ class TaskStore(UnifiedStoreBase):
         5: message, 6: artifacts, 7: history, 8: metadata,
         9: created_at, 10: updated_at, 11: creator_agent_id,
         12: recipient_agent_id, 13: canceled_by, 14: cancel_reason,
-        15: cancel_previous_status
+        15: cancel_previous_status, 16: cancel_operation_id
         """
         artifacts_data = json_loads(row[6]) if row[6] else []
         history_data = json_loads(row[7]) if row[7] else []

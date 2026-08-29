@@ -24,6 +24,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.a2a.task_manager import TaskCancellationAuthorizationError
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sdk.tools.base import ToolCategory
@@ -1083,6 +1084,14 @@ class TaskFeature(Feature):
                 data={"task_id": task_id, "state": terminal.value},
             )
 
+        # CANCELED is not an ordinary response-state write. Delegate before a
+        # local task lookup: with the normal per-agent SQLite topology, an
+        # outbound row exists only in the recipient store and the sender must
+        # resolve it through its durable PeersFeature route. Shared PostgreSQL
+        # visibility likewise cannot replace current peer-scope authorization.
+        if terminal == TaskState.CANCELED:
+            return await self.cancel_task(task_id, reason=content)
+
         try:
             task = await self.task_manager.get_task_for_recipient(
                 task_id,
@@ -1105,13 +1114,6 @@ class TaskFeature(Feature):
                 f"Task {task_id} is already terminal: {current.value}",
                 data={"task_id": task_id, "state": current.value},
             )
-
-        # CANCELED is not an ordinary response-state write. Delegate to the
-        # canonical cancellation tool so a sender-owned task follows its
-        # durable outbound route (and peer-scope reauthorization) even when a
-        # shared PostgreSQL store also exposes the recipient's row locally.
-        if terminal == TaskState.CANCELED:
-            return await self.cancel_task(task_id, reason=content)
 
         agent_name = getattr(self.agent, "did", None) or type(self.agent).__name__
         response_message = Message(
@@ -1366,6 +1368,16 @@ class TaskFeature(Feature):
                 task_id,
                 reason=reason,
                 agent_name=actor_agent_id,
+            )
+        except TaskCancellationAuthorizationError:
+            # This tool is a public task-discovery boundary.  Do not let a
+            # durable-principal authorization failure prove that the task ID
+            # exists; callers without creator/recipient authority receive the
+            # same result as an absent task.
+            logger.info("Task %s was not found for cancellation", task_id)
+            return ToolResult.failed(
+                f"Task {task_id} not found",
+                data={"task_id": task_id},
             )
         except ValueError as e:
             logger.error(f"Failed to cancel task {task_id}: {e}", exc_info=True)

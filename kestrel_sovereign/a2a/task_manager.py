@@ -44,6 +44,11 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
 from typing import Protocol, runtime_checkable, TYPE_CHECKING
 from uuid import uuid4
 
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
+
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
 
@@ -869,11 +874,32 @@ class TaskManager:
                 exc_info=True,
             )
 
-        # Notify subscribers
-        await self._notify_status_update(task, final=False)
+        # A recipient wake can race these best-effort projections and move the
+        # canonical row before create_task returns. Never publish an older
+        # SUBMITTED snapshot after a terminal transition already committed.
+        readback_succeeded = False
+        try:
+            canonical = await self.task_store._get_unscoped(task.id)
+            readback_succeeded = canonical is not None
+        except (Exception, asyncio.CancelledError):
+            canonical = None
+            logger.warning(
+                "Task %s was created but its canonical readback failed",
+                task.id,
+                exc_info=True,
+            )
+        if canonical is None:
+            # The insert is the acceptance boundary.  A read outage after that
+            # commit must not turn a successful submission into a transport
+            # failure whose exact retry is rejected as a duplicate.  The local
+            # snapshot is safe to return, but not to publish as a status event:
+            # the recipient may already have advanced the canonical row.
+            canonical = task
+        if readback_succeeded and canonical.status.state is TaskState.SUBMITTED:
+            await self._notify_status_update(canonical, final=False)
 
         logger.info(f"Task created: {task.id} in session {params.sessionId}")
-        return task
+        return canonical
 
     async def update_status(
         self,
@@ -949,7 +975,7 @@ class TaskManager:
 
         # Determine if this is a final state
         is_final = new_state in (TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED)
-        await self._project_status_transition(
+        await self._finish_status_projection(
             task,
             old_state=current_state.value,
             new_state=new_state,
@@ -1130,6 +1156,8 @@ class TaskManager:
             "actor_agent_id": agent_name,
             "reason": reason,
         }
+        operation_id = uuid4().hex
+        cancel_kwargs["operation_id"] = operation_id
         if recipient_agent_id is not None:
             cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
         if task_payload is not None:
@@ -1140,15 +1168,51 @@ class TaskManager:
                 task_id,
                 agent_name,
             )
+        store_failure: BaseException | None = None
+
+        async def is_this_actor_receipt(candidate: Task) -> bool:
+            receipt = (candidate.metadata or {}).get("cancellation_receipt") or {}
+            return (
+                candidate.status.state is TaskState.CANCELED
+                and receipt.get("actor_agent_id") == agent_name
+                and (
+                    recipient_agent_id is None
+                    or await self.task_store.is_task_recipient(
+                        task_id,
+                        recipient_agent_id,
+                    )
+                )
+            )
+
         try:
             task = await self.task_store.cancel_if_authorized(
                 task_id,
                 **cancel_kwargs,
             )
-        except BaseException:
-            if rollback_local_intent is not None:
-                rollback_local_intent()
-            raise
+        except BaseException as error:
+            # PostgreSQL can commit and then lose the COMMIT acknowledgement.
+            # Re-read before declaring this a pre-commit failure: the task that
+            # owns the durable receipt must still cancel its queued wake and
+            # finish session/SSE/memory/completion projections.  Preserve the
+            # original store outcome only after that reconciliation completes.
+            store_failure = error
+            try:
+                current = await self.task_store._get_unscoped(task_id)
+                committed_here = (
+                    current is not None
+                    and await is_this_actor_receipt(current)
+                    and await self.task_store.get_cancellation_operation_id(task_id)
+                    == operation_id
+                )
+            except BaseException as reconciliation_failure:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise error from reconciliation_failure
+            if not committed_here:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise
+            task = current
         if task is None:
             try:
                 current = await self.task_store._get_unscoped(task_id)
@@ -1160,35 +1224,12 @@ class TaskManager:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
                 raise ValueError(f"Task not found: {task_id}")
-            receipt = (current.metadata or {}).get("cancellation_receipt") or {}
-            if (
-                current.status.state is TaskState.CANCELED
-                and receipt.get("actor_agent_id") == agent_name
-                and (
-                    recipient_agent_id is None
-                    or await self.task_store.is_task_recipient(
-                        task_id,
-                        recipient_agent_id,
-                    )
-                )
-            ):
-                # The first atomic cancellation may have committed while its
-                # transport response was lost. Return that exact durable
-                # receipt, but reconcile its derived projections: cancellation
-                # may have interrupted session, observability, SSE, or memory
-                # after the canonical row committed. Projections are designed
-                # to tolerate replay; without it an already-connected SSE
-                # subscriber can remain stale until it reports an expiry.
-                await self._project_status_transition(
-                    current,
-                    old_state=str(
-                        receipt.get("status_before") or TaskState.UNKNOWN.value
-                    ),
-                    new_state=TaskState.CANCELED,
-                    agent_name=agent_name,
-                    is_final=True,
-                    reason=receipt.get("reason"),
-                )
+            if await is_this_actor_receipt(current):
+                # The first atomic cancellation owns every derived projection.
+                # Its cancellation-safe projection join completes those side
+                # effects before propagating a lost transport response, so a
+                # retry returns only the canonical receipt and must not append
+                # duplicate memory/session rows or completion wakes.
                 # Keep the just-acquired local execution exemption: this retry
                 # is still the same authorized recipient decline and its
                 # monitor must not cancel the response after seeing CANCELED.
@@ -1220,7 +1261,7 @@ class TaskManager:
                     exc,
                     exc_info=True,
                 )
-        await self._project_status_transition(
+        await self._finish_status_projection(
             task,
             old_state=str(previous_state or TaskState.UNKNOWN.value),
             new_state=TaskState.CANCELED,
@@ -1236,7 +1277,38 @@ class TaskManager:
             previous_state,
             TaskState.CANCELED.value,
         )
+        if store_failure is not None:
+            raise store_failure
         return task
+
+    async def _finish_status_projection(
+        self,
+        task: Task,
+        *,
+        old_state: str,
+        new_state: TaskState,
+        agent_name: Optional[str],
+        is_final: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Join post-commit projections before propagating caller cancellation."""
+
+        projection = asyncio.create_task(
+            self._project_status_transition(
+                task,
+                old_state=old_state,
+                new_state=new_state,
+                agent_name=agent_name,
+                is_final=is_final,
+                reason=reason,
+            ),
+            name="a2a-task-status-projection",
+        )
+        outcome = await await_owned_task(projection)
+        raise_owned_outcome(
+            outcome,
+            operation="A2A task status projection",
+        )
 
     async def fail_task(
         self,

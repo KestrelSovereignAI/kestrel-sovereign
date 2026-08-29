@@ -1940,7 +1940,12 @@ class PeersFeature(Feature):
         """
         db = getattr(self, "_db", None)
         if db is None:
-            return None
+            if local_recipient_match:
+                return None
+            return ToolResult.failed(
+                "The durable outbound route store is unavailable",
+                data={"task_id": task_id},
+            )
         if not getattr(self, "_outbound_route_store_ready", False):
             return ToolResult.failed(
                 "The durable outbound route store is unavailable",
