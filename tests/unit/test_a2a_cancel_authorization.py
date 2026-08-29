@@ -2872,6 +2872,88 @@ async def test_database_fence_rejects_legacy_live_insert_without_authority(
 
 
 @pytest.mark.asyncio
+async def test_database_fence_rejects_legacy_terminal_replace_without_authority(
+    tmp_path,
+):
+    """A late pre-authority worker cannot erase principals on completion."""
+
+    manager = await create_task_manager(str(tmp_path / "terminal-authority-fence.db"))
+    try:
+        await manager.create_task(
+            _params("late-legacy-terminal"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        with pytest.raises(Exception, match="requires durable authority"):
+            await manager.task_store.backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks
+                    (id, session_id, user_id, task_type, status, message,
+                     artifacts, history, metadata, updated_at)
+                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    "late-legacy-terminal",
+                    None,
+                    None,
+                    "generic",
+                    None,
+                    "[]",
+                    "[]",
+                    "{}",
+                ),
+            )
+
+        persisted = await manager.task_store._get_unscoped("late-legacy-terminal")
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+        assert await manager.get_task_for_creator(
+            "late-legacy-terminal",
+            "did:test:creator",
+        ) is not None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_cancel_locks_only_an_authorized_principal_row():
+    """A foreign task ID cannot be used as a cross-principal lock primitive."""
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        transaction=transaction,
+        fetch_one=AsyncMock(return_value=None),
+        execute=AsyncMock(return_value=0),
+    )
+    store = TaskStore(backend)
+
+    result = await store.cancel_if_authorized(
+        "foreign-task",
+        actor_agent_id="did:test:actor",
+        expected_recipient_agent_id="did:test:expected-recipient",
+    )
+
+    assert result is None
+    query, values = backend.fetch_one.await_args.args
+    normalized = " ".join(query.split())
+    assert "(creator_agent_id = ? OR recipient_agent_id = ?)" in normalized
+    assert "AND recipient_agent_id = ?" in normalized
+    assert normalized.endswith("FOR UPDATE")
+    assert values == (
+        "foreign-task",
+        "did:test:actor",
+        "did:test:actor",
+        "did:test:expected-recipient",
+    )
+    backend.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_database_fence_blocks_legacy_writer_on_available_backends(db_backend):
     store = TaskStore(db_backend)

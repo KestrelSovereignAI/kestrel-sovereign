@@ -25,7 +25,7 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
 
-_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v2"
+_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v3"
 
 
 class TaskAlreadyExistsError(ValueError):
@@ -296,7 +296,7 @@ class TaskStore(UnifiedStoreBase):
                     IF NEW.status IN ('submitted', 'working', 'input-required')
                        AND (NEW.creator_agent_id IS NULL
                             OR NEW.recipient_agent_id IS NULL) THEN
-                        RAISE EXCEPTION 'live A2A task requires durable authority'
+                        RAISE EXCEPTION 'A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
                     END IF;
                     RETURN NEW;
