@@ -1457,6 +1457,42 @@ async def test_malformed_signature_rejects_row_and_continues_scan(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_malformed_unicode_evidence_rejects_row_and_continues_scan(tmp_path):
+    """An unpaired surrogate cannot wedge later coordinator candidates."""
+
+    feat, backend = await _make_feature(tmp_path)
+    malformed = await feat.request_restart(
+        reason="malformed Unicode candidate",
+        urgency="critical",
+    )
+    later = await feat.request_restart(
+        reason="later candidate must still be inspected",
+        urgency="low",
+        policy="manual_only",
+    )
+    malformed_id = malformed.data["request"]["id"]
+    later_id = later.data["request"]["id"]
+    row = await get_request(backend, malformed_id)
+    document = json.loads(row.authority_evidence)
+    document["unused"] = "\ud800"
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ?, "
+        "authority_signature = ? WHERE id = ?",
+        (json.dumps(document), "0" * 64, malformed_id),
+    )
+
+    result = await feat.restart_coordinator()
+
+    rejected = await get_request(backend, malformed_id)
+    untouched = await get_request(backend, later_id)
+    assert rejected.status == "rejected"
+    assert "not valid UTF-8" in rejected.status_reason
+    assert untouched.status == "pending"
+    assert result.status is ToolResultStatus.OK
+    assert [item["request_id"] for item in result.data["deferred"]] == [later_id]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("timestamp_field", ["requested_at", "first_blocked_at"])
 async def test_executor_rejects_tampered_safety_clock(
     tmp_path,
@@ -1501,6 +1537,26 @@ async def test_executor_rejects_authority_revoked_by_sovereign_key_rotation(
     created = await feat.request_restart(reason="revoke before poll")
     request_id = created.data["request"]["id"]
     monkeypatch.setenv("KESTREL_API_KEY", "rotated-sovereign-key")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_whitespace_only_sovereign_key_rotation(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="revoke with significant whitespace")
+    request_id = created.data["request"]["id"]
+    monkeypatch.setenv("KESTREL_API_KEY", "restart-authority-test-key ")
 
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",

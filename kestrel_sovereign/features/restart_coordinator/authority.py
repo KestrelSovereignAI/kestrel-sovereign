@@ -21,7 +21,10 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from kestrel_sovereign.auth import current_caller_context
-from kestrel_sovereign.security.sovereign_key import is_ephemeral_sovereign_key
+from kestrel_sovereign.security.sovereign_key import (
+    is_ephemeral_sovereign_key,
+    normalize_sovereign_api_key,
+)
 
 
 AUTHORITY_KIND = "sovereign_api_key_hmac_v1"
@@ -34,19 +37,23 @@ class RestartAuthorityError(ValueError):
 
 
 def _sovereign_secret() -> bytes:
-    raw = (os.environ.get("KESTREL_API_KEY") or "").strip()
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
-        raw = raw[1:-1]
+    raw = normalize_sovereign_api_key(os.environ.get("KESTREL_API_KEY") or "")
     if not raw:
         raise RestartAuthorityError(
             "whole-host restart authority is unavailable: no stable sovereign key"
         )
-    if is_ephemeral_sovereign_key(raw):
+    try:
+        if is_ephemeral_sovereign_key(raw):
+            raise RestartAuthorityError(
+                "whole-host restart authority is unavailable: the server generated "
+                "a temporary sovereign key; configure a stable KESTREL_API_KEY"
+            )
+        return raw.encode("utf-8")
+    except UnicodeEncodeError as error:
         raise RestartAuthorityError(
-            "whole-host restart authority is unavailable: the server generated "
-            "a temporary sovereign key; configure a stable KESTREL_API_KEY"
-        )
-    return raw.encode("utf-8")
+            "whole-host restart authority is unavailable: the sovereign key is "
+            "not valid UTF-8"
+        ) from error
 
 
 def _request_claims(
@@ -87,12 +94,17 @@ def _request_claims(
 
 
 def _canonical(document: Mapping[str, Any]) -> bytes:
-    return json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+    try:
+        return json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise RestartAuthorityError(
+            "restart authority evidence is not valid UTF-8"
+        ) from error
 
 
 def _signature(document: Mapping[str, Any]) -> str:

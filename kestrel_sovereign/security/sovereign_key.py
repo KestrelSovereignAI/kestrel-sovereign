@@ -21,6 +21,14 @@ def _fingerprint(key: str) -> bytes:
     return hashlib.sha256(key.encode("utf-8")).digest()
 
 
+def normalize_sovereign_api_key(key: str) -> str:
+    """Apply the exact normalization used by HTTP sovereign authentication."""
+
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
+        return key[1:-1]
+    return key
+
+
 def mark_ephemeral_sovereign_key(key: str) -> None:
     """Record that *key* was generated for this process, not configured."""
 
