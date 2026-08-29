@@ -202,6 +202,12 @@ def _make_a2a_feature(name="emma"):
     feature._host_url = "http://multi_agent"
     feature._api_key = ""
     feature._own_name = name
+    # Result-fetch tests model a task this agent previously sent to Meridian.
+    # The durable dispatch row is the authority for the stable recipient DID;
+    # individual artifact-shape tests should not bypass that production check.
+    feature._outbound_recipient_agent_id = AsyncMock(
+        return_value="did:test:meridian"
+    )
     return feature
 
 
@@ -232,20 +238,13 @@ def _mock_directory_response():
     return response
 
 
-def _async_client_with(post_resp=None, get_resp=None):
+def _async_client_with(post_resp=None):
     client = AsyncMock()
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
     if post_resp is not None:
         client.post.return_value = post_resp
-    if get_resp is not None:
-        # The local adapter resolves once for the tool input, then
-        # reauthorizes the stable identity before fetching a task result.
-        client.get.side_effect = [
-            _mock_directory_response(), _mock_directory_response(), get_resp,
-        ]
-    else:
-        client.get.return_value = _mock_directory_response()
+    client.get.return_value = _mock_directory_response()
     return client
 
 
@@ -782,7 +781,8 @@ async def test_get_peer_task_result_reassembles_artifacts_in_index_order():
              "parts": [{"type": "text", "text": "second-"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -818,7 +818,8 @@ async def test_get_peer_task_result_flags_incomplete_chunked_body():
              "parts": [{"type": "text", "text": "second-"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -845,7 +846,8 @@ async def test_get_peer_task_result_falls_back_to_inline_message_when_no_artifac
         "message": "Rome",
         "artifacts": [],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -881,7 +883,8 @@ async def test_get_peer_task_result_legacy_terminal_artifacts_complete():
             {"name": "result", "parts": [{"type": "text", "text": "42"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -919,7 +922,8 @@ async def test_get_peer_task_result_multi_group_artifacts_isolate_reply_body():
              "parts": [{"type": "text", "text": "first-"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -960,7 +964,8 @@ async def test_get_peer_task_result_legacy_single_unnamed_group_still_works():
             {"name": "result", "parts": [{"type": "text", "text": "the answer"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
