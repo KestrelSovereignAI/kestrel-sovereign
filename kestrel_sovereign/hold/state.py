@@ -195,6 +195,11 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
 def _receipt_from_row(row: Any) -> HoldReceipt:
     if row is None or len(row) != 12:
         raise HoldCorruptStateError("hold receipt row has an unexpected shape")
+    if row[0] is None:
+        # SQLite does not implicitly make a non-INTEGER PRIMARY KEY non-null.
+        # Existing/imported databases may therefore contain a keyless receipt;
+        # never manufacture the string ``"None"`` as its durable identity.
+        raise HoldCorruptStateError("hold receipt is missing its receipt identity")
     try:
         receipt = HoldReceipt(
             receipt_id=str(row[0]),
@@ -292,7 +297,7 @@ class HoldStore:
             )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS hold_receipts ("
-                "receipt_id TEXT PRIMARY KEY, "
+                "receipt_id TEXT NOT NULL PRIMARY KEY, "
                 "operation_id TEXT NOT NULL UNIQUE, "
                 "action TEXT NOT NULL, "
                 "disposition TEXT NOT NULL, "
