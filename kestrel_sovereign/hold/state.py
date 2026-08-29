@@ -380,6 +380,37 @@ class HoldStore:
             (operation_id,),
         )
 
+    async def _read_receipt_by_id(self, receipt_id: str) -> Any:
+        return await self._db.fetchone(
+            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        )
+
+    async def _validate_active_latch_receipt(self, latch: Optional[HoldState]) -> None:
+        """Prove an active latch is backed by its exact applied-Hold receipt."""
+
+        if latch is None:
+            return
+        row = await self._read_receipt_by_id(latch.hold_receipt_id)
+        if row is None:
+            raise HoldCorruptStateError(
+                "active hold latch references a missing authority receipt"
+            )
+        receipt = _receipt_from_row(row)
+        if (
+            receipt.action is not HoldAction.HOLD
+            or receipt.disposition is not HoldDisposition.APPLIED
+            or receipt.receipt_id != latch.hold_receipt_id
+            or receipt.scope is not latch.scope
+            or receipt.target_id != latch.target_id
+            or receipt.reason != latch.reason
+            or receipt.actor_id != latch.actor_id
+            or receipt.occurred_at != latch.set_at
+        ):
+            raise HoldCorruptStateError(
+                "active hold latch does not match its authority receipt"
+            )
+
     @staticmethod
     def _assert_replay(
         receipt: HoldReceipt,
@@ -495,7 +526,9 @@ class HoldStore:
         operation = _required_text(operation_id, "operation_id")
 
         async with self._db.transaction(immediate=True):
-            await self._assert_host_latch_shape(for_update=True)
+            await self._assert_host_latch_shape(
+                for_update=resolved_scope is HoldScope.HOST
+            )
             await self._lock_operation_and_target(
                 operation, resolved_scope, resolved_target
             )
@@ -504,6 +537,7 @@ class HoldStore:
                 resolved_scope, resolved_target, for_update=True
             )
             prior = _latch_from_row(prior_row)
+            await self._validate_active_latch_receipt(prior)
             replay_row = await self._read_receipt_by_operation(operation)
             if replay_row is not None:
                 replay = _receipt_from_row(replay_row)
@@ -612,7 +646,9 @@ class HoldStore:
         )
 
         async with self._db.transaction(immediate=True):
-            await self._assert_host_latch_shape(for_update=True)
+            await self._assert_host_latch_shape(
+                for_update=resolved_scope is HoldScope.HOST
+            )
             await self._lock_operation_and_target(
                 operation, resolved_scope, resolved_target
             )
@@ -621,6 +657,7 @@ class HoldStore:
                 resolved_scope, resolved_target, for_update=True
             )
             prior = _latch_from_row(prior_row)
+            await self._validate_active_latch_receipt(prior)
             replay_row = await self._read_receipt_by_operation(operation)
             if replay_row is not None:
                 replay = _receipt_from_row(replay_row)
@@ -679,9 +716,11 @@ class HoldStore:
         resolved_scope = _coerce_scope(scope)
         resolved_target = _target(resolved_scope, target_id)
         await self._assert_host_latch_shape()
-        return _latch_from_row(
+        latch = _latch_from_row(
             await self._read_latch_row(resolved_scope, resolved_target)
         )
+        await self._validate_active_latch_receipt(latch)
+        return latch
 
     async def get_effective(self, agent_id: str) -> EffectiveHoldState:
         """Read host + agent latches in one database snapshot."""
@@ -705,6 +744,7 @@ class HoldStore:
             state = _latch_from_row(row)
             if state is None:
                 continue
+            await self._validate_active_latch_receipt(state)
             if state.scope is HoldScope.HOST:
                 host = state
             elif state.target_id == agent:
