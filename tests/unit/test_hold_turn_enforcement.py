@@ -15,6 +15,7 @@ from kestrel_sovereign.hold import (
     require_context_hold_store,
     require_turn_start_allowed,
 )
+from kestrel_sovereign.agent.streaming import StreamingMixin
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
@@ -92,6 +93,48 @@ async def test_streaming_input_refuses_before_first_yield_or_side_effect() -> No
     assert store.calls == ["did:test:held"]
     assert caught.value.host_hold is None
     assert caught.value.agent_hold is agent_hold
+
+
+@pytest.mark.asyncio
+async def test_streaming_command_reuses_its_single_turn_admission() -> None:
+    unheld = EffectiveHoldState(host=None, agent=None)
+    held = EffectiveHoldState(
+        host=None,
+        agent=_latch(
+            HoldScope.AGENT, "hold:after-admission", target="did:test:held"
+        ),
+    )
+
+    class _ChangingStore(_Store):
+        async def get_effective(self, agent_id: str) -> EffectiveHoldState:
+            result = await super().get_effective(agent_id)
+            self.effective = held
+            return result
+
+    class _CommandAgent(StreamingMixin):
+        def __init__(self) -> None:
+            self.did = "did:test:held"
+            self._hold_store = _ChangingStore(unheld)
+            self.storage = object()
+            self._safe_mode = False
+            self._constitution_audit_pending = False
+
+        async def _genesis_audit_cognition_block(self, _user_input):
+            return None
+
+        async def _maybe_audit(self):
+            return None
+
+        async def process_input(self, *_args, **_kwargs):
+            await require_turn_start_allowed(self)
+            return "command completed"
+
+    command_agent = _CommandAgent()
+
+    chunks = [chunk async for chunk in command_agent.process_input_streaming("!go")]
+
+    assert chunks == ["command completed"]
+    assert command_agent._hold_store.calls == ["did:test:held"]
 
 
 @pytest.mark.asyncio

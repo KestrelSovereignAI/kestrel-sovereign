@@ -2007,13 +2007,20 @@ async def test_late_hold_refusal_preserves_finite_retry_budget(tmp_path):
             f"{DURABLE_COGNITION_MARKER_VALUE}"
         ),
         max_attempts=1,
+        lease_seconds=1,
     )
     unheld = EffectiveHoldState(host=None, agent=None)
     held_state = _held_state(agent.did)
     agent._hold_store = _HoldSnapshots(unheld)
     refusal = HoldTurnRefusal(agent_id=agent.did, effective_state=held_state)
 
+    original_now = dispatcher._durable_store.now_utc
+    base = datetime.now(timezone.utc) - timedelta(hours=1)
+    clock = {"now": base}
+    dispatcher._durable_store.now_utc = lambda: clock["now"]
+
     async def _refuse(*_args, **_kwargs):
+        clock["now"] = base + timedelta(seconds=2)
         raise refusal
 
     agent.process_input = _refuse
@@ -2035,6 +2042,7 @@ async def test_late_hold_refusal_preserves_finite_retry_budget(tmp_path):
         assert delivery.attempts == 0
 
         agent.process_input = AsyncMock(return_value="resumed")
+        dispatcher._durable_store.now_utc = original_now
         dispatcher._start_durable_cognition_drain(consumer.consumer_id)
         for _ in range(100):
             [delivery] = await dispatcher.list_durable_deliveries(

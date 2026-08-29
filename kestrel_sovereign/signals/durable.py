@@ -4613,7 +4613,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 last_error = 'hold_deferred',
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
-              AND status = ? AND lease_token = ? AND lease_expires_at > ?
+              AND status = ? AND lease_token = ?
             """,
             (
                 RETRY,
@@ -4624,7 +4624,6 @@ class DurableSignalStore(UnifiedStoreBase):
                 delivery_id,
                 LEASED,
                 lease_token,
-                self.to_timestamp_param(now),
             ),
         )
         return updated == 1

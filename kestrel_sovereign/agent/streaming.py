@@ -979,12 +979,15 @@ class StreamingMixin:
             invocation_provenance: Endpoint-owned authenticated actor and
                 transport metadata bound task-locally for governed tools.
         """
-        from kestrel_sovereign.hold import require_turn_start_allowed
+        from kestrel_sovereign.hold import (
+            require_turn_start_allowed,
+            reuse_turn_start_admission,
+        )
 
         # Match ``process_input`` at the universal turn-start seam.  Raising a
         # typed refusal before the first yield lets each source keep its own
         # delivery semantics without rendering agent-authored rejection text.
-        await require_turn_start_allowed(self)
+        turn_admission = await require_turn_start_allowed(self)
 
         # Match process_input's retryable pre-initialization behavior. Without
         # storage there is no durable genesis receipt to inspect yet.
@@ -1071,7 +1074,9 @@ class StreamingMixin:
             # this wrapper believed the turn was non-enforcing. A plain ``str``
             # (pure-local command) reports ``enforcing=False`` via ``getattr``, so
             # its parts always flow.
-            with part_collector():
+            with part_collector(), reuse_turn_start_admission(
+                self, turn_admission
+            ):
                 # Preserve the pre-existing positional call shape
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.

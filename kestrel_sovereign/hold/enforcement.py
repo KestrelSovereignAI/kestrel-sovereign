@@ -8,10 +8,17 @@ when neither the host nor the addressed agent latch is active.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import Any
 
 from .state import EffectiveHoldState, HoldStateError
+
+
+_reused_turn_admission: ContextVar[
+    tuple[Any, EffectiveHoldState | None] | None
+] = ContextVar("kestrel_reused_hold_turn_admission", default=None)
 
 
 class HoldEnforcementUnavailableError(HoldStateError):
@@ -169,6 +176,10 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     initialization, and fail closed through :func:`require_context_hold_store`.
     """
 
+    reused = _reused_turn_admission.get()
+    if reused is not None and reused[0] is agent:
+        return reused[1]
+
     agent_id = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
     effective = await get_effective_hold_state(agent)
     if effective is None:
@@ -184,6 +195,20 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     return effective
 
 
+@contextmanager
+def reuse_turn_start_admission(
+    agent: Any,
+    effective_state: EffectiveHoldState | None,
+):
+    """Bind one already-linearized admission across an internal delegation."""
+
+    token = _reused_turn_admission.set((agent, effective_state))
+    try:
+        yield
+    finally:
+        _reused_turn_admission.reset(token)
+
+
 __all__ = [
     "HOLD_TURN_CONSOLE_MESSAGE",
     "HoldEnforcementUnavailableError",
@@ -196,4 +221,5 @@ __all__ = [
     "held_turn_stream_block",
     "require_context_hold_store",
     "require_turn_start_allowed",
+    "reuse_turn_start_admission",
 ]

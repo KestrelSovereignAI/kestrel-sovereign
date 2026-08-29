@@ -364,6 +364,35 @@ async def test_host_context_uses_shared_postgres_for_hold_state(
 
 
 @pytest.mark.asyncio
+async def test_host_context_cancellation_closes_partially_opened_hold_resources(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    db = SimpleNamespace(close=AsyncMock())
+    inner_factory = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(
+        AsyncDatabase, "sqlite", AsyncMock(return_value=db)
+    )
+    monkeypatch.setattr(
+        session_module,
+        "make_session_factory",
+        lambda _db: inner_factory,
+    )
+    monkeypatch.setattr(
+        HoldStore,
+        "ensure_schema",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await build_host_context(db_path=str(tmp_path / "cancelled-host.db"))
+
+    inner_factory.close.assert_awaited_once_with()
+    db.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
