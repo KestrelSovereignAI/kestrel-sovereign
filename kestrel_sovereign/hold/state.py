@@ -195,11 +195,13 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
 def _receipt_from_row(row: Any) -> HoldReceipt:
     if row is None or len(row) != 12:
         raise HoldCorruptStateError("hold receipt row has an unexpected shape")
-    if row[0] is None:
-        # SQLite does not implicitly make a non-INTEGER PRIMARY KEY non-null.
-        # Existing/imported databases may therefore contain a keyless receipt;
-        # never manufacture the string ``"None"`` as its durable identity.
-        raise HoldCorruptStateError("hold receipt is missing its receipt identity")
+    if any(value is None for value in row):
+        # SQLite does not implicitly make a non-INTEGER PRIMARY KEY non-null,
+        # and an imported/older schema may lack any of the v1 constraints.
+        # Never manufacture the string ``"None"`` as durable audit evidence.
+        raise HoldCorruptStateError("hold receipt has missing required evidence")
+    if any(not isinstance(value, str) for value in row):
+        raise HoldCorruptStateError("hold receipt has invalid evidence types")
     try:
         receipt = HoldReceipt(
             receipt_id=str(row[0]),
@@ -411,6 +413,65 @@ class HoldStore:
                 "active hold latch does not match its authority receipt"
             )
 
+    async def _validate_unheld_receipt_history(
+        self, scope: HoldScope, target_id: str
+    ) -> None:
+        """Prove an absent/inactive latch has no surviving Hold authority.
+
+        The latch is a mutable projection of append-only receipts.  If that
+        projection is deleted or reset, an applied Hold receipt must not become
+        an accidental permission to resume work.  Reconstruct the authority
+        graph for this target and require every applied Hold to have exactly
+        one later applied successor before accepting an unheld projection.
+        """
+
+        rows = await self._db.fetchall(
+            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
+        )
+        applied = [
+            receipt
+            for receipt in (_receipt_from_row(row) for row in rows)
+            if receipt.disposition is HoldDisposition.APPLIED
+        ]
+        authorities = {
+            receipt.receipt_id
+            for receipt in applied
+            if receipt.action is HoldAction.HOLD
+        }
+        consumers: dict[str, HoldReceipt] = {}
+        for receipt in applied:
+            prior = receipt.prior_hold_receipt_id
+            if not prior:
+                continue
+            if prior not in authorities:
+                raise HoldCorruptStateError(
+                    "applied Hold history consumes missing authority"
+                )
+            if prior in consumers:
+                raise HoldCorruptStateError(
+                    "applied Hold authority has multiple successors"
+                )
+            consumers[prior] = receipt
+
+        surviving = authorities.difference(consumers)
+        if surviving:
+            raise HoldCorruptStateError(
+                "unheld projection retains active Hold authority"
+            )
+
+    async def _validate_latch_projection(
+        self,
+        latch: Optional[HoldState],
+        scope: HoldScope,
+        target_id: str,
+    ) -> None:
+        if latch is None:
+            await self._validate_unheld_receipt_history(scope, target_id)
+        else:
+            await self._validate_active_latch_receipt(latch)
+
     @staticmethod
     def _assert_replay(
         receipt: HoldReceipt,
@@ -537,7 +598,9 @@ class HoldStore:
                 resolved_scope, resolved_target, for_update=True
             )
             prior = _latch_from_row(prior_row)
-            await self._validate_active_latch_receipt(prior)
+            await self._validate_latch_projection(
+                prior, resolved_scope, resolved_target
+            )
             replay_row = await self._read_receipt_by_operation(operation)
             if replay_row is not None:
                 replay = _receipt_from_row(replay_row)
@@ -657,7 +720,9 @@ class HoldStore:
                 resolved_scope, resolved_target, for_update=True
             )
             prior = _latch_from_row(prior_row)
-            await self._validate_active_latch_receipt(prior)
+            await self._validate_latch_projection(
+                prior, resolved_scope, resolved_target
+            )
             replay_row = await self._read_receipt_by_operation(operation)
             if replay_row is not None:
                 replay = _receipt_from_row(replay_row)
@@ -719,7 +784,9 @@ class HoldStore:
         latch = _latch_from_row(
             await self._read_latch_row(resolved_scope, resolved_target)
         )
-        await self._validate_active_latch_receipt(latch)
+        await self._validate_latch_projection(
+            latch, resolved_scope, resolved_target
+        )
         return latch
 
     async def get_effective(self, agent_id: str) -> EffectiveHoldState:
@@ -744,13 +811,16 @@ class HoldStore:
             state = _latch_from_row(row)
             if state is None:
                 continue
-            await self._validate_active_latch_receipt(state)
             if state.scope is HoldScope.HOST:
                 host = state
             elif state.target_id == agent:
                 agent_state = state
             else:
                 raise HoldCorruptStateError("effective hold query returned a foreign agent")
+        await self._validate_latch_projection(
+            host, HoldScope.HOST, HOST_HOLD_TARGET
+        )
+        await self._validate_latch_projection(agent_state, HoldScope.AGENT, agent)
         return EffectiveHoldState(host=host, agent=agent_state)
 
     async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:

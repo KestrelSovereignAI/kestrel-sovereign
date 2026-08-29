@@ -109,7 +109,7 @@ async def test_receipt_primary_key_is_explicitly_not_null(hold_db):
 
 
 def test_existing_null_receipt_identity_fails_closed_on_read() -> None:
-    with pytest.raises(HoldCorruptStateError, match="receipt identity"):
+    with pytest.raises(HoldCorruptStateError, match="missing required evidence"):
         _receipt_from_row(
             (
                 None,
@@ -126,6 +126,88 @@ def test_existing_null_receipt_identity_fails_closed_on_read() -> None:
                 "",
             )
         )
+
+
+@pytest.mark.parametrize("field_index", [1, 7, 8])
+@pytest.mark.parametrize("bad_value", [None, 42])
+def test_existing_invalid_required_receipt_evidence_fails_closed_on_read(
+    field_index,
+    bad_value,
+) -> None:
+    row = [
+        "receipt-id",
+        "legacy-operation",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "legacy import",
+        "did:sovereign:operator",
+        "2026-08-28T00:00:00+00:00",
+        "",
+        "",
+        "receipt-id",
+    ]
+    row[field_index] = bad_value
+
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="missing required evidence|invalid evidence types",
+    ):
+        _receipt_from_row(tuple(row))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projection_loss", ["delete", "reset"])
+@pytest.mark.parametrize("operation", ["get", "effective", "set", "release"])
+async def test_surviving_hold_authority_fails_closed_after_projection_loss(
+    hold_db,
+    projection_loss,
+    operation,
+):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="leave stopped",
+        operation_id="hold-before-projection-loss",
+    )
+    if projection_loss == "delete":
+        await db.execute(
+            "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
+            ("agent", "did:agent:kite"),
+        )
+    else:
+        await db.execute(
+            "UPDATE hold_latches SET active = 0, hold_receipt_id = '', "
+            "reason = '', actor_id = '', set_at = '' "
+            "WHERE scope = ? AND target_id = ?",
+            ("agent", "did:agent:kite"),
+        )
+
+    with pytest.raises(HoldCorruptStateError, match="active Hold authority"):
+        if operation == "get":
+            await store.get_hold("agent", "did:agent:kite")
+        elif operation == "effective":
+            await store.get_effective("did:agent:kite")
+        elif operation == "set":
+            await store.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="do not overwrite missing projection",
+                operation_id="set-after-projection-loss",
+            )
+        else:
+            await store.release_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="do not release missing projection",
+                operation_id="release-after-projection-loss",
+                expected_hold_receipt_id=held.receipt.receipt_id,
+            )
 
 
 @pytest.mark.asyncio
