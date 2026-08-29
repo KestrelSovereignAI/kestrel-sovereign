@@ -281,6 +281,7 @@ def bind_async_invocation(
                 bound.arguments[parameter] = invocation_id
                 lifecycle_owner = args[0] if args else None
                 registered = False
+                cleanup_abandoned = False
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
                         type(lifecycle_owner),
@@ -343,9 +344,51 @@ def bind_async_invocation(
                                 ):
                                     variable.set(child_value)
                     return await function(*bound.args, **bound.kwargs)
+                except InvocationCancelledError:
+                    # The isolated child cooperatively unwound after Stop. Its
+                    # cancellation is a successful lifecycle completion, not a
+                    # cleanup failure.
+                    raise
+                except BaseException:
+                    if registered:
+                        request_cancelled = getattr(
+                            type(lifecycle_owner),
+                            "is_request_cancelled",
+                            None,
+                        )
+                        try:
+                            cleanup_abandoned = bool(
+                                callable(request_cancelled)
+                                and request_cancelled(
+                                    lifecycle_owner, invocation_id
+                                )
+                            )
+                        except Exception:
+                            # Never hide the turn's original failure. A broken
+                            # cancellation predicate is conservatively treated
+                            # as failed cleanup.
+                            cleanup_abandoned = True
+                    raise
                 finally:
                     if registered:
-                        lifecycle_owner._cleanup_cancelled_request(invocation_id)
+                        if cleanup_abandoned:
+                            # Imported lazily to avoid the module cycle:
+                            # request_lifecycle imports the correlation helper
+                            # from this module during class definition.
+                            from .request_lifecycle import (
+                                RequestCompletionDisposition,
+                            )
+
+                            lifecycle_owner._cleanup_cancelled_request(
+                                invocation_id,
+                                disposition=(
+                                    RequestCompletionDisposition.ABANDONED
+                                ),
+                            )
+                        else:
+                            lifecycle_owner._cleanup_cancelled_request(
+                                invocation_id
+                            )
 
         return wrapped
 
