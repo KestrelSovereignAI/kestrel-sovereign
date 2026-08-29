@@ -188,6 +188,11 @@ def get_router() -> APIRouter:
                 content_preview=response_text,
                 duration_ms=elapsed_ms,
             )
+            if (
+                callable(request_cancelled)
+                and request_cancelled(request_id) is True
+            ):
+                raise stopped_invocation_http_error(request_id)
 
             http_response.headers["X-Request-ID"] = (
                 invocation_id_response_header(request_id)
@@ -276,10 +281,10 @@ def get_router() -> APIRouter:
         except BaseException:
             cleanup = getattr(agent, "_cleanup_cancelled_request", None)
             if callable(cleanup):
-                cleanup(
-                    request_id,
-                    disposition=RequestCompletionDisposition.ABANDONED,
-                )
+                # A terminal setup failure still has an endpoint owner which
+                # performs lifecycle cleanup here. ABANDONED is reserved for
+                # nested work whose cleanup ownership was actually lost.
+                cleanup(request_id)
             raise
 
         async def event_generator():
@@ -430,10 +435,7 @@ def get_router() -> APIRouter:
         except BaseException:
             cleanup = getattr(agent, "_cleanup_cancelled_request", None)
             if callable(cleanup):
-                cleanup(
-                    request_id,
-                    disposition=RequestCompletionDisposition.ABANDONED,
-                )
+                cleanup(request_id)
             raise
 
     # ------------------------------------------------------------------

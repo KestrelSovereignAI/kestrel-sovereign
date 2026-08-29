@@ -373,6 +373,127 @@ def test_bridge_invoke_reports_cooperative_stop_as_conflict():
         _restore_app(app, original)
 
 
+def test_bridge_invoke_rechecks_stop_after_outbound_audit():
+    """An outbound audit await cannot reopen the response publication race."""
+    stopped = False
+    agent = MagicMock()
+    agent.process_input = AsyncMock(return_value="must not publish")
+    agent.is_request_cancelled = MagicMock(
+        side_effect=lambda _request_id: stopped
+    )
+    bridge = MagicMock()
+    bridge.get_or_create_session = AsyncMock(
+        return_value=MagicMock(id="bridge-session-1")
+    )
+
+    async def _log_invocation(**kwargs):
+        nonlocal stopped
+        if kwargs["direction"] == "outbound":
+            stopped = True
+
+    bridge.log_invocation = AsyncMock(side_effect=_log_invocation)
+    agent.features = {"BridgeFeature": bridge}
+
+    app, original = _prepare_app(agent)
+    try:
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        app.include_router(get_router())
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/bridge/invoke",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "message": "stop at audit boundary",
+                        "channel_type": "api",
+                        "request_id": "bridge-outbound-stop",
+                    },
+                )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Request stopped during execution."
+    finally:
+        _restore_app(app, original)
+
+
+def test_bridge_stream_setup_failure_completes_owned_lifecycle():
+    """Terminal setup errors are completed, not abandoned generations."""
+    agent = MagicMock()
+    agent.process_input_streaming = MagicMock()
+    agent.is_request_cancelled = MagicMock(return_value=False)
+    bridge = MagicMock()
+    bridge.get_or_create_session = AsyncMock(
+        side_effect=RuntimeError("session setup failed")
+    )
+    bridge.log_invocation = AsyncMock()
+    agent.features = {"BridgeFeature": bridge}
+
+    app, original = _prepare_app(agent)
+    try:
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        app.include_router(get_router())
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/api/bridge/stream",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "message": "setup",
+                        "channel_type": "api",
+                        "request_id": "bridge-setup-failure",
+                    },
+                )
+
+        assert response.status_code == 500
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "bridge-setup-failure"
+        )
+    finally:
+        _restore_app(app, original)
+
+
+def test_bridge_stream_response_failure_completes_owned_lifecycle(monkeypatch):
+    """Response construction is still endpoint-owned terminal setup work."""
+    agent, _captured = _capturing_agent()
+    agent.is_request_cancelled = MagicMock(return_value=False)
+    _wire_bridge_feature(agent)
+
+    class ResponseConstructionFailure:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("response construction failed")
+
+    app, original = _prepare_app(agent)
+    try:
+        import kestrel_sovereign.features.bridge.router as bridge_router
+
+        monkeypatch.setattr(
+            bridge_router,
+            "StreamingResponse",
+            ResponseConstructionFailure,
+        )
+        app.include_router(bridge_router.get_router())
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/api/bridge/stream",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "message": "setup",
+                        "channel_type": "api",
+                        "request_id": "bridge-response-failure",
+                    },
+                )
+
+        assert response.status_code == 500
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "bridge-response-failure"
+        )
+    finally:
+        _restore_app(app, original)
+
+
 def test_bridge_stream_forwards_body_retry_id_and_trusted_provenance():
     """The bridge SSE route shares the same invocation identity contract."""
     captured = {}

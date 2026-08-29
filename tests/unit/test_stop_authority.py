@@ -695,6 +695,40 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     ]
 
 
+def test_live_agent_stop_rechecks_turns_after_receipt_preflight() -> None:
+    """A turn admitted during receipt I/O belongs to the same agent Stop."""
+    from kestrel_sovereign.endpoints.agent import router
+
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"turn-a"}
+    agent._current_request_id = "turn-a"
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(return_value=None)
+
+    class AdmittingReceiptStore(_MemoryReceiptStore):
+        async def load(self, request):
+            agent._active_request_ids.add("turn-b")
+            return await super().load(request)
+
+    app = FastAPI()
+    app.state.stop_receipt_store = AdmittingReceiptStore()
+    app.include_router(router)
+    app.state.agent = agent
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert agent.cancel_current_request.call_args_list == [
+        call(request_id="turn-a"),
+        call(request_id="turn-b"),
+    ]
+    assert agent.wait_for_request_completion.await_args_list == [
+        call("turn-a"),
+        call("turn-b"),
+    ]
+
+
 def test_stop_before_registration_fences_the_late_request_generation() -> None:
     """An empty Stop snapshot must still prevent its in-transit turn starting."""
 
