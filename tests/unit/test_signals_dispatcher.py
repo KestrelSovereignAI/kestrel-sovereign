@@ -329,6 +329,49 @@ async def test_hold_winning_exact_claim_race_is_deferred(
     assert result.error == "hold_deferred"
 
 
+@pytest.mark.asyncio
+async def test_held_durable_outcome_is_not_visible_before_lease_release(
+    dispatcher_components,
+):
+    """Mutation tripwire: the deferred receipt follows durable lease release."""
+
+    c = dispatcher_components
+    signal = _signal("claim.release.order")
+    registration = _action_reg("claim.release.order")
+    c.agent._hold_store = _HoldSnapshots(_held_state(c.agent.did))
+
+    async def release_then_observe(**_kwargs):
+        await c.dispatcher._drain_outcome_logs_for_signal(signal.id)
+        row = await c.backend.fetch_one(
+            "SELECT status, error FROM signal_log WHERE id = ?",
+            (signal.id,),
+        )
+        assert row is None
+
+    c.dispatcher._release_cognition_hold_lease = AsyncMock(
+        side_effect=release_then_observe
+    )
+
+    result = await c.dispatcher._route_durable_cognition_delivery(
+        signal,
+        registration,
+        0.0,
+        persisted_event_id="event-release-order",
+        consumer_id="consumer-release-order",
+        durable_admission=None,
+        durable_created=True,
+        use_live_signal=False,
+    )
+
+    await c.dispatcher._drain_outcome_logs_for_signal(signal.id)
+    assert result.error == "hold_deferred"
+    row = await c.backend.fetch_one(
+        "SELECT status, error FROM signal_log WHERE id = ?",
+        (signal.id,),
+    )
+    assert row == (Status.COALESCED.value, "hold_deferred")
+
+
 @pytest.mark.parametrize(
     ("durable", "status", "error"),
     [
@@ -850,6 +893,40 @@ async def test_coalescing_drops_duplicate_within_window(dispatcher_components):
     )
     assert r1.status == Status.OK
     assert r2.status == Status.COALESCED
+
+
+@pytest.mark.asyncio
+async def test_hold_refusal_does_not_consume_coalescing_key(dispatcher_components):
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    reg = _action_reg("coalesce_held", handler=handler)
+    reg = SourceRegistration(
+        name=reg.name,
+        schema=reg.schema,
+        default_mode=reg.default_mode,
+        allowed_modes=reg.allowed_modes,
+        handler=reg.handler,
+        log_redaction=reg.log_redaction,
+        coalescing_window=timedelta(seconds=10),
+    )
+    c.registry.register(reg)
+    unheld = EffectiveHoldState(host=None, agent=None)
+    c.agent._hold_store = _HoldSnapshots(
+        unheld,
+        _held_state(c.agent.did),
+        unheld,
+    )
+
+    refused = await c.dispatcher.dispatch_signal(
+        _signal("coalesce_held", dedupe_key="resumable")
+    )
+    resumed = await c.dispatcher.dispatch_signal(
+        _signal("coalesce_held", dedupe_key="resumable")
+    )
+
+    assert refused.error == "hold_skipped"
+    assert resumed.status is Status.OK
+    handler.assert_awaited_once()
 
 
 @pytest.mark.asyncio

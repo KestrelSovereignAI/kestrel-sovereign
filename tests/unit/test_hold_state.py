@@ -885,6 +885,86 @@ async def test_sqlite_effective_read_does_not_wait_for_writer_guard(hold_db):
     assert effective.agent == held.current
 
 
+@pytest.mark.asyncio
+async def test_effective_admission_is_constant_size_after_receipt_growth(
+    hold_db,
+    monkeypatch,
+):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:bounded-admission",
+        actor_id="did:sovereign:operator",
+        reason="long investigation",
+        operation_id="bounded-hold",
+    )
+    for index in range(128):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:bounded-admission",
+            actor_id="did:sovereign:operator",
+            reason="long investigation",
+            operation_id=f"bounded-same-state-{index}",
+        )
+
+    full_graph = AsyncMock(
+        side_effect=AssertionError("turn admission replayed the receipt ledger")
+    )
+    monkeypatch.setattr(store, "_validate_latch_projection", full_graph)
+    original_snapshot = db.fetchall_snapshot
+    snapshot_sizes: list[int] = []
+
+    async def inspect_snapshot(sql, params=()):
+        rows = await original_snapshot(sql, params)
+        snapshot_sizes.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(db, "fetchall_snapshot", inspect_snapshot)
+
+    effective = await store.get_effective("did:agent:bounded-admission")
+
+    assert effective.agent == held.current
+    assert snapshot_sizes == [2]
+    full_graph.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_receipt_append_dirties_bounded_admission_checkpoint(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:dirty-checkpoint",
+        actor_id="did:sovereign:operator",
+        reason="maintenance",
+        operation_id="dirty-checkpoint-hold",
+    )
+    authority = held.receipt.receipt_id
+    await db.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+        "prior_hold_receipt_id, resulting_hold_receipt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "unprojected-receipt",
+            "unprojected-operation",
+            "hold",
+            "already_in_state",
+            "agent",
+            "did:agent:dirty-checkpoint",
+            "maintenance",
+            "did:sovereign:operator",
+            "2026-08-29T00:00:00+00:00",
+            "",
+            authority,
+            authority,
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="unprojected receipt append"):
+        await store.get_effective("did:agent:dirty-checkpoint")
+
+
 def test_authority_graph_walk_is_linear_in_number_of_receipts():
     class CountingConsumers(dict[str, HoldReceipt]):
         get_count = 0

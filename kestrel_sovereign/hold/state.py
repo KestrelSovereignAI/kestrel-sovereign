@@ -125,6 +125,16 @@ class HoldMutation:
     current: Optional[HoldState]
 
 
+@dataclass(frozen=True)
+class _HoldAuthorityCheckpoint:
+    scope: HoldScope
+    target_id: str
+    active: bool
+    hold_receipt_id: str
+    latch_revision: int
+    dirty: bool
+
+
 def _terminal_authority_ids(
     authorities: Mapping[str, HoldReceipt],
     consumers: Mapping[str, HoldReceipt],
@@ -228,6 +238,54 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
     )
 
 
+def _checkpoint_from_row(row: Any) -> Optional[_HoldAuthorityCheckpoint]:
+    if row is None:
+        return None
+    if len(row) != 6:
+        raise HoldCorruptStateError(
+            "hold authority checkpoint has an unexpected shape"
+        )
+    try:
+        scope = HoldScope(str(row[0]))
+        target_id = str(row[1])
+        active = int(row[2])
+        latch_revision = int(row[4])
+        dirty = int(row[5])
+    except (TypeError, ValueError) as exc:
+        raise HoldCorruptStateError(
+            "hold authority checkpoint has invalid typed fields"
+        ) from exc
+    hold_receipt_id = str(row[3] or "")
+    if active not in (0, 1) or dirty not in (0, 1):
+        raise HoldCorruptStateError(
+            "hold authority checkpoint has invalid flags"
+        )
+    if latch_revision < 0:
+        raise HoldCorruptStateError(
+            "hold authority checkpoint has invalid counters"
+        )
+    if not target_id:
+        raise HoldCorruptStateError(
+            "hold authority checkpoint is missing its target identity"
+        )
+    if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
+        raise HoldCorruptStateError(
+            "host hold authority checkpoint has a foreign target"
+        )
+    if bool(active) != bool(hold_receipt_id):
+        raise HoldCorruptStateError(
+            "hold authority checkpoint active evidence is inconsistent"
+        )
+    return _HoldAuthorityCheckpoint(
+        scope=scope,
+        target_id=target_id,
+        active=bool(active),
+        hold_receipt_id=hold_receipt_id,
+        latch_revision=latch_revision,
+        dirty=bool(dirty),
+    )
+
+
 def _receipt_from_row(row: Any) -> HoldReceipt:
     if row is None or len(row) != 12:
         raise HoldCorruptStateError("hold receipt row has an unexpected shape")
@@ -314,7 +372,7 @@ class HoldStore:
         self._db = db
 
     async def ensure_schema(self) -> None:
-        """Create both Hold tables as one serialized schema unit."""
+        """Create Hold storage and its bounded admission checkpoint."""
 
         async with self._db.migration_lock(_SCHEMA_LOCK):
             await self._db.execute(
@@ -357,6 +415,134 @@ class HoldStore:
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
                 "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
             )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_authority_checkpoints ("
+                "scope TEXT NOT NULL, "
+                "target_id TEXT NOT NULL, "
+                "active INTEGER NOT NULL DEFAULT 0, "
+                "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+                "latch_revision INTEGER NOT NULL DEFAULT 0, "
+                "dirty INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (scope, target_id), "
+                "CHECK (scope IN ('host', 'agent')), "
+                "CHECK (scope <> 'host' OR target_id = 'host'), "
+                "CHECK (active IN (0, 1)), "
+                "CHECK (dirty IN (0, 1)), "
+                "CHECK (latch_revision >= 0))"
+            )
+            await self._backfill_authority_checkpoints()
+            await self._ensure_checkpoint_dirty_triggers()
+
+    async def _backfill_authority_checkpoints(self) -> None:
+        """Build a verified checkpoint once for each pre-checkpoint target."""
+
+        rows = await self._db.fetchall(
+            "SELECT existing.scope, existing.target_id FROM ("
+            "SELECT scope, target_id FROM hold_latches "
+            "UNION SELECT scope, target_id FROM hold_receipts"
+            ") existing LEFT JOIN hold_authority_checkpoints checkpoint "
+            "ON checkpoint.scope = existing.scope "
+            "AND checkpoint.target_id = existing.target_id "
+            "WHERE checkpoint.scope IS NULL"
+        )
+        for raw_scope, raw_target in rows:
+            try:
+                scope = HoldScope(str(raw_scope))
+            except (TypeError, ValueError) as exc:
+                raise HoldCorruptStateError(
+                    "hold checkpoint backfill found an invalid scope"
+                ) from exc
+            target_id = str(raw_target)
+            if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
+                # Do not bless an imported foreign host row with a valid
+                # checkpoint. Every state path detects it explicitly.
+                continue
+            latch_row = await self._read_latch_row(scope, target_id)
+            latch = _latch_from_row(latch_row)
+            receipt_rows = await self._db.fetchall(
+                f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
+                "WHERE scope = ? AND target_id = ?",
+                (scope.value, target_id),
+            )
+            await self._validate_latch_projection(
+                latch,
+                scope,
+                target_id,
+                receipt_rows=receipt_rows,
+            )
+            revision = int(latch_row[7]) if latch_row is not None else 0
+            await self._db.execute(
+                "INSERT INTO hold_authority_checkpoints ("
+                "scope, target_id, active, hold_receipt_id, latch_revision, dirty"
+                ") VALUES (?, ?, ?, ?, ?, 0) "
+                "ON CONFLICT (scope, target_id) DO NOTHING",
+                (
+                    scope.value,
+                    target_id,
+                    int(latch is not None),
+                    latch.hold_receipt_id if latch is not None else "",
+                    revision,
+                ),
+            )
+
+    async def _ensure_checkpoint_dirty_triggers(self) -> None:
+        """Make any out-of-band receipt mutation invalidate admission."""
+
+        if getattr(self._db, "backend_type", "") == "postgres":
+            await self._db.execute(
+                "CREATE OR REPLACE FUNCTION kestrel_hold_checkpoint_dirty() "
+                "RETURNS trigger AS $$ BEGIN IF TG_OP = 'INSERT' THEN "
+                "UPDATE hold_authority_checkpoints SET dirty = 1 "
+                "WHERE scope = NEW.scope AND target_id = NEW.target_id; "
+                "RETURN NEW; ELSIF TG_OP = 'DELETE' THEN "
+                "UPDATE hold_authority_checkpoints SET dirty = 1 "
+                "WHERE scope = OLD.scope AND target_id = OLD.target_id; "
+                "RETURN OLD; ELSE "
+                "UPDATE hold_authority_checkpoints SET dirty = 1 "
+                "WHERE (scope = OLD.scope AND target_id = OLD.target_id) "
+                "OR (scope = NEW.scope AND target_id = NEW.target_id); "
+                "RETURN NEW; END IF; END; $$ LANGUAGE plpgsql"
+            )
+            await self._db.execute(
+                "DROP TRIGGER IF EXISTS hold_receipts_checkpoint_dirty "
+                "ON hold_receipts"
+            )
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                trigger_name = f"hold_receipts_checkpoint_dirty_{operation.lower()}"
+                exists = await self._db.fetchone(
+                    "SELECT 1 FROM pg_trigger "
+                    "WHERE tgname = ? AND NOT tgisinternal",
+                    (trigger_name,),
+                )
+                if exists is None:
+                    await self._db.execute(
+                        f"CREATE TRIGGER {trigger_name} "
+                        f"AFTER {operation} ON hold_receipts FOR EACH ROW "
+                        "EXECUTE FUNCTION kestrel_hold_checkpoint_dirty()"
+                    )
+            return
+        await self._db.execute(
+            "DROP TRIGGER IF EXISTS hold_receipts_checkpoint_dirty"
+        )
+        await self._db.execute(
+            "CREATE TRIGGER IF NOT EXISTS hold_receipts_checkpoint_dirty_insert "
+            "AFTER INSERT ON hold_receipts BEGIN "
+            "UPDATE hold_authority_checkpoints SET dirty = 1 "
+            "WHERE scope = NEW.scope AND target_id = NEW.target_id; END"
+        )
+        await self._db.execute(
+            "CREATE TRIGGER IF NOT EXISTS hold_receipts_checkpoint_dirty_update "
+            "AFTER UPDATE ON hold_receipts BEGIN "
+            "UPDATE hold_authority_checkpoints SET dirty = 1 "
+            "WHERE (scope = OLD.scope AND target_id = OLD.target_id) "
+            "OR (scope = NEW.scope AND target_id = NEW.target_id); END"
+        )
+        await self._db.execute(
+            "CREATE TRIGGER IF NOT EXISTS hold_receipts_checkpoint_dirty_delete "
+            "AFTER DELETE ON hold_receipts BEGIN "
+            "UPDATE hold_authority_checkpoints SET dirty = 1 "
+            "WHERE scope = OLD.scope AND target_id = OLD.target_id; END"
+        )
 
     async def _lock_operation_and_target(
         self, operation_id: str, scope: HoldScope, target_id: str
@@ -400,6 +586,36 @@ class HoldStore:
             "ON CONFLICT (scope, target_id) DO NOTHING",
             (scope.value, target_id),
         )
+        await self._db.execute(
+            "INSERT INTO hold_authority_checkpoints (scope, target_id) "
+            "VALUES (?, ?) ON CONFLICT (scope, target_id) DO NOTHING",
+            (scope.value, target_id),
+        )
+
+    async def _mark_checkpoint_clean(
+        self,
+        scope: HoldScope,
+        target_id: str,
+        *,
+        latch: Optional[HoldState],
+        latch_revision: int,
+    ) -> None:
+        updated = await self._db.execute(
+            "UPDATE hold_authority_checkpoints SET active = ?, "
+            "hold_receipt_id = ?, latch_revision = ?, dirty = 0 "
+            "WHERE scope = ? AND target_id = ? AND dirty = 1",
+            (
+                int(latch is not None),
+                latch.hold_receipt_id if latch is not None else "",
+                latch_revision,
+                scope.value,
+                target_id,
+            ),
+        )
+        if updated != 1:
+            raise HoldCorruptStateError(
+                "hold authority checkpoint did not observe its receipt append"
+            )
 
     async def _read_latch_row(
         self, scope: HoldScope, target_id: str, *, for_update: bool = False
@@ -450,6 +666,89 @@ class HoldStore:
             f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE receipt_id = ?",
             (receipt_id,),
         )
+
+    async def _validate_admission_projection(
+        self,
+        *,
+        latch_row: Any,
+        checkpoint_row: Any,
+        authority_receipt_row: Any,
+        scope: HoldScope,
+        target_id: str,
+        receipt_exists: bool,
+    ) -> Optional[HoldState]:
+        """Validate one constant-size turn-admission integrity projection."""
+
+        latch = _latch_from_row(latch_row)
+        checkpoint = _checkpoint_from_row(checkpoint_row)
+        if checkpoint is None:
+            if latch_row is not None or receipt_exists:
+                raise HoldCorruptStateError(
+                    "hold authority checkpoint is missing for persisted state"
+                )
+            if authority_receipt_row is not None:
+                raise HoldCorruptStateError(
+                    "hold admission snapshot has orphan authority evidence"
+                )
+            return None
+        if checkpoint.scope is not scope or checkpoint.target_id != target_id:
+            raise HoldCorruptStateError(
+                "hold authority checkpoint returned a foreign target"
+            )
+        if checkpoint.dirty:
+            raise HoldCorruptStateError(
+                "hold authority checkpoint has an unprojected receipt append"
+            )
+        if latch_row is None:
+            message = (
+                "active Hold authority checkpoint has lost its latch projection"
+                if checkpoint.active
+                else "Hold authority checkpoint has lost its latch projection"
+            )
+            raise HoldCorruptStateError(message)
+        try:
+            latch_active = int(latch_row[2])
+            latch_revision = int(latch_row[7])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise HoldCorruptStateError(
+                "hold latch checkpoint fields are invalid"
+            ) from exc
+        if (
+            checkpoint.active != bool(latch_active)
+            or checkpoint.latch_revision != latch_revision
+            or checkpoint.hold_receipt_id != str(latch_row[3] or "")
+        ):
+            message = (
+                "active Hold authority checkpoint disagrees with its latch projection"
+                if checkpoint.active
+                else "Hold authority checkpoint disagrees with its latch projection"
+            )
+            raise HoldCorruptStateError(message)
+        if latch is None:
+            if authority_receipt_row is not None:
+                raise HoldCorruptStateError(
+                    "inactive Hold checkpoint retained authority evidence"
+                )
+            return None
+        if authority_receipt_row is None:
+            raise HoldCorruptStateError(
+                "active hold latch references a missing authority receipt"
+            )
+        authority = _receipt_from_row(authority_receipt_row)
+        if (
+            authority.action is not HoldAction.HOLD
+            or authority.disposition is not HoldDisposition.APPLIED
+            or authority.receipt_id != latch.hold_receipt_id
+            or authority.scope is not scope
+            or authority.target_id != target_id
+            or authority.reason != latch.reason
+            or authority.actor_id != latch.actor_id
+            or authority.occurred_at != latch.set_at
+        ):
+            raise HoldCorruptStateError(
+                "active hold latch does not match its authority receipt"
+            )
+        return latch
 
     async def _validate_receipt_authority_graph(
         self,
@@ -744,6 +1043,12 @@ class HoldStore:
                     prior_hold_receipt_id=prior.hold_receipt_id,
                     resulting_hold_receipt_id=prior.hold_receipt_id,
                 )
+                await self._mark_checkpoint_clean(
+                    resolved_scope,
+                    resolved_target,
+                    latch=prior,
+                    latch_revision=prior.revision,
+                )
                 return HoldMutation(receipt=receipt, current=prior)
 
             receipt_id = str(uuid4())
@@ -760,7 +1065,7 @@ class HoldStore:
                 resulting_hold_receipt_id=receipt_id,
                 receipt_id=receipt_id,
             )
-            await self._db.execute(
+            updated = await self._db.execute(
                 "UPDATE hold_latches SET active = 1, hold_receipt_id = ?, "
                 "reason = ?, actor_id = ?, set_at = ?, revision = revision + 1 "
                 "WHERE scope = ? AND target_id = ?",
@@ -773,8 +1078,22 @@ class HoldStore:
                     resolved_target,
                 ),
             )
+            if updated != 1:
+                raise HoldCorruptStateError(
+                    "applied Hold did not update exactly one latch"
+                )
             current = _latch_from_row(
                 await self._read_latch_row(resolved_scope, resolved_target)
+            )
+            if current is None:
+                raise HoldCorruptStateError(
+                    "applied Hold did not produce an active latch"
+                )
+            await self._mark_checkpoint_clean(
+                resolved_scope,
+                resolved_target,
+                latch=current,
+                latch_revision=current.revision,
             )
             return HoldMutation(receipt=receipt, current=current)
 
@@ -879,15 +1198,30 @@ class HoldStore:
                 resulting_hold_receipt_id=resulting_receipt_id,
             )
             if disposition is HoldDisposition.APPLIED:
-                await self._db.execute(
+                updated = await self._db.execute(
                     "UPDATE hold_latches SET active = 0, hold_receipt_id = '', "
                     "reason = '', actor_id = '', set_at = '', revision = revision + 1 "
                     "WHERE scope = ? AND target_id = ? AND active = 1 "
                     "AND hold_receipt_id = ?",
                     (resolved_scope.value, resolved_target, expected),
                 )
-            current = _latch_from_row(
-                await self._read_latch_row(resolved_scope, resolved_target)
+                if updated != 1:
+                    raise HoldCorruptStateError(
+                        "applied Hold release did not clear exactly one latch"
+                    )
+            current_row = await self._read_latch_row(
+                resolved_scope, resolved_target
+            )
+            current = _latch_from_row(current_row)
+            if current_row is None:
+                raise HoldCorruptStateError(
+                    "Hold release lost its durable latch projection"
+                )
+            await self._mark_checkpoint_clean(
+                resolved_scope,
+                resolved_target,
+                latch=current,
+                latch_revision=int(current_row[7]),
             )
             return HoldMutation(receipt=receipt, current=current)
 
@@ -931,7 +1265,7 @@ class HoldStore:
             raise
 
     async def _get_effective(self, agent_id: str) -> EffectiveHoldState:
-        """Read host + agent latches in one locked database snapshot."""
+        """Read the bounded host + agent admission projection."""
 
         agent = _required_text(agent_id, "agent_id")
         if getattr(self._db, "backend_type", "") == "sqlite":
@@ -942,127 +1276,125 @@ class HoldStore:
         )
         async with self._db.transaction(immediate=True):
             await self._lock_read_targets(targets)
-            await self._assert_host_latch_shape()
             rows = await self._db.fetchall(
-                f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
-                "WHERE (scope = ? AND target_id = ?) "
-                "OR (scope = ? AND target_id = ?)",
-                (
-                    HoldScope.HOST.value,
-                    HOST_HOLD_TARGET,
-                    HoldScope.AGENT.value,
-                    agent,
-                ),
+                self._effective_admission_query(),
+                self._effective_admission_params(agent),
             )
-            host: Optional[HoldState] = None
-            agent_state: Optional[HoldState] = None
-            seen: set[tuple[str, str]] = set()
-            for row in rows:
-                key = (str(row[0]), str(row[1]))
-                if key in seen:
-                    raise HoldCorruptStateError("duplicate hold latch key")
-                seen.add(key)
-                state = _latch_from_row(row)
-                if state is None:
-                    continue
-                if state.scope is HoldScope.HOST:
-                    host = state
-                elif state.target_id == agent:
-                    agent_state = state
-                else:
-                    raise HoldCorruptStateError(
-                        "effective hold query returned a foreign agent"
-                    )
-            await self._validate_latch_projection(
-                host, HoldScope.HOST, HOST_HOLD_TARGET
+            return await self._effective_from_admission_rows(rows, agent)
+
+    @staticmethod
+    def _effective_admission_query() -> str:
+        """Return the two-row, constant-size admission snapshot query."""
+
+        return (
+            "WITH requested(scope, target_id) AS ("
+            "SELECT ? AS scope, ? AS target_id UNION ALL SELECT ?, ?"
+            ") SELECT requested.scope, requested.target_id, "
+            "latch.active, latch.hold_receipt_id, latch.reason, "
+            "latch.actor_id, latch.set_at, latch.revision, "
+            "checkpoint.active, checkpoint.hold_receipt_id, "
+            "checkpoint.latch_revision, checkpoint.dirty, "
+            "authority.receipt_id, authority.operation_id, authority.action, "
+            "authority.disposition, authority.scope, authority.target_id, "
+            "authority.reason, authority.actor_id, authority.occurred_at, "
+            "authority.expected_hold_receipt_id, "
+            "authority.prior_hold_receipt_id, "
+            "authority.resulting_hold_receipt_id, "
+            "EXISTS(SELECT 1 FROM hold_receipts candidate "
+            "WHERE candidate.scope = requested.scope "
+            "AND candidate.target_id = requested.target_id), "
+            "(SELECT target_id FROM hold_latches "
+            "WHERE scope = 'host' AND target_id <> 'host' LIMIT 1), "
+            "(SELECT target_id FROM hold_receipts "
+            "WHERE scope = 'host' AND target_id <> 'host' LIMIT 1) "
+            "FROM requested "
+            "LEFT JOIN hold_latches latch ON latch.scope = requested.scope "
+            "AND latch.target_id = requested.target_id "
+            "LEFT JOIN hold_authority_checkpoints checkpoint "
+            "ON checkpoint.scope = requested.scope "
+            "AND checkpoint.target_id = requested.target_id "
+            "LEFT JOIN hold_receipts authority "
+            "ON authority.receipt_id = checkpoint.hold_receipt_id"
+        )
+
+    @staticmethod
+    def _effective_admission_params(agent: str) -> tuple[str, str, str, str]:
+        return (
+            HoldScope.HOST.value,
+            HOST_HOLD_TARGET,
+            HoldScope.AGENT.value,
+            agent,
+        )
+
+    async def _effective_from_admission_rows(
+        self,
+        rows: list[Any],
+        agent: str,
+    ) -> EffectiveHoldState:
+        if len(rows) != 2:
+            raise HoldCorruptStateError(
+                "effective Hold admission snapshot has an unexpected shape"
             )
-            await self._validate_latch_projection(
-                agent_state, HoldScope.AGENT, agent
+        states: dict[tuple[str, str], Optional[HoldState]] = {}
+        for row in rows:
+            if row is None or len(row) != 27:
+                raise HoldCorruptStateError(
+                    "effective Hold admission snapshot has an unexpected shape"
+                )
+            if row[25] is not None or row[26] is not None:
+                raise HoldCorruptStateError(
+                    "host hold state has a foreign target identity"
+                )
+            key = (str(row[0]), str(row[1]))
+            if key in states:
+                raise HoldCorruptStateError("duplicate hold admission target")
+            try:
+                scope = HoldScope(key[0])
+            except ValueError as exc:
+                raise HoldCorruptStateError(
+                    "effective Hold admission snapshot has an invalid scope"
+                ) from exc
+            expected_target = HOST_HOLD_TARGET if scope is HoldScope.HOST else agent
+            if key[1] != expected_target:
+                raise HoldCorruptStateError(
+                    "effective hold query returned a foreign target"
+                )
+            latch_row = (
+                (row[0], row[1], *row[2:8]) if row[2] is not None else None
             )
-            return EffectiveHoldState(host=host, agent=agent_state)
+            checkpoint_row = (
+                (row[0], row[1], *row[8:12]) if row[8] is not None else None
+            )
+            authority_row = tuple(row[12:24]) if row[12] is not None else None
+            states[key] = await self._validate_admission_projection(
+                latch_row=latch_row,
+                checkpoint_row=checkpoint_row,
+                authority_receipt_row=authority_row,
+                scope=scope,
+                target_id=key[1],
+                receipt_exists=bool(row[24]),
+            )
+        host_key = (HoldScope.HOST.value, HOST_HOLD_TARGET)
+        agent_key = (HoldScope.AGENT.value, agent)
+        if set(states) != {host_key, agent_key}:
+            raise HoldCorruptStateError(
+                "effective Hold admission snapshot omitted a requested target"
+            )
+        return EffectiveHoldState(
+            host=states[host_key],
+            agent=states[agent_key],
+        )
 
     async def _get_effective_sqlite_snapshot(
         self, agent: str
     ) -> EffectiveHoldState:
-        """Validate both latches from one independent committed statement."""
+        """Validate two fixed-size projections from one committed statement."""
 
         rows = await self._db.fetchall_snapshot(
-            "SELECT 'latch', scope, target_id, active, hold_receipt_id, "
-            "reason, actor_id, set_at, revision, "
-            "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL "
-            "FROM hold_latches WHERE scope = ? OR (scope = ? AND target_id = ?) "
-            "UNION ALL "
-            "SELECT 'receipt', scope, target_id, NULL, NULL, NULL, NULL, NULL, NULL, "
-            "receipt_id, operation_id, action, disposition, reason, actor_id, "
-            "occurred_at, expected_hold_receipt_id, prior_hold_receipt_id, "
-            "resulting_hold_receipt_id FROM hold_receipts "
-            "WHERE scope = ? OR (scope = ? AND target_id = ?)",
-            (
-                HoldScope.HOST.value,
-                HoldScope.AGENT.value,
-                agent,
-                HoldScope.HOST.value,
-                HoldScope.AGENT.value,
-                agent,
-            ),
+            self._effective_admission_query(),
+            self._effective_admission_params(agent),
         )
-        latches: dict[tuple[str, str], Optional[HoldState]] = {}
-        receipts: dict[tuple[str, str], list[Any]] = {}
-        for row in rows:
-            if row is None or len(row) != 19:
-                raise HoldCorruptStateError(
-                    "effective Hold snapshot has an unexpected shape"
-                )
-            kind = str(row[0])
-            scope = str(row[1])
-            target_id = str(row[2])
-            if scope == HoldScope.HOST.value and target_id != HOST_HOLD_TARGET:
-                raise HoldCorruptStateError(
-                    "host hold state has a foreign target identity"
-                )
-            key = (scope, target_id)
-            if kind == "latch":
-                if key in latches:
-                    raise HoldCorruptStateError("duplicate hold latch key")
-                latches[key] = _latch_from_row(row[1:9])
-                continue
-            if kind != "receipt":
-                raise HoldCorruptStateError(
-                    "effective Hold snapshot has an invalid row kind"
-                )
-            receipt_row = (
-                row[9],
-                row[10],
-                row[11],
-                row[12],
-                row[1],
-                row[2],
-                row[13],
-                row[14],
-                row[15],
-                row[16],
-                row[17],
-                row[18],
-            )
-            receipts.setdefault(key, []).append(receipt_row)
-
-        host_key = (HoldScope.HOST.value, HOST_HOLD_TARGET)
-        agent_key = (HoldScope.AGENT.value, agent)
-        host = latches.get(host_key)
-        agent_state = latches.get(agent_key)
-        await self._validate_latch_projection(
-            host,
-            HoldScope.HOST,
-            HOST_HOLD_TARGET,
-            receipt_rows=receipts.get(host_key, []),
-        )
-        await self._validate_latch_projection(
-            agent_state,
-            HoldScope.AGENT,
-            agent,
-            receipt_rows=receipts.get(agent_key, []),
-        )
-        return EffectiveHoldState(host=host, agent=agent_state)
+        return await self._effective_from_admission_rows(rows, agent)
 
     async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
         operation = _required_text(operation_id, "operation_id")

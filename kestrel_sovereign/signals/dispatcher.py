@@ -559,6 +559,22 @@ class _CoalescingState:
                 del per_source[key]
         return False
 
+    def discard(
+        self,
+        source: str,
+        dedupe_key: str,
+        *,
+        recorded_at: datetime,
+    ) -> None:
+        """Remove this dispatch's exact key after admission refusal."""
+
+        per_source = self._seen.get(source)
+        if not per_source or per_source.get(dedupe_key) != recorded_at:
+            return
+        del per_source[dedupe_key]
+        if not per_source:
+            self._seen.pop(source, None)
+
     def reset(self) -> None:
         """Drop all remembered dedupe keys. Called on host-resume: the
         wall-clock windows expired while the process was suspended, so the
@@ -3452,6 +3468,7 @@ class SignalDispatcher:
             registration,
             start,
             durable=True,
+            schedule_outcome=False,
         )
         if held_result is not None:
             # Volatile privacy modes activate an initial lease at persistence;
@@ -3463,6 +3480,7 @@ class SignalDispatcher:
                 persisted_event_id=persisted_event_id,
                 delivery=delivery,
             )
+            self._schedule_outcome_log(signal, registration, held_result)
             return held_result
         if delivery is None:
             delivery = await self.claim_durable_delivery_for_event(
@@ -3476,6 +3494,7 @@ class SignalDispatcher:
                 registration,
                 start,
                 durable=True,
+                schedule_outcome=False,
             )
             if held_result is not None:
                 await self._release_cognition_hold_lease(
@@ -3499,6 +3518,7 @@ class SignalDispatcher:
                             signal.id,
                         )
                     )
+                self._schedule_outcome_log(signal, registration, held_result)
                 return held_result
             existing = await self.get_durable_delivery_for_event(
                 consumer_id=consumer_id,
@@ -4058,16 +4078,18 @@ class SignalDispatcher:
         # delivery, so reapplying the process-local duplicate cache would make
         # a failed cognition turn COALESCED forever. The durable lease remains
         # its idempotency boundary.
+        coalescing_recorded_at: datetime | None = None
         if (
             signal.dedupe_key is not None
             and not self._durable_retry_skips_coalescing.get()
         ):
             window = registration.coalescing_window or self._default_window
+            coalescing_recorded_at = self._clock()
             if self._coalescing.check_and_record(
                 signal.source,
                 signal.dedupe_key,
                 window,
-                now=self._clock(),
+                now=coalescing_recorded_at,
             ):
                 return self._fail(
                     signal,
@@ -4097,6 +4119,12 @@ class SignalDispatcher:
         result = await self._route_under_locks(signal, registration, start)
         if self._hold_prevented_execution(result):
             self._rate.discard(signal.source, recorded_at=rate_recorded_at)
+            if signal.dedupe_key is not None and coalescing_recorded_at is not None:
+                self._coalescing.discard(
+                    signal.source,
+                    signal.dedupe_key,
+                    recorded_at=coalescing_recorded_at,
+                )
         return result
 
     @staticmethod
@@ -4124,6 +4152,7 @@ class SignalDispatcher:
         start: float,
         *,
         durable: bool,
+        schedule_outcome: bool = True,
     ) -> SignalResult | None:
         """Return the typed, audited Hold disposition for one signal unit."""
 
@@ -4131,16 +4160,21 @@ class SignalDispatcher:
             if not await self._agent_is_held():
                 return None
         except Exception as exc:
-            return self._fail(
+            result = self._failure_result(
                 signal,
                 start,
-                Status.FAILED,
                 error=f"hold_state_unavailable: {type(exc).__name__}",
-                registration=registration,
             )
+            if schedule_outcome:
+                self._schedule_outcome_log(signal, registration, result)
+            return result
 
         return self._hold_signal_disposition(
-            signal, registration, start, durable=durable
+            signal,
+            registration,
+            start,
+            durable=durable,
+            schedule_outcome=schedule_outcome,
         )
 
     def _hold_signal_disposition(
@@ -4150,6 +4184,7 @@ class SignalDispatcher:
         start: float,
         *,
         durable: bool,
+        schedule_outcome: bool = True,
         audit: "_ConstitutionAudit | None" = None,
     ) -> SignalResult:
         """Map one already-observed Hold without rereading a newer latch."""
@@ -4170,18 +4205,24 @@ class SignalDispatcher:
         # code is the receipt discriminator: scheduled surfaces already treat
         # DROPPED_QUIET_HOURS as a benign skip, while COALESCED is a benign
         # no-execution result and leaves durable delivery state untouched.
-        return self._fail(
+        result = self._failure_result(
             signal,
             start,
-            (
+            status=(
                 Status.COALESCED
                 if durable
                 else Status.DROPPED_QUIET_HOURS
             ),
             error=f"hold_{disposition.value}",
-            registration=registration,
-            audit=audit,
         )
+        if schedule_outcome:
+            self._schedule_outcome_log(
+                signal,
+                registration,
+                result,
+                audit=audit,
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Cycle detection (precise rules — see SIGNAL_DISPATCHER.md §6)
