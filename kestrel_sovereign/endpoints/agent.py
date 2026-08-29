@@ -1137,7 +1137,11 @@ async def stop_agent_request(request: Request):
                 else StopScope.AGENT
             ),
             actor_id=actor_id,
-            target=turn_id or request_id or agent_id,
+            target=(
+                turn_id
+                if turn_id is not None
+                else request_id if request_id is not None else agent_id
+            ),
             target_agent_id=(
                 agent_id
                 if request_id is not None or turn_id is not None

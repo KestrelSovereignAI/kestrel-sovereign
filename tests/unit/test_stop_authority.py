@@ -942,6 +942,48 @@ def test_stop_endpoint_rejects_request_and_turn_id_together() -> None:
     assert "either request_id or turn_id" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("request_id", ["", None, 0, False])
+def test_stop_endpoint_rejects_explicit_falsey_request_id(request_id) -> None:
+    """A malformed exact address cannot widen into agent-wide Stop."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:falsey-stop-address"
+    agent._active_request_ids = {"unrelated-live-turn"}
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": request_id},
+    )
+
+    assert response.status_code == 400
+    agent.cancel_current_request.assert_not_called()
+
+
+def test_stop_endpoint_rejects_empty_query_request_id() -> None:
+    """Query-field presence is preserved even when its value is empty."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:falsey-query-stop-address"
+    agent._active_request_ids = {"unrelated-live-turn"}
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+
+    response = TestClient(app).post("/api/agent/stop?request_id=")
+
+    assert response.status_code == 400
+    agent.cancel_current_request.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     """The endpoint must not confuse a cancel marker with completed execution."""
