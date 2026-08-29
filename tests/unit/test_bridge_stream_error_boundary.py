@@ -93,11 +93,18 @@ def _post_stream(process_input_streaming, *, cancellation_after_stream=False):
         restore()
 
 
-def _post_stream_with_agent(process_input_streaming):
+def _post_stream_with_agent(
+    process_input_streaming,
+    *,
+    cancellation_after_stream=False,
+):
     """Drive the real bridge route and retain its test agent for assertions."""
 
     os.environ["KESTREL_API_KEY"] = API_KEY
-    app, restore = _boot(process_input_streaming)
+    app, restore = _boot(
+        process_input_streaming,
+        cancellation_after_stream=cancellation_after_stream,
+    )
     agent = app.state.agent
     try:
         with TestClient(app) as client:
@@ -158,6 +165,23 @@ def test_bridge_stream_reports_stopped_command_instead_of_success():
     events = _events(response.text)
     assert [event["type"] for event in events] == ["stopped"]
     assert events[0]["request_id"]
+
+
+def test_bridge_stream_withholds_chunk_queued_before_stop():
+    """The bridge owner rechecks Stop before publishing a producer chunk."""
+
+    async def _queued(*_args, **_kwargs):
+        yield "must not escape"
+
+    response, agent = _post_stream_with_agent(
+        _queued,
+        cancellation_after_stream=True,
+    )
+
+    assert response.status_code == 200
+    assert [event["type"] for event in _events(response.text)] == ["stopped"]
+    assert "must not escape" not in response.text
+    assert agent.features["BridgeFeature"].log_invocation.await_count == 1
 
 
 def test_bridge_stream_generic_exception_emits_safe_constant_not_str_e():
