@@ -19,6 +19,7 @@ from kestrel_sovereign.storage.database_clock import database_now_sql
 
 HOST_HOLD_TARGET = "host"
 _SCHEMA_LOCK = "hold_state_v1"
+_WITNESS_BACKFILL = "hold_state_witness_ledgers_v1"
 _LATCH_COLUMNS = (
     "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
 )
@@ -341,6 +342,17 @@ class HoldStore:
         self._db = db
 
     async def ensure_schema(self) -> None:
+        """Create the Hold schema while preserving typed integrity failures."""
+
+        try:
+            await self._ensure_schema_transaction()
+        except BaseException as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _ensure_schema_transaction(self) -> None:
         """Create both Hold tables as one serialized schema unit."""
 
         async with self._db.migration_lock(_SCHEMA_LOCK):
@@ -408,9 +420,23 @@ class HoldStore:
                 "operation_id TEXT NOT NULL PRIMARY KEY, "
                 "receipt_id TEXT NOT NULL UNIQUE)"
             )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_schema_migrations ("
+                "name TEXT NOT NULL PRIMARY KEY)"
+            )
+            migration_complete = await self._db.fetchone(
+                "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
+                (_WITNESS_BACKFILL,),
+            )
+            if migration_complete is not None:
+                await self._assert_completed_witness_migration_intact()
+                return
+
             # Seed the witness exactly once for upgraded databases. Future
-            # schema checks never recompute an existing count from mutable
-            # receipt rows, so a later receipt deletion remains detectable.
+            # schema checks never derive missing witnesses from mutable receipt
+            # rows after the durable migration marker exists. Without that
+            # gate, deleting a witness on a later boot re-blessed whatever
+            # receipt content happened to remain.
             await self._db.execute(
                 "INSERT INTO hold_receipt_witnesses "
                 "(scope, target_id, receipt_count) "
@@ -463,6 +489,49 @@ class HoldStore:
                 "SELECT scope, target_id, 0 FROM hold_latches "
                 "WHERE scope <> 'host' OR target_id = 'host' "
                 "ON CONFLICT (scope, target_id) DO NOTHING"
+            )
+            await self._db.execute(
+                "INSERT INTO hold_schema_migrations (name) VALUES (?) "
+                "ON CONFLICT (name) DO NOTHING",
+                (_WITNESS_BACKFILL,),
+            )
+
+    async def _assert_completed_witness_migration_intact(self) -> None:
+        """Fail closed if a completed migration later loses any witness."""
+
+        missing_content = await self._db.fetchone(
+            "SELECT r.receipt_id FROM hold_receipts AS r "
+            "LEFT JOIN hold_receipt_content_witnesses AS w "
+            "ON w.receipt_id = r.receipt_id "
+            "WHERE w.receipt_id IS NULL LIMIT 1"
+        )
+        if missing_content is not None:
+            raise HoldCorruptStateError(
+                "completed Hold witness migration is missing a content witness"
+            )
+
+        missing_operation = await self._db.fetchone(
+            "SELECT r.operation_id FROM hold_receipts AS r "
+            "LEFT JOIN hold_operation_witnesses AS w "
+            "ON w.operation_id = r.operation_id "
+            "WHERE w.operation_id IS NULL LIMIT 1"
+        )
+        if missing_operation is not None:
+            raise HoldCorruptStateError(
+                "completed Hold witness migration is missing an operation witness"
+            )
+
+        missing_count = await self._db.fetchone(
+            "SELECT source.scope, source.target_id FROM ("
+            "SELECT scope, target_id FROM hold_receipts "
+            "UNION SELECT scope, target_id FROM hold_latches"
+            ") AS source LEFT JOIN hold_receipt_witnesses AS w "
+            "ON w.scope = source.scope AND w.target_id = source.target_id "
+            "WHERE w.scope IS NULL LIMIT 1"
+        )
+        if missing_count is not None:
+            raise HoldCorruptStateError(
+                "completed Hold witness migration is missing a receipt-count witness"
             )
 
     async def _lock_operation_and_target(
