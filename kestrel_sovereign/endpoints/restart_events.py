@@ -38,6 +38,10 @@ async def get_restart_status_events(
     never repaints restart bubbles filed from conversation B.
     """
     agent = get_agent(request)
+    principal = getattr(agent, "did", None)
+    if not isinstance(principal, str) or not principal.strip():
+        return {"events": [], "count": 0}
+    principal = principal.strip()
     db = resolve_feature_database(agent)
     if db is None:
         return {"events": [], "count": 0}
@@ -47,7 +51,11 @@ async def get_restart_status_events(
             list_recent_events_for_history,
         )
 
-        rows = await list_recent_events_for_history(db, limit=limit)
+        rows = await list_recent_events_for_history(
+            db,
+            agent_id=principal,
+            limit=limit,
+        )
     except Exception as e:
         # Restart feature not loaded / table absent — no trail to repaint.
         logger.debug("restart status-events lookup unavailable: %s", e)

@@ -296,7 +296,7 @@ test('demo-classified servers refuse the Create flow entirely — the #868 rail 
     const { readFileSync } = await import('node:fs');
     const src = readFileSync(new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
     const start = src.indexOf('function openNewAgentFlow()');
-    const block = src.slice(start, start + 2600);
+    const block = src.slice(start, start + 3600);
     assert.match(block, /serverDemoMode[\s\S]{0,200}?return;/,
         'creation refused on demo-mode servers before the dialog opens');
     const created = block.indexOf('onCreated');
@@ -322,7 +322,7 @@ test('the create flow FAILS CLOSED before server classification loads (codex P1 
         'unclassified server refuses the create flow (fail closed)');
 });
 
-test('creation is gated on the server-advertised can_create_agents capability (codex P2 round 2 + P1 round 3)', async () => {
+test('creation is gated on resettable caller-scoped lifecycle authority', async () => {
     const { readFileSync } = await import('node:fs');
     const adapterSrc = readFileSync(new URL('../../kestrel_sovereign/static/js/agent_list.js', import.meta.url), 'utf8');
     assert.match(adapterSrc, /canCreateAgents:\s*false/,
@@ -332,7 +332,8 @@ test('creation is gated on the server-advertised can_create_agents capability (c
     const identitySrc = readFileSync(new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
     const start = identitySrc.indexOf('function openNewAgentFlow()');
     const block = identitySrc.slice(start, start + 1600);
-    assert.match(block, /canCreateAgents/, 'openNewAgentFlow gates on the capability');
+    assert.match(block, /canManageHostAgentLifecycle\('create'\)/,
+        'openNewAgentFlow gates on resettable caller authority');
     assert.doesNotMatch(block, /mode === 'standalone'/,
         'mode-only inference replaced by the explicit capability');
 });
