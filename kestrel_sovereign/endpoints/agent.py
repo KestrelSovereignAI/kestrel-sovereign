@@ -31,6 +31,7 @@ from kestrel_sovereign.agent.invocation import (
     invocation_log_correlation,
     invocation_id_response_header,
     new_stream_delivery_id,
+    validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
@@ -434,6 +435,19 @@ async def invoke_agent(request: Request, http_response: Response):
                     ),
                     request=kite_evidence_request,
                 )
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    http_response.headers["X-Request-ID"] = (
+                        invocation_id_response_header(request_id)
+                    )
+                    return {
+                        "response": "Request stopped during execution.",
+                        "session_id": None,
+                        "model": None,
+                        "provider": None,
+                    }
             finally:
                 agent._cleanup_cancelled_request(request_id)
             nonce = kite_evidence_request.get("nonce")
@@ -904,20 +918,29 @@ async def stop_agent_request(request: Request):
         # remain literal values.  Only X-Request-ID is a percent-encoded wire
         # form, so a client can copy an invoke/stream response header here
         # verbatim without forking the cancellation key.
+        body_has_request_id = "request_id" in data
+        query_has_request_id = "request_id" in request.query_params
         explicit_request_id = (
-            data.get("request_id") or request.query_params.get("request_id")
+            data["request_id"]
+            if body_has_request_id
+            else request.query_params.get("request_id")
         )
-        request_id = (
-            resolve_request_invocation_id(
-                request,
-                {"request_id": explicit_request_id}
-                if explicit_request_id is not None
-                else {},
-            )
-            if explicit_request_id is not None
-            or request.headers.get("X-Request-ID") is not None
-            else None
-        )
+        if body_has_request_id or query_has_request_id:
+            try:
+                request_id = validate_invocation_id(explicit_request_id)
+            except ValueError as error:
+                raise ApiHTTPException(
+                    status_code=400,
+                    code="invalid_request_id",
+                    message=(
+                        "request_id must be a non-empty valid Unicode string no "
+                        f"longer than 256 characters: {error}"
+                    ),
+                ) from error
+        elif request.headers.get("X-Request-ID") is not None:
+            request_id = resolve_request_invocation_id(request, {})
+        else:
+            request_id = None
         correlation_id = data.get("correlation_id")
         if correlation_id is None:
             correlation_id = request.query_params.get("correlation_id")

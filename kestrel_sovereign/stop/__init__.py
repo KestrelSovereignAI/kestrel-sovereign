@@ -9,6 +9,7 @@ from .authority import (
     StopCleanupRegistry,
 )
 from .receipt import (
+    StopOperationClaim,
     StopReceipt,
     StopReceiptConflict,
     StopReceiptCorruptError,
@@ -24,6 +25,7 @@ __all__ = [
     "StopDisposition",
     "StopCleanupRegistry",
     "StopOutcome",
+    "StopOperationClaim",
     "StopReceipt",
     "StopReceiptConflict",
     "StopReceiptCorruptError",

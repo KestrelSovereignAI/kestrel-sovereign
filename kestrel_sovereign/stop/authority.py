@@ -8,7 +8,12 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .receipt import StopReceipt, StopReceiptConflict
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
+
+from .receipt import StopOperationClaim, StopReceipt, StopReceiptConflict
 from .types import StopDisposition, StopOutcome, StopRequest, StopScope
 
 StopOperation = Callable[[StopRequest], Awaitable[StopDisposition]]
@@ -40,7 +45,7 @@ class CooperativeStopTarget:
             ("tool_call_ids", self.tool_call_ids),
         ):
             if not isinstance(addresses, frozenset) or any(
-                not isinstance(address, str) or not address.strip()
+                not isinstance(address, str) or not address
                 for address in addresses
             ):
                 raise TypeError(
@@ -130,6 +135,57 @@ class CancellationAuthority:
             return replay.outcomes
 
         targets = self._resolve(request)
+        claim_id: str | None = None
+        claim_operation = getattr(self._receipt_store, "claim", None)
+        if callable(claim_operation):
+            try:
+                claim = await claim_operation(request)
+            except StopReceiptConflict:
+                return self._receipt_preflight_refusal(
+                    request,
+                    targets,
+                    detail="Stop operation identity conflicts with durable evidence",
+                )
+            except Exception:  # noqa: BLE001 - durable claim boundary
+                return self._receipt_preflight_refusal(
+                    request,
+                    targets,
+                    detail=(
+                        "Stop receipt storage is unavailable; cancellation not attempted"
+                    ),
+                )
+            if isinstance(claim, StopReceipt):
+                return claim.outcomes
+            if claim is None:
+                return self._receipt_preflight_refusal(
+                    request,
+                    targets,
+                    detail="An exact Stop operation is already in progress",
+                )
+            if not isinstance(claim, StopOperationClaim):
+                return self._receipt_preflight_refusal(
+                    request,
+                    targets,
+                    detail="Stop receipt storage returned an invalid operation claim",
+                )
+            claim_id = claim.claim_id
+
+        owner = asyncio.create_task(
+            self._stop_and_persist(request, targets, claim_id=claim_id),
+            name="cooperative-stop-operation",
+        )
+        outcome = await await_owned_task(owner)
+        return raise_owned_outcome(outcome, operation="cooperative Stop receipt")
+
+    async def _stop_and_persist(
+        self,
+        request: StopRequest,
+        targets: tuple[CooperativeStopTarget, ...],
+        *,
+        claim_id: str | None,
+    ) -> tuple[StopOutcome, ...]:
+        """Own target effects through their durable receipt commit."""
+
         if not targets:
             if request.scope is StopScope.HOST:
                 # HOST fan-out has one outcome per resolved agent.  An empty
@@ -138,21 +194,32 @@ class CancellationAuthority:
                 outcomes: tuple[StopOutcome, ...] = ()
             else:
                 outcomes = (
-                StopOutcome(
-                    scope=request.scope,
-                    requested_target=request.target,
-                    resolved_target=request.target or StopScope.HOST.value,
-                    agent_id=request.target_agent_id or request.target or "unresolved",
-                    disposition=StopDisposition.UNREACHABLE,
-                    correlation_id=request.correlation_id,
-                    detail="No cooperative Stop target resolved",
-                ),
-            )
+                    StopOutcome(
+                        scope=request.scope,
+                        requested_target=request.target,
+                        resolved_target=request.target or StopScope.HOST.value,
+                        agent_id=(
+                            request.target_agent_id
+                            or request.target
+                            or "unresolved"
+                        ),
+                        disposition=StopDisposition.UNREACHABLE,
+                        correlation_id=request.correlation_id,
+                        detail="No cooperative Stop target resolved",
+                    ),
+                )
         else:
             outcomes = await self._stop_targets(request, targets)
 
         try:
-            receipt = await self._receipt_store.persist(request, outcomes)
+            if claim_id is None:
+                receipt = await self._receipt_store.persist(request, outcomes)
+            else:
+                receipt = await self._receipt_store.persist(
+                    request,
+                    outcomes,
+                    claim_id=claim_id,
+                )
             if not isinstance(receipt, StopReceipt):
                 raise TypeError("Stop receipt storage returned invalid evidence")
             return receipt.outcomes
@@ -166,8 +233,6 @@ class CancellationAuthority:
                         "Stop receipt could not be persisted"
                     ),
                 )
-                if outcome.disposition is StopDisposition.STOPPED
-                else outcome
                 for outcome in outcomes
             )
 

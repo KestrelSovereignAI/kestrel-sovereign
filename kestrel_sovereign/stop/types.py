@@ -52,8 +52,10 @@ class StopRequest:
         if self.scope is StopScope.HOST:
             if self.target is not None:
                 raise ValueError("host Stop cannot carry a target")
-        elif not isinstance(self.target, str) or not self.target.strip():
+        elif not isinstance(self.target, str) or not self.target:
             raise ValueError(f"{self.scope.value} Stop requires a target")
+        elif self.scope is StopScope.AGENT and not self.target.strip():
+            raise ValueError("agent Stop requires a concrete identity")
         if self.scope in {StopScope.TURN, StopScope.TOOL_CALL} and (
             not isinstance(self.target_agent_id, str)
             or not self.target_agent_id.strip()
@@ -83,8 +85,11 @@ class StopRequest:
                 object.__setattr__(self, "turn_id", self.target)
             elif self.turn_id != self.target:
                 raise ValueError("turn Stop identity must match its target")
+        if self.turn_id is not None and (
+            not isinstance(self.turn_id, str) or not self.turn_id
+        ):
+            raise ValueError("turn_id must be a non-empty string when supplied")
         for field_name, value in (
-            ("turn_id", self.turn_id),
             ("span_id", self.span_id),
             ("trace_id", self.trace_id),
         ):
@@ -150,13 +155,14 @@ class StopOutcome:
             )
         if self.requested_target is not None and (
             not isinstance(self.requested_target, str)
-            or not self.requested_target.strip()
+            or not self.requested_target
         ):
             raise ValueError(
                 "requested_target must be a non-empty string when supplied"
             )
+        if not isinstance(self.resolved_target, str) or not self.resolved_target:
+            raise ValueError("resolved_target must be a non-empty string")
         for field_name, value in (
-            ("resolved_target", self.resolved_target),
             ("agent_id", self.agent_id),
             ("correlation_id", self.correlation_id),
         ):

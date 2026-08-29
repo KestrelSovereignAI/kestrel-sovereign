@@ -432,13 +432,19 @@ async def test_unreadable_receipt_store_prevents_cancellation():
 
 
 @pytest.mark.asyncio
-async def test_failed_receipt_write_never_reports_unwitnessed_stop():
+@pytest.mark.parametrize(
+    "terminal_disposition",
+    [StopDisposition.STOPPED, StopDisposition.ALREADY_COMPLETE],
+)
+async def test_failed_receipt_write_never_reports_unwitnessed_stop(
+    terminal_disposition,
+):
     calls = 0
 
     async def cancel(_request):
         nonlocal calls
         calls += 1
-        return StopDisposition.STOPPED
+        return terminal_disposition
 
     request = _request()
     authority = CancellationAuthority(
@@ -460,6 +466,100 @@ async def test_failed_receipt_write_never_reports_unwitnessed_stop():
     assert outcomes[0].disposition is StopDisposition.REFUSED
     assert outcomes[0].receipt_id is None
     assert "may have completed" in (outcomes[0].detail or "")
+
+
+@pytest.mark.asyncio
+async def test_operation_claim_precedes_concurrent_target_side_effect(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-claim-race.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        request = _request(correlation_id="one-effect")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def cancel(_request):
+            nonlocal calls
+            calls += 1
+            started.set()
+            if calls == 1:
+                await release.wait()
+            return StopDisposition.STOPPED
+
+        def authority():
+            return CancellationAuthority(
+                lambda: (
+                    CooperativeStopTarget(
+                        "agent-runtime-7",
+                        "did:test:agent",
+                        cancel,
+                        turn_ids=frozenset({request.target}),
+                    ),
+                ),
+                cleanup_registry=StopCleanupRegistry(),
+                receipt_store=store,
+            )
+
+        first = asyncio.create_task(authority().stop(request))
+        await started.wait()
+        overlapping = await authority().stop(request)
+        release.set()
+        committed = await first
+        assert overlapping[0].disposition is StopDisposition.REFUSED
+        assert "already in progress" in (overlapping[0].detail or "")
+        assert calls == 1
+
+        replay = await authority().stop(request)
+        assert committed == replay
+        assert calls == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_caller_cannot_split_effect_from_receipt(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-owned-receipt.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        request = _request(correlation_id="caller-cancelled-stop")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancel(_request):
+            started.set()
+            await release.wait()
+            return StopDisposition.STOPPED
+
+        authority = CancellationAuthority(
+            lambda: (
+                CooperativeStopTarget(
+                    "agent-runtime-7",
+                    "did:test:agent",
+                    cancel,
+                    turn_ids=frozenset({request.target}),
+                ),
+            ),
+            cleanup_registry=StopCleanupRegistry(),
+            receipt_store=store,
+        )
+        operation = asyncio.create_task(authority.stop(request))
+        await started.wait()
+        operation.cancel()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        receipt = await store.load(request)
+        assert receipt is not None
+        assert receipt.outcomes[0].disposition is StopDisposition.STOPPED
+    finally:
+        await db.close()
 
 
 def test_live_endpoint_without_receipt_store_refuses_before_cancellation():
@@ -505,6 +605,56 @@ def test_live_endpoint_rejects_invalid_stop_correlation_identity(correlation_id)
     assert response.json()["detail"] == (
         "Stop correlation_id must be a non-empty string."
     )
+
+
+@pytest.mark.parametrize("request_id", ["", 0, False, None])
+def test_live_endpoint_rejects_falsey_explicit_request_id(request_id):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = {"turn-a", "turn-b"}
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": request_id},
+    )
+
+    assert response.status_code == 400
+    agent.cancel_current_request.assert_not_called()
+
+
+def test_live_endpoint_stops_opaque_whitespace_request_id():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = {" "}
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(return_value=None)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": " "},
+    )
+
+    assert response.status_code == 200, response.text
+    agent.cancel_current_request.assert_called_once_with(request_id=" ")
 
 
 def test_live_endpoint_replays_client_stop_correlation_without_recancelling():
