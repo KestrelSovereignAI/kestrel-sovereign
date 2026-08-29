@@ -153,7 +153,9 @@ class TestTaskManager:
         task_store.cancel_if_authorized = AsyncMock(
             side_effect=cancel_if_authorized
         )
-        task_store.get = AsyncMock(side_effect=lambda _task_id: canceled_task)
+        task_store._get_unscoped = AsyncMock(
+            side_effect=lambda _task_id: canceled_task
+        )
         task_store.close = AsyncMock(side_effect=close_task_store)
         session_service = MagicMock()
         session_service.close = AsyncMock()
@@ -273,7 +275,7 @@ class TestTaskManager:
         assert len(created.artifacts) == 2
 
         # Recipient retrieval: round-trip through the store.
-        fetched = await task_manager.task_store.get(params.id)
+        fetched = await task_manager.task_store._get_unscoped(params.id)
         assert fetched is not None
         assert fetched.artifacts is not None
         assert len(fetched.artifacts) == 2
@@ -443,7 +445,9 @@ class TestTaskManager:
             )
             await task_manager.create_task(params, agent_name="test-agent")
 
-        pending = await task_manager.get_pending_tasks()
+        pending = await task_manager.get_pending_tasks(
+            recipient_agent_id="test-agent"
+        )
         assert len(pending) == 3
 
     @pytest.mark.asyncio
@@ -465,7 +469,10 @@ class TestTaskManager:
         )
         await task_manager.create_task(params, agent_name="test-agent")
 
-        session_tasks = await task_manager.get_session_tasks(session_id)
+        session_tasks = await task_manager.get_session_tasks(
+            session_id,
+            recipient_agent_id="test-agent",
+        )
         assert len(session_tasks) == 2
 
 
@@ -522,7 +529,7 @@ class TestOnTaskSubmittedCallback:
         with pytest.raises(asyncio.CancelledError):
             await manager.create_task(params, agent_name="did:test:recipient")
 
-        persisted = await manager.task_store.get(params.id)
+        persisted = await manager.task_store._get_unscoped(params.id)
         assert persisted is not None
         assert persisted.status.state is TaskState.SUBMITTED
         assert [task.id for task in received] == [params.id]
@@ -549,7 +556,7 @@ class TestOnTaskSubmittedCallback:
         task = await manager.create_task(params, agent_name="test-agent")
         assert task is not None
         # And the task IS persisted.
-        loaded = await manager.task_store.get(task.id)
+        loaded = await manager.task_store._get_unscoped(task.id)
         assert loaded is not None
 
     @pytest.mark.asyncio
@@ -1027,7 +1034,7 @@ class TestTaskManagerWorkerIntegration:
             agent_name="test-agent",
             recipient_agent_id="test-agent",
         )
-        working_task = await task_manager.get_task(task.id)
+        working_task = await task_manager.task_store._get_unscoped(task.id)
         assert working_task.status.state == TaskState.WORKING
 
         # Worker completes task
@@ -1040,7 +1047,7 @@ class TestTaskManagerWorkerIntegration:
         assert completed_task.status.state == TaskState.COMPLETED
 
         # Verify final state
-        final_task = await task_manager.get_task(task.id)
+        final_task = await task_manager.task_store._get_unscoped(task.id)
         assert final_task.status.state == TaskState.COMPLETED
         assert len(final_task.history) == 2
 
@@ -1067,7 +1074,7 @@ class TestTaskManagerWorkerIntegration:
             recipient_agent_id="test-agent",
         )
 
-        task = await task_manager.get_task(task.id)
+        task = await task_manager.task_store._get_unscoped(task.id)
         assert task.status.state == TaskState.INPUT_REQUIRED
 
         # User provides input (simulated by resuming)
@@ -1086,7 +1093,7 @@ class TestTaskManagerWorkerIntegration:
             recipient_agent_id="test-agent",
         )
 
-        final_task = await task_manager.get_task(task.id)
+        final_task = await task_manager.task_store._get_unscoped(task.id)
         assert final_task.status.state == TaskState.COMPLETED
 
 
@@ -1115,7 +1122,7 @@ class TestSubscribeLateTerminal:
             ),
         )
         store = MagicMock()
-        store.get = AsyncMock(return_value=task)
+        store.get_for_recipient = AsyncMock(return_value=task)
         store.close = AsyncMock()
         session_service = MagicMock()
         session_service.close = AsyncMock()
@@ -1132,7 +1139,10 @@ class TestSubscribeLateTerminal:
         # of hanging the test forever.
         frames = []
         async def _collect():
-            async for ev in manager.subscribe("t-late-completed"):
+            async for ev in manager.subscribe(
+                "t-late-completed",
+                recipient_agent_id="did:test:recipient",
+            ):
                 frames.append(ev)
         await asyncio.wait_for(_collect(), timeout=2.0)
 
@@ -1159,7 +1169,7 @@ class TestSubscribeLateTerminal:
             status=TaskStatus(state=TaskState.FAILED),
         )
         store = MagicMock()
-        store.get = AsyncMock(return_value=task)
+        store.get_for_recipient = AsyncMock(return_value=task)
         store.close = AsyncMock()
         session_service = MagicMock()
         session_service.close = AsyncMock()
@@ -1173,7 +1183,10 @@ class TestSubscribeLateTerminal:
 
         frames = []
         async def _collect():
-            async for ev in manager.subscribe("t-late-failed"):
+            async for ev in manager.subscribe(
+                "t-late-failed",
+                recipient_agent_id="did:test:recipient",
+            ):
                 frames.append(ev)
         await asyncio.wait_for(_collect(), timeout=2.0)
 

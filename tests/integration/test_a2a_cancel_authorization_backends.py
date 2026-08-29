@@ -48,7 +48,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             )
             is None
         )
-        assert (await store.get(task_id)).status.state is TaskState.SUBMITTED
+        assert (await store._get_unscoped(task_id)).status.state is TaskState.SUBMITTED
         assert (
             await store.cancel_if_authorized(
                 task_id,
@@ -58,7 +58,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             )
             is None
         )
-        assert (await store.get(task_id)).status.state is TaskState.SUBMITTED
+        assert (await store._get_unscoped(task_id)).status.state is TaskState.SUBMITTED
 
         canceled = await store.cancel_if_authorized(
             task_id,
@@ -82,7 +82,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             recipient_agent_id=recipient,
             expected_state=TaskState.SUBMITTED,
         )
-        assert (await store.get(task_id)).status.state is TaskState.CANCELED
+        assert (await store._get_unscoped(task_id)).status.state is TaskState.CANCELED
 
         initial = Task(
             id=payload_task_id,
@@ -95,7 +95,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             creator_agent_id=creator,
             recipient_agent_id=recipient,
         )
-        concurrent = await store.get(payload_task_id)
+        concurrent = await store._get_unscoped(payload_task_id)
         concurrent.artifacts = [
             Artifact(name="concurrent", parts=[TextPart(text="keep")])
         ]
@@ -165,7 +165,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             return_exceptions=True,
         )
         assert cancel_result is not None and not isinstance(cancel_result, Exception)
-        raced = await store.get(artifact_race_task_id)
+        raced = await store._get_unscoped(artifact_race_task_id)
         assert raced.status.state is TaskState.CANCELED
         if isinstance(append_result, Exception):
             assert "terminal task" in str(append_result)
@@ -340,8 +340,8 @@ async def test_upgrade_settles_live_rows_without_trustworthy_authority(tmp_path)
         store = TaskStore(backend)
         await store.initialize()
 
-        live = await store.get("legacy-live")
-        done = await store.get("legacy-done")
+        live = await store._get_unscoped("legacy-live")
+        done = await store._get_unscoped("legacy-done")
         assert live.status.state is TaskState.FAILED
         assert "no trustworthy creator/recipient binding" in (
             live.status.message.parts[0].text

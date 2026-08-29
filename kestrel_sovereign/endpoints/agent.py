@@ -2360,6 +2360,19 @@ async def reflection_status(request: Request):
     return result
 
 
+def _task_recipient_principal(agent) -> str:
+    """Return the route-bound durable recipient, never request metadata."""
+
+    for attribute in ("agent_id", "did"):
+        value = getattr(agent, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    raise HTTPException(
+        status_code=503,
+        detail="A2A task reads require a durable recipient identity",
+    )
+
+
 @router.get("/tasks")
 async def list_tasks(
     request: Request,
@@ -2392,11 +2405,11 @@ async def list_tasks(
                 )
 
         # Get tasks from task store
-        tasks = await agent.task_manager.task_store.list_tasks(limit=limit)
-
-        # Filter by status if provided
-        if task_state:
-            tasks = [t for t in tasks if t.status.state == task_state]
+        tasks = await agent.task_manager.task_store.list_tasks(
+            recipient_agent_id=_task_recipient_principal(agent),
+            status=task_state,
+            limit=limit,
+        )
 
         # Convert to response format
         task_list = []
@@ -3128,13 +3141,16 @@ async def get_task(request: Request, task_id: str):
         raise HTTPException(status_code=404, detail="TaskManager not available")
 
     try:
-        task = await agent.task_manager.task_store.get(task_id)
+        task = await agent.task_manager.get_task_for_recipient(
+            task_id,
+            _task_recipient_principal(agent),
+        )
     except Exception as e:
         logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error loading task.")
 
     if task is None:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+        raise HTTPException(status_code=404, detail="Task not found")
 
     message_text = None
     if task.status.message and task.status.message.parts:
@@ -3302,10 +3318,14 @@ async def subscribe_task(request: Request, task_id: str):
     # open against a non-existent subscription target — the sender
     # would otherwise idle forever waiting for terminal events that
     # can never fire.
-    task = await agent.task_manager.task_store.get(task_id)
+    recipient_agent_id = _task_recipient_principal(agent)
+    task = await agent.task_manager.get_task_for_recipient(
+        task_id,
+        recipient_agent_id,
+    )
     if task is None:
         raise HTTPException(
-            status_code=404, detail=f"Task '{task_id}' not found",
+            status_code=404, detail="Task not found",
         )
 
     client_ip = request.client.host if request.client else "unknown"
@@ -3333,7 +3353,10 @@ async def subscribe_task(request: Request, task_id: str):
             # on its internal timeout — we forward those as SSE
             # comments-or-pings so the connection stays warm even when
             # the task sits in SUBMITTED for a while.
-            async for ev in agent.task_manager.subscribe(task_id):
+            async for ev in agent.task_manager.subscribe(
+                task_id,
+                recipient_agent_id=recipient_agent_id,
+            ):
                 if await request.is_disconnected():
                     logger.debug(
                         "task subscribe client disconnected (task=%s)",

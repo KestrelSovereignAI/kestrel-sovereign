@@ -768,7 +768,13 @@ class CommandHandler:
 
         try:
             # Get tasks from store
-            tasks = await self.task_manager.task_store.list_tasks(limit=limit)
+            recipient_agent_id = getattr(self.agent, "did", None)
+            if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+                return "❌ Task recipient identity unavailable"
+            tasks = await self.task_manager.task_store.list_tasks(
+                recipient_agent_id=recipient_agent_id,
+                limit=limit,
+            )
 
             if not tasks:
                 return "📋 No tasks found"

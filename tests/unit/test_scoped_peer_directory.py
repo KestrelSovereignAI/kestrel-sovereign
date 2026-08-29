@@ -509,6 +509,101 @@ async def test_local_host_cancellation_preserves_recipient_lifecycle_conflict():
 
 
 @pytest.mark.asyncio
+async def test_local_task_reads_use_nonserializable_host_capabilities():
+    """Creator identity reaches local GET/SSE without a spoofable HTTP claim."""
+
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [{
+        "id": "did:local:recipient",
+        "name": "Recipient",
+        "routing_name": "current-route",
+    }]
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    local_get = AsyncMock(return_value={"id": "private", "status": "completed"})
+
+    async def local_subscribe(requester, peer, task_id):
+        assert requester.identity == "did:local:creator"
+        assert peer.agent_id == "did:local:recipient"
+        assert task_id == "private"
+        yield PeerSubscriptionEvent(event="status", data='{"final":true}')
+
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        client_factory=lambda *args, **kwargs: client,
+        local_get=local_get,
+        local_subscribe=local_subscribe,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="current-route",
+    )
+
+    result = await adapter.get_a2a_task(requester, peer, "private")
+    events = [
+        event async for event in adapter.subscribe_a2a_task(
+            requester,
+            peer,
+            "private",
+            timeout_seconds=5,
+        )
+    ]
+
+    assert result["id"] == "private"
+    assert events[0].event == "status"
+    assert local_get.await_args.args[0] is requester
+    assert local_get.await_args.args[1].agent_id == peer.agent_id
+    assert local_get.await_args.args[1].routing_key == peer.routing_key
+    assert local_get.await_args.args[2] == "private"
+    # Two directory reauthorizations, and no serialized task read.
+    assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_local_task_read_has_no_api_key_only_http_fallback():
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [{
+        "id": "did:local:recipient",
+        "routing_name": "recipient",
+    }]
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        api_key="shared-host-key-is-not-a-principal",
+        client_factory=lambda *args, **kwargs: client,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="recipient",
+    )
+
+    with pytest.raises(PeerAccessDeniedError):
+        await adapter.get_a2a_task(requester, peer, "guessed-task")
+    stream = adapter.subscribe_a2a_task(
+        requester,
+        peer,
+        "guessed-task",
+        timeout_seconds=5,
+    )
+    with pytest.raises(PeerAccessDeniedError):
+        await anext(stream)
+
+    # Only directory reauthorization used HTTP; no task row was requested.
+    assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_unexpected_router_resolution_error_does_not_disclose_provider_detail():
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b, unexpected_resolution_failure=True)

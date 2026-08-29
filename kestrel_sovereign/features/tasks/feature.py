@@ -93,6 +93,14 @@ class TaskFeature(Feature):
         self.task_manager = task_manager
         logger.info("TaskFeature connected to TaskManager")
 
+    def _recipient_agent_id(self) -> str:
+        """Return the runtime-bound inbox principal for every task operation."""
+
+        value = getattr(self.agent, "did", None)
+        if not isinstance(value, str) or not value:
+            raise ValueError("Task recipient identity unavailable")
+        return value
+
     # ------------------------------------------------------------------
     # Internal helpers
     #
@@ -127,7 +135,11 @@ class TaskFeature(Feature):
             return {"ok": False, "error": "Task manager not available"}
 
         try:
-            task = await self.task_manager.get_task(task_id)
+            recipient_agent_id = self._recipient_agent_id()
+            task = await self.task_manager.get_task_for_recipient(
+                task_id,
+                recipient_agent_id,
+            )
         except Exception as e:
             logger.error(f"Failed to fetch task {task_id}: {e}")
             return {"ok": False, "error": str(e)}
@@ -878,11 +890,16 @@ class TaskFeature(Feature):
                 # back empty in production (#1946). Route through the store-level
                 # list_tasks passthrough which filters by state in SQL.
                 tasks = await self.task_manager.list_tasks(
-                    status=task_state, limit=fetch_limit
+                    recipient_agent_id=self._recipient_agent_id(),
+                    status=task_state,
+                    limit=fetch_limit,
                 )
             else:
                 # No status filter — the inbox view (pending/submitted work).
-                tasks = await self.task_manager.get_pending_tasks(limit=fetch_limit)
+                tasks = await self.task_manager.get_pending_tasks(
+                    recipient_agent_id=self._recipient_agent_id(),
+                    limit=fetch_limit,
+                )
 
             if task_type:
                 tasks = [
@@ -1093,7 +1110,10 @@ class TaskFeature(Feature):
             )
 
         try:
-            task = await self.task_manager.get_task(task_id)
+            task = await self.task_manager.get_task_for_recipient(
+                task_id,
+                self._recipient_agent_id(),
+            )
         except Exception as e:
             logger.error(f"Failed to fetch task {task_id} for respond: {e}")
             return ToolResult.failed(str(e))

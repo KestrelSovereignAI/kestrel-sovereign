@@ -70,7 +70,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         )
         assert allowed is True
         assert denied is False
-        assert (await store.get(status_id)).status.state is TaskState.WORKING
+        assert (await store._get_unscoped(status_id)).status.state is TaskState.WORKING
 
         artifact = Artifact(name="result", parts=[TextPart(text="payload")])
         with pytest.raises(TaskMutationAuthorizationError):
@@ -84,11 +84,11 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
             artifact,
             recipient_agent_id=recipient,
         )
-        assert [item.name for item in (await store.get(artifact_id)).artifacts] == [
+        assert [item.name for item in (await store._get_unscoped(artifact_id)).artifacts] == [
             "result"
         ]
 
-        worker_copy = await store.get(lifecycle_id)
+        worker_copy = await store._get_unscoped(lifecycle_id)
         worker_copy.status = TaskStatus(state=TaskState.WORKING)
         assert not await store.save_recipient_lifecycle(
             worker_copy,
@@ -100,10 +100,10 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
             recipient_agent_id=recipient,
             expected_state=TaskState.SUBMITTED,
         )
-        assert (await store.get(lifecycle_id)).status.state is TaskState.WORKING
+        assert (await store._get_unscoped(lifecycle_id)).status.state is TaskState.WORKING
 
-        first = await store.get(lifecycle_race_id)
-        second = await store.get(lifecycle_race_id)
+        first = await store._get_unscoped(lifecycle_race_id)
+        second = await store._get_unscoped(lifecycle_race_id)
         first.status = TaskStatus(state=TaskState.COMPLETED)
         second.status = TaskStatus(state=TaskState.FAILED)
         lifecycle_winners = await asyncio.gather(
@@ -120,7 +120,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         )
         assert lifecycle_winners.count(True) == 1
         assert lifecycle_winners.count(False) == 1
-        assert (await store.get(lifecycle_race_id)).status.state in {
+        assert (await store._get_unscoped(lifecycle_race_id)).status.state in {
             TaskState.COMPLETED,
             TaskState.FAILED,
         }
@@ -141,7 +141,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         )
         assert status_winners.count(True) == 1
         assert status_winners.count(False) == 1
-        assert (await store.get(status_race_id)).status.state in {
+        assert (await store._get_unscoped(status_race_id)).status.state in {
             TaskState.COMPLETED,
             TaskState.FAILED,
         }

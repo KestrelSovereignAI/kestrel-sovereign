@@ -1293,6 +1293,8 @@ def _hosted_peer_directory_context(
         if not callable(refresh):
             return None, None
         local_cancel = None
+        local_get = None
+        local_subscribe = None
         if manager is not None:
             async def local_cancel(requester, peer, task_id, payload):
                 return await manager.cancel_host_attested_local_a2a_task(
@@ -1303,10 +1305,28 @@ def _hosted_peer_directory_context(
                     payload=payload,
                 )
 
+            async def local_get(requester, peer, task_id):
+                return await manager.get_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                )
+
+            def local_subscribe(requester, peer, task_id):
+                return manager.subscribe_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                )
+
         refreshed = refresh(
             host_url=host_url,
             api_key=get_api_key(),
             local_cancel=local_cancel,
+            local_get=local_get,
+            local_subscribe=local_subscribe,
         )
         return refreshed if refreshed is not None else (None, None)
     return (
