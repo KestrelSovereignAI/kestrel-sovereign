@@ -248,6 +248,49 @@ async def test_stop_waits_for_side_effecting_tool_batch_boundary():
     assert batch_completed.is_set() is True
 
 
+@pytest.mark.asyncio
+async def test_tool_batch_owner_preserves_transition_lock_reentry():
+    """The lifecycle owner cannot deadlock a transition-locked tool."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        ReentrantTransitionLock,
+    )
+
+    class Owner:
+        _execute_tool_batch_at_stop_boundary = (
+            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
+        )
+        _capture_transition_reentry_token = (
+            OrchestratorEngineMixin._capture_transition_reentry_token
+        )
+
+        def __init__(self):
+            self.transition_lock = ReentrantTransitionLock()
+
+        def _get_privacy_transition_lock(self):
+            return self.transition_lock
+
+        async def _execute_tool_batch(self):
+            async with self.transition_lock:
+                return "tool completed"
+
+    owner = Owner()
+
+    async def run_transition_locked_turn():
+        async with owner.transition_lock:
+            return await owner._execute_tool_batch_at_stop_boundary()
+
+    result = await asyncio.wait_for(
+        run_transition_locked_turn(),
+        timeout=0.1,
+    )
+
+    assert result == "tool completed"
+
+
 def test_orchestrator_paths_wire_every_tool_batch_through_stop_boundary():
     from kestrel_sovereign.agent.orchestrator_engine import (
         OrchestratorEngineMixin,

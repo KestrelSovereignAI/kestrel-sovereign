@@ -318,7 +318,17 @@ class CancellationAuthority:
         detail: str,
     ) -> tuple[StopOutcome, ...]:
         if not targets and request.scope is StopScope.HOST:
-            return ()
+            return (
+                StopOutcome(
+                    scope=request.scope,
+                    requested_target=None,
+                    resolved_target=StopScope.HOST.value,
+                    agent_id=StopScope.HOST.value,
+                    disposition=StopDisposition.REFUSED,
+                    correlation_id=request.correlation_id,
+                    detail=detail,
+                ),
+            )
         if not targets:
             return (
                 StopOutcome(

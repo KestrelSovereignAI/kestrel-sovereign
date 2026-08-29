@@ -329,6 +329,41 @@ async def test_empty_host_inventory_returns_authority_level_failure() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["load", "claim"])
+async def test_empty_host_receipt_preflight_returns_authority_refusal(
+    failure_stage: str,
+) -> None:
+    class FailingReceiptStore:
+        async def load(self, _request):
+            if failure_stage == "load":
+                raise RuntimeError("receipt backend unavailable")
+            return None
+
+        async def claim(self, _request):
+            if failure_stage == "claim":
+                raise RuntimeError("receipt backend unavailable")
+            raise AssertionError("claim must not run after load failure")
+
+        async def persist(self, *_args, **_kwargs):
+            raise AssertionError("preflight refusal must not be persisted")
+
+    authority = _authority(list, receipt_store=FailingReceiptStore())
+
+    outcomes = await authority.stop(
+        StopRequest(StopScope.HOST, "did:test:operator")
+    )
+
+    assert len(outcomes) == 1
+    assert outcomes[0].resolved_target == StopScope.HOST.value
+    assert outcomes[0].agent_id == StopScope.HOST.value
+    assert outcomes[0].disposition is StopDisposition.REFUSED
+    assert outcomes[0].receipt_id is None
+    assert outcomes[0].detail == (
+        "Stop receipt storage is unavailable; cancellation not attempted"
+    )
+
+
+@pytest.mark.asyncio
 async def test_inventory_rejects_duplicate_agent_identities() -> None:
     stop = AsyncMock(return_value=StopDisposition.STOPPED)
     authority = _authority(

@@ -2300,8 +2300,17 @@ class OrchestratorEngineMixin:
         prevents another tool or provider round-trip.
         """
 
+        capture_reentry = getattr(self, "_capture_transition_reentry_token", None)
+        transition_reentry_token = (
+            capture_reentry() if callable(capture_reentry) else None
+        )
+
+        async def run_owned_batch():
+            with bind_transition_lock_reentry(transition_reentry_token):
+                return await self._execute_tool_batch(*args, **kwargs)
+
         owner = asyncio.create_task(
-            self._execute_tool_batch(*args, **kwargs),
+            run_owned_batch(),
             name="orchestrator-tool-batch",
         )
         outcome = await await_owned_task(owner)

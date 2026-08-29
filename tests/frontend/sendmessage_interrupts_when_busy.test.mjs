@@ -451,6 +451,51 @@ test('receipt persistence failure retries with a fresh reconciliation operation'
 });
 
 
+test('ownerless durable claim retries with a fresh reconciliation operation', async () => {
+    const agent = 'agent-stop-ownerless-claim';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'ownerless-claim-turn';
+    const correlationIds = [];
+    let stopAttempts = 0;
+    apiModule.default.stop = async (_requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        correlationIds.push(correlationId);
+        if (stopAttempts === 1) {
+            const error = new Error('ownerless durable claim');
+            error.body = {
+                error: {
+                    code: 'stop_not_confirmed',
+                    details: [{
+                        disposition: 'refused',
+                        receipt_id: null,
+                        detail: 'An exact Stop operation is already in progress',
+                    }],
+                },
+            };
+            throw error;
+        }
+        return confirmedStopResponse();
+    };
+
+    assert.equal(await chatModule.stopAgent(agent), false);
+    assert.equal(state.unconfirmedStopAgents.has(agent), true);
+    assert.equal(await chatModule.stopAgent(agent), true);
+
+    assert.equal(correlationIds.length, 2);
+    assert.notEqual(
+        correlationIds[1],
+        correlationIds[0],
+        'a claim whose process owner vanished cannot wedge exact retries forever',
+    );
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+});
+
+
 test('queue mode preserves composer input behind an unconfirmed Stop', async () => {
     const agent = 'agent-queue-stop-failed';
     const pane = getOrCreateChatPane(agent);
