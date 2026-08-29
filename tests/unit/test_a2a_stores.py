@@ -211,7 +211,11 @@ class TestTaskStore:
         )
 
         new_status = TaskStatus(state=TaskState.WORKING)
-        await store.update_status("task-002", new_status)
+        await store.update_status(
+            "task-002",
+            new_status,
+            recipient_agent_id="did:test:recipient",
+        )
 
         retrieved = await store.get("task-002")
         assert retrieved.status.state == TaskState.WORKING
@@ -239,7 +243,11 @@ class TestTaskStore:
             description="Output file",
             parts=[TextPart(text="Result content")],
         )
-        await store.add_artifact("task-003", artifact)
+        await store.add_artifact(
+            "task-003",
+            artifact,
+            recipient_agent_id="did:test:recipient",
+        )
 
         retrieved = await store.get("task-003")
         assert retrieved.artifacts is not None

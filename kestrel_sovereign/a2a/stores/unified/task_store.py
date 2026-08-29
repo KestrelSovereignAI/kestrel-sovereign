@@ -30,6 +30,10 @@ class TaskAlreadyExistsError(ValueError):
     """A caller attempted to create a second task under an occupied ID."""
 
 
+class TaskMutationAuthorizationError(PermissionError):
+    """A responder mutation did not match the durable task recipient."""
+
+
 @dataclass(frozen=True)
 class TaskCancellationSnapshot:
     """Minimal durable state needed by live cancellation monitors."""
@@ -187,11 +191,11 @@ class TaskStore(UnifiedStoreBase):
         creator_agent_id: Optional[str] = None,
         recipient_agent_id: Optional[str] = None,
     ) -> bool:
-        """Create an authoritative task or persist a lifecycle update.
+        """Create an authoritative task.
 
-        Supplying either authority argument denotes initial creation and is
-        insert-only. Lifecycle saves omit both arguments and may update the
-        existing payload without ever touching authority columns.
+        Lifecycle persistence is deliberately a separate recipient-owned seam;
+        accepting an unscoped update here would let a shared-store worker mutate
+        any task whose identifier it learns.
         """
         if creator_agent_id is not None or recipient_agent_id is not None:
             if creator_agent_id is None or recipient_agent_id is None:
@@ -202,6 +206,21 @@ class TaskStore(UnifiedStoreBase):
                 recipient_agent_id=recipient_agent_id,
             )
             return True
+
+        raise ValueError(
+            "Task lifecycle saves require save_recipient_lifecycle"
+        )
+
+    async def save_recipient_lifecycle(
+        self,
+        task: Task,
+        *,
+        recipient_agent_id: str,
+    ) -> bool:
+        """Persist a worker result only for its durable task recipient."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task lifecycle recipient must be a concrete identity")
 
         if task.status.state is TaskState.CANCELED:
             raise ValueError(
@@ -224,7 +243,9 @@ class TaskStore(UnifiedStoreBase):
                 history = ?,
                 metadata = ?,
                 updated_at = {self.now_sql()}
-            WHERE id = ? AND status <> 'canceled'
+            WHERE id = ?
+              AND recipient_agent_id = ?
+              AND status <> 'canceled'
             """,
             (
                 task.status.state.value,
@@ -233,6 +254,7 @@ class TaskStore(UnifiedStoreBase):
                 history_json,
                 metadata_json,
                 task.id,
+                recipient_agent_id,
             ),
         )
         return rows_affected == 1
@@ -302,6 +324,23 @@ class TaskStore(UnifiedStoreBase):
             return None
         return self._row_to_task(row)
 
+    async def get_for_recipient(
+        self,
+        task_id: str,
+        recipient_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a task only through its durable responder principal."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task recipient lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? AND recipient_agent_id = ?",
+            (task_id, recipient_agent_id),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
     async def get_cancellation_snapshot(
         self,
         task_id: str,
@@ -343,8 +382,16 @@ class TaskStore(UnifiedStoreBase):
         )
         return [self._row_to_task(row) for row in rows]
 
-    async def update_status(self, task_id: str, status: TaskStatus) -> bool:
-        """Update a live task status without overwriting cancellation."""
+    async def update_status(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        recipient_agent_id: str,
+    ) -> bool:
+        """Update a live task only when the durable recipient matches."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task status recipient must be a concrete identity")
         if status.state is TaskState.CANCELED:
             raise ValueError(
                 "CANCELED is an authorized transition; use cancel_if_authorized"
@@ -354,9 +401,11 @@ class TaskStore(UnifiedStoreBase):
             f"""
             UPDATE a2a_tasks
             SET status = ?, message = ?, updated_at = {self.now_sql()}
-            WHERE id = ? AND status <> 'canceled'
+            WHERE id = ?
+              AND recipient_agent_id = ?
+              AND status <> 'canceled'
             """,
-            (status.state.value, message_json, task_id),
+            (status.state.value, message_json, task_id, recipient_agent_id),
         )
         return rows_affected == 1
 
@@ -557,7 +606,13 @@ class TaskStore(UnifiedStoreBase):
             return None
         return await self.get(task_id)
 
-    async def add_artifact(self, task_id: str, artifact: Artifact) -> None:
+    async def add_artifact(
+        self,
+        task_id: str,
+        artifact: Artifact,
+        *,
+        recipient_agent_id: str,
+    ) -> None:
         """Append an artifact without crossing a terminal-state transition.
 
         Cancellation may merge a handler's partial payload into this same JSON
@@ -567,23 +622,27 @@ class TaskStore(UnifiedStoreBase):
         sees an already-appended artifact, or the later append is refused.
         """
 
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task artifact recipient must be a concrete identity")
+
         transaction = (
             self._backend.transaction(immediate=True)
             if self.is_sqlite
             else self._backend.transaction()
         )
+        unauthorized = False
         terminal_status: Optional[str] = None
         update_conflict = False
         async with transaction:
             lock_suffix = " FOR UPDATE" if self.is_postgres else ""
             row = await self._backend.fetch_one(
                 "SELECT artifacts, status FROM a2a_tasks "
-                f"WHERE id = ?{lock_suffix}",
-                (task_id,),
+                f"WHERE id = ? AND recipient_agent_id = ?{lock_suffix}",
+                (task_id, recipient_agent_id),
             )
             if not row:
-                raise ValueError(f"Task not found: {task_id}")
-            if row[1] not in {
+                unauthorized = True
+            elif row[1] not in {
                 TaskState.SUBMITTED.value,
                 TaskState.WORKING.value,
                 TaskState.INPUT_REQUIRED.value,
@@ -602,11 +661,16 @@ class TaskStore(UnifiedStoreBase):
                     UPDATE a2a_tasks
                     SET artifacts = ?, updated_at = {self.now_sql()}
                     WHERE id = ?
+                      AND recipient_agent_id = ?
                       AND status IN ('submitted', 'working', 'input-required')
                     """,
-                    (json_dumps(artifacts), task_id),
+                    (json_dumps(artifacts), task_id, recipient_agent_id),
                 )
                 update_conflict = rows_affected != 1
+        if unauthorized:
+            raise TaskMutationAuthorizationError(
+                f"Task mutation was not authorized or task was not found: {task_id}"
+            )
         if terminal_status is not None:
             raise ValueError(
                 f"Cannot add artifact to terminal task {task_id}: {terminal_status}"

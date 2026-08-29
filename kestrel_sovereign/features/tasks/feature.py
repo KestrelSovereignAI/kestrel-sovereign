@@ -1109,12 +1109,14 @@ class TaskFeature(Feature):
                     task_id=task_id,
                     new_state=TaskState.WORKING,
                     agent_name=agent_name,
+                    recipient_agent_id=agent_name,
                 )
                 updated = await self.task_manager.update_status(
                     task_id=task_id,
                     new_state=terminal,
                     message=response_message,
                     agent_name=agent_name,
+                    recipient_agent_id=agent_name,
                 )
             else:
                 updated = await self.task_manager.update_status(
@@ -1122,6 +1124,7 @@ class TaskFeature(Feature):
                     new_state=terminal,
                     message=response_message,
                     agent_name=agent_name,
+                    recipient_agent_id=agent_name,
                 )
         except ValueError as e:
             # Transition validator caught an illegal sequence (rare —
@@ -1233,6 +1236,7 @@ class TaskFeature(Feature):
                 task_id=task_id,
                 artifact=artifact,
                 agent_name=agent_name,
+                recipient_agent_id=agent_name,
             )
         except ValueError as e:
             return ToolResult.failed(

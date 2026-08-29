@@ -203,6 +203,7 @@ async def test_artifact_append_cannot_mutate_an_authoritatively_canceled_task(tm
             await manager.add_artifact(
                 "artifact-after-cancel",
                 Artifact(name="late", parts=[TextPart(text="must not land")]),
+                recipient_agent_id="did:test:recipient",
             )
 
         canceled = await manager.get_task("artifact-after-cancel")
@@ -491,6 +492,7 @@ async def test_post_registration_gate_does_not_cancel_working_dispatch(tmp_path)
             created.id,
             TaskState.WORKING,
             agent_name=recipient.did,
+            recipient_agent_id=recipient.did,
         )
 
         recipient._on_task_submitted(created)
@@ -1028,7 +1030,10 @@ async def test_lifecycle_save_strips_forged_cancellation_receipt(tmp_path):
             "status_before": "working",
         }
 
-        assert await manager.task_store.save(task) is True
+        assert await manager.task_store.save_recipient_lifecycle(
+            task,
+            recipient_agent_id="did:test:recipient",
+        ) is True
 
         persisted = await manager.get_task("forged-save-receipt")
         assert persisted.metadata == {"payload": "retained"}
@@ -1084,11 +1089,13 @@ async def test_cancel_task_terminal_state_is_unchanged(tmp_path):
             task.id,
             TaskState.WORKING,
             agent_name="did:test:recipient",
+            recipient_agent_id="did:test:recipient",
         )
         await manager.update_status(
             task.id,
             TaskState.COMPLETED,
             agent_name="did:test:recipient",
+            recipient_agent_id="did:test:recipient",
         )
 
         result = await _feature(manager, "did:test:creator").cancel_task("finished")
@@ -1300,7 +1307,10 @@ async def test_stale_worker_save_cannot_overwrite_authorized_cancellation(tmp_pa
         )
 
         stale_worker_copy.status = TaskStatus(state=TaskState.COMPLETED)
-        await manager.task_store.save(stale_worker_copy)
+        await manager.task_store.save_recipient_lifecycle(
+            stale_worker_copy,
+            recipient_agent_id="did:test:recipient",
+        )
 
         persisted = await manager.get_task("stale-worker")
         assert persisted.status.state is TaskState.CANCELED
@@ -1313,14 +1323,14 @@ async def test_stale_worker_save_cannot_overwrite_authorized_cancellation(tmp_pa
 async def test_lifecycle_save_without_authority_cannot_create_task(tmp_path):
     manager = await create_task_manager(str(tmp_path / "update-only.db"))
     try:
-        inserted = await manager.task_store.save(
-            Task(
-                id="authority-less",
-                status=TaskStatus(state=TaskState.SUBMITTED),
+        with pytest.raises(ValueError, match="save_recipient_lifecycle"):
+            await manager.task_store.save(
+                Task(
+                    id="authority-less",
+                    status=TaskStatus(state=TaskState.SUBMITTED),
+                )
             )
-        )
 
-        assert inserted is False
         assert await manager.get_task("authority-less") is None
     finally:
         await manager.close()
@@ -1339,14 +1349,23 @@ async def test_generic_status_and_store_writes_cannot_cancel_task(tmp_path):
         with pytest.raises(
             TaskCancellationAuthorizationError, match="use cancel_task"
         ):
-            await manager.update_status(task.id, TaskState.CANCELED)
+            await manager.update_status(
+                task.id,
+                TaskState.CANCELED,
+                recipient_agent_id="did:test:recipient",
+            )
 
         task.status = TaskStatus(state=TaskState.CANCELED)
         with pytest.raises(ValueError, match="cancel_if_authorized"):
-            await manager.task_store.save(task)
+            await manager.task_store.save_recipient_lifecycle(
+                task,
+                recipient_agent_id="did:test:recipient",
+            )
         with pytest.raises(ValueError, match="cancel_if_authorized"):
             await manager.task_store.update_status(
-                task.id, TaskStatus(state=TaskState.CANCELED)
+                task.id,
+                TaskStatus(state=TaskState.CANCELED),
+                recipient_agent_id="did:test:recipient",
             )
 
         assert (await manager.get_task(task.id)).status.state is TaskState.SUBMITTED
@@ -1637,7 +1656,10 @@ async def test_handler_cancellation_merges_concurrently_committed_payload(tmp_pa
         concurrent.history.append(
             Message(role="agent", parts=[TextPart(text="concurrent history")])
         )
-        assert await manager.task_store.save(concurrent) is True
+        assert await manager.task_store.save_recipient_lifecycle(
+            concurrent,
+            recipient_agent_id=host_did,
+        ) is True
 
         release.set()
         result = await execution
@@ -1787,7 +1809,10 @@ async def test_async_canceling_handler_preserves_concurrent_completed_winner(tmp
                 parts=[TextPart(text="concurrent completion")],
             ),
         )
-        assert await manager.task_store.save(winning) is True
+        assert await manager.task_store.save_recipient_lifecycle(
+            winning,
+            recipient_agent_id=host_did,
+        ) is True
 
         release.set()
         await manager.drain_execution_tasks()
