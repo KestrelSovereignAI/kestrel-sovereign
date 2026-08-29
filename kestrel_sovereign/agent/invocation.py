@@ -8,10 +8,11 @@ operation identity with the task that is actually executing the turn.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from functools import wraps
 import hashlib
 import inspect
@@ -53,6 +54,10 @@ _current_invocation_provenance: ContextVar[InvocationProvenance | None] = Contex
 )
 
 _T = TypeVar("_T")
+
+
+class InvocationCancelledError(Exception):
+    """An isolated turn ended without cancelling its long-lived caller."""
 
 
 def validate_invocation_id(value: object) -> str:
@@ -253,8 +258,16 @@ def invocation_scope(
 
 def bind_async_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., Awaitable[_T]]], Callable[..., Awaitable[_T]]]:
-    """Bind/generate ``parameter`` for an async top-level turn method."""
+    """Bind/generate ``parameter`` for an async top-level turn method.
+
+    ``track_request_lifecycle`` makes the decorated method the canonical
+    inventory boundary for every transport that calls it. This avoids a Stop
+    implementation that works only for endpoints which remembered to install
+    their own lifecycle wrapper.
+    """
     def decorate(function: Callable[..., Awaitable[_T]]) -> Callable[..., Awaitable[_T]]:
         signature = inspect.signature(function)
 
@@ -266,7 +279,137 @@ def bind_async_invocation(
                 provenance=bound.arguments.get("invocation_provenance"),
             ) as invocation_id:
                 bound.arguments[parameter] = invocation_id
-                return await function(*bound.args, **bound.kwargs)
+                lifecycle_owner = args[0] if args else None
+                registered = False
+                cleanup_abandoned = False
+                if track_request_lifecycle and lifecycle_owner is not None:
+                    register = getattr(
+                        type(lifecycle_owner),
+                        "register_active_request",
+                        None,
+                    )
+                    if callable(register):
+                        register(lifecycle_owner, invocation_id)
+                        registered = True
+                try:
+                    if registered:
+                        bind_operation = getattr(
+                            type(lifecycle_owner),
+                            "bind_request_operation",
+                            None,
+                        )
+                        parent_context = copy_context()
+                        operation_context = parent_context.copy()
+                        operation = asyncio.create_task(
+                            function(*bound.args, **bound.kwargs),
+                            name=(
+                                "invocation-turn:"
+                                f"{invocation_log_correlation(invocation_id)}"
+                            ),
+                            context=operation_context,
+                        )
+                        if callable(bind_operation):
+                            bind_operation(
+                                lifecycle_owner,
+                                invocation_id,
+                                operation,
+                            )
+                        try:
+                            result = await operation
+                            # ``Task.cancel()`` is a no-op once the isolated
+                            # child has produced a result.  Stop can linearize
+                            # in the narrow window between that completion and
+                            # this owner resuming, so re-read the exact active
+                            # generation before publishing normal output.  No
+                            # await follows this check: another request cannot
+                            # interleave between the verdict and return.
+                            is_cancelled = getattr(
+                                type(lifecycle_owner),
+                                "is_request_cancelled",
+                                None,
+                            )
+                            if callable(is_cancelled) and is_cancelled(
+                                lifecycle_owner, invocation_id
+                            ):
+                                raise InvocationCancelledError(
+                                    "isolated invocation was stopped after "
+                                    "operation completion "
+                                    f"({invocation_log_correlation(invocation_id)})"
+                                )
+                            return result
+                        except asyncio.CancelledError as error:
+                            caller = asyncio.current_task()
+                            if caller is not None and caller.cancelling():
+                                raise
+                            raise InvocationCancelledError(
+                                "isolated invocation was cancelled "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            ) from error
+                        finally:
+                            # A normal ``await function(...)`` shares ContextVar
+                            # updates with its caller. Isolating the cancellable
+                            # task must preserve that contract (notably the
+                            # constitution-injection audit read immediately
+                            # after process_input returns).
+                            missing = object()
+                            for variable in operation_context:
+                                child_value = operation_context.get(
+                                    variable, missing
+                                )
+                                parent_value = parent_context.get(
+                                    variable, missing
+                                )
+                                if (
+                                    child_value is not missing
+                                    and child_value != parent_value
+                                ):
+                                    variable.set(child_value)
+                    return await function(*bound.args, **bound.kwargs)
+                except InvocationCancelledError:
+                    # The isolated child cooperatively unwound after Stop. Its
+                    # cancellation is a successful lifecycle completion, not a
+                    # cleanup failure.
+                    raise
+                except BaseException:
+                    if registered:
+                        request_cancelled = getattr(
+                            type(lifecycle_owner),
+                            "is_request_cancelled",
+                            None,
+                        )
+                        try:
+                            cleanup_abandoned = bool(
+                                callable(request_cancelled)
+                                and request_cancelled(
+                                    lifecycle_owner, invocation_id
+                                )
+                            )
+                        except Exception:
+                            # Never hide the turn's original failure. A broken
+                            # cancellation predicate is conservatively treated
+                            # as failed cleanup.
+                            cleanup_abandoned = True
+                    raise
+                finally:
+                    if registered:
+                        if cleanup_abandoned:
+                            # Imported lazily to avoid the module cycle:
+                            # request_lifecycle imports the correlation helper
+                            # from this module during class definition.
+                            from .request_lifecycle import (
+                                RequestCompletionDisposition,
+                            )
+
+                            lifecycle_owner._cleanup_cancelled_request(
+                                invocation_id,
+                                disposition=(
+                                    RequestCompletionDisposition.ABANDONED
+                                ),
+                            )
+                        else:
+                            lifecycle_owner._cleanup_cancelled_request(
+                                invocation_id
+                            )
 
         return wrapped
 

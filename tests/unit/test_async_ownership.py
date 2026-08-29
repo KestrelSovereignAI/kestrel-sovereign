@@ -152,6 +152,32 @@ async def test_closing_owned_iterator_interrupts_blocked_source():
 
 
 @pytest.mark.asyncio
+async def test_natural_unwind_failure_is_cleanup_when_stop_was_requested():
+    """A Stop between the final item and terminal anext preserves cleanup failure."""
+
+    stop_requested = False
+
+    async def source():
+        try:
+            yield "last item"
+        finally:
+            raise RuntimeError("natural unwind cleanup failed")
+
+    owned = OwnedAsyncIterator(
+        source,
+        operation="naturally unwound source",
+        cleanup_requested=lambda: stop_requested,
+    )
+    assert await anext(owned) == "last item"
+    stop_requested = True
+
+    with pytest.raises(RuntimeError, match="natural unwind cleanup failed"):
+        await anext(owned)
+
+    assert isinstance(owned.cleanup_error, RuntimeError)
+
+
+@pytest.mark.asyncio
 async def test_blocking_operation_finishes_before_cancellation_propagates():
     started = threading.Event()
     release = threading.Event()

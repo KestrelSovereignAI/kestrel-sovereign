@@ -191,6 +191,35 @@ def test_chat_completions_forwards_body_retry_id_and_authenticated_provenance():
         _restore_app(app, original)
 
 
+def test_chat_completions_reports_cooperative_stop_as_conflict():
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+
+    agent = MagicMock()
+    agent.process_input = AsyncMock(
+        side_effect=InvocationCancelledError("isolated turn stopped")
+    )
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "id": "openai-stopped-turn-☃",
+                        "messages": [{"role": "user", "content": "stop this"}],
+                    },
+                )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Request stopped during execution."
+        assert response.headers["X-Request-ID"] == (
+            "openai-stopped-turn-%E2%98%83"
+        )
+    finally:
+        _restore_app(app, original)
+
+
 def test_chat_completions_encodes_unicode_retry_id_for_response_header():
     """A valid UTF-8 body retry ID must not fail after the agent turn runs."""
     llm_service = MagicMock()

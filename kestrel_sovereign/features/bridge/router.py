@@ -23,6 +23,7 @@ Usage:
 """
 
 import asyncio
+from functools import lru_cache
 import json
 import logging
 import time
@@ -35,8 +36,12 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     get_caller,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    stopped_invocation_http_error,
 )
-from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    invocation_id_response_header,
+)
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
 )
@@ -71,12 +76,16 @@ def _get_bridge_feature(request: Request):
     return agent, bridge
 
 
+@lru_cache(maxsize=1)
 def get_router() -> APIRouter:
     """
-    Build and return the bridge APIRouter.
+    Build and return the process-local bridge APIRouter.
 
-    This factory function creates the router with all bridge endpoints.
-    Call it once and include the result in the FastAPI app.
+    SlowAPI indexes decorated routes by ``module.function``. Rebuilding this
+    router re-registers identical limits under those keys, multiplying the
+    cost of every request until legitimate traffic receives a false 429. The
+    handlers are request-scoped and hold no agent state, so one cached router
+    is the correct lifecycle and remains safe for multi-agent mounting.
     """
     router = APIRouter(prefix="/api/bridge", tags=["bridge"])
 
@@ -137,6 +146,8 @@ def get_router() -> APIRouter:
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             )
+        except InvocationCancelledError as error:
+            raise stopped_invocation_http_error(request_id) from error
         except Exception:
             # Exception text and tracebacks can contain bridge message/context
             # content.  The client receives only the fixed HTTP detail below;
@@ -224,6 +235,19 @@ def get_router() -> APIRouter:
                 else:
                     agent._current_request_id = request_id
                 request_lifecycle_registered = True
+                request_cancelled = getattr(agent, "is_request_cancelled", None)
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    stopped_data = json.dumps(
+                        {
+                            "type": "stopped",
+                            "request_id": request_id,
+                        }
+                    )
+                    yield f"data: {stopped_data}\n\n"
+                    return
                 # Wave 5E: bridge consumers (Slack/Discord/email/etc.)
                 # don't speak the chat-protocol revise sentinel —
                 # strip it before serializing each chunk into the
@@ -239,6 +263,9 @@ def get_router() -> APIRouter:
                         invocation_provenance=invocation_provenance,
                     ),
                     operation="bridge agent stream cleanup",
+                    cleanup_requested=lambda: agent.is_request_cancelled(
+                        request_id
+                    ),
                 )
                 async for chunk in agent_stream:
                     chunk = strip_revise_sentinels(chunk)

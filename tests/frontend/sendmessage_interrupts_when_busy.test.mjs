@@ -217,8 +217,10 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
     // New stream: capture that we got there, then end cleanly so
     // sendMessage's await resolves.
     const ctrl = controlledStream();
+    let dispatchedRequestId = null;
     apiModule.default.streamInvoke = (...args) => {
         eventLog.push('streamInvoke');
+        dispatchedRequestId = args[7];
         return ctrl.iter;
     };
     apiModule.default.invoke = async () => ({ response: '' });
@@ -249,6 +251,9 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
         'POST /api/agent/stop must resolve BEFORE the new streamInvoke opens');
     assert.ok(abortIdx <= stopIdx,
         'client-side abort must precede or coincide with the stop POST');
+    assert.equal(typeof dispatchedRequestId, 'string');
+    assert.ok(dispatchedRequestId.length > 0,
+        'chat must allocate the next turn address before opening its stream');
 });
 
 
@@ -260,10 +265,13 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
 
     state.waitingAgents.add(agent);
     apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
-    apiModule.default.getCurrentStreamRequestId = () => 'prior-request';
+    let currentRequestId = 'prior-request';
+    apiModule.default.getCurrentStreamRequestId = () => currentRequestId;
     let stopAttempts = 0;
-    apiModule.default.stop = async () => {
+    const stoppedRequestIds = [];
+    apiModule.default.stop = async (requestId) => {
         stopAttempts += 1;
+        stoppedRequestIds.push(requestId);
         throw new Error('stop_not_confirmed');
     };
     let replacementStarted = false;
@@ -286,14 +294,18 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
     // busy marker, then retry Send. The unconfirmed-Stop latch must still
     // route this through Stop and refuse to open a replacement stream.
     state.waitingAgents.delete(agent);
+    currentRequestId = null;
     messageInput.value = 'still do not overlap';
     await sendMessage();
     assert.equal(stopAttempts, 2,
         'a retry while Stop is unconfirmed must retry Stop first');
     assert.equal(replacementStarted, false,
         'clearing waitingAgents must not bypass the unconfirmed-Stop latch');
+    assert.deepEqual(stoppedRequestIds, ['prior-request', 'prior-request'],
+        'a failed Stop retry must retain the original turn ID');
 
     state.unconfirmedStopAgents.delete(agent);
+    state.unconfirmedStopRequestIds.delete(agent);
 });
 
 

@@ -85,7 +85,10 @@ from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin,
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
-from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
+)
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.signals import OrderedLockManager
@@ -1388,6 +1391,9 @@ class KestrelAgent(
         self._active_request_generations: dict[str, int] = {}
         self._next_request_generation = 0
         self._abandoned_request_generations: dict[str, set[int]] = {}
+        self._abandoned_request_dispositions: dict[
+            tuple[str, int], RequestCompletionDisposition
+        ] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
@@ -1396,6 +1402,10 @@ class KestrelAgent(
         self._turn_request_ids: dict[str, str] = {}
         self._cancelled_requests: set = set()
         self._cancelled_request_generations: set[tuple[str, int]] = set()
+        # An exact Stop can race ahead of the matching HTTP request's lifecycle
+        # registration. The short-lived entry is consumed by that first
+        # generation so an acknowledged Stop cannot be followed by late work.
+        self._pending_request_cancellations: dict[str, float] = {}
         # Stop is acknowledged only after endpoint cleanup has observed the
         # request leave execution. RequestLifecycleMixin owns these waiters.
         self._request_completion_events: dict[
@@ -5393,7 +5403,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    @bind_async_invocation("invocation_id")
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,

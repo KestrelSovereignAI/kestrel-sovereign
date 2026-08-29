@@ -107,6 +107,14 @@ function unconfirmedStopAgents() {
     return currentState.unconfirmedStopAgents;
 }
 
+function unconfirmedStopRequestIds() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopRequestIds instanceof Map)) {
+        currentState.unconfirmedStopRequestIds = new Map();
+    }
+    return currentState.unconfirmedStopRequestIds;
+}
+
 function isAgentBusy(agentName) {
     return deps().state.waitingAgents.has(agentName)
         || unconfirmedStopAgents().has(agentName);
@@ -2616,7 +2624,12 @@ export async function stopAgent(agentName) {
         try { abortController.abort(); } catch (_) { /* noop */ }
     }
 
-    const requestId = deps().api.getCurrentStreamRequestId(agentName);
+    const retainedRequestIds = unconfirmedStopRequestIds();
+    let requestId = retainedRequestIds.get(agentName) || null;
+    if (!requestId) {
+        requestId = deps().api.getCurrentStreamRequestId(agentName);
+        if (requestId) retainedRequestIds.set(agentName, requestId);
+    }
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
@@ -2643,12 +2656,24 @@ export async function stopAgent(agentName) {
     }
 
     unconfirmedStopAgents().delete(agentName);
+    retainedRequestIds.delete(agentName);
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === deps().api.getHostAgent()) {
         updateThinkingIndicator();
     }
     return true;
+}
+
+function newChatRequestId() {
+    const randomUuid = globalThis.crypto?.randomUUID;
+    if (typeof randomUuid === 'function') {
+        return randomUuid.call(globalThis.crypto);
+    }
+    // Cancellation identity is uniqueness, not a secret. The timestamp and
+    // two independent random components keep legacy browsers turn-addressable
+    // without introducing a dependency on response headers.
+    return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
 // ============================================================================
@@ -2908,6 +2933,9 @@ export async function sendMessage(overrideText, overrideAgent) {
     };
 
     let wasAborted = false;
+    // Allocate one exact turn address for streaming, fallback, and explicitly
+    // non-streaming delivery. The API publishes it before either fetch awaits.
+    const clientRequestId = newChatRequestId();
 
     try {
         if (deps().state.useStreaming) {
@@ -2957,7 +2985,16 @@ export async function sendMessage(overrideText, overrideAgent) {
                 // no visible char after it; consumed when the next
                 // packet's leading visible text is welded onto fullContent.
                 let pendingReviseBoundary = false;
-                for await (const rawChunk of deps().api.streamInvoke(text, null, sessionId, null, false, dispatchAgent, turnAttachments)) {
+                for await (const rawChunk of deps().api.streamInvoke(
+                    text,
+                    null,
+                    sessionId,
+                    null,
+                    false,
+                    dispatchAgent,
+                    turnAttachments,
+                    clientRequestId,
+                )) {
                     const merged = sentinelBuffer + rawChunk;
                     sentinelBuffer = '';
                     let processable = merged;
@@ -3268,7 +3305,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // unprefixed invoke() routes via the currently
                     // selected agent and would land on the wrong
                     // backend if the user has switched.
-                    const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+                    const response = await deps().api.invokeForAgent(
+                        text, null, sessionId, null, dispatchAgent, clientRequestId,
+                    );
                     if (response && response.session_id && !pane.sessionId) {
                         pane.sessionId = response.session_id;
                     }
@@ -3286,7 +3325,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                 }
             }
         } else {
-            const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+            const response = await deps().api.invokeForAgent(
+                text, null, sessionId, null, dispatchAgent, clientRequestId,
+            );
             if (response && response.session_id && !pane.sessionId) {
                 pane.sessionId = response.session_id;
             }

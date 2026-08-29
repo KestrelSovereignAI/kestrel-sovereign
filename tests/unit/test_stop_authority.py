@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import inspect
+import time
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -672,10 +673,73 @@ def test_stop_endpoint_rejects_request_and_turn_id_together() -> None:
     assert "either request_id or turn_id" in response.json()["detail"]
 
 
+def test_stop_before_registration_fences_the_late_request_generation() -> None:
+    """An empty Stop snapshot must still prevent its in-transit turn starting."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+
+    class LiveAgent(RequestLifecycleMixin):
+        agent_id = "did:test:registration-race"
+
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    agent = LiveAgent()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": "in-transit-turn"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stop_outcomes"][0]["disposition"] == (
+        "already_complete"
+    )
+    assert "in-transit-turn" in agent._pending_request_cancellations
+
+    generation = agent.register_active_request("in-transit-turn")
+
+    assert agent.is_request_cancelled("in-transit-turn") is True
+    assert ("in-transit-turn", generation) in agent._cancelled_request_generations
+    assert "in-transit-turn" in agent._pending_request_cancellations
+
+
+def test_expired_pre_registration_stop_does_not_poison_a_future_reuse() -> None:
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    class LiveAgent(RequestLifecycleMixin):
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+
+    agent = LiveAgent()
+    agent.reserve_request_cancellation("eventual-reuse")
+    agent._pending_request_cancellations["eventual-reuse"] -= 31
+
+    agent.register_active_request("eventual-reuse")
+
+    assert agent.is_request_cancelled("eventual-reuse") is False
+
+
 @pytest.mark.asyncio
 async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     """The endpoint must not confuse a cancel marker with completed execution."""
-    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
     from kestrel_sovereign.endpoints.agent import router
 
     cancel_seen = asyncio.Event()
@@ -719,6 +783,36 @@ async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
 
     assert response.status_code == 200
     assert response.json()["stop_outcomes"][0]["disposition"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_legacy_current_only_stop_waits_for_real_cleanup() -> None:
+    """A synthesized generation remains live until its legacy owner exits."""
+
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
+
+    class LegacyAgent(RequestLifecycleMixin):
+        def __init__(self) -> None:
+            self._current_request_id = "legacy-current"
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    agent = LegacyAgent()
+    assert agent.cancel_current_request("legacy-current")
+    waiter = asyncio.create_task(
+        agent.wait_for_request_completion("legacy-current")
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(waiter), timeout=0.05)
+
+    agent._cleanup_cancelled_request("legacy-current")
+    assert await asyncio.wait_for(waiter, timeout=1) is RequestCompletionDisposition.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -807,6 +901,38 @@ def test_agent_wide_stop_includes_pruned_unconfirmed_turns() -> None:
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
     assert "pruned-turn" in agent._cancelled_requests
+
+
+@pytest.mark.asyncio
+async def test_pruned_legacy_generation_is_reaped_by_eventual_cleanup() -> None:
+    """A generation synthesized during prune retains its cleanup owner."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    class LegacyAgent(RequestLifecycleMixin):
+        def __init__(self) -> None:
+            self._current_request_id = "legacy-pruned"
+            self._active_request_ids = {"legacy-pruned"}
+            self._active_request_counts = {"legacy-pruned": 1}
+            self._active_request_started_at = {
+                "legacy-pruned": time.monotonic() - 1000
+            }
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    agent = LegacyAgent()
+    assert agent.cancel_current_request("legacy-pruned")
+    generation = agent._active_request_generations["legacy-pruned"]
+    assert agent.prune_stale_active_requests(900) == ["legacy-pruned"]
+    assert ("legacy-pruned", generation) in agent._abandoned_request_counts
+
+    agent._cleanup_cancelled_request("legacy-pruned")
+
+    assert ("legacy-pruned", generation) not in agent._abandoned_request_counts
+    assert generation not in agent._abandoned_request_generations.get(
+        "legacy-pruned", set()
+    )
+    assert "legacy-pruned" not in agent._cancelled_requests
 
 
 def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:

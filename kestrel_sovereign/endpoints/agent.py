@@ -27,6 +27,8 @@ from kestrel_sovereign.endpoints.agent_helpers import (
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    invocation_log_correlation,
     invocation_id_response_header,
     new_stream_delivery_id,
     validate_invocation_id,
@@ -404,6 +406,21 @@ async def invoke_agent(request: Request, http_response: Response):
         else:
             agent._current_request_id = request_id
 
+        request_cancelled = getattr(agent, "is_request_cancelled", None)
+        if callable(request_cancelled) and request_cancelled(request_id) is True:
+            try:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped before execution.",
+                    "session_id": session_id,
+                    "model": None,
+                    "provider": None,
+                }
+            finally:
+                agent._cleanup_cancelled_request(request_id)
+
         if isinstance(kite_evidence_request, dict):
             if user_input not in (None, ""):
                 raise _kite_evidence_error("Kite evidence requests cannot include input.")
@@ -455,6 +472,28 @@ async def invoke_agent(request: Request, http_response: Response):
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             )
+            if callable(request_cancelled) and request_cancelled(request_id) is True:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": effective_session_id,
+                    "model": None,
+                    "provider": None,
+                }
+        except (asyncio.CancelledError, InvocationCancelledError):
+            if callable(request_cancelled) and request_cancelled(request_id) is True:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": effective_session_id,
+                    "model": None,
+                    "provider": None,
+                }
+            raise
         finally:
             agent._cleanup_cancelled_request(request_id)
         # Extract model/provider identity for frontend footer rendering (#1373)
@@ -706,6 +745,10 @@ async def stream_agent_response(request: Request):
             response_chunk_yielded = False
             agent_stream = None
             try:
+                if agent.is_request_cancelled(request_id) is True:
+                    yield stop_notice
+                    stop_notice_emitted = True
+                    return
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
                 agent_stream = OwnedAsyncIterator(
                     lambda: agent.process_input_streaming(
@@ -719,6 +762,9 @@ async def stream_agent_response(request: Request):
                         attachments=attachments,
                     ),
                     operation="agent stream cleanup",
+                    cleanup_requested=lambda: agent.is_request_cancelled(
+                        request_id
+                    ),
                 )
                 async for chunk in agent_stream:
                     # Check if request was cancelled
@@ -942,6 +988,19 @@ async def stop_agent_request(request: Request):
                 )
                 if canceled:
                     cancelled_request_ids.append(stop_request.target)
+                else:
+                    # The matching invoke/stream may have been dispatched by
+                    # the client but not yet reached lifecycle registration.
+                    # Fence that exact ID briefly; registration consumes the
+                    # tombstone before cognition can begin.  Unknown IDs keep
+                    # the historical ALREADY_COMPLETE result.
+                    reserve = getattr(
+                        type(agent),
+                        "reserve_request_cancellation",
+                        None,
+                    )
+                    if callable(reserve):
+                        reserve(agent, stop_request.target)
             else:
                 canceled = False
                 for active_request_id in sorted(active_request_ids):
