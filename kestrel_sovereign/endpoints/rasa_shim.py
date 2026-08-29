@@ -137,6 +137,11 @@ async def rasa_webhook(
         agent = request.app.state.agent
         await prime_durable_stop_fence(request, agent, request_id)
         async with _agent_semaphore:
+            # Semaphore admission can wait beyond the short in-memory Stop
+            # reservation TTL. Re-read the durable exact-turn authority at the
+            # execution boundary so an acknowledged queued Stop cannot age out
+            # and then start work.
+            await prime_durable_stop_fence(request, agent, request_id)
             response_text = await agent.process_input(
                 user_input=enriched_input,
                 session_id=f"sms:{sender}",  # namespace prevents collision with UI sessions
