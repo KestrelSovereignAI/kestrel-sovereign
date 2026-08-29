@@ -585,13 +585,91 @@ def test_vertex_nonstream_normalizes_cached_prompt_usage(monkeypatch):
 
 
 def test_vertex_usage_without_cache_telemetry_stays_inclusive():
-    from kestrel_sovereign.llm.vertex_adapter import _normalized_vertex_usage
+    from kestrel_sovereign.llm.google_adapter import _normalized_google_genai_usage
 
-    assert _normalized_vertex_usage(SimpleNamespace(
+    assert _normalized_google_genai_usage(SimpleNamespace(
         prompt_token_count=5,
         candidates_token_count=3,
         total_token_count=8,
     )) == (5, 3, 8, None)
+
+
+def test_google_text_stream_emits_terminal_cache_usage():
+    from kestrel_sovereign.llm.google_adapter import GoogleAdapter
+
+    chunks = [
+        SimpleNamespace(text="hello ", usage_metadata=None),
+        SimpleNamespace(text="world", usage_metadata=None),
+        SimpleNamespace(
+            text="",
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=11,
+                candidates_token_count=4,
+                total_token_count=15,
+                cached_content_token_count=7,
+            ),
+        ),
+    ]
+
+    async def generate_content_stream(**kwargs):
+        return _FakeAsyncIter(chunks)
+
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content_stream=generate_content_stream,
+            )
+        )
+    )
+    adapter = GoogleAdapter()
+
+    items = _collect(adapter.get_streaming_response_with_tools(
+        client=fake_client,
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+        tools=None,
+    ))
+
+    assert "".join(i for i in items if isinstance(i, str)) == "hello world"
+    terminals = [i for i in items if isinstance(i, LLMResponse)]
+    assert len(terminals) == 1
+    assert terminals[0].input_tokens == 4
+    assert terminals[0].output_tokens == 4
+    assert terminals[0].total_tokens == 8
+    assert terminals[0].cache_read_input_tokens == 7
+
+    text_items = _collect(adapter.get_streaming_response(
+        client=fake_client,
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+    ))
+    assert all(isinstance(item, str) for item in text_items)
+    assert "".join(text_items) == "hello world"
+
+
+def test_google_tool_fallback_forwards_probe_cache_usage():
+    from kestrel_sovereign.llm.google_adapter import GoogleAdapter
+
+    adapter = GoogleAdapter()
+    adapter.get_response = AsyncMock(return_value=LLMResponse(
+        content="text after probe",
+        input_tokens=4,
+        output_tokens=4,
+        total_tokens=8,
+        cache_read_input_tokens=7,
+    ))
+
+    items = _collect(adapter.get_streaming_response_with_tools(
+        client=SimpleNamespace(),
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+        tools=[{"type": "function", "function": {"name": "x"}}],
+    ))
+
+    assert "text after probe" in [item for item in items if isinstance(item, str)]
+    terminals = [item for item in items if isinstance(item, LLMResponse)]
+    assert len(terminals) == 1
+    assert terminals[0].cache_read_input_tokens == 7
 
 
 def test_vertex_text_with_tools_path_emits_terminal_response(monkeypatch):
