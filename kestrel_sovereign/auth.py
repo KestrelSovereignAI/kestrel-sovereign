@@ -73,16 +73,27 @@ class CallerContext:
         return self.role == CallerRole.SOVEREIGN
 
 
-_current_caller_context: ContextVar[Optional[CallerContext]] = ContextVar(
+@dataclass
+class _CallerContextBinding:
+    """Revocable authority shared by every copied task context."""
+
+    caller: Optional[CallerContext]
+    active: bool = True
+
+
+_current_caller_context: ContextVar[Optional[_CallerContextBinding]] = ContextVar(
     "kestrel_current_caller_context",
     default=None,
 )
 
 
 def current_caller_context() -> Optional[CallerContext]:
-    """Return the authenticated caller bound to this exact invocation task."""
+    """Return the caller while its endpoint-owned scope remains active."""
 
-    return _current_caller_context.get()
+    binding = _current_caller_context.get()
+    if binding is None or not binding.active:
+        return None
+    return binding.caller
 
 
 @contextmanager
@@ -96,8 +107,13 @@ def caller_context_scope(caller: Optional[CallerContext]):
 
     if caller is not None and not isinstance(caller, CallerContext):
         raise TypeError("caller context must be endpoint-owned CallerContext")
-    token = _current_caller_context.set(caller)
+    binding = _CallerContextBinding(caller=caller)
+    token = _current_caller_context.set(binding)
     try:
         yield caller
     finally:
+        # ContextVar values are copied into child tasks. Mutate the shared
+        # binding before restoring this task's prior value so a detached task
+        # cannot retain endpoint authority after the request scope closes.
+        binding.active = False
         _current_caller_context.reset(token)
