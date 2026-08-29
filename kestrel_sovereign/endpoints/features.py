@@ -51,6 +51,13 @@ router = APIRouter(tags=["features"])
 # property a caller with nobody watching needs; the multiple is the price.
 INSTALL_TIMEOUT_SECONDS = 300
 
+# A configuration write and the context-clause refresh it drives are one
+# policy transition.  Serializing that transition prevents overlapping PATCH
+# requests from snapshotting and later restoring across one another when a
+# renderer rejects the newer configuration.
+_FEATURE_CONFIG_UPDATE_LOCK = asyncio.Lock()
+
+
 def _core_requirement_unsatisfied(package_spec: str) -> Optional[str]:
     """Describe *package_spec*'s unmet requirement on core, or None.
 
@@ -850,8 +857,27 @@ async def update_feature_config(
     agent = get_agent(request)
     feature = _get_feature_or_404(agent, name)
 
+    async with _FEATURE_CONFIG_UPDATE_LOCK:
+        return await _update_feature_config_locked(agent, feature, name, body)
+
+
+async def _update_feature_config_locked(
+    agent: object,
+    feature: object,
+    name: str,
+    body: ConfigUpdateRequest,
+) -> Dict[str, Any]:
+    """Commit one config + rendered-context transition, or restore it.
+
+    Feature tools read their live configuration while the prompt consumes a
+    cached immutable context-clause snapshot.  Those two views must never be
+    allowed to diverge merely because rendering the new snapshot failed.
+    """
+
     schema = feature.config_schema
     incoming = dict(body.config)
+    previous = await feature.get_config()
+    previous = dict(previous) if isinstance(previous, dict) else {}
 
     secret_fields = _secret_field_names(schema)
     atomic_secret_update = getattr(feature, "set_config_with_secret_preservation", None)
@@ -883,9 +909,35 @@ async def update_feature_config(
 
     refresh_context = getattr(agent, "refresh_feature_context_clauses", None)
     if bool(getattr(feature, "enabled", True)) and callable(refresh_context):
-        refreshed = refresh_context(feature)
-        if inspect.isawaitable(refreshed):
-            await refreshed
+        try:
+            await _refresh_feature_context(refresh_context, feature)
+        except BaseException as refresh_exc:
+            try:
+                await feature.set_config(previous)
+                await _refresh_feature_context(refresh_context, feature)
+            except BaseException:
+                # The old prompt bytes cannot safely coexist with a config we
+                # failed to restore.  Canonical teardown removes both the
+                # cached clauses and the feature's live tools before the error
+                # leaves this request.
+                teardown = getattr(agent, "_unregister_feature_runtime", None)
+                if callable(teardown):
+                    try:
+                        deactivated = teardown(feature, unload=False)
+                        if inspect.isawaitable(deactivated):
+                            await deactivated
+                    except BaseException:  # noqa: BLE001 - teardown is exhaustive
+                        logger.exception(
+                            "Feature '%s' teardown reported an error after "
+                            "configuration rollback failed",
+                            name,
+                        )
+                feature.enabled = False
+                raise RuntimeError(
+                    "feature configuration and context refresh could not be "
+                    "reconciled; the feature was disabled"
+                ) from refresh_exc
+            raise
 
     updated = await feature.get_config()
 
@@ -898,6 +950,14 @@ async def update_feature_config(
         "config": updated,
         "message": "Configuration updated",
     }
+
+
+async def _refresh_feature_context(refresh_context, feature: object) -> None:
+    """Await either the core synchronous refresh or an async test/host seam."""
+
+    refreshed = refresh_context(feature)
+    if inspect.isawaitable(refreshed):
+        await refreshed
 
 
 def _validate_config(config: Dict[str, Any], schema: Dict[str, Any]) -> None:

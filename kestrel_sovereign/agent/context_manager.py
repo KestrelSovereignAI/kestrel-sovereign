@@ -1551,7 +1551,24 @@ class ContextManager:
                 )
                 return False
         guidance_tokens = self.counter.count(guidance_text)
-        budget.use("system", guidance_tokens)
+        # Reflection is optional.  It must not consume bytes when the system
+        # slice plus released elastic slack cannot accept the whole block.
+        # Check first because the legacy TokenBudget.use mutates on rejection;
+        # the production ElasticTokenBudget then provides a defensive commit
+        # result as well.
+        if not budget.can_fit("system", guidance_tokens) or not budget.use(
+            "system", guidance_tokens
+        ):
+            logger.warning(
+                "Skipping reflection guidance because %d tokens do not fit "
+                "the remaining system allocation",
+                guidance_tokens,
+            )
+            assembly.warnings.append(
+                "reflection guidance skipped because it would exceed the "
+                "remaining system token budget"
+            )
+            return False
         assembly.system_prompt = f"{assembly.system_prompt}\n\n{guidance_text}"
         logger.info(
             f"Injected {len(reflection_guidance)} reflection guidance items into prompt"

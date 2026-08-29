@@ -961,6 +961,78 @@ class TestUpdateFeatureConfig:
         feature.set_config.assert_awaited_once_with({"enabled": False})
         agent.refresh_feature_context_clauses.assert_called_once_with(feature)
 
+    def test_refresh_failure_restores_config_and_previous_context_snapshot(self):
+        """Tools and cached prompt policy roll back as one failed transition."""
+
+        state = {"mode": "old"}
+        feature = _make_feature(config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+
+        feature.get_config.side_effect = get_config
+        feature.set_config.side_effect = set_config
+        agent = _make_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses.side_effect = [
+            RuntimeError("new clause renderer failed"),
+            None,
+        ]
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "new"}},
+            )
+
+        assert resp.status_code == 500
+        assert state == {"mode": "old"}
+        assert [call.args[0] for call in feature.set_config.await_args_list] == [
+            {"mode": "new"},
+            {"mode": "old"},
+        ]
+        assert agent.refresh_feature_context_clauses.call_count == 2
+
+    def test_failed_refresh_and_rollback_disables_feature_runtime(self):
+        """A doubly-failed transition is quarantined instead of split-brain."""
+
+        state = {"mode": "old"}
+        feature = _make_feature(config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            if config == {"mode": "old"}:
+                raise RuntimeError("durable rollback failed")
+            state.clear()
+            state.update(config)
+
+        feature.get_config.side_effect = get_config
+        feature.set_config.side_effect = set_config
+        agent = _make_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses.side_effect = RuntimeError(
+            "new clause renderer failed"
+        )
+        agent._unregister_feature_runtime = AsyncMock()
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "new"}},
+            )
+
+        assert resp.status_code == 500
+        assert feature.enabled is False
+        agent._unregister_feature_runtime.assert_awaited_once_with(
+            feature, unload=False
+        )
+
     def test_updates_disabled_feature_without_refreshing_inactive_context(self):
         feature = _make_feature(config={"enabled": False}, enabled=False)
         agent = _make_agent(features={"TestFeature": feature})
