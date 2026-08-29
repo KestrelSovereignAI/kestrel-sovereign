@@ -371,6 +371,34 @@ class HoldStore:
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
                 "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
             )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_receipt_witnesses ("
+                "scope TEXT NOT NULL, "
+                "target_id TEXT NOT NULL, "
+                "receipt_count INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (scope, target_id), "
+                "CHECK (scope IN ('host', 'agent')), "
+                "CHECK (scope <> 'host' OR target_id = 'host'), "
+                "CHECK (receipt_count >= 0))"
+            )
+            # Seed the witness exactly once for upgraded databases. Future
+            # schema checks never recompute an existing count from mutable
+            # receipt rows, so a later receipt deletion remains detectable.
+            await self._db.execute(
+                "INSERT INTO hold_receipt_witnesses "
+                "(scope, target_id, receipt_count) "
+                "SELECT scope, target_id, COUNT(*) FROM hold_receipts "
+                "WHERE scope <> 'host' OR target_id = 'host' "
+                "GROUP BY scope, target_id "
+                "ON CONFLICT (scope, target_id) DO NOTHING"
+            )
+            await self._db.execute(
+                "INSERT INTO hold_receipt_witnesses "
+                "(scope, target_id, receipt_count) "
+                "SELECT scope, target_id, 0 FROM hold_latches "
+                "WHERE scope <> 'host' OR target_id = 'host' "
+                "ON CONFLICT (scope, target_id) DO NOTHING"
+            )
 
     async def _lock_operation_and_target(
         self, operation_id: str, scope: HoldScope, target_id: str
@@ -411,6 +439,12 @@ class HoldStore:
     async def _ensure_latch_row(self, scope: HoldScope, target_id: str) -> None:
         await self._db.execute(
             "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?) "
+            "ON CONFLICT (scope, target_id) DO NOTHING",
+            (scope.value, target_id),
+        )
+        await self._db.execute(
+            "INSERT INTO hold_receipt_witnesses "
+            "(scope, target_id, receipt_count) VALUES (?, ?, 0) "
             "ON CONFLICT (scope, target_id) DO NOTHING",
             (scope.value, target_id),
         )
@@ -495,11 +529,6 @@ class HoldStore:
         receipt_ids = {receipt.receipt_id for receipt in receipts}
         if len(receipt_ids) != len(receipts):
             raise HoldCorruptStateError("Hold receipt graph has duplicate identities")
-        applied = [
-            receipt
-            for receipt in receipts
-            if receipt.disposition is HoldDisposition.APPLIED
-        ]
         projection_row = await self._read_latch_row(scope, target_id)
         projection_revision = 0
         if projection_row is not None:
@@ -515,6 +544,27 @@ class HoldStore:
                 raise HoldCorruptStateError(
                     "hold latch row has invalid typed fields"
                 ) from exc
+        witness_row = await self._db.fetchone(
+            "SELECT receipt_count FROM hold_receipt_witnesses "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
+        )
+        if witness_row is None and not receipts and projection_row is None:
+            witnessed_receipts = 0
+        elif witness_row is None or len(witness_row) != 1:
+            raise HoldCorruptStateError("Hold receipt-count witness is missing")
+        else:
+            try:
+                witnessed_receipts = _exact_nonnegative_revision(witness_row[0])
+            except (TypeError, ValueError) as exc:
+                raise HoldCorruptStateError(
+                    "Hold receipt-count witness has invalid typed fields"
+                ) from exc
+        applied = [
+            receipt
+            for receipt in receipts
+            if receipt.disposition is HoldDisposition.APPLIED
+        ]
         authorities = {
             receipt.receipt_id: receipt
             for receipt in applied
@@ -552,6 +602,10 @@ class HoldStore:
         terminal_authorities = _terminal_authority_ids(authorities, consumers)
 
         if latch is None:
+            if witnessed_receipts != len(receipts):
+                raise HoldCorruptStateError(
+                    "hold receipt-count revision does not match receipt history"
+                )
             if not terminal_authorities:
                 if projection_revision != len(applied):
                     raise HoldCorruptStateError(
@@ -586,6 +640,10 @@ class HoldStore:
         if terminal_authorities != {latch.hold_receipt_id}:
             raise HoldCorruptStateError(
                 "active hold latch is not the receipt graph's terminal authority"
+            )
+        if witnessed_receipts != len(receipts):
+            raise HoldCorruptStateError(
+                "hold receipt-count revision does not match receipt history"
             )
         if projection_revision != len(applied):
             raise HoldCorruptStateError(
@@ -668,6 +726,12 @@ class HoldStore:
                 prior_hold_receipt_id,
                 resulting_hold_receipt_id,
             ),
+        )
+        await self._db.execute(
+            "UPDATE hold_receipt_witnesses "
+            "SET receipt_count = receipt_count + 1 "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
         )
         return _receipt_from_row(await self._read_receipt_by_operation(operation_id))
 

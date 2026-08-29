@@ -280,6 +280,53 @@ async def test_inactive_revision_rejects_deleted_closed_receipt_chain(hold_db):
 
 
 @pytest.mark.asyncio
+async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db):
+    """The receipt-count witness covers idempotent audit outcomes too."""
+
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:non-applied-loss",
+        actor_id="did:sovereign:operator",
+        reason="first reason",
+        operation_id="first-applied",
+    )
+    duplicate = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:non-applied-loss",
+        actor_id="did:sovereign:operator",
+        reason="first reason",
+        operation_id="old-idempotent-operation",
+    )
+    assert duplicate.receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+    replacement = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:non-applied-loss",
+        actor_id="did:sovereign:operator",
+        reason="newer reason",
+        operation_id="newer-applied",
+    )
+    assert replacement.receipt.receipt_id != first.receipt.receipt_id
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE operation_id = ?",
+        ("old-idempotent-operation",),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="receipt-count"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:non-applied-loss",
+            actor_id="did:sovereign:operator",
+            reason="first reason",
+            operation_id="old-idempotent-operation",
+        )
+
+    assert await store.get_receipt("old-idempotent-operation") is None
+    with pytest.raises(HoldCorruptStateError, match="receipt-count"):
+        await store.get_hold("agent", "did:agent:non-applied-loss")
+
+
+@pytest.mark.asyncio
 async def test_release_rejects_latch_rewound_to_consumed_hold_authority(hold_db):
     db, store = hold_db
     first = await store.set_hold(
