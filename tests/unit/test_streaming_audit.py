@@ -173,6 +173,7 @@ class TestRealStreaming:
         # Bind all orchestrator engine and tool registry mixin methods
         for method_name in (
             '_handle_orchestrator_response_streaming',
+            '_execute_tool_batch_at_stop_boundary',
             '_execute_tool_with_hooks',
             '_execute_tool_batch',
             '_partition_tool_calls',
