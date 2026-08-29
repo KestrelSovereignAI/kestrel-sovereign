@@ -26,6 +26,7 @@ class CooperativeStopTarget:
     turn_ids: frozenset[str] = field(default_factory=frozenset)
     tool_call_ids: frozenset[str] = field(default_factory=frozenset)
     turn_request_ids: Mapping[str, str] = field(default_factory=dict)
+    turn_request_generations: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -68,6 +69,25 @@ class CooperativeStopTarget:
             self,
             "turn_request_ids",
             MappingProxyType(turn_request_ids),
+        )
+        if not isinstance(self.turn_request_generations, Mapping):
+            raise TypeError("Stop target turn_request_generations must be a mapping")
+        turn_request_generations = dict(self.turn_request_generations)
+        if any(
+            turn_id not in turn_request_ids
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+            for turn_id, generation in turn_request_generations.items()
+        ):
+            raise TypeError(
+                "Stop target turn generations must bind known turns to "
+                "positive integers"
+            )
+        object.__setattr__(
+            self,
+            "turn_request_generations",
+            MappingProxyType(turn_request_generations),
         )
 
 
@@ -249,6 +269,9 @@ class CancellationAuthority:
                 cascade=request.cascade,
                 correlation_id=request.correlation_id,
                 target_is_turn_id=False,
+                request_generation=target.turn_request_generations.get(
+                    request.target
+                ),
             ),
             request_id,
         )
@@ -268,6 +291,7 @@ class CancellationAuthority:
             cascade=request.cascade,
             correlation_id=request.correlation_id,
             target_is_turn_id=request.target_is_turn_id,
+            request_generation=request.request_generation,
         )
 
     def _detach_cleanup(self, task: asyncio.Task[StopOutcome]) -> None:

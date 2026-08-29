@@ -19,6 +19,7 @@ import pytest
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
 from kestrel_sovereign.agent.invocation import invocation_scope
+from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import (
     TurnLifecycleMixin,
     bind_turn_session,
@@ -43,6 +44,18 @@ class _PrivateAccessorOnlyAgent(_StubAgent):
 
     def _get_turn_bound_session_id(self):
         return self._active_session_id
+
+
+class _RequestTurnAgent(RequestLifecycleMixin, TurnLifecycleMixin):
+    """Minimal carrier for the request-generation/turn-index seam."""
+
+    def __init__(self) -> None:
+        self._lock_manager = OrderedLockManager()
+        self._current_request_id = None
+        self._active_request_ids = set()
+        self._active_request_counts = {}
+        self._active_request_started_at = {}
+        self._cancelled_requests = set()
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +172,23 @@ async def test_turn_lifecycle_indexes_task_local_request_until_exit():
             )
 
     assert agent.resolve_turn_request_id(turn_id) is None
+
+
+@pytest.mark.asyncio
+async def test_turn_index_carries_the_exact_request_generation():
+    agent = _RequestTurnAgent()
+
+    with invocation_scope("reusable-request"):
+        generation = agent.register_active_request("reusable-request")
+        async with agent._turn_lifecycle() as turn_id:
+            assert agent.active_turn_request_bindings() == {
+                turn_id: ("reusable-request", generation)
+            }
+            assert agent.active_turn_request_ids() == {
+                turn_id: "reusable-request"
+            }
+
+    assert agent.active_turn_request_bindings() == {}
 
 
 @pytest.mark.asyncio
