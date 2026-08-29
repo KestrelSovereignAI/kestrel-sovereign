@@ -264,6 +264,58 @@ async def test_corrupt_active_latch_fails_closed(hold_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_greenfield_schema_rejects_foreign_host_target(hold_db):
+    db, _store = hold_db
+    with pytest.raises(Exception, match="CHECK constraint"):
+        await db.execute(
+            "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?)",
+            ("host", "foreign"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_upgraded_foreign_host_row_fails_closed_for_reads_and_mutation(
+    tmp_path,
+):
+    """Existing v1 tables lack the new CHECK, so runtime validation is load-bearing."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-hold.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (scope, target_id), "
+        "CHECK (scope IN ('host', 'agent')), CHECK (active IN (0, 1)), "
+        "CHECK (revision >= 0))"
+    )
+    await db.execute(
+        "INSERT INTO hold_latches "
+        "(scope, target_id, active, hold_receipt_id, reason, actor_id, set_at) "
+        "VALUES ('host', 'foreign', 1, 'receipt', 'reason', 'actor', 'time')"
+    )
+    store = HoldStore(db)
+    await store.ensure_schema()
+    try:
+        with pytest.raises(HoldCorruptStateError, match="foreign target"):
+            await store.get_hold("host")
+        with pytest.raises(HoldCorruptStateError, match="foreign target"):
+            await store.get_effective("did:agent:kite")
+        with pytest.raises(HoldCorruptStateError, match="foreign target"):
+            await store.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="must fail closed",
+                operation_id="foreign-host-row",
+            )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_inactive_latch_with_retained_evidence_fails_closed(
     hold_db,
     monkeypatch,
