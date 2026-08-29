@@ -1525,6 +1525,24 @@ class TaskManager:
         self._subscribers[task_id].append(queue)
 
         try:
+            # Close the admission race: a terminal transition between the
+            # authorization read above and queue registration could not have
+            # notified this subscriber.  Once registered, repeat the same
+            # principal-scoped read; any later transition must enqueue its
+            # update.
+            if creator_agent_id is not None:
+                authorized_task = await self.task_store.get_for_creator(
+                    task_id,
+                    creator_agent_id,
+                )
+            else:
+                authorized_task = await self.task_store.get_for_recipient(
+                    task_id,
+                    str(recipient_agent_id),
+                )
+            if authorized_task is None:
+                return
+
             # Send current state first. If the task is already terminal
             # (late subscriber), yield with top-level ``final`` so the
             # endpoint loop breaks cleanly — without this, the SSE
@@ -1533,25 +1551,24 @@ class TaskManager:
             # envelope shape ``_notify_status_update`` uses for the
             # live-update path so subscribers can rely on one contract.
             task = authorized_task
-            if task:
-                terminal = task.status.state in (
-                    TaskState.COMPLETED,
-                    TaskState.CANCELED,
-                    TaskState.FAILED,
-                )
-                yield {
-                    "event": "status",
-                    "data": TaskStatusUpdateEvent(
-                        id=task_id,
-                        status=task.status,
-                        final=terminal,
-                    ).model_dump_json(),
-                    "final": terminal,
-                }
-                if terminal:
-                    # Don't enter the keepalive loop — the subscriber
-                    # already has the terminal frame.
-                    return
+            terminal = task.status.state in (
+                TaskState.COMPLETED,
+                TaskState.CANCELED,
+                TaskState.FAILED,
+            )
+            yield {
+                "event": "status",
+                "data": TaskStatusUpdateEvent(
+                    id=task_id,
+                    status=task.status,
+                    final=terminal,
+                ).model_dump_json(),
+                "final": terminal,
+            }
+            if terminal:
+                # Don't enter the keepalive loop — the subscriber
+                # already has the terminal frame.
+                return
 
             # Stream updates
             while True:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -562,6 +563,54 @@ async def test_local_task_reads_use_nonserializable_host_capabilities():
     assert local_get.await_args.args[2] == "private"
     # Two directory reauthorizations, and no serialized task read.
     assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_local_subscription_honors_total_deadline():
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [{
+        "id": "did:local:recipient",
+        "routing_name": "current-route",
+    }]
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    stream_closed = asyncio.Event()
+
+    async def local_subscribe(_requester, _peer, _task_id):
+        try:
+            await asyncio.Event().wait()
+            yield PeerSubscriptionEvent(event="status", data="never")
+        finally:
+            stream_closed.set()
+
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        client_factory=lambda *args, **kwargs: client,
+        local_subscribe=local_subscribe,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="current-route",
+    )
+    started = asyncio.get_running_loop().time()
+
+    events = [
+        event async for event in adapter.subscribe_a2a_task(
+            requester,
+            peer,
+            "private",
+            timeout_seconds=0.02,
+        )
+    ]
+
+    assert events == []
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert stream_closed.is_set()
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.a2a.task_manager import create_task_manager
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+from kestrel_sovereign.a2a.types import (
+    Message,
+    TaskSendParams,
+    TaskState,
+    TaskStatus,
+    TextPart,
+)
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.features.peers.directory import (
     PeerIdentity,
@@ -125,6 +131,36 @@ async def test_subscription_admission_is_creator_scoped(tmp_path):
         assert first["event"] == "status"
         assert first["final"] is False
         await allowed.aclose()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_subscription_rereads_after_registration_to_close_terminal_race(
+    tmp_path, monkeypatch
+):
+    manager = await create_task_manager(str(tmp_path / "subscription-race.db"))
+    try:
+        working = await manager.create_task(
+            _params("fast-terminal"),
+            agent_name=RECIPIENT_A,
+            creator_agent_id=CREATOR_A,
+        )
+        terminal = working.model_copy(deep=True)
+        terminal.status = TaskStatus(state=TaskState.COMPLETED)
+        scoped_read = AsyncMock(side_effect=[working, terminal])
+        monkeypatch.setattr(manager.task_store, "get_for_creator", scoped_read)
+
+        stream = manager.subscribe(
+            "fast-terminal",
+            creator_agent_id=CREATOR_A,
+        )
+        event = await anext(stream)
+
+        assert event["final"] is True
+        assert '"state":"completed"' in event["data"]
+        assert scoped_read.await_count == 2
+        await stream.aclose()
     finally:
         await manager.close()
 

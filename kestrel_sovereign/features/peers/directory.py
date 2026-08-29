@@ -12,6 +12,7 @@ host behaviour.  It is deliberately an adapter, not a hosted tenancy policy.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import quote
@@ -563,19 +564,46 @@ class LocalHostPeerDirectory:
         timeout_seconds: float,
     ) -> AsyncIterator[PeerSubscriptionEvent]:
         self._require_requester(requester)
-        authorized_peer = await self._authorize_peer(requester, peer)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout_seconds))
+
+        def _remaining() -> float:
+            return max(0.0, deadline - loop.time())
+
+        try:
+            authorized_peer = await asyncio.wait_for(
+                self._authorize_peer(requester, peer),
+                timeout=_remaining(),
+            )
+        except TimeoutError:
+            return
         if callable(self._local_subscribe):
             stream = self._local_subscribe(
                 requester,
                 authorized_peer,
                 task_id,
             )
-            async for event in stream:
-                if not isinstance(event, PeerSubscriptionEvent):
-                    raise PeerProtocolError(
-                        "Local host returned an invalid A2A subscription event"
-                    )
-                yield event
+            iterator = stream.__aiter__()
+            try:
+                while _remaining() > 0:
+                    try:
+                        event = await asyncio.wait_for(
+                            anext(iterator),
+                            timeout=_remaining(),
+                        )
+                    except StopAsyncIteration:
+                        return
+                    except TimeoutError:
+                        return
+                    if not isinstance(event, PeerSubscriptionEvent):
+                        raise PeerProtocolError(
+                            "Local host returned an invalid A2A subscription event"
+                        )
+                    yield event
+            finally:
+                close = getattr(iterator, "aclose", None)
+                if callable(close):
+                    await close()
             return
         # As with point reads, an API key plus a task id is not creator proof.
         # A managed host injects the process-local capability above.
