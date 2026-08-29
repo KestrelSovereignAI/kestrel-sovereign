@@ -189,7 +189,7 @@ def _grouped_runtime_retained_detail(
 
 
 @router.get("/api/agents")
-async def get_agents(request: Request):
+async def get_agents(request: Request, response: Response):
     """Get list of agents (A2A agent cards).
 
     In multi-agent mode, returns all agents with mode: "multi_agent".
@@ -200,6 +200,8 @@ async def get_agents(request: Request):
     can render a DEMO MODE banner — the browser-side defence in #868.
     """
     server_demo_mode = bool(getattr(request.app.state, "demo_mode", False))
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
     caller = get_caller(request)
     can_manage_host_lifecycle = (
         getattr(caller, "is_sovereign", False) is True

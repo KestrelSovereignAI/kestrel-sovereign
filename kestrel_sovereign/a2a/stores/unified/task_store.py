@@ -25,7 +25,7 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
 
-_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v2"
+_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v3"
 
 
 class TaskAlreadyExistsError(ValueError):
@@ -207,7 +207,7 @@ class TaskStore(UnifiedStoreBase):
                       ON namespace.oid = relation.relnamespace
                     WHERE namespace.nspname = current_schema()
                       AND relation.relname = 'a2a_tasks'
-                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v3'
                       AND NOT trigger.tgisinternal
                 )
                 AND (
@@ -285,10 +285,11 @@ class TaskStore(UnifiedStoreBase):
                         RAISE EXCEPTION 'canceled A2A task is terminal'
                             USING ERRCODE = 'check_violation';
                     END IF;
-                    IF NEW.status IN ('submitted', 'working', 'input-required')
+                    IF (TG_OP = 'INSERT'
+                        OR NEW.status IN ('submitted', 'working', 'input-required'))
                        AND (NEW.creator_agent_id IS NULL
                             OR NEW.recipient_agent_id IS NULL) THEN
-                        RAISE EXCEPTION 'live A2A task requires durable authority'
+                        RAISE EXCEPTION 'A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
                     END IF;
                     RETURN NEW;
@@ -299,7 +300,9 @@ class TaskStore(UnifiedStoreBase):
                     ON a2a_tasks;
                 DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v2
                     ON a2a_tasks;
-                CREATE TRIGGER a2a_tasks_authority_fence_v2
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v3
+                    ON a2a_tasks;
+                CREATE TRIGGER a2a_tasks_authority_fence_v3
                 BEFORE INSERT OR UPDATE ON a2a_tasks
                 FOR EACH ROW
                 EXECUTE FUNCTION a2a_tasks_enforce_authority_fence();
@@ -328,14 +331,15 @@ class TaskStore(UnifiedStoreBase):
                 SELECT RAISE(ABORT, 'canceled A2A task is terminal');
             END;
 
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
+            DROP TRIGGER IF EXISTS a2a_tasks_live_authority_v2;
+            DROP TRIGGER IF EXISTS a2a_tasks_insert_authority_v3;
+            CREATE TRIGGER a2a_tasks_insert_authority_v3
             BEFORE INSERT ON a2a_tasks
             FOR EACH ROW
-            WHEN NEW.status IN ('submitted', 'working', 'input-required')
-              AND (NEW.creator_agent_id IS NULL
-                   OR NEW.recipient_agent_id IS NULL)
+            WHEN NEW.creator_agent_id IS NULL
+              OR NEW.recipient_agent_id IS NULL
             BEGIN
-                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
+                SELECT RAISE(ABORT, 'A2A task requires durable authority');
             END;
 
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_update_v2
@@ -738,8 +742,19 @@ class TaskStore(UnifiedStoreBase):
         async with transaction:
             lock_suffix = " FOR UPDATE" if self.is_postgres else ""
             current = await self._backend.fetch_one(
-                f"SELECT * FROM a2a_tasks WHERE id = ?{lock_suffix}",
-                (task_id,),
+                f"""
+                SELECT * FROM a2a_tasks
+                WHERE id = ?
+                  AND (creator_agent_id = ? OR recipient_agent_id = ?)
+                  {recipient_predicate}
+                {lock_suffix}
+                """,
+                (
+                    task_id,
+                    actor_agent_id,
+                    actor_agent_id,
+                    *recipient_values,
+                ),
             )
             if current is None:
                 return None

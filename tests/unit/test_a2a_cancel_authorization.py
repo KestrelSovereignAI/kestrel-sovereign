@@ -1,6 +1,7 @@
 """Authority and atomicity regressions for A2A task cancellation (#3134)."""
 
 import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1372,15 +1373,29 @@ async def test_idempotent_recipient_decline_keeps_live_execution_exemption(tmp_p
 async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
     """Rows without durable receipt columns cannot retain old metadata claims."""
 
-    manager = await create_task_manager(str(tmp_path / "legacy-forged-receipt.db"))
-    try:
-        await manager.task_store._backend.execute(
+    db_path = tmp_path / "legacy-forged-receipt.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
             """
-            INSERT INTO a2a_tasks (
-                id, task_type, status, metadata,
-                creator_agent_id, recipient_agent_id,
-                canceled_by, cancel_reason, cancel_previous_status
-            ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)
+            CREATE TABLE a2a_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                user_id TEXT,
+                task_type TEXT NOT NULL,
+                status TEXT DEFAULT 'submitted',
+                message TEXT,
+                artifacts TEXT DEFAULT '[]',
+                history TEXT DEFAULT '[]',
+                metadata TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO a2a_tasks (id, task_type, status, metadata)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 "legacy-forged-receipt",
@@ -1391,6 +1406,8 @@ async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
             ),
         )
 
+    manager = await create_task_manager(str(db_path))
+    try:
         legacy = await manager.task_store._get_unscoped("legacy-forged-receipt")
         assert "cancellation_receipt" not in (legacy.metadata or {})
         with pytest.raises(
@@ -2822,6 +2839,88 @@ async def test_database_fence_rejects_legacy_live_insert_without_authority(
 
 
 @pytest.mark.asyncio
+async def test_database_fence_rejects_legacy_terminal_replace_without_authority(
+    tmp_path,
+):
+    """A late pre-authority worker cannot erase principals on completion."""
+
+    manager = await create_task_manager(str(tmp_path / "terminal-authority-fence.db"))
+    try:
+        await manager.create_task(
+            _params("late-legacy-terminal"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        with pytest.raises(Exception, match="requires durable authority"):
+            await manager.task_store.backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks
+                    (id, session_id, user_id, task_type, status, message,
+                     artifacts, history, metadata, updated_at)
+                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    "late-legacy-terminal",
+                    None,
+                    None,
+                    "generic",
+                    None,
+                    "[]",
+                    "[]",
+                    "{}",
+                ),
+            )
+
+        persisted = await manager.task_store._get_unscoped("late-legacy-terminal")
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+        assert await manager.get_task_for_creator(
+            "late-legacy-terminal",
+            "did:test:creator",
+        ) is not None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_cancel_locks_only_an_authorized_principal_row():
+    """A foreign task ID cannot be used as a cross-principal lock primitive."""
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        transaction=transaction,
+        fetch_one=AsyncMock(return_value=None),
+        execute=AsyncMock(return_value=0),
+    )
+    store = TaskStore(backend)
+
+    result = await store.cancel_if_authorized(
+        "foreign-task",
+        actor_agent_id="did:test:actor",
+        expected_recipient_agent_id="did:test:expected-recipient",
+    )
+
+    assert result is None
+    query, values = backend.fetch_one.await_args.args
+    normalized = " ".join(query.split())
+    assert "(creator_agent_id = ? OR recipient_agent_id = ?)" in normalized
+    assert "AND recipient_agent_id = ?" in normalized
+    assert normalized.endswith("FOR UPDATE")
+    assert values == (
+        "foreign-task",
+        "did:test:actor",
+        "did:test:actor",
+        "did:test:expected-recipient",
+    )
+    backend.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_database_fence_blocks_legacy_writer_on_available_backends(db_backend):
     store = TaskStore(db_backend)
@@ -2883,7 +2982,7 @@ async def test_cancel_readback_failure_rolls_back_transition_on_available_backen
         fetch_one = db_backend.fetch_one
 
         async def fail_canonical_read(sql, params=()):
-            if "SELECT * FROM a2a_tasks WHERE id" in sql:
+            if "SELECT * FROM a2a_tasks WHERE id" in " ".join(sql.split()):
                 raise RuntimeError("injected in-transaction readback failure")
             return await fetch_one(sql, params)
 
@@ -2924,8 +3023,8 @@ async def test_postgres_initialization_installs_canceled_terminal_trigger():
     )
     assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence" in scripts
     assert "OLD.status = 'canceled'" in scripts
-    assert "live A2A task requires durable authority" in scripts
-    assert "CREATE TRIGGER a2a_tasks_authority_fence_v2" in scripts
+    assert "A2A task requires durable authority" in scripts
+    assert "CREATE TRIGGER a2a_tasks_authority_fence_v3" in scripts
 
 
 @pytest.mark.asyncio
