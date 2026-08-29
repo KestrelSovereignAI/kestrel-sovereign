@@ -429,6 +429,54 @@ class TestScheduleList:
 
 class TestRetiredCronCleanup:
     @pytest.mark.asyncio
+    async def test_post_load_removes_persisted_authority_bound_schedules(self):
+        """Upgrade closes request_restart rows accepted by older releases."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [
+                {
+                    "task_name": "request_restart",
+                    "id": "legacy-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "request_restart",
+                    "id": "legacy-paused",
+                    "enabled": False,
+                },
+                {
+                    "task_name": "backup_snapshot",
+                    "id": "keep-default",
+                    "enabled": True,
+                },
+            ]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.ok(confirmation="removed")
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+
+        removed_ids = {call.args[0] for call in f.schedule_remove.await_args_list}
+        assert removed_ids == {"legacy-live", "legacy-paused"}
+        readded = {
+            call.kwargs.get("task_name")
+            for call in f._ensure_builtin_schedule.await_args_list
+        }
+        assert "request_restart" not in readded
+
+    @pytest.mark.asyncio
     async def test_post_load_removes_retired_builtin_schedules(self):
         """Persisted rows for removed core sources must be deleted on upgrade."""
         from kestrel_sdk.tools.result import ToolResult
@@ -1114,6 +1162,26 @@ class TestScheduleAdd:
             task_name="wellness_check",
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_authority_bound_restart_tool(self, feature):
+        """An unattended scheduler tick cannot supply sovereign authority."""
+
+        restart_tool = MagicMock()
+        restart_tool.name = "request_restart"
+        restart_feature = MagicMock()
+        restart_feature.get_tools = MagicMock(return_value=[restart_tool])
+        feature.agent.features = {"RestartCoordinatorFeature": restart_feature}
+
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="request_restart",
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "unknown scheduled task" in result.error.lower()
+        assert "request_restart" not in result.data["valid_task_names"]
+        feature._db.execute.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_rejects_disabled_feature_tool(self, feature):

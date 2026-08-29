@@ -95,6 +95,12 @@ _RETIRED_BUILTIN_CRON_TASKS = frozenset({
     "talon_monitor",  # #1860 Wave 2 — superseded by the generic wait_reconcile
 })
 
+# Tools whose contract requires endpoint-owned caller authority cannot be
+# executed by an unattended scheduler tick. Their separate background
+# coordinators remain valid built-in cron sources; only the authority-bearing
+# request surface is excluded here.
+_AUTHORITY_BOUND_TASKS = frozenset({"request_restart"})
+
 # Stable namespace used to distinguish core-owned schedule rows from user rows.
 _BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX = "scheduler:builtin:v1:"
 
@@ -407,6 +413,24 @@ class SchedulerFeature(Feature):
         existing = await self.schedule_list()
         existing_tasks = (existing.data or {}).get("tasks", []) if existing.data else []
         existing_names = {t["task_name"] for t in existing_tasks}
+
+        # Older releases allowed endpoint-authorized mutation tools to be
+        # persisted as unattended cron rows.  Refusing new rows is not enough:
+        # an upgraded host would otherwise keep retrying the already-durable
+        # back door forever.  Remove every such row, including paused ones;
+        # the coordinator cron remains the only schedulable half of restart.
+        authority_bound = _AUTHORITY_BOUND_TASKS & existing_names
+        for task in existing_tasks:
+            if task["task_name"] in authority_bound:
+                task_id = task["id"]
+                await self.schedule_remove(task_id)
+                logger.warning(
+                    "Removed authority-bound schedule '%s' (id=%s): this "
+                    "request surface requires a live sovereign caller",
+                    task["task_name"],
+                    str(task_id)[:8],
+                )
+        existing_names -= authority_bound
 
         # One-time cutover cleanup: drop persisted schedule rows for built-in
         # cron tasks that no longer exist. An agent that booted on a prior
@@ -1162,7 +1186,7 @@ class SchedulerFeature(Feature):
         for agent_tool in self.get_tools():
             names.add(agent_tool.name)
 
-        return names
+        return names - _AUTHORITY_BOUND_TASKS
 
     async def _scheduled_task_denied(self, task_name: str) -> bool:
         """Return True if ``task_name`` resolves to a feature tool the

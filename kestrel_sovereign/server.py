@@ -37,6 +37,10 @@ from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+from kestrel_sovereign.security.sovereign_key import (
+    mark_ephemeral_sovereign_key,
+    normalize_sovereign_api_key,
+)
 from kestrel_sovereign.api_errors import (
     api_error_response,
     api_unhandled_exception_handler,
@@ -541,13 +545,12 @@ def get_api_key():
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
+        mark_ephemeral_sovereign_key(generated_key)
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
-    # Strip surrounding quotes (Docker --env-file includes them literally)
-    if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in ('"', "'"):
-        api_key = api_key[1:-1]
-    return api_key
+    # Strip surrounding quotes (Docker --env-file includes them literally).
+    return normalize_sovereign_api_key(api_key)
 
 
 async def verify_api_key(
@@ -3014,7 +3017,12 @@ async def auth_middleware(request: Request, call_next):
     # authenticated (or deliberately unauthenticated) request stays OUTSIDE
     # it, so an unhandled downstream application fault keeps FastAPI's
     # 500 semantics instead of masquerading as a 401 (#2490).
-    from kestrel_sovereign.auth import CallerContext, AuthMethod
+    from kestrel_sovereign.auth import (
+        LOCAL_PEER_TRANSPORT_HEADER,
+        LOCAL_PEER_TRANSPORT_VALUE,
+        AuthMethod,
+        CallerContext,
+    )
 
     caller = None
     unauthenticated_root_dispatch = False
@@ -3024,7 +3032,13 @@ async def auth_middleware(request: Request, call_next):
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
-            caller = CallerContext.sovereign(AuthMethod.API_KEY)
+            if (
+                request.headers.get(LOCAL_PEER_TRANSPORT_HEADER)
+                == LOCAL_PEER_TRANSPORT_VALUE
+            ):
+                caller = CallerContext.local_peer_transport()
+            else:
+                caller = CallerContext.sovereign(AuthMethod.API_KEY)
 
         # Check Bearer token (API key OR JWT)
         if caller is None:

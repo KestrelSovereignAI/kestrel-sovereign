@@ -19,6 +19,8 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, T
 from urllib.parse import quote, unquote_to_bytes
 import uuid
 
+from kestrel_sovereign.auth import caller_context_scope
+
 
 MAX_INVOCATION_ID_LENGTH = 256
 _HEADER_UNRESERVED = frozenset(
@@ -253,7 +255,9 @@ def bind_async_invocation(
             with invocation_scope(
                 bound.arguments.get(parameter),
                 provenance=bound.arguments.get("invocation_provenance"),
-            ) as invocation_id:
+            ) as invocation_id, caller_context_scope(
+                bound.arguments.get("caller")
+            ):
                 bound.arguments[parameter] = invocation_id
                 return await function(*bound.args, **bound.kwargs)
 
@@ -283,7 +287,7 @@ def bind_async_generator_invocation(
             with invocation_scope(
                 bound.arguments.get(parameter),
                 provenance=bound.arguments.get("invocation_provenance"),
-            ):
+            ), caller_context_scope(bound.arguments.get("caller")):
                 async for item in function(*bound.args, **bound.kwargs):
                     yield item
 

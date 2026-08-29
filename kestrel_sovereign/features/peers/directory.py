@@ -232,9 +232,17 @@ class LocalHostPeerDirectory:
         self._client_factory = client_factory
 
     def _headers(self) -> dict[str, str]:
+        from kestrel_sovereign.auth import (
+            LOCAL_PEER_TRANSPORT_HEADER,
+            LOCAL_PEER_TRANSPORT_VALUE,
+        )
+
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["X-API-Key"] = self._api_key
+            # The shared key authenticates this host-local transport; it does
+            # not turn the sending agent into the sovereign operator.
+            headers[LOCAL_PEER_TRANSPORT_HEADER] = LOCAL_PEER_TRANSPORT_VALUE
         return headers
 
     @staticmethod

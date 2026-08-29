@@ -19,7 +19,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-from kestrel_sovereign.storage.database_clock import database_now_sql
+from kestrel_sovereign.storage.database_clock import database_clock
+
+from .authority import (
+    RestartAuthorityError,
+    issue_restart_authority,
+    reseal_restart_safety_state,
+    verify_restart_authority,
+)
 
 
 # Terminal states — a request in any of these is locked. The
@@ -125,6 +132,11 @@ _ADDED_COLUMNS = (
     # inserted with 1 explicitly, so only a pre-upgrade backlog needs the
     # one-time acknowledgement before bounded escalation may override idle.
     ("escalation_acknowledged", "INTEGER DEFAULT 0"),
+    # Exact sovereign-key authorization for the host mutation. Legacy rows
+    # stay blank and are rejected by the executor; authority is never inferred
+    # from their requester, age, status, or prior approval.
+    ("authority_evidence", "TEXT DEFAULT ''"),
+    ("authority_signature", "TEXT DEFAULT ''"),
 )
 
 # One-time data backfills for legacy rows, keyed by the column whose addition
@@ -178,7 +190,8 @@ _COLUMNS = (
     "update_allow_migrations, update_log, requester_request_id, "
     "executing_boot_id, origin_session_id, wake_delivered, "
     "wake_dispatched_at, wake_dispatch_boot_id, wake_dispatch_count, "
-    "first_blocked_at, escalation_acknowledged"
+    "first_blocked_at, escalation_acknowledged, authority_evidence, "
+    "authority_signature"
 )
 
 
@@ -230,6 +243,10 @@ class RestartRequest:
     # Fresh rows opt into bounded escalation. Migrated rows remain false until
     # an explicit acknowledgement records acceptance of the new behavior.
     escalation_acknowledged: bool = False
+    # Host-sealed exact request bounds. The signature is intentionally omitted
+    # from ``to_public_dict`` so an agent cannot harvest/replay authority.
+    authority_evidence: str = ""
+    authority_signature: str = ""
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -264,6 +281,8 @@ class RestartRequest:
             wake_dispatch_count=int(g(22) or 0),
             first_blocked_at=str(g(23) or ""),
             escalation_acknowledged=bool(int(g(24) or 0)),
+            authority_evidence=str(g(25) or ""),
+            authority_signature=str(g(26) or ""),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -338,7 +357,9 @@ async def ensure_restart_requests_table(db) -> None:
             wake_dispatch_boot_id TEXT DEFAULT '',
             wake_dispatch_count INTEGER DEFAULT 0,
             first_blocked_at TEXT DEFAULT '',
-            escalation_acknowledged INTEGER DEFAULT 0
+            escalation_acknowledged INTEGER DEFAULT 0,
+            authority_evidence TEXT DEFAULT '',
+            authority_signature TEXT DEFAULT ''
         )
         """
     )
@@ -379,23 +400,41 @@ async def insert_request(
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
-    now_sql = database_now_sql(db)
+    requested_at = (await database_clock(db)).isoformat()
+    authority_evidence, authority_signature = issue_restart_authority(
+        request_id=req_id,
+        requested_by_agent=requested_by_agent,
+        reason=reason,
+        urgency=urgency,
+        policy=policy,
+        desired_window=desired_window,
+        operation=operation,
+        update_repo_path=update_repo_path,
+        update_target_ref=update_target_ref,
+        update_profile=update_profile,
+        update_allow_migrations=update_allow_migrations,
+        requester_request_id=requester_request_id,
+        origin_session_id=origin_session_id,
+        requested_at=requested_at,
+    )
     await db.execute(
-        f"""
+        """
         INSERT INTO restart_requests (
             id, requested_by_agent, reason, requested_at,
             desired_window, urgency, policy, status, status_reason,
             completed_at, operation, update_repo_path, update_target_ref,
             update_profile, update_allow_migrations, update_log,
-            requester_request_id, origin_session_id, escalation_acknowledged
+            requester_request_id, origin_session_id, escalation_acknowledged,
+            authority_evidence, authority_signature
         )
-        VALUES (?, ?, ?, {now_sql}, ?, ?, ?, 'pending', '', NULL,
-                ?, ?, ?, ?, ?, '', ?, ?, 1)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL,
+                ?, ?, ?, ?, ?, '', ?, ?, 1, ?, ?)
         """,
-        (req_id, requested_by_agent, reason, desired_window,
+        (req_id, requested_by_agent, reason, requested_at, desired_window,
          urgency, policy, operation, update_repo_path, update_target_ref,
          update_profile, 1 if update_allow_migrations else 0,
-         requester_request_id, origin_session_id),
+         requester_request_id, origin_session_id, authority_evidence,
+         authority_signature),
     )
     inserted = await get_request(db, req_id)
     if inserted is None:
@@ -576,34 +615,86 @@ async def mark_deferral_started(
     from a lost lifecycle race.
     """
 
-    stamp_sql = "?" if blocked_at is not None else database_now_sql(db)
-    params = (
-        (blocked_at, request_id, expected_current_status)
-        if blocked_at is not None
-        else (request_id, expected_current_status)
-    )
+    current = await get_request(db, request_id)
+    if current is None:
+        return None
+    verified, _ = verify_restart_authority(current)
+    if not verified:
+        return None
+    if current.first_blocked_at:
+        return current
+    stamped_at = blocked_at or (await database_clock(db)).isoformat()
+    try:
+        authority_evidence, authority_signature = reseal_restart_safety_state(
+            current,
+            first_blocked_at=stamped_at,
+        )
+    except RestartAuthorityError:
+        return None
     await db.execute(
-        f"UPDATE restart_requests SET first_blocked_at = {stamp_sql} "
+        "UPDATE restart_requests SET first_blocked_at = ?, "
+        "authority_evidence = ?, authority_signature = ? "
         "WHERE id = ? AND status = ? "
-        "AND (first_blocked_at IS NULL OR first_blocked_at = '')",
-        params,
+        "AND (first_blocked_at IS NULL OR first_blocked_at = '') "
+        "AND authority_signature = ?",
+        (
+            stamped_at,
+            authority_evidence,
+            authority_signature,
+            request_id,
+            expected_current_status,
+            current.authority_signature,
+        ),
     )
     return await get_request(db, request_id)
 
 
 async def clear_deferral_started(
     db, request_id: str, *, expected_current_status: str,
-) -> bool:
-    """Clear a busy interval after fleet quiescence is observed."""
+) -> Optional[RestartRequest]:
+    """Clear a busy interval and return the exact newly resealed row."""
 
+    current = await get_request(db, request_id)
+    if current is None:
+        return None
+    verified, _ = verify_restart_authority(current)
+    if not verified:
+        return None
+    try:
+        authority_evidence, authority_signature = reseal_restart_safety_state(
+            current,
+            first_blocked_at="",
+        )
+    except RestartAuthorityError:
+        return None
     result = await db.execute(
-        "UPDATE restart_requests SET first_blocked_at = '' "
-        "WHERE id = ? AND status = ?",
-        (request_id, expected_current_status),
+        "UPDATE restart_requests SET first_blocked_at = '', "
+        "authority_evidence = ?, authority_signature = ? "
+        "WHERE id = ? AND status = ? AND first_blocked_at = ? "
+        "AND authority_signature = ?",
+        (
+            authority_evidence,
+            authority_signature,
+            request_id,
+            expected_current_status,
+            current.first_blocked_at,
+            current.authority_signature,
+        ),
     )
-    return await _write_landed(
+    landed = await _write_landed(
         db, result, request_id, lambda row: row.first_blocked_at == "",
     )
+    if not landed:
+        return None
+    refreshed = await get_request(db, request_id)
+    if (
+        refreshed is None
+        or refreshed.status != expected_current_status
+        or refreshed.first_blocked_at
+        or refreshed.authority_signature != authority_signature
+    ):
+        return None
+    return refreshed
 
 
 async def acknowledge_escalation(

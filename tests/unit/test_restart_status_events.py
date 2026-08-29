@@ -14,8 +14,10 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
 )
@@ -42,6 +44,17 @@ from kestrel_sovereign.storage.db import SQLiteBackend
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _sovereign_restart_authority(monkeypatch):
+    """Every request fixture crosses the production authority boundary."""
+
+    monkeypatch.setenv("KESTREL_API_KEY", "restart-status-event-test-key")
+    with caller_context_scope(
+        CallerContext.sovereign(identity="restart-status-event-test")
+    ):
+        yield
 
 
 async def _backend(tmp_path):
