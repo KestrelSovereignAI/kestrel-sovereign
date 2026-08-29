@@ -73,10 +73,16 @@ class _StubTM:
     async def get_task(self, task_id):
         return self._tasks.get(task_id)
 
+    async def get_task_for_recipient(self, task_id, _recipient_agent_id):
+        return self._tasks.get(task_id)
+
 
 class _StubTaskFeature:
     def __init__(self, tasks):
         self.task_manager = _StubTM(tasks)
+        # Principal-bound task reads require the same recipient DID that the
+        # production TaskFeature carries on its owning agent.
+        self.agent = SimpleNamespace(did=AGENT_ID)
 
 
 class _StubPeers:
