@@ -392,6 +392,68 @@ async def test_partial_host_fanout_persists_every_exact_target_outcome(tmp_path)
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_host_receipt_rejects_empty_ambiguous_fanout(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-empty-host.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        request = StopRequest(
+            scope=StopScope.HOST,
+            actor_id="did:test:operator",
+            correlation_id="empty-host-fanout",
+        )
+
+        with pytest.raises(ValueError, match="at least one target outcome"):
+            await store.persist(request, ())
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_host_receipt_reader_rejects_legacy_empty_fanout(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.stop.receipt import _fingerprint
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-empty-host-read.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        request = StopRequest(
+            scope=StopScope.HOST,
+            actor_id="did:test:operator",
+            correlation_id="legacy-empty-host-fanout",
+        )
+        await db.execute(
+            "INSERT INTO stop_receipts ("
+            "receipt_id, operation_id, request_fingerprint, scope, actor_id, "
+            "requested_target, target_agent_id, reason, cascade, occurred_at, "
+            "turn_id, span_id, trace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-empty-receipt",
+                request.correlation_id,
+                _fingerprint(request),
+                StopScope.HOST.value,
+                request.actor_id,
+                None,
+                None,
+                None,
+                1,
+                "2026-08-28T00:00:00+00:00",
+                None,
+                None,
+                None,
+            ),
+        )
+
+        with pytest.raises(StopReceiptCorruptError, match="missing its target"):
+            await store.load(request)
+    finally:
+        await db.close()
+
+
 class _FailingStore:
     def __init__(self, *, fail_load=False, fail_persist=False):
         self.fail_load = fail_load
