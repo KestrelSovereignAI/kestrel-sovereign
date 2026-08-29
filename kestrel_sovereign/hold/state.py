@@ -486,6 +486,20 @@ class HoldStore:
             for receipt in applied
             if receipt.action is HoldAction.HOLD
         }
+        # Every prior/resulting reference names an applied Hold authority,
+        # including non-applied audit outcomes.  ALREADY_IN_STATE and
+        # REFUSED_STALE do not consume authority, but accepting a dangling
+        # reference would let an idempotent replay return a receipt whose
+        # requested latch never existed (or was deleted).
+        for receipt in receipts:
+            for authority_id in {
+                receipt.prior_hold_receipt_id,
+                receipt.resulting_hold_receipt_id,
+            }:
+                if authority_id and authority_id not in authorities:
+                    raise HoldCorruptStateError(
+                        "Hold history references missing authority receipt"
+                    )
         consumers: dict[str, HoldReceipt] = {}
         for receipt in applied:
             prior = receipt.prior_hold_receipt_id
