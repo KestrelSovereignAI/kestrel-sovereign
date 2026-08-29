@@ -1234,7 +1234,12 @@ def _active_local_peer_host_url(app: FastAPI) -> Optional[str]:
     return explicit_url.rstrip("/") if explicit_url else None
 
 
-def _hosted_peer_directory_context(app: FastAPI, agent) -> tuple[object, object]:
+def _hosted_peer_directory_context(
+    app: FastAPI,
+    agent,
+    *,
+    manager=None,
+) -> tuple[object, object]:
     """Return the effective directory pair for one hosted agent's A2A policy.
 
     ``PeersFeature`` owns the local-host compatibility adapter after feature
@@ -1288,7 +1293,22 @@ def _hosted_peer_directory_context(app: FastAPI, agent) -> tuple[object, object]
         refresh = getattr(peer_feature, "refresh_local_host_peer_directory", None)
         if not callable(refresh):
             return None, None
-        refreshed = refresh(host_url=host_url, api_key=get_api_key())
+        local_cancel = None
+        if manager is not None:
+            async def local_cancel(requester, peer, task_id, payload):
+                return await manager.cancel_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                    payload=payload,
+                )
+
+        refreshed = refresh(
+            host_url=host_url,
+            api_key=get_api_key(),
+            local_cancel=local_cancel,
+        )
         return refreshed if refreshed is not None else (None, None)
     return (
         getattr(agent, "peer_directory_router", None),
@@ -1333,7 +1353,11 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         federated_fallback=federated,
     )
     install_a2a_inbound_sender_authorizer(manager, recipient=agent)
-    peer_router, peer_requester = _hosted_peer_directory_context(app, agent)
+    peer_router, peer_requester = _hosted_peer_directory_context(
+        app,
+        agent,
+        manager=manager,
+    )
     manager.install_a2a_hosted_policy(
         agent,
         resolver=agent.a2a_did_resolver,

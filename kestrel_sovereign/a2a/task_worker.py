@@ -163,7 +163,10 @@ class TaskWorker:
     async def _poll_and_process(self) -> None:
         """Poll for pending tasks and dispatch them."""
         # Get pending tasks
-        pending = await self.task_manager.get_pending_tasks(limit=self.max_concurrent)
+        pending = await self.task_manager.get_pending_tasks(
+            limit=self.max_concurrent,
+            recipient_agent_id=self.agent_name,
+        )
 
         for task in pending:
             # Find handler
@@ -202,6 +205,7 @@ class TaskWorker:
                     task_id=task_id,
                     new_state=TaskState.WORKING,
                     agent_name=self.agent_name,
+                    recipient_agent_id=self.agent_name,
                 )
 
                 # Execute handler
@@ -228,6 +232,7 @@ class TaskWorker:
                         new_state=TaskState.INPUT_REQUIRED,
                         message=message,
                         agent_name=self.agent_name,
+                        recipient_agent_id=self.agent_name,
                     )
                 elif result.success:
                     # Complete successfully
@@ -236,6 +241,7 @@ class TaskWorker:
                         response=result.response or "Task completed.",
                         agent_name=self.agent_name,
                         artifacts=result.artifacts,
+                        recipient_agent_id=self.agent_name,
                     )
                     # Clear retry count on success
                     self._retry_counts.pop(task_id, None)
@@ -265,6 +271,7 @@ class TaskWorker:
                 task_id=task_id,
                 new_state=TaskState.SUBMITTED,
                 agent_name=self.agent_name,
+                recipient_agent_id=self.agent_name,
             )
 
             await asyncio.sleep(self.retry_delay)
@@ -275,6 +282,7 @@ class TaskWorker:
                 task_id=task_id,
                 error=f"Failed after {self.max_retries} attempts: {error}",
                 agent_name=self.agent_name,
+                recipient_agent_id=self.agent_name,
             )
             self._retry_counts.pop(task_id, None)
 

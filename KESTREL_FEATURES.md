@@ -743,6 +743,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/stream`
   - `GET /api/agent/tasks`
   - `POST /api/agent/tasks/send`
+  - `POST /api/agent/tasks/{task_id:path}/cancel`
   - `GET /api/agent/tasks/{task_id}`
   - `GET /api/agent/tasks/{task_id}/subscribe`
 - [`kestrel_sovereign/endpoints/auth_oauth.py`](kestrel_sovereign/endpoints/auth_oauth.py)

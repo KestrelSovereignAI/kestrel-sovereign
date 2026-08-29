@@ -51,6 +51,10 @@ class PeerTransportError(PeerDirectoryError):
     """The transport failed without a peer authorization decision."""
 
 
+class PeerTaskConflictError(PeerDirectoryError):
+    """The peer rejected a task operation because its lifecycle already won."""
+
+
 class PeerProtocolError(PeerDirectoryError):
     """A router or peer returned an invalid protocol payload."""
 
@@ -174,6 +178,15 @@ class PeerDirectoryRouter(Protocol):
     ) -> Mapping[str, Any]:
         """Authorize and fetch one routed A2A task result."""
 
+    async def cancel_a2a_task(
+        self,
+        requester: PeerRequester,
+        peer: PeerIdentity,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Authorize and deliver one signed cancellation to its recipient."""
+
     def subscribe_a2a_task(
         self,
         requester: PeerRequester,
@@ -226,10 +239,13 @@ class LocalHostPeerDirectory:
         *,
         api_key: str = "",
         client_factory: Callable[..., Any] = httpx.AsyncClient,
+        local_cancel: Optional[Callable[..., Any]] = None,
     ) -> None:
         self._host_url = host_url.rstrip("/")
         self._api_key = api_key
         self._client_factory = client_factory
+        # Host-owned process-local capability; never serialized onto the wire.
+        self._local_cancel = local_cancel
 
     def _headers(self) -> dict[str, str]:
         from kestrel_sovereign.auth import (
@@ -277,6 +293,10 @@ class LocalHostPeerDirectory:
             raise PeerUnavailableError("Peer is unavailable")
         if status_code in (401, 403):
             raise PeerAccessDeniedError("Peer operation is not authorized")
+        if status_code == 409:
+            raise PeerTaskConflictError(
+                "Peer task state conflicts with the requested operation"
+            )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -486,6 +506,54 @@ class LocalHostPeerDirectory:
                 )
                 self._raise_for_route_status(response, action="fetching A2A task")
                 return self._as_mapping(response, action="fetching A2A task")
+        except PeerDirectoryError:
+            raise
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            raise PeerTransportError("Could not reach local peer host") from exc
+
+    async def cancel_a2a_task(
+        self,
+        requester: PeerRequester,
+        peer: PeerIdentity,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        self._require_requester(requester)
+        try:
+            authorized_peer = await self._authorize_peer(requester, peer)
+            if callable(self._local_cancel):
+                result = self._local_cancel(
+                    requester,
+                    authorized_peer,
+                    task_id,
+                    payload,
+                )
+                if hasattr(result, "__await__"):
+                    result = await result
+                if not isinstance(result, Mapping):
+                    raise PeerProtocolError(
+                        "Local host returned an invalid cancellation receipt"
+                    )
+                return result
+            async with self._client_factory() as client:
+                response = await client.post(
+                    self._peer_url(
+                        authorized_peer,
+                        f"api/agent/tasks/{quote(task_id, safe='')}/cancel",
+                    ),
+                    json=dict(payload),
+                    headers=self._headers(),
+                    timeout=httpx.Timeout(
+                        connect=PEER_CONNECT_TIMEOUT,
+                        read=PEER_READ_TIMEOUT,
+                        write=PEER_READ_TIMEOUT,
+                        pool=PEER_CONNECT_TIMEOUT,
+                    ),
+                )
+                self._raise_for_route_status(
+                    response, action="canceling A2A task"
+                )
+                return self._as_mapping(response, action="canceling A2A task")
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
