@@ -119,6 +119,8 @@ class TestSpawnCaps:
         m._child_mandates = {"existing": MagicMock()}
         parent = MagicMock()
         parent.agent_id = "did:test:parent"
+        m._agent_names = {parent.agent_id: "parentname"}
+        m._agents = {"parentname": parent}
         from kestrel_sovereign.spawn.mandate import SpawnMandate
         with pytest.raises(ValueError, match="cap"):
             await m.spawn_agent(
@@ -134,6 +136,7 @@ class TestSpawnCaps:
         parent.agent_id = "did:test:parent"
         # Parent was itself spawned with a leaf mandate (max_child_depth=0).
         m._agent_names = {"did:test:parent": "parentname"}
+        m._agents = {"parentname": parent}
         leaf_mandate = MagicMock()
         leaf_mandate.max_child_depth = 0
         m._child_mandates = {"parentname": leaf_mandate}
@@ -153,6 +156,7 @@ class TestSpawnCaps:
         parent = MagicMock()
         parent.agent_id = "did:test:parent"
         m._agent_names = {"did:test:parent": "parentname"}
+        m._agents = {"parentname": parent}
         parent_mandate = MagicMock()
         parent_mandate.max_child_depth = 2
         m._child_mandates = {"parentname": parent_mandate}
