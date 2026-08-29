@@ -865,7 +865,7 @@ class TaskManager:
         try:
             canonical = await self.task_store.get(task.id)
             canonical_read_succeeded = canonical is not None
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             canonical = None
             logger.warning(
                 "Task %s was accepted but its canonical readback failed",
