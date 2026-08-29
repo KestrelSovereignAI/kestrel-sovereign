@@ -674,6 +674,48 @@ async def test_existing_foreign_host_receipt_fails_closed_on_every_state_path(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "disposition", "expected", "prior"),
+    [
+        ("hold", "already_in_state", "", "missing-active-hold"),
+        ("release", "refused_stale", "stale-observation", "fabricated-current"),
+    ],
+)
+async def test_non_applied_receipt_prior_must_reference_applied_authority(
+    hold_db,
+    action,
+    disposition,
+    expected,
+    prior,
+):
+    db, store = hold_db
+    await db.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+        "prior_hold_receipt_id, resulting_hold_receipt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            f"non-applied-{disposition}",
+            f"operation-{disposition}",
+            action,
+            disposition,
+            "agent",
+            "did:agent:kite",
+            "imported malformed audit evidence",
+            "did:sovereign:operator",
+            "2026-08-28T00:00:00+00:00",
+            expected,
+            prior,
+            prior,
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="non-applied.*authority"):
+        await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("read", ["one", "effective"])
 async def test_state_read_validates_projection_inside_one_locked_snapshot(
     hold_db,

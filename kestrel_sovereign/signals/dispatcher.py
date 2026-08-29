@@ -967,6 +967,12 @@ class SignalDispatcher:
         # final outcome. Every public dispatch begins with a private collector;
         # a durable route installs a fresh one for its one final outcome below.
         deferred_token = self._deferred_outcome_logs.set(None)
+        # This public boundary may be entered by a task spawned inside a durable
+        # cognition turn. The nested signal owns no selected durable lease, so
+        # it must not inherit the parent's defer/NACK classification. The one
+        # private route task that does own the lease calls
+        # ``_route_after_durable_persistence`` directly with the marker set.
+        durable_route_token = self._durable_cognition_route.set(False)
         # Publish the in-flight signal for the duration of this dispatch so
         # code running inside handlers/turns (e.g. the Talon coordinator's
         # orchestrator/workflow correlation stamping, kestrel-talon#53) can
@@ -1045,6 +1051,7 @@ class SignalDispatcher:
                     )
                 )
             reset_current_signal(ctx_token)
+            self._durable_cognition_route.reset(durable_route_token)
             self._deferred_outcome_logs.reset(deferred_token)
 
     async def enqueue_signal(
@@ -3163,6 +3170,14 @@ class SignalDispatcher:
             executor_id=self._durable_delivery_owner,
         )
         if delivery is None:
+            held_result = await self._held_signal_result(
+                signal,
+                registration,
+                start,
+                durable=True,
+            )
+            if held_result is not None:
+                return held_result
             existing = await self.get_durable_delivery_for_event(
                 consumer_id=consumer_id,
                 event_id=persisted_event_id,
@@ -3245,6 +3260,14 @@ class SignalDispatcher:
                 executor_id=self._durable_delivery_owner,
             )
         if delivery is None:
+            held_result = await self._held_signal_result(
+                signal,
+                registration,
+                start,
+                durable=True,
+            )
+            if held_result is not None:
+                return held_result
             existing = await self.get_durable_delivery_for_event(
                 consumer_id=consumer_id,
                 event_id=persisted_event_id,

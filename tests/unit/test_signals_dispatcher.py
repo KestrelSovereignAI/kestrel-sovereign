@@ -260,6 +260,75 @@ async def test_hold_committed_while_waiting_for_signal_lock_skips_handler(
     handler.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_public_nested_dispatch_does_not_inherit_durable_parent_marker(
+    dispatcher_components,
+):
+    """A durable parent cannot misclassify an ordinary nested signal as retryable."""
+
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    c.registry.register(_action_reg("nested.while.held", handler=handler))
+    c.agent._hold_store = _HoldSnapshots(_held_state(c.agent.did))
+    token = c.dispatcher._durable_cognition_route.set(True)
+    try:
+        result = await c.dispatcher.dispatch_signal(_signal("nested.while.held"))
+    finally:
+        c.dispatcher._durable_cognition_route.reset(token)
+
+    assert result.status is Status.DROPPED_QUIET_HOURS
+    assert result.error == "hold_skipped"
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [False, True], ids=["cognition", "terminal"])
+async def test_hold_winning_exact_claim_race_is_deferred(
+    dispatcher_components,
+    terminal,
+):
+    """A Hold-fenced claim miss is not an unavailable-delivery failure."""
+
+    c = dispatcher_components
+    signal = _signal("claim.race")
+    registration = _action_reg("claim.race")
+    hold_snapshots = (
+        (EffectiveHoldState(host=None, agent=None), _held_state(c.agent.did))
+        if not terminal
+        else (_held_state(c.agent.did),)
+    )
+    c.agent._hold_store = _HoldSnapshots(*hold_snapshots)
+    c.dispatcher.claim_durable_delivery_for_event = AsyncMock(return_value=None)
+    c.dispatcher.get_durable_delivery_for_event = AsyncMock(
+        return_value=SimpleNamespace(status="pending")
+    )
+
+    if terminal:
+        result = await c.dispatcher._route_durable_terminal_delivery(
+            signal,
+            registration,
+            0.0,
+            persisted_event_id="event-race",
+            consumer_id="consumer-race",
+            durable_admission=None,
+        )
+    else:
+        result = await c.dispatcher._route_durable_cognition_delivery(
+            signal,
+            registration,
+            0.0,
+            persisted_event_id="event-race",
+            consumer_id="consumer-race",
+            durable_admission=None,
+            durable_created=True,
+            use_live_signal=False,
+        )
+
+    await c.dispatcher._drain_outcome_logs_for_signal(signal.id)
+    assert result.status is Status.COALESCED
+    assert result.error == "hold_deferred"
+
+
 @pytest.mark.parametrize(
     ("durable", "status", "error"),
     [
@@ -282,7 +351,8 @@ async def test_turn_gate_hold_refusal_preserves_signal_disposition(
     c = dispatcher_components
     template = tmp_path / "hold-race.md"
     template.write_text("source={source} payload={payload}")
-    c.registry.register(_cognition_reg(template, name="hold.turn.race"))
+    registration = _cognition_reg(template, name="hold.turn.race")
+    c.registry.register(registration)
     refusal = HoldTurnRefusal(
         agent_id=c.agent.did,
         effective_state=_held_state(c.agent.did),
@@ -292,13 +362,20 @@ async def test_turn_gate_hold_refusal_preserves_signal_disposition(
         raise refusal
 
     c.agent.process_input = refuse_at_turn_gate
-    token = c.dispatcher._durable_cognition_route.set(durable)
-    try:
-        result = await c.dispatcher.dispatch_signal(
-            _signal("hold.turn.race", mode=SignalMode.COGNITION)
-        )
-    finally:
-        c.dispatcher._durable_cognition_route.reset(token)
+    signal = _signal("hold.turn.race", mode=SignalMode.COGNITION)
+    if durable:
+        token = c.dispatcher._durable_cognition_route.set(True)
+        try:
+            result = await c.dispatcher._route_after_durable_persistence(
+                signal,
+                registration,
+                0.0,
+            )
+        finally:
+            c.dispatcher._durable_cognition_route.reset(token)
+        await c.dispatcher._drain_outcome_logs_for_signal(signal.id)
+    else:
+        result = await c.dispatcher.dispatch_signal(signal)
 
     assert result.status is status
     assert result.error == error
