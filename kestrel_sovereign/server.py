@@ -1679,11 +1679,6 @@ async def _shutdown_host_features(app: FastAPI) -> None:
         # Router/UI state must not outlive a failed feature shutdown.  Each
         # following cleanup is in a ``finally`` so one bad unmount cannot leave
         # the host session factory or database live.
-        session_factory = (
-            getattr(host_context, "session_factory", None)
-            if host_context is not None
-            else None
-        )
         try:
             _hf.unmount_host_features(app)
         finally:
@@ -1693,26 +1688,8 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                 try:
                     _unmount_feature_ui_assets(app)
                 finally:
-                    try:
-                        if session_factory is not None:
-                            await session_factory.close()
-                    except Exception as exc:  # noqa: BLE001 - close host DB too
-                        logger.warning(
-                            "Host feature session-factory shutdown failed: %s", exc
-                        )
-                    finally:
-                        host_db = (
-                            getattr(host_context, "db", None)
-                            if host_context is not None
-                            else None
-                        )
-                        if host_db is not None and hasattr(host_db, "close"):
-                            try:
-                                await host_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Host feature database shutdown failed: %s", exc
-                                )
+                    if host_context is not None:
+                        await _hf.close_host_context(host_context)
 
 
 def _uses_shared_postgres_scheduler() -> bool:
@@ -2640,13 +2617,21 @@ async def _lifespan_startup(app: FastAPI):
         # Complete prospective-set rejection is a startup failure, not an
         # optional-feature warning. No candidate was mounted and prior valid
         # state remains visible.
-        if candidate_ctx is not None and candidate_started:
-            await _hf.stop_host_features(candidate_started, candidate_ctx)
+        if candidate_ctx is not None:
+            try:
+                if candidate_started:
+                    await _hf.stop_host_features(candidate_started, candidate_ctx)
+            finally:
+                await _hf.close_host_context(candidate_ctx)
         raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Host feature initialization failed: %s", exc)
-        if candidate_ctx is not None and candidate_started:
-            await _hf.stop_host_features(candidate_started, candidate_ctx)
+        if candidate_ctx is not None:
+            try:
+                if candidate_started:
+                    await _hf.stop_host_features(candidate_started, candidate_ctx)
+            finally:
+                await _hf.close_host_context(candidate_ctx)
 
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)

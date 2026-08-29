@@ -34,6 +34,7 @@ from kestrel_sovereign.agent.system_prompt_assembler import (
     CLAUSE_STYLE_REMINDER,
     TORTOISE_DOCTRINE_FILENAME,
 )
+from kestrel_sovereign.features.bootstrap.loader import DEFAULT_BOOTSTRAP_FILES
 from kestrel_sovereign.operator import (
     ExecutionTargetRegistration,
     OperatorRegistrationSet,
@@ -121,9 +122,9 @@ class ContextClauseRegistry:
         self._external_registries: tuple[ContextClauseRegistry, ...] = ()
 
     _RESERVED_AUDIT_NAMES = frozenset(
-        {
+        set(DEFAULT_BOOTSTRAP_FILES)
+        | {
             AGENTS_FILENAME,
-            "SOUL.md",
             TORTOISE_DOCTRINE_FILENAME,
             CLAUSE_ADDITIONAL_CONTEXT,
             CLAUSE_KESTREL_CONSTITUTION,

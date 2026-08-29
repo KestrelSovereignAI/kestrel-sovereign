@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import APIRouter, FastAPI
-
+from kestrel_sdk.features import ContributionContractError
 from kestrel_sdk.features.host_base import HostFeature
 from kestrel_sdk.features.ui import UIContributions
 
@@ -293,8 +293,9 @@ async def test_one_feature_start_failure_does_not_abort_others():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reject_context", [False, True])
 async def test_server_lifespan_wires_and_closes_host_features(
-    monkeypatch, tmp_path: Path,
+    monkeypatch, tmp_path: Path, reject_context: bool,
 ):
     """Exercise the deployed ``server:app`` call site, not runtime helpers.
 
@@ -366,6 +367,8 @@ async def test_server_lifespan_wires_and_closes_host_features(
     def validate_host_context(registry):
         assert registry is host_context_registry
         events.append("host-context-validate")
+        if reject_context:
+            raise ContributionContractError("host/agent context conflict")
 
     def bind_host_context(registry):
         assert registry is host_context_registry
@@ -420,6 +423,27 @@ async def test_server_lifespan_wires_and_closes_host_features(
     )
 
     test_app = FastAPI()
+    if reject_context:
+        with pytest.raises(
+            ContributionContractError,
+            match="host/agent context conflict",
+        ):
+            async with server.lifespan(test_app):
+                pass
+
+        assert events == [
+            "agents-load",
+            "context-build",
+            "host-start",
+            "host-context-validate",
+            "host-stop",
+            "session-close",
+            "db-close",
+            "host-unmount",
+            "agents-stop",
+        ]
+        return
+
     async with server.lifespan(test_app):
         assert fake_config.host.port == 9090
         assert test_app.state.host_features == [feature]

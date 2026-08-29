@@ -229,6 +229,27 @@ def test_active_context_name_conflict_is_rejected_before_rendering(tmp_path):
     assert runtime.active_owners() == (first.contribution_owner,)
 
 
+def test_bootstrap_yaml_name_is_rejected_before_rendering(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    feature.context_registration = ContextClauseRegistration(
+        owner=feature.contribution_owner,
+        name="STRATEGY.yaml",
+        priority=30,
+        renderer=feature._render_context_clause,
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        runtime.prepare_transition((feature,))
+
+    assert feature.context_renderer_calls == 0
+    assert runtime.active_owners() == ()
+
+
 @pytest.mark.asyncio
 async def test_owner_conflict_rejects_complete_transition_before_mutation(tmp_path):
     agent = _agent(tmp_path)

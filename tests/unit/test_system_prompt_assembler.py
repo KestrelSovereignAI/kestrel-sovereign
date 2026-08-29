@@ -140,6 +140,31 @@ def test_assemble_skips_agents_when_anchored_supplies_it():
     assert "from anchor" in result.prompt
 
 
+def test_anchored_doctrine_takes_precedence_for_every_bootstrap_name():
+    result = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(
+            [
+                ("TOOLS.md", "bootstrap tools"),
+                ("STRATEGY.yaml", "bootstrap strategy"),
+            ]
+        ),
+        anchored_doctrine=OrderedDict(
+            [
+                ("TOOLS.md", "anchored tools"),
+                ("STRATEGY.yaml", "anchored strategy"),
+            ]
+        ),
+    )
+
+    assert result.injected_clauses.count("TOOLS.md") == 1
+    assert result.injected_clauses.count("STRATEGY.yaml") == 1
+    assert "bootstrap tools" not in result.prompt
+    assert "bootstrap strategy" not in result.prompt
+    assert "anchored tools" in result.prompt
+    assert "anchored strategy" in result.prompt
+
+
 def test_assemble_includes_agents_from_bootstrap_when_no_anchor():
     """Backwards-compat: if no anchored doctrine is supplied,
     AGENTS.md from bootstrap iteration is still emitted."""

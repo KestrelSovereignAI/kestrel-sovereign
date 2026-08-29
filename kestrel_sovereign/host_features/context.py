@@ -236,9 +236,28 @@ async def build_host_context(
     )
 
 
+async def close_host_context(ctx: Any) -> None:
+    """Best-effort close of every resource owned by one host context."""
+
+    session_factory = getattr(ctx, "session_factory", None)
+    try:
+        if session_factory is not None:
+            await session_factory.close()
+    except Exception as exc:  # noqa: BLE001 - the database must still close
+        logger.warning("Host feature session-factory shutdown failed: %s", exc)
+    finally:
+        db = getattr(ctx, "db", None)
+        if db is not None and hasattr(db, "close"):
+            try:
+                await db.close()
+            except Exception as exc:  # noqa: BLE001 - terminal cleanup
+                logger.warning("Host feature database shutdown failed: %s", exc)
+
+
 __all__ = [
     "FLEET_TENANT_ID",
     "FleetSessionFactory",
     "SovereignHostContext",
     "build_host_context",
+    "close_host_context",
 ]

@@ -163,8 +163,8 @@ def assemble_system_prompt(
 
     `bootstrap_files` is the full `BootstrapLoader.load()` cache —
     SOUL.md is special-cased; HEARTBEAT.md is skipped (loaded
-    separately by the heartbeat runner); AGENTS.md is skipped IF
-    `anchored_doctrine` already supplies it (avoids duplication).
+    separately by the heartbeat runner); any filename also supplied by
+    `anchored_doctrine` is skipped so the anchored copy takes precedence.
 
     `anchored_doctrine` is an OrderedDict of `filename → content` for
     constitutional-injection bundle members. Order is the caller's
@@ -202,16 +202,15 @@ def assemble_system_prompt(
 
     # Bootstrap files (priorities 4 / 6) — SOUL.md is priority 4 with
     # its identity wrapper; HEARTBEAT.md is loaded by the heartbeat
-    # runner separately and must NOT appear here. AGENTS.md is
-    # excluded if anchored_doctrine already supplies it (avoids
-    # duplication when the dispatcher passes AGENTS.md as anchored).
+    # runner separately and must NOT appear here. Any bootstrap file is
+    # excluded if anchored_doctrine already supplies the same audit name;
+    # the anchored copy has higher authority and priority.
     anchored = anchored_doctrine or OrderedDict()
-    skip_agents_from_bootstrap = AGENTS_FILENAME in anchored
 
     for filename, content in bootstrap_files.items():
         if filename == "HEARTBEAT.md":
             continue
-        if filename == AGENTS_FILENAME and skip_agents_from_bootstrap:
+        if filename in anchored:
             continue
         if filename == "SOUL.md":
             add(
