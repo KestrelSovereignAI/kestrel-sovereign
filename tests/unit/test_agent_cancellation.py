@@ -490,10 +490,40 @@ def test_every_http_turn_door_primes_the_durable_stop_fence():
     bridge_source = Path(
         "kestrel_sovereign/features/bridge/router.py"
     ).read_text()
+    models_source = Path("kestrel_sovereign/endpoints/models.py").read_text()
+    rasa_source = Path("kestrel_sovereign/endpoints/rasa_shim.py").read_text()
+    sovereignty_source = Path(
+        "kestrel_sovereign/endpoints/sovereignty.py"
+    ).read_text()
     call = "await prime_durable_stop_fence(request, agent, request_id)"
 
     assert agent_source.count(call) == 2
     assert bridge_source.count(call) == 2
+    assert models_source.count(call) == 1
+    assert rasa_source.count(call) == 1
+    assert sovereignty_source.count(call) == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_stop_fence_fails_closed_after_store_startup_error():
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.api_errors import ApiHTTPException
+    from kestrel_sovereign.endpoints.agent_helpers import prime_durable_stop_fence
+
+    app = FastAPI()
+    app.state.stop_receipt_store = None
+    app.state.stop_receipt_store_error = "RuntimeError"
+    request = MagicMock()
+    request.app = app
+    agent = MagicMock()
+    agent.agent_id = "did:test:receipt-outage"
+
+    with pytest.raises(ApiHTTPException) as raised:
+        await prime_durable_stop_fence(request, agent, "stopped-turn")
+
+    assert raised.value.status_code == 503
+    assert raised.value.code == "stop_evidence_unavailable"
 
 
 @pytest.mark.asyncio

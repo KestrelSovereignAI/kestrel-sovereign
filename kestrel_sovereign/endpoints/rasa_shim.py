@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from kestrel_sovereign.endpoints.agent_helpers import (
+    prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
     stopped_invocation_http_error,
@@ -134,6 +135,7 @@ async def rasa_webhook(
 
     try:
         agent = request.app.state.agent
+        await prime_durable_stop_fence(request, agent, request_id)
         async with _agent_semaphore:
             response_text = await agent.process_input(
                 user_input=enriched_input,
@@ -148,6 +150,8 @@ async def rasa_webhook(
 
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error(f"[rasa-shim] Error processing message from {sender}: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail="Kestrel agent failed to process the message.")

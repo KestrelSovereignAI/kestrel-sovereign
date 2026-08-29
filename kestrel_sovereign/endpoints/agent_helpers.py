@@ -92,6 +92,17 @@ async def prime_durable_stop_fence(
     store = getattr(request.app.state, "stop_receipt_store", None)
     lookup = getattr(store, "has_acknowledged_turn_stop", None)
     if not callable(lookup):
+        startup_error = getattr(
+            request.app.state, "stop_receipt_store_error", ""
+        )
+        if isinstance(startup_error, str) and startup_error:
+            raise ApiHTTPException(
+                status_code=503,
+                code="stop_evidence_unavailable",
+                message=(
+                    "Durable Stop evidence could not be checked before execution."
+                ),
+            )
         return False
     agent_id = getattr(agent, "agent_id", None)
     if not isinstance(agent_id, str) or not agent_id.strip():
