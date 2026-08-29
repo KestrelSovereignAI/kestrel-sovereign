@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
-import tempfile
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +33,6 @@ from kestrel_sdk.signals import (
     Status,
     Trust,
     Urgency,
-    Visibility,
 )
 
 from kestrel_sovereign.signals import (
@@ -261,6 +258,50 @@ async def test_hold_committed_while_waiting_for_signal_lock_skips_handler(
     assert result.status is Status.DROPPED_QUIET_HOURS
     assert result.error == "hold_skipped"
     handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("durable", "status", "error"),
+    [
+        (False, Status.DROPPED_QUIET_HOURS, "hold_skipped"),
+        (True, Status.COALESCED, "hold_deferred"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_turn_gate_hold_refusal_preserves_signal_disposition(
+    dispatcher_components,
+    tmp_path,
+    durable,
+    status,
+    error,
+):
+    """A Hold that wins after snapshots is not a failed cognition turn."""
+
+    from kestrel_sovereign.hold import HoldTurnRefusal
+
+    c = dispatcher_components
+    template = tmp_path / "hold-race.md"
+    template.write_text("source={source} payload={payload}")
+    c.registry.register(_cognition_reg(template, name="hold.turn.race"))
+    refusal = HoldTurnRefusal(
+        agent_id=c.agent.did,
+        effective_state=_held_state(c.agent.did),
+    )
+
+    async def refuse_at_turn_gate(*_args, **_kwargs):
+        raise refusal
+
+    c.agent.process_input = refuse_at_turn_gate
+    token = c.dispatcher._durable_cognition_route.set(durable)
+    try:
+        result = await c.dispatcher.dispatch_signal(
+            _signal("hold.turn.race", mode=SignalMode.COGNITION)
+        )
+    finally:
+        c.dispatcher._durable_cognition_route.reset(token)
+
+    assert result.status is status
+    assert result.error == error
 
 
 @pytest.mark.asyncio

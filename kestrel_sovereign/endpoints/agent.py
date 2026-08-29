@@ -26,7 +26,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     request_invocation_provenance,
     resolve_request_invocation_id,
 )
-from kestrel_sovereign.hold import HoldTurnRefusal
+from kestrel_sovereign.hold import HoldTurnRefusal, require_turn_start_allowed
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
@@ -675,11 +675,14 @@ async def stream_agent_response(request: Request):
         except Exception:
             effective_session_id = session_id  # fall back; never block the stream
 
-        # Async-generator bodies do not run until the response body is already
-        # being consumed. Pull exactly one item at setup time so the universal
-        # turn-start Hold seam can still produce a typed HTTP 423 before
-        # headers become immutable. A non-Hold route error retains the legacy
-        # streamed safe-error contract below rather than becoming a setup 500.
+        # StreamingResponse consumes its body in a separate ASGI task. Take a
+        # read-only Hold admission snapshot here so a pre-existing latch still
+        # produces HTTP 423, but leave every interaction with the context-bound
+        # agent generator to that single response task.
+        try:
+            await require_turn_start_allowed(agent)
+        except HoldTurnRefusal as refusal:
+            raise held_turn_http_exception(refusal) from refusal
         stream_iterator = agent.process_input_streaming(
             user_input,
             model_override=model_override,
@@ -690,16 +693,6 @@ async def stream_agent_response(request: Request):
             invocation_provenance=invocation_provenance,
             attachments=attachments,
         )
-        no_prefetched_chunk = object()
-        first_chunk: object = no_prefetched_chunk
-        prefetched_error: Exception | None = None
-        try:
-            first_chunk = await anext(stream_iterator, no_prefetched_chunk)
-        except HoldTurnRefusal as refusal:
-            raise held_turn_http_exception(refusal) from refusal
-        except Exception as error:
-            prefetched_error = error
-
         async def generate():
             # Shared stop notice for the in-loop cancel check AND the post-loop
             # fallback (#2674). A strict (fail-closed) response audit that is
@@ -723,16 +716,7 @@ async def stream_agent_response(request: Request):
             try:
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
 
-                if prefetched_error is not None:
-                    raise prefetched_error
-
-                async def remaining_chunks():
-                    if first_chunk is not no_prefetched_chunk:
-                        yield first_chunk
-                    async for remaining in stream_iterator:
-                        yield remaining
-
-                async for chunk in remaining_chunks():
+                async for chunk in stream_iterator:
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
                         yield stop_notice

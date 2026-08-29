@@ -19,6 +19,7 @@ sessions against the host backend (SQLite default), so Phase 1 works standalone.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -207,9 +208,24 @@ async def build_host_context(
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
 
-        resolved = prepare_host_database(db_path)
-        db = await AsyncDatabase.sqlite(str(resolved))
-        validate_sqlite_family_private(resolved)
+        use_postgres = (
+            db_path is None
+            and os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+            == "postgres"
+        )
+        if use_postgres:
+            dsn = os.environ.get("KESTREL_DATABASE_URL")
+            if not dsn:
+                raise RuntimeError(
+                    "PostgreSQL host control storage requires KESTREL_DATABASE_URL"
+                )
+            db = await AsyncDatabase.postgres(dsn)
+            backend_location = "shared PostgreSQL"
+        else:
+            resolved = prepare_host_database(db_path)
+            db = await AsyncDatabase.sqlite(str(resolved))
+            validate_sqlite_family_private(resolved)
+            backend_location = str(resolved)
         inner = make_session_factory(db)
         session_factory = FleetSessionFactory(inner)
         from kestrel_sovereign.hold import HoldStore
@@ -217,7 +233,9 @@ async def build_host_context(
         hold_store = HoldStore(db)
         await hold_store.ensure_schema()
         logger.info(
-            "Host backend opened at %s (fleet tenant=%s)", resolved, FLEET_TENANT_ID
+            "Host backend opened at %s (fleet tenant=%s)",
+            backend_location,
+            FLEET_TENANT_ID,
         )
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
         if session_factory is not None:

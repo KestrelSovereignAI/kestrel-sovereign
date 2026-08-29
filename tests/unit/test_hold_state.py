@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -326,6 +326,34 @@ async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_p
             await reopened.session_factory.close()
         if reopened.db is not None:
             await reopened.db.close()
+
+
+@pytest.mark.asyncio
+async def test_host_context_uses_shared_postgres_for_hold_state(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign.host_features import storage
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "postgres-double.db"))
+    postgres = AsyncMock(return_value=db)
+    prepare = MagicMock(side_effect=AssertionError("SQLite must not open"))
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://shared/hold")
+    monkeypatch.setattr(AsyncDatabase, "postgres", postgres)
+    monkeypatch.setattr(storage, "prepare_host_database", prepare)
+
+    context = await build_host_context()
+    try:
+        postgres.assert_awaited_once_with("postgresql://shared/hold")
+        prepare.assert_not_called()
+        assert context.hold_store is not None
+    finally:
+        if context.session_factory is not None:
+            await context.session_factory.close()
+        if context.db is not None:
+            await context.db.close()
+        elif db is not None:
+            await db.close()
 
 
 @pytest.mark.asyncio

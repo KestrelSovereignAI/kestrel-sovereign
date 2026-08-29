@@ -427,6 +427,11 @@ class TestStopEndpoint:
         mock_agent.is_request_cancelled = MagicMock(return_value=False)
         mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
         mock_agent._conversation_response_identity = MagicMock(return_value={})
+        mock_agent.did = "did:test:http-held"
+        mock_agent.agent_id = "did:test:http-held"
+        mock_agent.__dict__["_hold_store"] = MagicMock(
+            get_effective=AsyncMock(return_value=refusal.effective_state)
+        )
         app.state.agent = mock_agent
 
         response = TestClient(app).post(path, json={"input": "do not begin"})
@@ -434,6 +439,47 @@ class TestStopEndpoint:
         assert response.status_code == 423
         assert response.json()["detail"] == "The agent is held and cannot begin a turn."
         assert "private operator reason" not in response.text
+        mock_agent._cleanup_cancelled_request.assert_called_once()
+
+    def test_stream_iterator_is_never_split_across_asgi_tasks(self):
+        """The endpoint and StreamingResponse must not share one generator."""
+
+        from contextvars import ContextVar
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        owner = ContextVar("stream-owner", default=False)
+
+        async def context_bound_stream(*_args, **_kwargs):
+            token = owner.set(True)
+            try:
+                yield "one safe chunk"
+            finally:
+                owner.reset(token)
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.process_input_streaming = context_bound_stream
+        mock_agent.register_active_request = MagicMock()
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.is_request_cancelled = MagicMock(return_value=False)
+        mock_agent.storage.resolve_session_id = AsyncMock(
+            side_effect=lambda value: value
+        )
+        app.state.agent = mock_agent
+
+        response = TestClient(app).post(
+            "/api/agent/stream", json={"input": "stay in one task"}
+        )
+
+        assert response.status_code == 200
+        assert response.text == "one safe chunk"
         mock_agent._cleanup_cancelled_request.assert_called_once()
 
     @pytest.mark.asyncio

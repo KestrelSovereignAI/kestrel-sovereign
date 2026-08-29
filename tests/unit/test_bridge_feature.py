@@ -14,19 +14,14 @@ Tests:
 - Protocol model validation
 """
 
-import asyncio
-import json
-import time
-import uuid
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 
 from kestrel_sovereign.features.bridge.feature import (
     BridgeFeature,
-    MAX_ACTIVE_SESSIONS,
     SESSION_IDLE_TIMEOUT_SECONDS,
 )
 from kestrel_sovereign.features.bridge.protocol import (
@@ -794,6 +789,68 @@ class TestGetRouter:
         assert "/api/bridge/capabilities" in route_paths
         assert "/api/bridge/health" in route_paths
         assert "/api/bridge/session" in route_paths
+
+    @pytest.mark.parametrize("path", ["/api/bridge/invoke", "/api/bridge/stream"])
+    def test_held_bridge_turn_returns_typed_423(self, path):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.features.bridge.router import get_router
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+            HoldTurnRefusal,
+        )
+        from kestrel_sovereign.rate_limit import limiter
+
+        latch = HoldState(
+            scope=HoldScope.AGENT,
+            target_id="did:test:bridge-held",
+            reason="private bridge Hold reason",
+            actor_id="did:sovereign:operator",
+            set_at="2026-08-28T12:00:00+00:00",
+            hold_receipt_id="hold:bridge",
+            revision=1,
+        )
+        effective = EffectiveHoldState(host=None, agent=latch)
+        refusal = HoldTurnRefusal(
+            agent_id="did:test:bridge-held", effective_state=effective
+        )
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent = MagicMock()
+        agent.did = "did:test:bridge-held"
+        agent.agent_id = "did:test:bridge-held"
+        agent.features = {"BridgeFeature": bridge}
+        agent.__dict__["_hold_store"] = MagicMock(
+            get_effective=AsyncMock(return_value=effective)
+        )
+        agent.process_input = AsyncMock(side_effect=refusal)
+
+        async def held_stream(*_args, **_kwargs):
+            raise refusal
+            yield  # pragma: no cover
+
+        agent.process_input_streaming = held_stream
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.state.agent = agent
+        app.include_router(get_router())
+
+        response = TestClient(app).post(
+            path,
+            json={"message": "do not begin", "channel_type": "api"},
+        )
+
+        assert response.status_code == 423
+        assert response.json()["detail"] == (
+            "The agent is held and cannot begin a turn."
+        )
+        assert "private bridge Hold reason" not in response.text
 
 
 # ============================================================================

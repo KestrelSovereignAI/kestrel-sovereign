@@ -32,10 +32,12 @@ from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    held_turn_http_exception,
     request_invocation_provenance,
     resolve_request_invocation_id,
 )
 from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign.hold import HoldTurnRefusal, require_turn_start_allowed
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -95,6 +97,10 @@ def get_router() -> APIRouter:
         """
         agent, bridge = _get_bridge_feature(request)
         start_ms = time.monotonic()
+        try:
+            await require_turn_start_allowed(agent)
+        except HoldTurnRefusal as refusal:
+            raise held_turn_http_exception(refusal) from refusal
 
         # Resolve or create a session
         session = await bridge.get_or_create_session(
@@ -132,6 +138,8 @@ def get_router() -> APIRouter:
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             )
+        except HoldTurnRefusal as refusal:
+            raise held_turn_http_exception(refusal) from refusal
         except Exception:
             # Exception text and tracebacks can contain bridge message/context
             # content.  The client receives only the fixed HTTP detail below;
@@ -176,6 +184,10 @@ def get_router() -> APIRouter:
         """
         agent, bridge = _get_bridge_feature(request)
         start_ms = time.monotonic()
+        try:
+            await require_turn_start_allowed(agent)
+        except HoldTurnRefusal as refusal:
+            raise held_turn_http_exception(refusal) from refusal
 
         # Resolve or create a session
         session = await bridge.get_or_create_session(

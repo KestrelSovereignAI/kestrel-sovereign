@@ -3846,6 +3846,21 @@ class SignalDispatcher:
                 registration=registration,
             )
 
+        return self._hold_signal_disposition(
+            signal, registration, start, durable=durable
+        )
+
+    def _hold_signal_disposition(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        start: float,
+        *,
+        durable: bool,
+        audit: "_ConstitutionAudit | None" = None,
+    ) -> SignalResult:
+        """Map one already-observed Hold without rereading a newer latch."""
+
         from kestrel_sovereign.hold import HeldWorkDisposition
         from kestrel_sovereign.hold.metrics import record_held_work_disposition
 
@@ -3872,6 +3887,7 @@ class SignalDispatcher:
             ),
             error=f"hold_{disposition.value}",
             registration=registration,
+            audit=audit,
         )
 
     # ------------------------------------------------------------------
@@ -4053,6 +4069,7 @@ class SignalDispatcher:
         from kestrel_sovereign.agent.context_manager import (
             reset_injection_tracking,
         )
+        from kestrel_sovereign.hold import HoldTurnRefusal
 
         reset_injection_tracking()
 
@@ -4108,6 +4125,14 @@ class SignalDispatcher:
                         "kestrel.signal.status", result.status.value
                     )
                 return result
+        except HoldTurnRefusal:
+            return self._hold_signal_disposition(
+                signal,
+                registration,
+                start,
+                durable=self._durable_cognition_route.get(),
+                audit=audit,
+            )
         except Exception as e:
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
