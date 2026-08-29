@@ -192,6 +192,16 @@ def _exact_nonnegative_revision(value: object) -> int:
     return value
 
 
+def _exact_active_flag(value: object) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in (0, 1)
+    ):
+        raise HoldCorruptStateError("hold latch active flag is invalid")
+    return value
+
+
 def _latch_from_row(row: Any) -> Optional[HoldState]:
     if row is None:
         return None
@@ -200,12 +210,10 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
     try:
         scope = HoldScope(str(row[0]))
         target_id = str(row[1])
-        active = int(row[2])
+        active = _exact_active_flag(row[2])
         revision = _exact_nonnegative_revision(row[7])
     except (TypeError, ValueError) as exc:
         raise HoldCorruptStateError("hold latch row has invalid typed fields") from exc
-    if active not in (0, 1):
-        raise HoldCorruptStateError("hold latch active flag is invalid")
     hold_receipt_id = str(row[3] or "")
     reason = str(row[4] or "")
     actor_id = str(row[5] or "")

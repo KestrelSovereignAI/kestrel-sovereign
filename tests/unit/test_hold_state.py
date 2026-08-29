@@ -491,6 +491,76 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
+    monkeypatch,
+    tmp_path,
+):
+    """An opening error cannot turn later shutdown into a degraded context."""
+
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[object] = []
+    factory_close_started = asyncio.Event()
+    release_factory_close = asyncio.Event()
+
+    class _DB:
+        def __init__(self, backend_type):
+            self.backend_type = backend_type
+
+        async def close(self):
+            events.append(("db-close", self.backend_type))
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close-started")
+            factory_close_started.set()
+            await release_factory_close.wait()
+            events.append("factory-close-finished")
+
+    fake_host_db = _DB("sqlite")
+    fake_hold_db = _DB("postgres")
+
+    async def _sqlite(_cls, _path):
+        return fake_host_db
+
+    async def _postgres(_cls, _dsn):
+        return fake_hold_db
+
+    async def _fail_schema(_self):
+        raise RuntimeError("schema opening failed")
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module,
+        "make_session_factory",
+        lambda _db: _InnerFactory(),
+    )
+    monkeypatch.setattr(HoldStore, "ensure_schema", _fail_schema)
+
+    bootstrap = asyncio.create_task(
+        build_host_context(db_path=str(tmp_path / "host.db"))
+    )
+    await factory_close_started.wait()
+    bootstrap.cancel()
+    release_factory_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await bootstrap
+
+    assert events == [
+        "factory-close-started",
+        "factory-close-finished",
+        ("db-close", "postgres"),
+        ("db-close", "sqlite"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_receipt_lookup_rejects_missing_authority_history(hold_db):
     db, store = hold_db
     held = await store.set_hold(
@@ -691,6 +761,40 @@ async def test_fractional_latch_revision_fails_closed(hold_db):
 
     with pytest.raises(HoldCorruptStateError, match="revision"):
         await store.get_hold("agent", "did:agent:fractional-revision")
+
+
+@pytest.mark.asyncio
+async def test_fractional_latch_active_flag_fails_closed(tmp_path):
+    """Legacy tables cannot truncate a fractional flag into active state."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-fractional-active.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, active INTEGER NOT NULL, "
+        "hold_receipt_id TEXT NOT NULL, reason TEXT NOT NULL, "
+        "actor_id TEXT NOT NULL, set_at TEXT NOT NULL, revision INTEGER NOT NULL, "
+        "PRIMARY KEY (scope, target_id))"
+    )
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await db.execute(
+        "INSERT INTO hold_latches VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "agent",
+            "did:agent:fractional-active",
+            1.5,
+            "receipt",
+            "inspect active flag",
+            "did:sovereign:operator",
+            "2026-08-28T00:00:00+00:00",
+            1,
+        ),
+    )
+    try:
+        with pytest.raises(HoldCorruptStateError, match="active flag"):
+            await store.get_hold("agent", "did:agent:fractional-active")
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
