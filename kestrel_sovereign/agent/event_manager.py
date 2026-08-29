@@ -431,9 +431,12 @@ class EventManagerMixin:
                     # stored, any later cancellation synchronously cancels the
                     # exact dispatch task; this post-registration read covers
                     # every earlier cancellation.
-                    current = await self.task_manager.get_task(str(task_id))
-                    state = getattr(getattr(current, "status", None), "state", None)
-                    if getattr(state, "value", state) == "canceled":
+                    snapshot = (
+                        await self.task_manager.get_task_cancellation_snapshot(
+                            str(task_id)
+                        )
+                    )
+                    if snapshot is not None and snapshot.state == "canceled":
                         dispatch_task = getattr(handle, "task", None)
                         if dispatch_task is not None and not dispatch_task.done():
                             dispatch_task.cancel()
@@ -487,11 +490,10 @@ class EventManagerMixin:
         if not isinstance(task_id, str) or not task_id:
             return "a2a.task_submitted has no concrete durable task id"
 
-        current = await self.task_manager.get_task(task_id)
-        if current is None:
+        snapshot = await self.task_manager.get_task_cancellation_snapshot(task_id)
+        if snapshot is None:
             return f"A2A task {task_id!r} no longer exists"
-        state = getattr(getattr(current, "status", None), "state", None)
-        durable_state = getattr(state, "value", state)
+        durable_state = snapshot.state
         if durable_state != "submitted":
             return (
                 f"A2A task {task_id!r} is already {durable_state!r}; "
@@ -518,15 +520,13 @@ class EventManagerMixin:
             return "a2a.task_submitted has no concrete durable task id"
 
         while True:
-            current = await self.task_manager.get_task(task_id)
-            if current is None:
+            snapshot = await self.task_manager.get_task_cancellation_snapshot(
+                task_id
+            )
+            if snapshot is None:
                 return f"A2A task {task_id!r} no longer exists"
-            state = getattr(getattr(current, "status", None), "state", None)
-            durable_state = getattr(state, "value", state)
+            durable_state = snapshot.state
             if durable_state == "canceled":
-                receipt = (
-                    getattr(current, "metadata", None) or {}
-                ).get("cancellation_receipt") or {}
                 self_declines = vars(self).get(
                     "_a2a_self_declining_task_ids",
                 )
@@ -539,7 +539,7 @@ class EventManagerMixin:
                     # in flight. A creator on another worker may win first;
                     # only the durable receipt actor proves this wake owns the
                     # self-decline exemption.
-                    if receipt.get("actor_agent_id") == self.did:
+                    if snapshot.actor_agent_id == self.did:
                         return None
                 return (
                     f"A2A task {task_id!r} was canceled while its "

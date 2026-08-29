@@ -7,6 +7,7 @@ Works with both SQLite and PostgreSQL backends.
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -27,6 +28,14 @@ logger = logging.getLogger(__name__)
 
 class TaskAlreadyExistsError(ValueError):
     """A caller attempted to create a second task under an occupied ID."""
+
+
+@dataclass(frozen=True)
+class TaskCancellationSnapshot:
+    """Minimal durable state needed by live cancellation monitors."""
+
+    state: str
+    actor_agent_id: Optional[str]
 
 
 def without_reserved_cancellation_receipt(
@@ -292,6 +301,23 @@ class TaskStore(UnifiedStoreBase):
         if not row:
             return None
         return self._row_to_task(row)
+
+    async def get_cancellation_snapshot(
+        self,
+        task_id: str,
+    ) -> Optional[TaskCancellationSnapshot]:
+        """Read cancellation authority without loading task payload columns."""
+
+        row = await self._backend.fetch_one(
+            "SELECT status, canceled_by FROM a2a_tasks WHERE id = ?",
+            (task_id,),
+        )
+        if not row:
+            return None
+        return TaskCancellationSnapshot(
+            state=str(row[0]),
+            actor_agent_id=row[1],
+        )
 
     async def is_task_recipient(self, task_id: str, agent_id: str) -> bool:
         """Whether ``agent_id`` is the durable execution recipient of ``task_id``."""

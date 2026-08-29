@@ -37,6 +37,7 @@ from kestrel_sovereign.a2a.stores import (
     FeedbackStore,
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import (
+    TaskCancellationSnapshot,
     without_reserved_cancellation_receipt,
 )
 from typing import Protocol, runtime_checkable, TYPE_CHECKING
@@ -957,6 +958,14 @@ class TaskManager:
     async def get_task(self, task_id: str) -> Optional[Task]:
         """Get a task by ID."""
         return await self.task_store.get(task_id)
+
+    async def get_task_cancellation_snapshot(
+        self,
+        task_id: str,
+    ) -> Optional[TaskCancellationSnapshot]:
+        """Read the minimal durable state used to withdraw live cognition."""
+
+        return await self.task_store.get_cancellation_snapshot(task_id)
 
     async def is_task_recipient(self, task_id: str, agent_id: str) -> bool:
         """Whether this manager's durable task row delegates execution to agent."""

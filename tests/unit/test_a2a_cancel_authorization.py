@@ -13,6 +13,7 @@ from kestrel_sovereign.a2a.task_manager import (
     create_task_manager,
 )
 from kestrel_sovereign.a2a.outbound_store import OutboundTaskRouteAmbiguousError
+from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
 from kestrel_sovereign.a2a.agent_card import (
     AgentCapabilities,
     AgentCard,
@@ -785,13 +786,8 @@ async def test_provisional_self_decline_does_not_exempt_creator_winning_receipt(
 
     task_id = "creator-won-self-decline-race"
     canceled = SimpleNamespace(
-        status=SimpleNamespace(state=TaskState.CANCELED),
-        metadata={
-            "cancellation_receipt": {
-                "actor_agent_id": "did:test:creator",
-                "status_before": "submitted",
-            }
-        },
+        state="canceled",
+        actor_agent_id="did:test:creator",
     )
 
     class Recipient(EventManagerMixin):
@@ -799,7 +795,7 @@ async def test_provisional_self_decline_does_not_exempt_creator_winning_receipt(
 
     recipient = Recipient()
     recipient.task_manager = SimpleNamespace(
-        get_task=AsyncMock(return_value=canceled)
+        get_task_cancellation_snapshot=AsyncMock(return_value=canceled)
     )
     recipient._a2a_self_declining_task_ids = {task_id}
     signal = SimpleNamespace(
@@ -811,6 +807,66 @@ async def test_provisional_self_decline_does_not_exempt_creator_winning_receipt(
 
     assert "was canceled while" in withdrawal
     assert recipient._a2a_self_declining_task_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_live_cancellation_monitor_uses_lightweight_snapshot():
+    """The high-frequency monitor must not deserialize the complete task row."""
+
+    task_id = "lightweight-cancellation-monitor"
+    full_task = SimpleNamespace(
+        status=SimpleNamespace(state=TaskState.CANCELED),
+        metadata={
+            "cancellation_receipt": {
+                "actor_agent_id": "did:test:creator",
+            }
+        },
+    )
+    task_manager = SimpleNamespace(
+        get_task=AsyncMock(return_value=full_task),
+        get_task_cancellation_snapshot=AsyncMock(
+            return_value=SimpleNamespace(
+                state="canceled",
+                actor_agent_id="did:test:creator",
+            )
+        ),
+    )
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+    recipient = Recipient()
+    recipient.task_manager = task_manager
+    signal = SimpleNamespace(
+        source="a2a.task_submitted",
+        payload={"task_id": task_id},
+    )
+
+    withdrawal = await recipient.monitor_cognition_signal_execution(signal)
+
+    assert "was canceled while" in withdrawal
+    task_manager.get_task_cancellation_snapshot.assert_awaited_once_with(task_id)
+    task_manager.get_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_snapshot_selects_only_authority_columns():
+    """Polling must not fetch message, history, artifacts, or metadata."""
+
+    backend = SimpleNamespace(
+        fetch_one=AsyncMock(
+            return_value=("canceled", "did:test:creator")
+        )
+    )
+    store = TaskStore(backend)
+
+    snapshot = await store.get_cancellation_snapshot("task-1")
+
+    query, params = backend.fetch_one.await_args.args
+    assert query == "SELECT status, canceled_by FROM a2a_tasks WHERE id = ?"
+    assert params == ("task-1",)
+    assert snapshot.state == "canceled"
+    assert snapshot.actor_agent_id == "did:test:creator"
 
 
 @pytest.mark.asyncio

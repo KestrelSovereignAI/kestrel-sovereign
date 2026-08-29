@@ -4050,15 +4050,31 @@ class SignalDispatcher:
                 result, tracking = await execute_with_tracking()
                 return result, None, tracking
 
-            execution_task = asyncio.create_task(
-                execute_with_tracking(),
-                name=f"signal_cognition:{signal.id}",
-            )
             monitor_task = asyncio.create_task(
                 monitor,
                 name=f"signal_cognition_monitor:{signal.id}",
             )
+            execution_task = None
             try:
+                # Start the durable withdrawal monitor first, then repeat the
+                # source validation at the exact cognition handoff. The first
+                # validation avoids building a turn for stale work; this read
+                # closes the interval between that check and task creation.
+                if callable(validate_execution):
+                    handoff_error = validate_execution(signal)
+                    if asyncio.iscoroutine(handoff_error):
+                        handoff_error = await handoff_error
+                    if handoff_error is not None:
+                        return None, str(handoff_error), None
+                if monitor_task.done():
+                    withdrawal = await monitor_task
+                    if withdrawal is not None:
+                        return None, str(withdrawal), None
+
+                execution_task = asyncio.create_task(
+                    execute_with_tracking(),
+                    name=f"signal_cognition:{signal.id}",
+                )
                 done, _ = await asyncio.wait(
                     {execution_task, monitor_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -4076,12 +4092,17 @@ class SignalDispatcher:
                 result, tracking = await execution_task
                 return result, None, tracking
             finally:
-                for task in (execution_task, monitor_task):
+                tasks = tuple(
+                    task for task in (execution_task, monitor_task)
+                    if task is not None
+                )
+                if execution_task is None and inspect.iscoroutine(execution):
+                    execution.close()
+                for task in tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(
-                    execution_task,
-                    monitor_task,
+                    *tasks,
                     return_exceptions=True,
                 )
                 finish_execution = getattr(
