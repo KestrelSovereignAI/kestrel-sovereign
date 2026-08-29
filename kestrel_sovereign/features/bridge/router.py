@@ -22,7 +22,6 @@ Usage:
         app.include_router(get_router())
 """
 
-import asyncio
 from functools import lru_cache
 import json
 import logging
@@ -34,6 +33,7 @@ from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
     stopped_invocation_http_error,
@@ -131,6 +131,7 @@ def get_router() -> APIRouter:
             request,
             source_locator="POST:/api/bridge/invoke",
         )
+        await prime_durable_stop_fence(request, agent, request_id)
 
         # Route through the agent's process_input
         try:
@@ -224,6 +225,7 @@ def get_router() -> APIRouter:
             request,
             source_locator="POST:/api/bridge/stream",
         )
+        await prime_durable_stop_fence(request, agent, request_id)
 
         async def event_generator():
             full_response = []

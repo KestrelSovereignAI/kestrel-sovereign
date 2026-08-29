@@ -160,6 +160,35 @@ class StopReceiptStore:
         self._assert_request_matches_receipt(request, receipt, expected)
         return receipt
 
+    async def has_acknowledged_turn_stop(
+        self,
+        agent_id: str,
+        turn_id: str,
+    ) -> bool:
+        """Whether durable evidence forbids this exact turn from starting.
+
+        A pre-registration Stop truthfully records ``already_complete`` because
+        no live generation existed yet. That outcome still acknowledges the
+        caller's exact-ID andon cord, so a delayed transport delivery must not
+        resurrect the named turn after the short in-memory race fence expires.
+        Refused or unreachable outcomes never establish this admission fence.
+        """
+
+        agent_id = _required_text(agent_id, "target agent identity")
+        turn_id = _required_text(turn_id, "turn identity")
+        row = await self._db.fetchone(
+            "SELECT 1 FROM stop_receipts AS receipt "
+            "JOIN stop_receipt_outcomes AS outcome "
+            "ON outcome.receipt_id = receipt.receipt_id "
+            "WHERE receipt.scope = 'turn' "
+            "AND receipt.target_agent_id = ? "
+            "AND receipt.requested_target = ? "
+            "AND outcome.disposition IN ('stopped', 'already_complete') "
+            "LIMIT 1",
+            (agent_id, turn_id),
+        )
+        return row is not None
+
     async def claim(
         self,
         request: StopRequest,

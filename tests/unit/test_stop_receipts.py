@@ -124,6 +124,39 @@ async def test_receipt_store_roundtrips_exact_evidence_on_available_backends(
 
 
 @pytest.mark.asyncio
+async def test_acknowledged_turn_stop_is_queryable_by_durable_target(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-target.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        acknowledged = _request(correlation_id="acknowledged-turn-stop")
+        unreachable = replace(
+            _request(correlation_id="unreachable-turn-stop"),
+            target="turn-unreachable",
+            turn_id="turn-unreachable",
+        )
+        await store.persist(acknowledged, _outcomes(acknowledged))
+        await store.persist(
+            unreachable,
+            _outcomes(unreachable, StopDisposition.UNREACHABLE),
+        )
+
+        assert await store.has_acknowledged_turn_stop(
+            "did:test:agent", "turn-7"
+        )
+        assert not await store.has_acknowledged_turn_stop(
+            "did:test:agent", "turn-unreachable"
+        )
+        assert not await store.has_acknowledged_turn_stop(
+            "did:test:other", "turn-7"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_receipt_survives_sqlite_connection_restart(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
