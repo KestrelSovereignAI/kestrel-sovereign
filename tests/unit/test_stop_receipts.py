@@ -287,6 +287,34 @@ async def test_initialize_and_shutdown_host_owned_receipt_store(
 
 
 @pytest.mark.asyncio
+async def test_initialize_receipts_uses_configured_shared_postgres(
+    tmp_path,
+    monkeypatch,
+):
+    from fastapi import FastAPI
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.host_features import storage
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "postgres-double.db"))
+    postgres = AsyncMock(return_value=db)
+    prepare = MagicMock(side_effect=AssertionError("SQLite path must not open"))
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://shared/stop")
+    monkeypatch.setattr(AsyncDatabase, "postgres", postgres)
+    monkeypatch.setattr(storage, "prepare_host_database", prepare)
+    app = FastAPI()
+
+    await server._initialize_stop_receipts(app)
+
+    postgres.assert_awaited_once_with("postgresql://shared/stop")
+    prepare.assert_not_called()
+    assert isinstance(app.state.stop_receipt_store, StopReceiptStore)
+    await server._shutdown_stop_receipts(app)
+
+
+@pytest.mark.asyncio
 async def test_receipt_store_startup_failure_degrades_to_fail_closed(
     monkeypatch,
 ):
@@ -649,7 +677,9 @@ def test_live_endpoint_without_receipt_store_refuses_before_cancellation():
     agent.cancel_current_request.assert_not_called()
 
 
-@pytest.mark.parametrize("correlation_id", ["", "   ", 7, "\ud800"])
+@pytest.mark.parametrize(
+    "correlation_id", ["", "   ", 7, "\ud800", "x" * 257]
+)
 def test_live_endpoint_rejects_invalid_stop_correlation_identity(correlation_id):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

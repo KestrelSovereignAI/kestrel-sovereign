@@ -31,7 +31,6 @@ from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
-    invocation_log_correlation,
     invocation_id_response_header,
     new_stream_delivery_id,
     validate_invocation_id,
@@ -47,6 +46,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     CooperativeStopTarget,
+    MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
     StopCleanupRegistry,
     StopRequest,
@@ -1016,9 +1016,14 @@ async def stop_agent_request(request: Request):
         )
         if isinstance(correlation_id, str):
             try:
-                correlation_id.encode("utf-8")
+                encoded_correlation_id = correlation_id.encode("utf-8")
             except UnicodeEncodeError:
                 invalid_correlation_id = True
+            else:
+                invalid_correlation_id = invalid_correlation_id or (
+                    len(encoded_correlation_id)
+                    > MAX_STOP_CORRELATION_ID_BYTES
+                )
         if invalid_correlation_id:
             raise ApiHTTPException(
                 status_code=400,
