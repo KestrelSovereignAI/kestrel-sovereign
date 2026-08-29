@@ -220,6 +220,11 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
     )
     events: list[str] = []
+    hold_store = object()
+    host_context = SimpleNamespace(
+        hold_store=hold_store,
+        feature_contribution_runtime=None,
+    )
 
     class _Manager:
         init_failures = []
@@ -247,13 +252,22 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert config is fake_config
         events.append("host-start")
 
+    async def _build_host_context(*, config):
+        assert isinstance(config, dict)
+        events.append("context-build")
+        return host_context
+
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
     monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
-    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_k: manager)
+    def _manager_factory(**kwargs):
+        assert kwargs["hold_store"] is hold_store
+        return manager
+
+    monkeypatch.setattr(agent_manager, "AgentManager", _manager_factory)
     monkeypatch.setattr(
         server, "_prepare_shared_postgres_scheduler_protocol", _preflight
     )
@@ -265,8 +279,12 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
     monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
+    monkeypatch.setattr(hf, "build_host_context", _build_host_context)
 
-    async with server._lifespan_startup(FastAPI()):
+    app = FastAPI()
+    async with server._lifespan_startup(app):
         pass
 
-    assert events == ["preflight", "load", "host-start"]
+    assert events == ["context-build", "preflight", "load", "host-start"]
+    assert app.state.host_context is host_context
+    assert app.state.host_context.hold_store is hold_store

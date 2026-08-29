@@ -619,7 +619,10 @@ class SpawnFeature(Feature):
             from kestrel_sovereign.multi_agent.agent_manager import AgentManager
             storage_dir = getattr(self.agent, 'storage_path', None)
             base_dir = Path(storage_dir).parent.parent if storage_dir else None
-            manager = AgentManager(base_data_dir=base_dir)
+            manager = AgentManager(
+                base_data_dir=base_dir,
+                hold_store=getattr(self.agent, "_hold_store", None),
+            )
             # Register the current agent so it appears as the parent
             agent_name = getattr(self.agent, 'agent_name', None) or 'default'
             manager._agents[agent_name] = self.agent

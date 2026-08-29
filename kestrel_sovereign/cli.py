@@ -529,6 +529,12 @@ async def _run_shell(agent_dir: Path, args) -> int:
         storage_path=str(db_path),
         llm_service=llm_service,
     )
+    from kestrel_sovereign.hold import (
+        build_bound_host_context,
+        close_bound_host_context,
+    )
+
+    hold_context = await build_bound_host_context(agent)
     await agent.initialize()
 
     # Load extension if requested
@@ -601,6 +607,7 @@ async def _run_shell(agent_dir: Path, args) -> int:
         except Exception:
             print("Agent deactivated (with errors).")
         cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 

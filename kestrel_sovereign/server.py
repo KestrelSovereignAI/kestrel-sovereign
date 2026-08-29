@@ -1689,6 +1689,7 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                                 logger.warning(
                                     "Host feature database shutdown failed: %s", exc
                                 )
+                        app.state.host_context = None
 
 
 def _uses_shared_postgres_scheduler() -> bool:
@@ -2309,7 +2310,21 @@ async def _lifespan_startup(app: FastAPI):
                 auto_discover_fallback=True,
             )
             _apply_platform_host_port(config, os.environ)
-            manager = AgentManager(base_data_dir=Path.cwd())
+            # The host control store must exist before agent initialization:
+            # ready hooks are allowed to invoke cognition, so binding Hold only
+            # after load/publication would leave a restart-time bypass.
+            from kestrel_sovereign import host_features as _early_hf
+            from kestrel_sovereign.hold import require_context_hold_store
+
+            host_ctx = await _early_hf.build_host_context(
+                config=_host_config_mapping(config)
+            )
+            app.state.host_context = host_ctx
+            hold_store = require_context_hold_store(host_ctx)
+            manager = AgentManager(
+                base_data_dir=Path.cwd(),
+                hold_store=hold_store,
+            )
             app.state.agent_manager = manager
             # Persistence context for runtime agent creation (#2358): when the
             # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent
@@ -2429,6 +2444,14 @@ async def _lifespan_startup(app: FastAPI):
         app.state.agent_manager = None
         llm_service = None
         try:
+            from kestrel_sovereign import host_features as _early_hf
+            from kestrel_sovereign.hold import require_context_hold_store
+
+            host_ctx = await _early_hf.build_host_context(
+                config=_host_config_mapping(None)
+            )
+            app.state.host_context = host_ctx
+            hold_store = require_context_hold_store(host_ctx)
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
 
@@ -2450,6 +2473,7 @@ async def _lifespan_startup(app: FastAPI):
                     database_url=database_url,
                     db_backend="postgres",
                 )
+                app.state.agent._hold_store = hold_store
             else:
                 storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
                 db_path = os.path.join(storage_dir, "kestrel_prime.db")
@@ -2461,6 +2485,7 @@ async def _lifespan_startup(app: FastAPI):
                     storage_path=db_path,
                     llm_service=llm_service,
                 )
+                app.state.agent._hold_store = hold_store
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
 
             # Lifecycle hardening: provider availability (#377) is verified
@@ -2559,12 +2584,15 @@ async def _lifespan_startup(app: FastAPI):
         features = _hf.instantiate_host_features(
             manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
         )
+        host_cfg = getattr(app.state, "multi_agent_config", None)
+        # Agent startup already opened and validated this context so Hold was
+        # enforced before any ready hook.  A no-agent/config-failure startup
+        # still builds a context here for host-only features.
+        ctx = getattr(app.state, "host_context", None)
+        if ctx is None:
+            ctx = await _hf.build_host_context(config=_host_config_mapping(host_cfg))
+        candidate_ctx = ctx
         if features:
-            host_cfg = getattr(app.state, "multi_agent_config", None)
-            ctx = await _hf.build_host_context(
-                config=_host_config_mapping(host_cfg)
-            )
-            candidate_ctx = ctx
             # Validate and activate the complete prospective contribution set
             # before changing any already-valid mounted host surface.
             started_features = await _hf.start_host_features(features, ctx)
@@ -2590,6 +2618,13 @@ async def _lifespan_startup(app: FastAPI):
                 )
                 app.state.host_setup_step_registry = runtime.setup_step_registry
             logger.info("Host features initialized: %d", len(started_features))
+        else:
+            # The fleet control store is host infrastructure, not an optional
+            # feature side effect. Hold authority must therefore exist on the
+            # default zero-feature installation as well.
+            app.state.host_features = []
+            app.state.host_context = ctx
+            logger.info("Host features initialized: 0")
     except (ContributionContractError, FeatureContributionRuntimeError):
         # Complete prospective-set rejection is a startup failure, not an
         # optional-feature warning. No candidate was mounted and prior valid
