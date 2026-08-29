@@ -230,7 +230,11 @@ class CancellationAuthority:
     ) -> tuple[StopRequest, str]:
         """Resolve a public turn address behind the single authority seam."""
 
-        if request.scope is not StopScope.TURN or request.target is None:
+        if (
+            request.scope is not StopScope.TURN
+            or request.target is None
+            or not request.target_is_turn_id
+        ):
             return request, target.target_id
         request_id = target.turn_request_ids.get(request.target)
         if request_id is None:
@@ -244,6 +248,7 @@ class CancellationAuthority:
                 reason=request.reason,
                 cascade=request.cascade,
                 correlation_id=request.correlation_id,
+                target_is_turn_id=False,
             ),
             request_id,
         )
@@ -262,6 +267,7 @@ class CancellationAuthority:
             reason=request.reason,
             cascade=request.cascade,
             correlation_id=request.correlation_id,
+            target_is_turn_id=request.target_is_turn_id,
         )
 
     def _detach_cleanup(self, task: asyncio.Task[StopOutcome]) -> None:

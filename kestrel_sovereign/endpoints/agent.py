@@ -1143,6 +1143,7 @@ async def stop_agent_request(request: Request):
                 if request_id is not None or turn_id is not None
                 else None
             ),
+            target_is_turn_id=turn_id is not None,
         )
         outcomes = await authority.stop(stop_request)
         failed_outcomes = tuple(
