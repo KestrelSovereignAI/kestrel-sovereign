@@ -18,6 +18,7 @@ sessions against the host backend (SQLite default), so Phase 1 works standalone.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -190,6 +191,30 @@ class SovereignHostContext:
         return FLEET_TENANT_ID
 
 
+async def _close_partial_host_resources(
+    session_factory: Optional[FleetSessionFactory],
+    hold_db: Any,
+    db: Any,
+) -> None:
+    """Close every resource acquired before host bootstrap completed."""
+
+    if session_factory is not None:
+        try:
+            await session_factory.close()
+        except Exception as close_exc:  # noqa: BLE001 - preserve original failure
+            logger.warning("Could not close partial host session factory: %s", close_exc)
+    if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
+        try:
+            await hold_db.close()
+        except Exception as close_exc:  # noqa: BLE001 - preserve original failure
+            logger.warning("Could not close partial Hold backend: %s", close_exc)
+    if db is not None and hasattr(db, "close"):
+        try:
+            await db.close()
+        except Exception as close_exc:  # noqa: BLE001 - preserve original failure
+            logger.warning("Could not close partial host backend: %s", close_exc)
+
+
 async def build_host_context(
     *,
     config: Any = None,
@@ -247,24 +272,11 @@ async def build_host_context(
             FLEET_TENANT_ID,
             hold_location,
         )
+    except asyncio.CancelledError:
+        await _close_partial_host_resources(session_factory, hold_db, db)
+        raise
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
-        if session_factory is not None:
-            try:
-                await session_factory.close()
-            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
-                logger.warning(
-                    "Could not close partial host session factory: %s", close_exc
-                )
-        if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
-            try:
-                await hold_db.close()
-            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
-                logger.warning("Could not close partial Hold backend: %s", close_exc)
-        if db is not None and hasattr(db, "close"):
-            try:
-                await db.close()
-            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
-                logger.warning("Could not close partial host backend: %s", close_exc)
+        await _close_partial_host_resources(session_factory, hold_db, db)
         session_factory = None
         hold_store = None
         hold_db = None
