@@ -2068,7 +2068,7 @@ class AgentManager:
     def _commit_restored_child_ttl(
         self, name: str, agent: KestrelAgent
     ) -> None:
-        """Arm an adopted TTL only after every onboarding stage committed."""
+        """Validate and arm an adopted TTL before scheduler publication."""
 
         mandate = vars(agent).get("_persisted_spawn_mandate")
         if not isinstance(mandate, SpawnMandate) or not mandate.parent_signature:
@@ -2799,8 +2799,8 @@ class AgentManager:
                             arm_restored_ttl=False,
                         )
                         await self._on_agent_registered(name, agent)
-                        self._commit_dynamic_scheduler_registration(agent)
                         self._commit_restored_child_ttl(name, agent)
+                        self._commit_dynamic_scheduler_registration(agent)
                     except BaseException:
                         # The registration hook can install hosted A2A policy
                         # and app routes before it reports failure.  Withdraw
@@ -3338,6 +3338,7 @@ class AgentManager:
         known_agent_config: Optional[LocalAgentConfig] = None,
         offboarding_admission: Optional[RuntimeOffboardingAdmission] = None,
         _spawn_rollback_admission: Optional[AgentOperationAdmission] = None,
+        _lifecycle_cleanup_expected_agent_id: Optional[str] = None,
     ) -> bool:
         """Stop/unpublish an agent and optionally offboard its runtime tree.
 
@@ -3377,6 +3378,9 @@ class AgentManager:
                 offboard_runtime=offboard_runtime,
                 known_agent_id=known_agent_id,
                 known_agent_config=known_agent_config,
+                lifecycle_cleanup_expected_agent_id=(
+                    _lifecycle_cleanup_expected_agent_id
+                ),
                 pending_offboarding=pending_offboarding,
                 offboarding_admission=offboarding_admission,
             )
@@ -3454,6 +3458,7 @@ class AgentManager:
         offboard_runtime: bool,
         known_agent_id: Optional[str],
         known_agent_config: Optional[LocalAgentConfig],
+        lifecycle_cleanup_expected_agent_id: Optional[str],
         pending_offboarding: list[InflightRuntimeOffboarding],
         offboarding_admission: Optional[RuntimeOffboardingAdmission],
     ) -> bool:
@@ -3492,14 +3497,23 @@ class AgentManager:
                 "known_agent_config requires destructive offboarding, a known DID, "
                 "and a LocalAgentConfig"
             )
+        if lifecycle_cleanup_expected_agent_id is not None and (
+            type(lifecycle_cleanup_expected_agent_id) is not str
+            or not lifecycle_cleanup_expected_agent_id
+            or known_agent_id is not None
+        ):
+            raise TypeError(
+                "lifecycle cleanup requires one non-empty expected agent DID"
+            )
+        expected_agent_id = known_agent_id or lifecycle_cleanup_expected_agent_id
 
         async with self._lock:
             published_name, current = self._published_agent_binding(name)
             agent_id = _loaded_agent_did(current) if current is not None else None
-            if agent_id and known_agent_id and agent_id != known_agent_id:
+            if agent_id and expected_agent_id and agent_id != expected_agent_id:
                 raise ValueError(
                     "Registered agent identity does not match the loaded agent; "
-                    "offboarding was refused."
+                    "removal was refused."
                 )
             authority_name, authority_id = self._scheduler_authority_binding_by_name(
                 name
@@ -3513,10 +3527,10 @@ class AgentManager:
                 # returning a misleading 404 and letting the already-claimed
                 # cold wake publish the agent immediately afterwards.
                 agent_id = authority_id
-            if agent_id and known_agent_id and agent_id != known_agent_id:
+            if agent_id and expected_agent_id and agent_id != expected_agent_id:
                 raise ValueError(
                     "Registered agent identity does not match scheduler authority; "
-                    "offboarding was refused."
+                    "removal was refused."
                 )
             if not agent_id and known_agent_id:
                 agent_id = known_agent_id
@@ -5370,6 +5384,19 @@ class AgentManager:
         allocation_id = getattr(allocation, "child_did", None)
         return allocation_id if isinstance(allocation_id, str) and allocation_id else None
 
+    def _delegated_hold_child_agent_id(self, child_name: str) -> Optional[str]:
+        """Resolve only a live delegated-budget hold, never a mandate cache."""
+
+        entry = self._child_budgets.get(child_name)
+        delegated = entry[0] if isinstance(entry, tuple) and entry else None
+        allocation = getattr(delegated, "allocation", None)
+        allocation_id = getattr(allocation, "child_did", None)
+        return (
+            allocation_id
+            if isinstance(allocation_id, str) and allocation_id
+            else None
+        )
+
     def _has_budgeted_descendants(
         self,
         name: str,
@@ -6548,6 +6575,14 @@ class AgentManager:
         return list(self._parent_children.get(parent_did, []))
 
     async def _verified_spawn_relations(self) -> dict[str, tuple[str, str]]:
+        """Revalidate one authority snapshot under the topology reader lease."""
+
+        async with self.a2a_execution_lease():
+            return await self._verified_spawn_relations_under_lease()
+
+    async def _verified_spawn_relations_under_lease(
+        self,
+    ) -> dict[str, tuple[str, str]]:
         """Return ``child_did -> (parent_did, child_name)`` after revalidation."""
 
         from kestrel_sovereign.spawn.mandate import verify_mandate
@@ -6639,8 +6674,20 @@ class AgentManager:
                 raise SpawnAuthorityGraphError(
                     "Signed spawn authority contains an invalid mandate"
                 )
+            if (
+                mandate.ttl_seconds > 0
+                and remaining_spawn_ttl_seconds(
+                    mandate.created_at,
+                    mandate.ttl_seconds,
+                )
+                <= 0
+            ):
+                # Expiry withdraws governance authority immediately even when
+                # lifecycle teardown is delayed or refused. The manager-owned
+                # finalizer below retains a separate cleanup-only capability.
+                continue
             if child is None:
-                retained_did = self._budgeted_child_agent_id(child_name)
+                retained_did = self._delegated_hold_child_agent_id(child_name)
                 if retained_did is not None and retained_did != mandate.child_did:
                     raise SpawnAuthorityGraphError(
                         "Signed spawn authority child DID conflicts with cleanup custody"
@@ -6763,8 +6810,20 @@ class AgentManager:
             True if the child was found and terminated.
         """
         children = await self.get_authoritative_children(parent_did)
+        cleanup_child_did: Optional[str] = None
         if child_name not in children:
-            return False
+            lifecycle = vars(self).get("_lifecycle")
+            cleanup_authority = getattr(
+                type(lifecycle), "cleanup_authority_child_did", None
+            )
+            if callable(cleanup_authority):
+                cleanup_child_did = cleanup_authority(
+                    lifecycle,
+                    parent_did=parent_did,
+                    child_name=child_name,
+                )
+            if cleanup_child_did is None:
+                return False
         if type(offboard_runtime) is not bool:
             raise TypeError("offboard_runtime must be a bool")
 
@@ -6803,10 +6862,17 @@ class AgentManager:
         # stale mandate that consumes a spawn-cap slot forever.
         removed = False
         try:
-            removed = await self.remove_agent(
-                child_name,
-                offboard_runtime=offboard_runtime,
-            )
+            removal_kwargs: dict[str, object] = {
+                "offboard_runtime": offboard_runtime,
+            }
+            if cleanup_child_did is not None:
+                # Bind cleanup-only custody to the exact tracked child so a
+                # same-name replacement cannot be removed after the authority
+                # snapshot. Governance callers retain their existing API.
+                removal_kwargs["_lifecycle_cleanup_expected_agent_id"] = (
+                    cleanup_child_did
+                )
+            removed = await self.remove_agent(child_name, **removal_kwargs)
         except BaseException as exc:
             if not _is_lifecycle_terminal_outcome(exc):
                 raise

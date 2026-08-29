@@ -270,6 +270,29 @@ class SpawnedAgentLifecycle:
         else:
             self._finalization_owner_counts.pop(key, None)
 
+    def cleanup_authority_child_did(
+        self,
+        *,
+        parent_did: str,
+        child_name: str,
+    ) -> Optional[str]:
+        """Return the exact child owned by a currently active finalizer.
+
+        A signed TTL ceases to authorize new governance at expiry, and its
+        parent may already be unloaded. The lifecycle finalizer still needs a
+        cleanup-only capability for the child it claimed before calling the
+        manager. No inactive tracker record grants this authority.
+        """
+
+        tracked = self._tracked.get(child_name)
+        if tracked is None or tracked.parent_did != parent_did:
+            return None
+        if self._finalization_owner_counts.get(
+            (tracked.child_name, tracked.child_did), 0
+        ) <= 0:
+            return None
+        return tracked.child_did
+
     @staticmethod
     def _remaining_ttl_seconds(created_at: str, ttl_seconds: int) -> float:
         """Return a persisted mandate's remaining lifetime, never a fresh TTL."""

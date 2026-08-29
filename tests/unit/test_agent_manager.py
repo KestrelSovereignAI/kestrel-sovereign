@@ -326,6 +326,30 @@ async def test_restored_ttl_cannot_remove_child_before_load_commits(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_restored_ttl_validation_precedes_scheduler_commit(tmp_path):
+    """A rejected restored lifetime cannot publish scheduler execution scope."""
+
+    child = _make_mock_agent("did:pkh:eip155:1:0xExpiredSchedulerChild")
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._initialize_agent = AsyncMock(return_value=child)
+    manager._commit_dynamic_scheduler_registration = MagicMock()
+    manager._commit_restored_child_ttl = MagicMock(
+        side_effect=RuntimeError("Persisted spawn mandate expired during onboarding")
+    )
+
+    with pytest.raises(RuntimeError, match="expired during onboarding"):
+        await manager.load_agent(
+            "ExpiredSchedulerChild",
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+
+    manager._commit_dynamic_scheduler_registration.assert_not_called()
+    manager._commit_restored_child_ttl.assert_called_once_with(
+        "ExpiredSchedulerChild", child
+    )
+
+
+@pytest.mark.asyncio
 async def test_restored_ttl_cancels_ready_hook_at_signed_deadline(tmp_path):
     """Wake-capable readiness cannot run past an ephemeral mandate expiry."""
 
@@ -1102,6 +1126,95 @@ async def test_authoritative_query_rejects_deleted_durable_receipt(tmp_path):
     assert await manager.get_authoritative_children(parent_did) == []
 
 
+@pytest.mark.asyncio
+async def test_authoritative_query_rejects_expired_signed_receipt(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xExpiredQueryParent"
+    child_did = "did:pkh:eip155:1:0xExpiredQueryChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=1,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents.update({"Parent": parent, "Child": child})
+    manager._agent_names.update({parent_did: "Parent", child_did: "Child"})
+    manager._child_mandates["Child"] = mandate
+
+    assert await manager.get_authoritative_children(parent_did) == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_excludes_mandate_without_runtime_custody(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xMandateOnlyParent"
+    child_did = "did:pkh:eip155:1:0xMandateOnlyChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["Parent"] = parent
+    manager._agent_names[parent_did] = "Parent"
+    manager._child_mandates["RemovedChild"] = mandate
+
+    assert await manager.get_authoritative_children(parent_did) == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_receipt_read_holds_topology_execution_lease(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xLeaseQueryParent"
+    child_did = "did:pkh:eip155:1:0xLeaseQueryChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    writer_entered = asyncio.Event()
+
+    async def delayed_durable_edges(node_id: str):
+        read_started.set()
+        await release_read.wait()
+        if vars(child.storage).get("closed") is True:
+            raise RuntimeError("storage closed during authority read")
+        return [
+            SimpleNamespace(
+                label="spawned_by",
+                source_id=node_id,
+                target_id=mandate.parent_did,
+                properties=mandate.to_edge_properties(),
+            )
+        ]
+
+    child.storage.get_edges_from = delayed_durable_edges
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents.update({"Parent": parent, "Child": child})
+    manager._agent_names.update({parent_did: "Parent", child_did: "Child"})
+    manager._child_mandates["Child"] = mandate
+
+    query = asyncio.create_task(manager.get_authoritative_children(parent_did))
+    await asyncio.wait_for(read_started.wait(), timeout=1)
+
+    async def withdraw_child() -> None:
+        async with manager.a2a_lifecycle_lease():
+            writer_entered.set()
+            child.storage.closed = True
+            manager._agents.pop("Child", None)
+            manager._agent_names.pop(child_did, None)
+
+    withdrawal = asyncio.create_task(withdraw_child())
+    await asyncio.sleep(0)
+    writer_crossed_receipt_read = writer_entered.is_set()
+    release_read.set()
+    query_result, withdrawal_result = await asyncio.gather(
+        query,
+        withdrawal,
+        return_exceptions=True,
+    )
+
+    assert writer_crossed_receipt_read is False
+    assert query_result == ["Child"]
+    assert withdrawal_result is None
+
+
 def test_cold_restore_rejects_features_beyond_parent_ceiling(tmp_path):
     root_did = "did:pkh:eip155:1:0xCeilingRoot"
     parent_did = "did:pkh:eip155:1:0xCeilingParent"
@@ -1213,6 +1326,76 @@ async def test_terminate_child_ignores_forged_runtime_projection(tmp_path):
 
     assert await manager.terminate_child("did:test:parent", "Forged") is False
     manager.remove_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_cleanup_survives_expired_parent_unload(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xUnloadedCleanupParent"
+    child_did = "did:pkh:eip155:1:0xUnloadedCleanupChild"
+    _parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=1,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["Child"] = child
+    manager._agent_names[child_did] = "Child"
+    manager._child_mandates["Child"] = mandate
+    manager._parent_children[parent_did] = ["Child"]
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+
+    async def remove_child(name: str, **kwargs) -> bool:
+        assert name == "Child"
+        assert kwargs["_lifecycle_cleanup_expected_agent_id"] == child_did
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child_did, None)
+        manager._child_mandates.pop(name, None)
+        manager._parent_children[parent_did].remove(name)
+        return True
+
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    result = await lifecycle.terminate("Child", reason="expired mandate cleanup")
+
+    assert result is not None
+    assert result.child_did == child_did
+    manager.remove_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_cleanup_witness_refuses_same_name_replacement(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xReplacementCleanupParent"
+    expired_child_did = "did:pkh:eip155:1:0xExpiredCleanupChild"
+    replacement_did = "did:pkh:eip155:1:0xReplacementCleanupChild"
+    replacement = _make_mock_agent(replacement_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    await lifecycle.register(
+        "ReusableChild",
+        expired_child_did,
+        parent_did,
+        ttl_seconds=3600,
+    )
+    manager._agents["ReusableChild"] = replacement
+    manager._agent_names[replacement_did] = "ReusableChild"
+    lifecycle._claim_finalization("ReusableChild", expired_child_did)
+    try:
+        with pytest.raises(ValueError, match="loaded agent"):
+            await manager.terminate_child(parent_did, "ReusableChild")
+    finally:
+        lifecycle._release_finalization("ReusableChild", expired_child_did)
+        lifecycle.withdraw_persisted_child(
+            "ReusableChild",
+            expected_child_did=expired_child_did,
+        )
+
+    assert manager.get_agent("ReusableChild") is replacement
+    replacement.shutdown.assert_not_awaited()
 
 
 def test_failed_onboarding_rolls_back_rehydrated_parent_authority(tmp_path):
