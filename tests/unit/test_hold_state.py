@@ -329,6 +329,84 @@ async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_host_context_uses_configured_postgres_for_durable_hold(
+    monkeypatch,
+):
+    """Cloud/PG hosts must not put restart-surviving Hold on ephemeral disk."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[object] = []
+
+    class _DB:
+        backend_type = "postgres"
+
+        async def close(self):
+            events.append("db-close")
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close")
+
+    fake_db = _DB()
+
+    async def _postgres(_cls, dsn):
+        events.append(("postgres", dsn))
+        return fake_db
+
+    async def _ensure_schema(self):
+        events.append(("hold-schema", self._db))
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module, "make_session_factory", lambda db: _InnerFactory()
+    )
+    monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
+
+    ctx = await build_host_context(db_path="/must/not/be/used.db")
+
+    assert ctx.db is fake_db
+    assert ctx.hold_store._db is fake_db
+    assert events[:2] == [
+        ("postgres", "postgresql://durable/host"),
+        ("hold-schema", fake_db),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receipt_lookup_rejects_missing_authority_history(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:receipt-history",
+        actor_id="did:sovereign:operator",
+        reason="inspect authority",
+        operation_id="receipt-authority-hold",
+    )
+    released = await store.release_hold(
+        scope="agent",
+        target_id="did:agent:receipt-history",
+        actor_id="did:sovereign:operator",
+        reason="inspect release",
+        operation_id="receipt-authority-release",
+        expected_hold_receipt_id=held.receipt.receipt_id,
+    )
+    assert released.receipt.disposition is HoldDisposition.APPLIED
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE operation_id = ?",
+        ("receipt-authority-hold",),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing authority"):
+        await store.get_receipt("receipt-authority-release")
+
+
+@pytest.mark.asyncio
 async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
