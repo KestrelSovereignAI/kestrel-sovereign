@@ -14,7 +14,10 @@ from kestrel_sovereign.hold import (
     HoldStateError,
     HoldStore,
 )
-from kestrel_sovereign.hold.state import HoldCorruptStateError
+from kestrel_sovereign.hold.state import (
+    HoldCorruptStateError,
+    _receipt_from_row,
+)
 from kestrel_sovereign.host_features.context import build_host_context
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -95,6 +98,34 @@ async def test_state_and_receipts_survive_database_restart(tmp_path):
         assert datetime.fromisoformat(receipt.occurred_at).tzinfo is not None
     finally:
         await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_primary_key_is_explicitly_not_null(hold_db):
+    db, _store = hold_db
+    columns = await db.fetchall("PRAGMA table_info(hold_receipts)")
+    receipt_id = next(row for row in columns if row[1] == "receipt_id")
+    assert receipt_id[3] == 1
+
+
+def test_existing_null_receipt_identity_fails_closed_on_read() -> None:
+    with pytest.raises(HoldCorruptStateError, match="receipt identity"):
+        _receipt_from_row(
+            (
+                None,
+                "legacy-operation",
+                "release",
+                "already_in_state",
+                "agent",
+                "did:agent:kite",
+                "legacy import",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                "expected-receipt",
+                "",
+                "",
+            )
+        )
 
 
 @pytest.mark.asyncio
