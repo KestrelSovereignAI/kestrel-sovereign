@@ -1499,6 +1499,64 @@ async def test_upgraded_foreign_host_row_fails_closed_for_reads_and_mutation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["get", "set", "release"])
+async def test_imported_duplicate_latch_fails_closed_on_single_target_paths(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    """A legacy table without its key cannot make one duplicate authoritative."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / f"duplicate-{operation}.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0)"
+    )
+    await db.execute(
+        "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?)",
+        ("agent", "did:agent:duplicate"),
+    )
+    await db.execute(
+        "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?)",
+        ("agent", "did:agent:duplicate"),
+    )
+    store = HoldStore(db)
+    await store.ensure_schema()
+    if operation != "get":
+        # The imported rows already exist. Bypass the insert-if-absent helper,
+        # whose ON CONFLICT target also depends on the missing legacy key, so
+        # this regression reaches the shared single-latch read itself.
+        monkeypatch.setattr(store, "_ensure_latch_row", AsyncMock())
+    try:
+        with pytest.raises(HoldCorruptStateError, match="duplicate hold latch key"):
+            if operation == "get":
+                await store.get_hold("agent", "did:agent:duplicate")
+            elif operation == "set":
+                await store.set_hold(
+                    scope="agent",
+                    target_id="did:agent:duplicate",
+                    actor_id="did:sovereign:operator",
+                    reason="must reject ambiguous projection",
+                    operation_id="set-duplicate-projection",
+                )
+            else:
+                await store.release_hold(
+                    scope="agent",
+                    target_id="did:agent:duplicate",
+                    actor_id="did:sovereign:operator",
+                    reason="must reject ambiguous projection",
+                    operation_id="release-duplicate-projection",
+                    expected_hold_receipt_id="unknown-authority",
+                )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_inactive_latch_with_retained_evidence_fails_closed(
     hold_db,
     monkeypatch,

@@ -591,11 +591,14 @@ class HoldStore:
             if for_update and getattr(self._db, "backend_type", "") == "postgres"
             else ""
         )
-        return await self._db.fetchone(
+        rows = await self._db.fetchall(
             f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
             f"WHERE scope = ? AND target_id = ?{suffix}",
             (scope.value, target_id),
         )
+        if len(rows) > 1:
+            raise HoldCorruptStateError("duplicate hold latch key")
+        return rows[0] if rows else None
 
     async def _assert_host_latch_shape(self, *, for_update: bool = False) -> None:
         """Fail closed if an upgraded/shared database has a foreign host row."""
