@@ -194,10 +194,32 @@ class ContextBuilder:
             max_total_chars=max_total_chars,
             db=db,
             agent_id=agent_id,
+            audit_name_validator=self._validate_bootstrap_audit_names,
         )
+
+        bind_reserved_names = getattr(
+            self._context_clause_registry,
+            "bind_reserved_audit_name_provider",
+            None,
+        )
+        if callable(bind_reserved_names):
+            bind_reserved_names(lambda: self._bootstrap_loader.file_order)
+        self._validate_bootstrap_audit_names()
 
         # Load all bootstrap files (includes SOUL.md)
         self._bootstrap_loader.load()
+
+    def _validate_bootstrap_audit_names(
+        self, names=None
+    ) -> None:
+        """Preflight the live bootstrap namespace against context clauses."""
+
+        registry = getattr(self, "_context_clause_registry", None)
+        validator = getattr(registry, "validate_reserved_audit_names", None)
+        if callable(validator):
+            validator(
+                self._bootstrap_loader.file_order if names is None else names
+            )
 
     async def load_bootstrap_db_config(self) -> None:
         """Merge DB-backed bootstrap config into the loader (#2135, F099).
@@ -211,6 +233,7 @@ class ContextBuilder:
         regression.
         """
         await self._bootstrap_loader.load_db_config()
+        self._validate_bootstrap_audit_names()
         # load_db_config() invalidates the cache; re-read now so the first
         # system-prompt assembly sees the merged file set.
         self._bootstrap_loader.load()

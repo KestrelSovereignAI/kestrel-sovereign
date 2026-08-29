@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from kestrel_sdk.features import ContributionContractError
+from kestrel_sdk.features import ContextClauseRegistration, ContributionContractError
 
 from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.features.contribution_runtime import (
@@ -21,7 +21,10 @@ from kestrel_sovereign.host_features import (
     unmount_host_features,
 )
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from tests.fixtures.sdk_contribution_fixture import SDKFixtureHostFeature
+from tests.fixtures.sdk_contribution_fixture import (
+    SDKFixtureFeature,
+    SDKFixtureHostFeature,
+)
 
 
 def _assert_live(ctx, feature, expected: bool) -> None:
@@ -90,6 +93,127 @@ async def test_host_context_clauses_reach_existing_agent_prompts_and_teardown():
         "C", include_briefing=False
     )
     assert "stable context from host-fixture" not in prompt_after_stop
+
+
+@pytest.mark.asyncio
+async def test_later_host_context_collision_is_rejected_before_rendering(tmp_path):
+    """A host registry must retain reverse visibility into bound agents."""
+
+    ctx = SovereignHostContext()
+    await start_host_features([], ctx)
+    agent = KestrelAgent(
+        did="did:test:late-host-context-collision",
+        storage_path=str(tmp_path / "agent.db"),
+        sync_enabled=False,
+    )
+    agent_feature = SDKFixtureFeature(agent)
+    agent_runtime = agent._ensure_feature_contribution_runtime()
+    agent_runtime.activate(
+        agent_runtime.prepare_transition((agent_feature,)).only()
+    )
+    agent.bind_host_context_clause_registry(
+        ctx.feature_contribution_runtime.context_clause_registry
+    )
+
+    class LateHostFeature(SDKFixtureHostFeature):
+        name = "late-host-fixture"
+        contribution_prefix = "late-host-fixture"
+
+    candidate = LateHostFeature()
+    candidate.context_registration = ContextClauseRegistration(
+        owner=candidate.contribution_owner,
+        name=agent_feature.context_registration.name,
+        priority=30,
+        renderer=candidate._render_context_clause,
+    )
+
+    started = await start_host_features([candidate], ctx)
+
+    assert started == []
+    assert len(ctx.rejected_host_feature_contributions) == 1
+    assert "context clause already registered" in (
+        ctx.rejected_host_feature_contributions[0].reason
+    )
+    assert candidate.context_renderer_calls == 0
+    assert ctx.feature_contribution_runtime.active_owners() == ()
+
+
+@pytest.mark.asyncio
+async def test_later_host_context_respects_bound_agent_bootstrap_names(tmp_path):
+    """An agent's custom bootstrap namespace is visible to later host starts."""
+
+    ctx = SovereignHostContext()
+    await start_host_features([], ctx)
+    agent = KestrelAgent(
+        did="did:test:host-bootstrap-collision",
+        storage_path=str(tmp_path / "agent.db"),
+        sync_enabled=False,
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+    agent.context_builder = ContextBuilder(
+        MagicMock(),
+        agent_data_path=str(tmp_path),
+        context_clause_registry=runtime.context_clause_registry,
+    )
+    assert agent.context_builder._bootstrap_loader.add_file("POLICY.yaml")
+    agent.bind_host_context_clause_registry(
+        ctx.feature_contribution_runtime.context_clause_registry
+    )
+
+    class LateHostFeature(SDKFixtureHostFeature):
+        name = "late-bootstrap-host-fixture"
+        contribution_prefix = "late-bootstrap-host-fixture"
+
+    candidate = LateHostFeature()
+    candidate.context_registration = ContextClauseRegistration(
+        owner=candidate.contribution_owner,
+        name="POLICY.yaml",
+        priority=30,
+        renderer=candidate._render_context_clause,
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        await start_host_features([candidate], ctx)
+
+    assert candidate.context_renderer_calls == 0
+    assert ctx.feature_contribution_runtime.active_owners() == ()
+
+
+@pytest.mark.asyncio
+async def test_host_renderer_failure_does_not_leak_feature_repr_or_cause():
+    """The sanitized collection boundary must cross host activation intact."""
+
+    secret = "api-key=host-renderer-must-stay-private"
+    original = RuntimeError(secret)
+
+    class SecretReprHostFeature(SDKFixtureHostFeature):
+        name = "secret-repr-host-fixture"
+        contribution_prefix = "secret-repr-host-fixture"
+
+        def __repr__(self):
+            return f"<SecretReprHostFeature {secret}>"
+
+    feature = SecretReprHostFeature()
+
+    def fail_renderer():
+        raise original
+
+    object.__setattr__(feature.context_registration, "renderer", fail_renderer)
+    ctx = SovereignHostContext()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        await start_host_features([feature], ctx)
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.getter == "render_context_clauses"
+    assert secret not in str(error)
+    assert error.__cause__ is original
+    assert ctx.feature_contribution_runtime.active_owners() == ()
+    assert not feature.started
 
 
 @pytest.mark.asyncio
@@ -162,6 +286,8 @@ async def test_host_owner_conflict_fails_before_either_feature_starts():
 async def test_host_declarative_commit_failure_rejects_partial_startup(
     monkeypatch,
 ):
+    secret = "api-key=host-activation-must-stay-private"
+
     class FirstHostFeature(SDKFixtureHostFeature):
         name = "first-host-fixture"
         contribution_prefix = "first-host-fixture"
@@ -169,6 +295,9 @@ async def test_host_declarative_commit_failure_rejects_partial_startup(
     class SecondHostFeature(SDKFixtureHostFeature):
         name = "second-host-fixture"
         contribution_prefix = "second-host-fixture"
+
+        def __repr__(self):
+            return f"<SecondHostFeature {secret}>"
 
     first = FirstHostFeature()
     second = SecondHostFeature()
@@ -188,9 +317,10 @@ async def test_host_declarative_commit_failure_rejects_partial_startup(
     with pytest.raises(
         FeatureContributionRuntimeError,
         match="contribution activation failed",
-    ):
+    ) as exc_info:
         await start_host_features([first, second], ctx)
 
+    assert secret not in str(exc_info.value)
     assert first.started and first.stopped
     assert not second.started
     _assert_live(ctx, first, False)

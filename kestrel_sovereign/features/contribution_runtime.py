@@ -7,8 +7,9 @@ enable (or host-feature start) transition until its matching teardown.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, replace
-from typing import Iterable
+from typing import Callable, Iterable
 
 from kestrel_sdk.features import (
     ContributionContractError,
@@ -120,6 +121,16 @@ class ContextClauseRegistry:
     def __init__(self) -> None:
         self._clauses: dict[tuple[str, str], ResolvedContextClause] = {}
         self._external_registries: tuple[ContextClauseRegistry, ...] = ()
+        # An agent registry depends on the host registry for prompt assembly.
+        # The reverse weak edge lets a later host-feature start preflight
+        # against already-bound agents without retaining stopped agents or
+        # making independent agents conflict with one another.
+        self._dependent_registries: weakref.WeakSet[ContextClauseRegistry] = (
+            weakref.WeakSet()
+        )
+        self._reserved_audit_name_provider: (
+            Callable[[], Iterable[str]] | None
+        ) = None
 
     _RESERVED_AUDIT_NAMES = frozenset(
         set(DEFAULT_BOOTSTRAP_FILES)
@@ -135,8 +146,21 @@ class ContextClauseRegistry:
         }
     )
 
-    @classmethod
-    def validate_declared_names(cls, names: Iterable[str]) -> tuple[str, ...]:
+    def _local_reserved_audit_names(self) -> frozenset[str]:
+        names = set(self._RESERVED_AUDIT_NAMES)
+        if self._reserved_audit_name_provider is not None:
+            names.update(self._reserved_audit_name_provider())
+        return frozenset(names)
+
+    def _visible_reserved_audit_names(self) -> frozenset[str]:
+        names = set(self._local_reserved_audit_names())
+        for registry in self._external_registries:
+            names.update(registry._local_reserved_audit_names())
+        for registry in self._dependent_registries:
+            names.update(registry._local_reserved_audit_names())
+        return frozenset(names)
+
+    def validate_declared_names(self, names: Iterable[str]) -> tuple[str, ...]:
         """Validate host-visible audit names without invoking renderers."""
 
         values = tuple(names)
@@ -148,7 +172,8 @@ class ContextClauseRegistry:
             (
                 name
                 for name in values
-                if name in cls._RESERVED_AUDIT_NAMES or name.endswith(".md")
+                if name in self._visible_reserved_audit_names()
+                or name.casefold().endswith(".md")
             ),
             None,
         )
@@ -158,14 +183,13 @@ class ContextClauseRegistry:
             )
         return values
 
-    @classmethod
     def _validate_names(
-        cls,
+        self,
         values: tuple[ResolvedContextClause, ...],
         *,
         resident: Iterable[ResolvedContextClause],
     ) -> None:
-        names = cls.validate_declared_names(clause.name for clause in values)
+        names = self.validate_declared_names(clause.name for clause in values)
         resident_names = {clause.name for clause in resident}
         conflict = next((name for name in names if name in resident_names), None)
         if conflict is not None:
@@ -180,12 +204,56 @@ class ContextClauseRegistry:
             for clause in registry.snapshot()
         )
 
-    def has_audit_name(self, name: str) -> bool:
-        """Whether local or bound host state already owns one audit name."""
+    def _dependent_clauses(self) -> tuple[ResolvedContextClause, ...]:
+        return tuple(
+            clause
+            for registry in self._dependent_registries
+            for clause in registry.snapshot()
+        )
 
-        return any(
+    def validate_reserved_audit_names(
+        self, names: Iterable[str]
+    ) -> tuple[str, ...]:
+        """Ensure prospective bootstrap audit names do not shadow clauses."""
+
+        values = tuple(names)
+        if len(set(values)) != len(values):
+            raise FeatureContributionRuntimeError(
+                "duplicate bootstrap audit name"
+            )
+        resident_names = {
+            clause.name
+            for clause in (
+                *self._clauses.values(),
+                *self._external_clauses(),
+                *self._dependent_clauses(),
+            )
+        }
+        conflict = next((name for name in values if name in resident_names), None)
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name is already registered: {conflict!r}"
+            )
+        return values
+
+    def bind_reserved_audit_name_provider(
+        self, provider: Callable[[], Iterable[str]]
+    ) -> None:
+        """Bind one live bootstrap namespace after an atomic conflict check."""
+
+        self.validate_reserved_audit_names(provider())
+        self._reserved_audit_name_provider = provider
+
+    def has_audit_name(self, name: str) -> bool:
+        """Whether visible clause or bootstrap state owns one audit name."""
+
+        return name in self._visible_reserved_audit_names() or any(
             clause.name == name
-            for clause in (*self._clauses.values(), *self._external_clauses())
+            for clause in (
+                *self._clauses.values(),
+                *self._external_clauses(),
+                *self._dependent_clauses(),
+            )
         )
 
     def validate_external_registries(
@@ -200,6 +268,23 @@ class ContextClauseRegistry:
             clause for registry in values for clause in registry.snapshot()
         )
         self._validate_names(external, resident=self._clauses.values())
+        external_reserved = {
+            name
+            for registry in values
+            for name in registry._local_reserved_audit_names()
+        }
+        conflict = next(
+            (
+                clause.name
+                for clause in self._clauses.values()
+                if clause.name in external_reserved
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name {conflict!r} is a reserved host audit name"
+            )
         return values
 
     def bind_external_registries(
@@ -208,6 +293,11 @@ class ContextClauseRegistry:
         """Atomically bind host registries after validating bare audit names."""
 
         values = self.validate_external_registries(registries)
+        for registry in self._external_registries:
+            if registry not in values:
+                registry._dependent_registries.discard(self)
+        for registry in values:
+            registry._dependent_registries.add(self)
         self._external_registries = values
 
     def validate_register_batch(
@@ -221,7 +311,11 @@ class ContextClauseRegistry:
             )
         self._validate_names(
             values,
-            resident=(*self._clauses.values(), *self._external_clauses()),
+            resident=(
+                *self._clauses.values(),
+                *self._external_clauses(),
+                *self._dependent_clauses(),
+            ),
         )
         conflict = next(
             (identity for identity in identities if identity in self._clauses),
@@ -277,6 +371,7 @@ class ContextClauseRegistry:
                     if clause.identity not in old_identities
                 ),
                 *self._external_clauses(),
+                *self._dependent_clauses(),
             ),
         )
         if any(
@@ -325,6 +420,24 @@ class CompositeContextClauseRegistry:
                 key=lambda clause: (clause.priority, clause.name, clause.owner),
             )
         )
+
+    def validate_reserved_audit_names(
+        self, names: Iterable[str]
+    ) -> tuple[str, ...]:
+        """Ensure bootstrap audit names do not shadow any union member."""
+
+        values = tuple(names)
+        if len(set(values)) != len(values):
+            raise FeatureContributionRuntimeError(
+                "duplicate bootstrap audit name"
+            )
+        resident_names = {clause.name for clause in self.snapshot()}
+        conflict = next((name for name in values if name in resident_names), None)
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name is already registered: {conflict!r}"
+            )
+        return values
 
 
 class PermissionDefaultsRegistry:
@@ -1110,7 +1223,7 @@ class FeatureContributionRuntime:
             [registration.name for registration in setup_steps], "setup step name"
         )
         self._require_unique(context_names, "context-clause name")
-        ContextClauseRegistry.validate_declared_names(context_names)
+        self.context_clause_registry.validate_declared_names(context_names)
 
         rejections = tuple(
             ContributionRejection(item.feature, item.feature_name, reason)

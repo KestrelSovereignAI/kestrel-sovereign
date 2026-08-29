@@ -187,6 +187,54 @@ def test_core_registry_rejects_ambiguous_or_reserved_audit_names():
         )
 
 
+def test_bootstrap_add_rejects_active_context_name_without_mutation():
+    registry = ContextClauseRegistry()
+    registry.register_batch((_clause("POLICY.yaml", 10, "policy"),))
+    builder = ContextBuilder(MagicMock(), context_clause_registry=registry)
+    before = builder._bootstrap_loader.file_order
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="already registered",
+    ):
+        builder._bootstrap_loader.add_file("POLICY.yaml")
+
+    assert builder._bootstrap_loader.file_order == before
+
+
+def test_bound_agents_can_share_names_and_unbind_without_stale_host_conflicts():
+    host = ContextClauseRegistry()
+    first = ContextClauseRegistry()
+    second = ContextClauseRegistry()
+    first.register_batch((_clause("shared-agent-name", 10, "one"),))
+    second.register_batch(
+        (
+            _clause(
+                "shared-agent-name",
+                20,
+                "two",
+                owner="tests:second-agent",
+            ),
+        )
+    )
+
+    first.bind_external_registries((host,))
+    second.bind_external_registries((host,))
+    first.bind_external_registries(())
+    second.bind_external_registries(())
+
+    host.register_batch(
+        (
+            _clause(
+                "shared-agent-name",
+                30,
+                "host",
+                owner="tests:host",
+            ),
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_measure_context_breakdown_attributes_exact_clause_tokens():
     registry = _ClauseRegistry(
