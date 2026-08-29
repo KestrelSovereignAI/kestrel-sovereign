@@ -21,7 +21,7 @@ from kestrel_sovereign.a2a.types import (
 )
 from kestrel_sovereign.a2a.stores.base import json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
 
@@ -553,28 +553,48 @@ class TaskStore(UnifiedStoreBase):
         )
         user_id = metadata.get("user_id")
 
-        rows_affected = await self._backend.execute(
-            f"""
-            INSERT INTO a2a_tasks
-            (id, session_id, user_id, task_type, status, message, artifacts,
-             history, metadata, updated_at, creator_agent_id, recipient_agent_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()}, ?, ?)
-            ON CONFLICT (id) DO NOTHING
-            """,
-            (
-                task.id,
-                task.sessionId,
-                user_id,
-                task_type,
-                task.status.state.value,
-                message_json,
-                artifacts_json,
-                history_json,
-                metadata_json,
-                creator_agent_id,
-                recipient_agent_id,
-            ),
-        )
+        try:
+            rows_affected = await self._backend.execute(
+                f"""
+                INSERT INTO a2a_tasks
+                (id, session_id, user_id, task_type, status, message, artifacts,
+                 history, metadata, updated_at, creator_agent_id, recipient_agent_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()}, ?, ?)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    task.id,
+                    task.sessionId,
+                    user_id,
+                    task_type,
+                    task.status.state.value,
+                    message_json,
+                    artifacts_json,
+                    history_json,
+                    metadata_json,
+                    creator_agent_id,
+                    recipient_agent_id,
+                ),
+            )
+        except QueryError as insert_error:
+            # SQLite fires BEFORE INSERT triggers before applying this
+            # statement's ON CONFLICT policy. The terminal canceled-row fence
+            # must continue blocking legacy INSERT OR REPLACE writers, but an
+            # ordinary duplicate submission still has the backend-independent
+            # TaskAlreadyExists contract. Re-probe the canonical key after the
+            # failed statement; do not translate unrelated storage failures.
+            try:
+                occupied = await self._backend.fetch_one(
+                    "SELECT 1 FROM a2a_tasks WHERE id = ?",
+                    (task.id,),
+                )
+            except QueryError:
+                raise insert_error
+            if occupied is not None:
+                raise TaskAlreadyExistsError(
+                    f"Task already exists: {task.id}"
+                ) from insert_error
+            raise
         if rows_affected != 1:
             raise TaskAlreadyExistsError(f"Task already exists: {task.id}")
 
