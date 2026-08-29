@@ -112,7 +112,6 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
-from kestrel_sovereign.agent.invocation import InvocationCancelledError
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.security.encryption import (
     DecryptionError,
@@ -3902,6 +3901,7 @@ class SignalDispatcher:
         from kestrel_sovereign.agent.context_manager import (
             reset_injection_tracking,
         )
+        from kestrel_sovereign.agent.invocation import InvocationCancelledError
 
         reset_injection_tracking()
 
