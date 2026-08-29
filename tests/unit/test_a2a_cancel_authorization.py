@@ -188,7 +188,7 @@ async def test_same_actor_cancel_retry_returns_existing_receipt_once(tmp_path):
 async def test_cancel_retry_reconciles_terminal_projection_after_interruption(
     tmp_path,
 ):
-    """A committed cancel is replayable when its first SSE projection dies."""
+    """Caller cancellation cannot split projection ownership across a retry."""
 
     manager = await create_task_manager(str(tmp_path / "cancel-reconcile.db"))
     try:
@@ -197,24 +197,54 @@ async def test_cancel_retry_reconciles_terminal_projection_after_interruption(
             agent_name="did:test:recipient",
             creator_agent_id="did:test:creator",
         )
+        terminal_events = asyncio.Queue()
+        manager._subscribers["cancel-reconcile"] = [terminal_events]
+        completions = []
+        manager._on_task_complete = lambda task: completions.append(task.id)
         project = manager._project_status_transition
-        manager._project_status_transition = AsyncMock(
-            side_effect=asyncio.CancelledError
-        )
-        with pytest.raises(asyncio.CancelledError):
-            await manager.cancel_task(
+        projection_started = asyncio.Event()
+        release_projection = asyncio.Event()
+
+        async def slow_projection(*args, **kwargs):
+            projection_started.set()
+            await release_projection.wait()
+            await project(*args, **kwargs)
+
+        manager._project_status_transition = slow_projection
+        cancellation = asyncio.create_task(
+            manager.cancel_task(
                 "cancel-reconcile",
                 reason="withdrawn",
                 agent_name="did:test:creator",
                 recipient_agent_id="did:test:recipient",
             )
+        )
+        await projection_started.wait()
+        cancellation.cancel()
+        await asyncio.sleep(0)
+        assert not cancellation.done()
+        release_projection.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancellation
         assert (
             await manager.get_task("cancel-reconcile")
         ).status.state is TaskState.CANCELED
 
-        terminal_events = asyncio.Queue()
-        manager._subscribers["cancel-reconcile"] = [terminal_events]
         manager._project_status_transition = project
+        session_before = await manager.session_service.get_session(
+            "session-cancel-reconcile"
+        )
+        session_events_before = len(
+            [
+                event
+                for event in session_before.events
+                if event.get("event_type") == "status_update"
+            ]
+        )
+        memory_before = await manager.task_store._backend.fetch_one(
+            "SELECT COUNT(*) FROM a2a_memory WHERE session_id = ?",
+            ("session-cancel-reconcile",),
+        )
         retry = await manager.cancel_task(
             "cancel-reconcile",
             reason="withdrawn",
@@ -226,6 +256,54 @@ async def test_cancel_retry_reconciles_terminal_projection_after_interruption(
         assert retry.status.state is TaskState.CANCELED
         assert event["event"] == "status"
         assert event["final"] is True
+        assert terminal_events.empty()
+        assert completions == ["cancel-reconcile"]
+        session_after = await manager.session_service.get_session(
+            "session-cancel-reconcile"
+        )
+        assert len(
+            [
+                event
+                for event in session_after.events
+                if event.get("event_type") == "status_update"
+            ]
+        ) == session_events_before
+        assert await manager.task_store._backend.fetch_one(
+            "SELECT COUNT(*) FROM a2a_memory WHERE session_id = ?",
+            ("session-cancel-reconcile",),
+        ) == memory_before
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_create_task_never_publishes_a_stale_submitted_snapshot(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "create-readback.db"))
+    try:
+        task_id = "create-race"
+        notifications = asyncio.Queue()
+        manager._subscribers[task_id] = [notifications]
+
+        async def cancel_during_projection(_session_id):
+            canceled = await manager.task_store.cancel_if_authorized(
+                task_id,
+                actor_agent_id="did:test:creator",
+                reason="raced admission",
+            )
+            assert canceled is not None
+            return None
+
+        manager.session_service.get_session = AsyncMock(
+            side_effect=cancel_during_projection
+        )
+        created = await manager.create_task(
+            _params(task_id),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        assert created.status.state is TaskState.CANCELED
+        assert notifications.empty()
     finally:
         await manager.close()
 
