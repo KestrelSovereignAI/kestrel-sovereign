@@ -156,6 +156,9 @@ class TestTaskManager:
         task_store._get_unscoped = AsyncMock(
             side_effect=lambda _task_id: canceled_task
         )
+        task_store.get_for_principal = AsyncMock(
+            side_effect=lambda _task_id, _principal: canceled_task
+        )
         task_store.close = AsyncMock(side_effect=close_task_store)
         session_service = MagicMock()
         session_service.close = AsyncMock()
