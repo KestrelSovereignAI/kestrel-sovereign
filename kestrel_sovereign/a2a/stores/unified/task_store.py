@@ -316,6 +316,18 @@ class TaskStore(UnifiedStoreBase):
                 SELECT RAISE(ABORT, 'canceled A2A task is terminal');
             END;
 
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_insert_fence_v3;
+            CREATE TRIGGER a2a_tasks_canceled_insert_fence_v3
+            BEFORE INSERT ON a2a_tasks
+            FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM a2a_tasks existing
+                WHERE existing.id = NEW.id AND existing.status = 'canceled'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
             BEFORE INSERT ON a2a_tasks
             FOR EACH ROW
