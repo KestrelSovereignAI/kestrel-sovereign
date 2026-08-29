@@ -2612,6 +2612,7 @@ function stopFailureRequiresFreshOperation(error) {
                 + 'Stop receipt could not be persisted'
             )
             || outcome.detail === 'An exact Stop operation is already in progress'
+            || outcome.detail === 'Stop operation identity conflicts with durable evidence'
         )
     ));
 }

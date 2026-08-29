@@ -22,6 +22,7 @@ from kestrel_sovereign.features.sovereignty.artifacts import owned_artifacts, ow
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    prime_durable_stop_fence,
     request_invocation_provenance,
     caller_is_sovereign,
     require_sovereign_host_lifecycle,
@@ -3335,6 +3336,7 @@ async def chat_completions(request: Request, http_response: Response):
         # Extract user_passphrase for USER_BYOK agents
         user_passphrase = data.get("user_passphrase")
         request_id = resolve_request_invocation_id(request, data)
+        await prime_durable_stop_fence(request, agent, request_id)
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/v1/chat/completions",

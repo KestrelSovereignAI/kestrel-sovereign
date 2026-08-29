@@ -383,6 +383,67 @@ test('terminal failed Stop receipt retries with a new durable operation ID', asy
 });
 
 
+test('durable operation identity conflict rotates the reconciliation operation', async () => {
+    const agent = 'agent-stop-operation-conflict';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'conflicted-stop-turn';
+    const correlationIds = [];
+    const requestIds = [];
+    let stopAttempts = 0;
+    apiModule.default.stop = async (requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        requestIds.push(requestId);
+        correlationIds.push(correlationId);
+        if (stopAttempts === 1) {
+            const error = new Error('durable operation identity conflict');
+            error.body = {
+                error: {
+                    code: 'stop_not_confirmed',
+                    details: [{
+                        disposition: 'refused',
+                        receipt_id: null,
+                        detail: 'Stop operation identity conflicts with durable evidence',
+                    }],
+                },
+            };
+            throw error;
+        }
+        return confirmedStopResponse();
+    };
+    const ctrl = controlledStream();
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return ctrl.iter;
+    };
+    apiModule.default.invoke = async () => ({ response: '' });
+
+    messageInput.value = 'first conflict reconciliation';
+    await sendMessage();
+    assert.equal(replacementStarted, false);
+    assert.equal(state.unconfirmedStopAgents.has(agent), true);
+
+    state.waitingAgents.delete(agent);
+    messageInput.value = 'retry after operation conflict';
+    const retry = sendMessage();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(replacementStarted, true);
+    ctrl.end();
+    await retry;
+
+    assert.deepEqual(requestIds, ['conflicted-stop-turn', 'conflicted-stop-turn']);
+    assert.equal(typeof correlationIds[0], 'string');
+    assert.equal(typeof correlationIds[1], 'string');
+    assert.notEqual(correlationIds[1], correlationIds[0]);
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+});
+
+
 test('receipt persistence failure retries with a fresh reconciliation operation', async () => {
     const agent = 'agent-stop-persistence-reconcile';
     getOrCreateChatPane(agent);
