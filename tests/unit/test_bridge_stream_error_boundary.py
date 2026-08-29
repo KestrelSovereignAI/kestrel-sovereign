@@ -186,6 +186,23 @@ def test_bridge_stream_withholds_chunk_queued_before_stop():
     assert agent.features["BridgeFeature"].log_invocation.await_count == 1
 
 
+def test_bridge_stream_reports_stop_after_clean_producer_eof():
+    """A stopped clean unwind cannot fall through to done or outbound logging."""
+
+    async def _clean_eof(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+
+    response, agent = _post_stream_with_agent(
+        _clean_eof,
+        cancellation_after_stream=True,
+    )
+
+    assert response.status_code == 200
+    assert [event["type"] for event in _events(response.text)] == ["stopped"]
+    assert agent.features["BridgeFeature"].log_invocation.await_count == 1
+
+
 def test_bridge_stream_generic_exception_emits_safe_constant_not_str_e():
     """A generic mid-stream exception whose text carries the withheld marker must
     NOT be reflected; the SSE error event is a stable, content-free constant."""

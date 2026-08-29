@@ -2587,6 +2587,16 @@ async function stopRequest() {
     return stopAgent(deps().api.getHostAgent());
 }
 
+function hasTerminalStopReceipt(error) {
+    const details = error?.body?.error?.details;
+    return Array.isArray(details) && details.some((outcome) => (
+        outcome
+        && typeof outcome === 'object'
+        && typeof outcome.receipt_id === 'string'
+        && outcome.receipt_id.length > 0
+    ));
+}
+
 /**
  * Stop a specific agent's in-flight stream. Aborts client-side via
  * the per-agent AbortController, and tells the server to halt by
@@ -2666,6 +2676,14 @@ export async function stopAgent(agentName) {
         }
     } catch (e) {
         console.error(`Error stopping request on ${agentName}:`, e);
+        // A receipt-bearing failure is definitive and immutable for this
+        // operation ID. Retain the exact request address, but let the next
+        // reconciliation allocate a fresh operation so it can observe that
+        // the old turn subsequently completed. Transport/malformed failures
+        // remain ambiguous and must replay the original durable operation.
+        if (hasTerminalStopReceipt(e)) {
+            retainedCorrelationIds.delete(agentName);
+        }
         refreshAgentThinkingDot(agentName);
         if (agentName === deps().api.getHostAgent()) {
             updateThinkingIndicator();
