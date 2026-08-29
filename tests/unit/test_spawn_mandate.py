@@ -2,6 +2,7 @@
 
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,8 @@ from kestrel_sovereign.spawn.mandate import (
     create_child_did_document,
 )
 from kestrel_sovereign.inception_service import generate_secp256k1_keypair
+from kestrel_sovereign.identity.succession import SuccessionStatement
+from kestrel_sovereign.identity.succession_chain import build_chain
 
 
 @pytest.fixture
@@ -134,6 +137,60 @@ class TestMandateSigning:
         _, public_key = parent_keys
         sample_mandate.parent_signature = "deadbeef"
         assert verify_mandate(sample_mandate, public_key) is False
+
+    def test_rotated_parent_accepts_classical_mandate_from_before_cutoff(
+        self, parent_keys
+    ):
+        parent_private, parent_public = parent_keys
+        legacy_did = "did:pkh:eip155:1:0xPreRotationParent"
+        statement = SuccessionStatement(
+            predecessor_did=legacy_did,
+            successor_did="did:web:example.test:rotated-parent",
+            effective_from="2026-08-20T00:00:00+00:00",
+            reason="test rotation",
+        )
+        identity = SimpleNamespace(
+            is_hybrid=True,
+            legacy_did=legacy_did,
+            succession_chain=build_chain([statement]),
+        )
+        mandate = SpawnMandate(
+            parent_did=legacy_did,
+            child_did="did:test:child",
+            created_at="2026-08-19T23:59:59+00:00",
+        )
+        sign_mandate(mandate, parent_private)
+
+        assert verify_mandate(
+            mandate, parent_public, parent_identity=identity
+        ) is True
+
+    def test_rotated_parent_rejects_classical_mandate_at_or_after_cutoff(
+        self, parent_keys
+    ):
+        parent_private, parent_public = parent_keys
+        legacy_did = "did:pkh:eip155:1:0xPostRotationParent"
+        statement = SuccessionStatement(
+            predecessor_did=legacy_did,
+            successor_did="did:web:example.test:rotated-parent",
+            effective_from="2026-08-20T00:00:00+00:00",
+            reason="test rotation",
+        )
+        identity = SimpleNamespace(
+            is_hybrid=True,
+            legacy_did=legacy_did,
+            succession_chain=build_chain([statement]),
+        )
+        mandate = SpawnMandate(
+            parent_did=legacy_did,
+            child_did="did:test:child",
+            created_at="2026-08-20T00:00:00+00:00",
+        )
+        sign_mandate(mandate, parent_private)
+
+        assert verify_mandate(
+            mandate, parent_public, parent_identity=identity
+        ) is False
 
 
 class TestChildDIDDocument:

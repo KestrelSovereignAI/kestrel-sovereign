@@ -1,6 +1,7 @@
 """Unit tests for the in-process AgentManager."""
 
 import asyncio
+import inspect
 import os
 import subprocess
 import sys
@@ -29,12 +30,15 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.identity.local_anchor import AgentDIDLookupMode
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
+from kestrel_sovereign.identity.succession import SuccessionStatement
+from kestrel_sovereign.identity.succession_chain import build_chain
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.knowledge import InferenceError, InferenceProfile, OntologyRef
 from kestrel_sovereign.multi_agent.agent_manager import (
     AgentOperationAdmission,
     AgentManager,
     ChildTerminationReconciliationError,
+    PersistedSpawnParentUnavailableError,
     QuarantinedShutdownHistory,
     RUNTIME_OFFBOARD_TIMEOUT_S,
     RuntimeOffboardingAdmission,
@@ -264,6 +268,7 @@ async def test_load_validates_restored_authority_before_agent_ready(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
     manager._register_agent("ReadyParent", parent)
     ready_events: list[str] = []
+    feature_worker_events: list[str] = []
 
     class HostedChild:
         def __init__(self, *, did, **_kwargs):
@@ -273,6 +278,12 @@ async def test_load_validates_restored_authority_before_agent_ready(tmp_path):
             self._persisted_spawn_mandate = mandate
 
         async def initialize(self):
+            preflight = vars(self).get("_host_authority_preflight")
+            if preflight is not None:
+                result = preflight()
+                if inspect.isawaitable(result):
+                    await result
+            feature_worker_events.append("started")
             if not vars(self).get("_host_ready_hooks_deferred", False):
                 ready_events.append("ready")
 
@@ -298,6 +309,7 @@ async def test_load_validates_restored_authority_before_agent_ready(tmp_path):
         await manager.load_agent("ReadyChild", config)
 
     assert ready_events == []
+    assert feature_worker_events == []
     assert manager.get_agent("ReadyChild") is None
 
 
@@ -1177,6 +1189,48 @@ def test_hybrid_parent_signing_alias_restores_to_stable_parent(tmp_path):
 
     assert manager.get_children(legacy_did) == ["HybridChild"]
     assert manager.get_mandate("HybridChild") is mandate
+
+
+def test_rotated_parent_restores_pre_cutoff_classical_child_from_public_key(
+    tmp_path,
+):
+    """Rotation keeps archival verification without legacy private custody."""
+
+    legacy_did = "did:pkh:eip155:1:0xArchivedParent"
+    child_did = "did:test:archived-child"
+    private_key, public_key = generate_secp256k1_keypair()
+    statement = SuccessionStatement(
+        predecessor_did=legacy_did,
+        successor_did="did:web:example.test:archived-parent",
+        effective_from="2026-08-20T00:00:00+00:00",
+        reason="test rotation",
+    )
+    parent = _make_mock_agent(legacy_did)
+    parent._private_key = None
+    parent.identity = SimpleNamespace(
+        is_hybrid=True,
+        legacy_did=legacy_did,
+        new_did=statement.successor_did,
+        legacy_keypair=SimpleNamespace(public_key=public_key),
+        succession_chain=build_chain([statement]),
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=legacy_did,
+            child_did=child_did,
+            ttl_seconds=0,
+            created_at="2026-08-19T23:59:59+00:00",
+        ),
+        private_key,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+
+    manager._register_agent("ArchivedParent", parent)
+    manager._register_agent("ArchivedChild", child)
+
+    assert manager.get_children(legacy_did) == ["ArchivedChild"]
+    assert manager.get_mandate("ArchivedChild") is child._persisted_spawn_mandate
 
 
 @pytest.mark.asyncio
@@ -6213,6 +6267,49 @@ class TestLoadFromConfig:
             "ChildFirstInConfig",
         ]
         assert manager.get_children(parent_did) == ["ChildFirstInConfig"]
+
+    @pytest.mark.asyncio
+    async def test_batch_retries_pre_feature_child_after_parent_publication(
+        self, tmp_path
+    ):
+        """Dependency rounds preserve child-first configuration safely."""
+
+        parent_did = "did:test:round-parent"
+        child_did = "did:test:round-child"
+        parent, mandate = _signed_restored_mandate(
+            parent_did,
+            child_did,
+            ttl_seconds=0,
+        )
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        config = MultiAgentConfig(
+            agents={
+                "RoundChild": LocalAgentConfig(
+                    data_dir=tmp_path / "child", port=8801
+                ),
+                "RoundParent": LocalAgentConfig(
+                    data_dir=tmp_path / "parent", port=8802
+                ),
+            }
+        )
+        manager = AgentManager(base_data_dir=tmp_path)
+        attempts = {"RoundChild": 0, "RoundParent": 0}
+
+        async def initialize(name, _config):
+            attempts[name] += 1
+            if name == "RoundChild" and manager.get_agent("RoundParent") is None:
+                raise PersistedSpawnParentUnavailableError(
+                    "parent authority is not loaded"
+                )
+            return child if name == "RoundChild" else parent
+
+        manager._initialize_agent = initialize
+
+        assert await manager.load_from_config(config) == 2
+        assert attempts == {"RoundChild": 2, "RoundParent": 1}
+        assert list(manager._agents) == ["RoundParent", "RoundChild"]
+        assert manager.init_failures == []
 
     @pytest.mark.asyncio
     async def test_batch_projects_authority_before_ready_and_rolls_it_back(

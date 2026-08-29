@@ -1558,6 +1558,21 @@ class AgentManager:
             # authority.  The flag preserves initialize()'s direct-boot API
             # while making hosted readiness an explicit publication phase.
             agent._host_ready_hooks_deferred = True
+            # A feature initializer may start a worker before on_agent_ready.
+            # Validate any cold signed lineage at the phase-4 boundary, while
+            # no feature has been discovered, against the currently loaded
+            # parent. Batch startup retries parent-unavailable descendants in
+            # a later round after successful roots have published.
+            def _preflight_hosted_authority() -> None:
+                self._refuse_unrestored_delegated_budget(name, agent)
+                self._restore_persisted_spawn_authority(
+                    name,
+                    agent,
+                    agent_did,
+                    project=False,
+                )
+
+            agent._host_authority_preflight = _preflight_hosted_authority
             await agent.initialize()
         except BaseException:
             if agent is not None:
@@ -1848,6 +1863,9 @@ class AgentManager:
         public_key_getter = getattr(parent_private_key, "public_key", None)
         if callable(public_key_getter):
             public_key = public_key_getter()
+        if public_key is None and parent_identity is not None:
+            legacy_keypair = getattr(parent_identity, "legacy_keypair", None)
+            public_key = getattr(legacy_keypair, "public_key", None)
         from kestrel_sovereign.spawn.mandate import verify_mandate
 
         if not verify_mandate(
@@ -2933,217 +2951,256 @@ class AgentManager:
                     continue
                 admitted.append((name, agent_cfg, admission))
 
-            # Agent storage, provider construction, and feature initialization
-            # are independent. Run them concurrently, then register successful
-            # results in config order so UI/fleet order remains stable.
+            # Initialize in concurrent dependency rounds. Roots and siblings
+            # retain bounded overlap; a signed descendant whose parent has not
+            # published yet fails its pre-feature authority gate, rolls back,
+            # and is reconstructed in the next round. This preserves
+            # child-before-parent config support without ever letting a child
+            # feature worker run on an unverified receipt.
             init_slots = asyncio.Semaphore(self._init_concurrency)
 
             async def _bounded_initialize(name, agent_cfg):
                 async with init_slots:
                     return await self._initialize_agent(name, agent_cfg)
 
-            init_tasks = [
-                asyncio.create_task(_bounded_initialize(name, agent_cfg))
-                for name, agent_cfg, _ in admitted
-            ]
-            try:
-                results = await asyncio.gather(*init_tasks, return_exceptions=True)
-            except BaseException as initial_failure:
-                # ``gather`` cancellation cancels pending initializers.  Results
-                # that already initialized are invisible to shutdown_all(), so
-                # this batch still owns their cleanup.  Cancellation wins only
-                # after all of those ownership transfers have settled.
-                settled = await asyncio.gather(*init_tasks, return_exceptions=True)
-                initialized = [
-                    (name, result)
-                    for (name, _, _), result in zip(admitted, settled)
-                    if not isinstance(result, BaseException)
+            remaining = list(admitted)
+            while remaining:
+                init_tasks = [
+                    asyncio.create_task(_bounded_initialize(name, agent_cfg))
+                    for name, agent_cfg, _ in remaining
                 ]
                 try:
-                    cleanup_cancelled = (
-                        await self._discard_unpublished_initialized_agents(initialized)
+                    results = await asyncio.gather(
+                        *init_tasks, return_exceptions=True
                     )
-                except BaseException:
-                    if isinstance(initial_failure, asyncio.CancelledError):
-                        raise asyncio.CancelledError()
-                    raise
-                if isinstance(initial_failure, asyncio.CancelledError) or cleanup_cancelled:
-                    raise asyncio.CancelledError()
-                raise initial_failure
-
-            fatal = next(
-                (
-                    result
-                    for result in results
-                    if isinstance(result, BaseException)
-                    and not isinstance(result, Exception)
-                ),
-                None,
-            )
-            if fatal is not None:
-                initialized = [
-                    (name, result)
-                    for (name, _, _), result in zip(admitted, results)
-                    if not isinstance(result, BaseException)
-                ]
-                try:
-                    cleanup_cancelled = (
-                        await self._discard_unpublished_initialized_agents(initialized)
+                except BaseException as initial_failure:
+                    # ``gather`` cancellation cancels pending initializers.
+                    # Successful unpublished results remain owned by this
+                    # round and must settle before cancellation propagates.
+                    settled = await asyncio.gather(
+                        *init_tasks, return_exceptions=True
                     )
-                except BaseException:
-                    if isinstance(fatal, asyncio.CancelledError):
-                        raise asyncio.CancelledError()
-                    raise
-                if isinstance(fatal, asyncio.CancelledError) or cleanup_cancelled:
-                    raise asyncio.CancelledError()
-                raise fatal
-
-            unpublished = {
-                name: result
-                for (name, _, _), result in zip(admitted, results)
-                if not isinstance(result, BaseException)
-            }
-            try:
-                initialized_for_registration = []
-                for (name, _, admission), result in zip(admitted, results):
-                    if isinstance(result, BaseException):
-                        e = result
-                        if isinstance(e, IdentityReadinessError):
-                            logger.error(
-                                "Failed to load agent '%s': %s "
-                                "(code=%s, cause_type=%s)",
-                                name,
-                                e,
-                                e.error_code,
-                                e.cause_type,
-                            )
-                        else:
-                            logger.error(
-                                f"Failed to load agent '{name}': {e}",
-                                exc_info=(type(e), e, e.__traceback__),
-                            )
-                        self._init_failures.append((name, e))
-                        continue
-                    initialized_for_registration.append(
-                        (name, admission, result)
-                    )
-
-                for name, admission, result in (
-                    self._registration_order_for_initialized_agents(
-                        initialized_for_registration
-                    )
-                ):
-                    try:
-                        withdrawn_after_onboarding_failure = False
-                        async with self._a2a_lifecycle_lock:
-                            if not self._operation_is_admitted(admission):
-                                raise RuntimeError(
-                                    "Agent initialization completed after manager shutdown began"
-                                )
-                            async with self._lock:
-                                self._prepare_agent_authority(name, result)
-                        await self._run_hosted_agent_ready_hooks_before_mandate_expiry(
-                            result
-                        )
-                        async with self._a2a_lifecycle_lock:
-                            if not self._operation_is_admitted(admission):
-                                raise RuntimeError(
-                                    "Agent initialization completed after manager shutdown began"
-                                )
-                            try:
-                                self._register_agent(
-                                    name,
-                                    result,
-                                    arm_restored_ttl=False,
-                                )
-                                await self._on_agent_registered(name, result)
-                                self._commit_restored_child_ttl(name, result)
-                                self._commit_dynamic_scheduler_registration(result)
-                            except BaseException:
-                                # Mirror the single-load path: an onboarding
-                                # rejection is withdrawn before releasing the
-                                # A2A writer, while cleanup remains outside the
-                                # writer so it cannot block inbound topology.
-                                self._withdraw_initialized_agent(name, result)
-                                withdrawn_after_onboarding_failure = True
-                                raise
-                            admission.published = True
-                        unpublished.pop(name, None)
-                        loaded += 1
-                    except BaseException as onboarding_failure:
-                        # Claim before the first cleanup await.  If that cleanup
-                        # fails, the outer batch handler must not discover and
-                        # shut down this same initialized agent a second time.
-                        claimed = unpublished.pop(name, None)
-                        cleanup_failure: Optional[BaseException] = None
-                        cleanup_cancelled = False
-                        if claimed is not None:
-                            try:
-                                cleanup_cancelled = (
-                                    await self._discard_unpublished_initialized_agents(
-                                        [(name, claimed)],
-                                        already_withdrawn=withdrawn_after_onboarding_failure,
-                                    )
-                                )
-                            except BaseException as error:
-                                cleanup_failure = error
-                        if (
-                            isinstance(onboarding_failure, asyncio.CancelledError)
-                            or cleanup_cancelled
-                            or isinstance(cleanup_failure, asyncio.CancelledError)
-                        ):
-                            raise asyncio.CancelledError()
-                        if cleanup_failure is not None:
-                            if isinstance(onboarding_failure, Exception) and isinstance(
-                                cleanup_failure, Exception
-                            ):
-                                raise ExceptionGroup(
-                                    "Agent onboarding and its claimed cleanup failed",
-                                    [onboarding_failure, cleanup_failure],
-                                )
-                            raise cleanup_failure
-                        if not isinstance(onboarding_failure, Exception):
-                            raise onboarding_failure
-                        logger.error(
-                            "Failed to onboard agent %r after initialization: %s",
-                            name,
-                            onboarding_failure,
-                            exc_info=True,
-                        )
-                        self._init_failures.append((name, onboarding_failure))
-                        continue
-            except BaseException as publication_failure:
-                # ``unpublished`` contains only agents this path still owns;
-                # failing onboarding claimed its result before cleanup above.
-                cleanup_failure: Optional[BaseException] = None
-                cleanup_cancelled = False
-                if unpublished:
-                    claimed_unpublished = list(unpublished.items())
-                    unpublished.clear()
+                    initialized = [
+                        (name, result)
+                        for (name, _, _), result in zip(remaining, settled)
+                        if not isinstance(result, BaseException)
+                    ]
                     try:
                         cleanup_cancelled = (
                             await self._discard_unpublished_initialized_agents(
-                                claimed_unpublished
+                                initialized
                             )
                         )
-                    except BaseException as error:
-                        cleanup_failure = error
-                if (
-                    isinstance(publication_failure, asyncio.CancelledError)
-                    or cleanup_cancelled
-                    or isinstance(cleanup_failure, asyncio.CancelledError)
-                ):
-                    raise asyncio.CancelledError()
-                if cleanup_failure is not None:
-                    if isinstance(publication_failure, Exception) and isinstance(
-                        cleanup_failure, Exception
+                    except BaseException:
+                        if isinstance(initial_failure, asyncio.CancelledError):
+                            raise asyncio.CancelledError()
+                        raise
+                    if (
+                        isinstance(initial_failure, asyncio.CancelledError)
+                        or cleanup_cancelled
                     ):
-                        raise ExceptionGroup(
-                            "Batch publication and claimed cleanup failed",
-                            [publication_failure, cleanup_failure],
+                        raise asyncio.CancelledError()
+                    raise initial_failure
+
+                fatal = next(
+                    (
+                        result
+                        for result in results
+                        if isinstance(result, BaseException)
+                        and not isinstance(result, Exception)
+                    ),
+                    None,
+                )
+                if fatal is not None:
+                    initialized = [
+                        (name, result)
+                        for (name, _, _), result in zip(remaining, results)
+                        if not isinstance(result, BaseException)
+                    ]
+                    try:
+                        cleanup_cancelled = (
+                            await self._discard_unpublished_initialized_agents(
+                                initialized
+                            )
                         )
-                    raise cleanup_failure
-                raise
+                    except BaseException:
+                        if isinstance(fatal, asyncio.CancelledError):
+                            raise asyncio.CancelledError()
+                        raise
+                    if isinstance(fatal, asyncio.CancelledError) or cleanup_cancelled:
+                        raise asyncio.CancelledError()
+                    raise fatal
+
+                deferred: list[
+                    tuple[str, LocalAgentConfig, AgentOperationAdmission]
+                ] = []
+                deferred_errors: dict[str, Exception] = {}
+                unpublished = {
+                    name: result
+                    for (name, _, _), result in zip(remaining, results)
+                    if not isinstance(result, BaseException)
+                }
+                published_this_round = 0
+                try:
+                    initialized_for_registration = []
+                    for (name, agent_cfg, admission), result in zip(
+                        remaining, results
+                    ):
+                        if isinstance(
+                            result, PersistedSpawnParentUnavailableError
+                        ):
+                            deferred.append((name, agent_cfg, admission))
+                            deferred_errors[name] = result
+                            continue
+                        if isinstance(result, BaseException):
+                            e = result
+                            if isinstance(e, IdentityReadinessError):
+                                logger.error(
+                                    "Failed to load agent '%s': %s "
+                                    "(code=%s, cause_type=%s)",
+                                    name,
+                                    e,
+                                    e.error_code,
+                                    e.cause_type,
+                                )
+                            else:
+                                logger.error(
+                                    f"Failed to load agent '{name}': {e}",
+                                    exc_info=(type(e), e, e.__traceback__),
+                                )
+                            self._init_failures.append((name, e))
+                            continue
+                        initialized_for_registration.append(
+                            (name, admission, result)
+                        )
+
+                    for name, admission, result in (
+                        self._registration_order_for_initialized_agents(
+                            initialized_for_registration
+                        )
+                    ):
+                        try:
+                            withdrawn_after_onboarding_failure = False
+                            async with self._a2a_lifecycle_lock:
+                                if not self._operation_is_admitted(admission):
+                                    raise RuntimeError(
+                                        "Agent initialization completed after manager shutdown began"
+                                    )
+                                async with self._lock:
+                                    self._prepare_agent_authority(name, result)
+                            await self._run_hosted_agent_ready_hooks_before_mandate_expiry(
+                                result
+                            )
+                            async with self._a2a_lifecycle_lock:
+                                if not self._operation_is_admitted(admission):
+                                    raise RuntimeError(
+                                        "Agent initialization completed after manager shutdown began"
+                                    )
+                                try:
+                                    self._register_agent(
+                                        name,
+                                        result,
+                                        arm_restored_ttl=False,
+                                    )
+                                    await self._on_agent_registered(name, result)
+                                    self._commit_restored_child_ttl(name, result)
+                                    self._commit_dynamic_scheduler_registration(result)
+                                except BaseException:
+                                    self._withdraw_initialized_agent(name, result)
+                                    withdrawn_after_onboarding_failure = True
+                                    raise
+                                admission.published = True
+                            unpublished.pop(name, None)
+                            loaded += 1
+                            published_this_round += 1
+                        except BaseException as onboarding_failure:
+                            claimed = unpublished.pop(name, None)
+                            cleanup_failure: Optional[BaseException] = None
+                            cleanup_cancelled = False
+                            if claimed is not None:
+                                try:
+                                    cleanup_cancelled = (
+                                        await self._discard_unpublished_initialized_agents(
+                                            [(name, claimed)],
+                                            already_withdrawn=(
+                                                withdrawn_after_onboarding_failure
+                                            ),
+                                        )
+                                    )
+                                except BaseException as error:
+                                    cleanup_failure = error
+                            if (
+                                isinstance(
+                                    onboarding_failure, asyncio.CancelledError
+                                )
+                                or cleanup_cancelled
+                                or isinstance(
+                                    cleanup_failure, asyncio.CancelledError
+                                )
+                            ):
+                                raise asyncio.CancelledError()
+                            if cleanup_failure is not None:
+                                if isinstance(
+                                    onboarding_failure, Exception
+                                ) and isinstance(cleanup_failure, Exception):
+                                    raise ExceptionGroup(
+                                        "Agent onboarding and its claimed cleanup failed",
+                                        [onboarding_failure, cleanup_failure],
+                                    )
+                                raise cleanup_failure
+                            if not isinstance(onboarding_failure, Exception):
+                                raise onboarding_failure
+                            logger.error(
+                                "Failed to onboard agent %r after initialization: %s",
+                                name,
+                                onboarding_failure,
+                                exc_info=True,
+                            )
+                            self._init_failures.append(
+                                (name, onboarding_failure)
+                            )
+                except BaseException as publication_failure:
+                    cleanup_failure: Optional[BaseException] = None
+                    cleanup_cancelled = False
+                    if unpublished:
+                        claimed_unpublished = list(unpublished.items())
+                        unpublished.clear()
+                        try:
+                            cleanup_cancelled = (
+                                await self._discard_unpublished_initialized_agents(
+                                    claimed_unpublished
+                                )
+                            )
+                        except BaseException as error:
+                            cleanup_failure = error
+                    if (
+                        isinstance(publication_failure, asyncio.CancelledError)
+                        or cleanup_cancelled
+                        or isinstance(cleanup_failure, asyncio.CancelledError)
+                    ):
+                        raise asyncio.CancelledError()
+                    if cleanup_failure is not None:
+                        if isinstance(
+                            publication_failure, Exception
+                        ) and isinstance(cleanup_failure, Exception):
+                            raise ExceptionGroup(
+                                "Batch publication and claimed cleanup failed",
+                                [publication_failure, cleanup_failure],
+                            )
+                        raise cleanup_failure
+                    raise
+
+                if not deferred:
+                    break
+                if published_this_round == 0:
+                    # No new parent can become available in another retry.
+                    # Record the exact pre-feature refusal once and stop.
+                    for name, _, _ in deferred:
+                        error = deferred_errors[name]
+                        logger.error("Failed to load agent %r: %s", name, error)
+                        self._init_failures.append((name, error))
+                    break
+                remaining = deferred
             return loaded
         finally:
             # No batch admission is reusable until all initialization,

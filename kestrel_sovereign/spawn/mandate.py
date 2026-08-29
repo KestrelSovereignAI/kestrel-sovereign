@@ -262,11 +262,10 @@ def verify_mandate(
            BOTH ed25519 + ml-dsa-65 to be present (HYBRID_REQUIRED).
 
     - Otherwise (bare hex) → classic secp256k1 ECDSA verify against
-      ``parent_public_key``. Pre-ceremony mandates follow this path
-      unchanged — UNLESS the trusted ``parent_identity`` is hybrid, in
-      which case a classical-only signature is a downgrade and is
-      rejected outright (#2400) rather than routed to ECDSA, mirroring
-      ``verify_policy``'s post-cutoff classical-downgrade semantics.
+      ``parent_public_key``. A rotated parent retains classical mandates
+      whose signed ``created_at`` predates its first succession cutoff;
+      post-cutoff classical signatures (and every classical signature for a
+      born-hybrid parent) remain downgrade attempts and are refused.
     """
     if not mandate.parent_signature:
         logger.warning("Mandate has no signature to verify")
@@ -305,23 +304,51 @@ def verify_mandate(
             parent_identity.new_verification_methods,
         )
 
-    # Policy-first downgrade check (#2400): a bare-hex (classical
-    # secp256k1) signature must NOT be accepted for a hybrid parent.
-    # Sniffing the verification path from the wire format alone let an
-    # attacker present a classical-only mandate for a hybrid parent
-    # (HYBRID_REQUIRED enforced only *inside* the hybrid envelope).
-    # Mirror ``evaluate_signatures``' post-cutoff classical-downgrade
-    # rejection: once the trusted parent identity is hybrid, a
-    # non-hybrid signature is a downgrade and is refused outright.
+    # Policy-first temporal downgrade check (#2400/#3142). A rotation does
+    # not retroactively invalidate artifacts signed by the predecessor while
+    # it was authoritative: ``created_at`` is itself signature-bound. Resolve
+    # that instant through the trusted succession chain, accepting ECDSA only
+    # while the mandate's named legacy DID was still the active root. A
+    # born-hybrid identity has no predecessor window; malformed/missing chain
+    # evidence fails closed.
     if parent_identity is not None and getattr(
         parent_identity, "is_hybrid", False
     ):
-        logger.warning(
-            "Mandate for hybrid parent %r carries a classical (non-hybrid) "
-            "signature; refusing classical downgrade (HYBRID_REQUIRED)",
-            mandate.parent_did,
-        )
-        return False
+        legacy_did = getattr(parent_identity, "legacy_did", None)
+        chain = getattr(parent_identity, "succession_chain", None)
+        classical_was_active = False
+        try:
+            if (
+                isinstance(legacy_did, str)
+                and legacy_did
+                and mandate.parent_did == legacy_did
+                and chain is not None
+                and getattr(chain, "statements", ())
+            ):
+                from kestrel_sovereign.identity.succession_chain import (
+                    resolve_active_identity,
+                )
+
+                first = chain.statements[0]
+                active = resolve_active_identity(
+                    root_did=legacy_did,
+                    root_verification_methods=(
+                        first.predecessor_verification_methods
+                    ),
+                    chain=chain,
+                    artifact_timestamp=mandate.created_at,
+                )
+                classical_was_active = active.is_root and active.did == legacy_did
+        except (AttributeError, TypeError, ValueError):
+            classical_was_active = False
+        if not classical_was_active:
+            logger.warning(
+                "Mandate for hybrid parent %r carries a classical (non-hybrid) "
+                "signature outside its predecessor-authority window; refusing "
+                "classical downgrade (HYBRID_REQUIRED)",
+                mandate.parent_did,
+            )
+            return False
 
     from kestrel_sovereign.security.crypto_suite import (
         ALG_ECDSA_SECP256K1_SHA256, get_suite,
