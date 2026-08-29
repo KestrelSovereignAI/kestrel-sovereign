@@ -201,18 +201,39 @@ async def _close_partial_host_resources(
     if session_factory is not None:
         try:
             await session_factory.close()
-        except Exception as close_exc:  # noqa: BLE001 - preserve original failure
+        except BaseException as close_exc:  # noqa: BLE001 - finish later resources
             logger.warning("Could not close partial host session factory: %s", close_exc)
     if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
         try:
             await hold_db.close()
-        except Exception as close_exc:  # noqa: BLE001 - preserve original failure
+        except BaseException as close_exc:  # noqa: BLE001 - finish later resources
             logger.warning("Could not close partial Hold backend: %s", close_exc)
     if db is not None and hasattr(db, "close"):
         try:
             await db.close()
-        except Exception as close_exc:  # noqa: BLE001 - preserve original failure
+        except BaseException as close_exc:  # noqa: BLE001 - finish later resources
             logger.warning("Could not close partial host backend: %s", close_exc)
+
+
+async def _finish_partial_host_cleanup(
+    session_factory: Optional[FleetSessionFactory],
+    hold_db: Any,
+    db: Any,
+) -> None:
+    """Own partial bootstrap cleanup through repeated caller cancellation."""
+
+    cleanup = asyncio.create_task(
+        _close_partial_host_resources(session_factory, hold_db, db),
+        name="partial-host-bootstrap-cleanup",
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A supervisor may cancel shutdown more than once. The resource
+            # owner is independent, so every acquired backend still closes.
+            continue
+    await cleanup
 
 
 async def build_host_context(
@@ -272,9 +293,9 @@ async def build_host_context(
             FLEET_TENANT_ID,
             hold_location,
         )
-    except asyncio.CancelledError:
-        await _close_partial_host_resources(session_factory, hold_db, db)
-        raise
+    except asyncio.CancelledError as cancellation:
+        await _finish_partial_host_cleanup(session_factory, hold_db, db)
+        raise cancellation
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
         await _close_partial_host_resources(session_factory, hold_db, db)
         session_factory = None
