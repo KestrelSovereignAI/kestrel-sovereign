@@ -2186,6 +2186,7 @@ def _bind_real_orchestrator(agent):
 
     for m in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch", "_partition_tool_calls",
         "_dispatch_tool_call", "_dispatch_feature_tool", "_dispatch_direct_tool",
         "_get_denied_tools", "_handle_feature_error", "_prune_orchestrator_messages",
