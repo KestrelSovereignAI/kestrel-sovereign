@@ -18,6 +18,7 @@ disagree about who this agent is that is a custody failure, not a tie to break.
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -27,6 +28,31 @@ from kestrel_sovereign import main as main_module
 ANCHORED_DID = "did:web:agents.example.com:kestrel"
 NEIGHBOUR_DID = "did:web:agents.example.com:someone-else"
 DSN = "postgresql://durable.example/kestrel"
+
+
+@pytest.mark.asyncio
+async def test_get_agent_by_did_closes_hold_context_when_initialize_fails(
+    monkeypatch,
+):
+    agent = MagicMock()
+    agent.initialize = AsyncMock(side_effect=RuntimeError("initialize failed"))
+    context = object()
+    build_context = AsyncMock(return_value=context)
+    close_context = AsyncMock()
+    monkeypatch.setattr(main_module, "KestrelAgent", MagicMock(return_value=agent))
+    monkeypatch.setattr(main_module, "LLMService", MagicMock(return_value=object()))
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.build_bound_host_context", build_context
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.close_bound_host_context", close_context
+    )
+
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        await main_module.get_agent_by_did("did:test:broken")
+
+    close_context.assert_awaited_once_with(context)
+    assert agent._standalone_hold_context is None
 
 
 def _write_anchor(agent_dir: Path, *dids: str) -> Path:

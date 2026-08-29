@@ -7,10 +7,13 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from kestrel_sovereign.host_features.context import build_host_context
+from kestrel_sovereign import server
 from kestrel_sovereign.host_features.storage import (
     HOST_DB_PATH_ENV,
     HOST_FEATURE_DB_FILENAME,
@@ -18,6 +21,7 @@ from kestrel_sovereign.host_features.storage import (
     host_database_path,
     prepare_host_database,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 # These tests are *about* default host-database resolution, so they set
 # HOME / KESTREL_HOME / KESTREL_HOST_DB_PATH themselves (or pass an explicit
@@ -34,6 +38,8 @@ def _mode(path: Path) -> int:
 async def _close_context(ctx) -> None:
     if ctx.session_factory is not None:
         await ctx.session_factory.close()
+    if ctx.hold_db is not None and ctx.hold_db is not ctx.db:
+        await ctx.hold_db.close()
     if ctx.db is not None:
         await ctx.db.close()
 
@@ -131,7 +137,7 @@ async def test_custom_env_path_is_supported_hardened_and_reopened(
 
 
 @pytest.mark.asyncio
-async def test_explicit_host_db_env_override_beats_agent_postgres_backend(
+async def test_explicit_host_db_override_does_not_redirect_shared_hold_backend(
     tmp_path,
     monkeypatch,
 ):
@@ -140,18 +146,40 @@ async def test_explicit_host_db_env_override_beats_agent_postgres_backend(
     db_path = private_parent / "authoritative-host.db"
     monkeypatch.setenv(HOST_DB_PATH_ENV, str(db_path))
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv(
-        "KESTREL_DATABASE_URL",
-        "postgresql://must-not-be-opened.invalid/kestrel",
-    )
+    dsn = "postgresql://shared/hold"
+    hold_db = await AsyncDatabase.sqlite(str(tmp_path / "hold-double.db"))
+    postgres = AsyncMock(return_value=hold_db)
+    monkeypatch.setenv("KESTREL_DATABASE_URL", dsn)
+    monkeypatch.setattr(AsyncDatabase, "postgres", postgres)
 
     ctx = await build_host_context()
     try:
         assert ctx.db is not None
         assert ctx.db.backend_type == "sqlite"
         assert ctx.db.backend.db_path == str(db_path)
+        assert ctx.hold_db is hold_db
+        postgres.assert_awaited_once_with(dsn)
     finally:
         await _close_context(ctx)
+        if hold_db is not ctx.hold_db:
+            await hold_db.close()
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_closes_distinct_hold_and_host_backends():
+    host_db = SimpleNamespace(close=AsyncMock())
+    hold_db = SimpleNamespace(close=AsyncMock())
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            host_context=SimpleNamespace(db=host_db, hold_db=hold_db)
+        )
+    )
+
+    await server._shutdown_host_context(app)
+
+    hold_db.close.assert_awaited_once_with()
+    host_db.close.assert_awaited_once_with()
+    assert app.state.host_context is None
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX custody contract")

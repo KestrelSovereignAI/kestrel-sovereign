@@ -1689,8 +1689,21 @@ async def _shutdown_host_context(app: FastAPI) -> None:
             if host_context is not None
             else None
         )
-        if host_db is not None and hasattr(host_db, "close"):
-            await host_db.close()
+        hold_db = (
+            getattr(host_context, "hold_db", None)
+            if host_context is not None
+            else None
+        )
+        try:
+            if (
+                hold_db is not None
+                and hold_db is not host_db
+                and hasattr(hold_db, "close")
+            ):
+                await hold_db.close()
+        finally:
+            if host_db is not None and hasattr(host_db, "close"):
+                await host_db.close()
     finally:
         app.state.host_context = None
 

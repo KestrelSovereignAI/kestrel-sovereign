@@ -129,6 +129,7 @@ class SovereignHostContext:
         config: Any = None,
         session_factory: Optional[FleetSessionFactory] = None,
         hold_store: Any = None,
+        hold_db: Any = None,
         backend_error: str = "",
     ) -> None:
         self._db = db
@@ -136,6 +137,7 @@ class SovereignHostContext:
         self._config = config if config is not None else {}
         self._session_factory = session_factory
         self._hold_store = hold_store
+        self._hold_db = hold_db
         self._backend_error = str(backend_error or "")
 
     @property
@@ -160,6 +162,17 @@ class SovereignHostContext:
         """Durable host/agent Hold latches on the host control backend."""
 
         return self._hold_store
+
+    @property
+    def hold_db(self) -> Any:
+        """Backend that owns durable Hold state.
+
+        Host-feature storage remains private SQLite even when agent runtimes
+        share PostgreSQL.  In that deployment shape Hold uses the shared
+        PostgreSQL backend so every process observes one fleet-wide latch.
+        """
+
+        return self._hold_db
 
     @property
     def backend_error(self) -> str:
@@ -187,57 +200,59 @@ async def build_host_context(
     config: Any = None,
     db_path: Optional[str] = None,
 ) -> SovereignHostContext:
-    """Build the host context: open a host backend + fleet session factory.
+    """Build the host context and its durable Hold backend.
 
-    The host is not an agent, so it owns a dedicated host backend (SQLite by
-    default) distinct from any agent DB. ``db_path`` overrides the default
-    location (``$KESTREL_HOST_DB_PATH`` or the private host-data root). Failure
-    to secure or open the backend degrades gracefully to a context with a
-    ``None`` db/session_factory — the host still starts and host features whose
-    routers/UI don't need a store keep working.
+    The host is not an agent, so host features always retain their dedicated
+    private SQLite database. ``db_path`` overrides its default location
+    (``$KESTREL_HOST_DB_PATH`` or the private host-data root). When agent
+    runtimes use PostgreSQL, Hold alone binds to that shared database so every
+    process sees the same latch. Failure to open either load-bearing backend
+    degrades to a context with no usable store and a named ``backend_error``.
     """
     db = None
+    hold_db = None
     session_factory: Optional[FleetSessionFactory] = None
     hold_store = None
     backend_error = ""
     try:
         from kestrel_sovereign.host_features.storage import (
-            HOST_DB_PATH_ENV,
             prepare_host_database,
             validate_sqlite_family_private,
         )
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
 
+        resolved = prepare_host_database(db_path)
+        db = await AsyncDatabase.sqlite(str(resolved))
+        validate_sqlite_family_private(resolved)
+        backend_location = str(resolved)
+        inner = make_session_factory(db)
+        session_factory = FleetSessionFactory(inner)
+
         use_postgres = (
-            db_path is None
-            and not os.environ.get(HOST_DB_PATH_ENV)
-            and os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+            os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
             == "postgres"
         )
         if use_postgres:
             dsn = os.environ.get("KESTREL_DATABASE_URL")
             if not dsn:
                 raise RuntimeError(
-                    "PostgreSQL host control storage requires KESTREL_DATABASE_URL"
+                    "PostgreSQL Hold storage requires KESTREL_DATABASE_URL"
                 )
-            db = await AsyncDatabase.postgres(dsn)
-            backend_location = "shared PostgreSQL"
+            hold_db = await AsyncDatabase.postgres(dsn)
+            hold_backend_location = "shared PostgreSQL"
         else:
-            resolved = prepare_host_database(db_path)
-            db = await AsyncDatabase.sqlite(str(resolved))
-            validate_sqlite_family_private(resolved)
-            backend_location = str(resolved)
-        inner = make_session_factory(db)
-        session_factory = FleetSessionFactory(inner)
+            hold_db = db
+            hold_backend_location = backend_location
         from kestrel_sovereign.hold import HoldStore
 
-        hold_store = HoldStore(db)
+        hold_store = HoldStore(hold_db)
         await hold_store.ensure_schema()
         logger.info(
-            "Host backend opened at %s (fleet tenant=%s)",
+            "Host backend opened at %s (fleet tenant=%s); Hold backend=%s",
             backend_location,
             FLEET_TENANT_ID,
+            hold_backend_location,
         )
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
         if session_factory is not None:
@@ -247,6 +262,11 @@ async def build_host_context(
                 logger.warning(
                     "Could not close partial host session factory: %s", close_exc
                 )
+        if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
+            try:
+                await hold_db.close()
+            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
+                logger.warning("Could not close partial Hold backend: %s", close_exc)
         if db is not None and hasattr(db, "close"):
             try:
                 await db.close()
@@ -254,6 +274,7 @@ async def build_host_context(
                 logger.warning("Could not close partial host backend: %s", close_exc)
         session_factory = None
         hold_store = None
+        hold_db = None
         db = None
         backend_error = f"{type(exc).__name__}: {exc}"
         # ERROR, not warning: everything that depends on the host store is
@@ -267,6 +288,7 @@ async def build_host_context(
         config=config,
         session_factory=session_factory,
         hold_store=hold_store,
+        hold_db=hold_db,
         backend_error=backend_error,
     )
 

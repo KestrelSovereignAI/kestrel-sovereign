@@ -938,11 +938,26 @@ class SpawnFeature(Feature):
         # child persists until its TTL expires, an explicit terminate_child, or
         # parent shutdown — the paths that legitimately finalize it.
         async def _run_child_task():
+            from kestrel_sovereign.hold import (
+                HoldTurnRefusal,
+                HeldWorkDisposition,
+            )
+
             try:
                 result = await child_agent.process_input(task)
                 self._child_results[child_name] = {
                     "success": True,
                     "result": result,
+                    "completed_at": time.time(),
+                }
+            except HoldTurnRefusal as refusal:
+                logger.info("Child '%s' refused delegated work while held", child_name)
+                self._child_results[child_name] = {
+                    "success": False,
+                    "error": "Delegated child work was refused because the agent is held.",
+                    "code": refusal.code,
+                    "disposition": HeldWorkDisposition.REFUSED.value,
+                    "agent_id": refusal.agent_id,
                     "completed_at": time.time(),
                 }
             except Exception as e:

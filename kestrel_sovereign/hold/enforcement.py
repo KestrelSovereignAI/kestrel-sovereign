@@ -125,8 +125,13 @@ async def close_bound_host_context(context: Any) -> None:
             await factory.close()
     finally:
         db = getattr(context, "db", None)
-        if db is not None and hasattr(db, "close"):
-            await db.close()
+        hold_db = getattr(context, "hold_db", None)
+        try:
+            if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
+                await hold_db.close()
+        finally:
+            if db is not None and hasattr(db, "close"):
+                await db.close()
 
 
 async def get_effective_hold_state(agent: Any) -> EffectiveHoldState | None:

@@ -1181,6 +1181,29 @@ class TestLifecycle:
         await agent.shutdown()
 
     @pytest.mark.asyncio
+    async def test_shutdown_closes_transferred_standalone_hold_context(self, tmp_path):
+        agent = KestrelAgent(
+            did="did:test:standalone",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.storage = None
+        context = object()
+        agent._standalone_hold_context = context
+        close_context = AsyncMock()
+
+        with patch(
+            "kestrel_sovereign.hold.close_bound_host_context",
+            close_context,
+        ):
+            await agent.shutdown()
+
+        close_context.assert_awaited_once_with(context)
+        assert agent._standalone_hold_context is None
+
+    @pytest.mark.asyncio
     async def test_background_task_removed_after_completion(self, tmp_path):
         """Agent-owned background tasks are removed when they finish."""
         agent = KestrelAgent(

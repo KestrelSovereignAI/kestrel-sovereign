@@ -23,6 +23,13 @@ from kestrel_sovereign.multi_agent.agent_manager import (
 )
 from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle, SpawnMode
 from kestrel_sovereign.spawn.mandate import SpawnMandate
+from kestrel_sovereign.hold import (
+    EffectiveHoldState,
+    HeldWorkDisposition,
+    HoldScope,
+    HoldState,
+    HoldTurnRefusal,
+)
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
@@ -380,6 +387,40 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.get_child_result(child_name="helper")
         assert envelope.data["ready"] is True
         assert envelope.data["result"] == "analysis complete: 42"
+
+    @pytest.mark.asyncio
+    async def test_delegate_held_child_preserves_typed_refusal(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        latch = HoldState(
+            scope=HoldScope.AGENT,
+            target_id="did:child",
+            reason="private operator reason",
+            actor_id="did:operator",
+            set_at="2026-08-29T00:00:00Z",
+            hold_receipt_id="receipt-1",
+            revision=1,
+        )
+        child.process_input = AsyncMock(
+            side_effect=HoldTurnRefusal(
+                agent_id="did:child",
+                effective_state=EffectiveHoldState(host=None, agent=latch),
+            )
+        )
+        manager = MagicMock()
+        manager.get_agent = MagicMock(return_value=child)
+        manager.get_children = MagicMock(return_value=["helper"])
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        await feature.delegate_task(child_name="helper", task="analyze")
+        await feature._child_tasks["helper"]
+        envelope = await feature.get_child_result(child_name="helper")
+
+        assert envelope.status is ToolResultStatus.ERROR
+        assert envelope.data["code"] == HoldTurnRefusal.code
+        assert envelope.data["disposition"] == HeldWorkDisposition.REFUSED.value
+        assert envelope.data["agent_id"] == "did:child"
+        assert "private operator reason" not in envelope.error
 
     @pytest.mark.asyncio
     async def test_get_child_result_still_running(self):

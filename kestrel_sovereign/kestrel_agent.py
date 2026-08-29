@@ -7454,6 +7454,28 @@ Expected Duration: {expected_duration}
             # is still running.
             tail_degraded = True
 
+        # ``main.get_agent_by_did`` transfers its standalone Hold context to
+        # the agent.  Close that separately-owned backend only after the
+        # durable agent tail has finished, including cancellation paths.
+        standalone_hold_context = self.__dict__.get("_standalone_hold_context")
+        if standalone_hold_context is not None:
+            from kestrel_sovereign.hold import close_bound_host_context
+
+            try:
+                await close_bound_host_context(standalone_hold_context)
+            except asyncio.CancelledError:
+                shutdown_cancelled = True
+                tail_degraded = True
+            except Exception as error:
+                tail_degraded = True
+                logging.warning(
+                    "Standalone Hold context shutdown failed: %s",
+                    error,
+                    exc_info=True,
+                )
+            else:
+                self._standalone_hold_context = None
+
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer
             # asyncio.wait_for surfaces the timeout/cancellation. Report the

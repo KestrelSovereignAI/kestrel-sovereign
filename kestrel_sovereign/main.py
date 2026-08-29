@@ -154,8 +154,23 @@ async def get_agent_by_did(did: str) -> KestrelAgent:
 
     # This legacy helper transfers both agent and context lifetime to its
     # caller.  Main process paths below close their context explicitly.
-    agent._standalone_hold_context = await build_bound_host_context(agent)
-    await agent.initialize()
+    context = await build_bound_host_context(agent)
+    agent._standalone_hold_context = context
+    try:
+        await agent.initialize()
+    except BaseException as error:
+        from kestrel_sovereign.hold import close_bound_host_context
+
+        try:
+            await close_bound_host_context(context)
+        except BaseException as close_error:
+            error.add_note(
+                "Standalone Hold context cleanup also failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        finally:
+            agent._standalone_hold_context = None
+        raise
     return agent
 
 async def main():
