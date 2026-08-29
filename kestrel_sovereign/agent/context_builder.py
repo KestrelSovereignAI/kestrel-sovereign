@@ -953,6 +953,11 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         registry = getattr(self, "_context_clause_registry", None)
         return () if registry is None else registry.snapshot()
 
+    def has_context_clauses(self) -> bool:
+        """Whether an immutable contributed-context snapshot is non-empty."""
+
+        return bool(self._resolved_context_clauses())
+
     @staticmethod
     def _join_system_prompt_groups(
         groups: List[Tuple[str, List[str]]],
@@ -973,8 +978,37 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         prompt_adaptation: Optional['PromptAdaptation'] = None,
         state_of_mind: Optional['StateOfMind'] = None,
         system_prompt_addendum: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> Tuple[str, List[Tuple[str, str]]]:
         """Build once and retain the exact subsection bodies for accounting."""
+
+        resolved_context_clauses = self._resolved_context_clauses()
+        if resolved_context_clauses:
+            if max_tokens is None:
+                from .token_budget import RESPONSE_RESERVE
+
+                max_tokens = max(
+                    1,
+                    self.counter.get_context_limit() - RESPONSE_RESERVE,
+                )
+            tracked = self.build_system_prompt_with_tracking(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                additional_context=additional_context,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                budget_tokens=max_tokens,
+                required_suffix=system_prompt_addendum,
+                _resolved_context_clauses=resolved_context_clauses,
+            )
+            prompt = tracked.prompt
+            subsections = list(tracked.subsections)
+            if system_prompt_addendum:
+                prompt = f"{prompt}\n\n{system_prompt_addendum}"
+                subsections.append(
+                    ("system_prompt_addendum", system_prompt_addendum)
+                )
+            return prompt, subsections
 
         groups = self._collect_system_prompt_parts(
             constitution=constitution,
@@ -1041,6 +1075,7 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         prompt_adaptation: Optional['PromptAdaptation'] = None,
         state_of_mind: Optional['StateOfMind'] = None,
         system_prompt_addendum: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """
         Build the complete system prompt for the LLM.
@@ -1079,6 +1114,7 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
             prompt_adaptation=prompt_adaptation,
             state_of_mind=state_of_mind,
             system_prompt_addendum=system_prompt_addendum,
+            max_tokens=max_tokens,
         )
         return prompt
 
@@ -1092,6 +1128,9 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         prompt_adaptation: Optional['PromptAdaptation'] = None,
         state_of_mind: Optional['StateOfMind'] = None,
         budget_bytes: Optional[int] = None,
+        budget_tokens: Optional[int] = None,
+        required_suffix: Optional[str] = None,
+        _resolved_context_clauses=None,
     ) -> 'SystemPromptResult':
         """Priority-aware variant that returns the prompt + audit trail.
 
@@ -1107,10 +1146,11 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         `AGENTS.md`, etc.). When present, AGENTS.md is excluded from
         bootstrap iteration to avoid duplication.
 
-        `budget_bytes` enforces priority-ordered truncation. The
-        constitution is never droppable; everything else is dropped
-        highest-priority-number first until the assembled UTF-8 byte
-        length fits.
+        ``budget_bytes`` and ``budget_tokens`` enforce priority-ordered
+        truncation. The constitution is never droppable; everything else is
+        dropped highest-priority-number first until every supplied ceiling
+        fits. ``required_suffix`` reserves an exact non-droppable tail such as
+        a signal canary without adding it to the clause audit trail.
 
         See `kestrel_sovereign/agent/system_prompt_assembler.py` for
         the priority table (mirrors CONSTITUTION_INJECTION.md §7).
@@ -1153,6 +1193,11 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 "--- END REMINDER ---"
             )
 
+        resolved_context_clauses = (
+            self._resolved_context_clauses()
+            if _resolved_context_clauses is None
+            else tuple(_resolved_context_clauses)
+        )
         return assemble_system_prompt(
             constitution=constitution,
             bootstrap_files=self._bootstrap_files,
@@ -1170,9 +1215,12 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
             additional_context=additional_context,
             context_clauses=tuple(
                 (clause.owner, clause.name, clause.priority, clause.body)
-                for clause in self._resolved_context_clauses()
+                for clause in resolved_context_clauses
             ),
             budget_bytes=budget_bytes,
+            budget_tokens=budget_tokens,
+            count_tokens=self.counter.count if budget_tokens is not None else None,
+            required_suffix=required_suffix,
         )
 
     async def build_rag_context(

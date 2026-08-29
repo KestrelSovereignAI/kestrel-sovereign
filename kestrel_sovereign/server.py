@@ -2598,13 +2598,26 @@ async def _lifespan_startup(app: FastAPI):
             if started_features is None:
                 started_features = features
             candidate_started = list(started_features)
+            runtime = getattr(ctx, "feature_contribution_runtime", None)
+            host_context_registry = (
+                None if runtime is None else runtime.context_clause_registry
+            )
+            manager = getattr(app.state, "agent_manager", None)
+            default_agent = getattr(app.state, "agent", None)
+            if manager is not None:
+                manager.validate_host_context_clause_registry(
+                    host_context_registry
+                )
+            elif default_agent is not None:
+                default_agent.validate_host_context_clause_registry(
+                    host_context_registry
+                )
             if replacing_host_state:
                 _hf.unmount_host_features(app)
             _hf.mount_host_feature_routers(app, candidate_started)
             _hf.mount_host_feature_ui(app, candidate_started)
             app.state.host_features = list(started_features)
             app.state.host_context = ctx
-            runtime = getattr(ctx, "feature_contribution_runtime", None)
             if runtime is not None:
                 app.state.host_operator_registry = runtime.operator_registry
                 app.state.host_wait_registry = runtime.wait_registry
@@ -2613,11 +2626,22 @@ async def _lifespan_startup(app: FastAPI):
                     runtime.permission_defaults_registry
                 )
                 app.state.host_setup_step_registry = runtime.setup_step_registry
+                app.state.host_context_clause_registry = host_context_registry
+                if manager is not None:
+                    manager.bind_host_context_clause_registry(
+                        host_context_registry
+                    )
+                elif default_agent is not None:
+                    default_agent.bind_host_context_clause_registry(
+                        host_context_registry
+                    )
             logger.info("Host features initialized: %d", len(started_features))
     except (ContributionContractError, FeatureContributionRuntimeError):
         # Complete prospective-set rejection is a startup failure, not an
         # optional-feature warning. No candidate was mounted and prior valid
         # state remains visible.
+        if candidate_ctx is not None and candidate_started:
+            await _hf.stop_host_features(candidate_started, candidate_ctx)
         raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Host feature initialization failed: %s", exc)

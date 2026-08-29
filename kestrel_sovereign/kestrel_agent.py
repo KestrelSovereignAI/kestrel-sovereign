@@ -578,6 +578,7 @@ class KestrelAgent(
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
         host_db=None,
+        host_context_clause_registry=None,
         hosted_telegram_route_attestation_resolver: Any = None,
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
@@ -630,6 +631,10 @@ class KestrelAgent(
                        a host on Postgres supply the host db directly (e.g.
                        ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
                        lifecycle; the agent does not close it.
+            host_context_clause_registry: Optional host-feature context registry.
+                       Its immutable clauses are combined with this agent's own
+                       contribution registry without sharing agent-local clauses
+                       with any peer.
             hosted_telegram_route_attestation_resolver: Optional host-owned
                        pre-initialize resolver for a Telegram route already
                        provisioned outside Core. It supplies typed ledger
@@ -1322,6 +1327,7 @@ class KestrelAgent(
         self.permission_defaults_registry = None
         self.setup_step_registry = None
         self.context_clause_registry = None
+        self._host_context_clause_registry = host_context_clause_registry
         # Bootstrap service is constructed in initialize(); default it here so
         # any code path that runs before/without full initialization (e.g. a
         # COGNITION signal dispatch reaching process_input's bootstrap check)
@@ -3218,6 +3224,10 @@ class KestrelAgent(
                 self._ensure_feature_contribution_runtime().context_clause_registry
             ),
         )
+        if self._host_context_clause_registry is not None:
+            self.bind_host_context_clause_registry(
+                self._host_context_clause_registry
+            )
         # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
         # persistence) into the loader before the first system-prompt
         # assembly (#2135, F099). Storage is up here and no prompt has been
@@ -4269,6 +4279,7 @@ class KestrelAgent(
         Laziness supports both without creating a competing registry.
         """
         from kestrel_sovereign.features.contribution_runtime import (
+            CompositeContextClauseRegistry,
             FeatureContributionRuntime,
         )
         from kestrel_sovereign.signals import SourceRegistry
@@ -4304,10 +4315,52 @@ class KestrelAgent(
         self.permission_defaults_registry = runtime.permission_defaults_registry
         self.setup_step_registry = runtime.setup_step_registry
         self.context_clause_registry = runtime.context_clause_registry
+        host_registry = getattr(self, "_host_context_clause_registry", None)
+        runtime.context_clause_registry.bind_external_registries(
+            () if host_registry is None else (host_registry,)
+        )
         context_builder = getattr(self, "context_builder", None)
         if context_builder is not None:
-            context_builder._context_clause_registry = runtime.context_clause_registry
+            context_builder._context_clause_registry = (
+                runtime.context_clause_registry
+                if host_registry is None
+                else CompositeContextClauseRegistry(
+                    host_registry,
+                    runtime.context_clause_registry,
+                )
+            )
         return runtime
+
+    def validate_host_context_clause_registry(self, registry) -> None:
+        """Preflight a host registry against this agent's active audit names."""
+
+        runtime = self._ensure_feature_contribution_runtime()
+        runtime.context_clause_registry.validate_external_registries(
+            () if registry is None else (registry,)
+        )
+
+    def bind_host_context_clause_registry(self, registry) -> None:
+        """Publish one validated host registry to this agent's prompt builder."""
+
+        from kestrel_sovereign.features.contribution_runtime import (
+            CompositeContextClauseRegistry,
+        )
+
+        runtime = self._ensure_feature_contribution_runtime()
+        runtime.context_clause_registry.bind_external_registries(
+            () if registry is None else (registry,)
+        )
+        self._host_context_clause_registry = registry
+        context_builder = getattr(self, "context_builder", None)
+        if context_builder is not None:
+            context_builder._context_clause_registry = (
+                runtime.context_clause_registry
+                if registry is None
+                else CompositeContextClauseRegistry(
+                    registry,
+                    runtime.context_clause_registry,
+                )
+            )
 
     def refresh_feature_context_clauses(self, feature: object):
         """Commit fresh feature context bytes after an explicit config change."""

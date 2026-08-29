@@ -12,7 +12,7 @@ Produces the full in-agent system prompt by combining:
 7. Caller-supplied additional context (priority 7)
 8. Lifecycle-resolved feature context (priority 8+)
 
-When the assembled prompt exceeds a configured byte budget, clauses
+When the assembled prompt exceeds a configured byte or token budget, clauses
 are dropped highest-priority-number first (within a priority, in
 reverse emission order) until the prompt fits. The constitution is
 never droppable; if it alone exceeds budget the budget is honored
@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 
 # Priority ladder. Lower number = higher priority = kept first.
@@ -71,9 +71,7 @@ TORTOISE_DOCTRINE_FILENAME = "TORTOISE_DOCTRINE.md"
 AGENTS_FILENAME = "AGENTS.md"
 
 
-# Bytes added per joiner ("\n\n" between clauses).
 _JOINER = "\n\n"
-_JOINER_BYTES = len(_JOINER.encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -152,6 +150,9 @@ def assemble_system_prompt(
     additional_context: Optional[str] = None,
     context_clauses: Iterable[tuple[str, str, int, str]] = (),
     budget_bytes: Optional[int] = None,
+    budget_tokens: Optional[int] = None,
+    count_tokens: Optional[Callable[[str], int]] = None,
+    required_suffix: Optional[str] = None,
 ) -> SystemPromptResult:
     """Assemble the system prompt with priority-ordered truncation.
 
@@ -172,19 +173,26 @@ def assemble_system_prompt(
     `PRIORITY_ANCHORED_DOCTRINE` except `TORTOISE_DOCTRINE.md` which
     gets `PRIORITY_TORTOISE_DOCTRINE` per the design's two-tier rule.
 
-    If `budget_bytes` is None, no truncation is applied. If supplied,
-    clauses are dropped highest-priority-number first until the
-    assembled UTF-8 byte length ≤ `budget_bytes`. The constitution is
-    never droppable.
+    Byte and token budgets are independent optional ceilings. Clauses are
+    dropped highest-priority-number first until both supplied ceilings fit.
+    ``required_suffix`` participates in both measurements but is returned to
+    the caller separately; this lets a non-droppable canary/addendum reserve
+    its exact joined cost. The constitution is never droppable.
     """
     clauses: List[_Clause] = []
     emit_counter = 0
+    emitted_names: set[str] = set()
 
     def add(name: str, priority: int, body: str) -> None:
         nonlocal emit_counter
+        if name in emitted_names:
+            raise ValueError(
+                f"system prompt clause name {name!r} is not globally unique"
+            )
         clauses.append(
             _Clause(name=name, priority=priority, body=body, emit_index=emit_counter)
         )
+        emitted_names.add(name)
         emit_counter += 1
 
     # --------------------------------------------------------------
@@ -307,7 +315,13 @@ def assemble_system_prompt(
     # --------------------------------------------------------------
     # Truncation.
     # --------------------------------------------------------------
-    kept, dropped_in_drop_order = _drop_to_fit(clauses, budget_bytes)
+    kept, dropped_in_drop_order = _drop_to_fit(
+        clauses,
+        budget_bytes,
+        budget_tokens=budget_tokens,
+        count_tokens=count_tokens,
+        required_suffix=required_suffix,
+    )
 
     # Re-emit kept clauses in original emission order.
     kept_sorted = sorted(kept, key=lambda c: c.emit_index)
@@ -322,15 +336,20 @@ def assemble_system_prompt(
 
 
 def _drop_to_fit(
-    clauses: List[_Clause], budget_bytes: Optional[int]
+    clauses: List[_Clause],
+    budget_bytes: Optional[int],
+    *,
+    budget_tokens: Optional[int] = None,
+    count_tokens: Optional[Callable[[str], int]] = None,
+    required_suffix: Optional[str] = None,
 ) -> tuple[List[_Clause], List[_Clause]]:
-    """Walk clauses by descending priority, dropping until size <= budget.
+    """Walk clauses by descending priority, dropping until all budgets fit.
 
     Returns `(kept, dropped)`. `kept` retains original list order;
     `dropped` is in the order they were removed (drop-time order, not
     emission order — useful for forensics).
 
-    Budget None means no truncation. The constitution
+    A missing byte/token budget disables only that measurement. The constitution
     (`PRIORITY_CONSTITUTION`) is never dropped even when its size
     alone exceeds budget — the design treats constitutional integrity
     as the load-bearing invariant; an oversized constitution is an
@@ -339,17 +358,32 @@ def _drop_to_fit(
     kept = list(clauses)
     dropped: List[_Clause] = []
 
-    if budget_bytes is None:
+    if (budget_tokens is None) is not (count_tokens is None):
+        raise ValueError("budget_tokens and count_tokens must be supplied together")
+    if budget_bytes is None and budget_tokens is None:
         return kept, dropped
 
-    def total_bytes(items: List[_Clause]) -> int:
-        if not items:
-            return 0
-        body_total = sum(c.bytes_size for c in items)
-        joiner_total = _JOINER_BYTES * (len(items) - 1)
-        return body_total + joiner_total
+    def joined(items: List[_Clause]) -> str:
+        prompt = _JOINER.join(c.body for c in items)
+        if required_suffix:
+            return f"{prompt}{_JOINER if prompt else ''}{required_suffix}"
+        return prompt
 
-    while total_bytes(kept) > budget_bytes:
+    def over_budget(items: List[_Clause]) -> bool:
+        rendered = joined(items)
+        return bool(
+            (
+                budget_bytes is not None
+                and len(rendered.encode("utf-8")) > budget_bytes
+            )
+            or (
+                budget_tokens is not None
+                and count_tokens is not None
+                and count_tokens(rendered) > budget_tokens
+            )
+        )
+
+    while over_budget(kept):
         # Candidates: clauses with priority > CONSTITUTION, sorted
         # so the highest-priority-number-and-latest-emit_index goes
         # first. Same priority → drop later-emitted first.

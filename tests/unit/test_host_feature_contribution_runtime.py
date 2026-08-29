@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from kestrel_sdk.features import ContributionContractError
 
+from kestrel_sovereign.agent.context_builder import ContextBuilder
+from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionCollectionError,
+    FeatureContributionRuntimeError,
+)
 from kestrel_sovereign.host_features import (
     SovereignHostContext,
     mount_host_feature_routers,
@@ -13,10 +20,7 @@ from kestrel_sovereign.host_features import (
     stop_host_features,
     unmount_host_features,
 )
-from kestrel_sovereign.features.contribution_runtime import (
-    FeatureContributionCollectionError,
-    FeatureContributionRuntimeError,
-)
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 from tests.fixtures.sdk_contribution_fixture import SDKFixtureHostFeature
 
 
@@ -58,6 +62,34 @@ async def test_host_start_stop_wires_all_exact_sdk_contributions_once():
     await stop_host_features([feature], ctx)
     assert feature.stopped
     _assert_live(ctx, feature, False)
+
+
+@pytest.mark.asyncio
+async def test_host_context_clauses_reach_existing_agent_prompts_and_teardown():
+    ctx = SovereignHostContext()
+    feature = SDKFixtureHostFeature()
+    await start_host_features([feature], ctx)
+    agent = KestrelAgent(did="did:test:host-context-clause", sync_enabled=False)
+    agent._ensure_feature_contribution_runtime()
+    agent.context_builder = ContextBuilder(
+        MagicMock(),
+        context_clause_registry=agent.context_clause_registry,
+    )
+
+    agent.bind_host_context_clause_registry(
+        ctx.feature_contribution_runtime.context_clause_registry
+    )
+
+    prompt = agent.context_builder.build_system_prompt(
+        "C", include_briefing=False
+    )
+    assert "stable context from host-fixture" in prompt
+
+    await stop_host_features([feature], ctx)
+    prompt_after_stop = agent.context_builder.build_system_prompt(
+        "C", include_briefing=False
+    )
+    assert "stable context from host-fixture" not in prompt_after_stop
 
 
 @pytest.mark.asyncio

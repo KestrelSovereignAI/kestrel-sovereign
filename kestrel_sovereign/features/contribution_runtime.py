@@ -24,6 +24,16 @@ from kestrel_sdk.features import (
 )
 from kestrel_sdk.operator import ServiceScope
 
+from kestrel_sovereign.agent.system_prompt_assembler import (
+    AGENTS_FILENAME,
+    CLAUSE_ADDITIONAL_CONTEXT,
+    CLAUSE_KESTREL_CONSTITUTION,
+    CLAUSE_PROMPT_ADAPTATION,
+    CLAUSE_SESSION_BRIEFING,
+    CLAUSE_STATE_OF_MIND,
+    CLAUSE_STYLE_REMINDER,
+    TORTOISE_DOCTRINE_FILENAME,
+)
 from kestrel_sovereign.operator import (
     ExecutionTargetRegistration,
     OperatorRegistrationSet,
@@ -108,6 +118,81 @@ class ContextClauseRegistry:
 
     def __init__(self) -> None:
         self._clauses: dict[tuple[str, str], ResolvedContextClause] = {}
+        self._external_registries: tuple[ContextClauseRegistry, ...] = ()
+
+    _RESERVED_AUDIT_NAMES = frozenset(
+        {
+            AGENTS_FILENAME,
+            "SOUL.md",
+            TORTOISE_DOCTRINE_FILENAME,
+            CLAUSE_ADDITIONAL_CONTEXT,
+            CLAUSE_KESTREL_CONSTITUTION,
+            CLAUSE_PROMPT_ADAPTATION,
+            CLAUSE_SESSION_BRIEFING,
+            CLAUSE_STATE_OF_MIND,
+            CLAUSE_STYLE_REMINDER,
+        }
+    )
+
+    @classmethod
+    def _validate_names(
+        cls,
+        values: tuple[ResolvedContextClause, ...],
+        *,
+        resident: Iterable[ResolvedContextClause],
+    ) -> None:
+        names = [clause.name for clause in values]
+        if len(set(names)) != len(names):
+            raise FeatureContributionRuntimeError(
+                "duplicate context-clause name in one registration batch"
+            )
+        reserved = next(
+            (
+                name
+                for name in names
+                if name in cls._RESERVED_AUDIT_NAMES or name.endswith(".md")
+            ),
+            None,
+        )
+        if reserved is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name {reserved!r} is a reserved host audit name"
+            )
+        resident_names = {clause.name for clause in resident}
+        conflict = next((name for name in names if name in resident_names), None)
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name is already registered: {conflict!r}"
+            )
+
+    def _external_clauses(self) -> tuple[ResolvedContextClause, ...]:
+        return tuple(
+            clause
+            for registry in self._external_registries
+            for clause in registry.snapshot()
+        )
+
+    def validate_external_registries(
+        self, registries: Iterable[ContextClauseRegistry]
+    ) -> tuple[ContextClauseRegistry, ...]:
+        values = tuple(registries)
+        if any(registry is self for registry in values):
+            raise FeatureContributionRuntimeError(
+                "context-clause registry cannot depend on itself"
+            )
+        external = tuple(
+            clause for registry in values for clause in registry.snapshot()
+        )
+        self._validate_names(external, resident=self._clauses.values())
+        return values
+
+    def bind_external_registries(
+        self, registries: Iterable[ContextClauseRegistry]
+    ) -> None:
+        """Atomically bind host registries after validating bare audit names."""
+
+        values = self.validate_external_registries(registries)
+        self._external_registries = values
 
     def validate_register_batch(
         self, clauses: Iterable[ResolvedContextClause]
@@ -118,6 +203,10 @@ class ContextClauseRegistry:
             raise FeatureContributionRuntimeError(
                 "duplicate context-clause registration identity"
             )
+        self._validate_names(
+            values,
+            resident=(*self._clauses.values(), *self._external_clauses()),
+        )
         conflict = next(
             (identity for identity in identities if identity in self._clauses),
             None,
@@ -163,6 +252,17 @@ class ContextClauseRegistry:
             raise FeatureContributionRuntimeError(
                 "duplicate context-clause registration identity"
             )
+        self._validate_names(
+            new_values,
+            resident=(
+                *(
+                    clause
+                    for clause in self._clauses.values()
+                    if clause.identity not in old_identities
+                ),
+                *self._external_clauses(),
+            ),
+        )
         if any(
             identity in self._clauses and identity not in old_identities
             for identity in new_identities
@@ -181,6 +281,31 @@ class ContextClauseRegistry:
         return tuple(
             sorted(
                 self._clauses.values(),
+                key=lambda clause: (clause.priority, clause.name, clause.owner),
+            )
+        )
+
+
+class CompositeContextClauseRegistry:
+    """Read-only deterministic union of host and agent lifecycle registries."""
+
+    def __init__(self, *registries: ContextClauseRegistry) -> None:
+        self._registries = tuple(registry for registry in registries if registry)
+
+    def snapshot(self) -> tuple[ResolvedContextClause, ...]:
+        clauses = tuple(
+            clause
+            for registry in self._registries
+            for clause in registry.snapshot()
+        )
+        names = [clause.name for clause in clauses]
+        if len(set(names)) != len(names):
+            raise FeatureContributionRuntimeError(
+                "composite context-clause audit names are not globally unique"
+            )
+        return tuple(
+            sorted(
+                clauses,
                 key=lambda clause: (clause.priority, clause.name, clause.owner),
             )
         )

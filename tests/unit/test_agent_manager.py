@@ -262,6 +262,24 @@ class TestAgentManagerBasics:
         assert result["Alpha"] is agent1
         assert result["Beta"] is agent2
 
+    def test_host_context_registry_binds_existing_agents_and_is_retained(self):
+        manager = AgentManager()
+        agent1 = _make_mock_agent("did:1")
+        agent2 = _make_mock_agent("did:2")
+        manager._agents.update({"Alpha": agent1, "Beta": agent2})
+        registry = object()
+
+        manager.bind_host_context_clause_registry(registry)
+
+        for agent in (agent1, agent2):
+            agent.validate_host_context_clause_registry.assert_called_once_with(
+                registry
+            )
+            agent.bind_host_context_clause_registry.assert_called_once_with(
+                registry
+            )
+        assert manager._host_context_clause_registry is registry
+
     def test_get_agent_name(self):
         manager = AgentManager()
         mock = _make_mock_agent("did:pkh:test")
@@ -4154,6 +4172,37 @@ class TestAgentManagerBasics:
 
 class TestLoadFromConfig:
     """Test loading agents from MultiAgentConfig."""
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_future_agent_receives_bound_host_context_registry(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        mock_get_did.return_value = "did:future"
+        mock_agent_cls.return_value = _make_mock_agent("did:future")
+        manager = AgentManager(base_data_dir=tmp_path)
+        registry = object()
+        manager.bind_host_context_clause_registry(registry)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent(
+                "future",
+                LocalAgentConfig(data_dir=Path("future"), port=8801),
+            )
+
+        assert (
+            mock_agent_cls.call_args.kwargs["host_context_clause_registry"]
+            is registry
+        )
 
     @pytest.mark.asyncio
     async def test_load_from_config_initializes_concurrently_and_registers_in_order(self):

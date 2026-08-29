@@ -339,6 +339,15 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
     fake_manager = FakeManager()
     feature = _UIHostFeature()
+    host_context_registry = object()
+    host_runtime = SimpleNamespace(
+        operator_registry=object(),
+        wait_registry=object(),
+        source_registry=object(),
+        permission_defaults_registry=object(),
+        setup_step_registry=object(),
+        context_clause_registry=host_context_registry,
+    )
 
     class Closeable:
         def __init__(self, event: str):
@@ -352,6 +361,19 @@ async def test_server_lifespan_wires_and_closes_host_features(
         config={},
         session_factory=Closeable("session-close"),
     )
+    ctx.feature_contribution_runtime = host_runtime
+
+    def validate_host_context(registry):
+        assert registry is host_context_registry
+        events.append("host-context-validate")
+
+    def bind_host_context(registry):
+        assert registry is host_context_registry
+        validate_host_context(registry)
+        events.append("host-context-bind")
+
+    fake_manager.validate_host_context_clause_registry = validate_host_context
+    fake_manager.bind_host_context_clause_registry = bind_host_context
 
     async def build_context(*, config):
         assert config["host_port"] == 9090
@@ -406,8 +428,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "agents-load",
             "context-build",
             "host-start",
+            "host-context-validate",
             "host-router-mount",
             "host-ui-mount",
+            "host-context-validate",
+            "host-context-bind",
         ]
 
     assert events[-5:] == [

@@ -181,9 +181,9 @@ class ContextResult:
     # OpenAI prefix cache, Anthropic cache_control) can actually hit.
     # Callers prepend this to the current user message content.
     dynamic_user_context: str = ""
-    # Constitutional-injection tracking — populated only when the
-    # caller supplies `system_prompt_budget_bytes` and the
-    # priority-aware tracking assembler runs (kestrel-sovereign#1137).
+    # Constitutional-injection tracking — populated whenever the
+    # priority-aware assembler runs, including turns with lifecycle-owned
+    # feature context (kestrel-sovereign#1137 and #3025).
     # The dispatcher reads these via `self._agent._last_injection_tracking`
     # after `process_input` returns and threads them into
     # `signal_log.injected_clauses_json` / `dropped_clauses_json`.
@@ -599,8 +599,8 @@ class ContextManager:
         # 1. Assemble the stable system prefix (constitution/identity/doctrine)
         # and record its usage. Kept separate from the per-turn dynamic user
         # context by construction (ContextAssembly). The tracking assembler is
-        # used when a per-source byte budget is set OR anchored doctrine is
-        # supplied; otherwise the byte-stable legacy assembler.
+        # used when a per-source byte budget, anchored doctrine, or lifecycle-
+        # owned context is present; otherwise the byte-stable legacy assembler.
         (
             assembly.system_prompt,
             assembly.injected_clauses,
@@ -612,6 +612,7 @@ class ContextManager:
             prompt_adaptation=prompt_adaptation,
             system_prompt_addendum=system_prompt_addendum,
             system_prompt_budget_bytes=system_prompt_budget_bytes,
+            system_prompt_budget_tokens=budget.allocations["system"].budget,
             anchored_doctrine=anchored_doctrine,
         )
         self._record_system_usage(assembly, budget)
@@ -1317,6 +1318,7 @@ class ContextManager:
         prompt_adaptation: Any,
         system_prompt_addendum: Optional[str],
         system_prompt_budget_bytes: Optional[int],
+        system_prompt_budget_tokens: int,
         anchored_doctrine: Optional["OrderedDict[str, str]"],
     ) -> Tuple[
         str,
@@ -1327,12 +1329,11 @@ class ContextManager:
         """Assemble the stable system prefix and optional injection tracking.
 
         Routes to the priority-aware tracking assembler when the caller sets
-        a per-source byte budget OR supplies anchored doctrine (the legacy
-        ``build_system_prompt`` has no ``anchored_doctrine`` parameter);
-        otherwise uses the byte-stable legacy assembler so the cache prefix
-        stays identical for legacy callers. When budgeting, the addendum's
-        bytes are reserved BEFORE the assembler truncates (codex round-12 P2)
-        so the final ``assembler output + joiner + addendum`` fits the cap.
+        a per-source byte budget, supplies anchored doctrine, or has active
+        lifecycle-owned context. The legacy path remains byte-identical for
+        callers with none of those inputs. Contributed clauses are additionally
+        bounded by the system allocation's exact token ceiling, with the
+        addendum measured as a required non-droppable suffix.
 
         Returns ``(system_prompt, injected_clauses, dropped_clauses,
         subsections)``; the clause lists are ``None`` for the legacy path.
@@ -1340,25 +1341,29 @@ class ContextManager:
         injected_clauses: Optional[List[str]] = None
         dropped_clauses: Optional[List[str]] = None
         subsections: List[Tuple[str, str]]
-        if system_prompt_budget_bytes is not None or anchored_doctrine:
-            effective_budget: Optional[int]
-            if system_prompt_budget_bytes is None:
-                # anchored_doctrine triggered this path with no budget
-                # (codex round-17 P2): pass None so nothing truncates.
-                effective_budget = None
-            else:
-                reserved = 0
-                if system_prompt_addendum:
-                    reserved = (
-                        len(system_prompt_addendum.encode("utf-8")) + 2
-                    )  # 2 bytes for the "\n\n" joiner
-                effective_budget = max(1, system_prompt_budget_bytes - reserved)
+        context_clause_probe = getattr(
+            type(self.context_builder), "has_context_clauses", None
+        )
+        has_context_clauses = bool(
+            context_clause_probe(self.context_builder)
+            if callable(context_clause_probe)
+            else False
+        )
+        if (
+            system_prompt_budget_bytes is not None
+            or anchored_doctrine
+            or has_context_clauses
+        ):
             tracking_result = self.context_builder.build_system_prompt_with_tracking(
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
                 state_of_mind=None,
-                budget_bytes=effective_budget,
+                budget_bytes=system_prompt_budget_bytes,
+                budget_tokens=(
+                    system_prompt_budget_tokens if has_context_clauses else None
+                ),
+                required_suffix=system_prompt_addendum,
                 anchored_doctrine=anchored_doctrine,
             )
             system_prompt = tracking_result.prompt
@@ -1911,39 +1916,57 @@ class ContextManager:
         # append below via the ``EPHEMERAL_NOTICE`` constant so the
         # reserved and appended bytes cannot drift.
         ephemeral_notice = EPHEMERAL_NOTICE
+        from .token_budget import RESPONSE_RESERVE
+
+        # Resolve the model limit through the canonical catalog instead of
+        # assuming an injected/testing counter implements this optional query.
+        # The counter itself remains the exact tokenizer used below.
+        context_limit = get_token_counter(self.model).get_context_limit()
+        total_budget = max(0, context_limit - RESPONSE_RESERVE)
+        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
+        system_token_budget = max(0, total_budget - tools_tokens)
+        context_clause_probe = getattr(
+            type(self.context_builder), "has_context_clauses", None
+        )
+        has_context_clauses = bool(
+            context_clause_probe(self.context_builder)
+            if callable(context_clause_probe)
+            else False
+        )
 
         ephemeral_tracking = None
         injected_clauses_for_audit: Optional[List[str]] = None
         dropped_clauses_for_audit: Optional[List[str]] = None
-        if system_prompt_budget_bytes is not None or anchored_doctrine:
-            # Reserve addendum + ephemeral notice + their joiners.
-            effective_budget: Optional[int]
-            if system_prompt_budget_bytes is None:
-                effective_budget = None
-            else:
-                reserved = 0
-                if system_prompt_addendum:
-                    reserved += (
-                        len(system_prompt_addendum.encode("utf-8")) + 2
-                    )
-                reserved += len(ephemeral_notice.encode("utf-8")) + 2
-                effective_budget = max(
-                    1, system_prompt_budget_bytes - reserved
-                )
+        if (
+            system_prompt_budget_bytes is not None
+            or anchored_doctrine
+            or has_context_clauses
+        ):
+            required_suffix = "\n\n".join(
+                part
+                for part in (system_prompt_addendum, ephemeral_notice)
+                if part
+            )
             ephemeral_tracking = self.context_builder.build_system_prompt_with_tracking(
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
                 state_of_mind=None,
-                budget_bytes=effective_budget,
+                budget_bytes=system_prompt_budget_bytes,
+                budget_tokens=(
+                    system_token_budget if has_context_clauses else None
+                ),
+                required_suffix=required_suffix,
                 anchored_doctrine=anchored_doctrine,
             )
             system_prompt = ephemeral_tracking.prompt
             injected_clauses_for_audit = list(ephemeral_tracking.injected_clauses)
             dropped_clauses_for_audit = list(ephemeral_tracking.dropped_clauses)
-            if system_prompt_addendum:
+            if required_suffix:
                 system_prompt = (
-                    f"{system_prompt}\n\n{system_prompt_addendum}"
+                    f"{system_prompt}\n\n{required_suffix}"
+                    if system_prompt
+                    else required_suffix
                 )
         else:
             system_prompt = self.context_builder.build_system_prompt(
@@ -1953,14 +1976,9 @@ class ContextManager:
                 state_of_mind=None,
                 system_prompt_addendum=system_prompt_addendum,
             )
-
-        # Append the ephemeral notice (already accounted for in the
-        # reserved budget above when budget_bytes was set).
-        system_prompt = f"{system_prompt}\n\n{EPHEMERAL_NOTICE}"
+            system_prompt = f"{system_prompt}\n\n{ephemeral_notice}"
 
         tokens = self.counter.count(system_prompt)
-        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
-        from .token_budget import RESPONSE_RESERVE
 
         assembly = ContextAssembly(
             system_prompt=system_prompt,
@@ -2061,7 +2079,6 @@ class ContextManager:
                 },
             ),
         }
-        context_limit = get_token_counter(self.model).get_context_limit()
         return ContextBuildPlan(
             mode=mode,
             model=self.model,
@@ -2070,7 +2087,7 @@ class ContextManager:
             budget_summary={"mode": "ephemeral"},
             context_limit=context_limit,
             response_reserve=RESPONSE_RESERVE,
-            total_budget=max(0, context_limit - RESPONSE_RESERVE),
+            total_budget=total_budget,
             total_tokens=tokens + tools_tokens,
             state_of_mind=state_of_mind,
         )

@@ -617,6 +617,7 @@ class AgentManager:
         # termination can release the unspent hold back to the parent (#2113).
         self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = (base_data_dir or Path.cwd()).expanduser().resolve()
+        self._host_context_clause_registry = None
         # A multi-agent host owns one mutable isolated-feature root.  The
         # per-agent namespace is derived below from the stable DID rather than
         # accepting the routing name as a path component.
@@ -1562,6 +1563,7 @@ class AgentManager:
                     database_url=database_url,
                     db_backend="postgres",
                     allowed_features=allowed_features,
+                    host_context_clause_registry=self._host_context_clause_registry,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     isolated_runtime_root=runtime_root,
@@ -1585,6 +1587,7 @@ class AgentManager:
                     storage_path=db_path,
                     llm_service=llm_service,
                     allowed_features=allowed_features,
+                    host_context_clause_registry=self._host_context_clause_registry,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
@@ -2612,6 +2615,20 @@ class AgentManager:
     def list_agents(self) -> dict[str, KestrelAgent]:
         """Return all loaded agents as {name: agent}."""
         return dict(self._agents)
+
+    def validate_host_context_clause_registry(self, registry) -> None:
+        """Preflight one host registry against every currently loaded agent."""
+
+        for agent in self._agents.values():
+            agent.validate_host_context_clause_registry(registry)
+
+    def bind_host_context_clause_registry(self, registry) -> None:
+        """Publish host context to existing agents and every future agent."""
+
+        self.validate_host_context_clause_registry(registry)
+        for agent in self._agents.values():
+            agent.bind_host_context_clause_registry(registry)
+        self._host_context_clause_registry = registry
 
     async def local_agent_configs_by_did(
         self,
