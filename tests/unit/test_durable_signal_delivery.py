@@ -1926,6 +1926,133 @@ async def test_hold_winning_after_durable_claim_requeues_exact_lease(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("privacy_preset", ("ephemeral", "isolated", "deidentified"))
+async def test_hold_releases_volatile_initial_cognition_lease(
+    tmp_path, privacy_preset
+):
+    """A held volatile delivery cannot remain hidden in LEASED forever."""
+
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / f"held-volatile-{privacy_preset}.db",
+        f"did:agent:held-volatile:{privacy_preset}",
+    )
+    agent.privacy_config = get_privacy_preset(privacy_preset)
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=1,
+    )
+    held = _HoldSnapshots(_held_state(agent.did))
+    agent._hold_store = held
+    agent.process_input = AsyncMock(return_value="ok")
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, f"held-{privacy_preset}"),
+            source_event_id=f"telegram:update:held-{privacy_preset}",
+            consumer_id=consumer.consumer_id,
+        )
+
+        result = await handle.wait()
+        [delivery] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert result.status is Status.COALESCED
+        assert result.error == "hold_deferred"
+        assert delivery.status == RETRY
+        assert delivery.attempts == 0
+        assert delivery.lease_token is None
+
+        held.snapshots[:] = [EffectiveHoldState(host=None, agent=None)]
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        for _ in range(100):
+            [delivery] = await dispatcher.list_durable_deliveries(
+                consumer_id=consumer.consumer_id
+            )
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED, (
+            delivery.status, delivery.attempts, delivery.last_error
+        )
+        agent.process_input.assert_awaited_once()
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_late_hold_refusal_preserves_finite_retry_budget(tmp_path):
+    """A max-attempts delivery refused by Hold remains unspent and resumable."""
+
+    from kestrel_sovereign.hold import HoldTurnRefusal
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "held-late-refusal-budget.db",
+        "did:agent:held-late-refusal",
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=1,
+    )
+    unheld = EffectiveHoldState(host=None, agent=None)
+    held_state = _held_state(agent.did)
+    agent._hold_store = _HoldSnapshots(unheld)
+    refusal = HoldTurnRefusal(agent_id=agent.did, effective_state=held_state)
+
+    async def _refuse(*_args, **_kwargs):
+        raise refusal
+
+    agent.process_input = _refuse
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "late-hold"),
+            source_event_id="telegram:update:late-hold",
+            consumer_id=consumer.consumer_id,
+        )
+
+        result = await handle.wait()
+        [delivery] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert result.status is Status.COALESCED
+        assert result.error == "hold_deferred"
+        assert delivery.status == RETRY
+        assert delivery.attempts == 0
+
+        agent.process_input = AsyncMock(return_value="resumed")
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        for _ in range(100):
+            [delivery] = await dispatcher.list_durable_deliveries(
+                consumer_id=consumer.consumer_id
+            )
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED, (
+            delivery.status, delivery.attempts, delivery.last_error
+        )
+        assert delivery.attempts == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 async def test_cursor_owned_cognition_rate_limit_keeps_durable_retry_after_admission(tmp_path):
     """A rate limit cannot turn committed Telegram work into a duplicate loss."""
     backend, agent, dispatcher = await _channel_dispatcher(

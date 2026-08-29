@@ -4610,9 +4610,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 END,
                 lease_owner = NULL, lease_token = NULL,
                 lease_expires_at = NULL, next_attempt_at = ?,
-                last_error = COALESCE(
-                    last_error, 'hold committed during lease transfer'
-                ),
+                last_error = 'hold_deferred',
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
               AND status = ? AND lease_token = ? AND lease_expires_at > ?

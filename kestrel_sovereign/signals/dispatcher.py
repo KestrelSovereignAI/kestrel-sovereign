@@ -430,6 +430,10 @@ class _TransientDurableHandoff:
     created_at: datetime
     retention_until: datetime
     expires_at: datetime
+    # Process-local protected identity for a same-runtime retry. Privacy-elided
+    # rows persist no caller; this sidecar remains bounded by the same timer as
+    # the payload and prevents Hold from making a resumed delivery unusable.
+    caller_identity: Optional[str] = None
     # Kept as the historical field name for in-process test/embedding
     # compatibility. It is a reservation capability until post-commit
     # activation, never a pre-commit lease token.
@@ -1600,9 +1604,12 @@ class SignalDispatcher:
             self._schedule_transient_durable_handoff_expiry(
                 delivery.delivery_id, handoff.expires_at
             )
+        event_changes = {"payload": copy.deepcopy(handoff.payload)}
+        if handoff.caller_identity is not None:
+            event_changes["caller_identity"] = handoff.caller_identity
         return replace(
             delivery,
-            event=replace(delivery.event, payload=copy.deepcopy(handoff.payload)),
+            event=replace(delivery.event, **event_changes),
         )
 
     async def ack_durable_delivery(
@@ -1666,6 +1673,72 @@ class SignalDispatcher:
                     ),
                 )
             return delivery
+
+    async def _release_durable_delivery_for_hold(
+        self,
+        *,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+    ) -> bool:
+        """Return an unexecuted exact lease without spending an attempt."""
+
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            released = await self._durable_store.release_delivery_for_hold(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                delivery_id=delivery_id,
+                lease_token=lease_token,
+            )
+            if not released:
+                return False
+            handoff = self._transient_durable_handoffs.get(delivery_id)
+            if (
+                handoff is not None
+                and handoff.initial_lease_token == lease_token
+            ):
+                # The initial volatile reservation is now an ordinary RETRY.
+                # Future claims use the row's normal lease path while the
+                # still-bounded sidecar remains available until its timer.
+                handoff.initial_lease_token = None
+            if consumer_id in self._started_durable_cognition_consumers:
+                self._schedule_durable_cognition_drain(consumer_id, delay=1.0)
+            return True
+
+    async def _release_cognition_hold_lease(
+        self,
+        *,
+        consumer_id: str,
+        persisted_event_id: str,
+        delivery: DurableDelivery | None,
+    ) -> bool:
+        """Resolve either a claimed lease or a volatile initial reservation."""
+
+        if delivery is not None:
+            delivery_id = delivery.delivery_id
+            lease_token = delivery.lease_token or ""
+        else:
+            existing = await self.get_durable_delivery_for_event(
+                consumer_id=consumer_id,
+                event_id=persisted_event_id,
+            )
+            if existing is None:
+                return False
+            delivery_id = getattr(existing, "delivery_id", None)
+            if not isinstance(delivery_id, str) or not delivery_id:
+                return False
+            handoff = self._transient_durable_handoffs.get(delivery_id)
+            lease_token = (
+                handoff.initial_lease_token if handoff is not None else ""
+            ) or ""
+        if not lease_token:
+            return False
+        return await self._release_durable_delivery_for_hold(
+            consumer_id=consumer_id,
+            delivery_id=delivery_id,
+            lease_token=lease_token,
+        )
 
     async def release_durable_delivery_after_task(
         self,
@@ -2865,6 +2938,12 @@ class SignalDispatcher:
                                 # activation replaces this retention bound with
                                 # the actual lease deadline.
                                 expires_at=retention_until,
+                                caller_identity=(
+                                    self._protect_durable_caller_identity_for_event(
+                                        signal.caller,
+                                        event_id=persisted.event_id,
+                                    )
+                                ),
                                 initial_lease_token=(
                                     reservation.reservation_token
                                 ),
@@ -3274,17 +3353,15 @@ class SignalDispatcher:
             durable=True,
         )
         if held_result is not None:
-            if delivery is not None:
-                # A Hold can win after the drainer's pre-claim snapshot.  Give
-                # back that exact lease before returning the deferred receipt;
-                # release never terminalizes or advances a provider cursor.
-                await self.nack_durable_delivery(
-                    consumer_id=consumer_id,
-                    delivery_id=delivery.delivery_id,
-                    lease_token=delivery.lease_token or "",
-                    error="hold_deferred",
-                    retry_delay=retry_delay or _DURABLE_COGNITION_RETRY_DELAY,
-                )
+            # Volatile privacy modes activate an initial lease at persistence;
+            # drainer-owned work can also arrive here already claimed. Return
+            # either exact capability with the Hold-specific transition so no
+            # executor attempt is spent and no LEASED row becomes invisible.
+            await self._release_cognition_hold_lease(
+                consumer_id=consumer_id,
+                persisted_event_id=persisted_event_id,
+                delivery=delivery,
+            )
             return held_result
         if delivery is None:
             delivery = await self.claim_durable_delivery_for_event(
@@ -3300,6 +3377,11 @@ class SignalDispatcher:
                 durable=True,
             )
             if held_result is not None:
+                await self._release_cognition_hold_lease(
+                    consumer_id=consumer_id,
+                    persisted_event_id=persisted_event_id,
+                    delivery=None,
+                )
                 # Persistence already owns this cursor event. If Hold won the
                 # lease-transfer race, the public claim seam rolled the exact
                 # lease back to RETRY without spending an attempt. The source
@@ -3430,6 +3512,7 @@ class SignalDispatcher:
                 deferred_token = self._deferred_outcome_logs.set(deferred_outcomes)
                 coalescing_token = self._durable_retry_skips_coalescing.set(
                     delivery.attempts > 1
+                    or delivery.last_error == "hold_deferred"
                 )
                 durable_route_token = self._durable_cognition_route.set(True)
                 try:
@@ -3594,6 +3677,24 @@ class SignalDispatcher:
                 result=ack_rejected,
             )
             return ack_rejected
+
+        if result.status is Status.COALESCED and result.error == "hold_deferred":
+            # HoldTurnRefusal may win only after cognition has crossed the
+            # durable claim boundary. That refusal means the turn did not run;
+            # ordinary NACK would spend the attempt and can terminalize a
+            # max_attempts=1 delivery without execution.
+            await self._release_cognition_hold_lease(
+                consumer_id=consumer_id,
+                persisted_event_id=persisted_event_id,
+                delivery=delivery,
+            )
+            self._finalize_deferred_durable_outcome(
+                deferred_outcomes,
+                fallback_signal=routing_signal,
+                fallback_registration=registration,
+                result=result,
+            )
+            return result
 
         # Rate limits, quiet hours, coalescing, and cognition failures are
         # recoverable for cursor-owning ingress. Validation/cycle refusal is a
