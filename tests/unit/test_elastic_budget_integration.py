@@ -82,6 +82,22 @@ class TestMeasureMandatoryFloor:
         floor_b = cb_with_agents.measure_mandatory_system_tokens(constitution="Be kind.")
         assert floor_b > floor_a
 
+    def test_uses_effective_anchored_agents_policy(self):
+        cb = _real_builder_with_bootstrap(
+            {"AGENTS.md": "short bootstrap policy"}
+        )
+        bootstrap_floor = cb.measure_mandatory_system_tokens(
+            constitution="Be kind."
+        )
+        anchored_floor = cb.measure_mandatory_system_tokens(
+            constitution="Be kind.",
+            anchored_doctrine=OrderedDict(
+                [("AGENTS.md", "long anchored policy " * 200)]
+            ),
+        )
+
+        assert anchored_floor > bootstrap_floor
+
     def test_excludes_optional_bootstrap(self):
         """A non-mandatory bootstrap file (e.g. TOOLS.md) must NOT
         change the floor — only items in ``MANDATORY_SYSTEM_SUBSECTIONS``

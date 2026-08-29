@@ -567,7 +567,11 @@ class ContextManager:
         # raises DegradedModeError → surface a degraded-mode ContextResult so
         # the caller does not issue the LLM call under a false "normal" status.
         mandatory_system_tokens = self._measure_mandatory_system_tokens(
-            constitution, prompt_adaptation
+            constitution,
+            prompt_adaptation,
+            anchored_doctrine=anchored_doctrine,
+            required_suffix=system_prompt_addendum,
+            tracked_prompt=system_prompt_budget_bytes is not None,
         )
         try:
             budget = create_budget(
@@ -1284,7 +1288,13 @@ class ContextManager:
     # ------------------------------------------------------------------
 
     def _measure_mandatory_system_tokens(
-        self, constitution: str, prompt_adaptation: Any
+        self,
+        constitution: str,
+        prompt_adaptation: Any,
+        *,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        required_suffix: Optional[str] = None,
+        tracked_prompt: bool = False,
     ) -> int:
         """Measure the non-borrowable mandatory governance floor (#1309).
 
@@ -1298,6 +1308,9 @@ class ContextManager:
             constitution=constitution,
             state_of_mind=None,
             prompt_adaptation=prompt_adaptation,
+            anchored_doctrine=anchored_doctrine,
+            required_suffix=required_suffix,
+            tracked_prompt=tracked_prompt,
         )
         try:
             return int(raw_mandatory)

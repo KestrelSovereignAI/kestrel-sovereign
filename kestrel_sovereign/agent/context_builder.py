@@ -25,11 +25,10 @@ from kestrel_sovereign.security.input_guardrails import wrap_user_input
 # effective-history estimator.
 _MESSAGE_OVERHEAD = 4
 
-# Subsection names that count as mandatory governance content for the
-# #1309 elastic-budget non-borrowable floor (Emma 2026-05-20). The rest
-# of ``_collect_system_prompt_parts``'s output (session_briefing, style
-# reminder, additional_context, addenda, etc.) is optional and lives
-# under the borrowable system budget.
+# Legacy-renderer subsection names that count as mandatory governance content
+# for the #1309 elastic-budget non-borrowable floor (Emma 2026-05-20). Tracked
+# rendering selects host clauses by canonical audit name instead so feature
+# context cannot acquire authority by copying one of these legacy group names.
 #
 # Bootstrap-file subsections use the ``bootstrap_<stem>`` naming
 # convention from ``_collect_system_prompt_parts``; AGENTS.md is
@@ -1051,13 +1050,16 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         *,
         state_of_mind: Optional["StateOfMind"] = None,
         prompt_adaptation: Optional["PromptAdaptation"] = None,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        required_suffix: Optional[str] = None,
+        tracked_prompt: bool = False,
     ) -> int:
         """Measured non-borrowable floor for the #1309 elastic budget.
 
-        Sums the tokens of the mandatory subsections — constitution,
+        Sums the tokens of the mandatory host clauses — constitution,
         identity (SOUL.md), operator policy (AGENTS.md), and any
-        active state-of-mind block — as joined by
-        ``_collect_system_prompt_parts``. The result is what the
+        active state-of-mind block — using the same tracked assembler that
+        emits them. The result is what the
         ``ElasticTokenBudget`` carves out as a non-borrowable hard
         floor (Emma's 2026-05-20 hardening). Optional system content
         (session briefing, style reminder, addenda, etc.) is excluded
@@ -1069,6 +1071,13 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 floor when present (governance signaling).
             prompt_adaptation: Optional preamble; not currently part
                 of the mandatory floor.
+            anchored_doctrine: Effective per-turn doctrine. An anchored
+                SOUL.md or AGENTS.md replaces its bootstrap counterpart.
+            required_suffix: Non-droppable per-turn suffix whose exact joined
+                cost must also be reserved.
+            tracked_prompt: Force the priority-aware renderer used by callers
+                with an explicit prompt budget. Anchors and active feature
+                context select it automatically.
 
         Returns:
             Token count for the mandatory subsections, including the
@@ -1076,18 +1085,49 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
             assembled prompt — so the floor reflects what the LLM
             actually receives.
         """
-        groups = self._collect_system_prompt_parts(
-            constitution=constitution,
-            include_briefing=False,  # briefing is optional
-            additional_context=None,  # optional
-            prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind,
-            system_prompt_addendum=None,  # optional
+        from kestrel_sovereign.agent.system_prompt_assembler import (
+            AGENTS_FILENAME,
+            CLAUSE_KESTREL_CONSTITUTION,
+            CLAUSE_STATE_OF_MIND,
         )
-        mandatory_parts: List[str] = []
-        for name, parts in groups:
-            if name in MANDATORY_SYSTEM_SUBSECTIONS:
-                mandatory_parts.extend(parts)
+
+        if tracked_prompt or anchored_doctrine or self.has_context_clauses():
+            tracked = self.build_system_prompt_with_tracking(
+                constitution=constitution,
+                anchored_doctrine=anchored_doctrine,
+                include_briefing=False,
+                additional_context=None,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                required_suffix=required_suffix,
+                _resolved_context_clauses=(),
+            )
+            mandatory_names = {
+                CLAUSE_KESTREL_CONSTITUTION,
+                "SOUL.md",
+                AGENTS_FILENAME,
+                CLAUSE_STATE_OF_MIND,
+            }
+            mandatory_parts = [
+                body
+                for name, body in tracked.subsections
+                if name in mandatory_names
+            ]
+        else:
+            groups = self._collect_system_prompt_parts(
+                constitution=constitution,
+                include_briefing=False,
+                additional_context=None,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                system_prompt_addendum=None,
+            )
+            mandatory_parts = []
+            for name, parts in groups:
+                if name in MANDATORY_SYSTEM_SUBSECTIONS:
+                    mandatory_parts.extend(parts)
+        if required_suffix:
+            mandatory_parts.append(required_suffix)
         if not mandatory_parts:
             return 0
         return self.counter.count("\n\n".join(mandatory_parts))
@@ -1172,10 +1212,10 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         bootstrap iteration to avoid duplication.
 
         ``budget_bytes`` and ``budget_tokens`` enforce priority-ordered
-        truncation. The constitution is never droppable; everything else is
-        dropped highest-priority-number first until every supplied ceiling
-        fits. ``required_suffix`` reserves an exact non-droppable tail such as
-        a signal canary without adding it to the clause audit trail.
+        truncation. Mandatory governance clauses are never droppable; optional
+        clauses are dropped highest-priority-number first until every supplied
+        ceiling fits. ``required_suffix`` reserves an exact non-droppable tail
+        such as a signal canary without adding it to the clause audit trail.
 
         See `kestrel_sovereign/agent/system_prompt_assembler.py` for
         the priority table (mirrors CONSTITUTION_INJECTION.md §7).

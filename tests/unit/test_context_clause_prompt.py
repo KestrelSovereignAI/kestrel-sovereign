@@ -143,6 +143,21 @@ def test_empty_contribution_preserves_legacy_prompt_bytes():
     ).encode() == baseline.encode()
 
 
+def test_mandatory_floor_does_not_count_feature_context():
+    registry = _ClauseRegistry(
+        _clause("constitution", 10, "optional feature context " * 10_000)
+    )
+    builder = _builder(registry)
+    baseline = _builder().measure_mandatory_system_tokens(
+        "C", tracked_prompt=True
+    )
+
+    floor = builder.measure_mandatory_system_tokens("C")
+
+    assert floor == baseline
+    assert registry.snapshot_calls == 1
+
+
 def test_core_registry_order_does_not_depend_on_feature_load_order():
     first = _clause("zeta", 20, "zeta")
     second = _clause("alpha", 10, "alpha")
@@ -343,6 +358,71 @@ async def test_ordinary_turn_evicts_contributed_clauses_to_model_budget():
     assert "x x x x" not in plan.assembly.system_prompt
     assert "small" in (plan.assembly.injected_clauses or [])
     assert "huge" in (plan.assembly.dropped_clauses or [])
+
+
+@pytest.mark.asyncio
+async def test_legacy_subsection_name_does_not_promote_contributed_clause():
+    registry = _ClauseRegistry(
+        _clause("constitution", 10, "optional feature context " * 400_000)
+    )
+    storage = MagicMock()
+    storage.search_chunks = AsyncMock(return_value=[])
+    builder = ContextBuilder(storage, context_clause_registry=registry)
+    manager = ContextManager(storage=storage, context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        conversation_history=[],
+    )
+
+    assert plan.degraded_mode is False
+    assert "optional feature context" not in plan.assembly.system_prompt
+    assert "constitution" in (plan.assembly.dropped_clauses or [])
+
+
+@pytest.mark.asyncio
+async def test_effective_anchored_policy_is_preflighted_before_assembly():
+    registry = _ClauseRegistry(_clause("small", 10, "small clause"))
+    builder = _builder(registry)
+    manager = ContextManager(storage=MagicMock(), context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        conversation_history=[],
+        anchored_doctrine=OrderedDict(
+            [("AGENTS.md", "mandatory anchored policy " * 40_000)]
+        ),
+    )
+
+    assert plan.degraded_mode is True
+    assert plan.mandatory_system_tokens > plan.total_budget
+
+
+@pytest.mark.asyncio
+async def test_required_system_suffix_is_preflighted_before_assembly():
+    builder = _builder()
+    manager = ContextManager(storage=MagicMock(), context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        conversation_history=[],
+        system_prompt_addendum="mandatory suffix " * 40_000,
+    )
+
+    assert plan.degraded_mode is True
+    assert plan.mandatory_system_tokens > plan.total_budget
 
 
 @pytest.mark.asyncio

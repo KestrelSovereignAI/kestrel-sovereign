@@ -12,11 +12,11 @@ Produces the full in-agent system prompt by combining:
 7. Caller-supplied additional context (priority 7)
 8. Lifecycle-resolved feature context (priority 8+)
 
-When the assembled prompt exceeds a configured byte or token budget, clauses
-are dropped highest-priority-number first (within a priority, in
-reverse emission order) until the prompt fits. The constitution is
-never droppable; if it alone exceeds budget the budget is honored
-in spirit (return whatever fits) but the constitution stays.
+When the assembled prompt exceeds a configured byte or token budget, optional
+clauses are dropped highest-priority-number first (within a priority, in
+reverse emission order) until the prompt fits. Mandatory governance clauses
+(constitution, identity, operator policy, and state of mind) stay intact; if
+their floor exceeds budget, the caller must fail closed during preflight.
 
 Both the kept and dropped clause lists are returned for forensic
 recording on `signal_log` (`injected_clauses_json`,
@@ -84,10 +84,10 @@ class SystemPromptResult:
     to `signal_log.injected_clauses_json` / `dropped_clauses_json`.
 
     `injected_clauses` is in legacy emission order (the order the
-    clauses appear in `prompt`). `dropped_clauses` is in the order
-    the budget-fit loop removed them — useful for an auditor
-    reconstructing what would have been included next if the budget
-    were larger.
+    clauses appear in `prompt`). `dropped_clauses` starts with contributed
+    clauses displaced by same-name per-turn anchors, followed by the order the
+    budget-fit loop removed remaining optional clauses. This lets an auditor
+    reconstruct authority and what would fit under a larger budget.
     """
 
     prompt: str
@@ -109,6 +109,7 @@ class _Clause:
     name: str
     priority: int
     body: str
+    mandatory: bool = False
     emit_index: int = 0
     bytes_size: int = field(init=False)
 
@@ -177,20 +178,32 @@ def assemble_system_prompt(
     dropped highest-priority-number first until both supplied ceilings fit.
     ``required_suffix`` participates in both measurements but is returned to
     the caller separately; this lets a non-droppable canary/addendum reserve
-    its exact joined cost. The constitution is never droppable.
+    its exact joined cost. Mandatory governance clauses are never droppable.
     """
     clauses: List[_Clause] = []
     emit_counter = 0
     emitted_names: set[str] = set()
 
-    def add(name: str, priority: int, body: str) -> None:
+    def add(
+        name: str,
+        priority: int,
+        body: str,
+        *,
+        mandatory: bool = False,
+    ) -> None:
         nonlocal emit_counter
         if name in emitted_names:
             raise ValueError(
                 f"system prompt clause name {name!r} is not globally unique"
             )
         clauses.append(
-            _Clause(name=name, priority=priority, body=body, emit_index=emit_counter)
+            _Clause(
+                name=name,
+                priority=priority,
+                body=body,
+                mandatory=mandatory,
+                emit_index=emit_counter,
+            )
         )
         emitted_names.add(name)
         emit_counter += 1
@@ -217,6 +230,7 @@ def assemble_system_prompt(
                 name="SOUL.md",
                 priority=PRIORITY_SOUL,
                 body=_wrap("YOUR IDENTITY", content),
+                mandatory=True,
             )
         else:
             label = filename.replace(".md", "").upper()
@@ -224,6 +238,7 @@ def assemble_system_prompt(
                 name=filename,
                 priority=PRIORITY_OTHER_BOOTSTRAP,
                 body=_wrap(label, content),
+                mandatory=filename == AGENTS_FILENAME,
             )
 
     # Session briefing (priority 6 — non-critical, droppable before
@@ -255,13 +270,19 @@ def assemble_system_prompt(
             else PRIORITY_ANCHORED_DOCTRINE
         )
         label = section_name_for_anchored_file(filename)
-        add(name=filename, priority=priority, body=_wrap(label, content))
+        add(
+            name=filename,
+            priority=priority,
+            body=_wrap(label, content),
+            mandatory=filename in {"SOUL.md", AGENTS_FILENAME},
+        )
 
     # Constitution (priority 1 — never droppable).
     add(
         name=CLAUSE_KESTREL_CONSTITUTION,
         priority=PRIORITY_CONSTITUTION,
         body=_wrap("GOVERNING CONSTITUTION", constitution),
+        mandatory=True,
     )
 
     # State of mind (priority 5) — pre-rendered by the caller.
@@ -270,6 +291,7 @@ def assemble_system_prompt(
             name=CLAUSE_STATE_OF_MIND,
             priority=PRIORITY_STATE_OF_MIND,
             body=state_of_mind_block.strip(),
+            mandatory=True,
         )
 
     # Style reminder (priority 7).
@@ -302,8 +324,16 @@ def assemble_system_prompt(
             sorted({clause[2] for clause in ordered_context})
         )
     }
+    shadowed_context_names: List[str] = []
     for _owner, name, priority, body in ordered_context:
         if not body:
+            continue
+        if name in anchored:
+            # Per-turn anchored doctrine has higher authority than lifecycle
+            # feature context. Keep the displaced contribution in the drop
+            # audit even though the authoritative anchor with the same stable
+            # audit name is injected.
+            shadowed_context_names.append(name)
             continue
         add(
             name=name,
@@ -329,7 +359,8 @@ def assemble_system_prompt(
     return SystemPromptResult(
         prompt=prompt,
         injected_clauses=[c.name for c in kept_sorted],
-        dropped_clauses=[c.name for c in dropped_in_drop_order],
+        dropped_clauses=shadowed_context_names
+        + [c.name for c in dropped_in_drop_order],
         subsections=[(c.name, c.body) for c in kept_sorted],
     )
 
@@ -348,11 +379,13 @@ def _drop_to_fit(
     `dropped` is in the order they were removed (drop-time order, not
     emission order — useful for forensics).
 
-    A missing byte/token budget disables only that measurement. The constitution
-    (`PRIORITY_CONSTITUTION`) is never dropped even when its size
-    alone exceeds budget — the design treats constitutional integrity
-    as the load-bearing invariant; an oversized constitution is an
-    operator-config problem, not something the assembler should hide.
+    A missing byte/token budget disables only that measurement. Mandatory host
+    clauses (constitution, identity, operator policy, and state of mind) are
+    never dropped even when their combined size alone exceeds budget — the
+    design treats governance integrity as the load-bearing invariant; an
+    oversized mandatory floor is an operator-config problem, not something the
+    assembler should hide. Mandatory status is source metadata on ``_Clause``;
+    a contributed clause cannot promote itself by copying a host audit name.
     """
     kept = list(clauses)
     dropped: List[_Clause] = []
@@ -383,13 +416,13 @@ def _drop_to_fit(
         )
 
     while over_budget(kept):
-        # Candidates: clauses with priority > CONSTITUTION, sorted
+        # Candidates: non-mandatory clauses, sorted
         # so the highest-priority-number-and-latest-emit_index goes
         # first. Same priority → drop later-emitted first.
-        droppable = [c for c in kept if c.priority != PRIORITY_CONSTITUTION]
+        droppable = [c for c in kept if not c.mandatory]
         if not droppable:
-            # Only the constitution remains and it's still over budget.
-            # Honor the constitution; let the prompt exceed budget.
+            # Only mandatory governance remains and it is still over budget.
+            # Preserve it; the caller's floor preflight must fail closed.
             break
         droppable.sort(key=lambda c: (-c.priority, -c.emit_index))
         victim = droppable[0]

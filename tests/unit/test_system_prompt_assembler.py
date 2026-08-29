@@ -306,6 +306,47 @@ def test_contributed_context_alone_over_budget_never_drops_constitution():
     assert result.dropped_clauses == ["huge"]
 
 
+def test_budget_never_drops_mandatory_identity_or_operator_policy():
+    result = assemble_system_prompt(
+        constitution="governance",
+        bootstrap_files=OrderedDict(
+            [
+                ("SOUL.md", "identity"),
+                ("AGENTS.md", "operator policy"),
+                ("TOOLS.md", "optional tools"),
+            ]
+        ),
+        budget_bytes=1,
+    )
+
+    assert result.injected_clauses == [
+        "SOUL.md",
+        "AGENTS.md",
+        CLAUSE_KESTREL_CONSTITUTION,
+    ]
+    assert result.dropped_clauses == ["TOOLS.md"]
+    assert "identity" in result.prompt
+    assert "operator policy" in result.prompt
+
+
+def test_anchored_doctrine_shadows_same_name_contributed_context_with_audit():
+    result = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(),
+        anchored_doctrine=OrderedDict(
+            [("POLICY.yaml", "authoritative per-turn policy")]
+        ),
+        context_clauses=(
+            ("tests:feature", "POLICY.yaml", 10, "feature policy"),
+        ),
+    )
+
+    assert result.injected_clauses.count("POLICY.yaml") == 1
+    assert "POLICY.yaml" in result.dropped_clauses
+    assert "authoritative per-turn policy" in result.prompt
+    assert "feature policy" not in result.prompt
+
+
 def test_zero_contributed_context_is_byte_identical_to_omitted_parameter():
     kwargs = {
         "constitution": "C",
