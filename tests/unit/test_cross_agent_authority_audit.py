@@ -176,6 +176,14 @@ def test_api_route_declarations_expand_every_registered_method() -> None:
     assert _route_methods(decorator) == ("POST", "PUT")
 
 
+def test_audit_records_remediated_authority_paths_as_enforced() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    for issue in (3146, 3147, 3149):
+        row = next(line for line in audit.splitlines() if f"[#{issue}]" in line)
+        assert "Enforced by" in row
+        assert "Defect:" not in row
+
+
 def _identifier_tokens(node: ast.AST) -> set[str]:
     tokens: set[str] = set()
     for child in ast.walk(node):
