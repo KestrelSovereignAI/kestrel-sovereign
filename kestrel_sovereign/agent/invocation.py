@@ -315,7 +315,28 @@ def bind_async_invocation(
                                 operation,
                             )
                         try:
-                            return await operation
+                            result = await operation
+                            # ``Task.cancel()`` is a no-op once the isolated
+                            # child has produced a result.  Stop can linearize
+                            # in the narrow window between that completion and
+                            # this owner resuming, so re-read the exact active
+                            # generation before publishing normal output.  No
+                            # await follows this check: another request cannot
+                            # interleave between the verdict and return.
+                            is_cancelled = getattr(
+                                type(lifecycle_owner),
+                                "is_request_cancelled",
+                                None,
+                            )
+                            if callable(is_cancelled) and is_cancelled(
+                                lifecycle_owner, invocation_id
+                            ):
+                                raise InvocationCancelledError(
+                                    "isolated invocation was stopped after "
+                                    "operation completion "
+                                    f"({invocation_log_correlation(invocation_id)})"
+                                )
+                            return result
                         except asyncio.CancelledError as error:
                             caller = asyncio.current_task()
                             if caller is not None and caller.cancelling():

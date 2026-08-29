@@ -97,6 +97,46 @@ async def test_isolated_turn_preserves_context_outputs_for_caller_audit():
 
 
 @pytest.mark.asyncio
+async def test_stop_racing_with_isolated_completion_suppresses_normal_result():
+    """A completed child cannot outrun Stop before its owner publishes output."""
+
+    from kestrel_sovereign.agent.invocation import (
+        InvocationCancelledError,
+        bind_async_invocation,
+    )
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+
+        def bind_request_operation(self, request_id, operation):
+            super().bind_request_operation(request_id, operation)
+            # Done callbacks registered before ``await operation`` wakes its
+            # owner.  This deterministically models Stop linearizing after the
+            # child result exists but before the wrapper can return it.
+            operation.add_done_callback(
+                lambda _done: self.cancel_current_request(request_id)
+            )
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            return "must-not-escape"
+
+    with pytest.raises(InvocationCancelledError, match="after operation completion"):
+        await Owner().run(invocation_id="completion-race")
+
+
+@pytest.mark.asyncio
 async def test_cancelled_isolated_turn_cleanup_failure_is_abandoned():
     from kestrel_sovereign.agent.invocation import bind_async_invocation
     from kestrel_sovereign.agent.request_lifecycle import (
