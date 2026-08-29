@@ -19,6 +19,7 @@ sessions against the host backend (SQLite default), so Phase 1 works standalone.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -188,12 +189,13 @@ async def build_host_context(
 ) -> SovereignHostContext:
     """Build the host context: open a host backend + fleet session factory.
 
-    The host is not an agent, so it owns a dedicated host backend (SQLite by
-    default) distinct from any agent DB. ``db_path`` overrides the default
-    location (``$KESTREL_HOST_DB_PATH`` or the private host-data root). Failure
-    to secure or open the backend degrades gracefully to a context with a
-    ``None`` db/session_factory — the host still starts and host features whose
-    routers/UI don't need a store keep working.
+    The host is not an agent, but its control state must share the deployment's
+    durability class. PostgreSQL deployments therefore use
+    ``KESTREL_DATABASE_URL``; otherwise the host owns a dedicated SQLite file.
+    ``db_path`` overrides the SQLite location (``$KESTREL_HOST_DB_PATH`` or the
+    private host-data root). Failure to secure or open the backend degrades
+    gracefully to a context with a ``None`` db/session_factory — the host still
+    starts and host features whose routers/UI don't need a store keep working.
     """
     db = None
     session_factory: Optional[FleetSessionFactory] = None
@@ -207,9 +209,21 @@ async def build_host_context(
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
 
-        resolved = prepare_host_database(db_path)
-        db = await AsyncDatabase.sqlite(str(resolved))
-        validate_sqlite_family_private(resolved)
+        backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+        if backend == "postgres":
+            dsn = os.environ.get("KESTREL_DATABASE_URL")
+            if not dsn:
+                raise ValueError(
+                    "KESTREL_DATABASE_URL is required for the durable host "
+                    "control backend when KESTREL_DB_BACKEND=postgres"
+                )
+            db = await AsyncDatabase.postgres(dsn)
+            location = "configured PostgreSQL database"
+        else:
+            resolved = prepare_host_database(db_path)
+            db = await AsyncDatabase.sqlite(str(resolved))
+            validate_sqlite_family_private(resolved)
+            location = str(resolved)
         inner = make_session_factory(db)
         session_factory = FleetSessionFactory(inner)
         from kestrel_sovereign.hold import HoldStore
@@ -217,7 +231,7 @@ async def build_host_context(
         hold_store = HoldStore(db)
         await hold_store.ensure_schema()
         logger.info(
-            "Host backend opened at %s (fleet tenant=%s)", resolved, FLEET_TENANT_ID
+            "Host backend opened at %s (fleet tenant=%s)", location, FLEET_TENANT_ID
         )
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
         if session_factory is not None:

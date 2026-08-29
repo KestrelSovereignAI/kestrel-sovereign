@@ -936,9 +936,33 @@ class HoldStore:
             return EffectiveHoldState(host=host, agent=agent_state)
 
     async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
+        try:
+            return await self._get_receipt(operation_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
+        """Read one receipt only after proving its target authority graph."""
+
         operation = _required_text(operation_id, "operation_id")
-        row = await self._read_receipt_by_operation(operation)
-        return _receipt_from_row(row) if row is not None else None
+        async with self._db.transaction(immediate=True):
+            row = await self._read_receipt_by_operation(operation)
+            if row is None:
+                return None
+            receipt = _receipt_from_row(row)
+            targets = ((receipt.scope, receipt.target_id),)
+            await self._lock_read_targets(targets)
+            await self._assert_host_latch_shape()
+            latch = _latch_from_row(
+                await self._read_latch_row(receipt.scope, receipt.target_id)
+            )
+            await self._validate_latch_projection(
+                latch, receipt.scope, receipt.target_id
+            )
+            return receipt
 
 
 __all__ = [
