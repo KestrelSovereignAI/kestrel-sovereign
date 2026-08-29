@@ -6,6 +6,7 @@ from fastapi import HTTPException, Request
 
 from kestrel_sovereign.agent.invocation import (
     InvocationProvenance,
+    invocation_id_response_header,
     request_provenance,
     resolve_transport_invocation_id,
 )
@@ -71,6 +72,17 @@ def request_invocation_provenance(
         actor=actor,
         source_kind="http_request",
         source_locator=source_locator,
+    )
+
+
+def stopped_invocation_http_error(invocation_id: str) -> ApiHTTPException:
+    """Translate cooperative turn cancellation at a synchronous HTTP door."""
+
+    return ApiHTTPException(
+        status_code=409,
+        code="request_stopped",
+        message="Request stopped during execution.",
+        headers={"X-Request-ID": invocation_id_response_header(invocation_id)},
     )
 
 

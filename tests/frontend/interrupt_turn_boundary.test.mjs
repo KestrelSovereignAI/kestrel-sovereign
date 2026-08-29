@@ -172,7 +172,10 @@ test('a prior turn\'s late paint cannot weld into the interrupting turn\'s bubbl
     apiModule.default.invoke = async () => ({ response: '' });
     apiModule.default.getStreamAbortController = () => null;  // no controller → no abort
     apiModule.default.getCurrentStreamRequestId = () => 'prior-req';
-    apiModule.default.stop = async () => ({ ok: true });
+    apiModule.default.stop = async () => ({
+        success: true,
+        stop_outcomes: [{ disposition: 'stopped' }],
+    });
 
     messageInput.value = 'do the soul work';
     const priorPromise = sendMessage();

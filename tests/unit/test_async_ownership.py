@@ -8,6 +8,7 @@ import threading
 import pytest
 
 from kestrel_sovereign._async_ownership import (
+    OwnedAsyncIterator,
     await_owned_task,
     raise_owned_outcome,
     run_blocking_operation,
@@ -115,6 +116,65 @@ async def test_preexisting_cancellation_is_propagated_after_owned_result():
 
     with pytest.raises(asyncio.CancelledError, match="already cancelled"):
         raise_owned_outcome(outcome, operation="test operation")
+
+
+@pytest.mark.asyncio
+async def test_closing_owned_iterator_interrupts_blocked_source():
+    """Close must reach a producer blocked before its first item."""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def source():
+        try:
+            entered.set()
+            await release.wait()
+            yield "late"
+        finally:
+            finalized.set()
+
+    owned = OwnedAsyncIterator(source, operation="blocked source")
+    consumer = asyncio.create_task(anext(owned))
+    await entered.wait()
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    close = asyncio.create_task(owned.aclose())
+    await asyncio.sleep(0.05)
+    closed_without_source_release = close.done()
+    release.set()
+    await close
+
+    assert closed_without_source_release is True
+    assert finalized.is_set()
+
+
+@pytest.mark.asyncio
+async def test_natural_unwind_failure_is_cleanup_when_stop_was_requested():
+    """A Stop between the final item and terminal anext preserves cleanup failure."""
+
+    stop_requested = False
+
+    async def source():
+        try:
+            yield "last item"
+        finally:
+            raise RuntimeError("natural unwind cleanup failed")
+
+    owned = OwnedAsyncIterator(
+        source,
+        operation="naturally unwound source",
+        cleanup_requested=lambda: stop_requested,
+    )
+    assert await anext(owned) == "last item"
+    stop_requested = True
+
+    with pytest.raises(RuntimeError, match="natural unwind cleanup failed"):
+        await anext(owned)
+
+    assert isinstance(owned.cleanup_error, RuntimeError)
 
 
 @pytest.mark.asyncio
