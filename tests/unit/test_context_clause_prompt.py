@@ -132,6 +132,17 @@ def test_cached_contribution_bytes_are_stable_across_real_prompt_paths():
     assert registry.snapshot_calls == 6
 
 
+def test_empty_contribution_preserves_legacy_prompt_bytes():
+    baseline = _builder().build_system_prompt("C", include_briefing=False)
+    registry = _ClauseRegistry(_clause("conditional", 10, ""))
+    builder = _builder(registry)
+
+    assert builder.has_context_clauses() is False
+    assert builder.build_system_prompt(
+        "C", include_briefing=False
+    ).encode() == baseline.encode()
+
+
 def test_core_registry_order_does_not_depend_on_feature_load_order():
     first = _clause("zeta", 20, "zeta")
     second = _clause("alpha", 10, "alpha")

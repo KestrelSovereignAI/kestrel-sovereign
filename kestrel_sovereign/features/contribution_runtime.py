@@ -135,21 +135,18 @@ class ContextClauseRegistry:
     )
 
     @classmethod
-    def _validate_names(
-        cls,
-        values: tuple[ResolvedContextClause, ...],
-        *,
-        resident: Iterable[ResolvedContextClause],
-    ) -> None:
-        names = [clause.name for clause in values]
-        if len(set(names)) != len(names):
+    def validate_declared_names(cls, names: Iterable[str]) -> tuple[str, ...]:
+        """Validate host-visible audit names without invoking renderers."""
+
+        values = tuple(names)
+        if len(set(values)) != len(values):
             raise FeatureContributionRuntimeError(
                 "duplicate context-clause name in one registration batch"
             )
         reserved = next(
             (
                 name
-                for name in names
+                for name in values
                 if name in cls._RESERVED_AUDIT_NAMES or name.endswith(".md")
             ),
             None,
@@ -158,6 +155,16 @@ class ContextClauseRegistry:
             raise FeatureContributionRuntimeError(
                 f"context-clause name {reserved!r} is a reserved host audit name"
             )
+        return values
+
+    @classmethod
+    def _validate_names(
+        cls,
+        values: tuple[ResolvedContextClause, ...],
+        *,
+        resident: Iterable[ResolvedContextClause],
+    ) -> None:
+        names = cls.validate_declared_names(clause.name for clause in values)
         resident_names = {clause.name for clause in resident}
         conflict = next((name for name in names if name in resident_names), None)
         if conflict is not None:
@@ -170,6 +177,14 @@ class ContextClauseRegistry:
             clause
             for registry in self._external_registries
             for clause in registry.snapshot()
+        )
+
+    def has_audit_name(self, name: str) -> bool:
+        """Whether local or bound host state already owns one audit name."""
+
+        return any(
+            clause.name == name
+            for clause in (*self._clauses.values(), *self._external_clauses())
         )
 
     def validate_external_registries(
@@ -1067,6 +1082,7 @@ class FeatureContributionRuntime:
         source_names = []
         permission_names = []
         setup_steps = []
+        context_names = []
         for item in prepared:
             values = item.contributions
             service_refs.extend(registration.reference for registration in values.services)
@@ -1080,6 +1096,9 @@ class FeatureContributionRuntime:
             if values.permission_defaults is not None:
                 permission_names.append(item.feature_name)
             setup_steps.extend(values.setup_steps)
+            context_names.extend(
+                registration.name for registration in values.context_clauses
+            )
 
         self._require_unique(service_refs, "service reference")
         self._require_unique(workflow_names, "workflow name")
@@ -1089,6 +1108,8 @@ class FeatureContributionRuntime:
         self._require_unique(
             [registration.name for registration in setup_steps], "setup step name"
         )
+        self._require_unique(context_names, "context-clause name")
+        ContextClauseRegistry.validate_declared_names(context_names)
 
         rejections = tuple(
             ContributionRejection(item.feature, item.feature_name, reason)
@@ -1160,6 +1181,12 @@ class FeatureContributionRuntime:
         for registration in values.setup_steps:
             if self.setup_step_registry.get(registration.name) is not None:
                 return f"setup step already registered: {registration.name}"
+        for registration in values.context_clauses:
+            if self.context_clause_registry.has_audit_name(registration.name):
+                return (
+                    "context clause already registered: "
+                    f"{registration.name}"
+                )
         return None
 
     @staticmethod

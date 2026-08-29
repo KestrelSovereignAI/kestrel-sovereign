@@ -951,7 +951,9 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
 
     def _resolved_context_clauses(self):
         registry = getattr(self, "_context_clause_registry", None)
-        return () if registry is None else registry.snapshot()
+        if registry is None:
+            return ()
+        return tuple(clause for clause in registry.snapshot() if clause.body)
 
     def has_context_clauses(self) -> bool:
         """Whether an immutable contributed-context snapshot is non-empty."""

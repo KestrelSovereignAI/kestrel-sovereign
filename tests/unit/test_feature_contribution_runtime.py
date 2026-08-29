@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from kestrel_sdk.features import ContributionContractError
+from kestrel_sdk.features import (
+    ContextClauseRegistration,
+    ContributionContractError,
+)
 from kestrel_sdk.operator import ExecutionTargetDescriptor
 
 from kestrel_sovereign import server
@@ -163,6 +166,67 @@ def test_context_renderer_failure_precedes_registry_mutation(tmp_path):
     assert runtime.active_context_clauses() == ()
     assert len(agent.wait_registry.kinds()) == 0
     assert len(agent.signal_registry) == 0
+
+
+def test_duplicate_context_names_fail_complete_transition_preflight(tmp_path):
+    agent = _agent(tmp_path)
+
+    class FirstFixture(SDKFixtureFeature):
+        contribution_prefix = "first-context"
+
+    class SecondFixture(SDKFixtureFeature):
+        contribution_prefix = "second-context"
+
+    first = FirstFixture(agent)
+    second = SecondFixture(agent)
+    second.context_registration = ContextClauseRegistration(
+        owner=second.contribution_owner,
+        name=first.context_registration.name,
+        priority=30,
+        renderer=second._render_context_clause,
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="duplicate context-clause name in contribution transition",
+    ):
+        runtime.prepare_transition((first, second))
+
+    assert first.context_renderer_calls == 0
+    assert second.context_renderer_calls == 0
+    assert runtime.active_owners() == ()
+
+
+def test_active_context_name_conflict_is_rejected_before_rendering(tmp_path):
+    agent = _agent(tmp_path)
+
+    class FirstFixture(SDKFixtureFeature):
+        contribution_prefix = "first-active-context"
+
+    class SecondFixture(SDKFixtureFeature):
+        contribution_prefix = "second-active-context"
+
+    first = FirstFixture(agent)
+    second = SecondFixture(agent)
+    second.context_registration = ContextClauseRegistration(
+        owner=second.contribution_owner,
+        name=first.context_registration.name,
+        priority=30,
+        renderer=second._render_context_clause,
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((first,)).only())
+
+    transition = runtime.prepare_transition((second,))
+
+    assert transition.accepted == ()
+    assert len(transition.rejected) == 1
+    assert transition.rejected[0].feature is second
+    assert "context clause already registered" in transition.rejected[0].reason
+    assert first.context_renderer_calls == 1
+    assert second.context_renderer_calls == 0
+    assert runtime.active_owners() == (first.contribution_owner,)
 
 
 @pytest.mark.asyncio
