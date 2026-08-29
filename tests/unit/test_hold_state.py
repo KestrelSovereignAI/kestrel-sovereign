@@ -249,6 +249,108 @@ async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
 
 
 @pytest.mark.asyncio
+async def test_release_rejects_latch_with_missing_authority_receipt(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="investigate",
+        operation_id="hold-before-receipt-loss",
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing authority receipt"):
+        await store.release_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="must remain held",
+            operation_id="release-without-authority",
+            expected_hold_receipt_id=held.receipt.receipt_id,
+        )
+
+    row = await db.fetchone(
+        "SELECT active, hold_receipt_id FROM hold_latches "
+        "WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:kite"),
+    )
+    assert row == (1, held.receipt.receipt_id)
+    assert await store.get_receipt("release-without-authority") is None
+
+
+@pytest.mark.asyncio
+async def test_release_rejects_latch_bound_to_another_targets_receipt(hold_db):
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:first",
+        actor_id="did:sovereign:operator",
+        reason="first investigation",
+        operation_id="hold-first-target",
+    )
+    other = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:other",
+        actor_id="did:sovereign:operator",
+        reason="other investigation",
+        operation_id="hold-other-target",
+    )
+    await db.execute(
+        "UPDATE hold_latches SET hold_receipt_id = ? "
+        "WHERE scope = ? AND target_id = ?",
+        (other.receipt.receipt_id, "agent", "did:agent:first"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="does not match"):
+        await store.release_hold(
+            scope="agent",
+            target_id="did:agent:first",
+            actor_id="did:sovereign:operator",
+            reason="must remain held",
+            operation_id="release-mismatched-authority",
+            expected_hold_receipt_id=other.receipt.receipt_id,
+        )
+
+    row = await db.fetchone(
+        "SELECT active, hold_receipt_id FROM hold_latches "
+        "WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:first"),
+    )
+    assert row == (1, other.receipt.receipt_id)
+    assert first.receipt.receipt_id != other.receipt.receipt_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "target_id", "expected_lock"),
+    [
+        (HoldScope.AGENT, "did:agent:independent", False),
+        (HoldScope.HOST, None, True),
+    ],
+)
+async def test_mutation_locks_host_shape_only_for_host_scope(
+    hold_db, monkeypatch, scope, target_id, expected_lock,
+):
+    _db, store = hold_db
+    inspect_shape = AsyncMock(wraps=store._assert_host_latch_shape)
+    monkeypatch.setattr(store, "_assert_host_latch_shape", inspect_shape)
+
+    await store.set_hold(
+        scope=scope,
+        target_id=target_id,
+        actor_id="did:sovereign:operator",
+        reason="scope-specific lock",
+        operation_id=f"lock-{scope.value}",
+    )
+
+    inspect_shape.assert_awaited_once_with(for_update=expected_lock)
+
+
+@pytest.mark.asyncio
 async def test_receipt_and_latch_roll_back_as_one_unit(hold_db, monkeypatch):
     _db, store = hold_db
     insert = store._insert_receipt
