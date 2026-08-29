@@ -2267,7 +2267,7 @@ class RestartCoordinatorFeature(Feature):
         """
         # POLL to the deadline rather than checking once at the end. The
         # realistic failure — ``os.kill`` refused (EPERM: host under another
-        # uid, pid-file mismatch) — has ``cmd_stop`` burn ~5.5s on
+        # uid, pid-file mismatch) — has ``cmd_terminate`` burn ~5.5s on
         # SIGTERM/poll/SIGKILL before ``cmd_start`` fails on the port, so the
         # child dies around 7-10s. A single check at 10.0s is a coin flip
         # against that, and losing it means the watchdog declares the dispatch

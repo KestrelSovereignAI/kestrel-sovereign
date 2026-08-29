@@ -1037,7 +1037,8 @@ export async function loadAgents() {
             // Per-agent thinking pulse is driven by `state.waitingAgents` (the
             // Set sendMessage adds to on dispatch); the stop control aborts that
             // exact agent's stream via stopAgent().
-            isThinking: (name) => state.waitingAgents.has(name),
+            isThinking: (name) => state.waitingAgents.has(name)
+                || state.unconfirmedStopAgents.has(name),
             onStop: (name) => stopAgent(name),
             // Selecting a card runs the full product wiring (capability refresh,
             // chat mount, agent:switch bus emit); the component already pinned
@@ -1269,6 +1270,7 @@ function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view) {
         && autoTargetPane.element.children.length === 0;
     if (!state.currentSessionId
         && !state.waitingAgents.has(autoTargetAgent)
+        && !state.unconfirmedStopAgents.has(autoTargetAgent)
         && paneIsCold
         && typeof window.loadConversation === 'function') {
         const mostRecent = _pickMostRecentConversation(conversations);
@@ -1673,6 +1675,7 @@ window.loadConversation = async function(sessionId, options = {}) {
     // user starts DURING this load's awaits — that turn owns the pane.
     const paneAtClick = state.chatPanes.get(host);
     const busyAtClick = state.waitingAgents.has(host)
+        || state.unconfirmedStopAgents.has(host)
         || !!(paneAtClick && paneAtClick.streamingMsgDiv);
     // Monotonic activity marker (#2380 codex round 9): a turn that starts AND
     // completes entirely inside this load's awaits leaves both busy flags
@@ -1799,6 +1802,7 @@ window.loadConversation = async function(sessionId, options = {}) {
         // explicit clicks override pre-existing streams, as before.)
         const paneNow = state.chatPanes.get(host);
         const busyNow = state.waitingAgents.has(host)
+            || state.unconfirmedStopAgents.has(host)
             || !!(paneNow && paneNow.streamingMsgDiv);
         // User-turn growth catches a turn that ran to completion entirely
         // within the awaits (both busy flags false again) — and a replacement
@@ -1825,7 +1829,8 @@ window.loadConversation = async function(sessionId, options = {}) {
                 && !pane.streamingMsgDiv
                 && !pane.awaitingNewSession
                 && pane.element.children.length === 0;
-            const userBusy = state.waitingAgents.has(currentAgent);
+            const userBusy = state.waitingAgents.has(currentAgent)
+                || state.unconfirmedStopAgents.has(currentAgent);
             const sessionAlreadySet = !!state.currentSessionId;
             // A deliberate wipe during these awaits bumps the pane generation
             // and re-empties the pane, so the three checks above all pass and
