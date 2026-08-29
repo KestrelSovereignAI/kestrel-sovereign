@@ -1869,6 +1869,7 @@ class AgentManager:
         parent_did = authority_parent_did
         if not isinstance(parent_did, str) or not parent_did or parent_did == agent_id:
             raise RuntimeError("Persisted spawn mandate has an invalid parent DID")
+        self._validate_restored_mandate_ceiling(parent, mandate)
 
         canonical_name = self._canonical_agent_name(name)
         for recorded_parent, children in self._parent_children.items():
@@ -5212,6 +5213,33 @@ class AgentManager:
         if not ok:
             raise ValueError(f"Spawn refused: {msg}")
 
+    def _validate_restored_mandate_ceiling(
+        self,
+        parent_agent: KestrelAgent,
+        mandate: SpawnMandate,
+    ) -> None:
+        """Reapply live-spawn narrowing to one durable signed receipt."""
+
+        try:
+            self._validate_mandate_subset(parent_agent, mandate)
+        except ValueError as error:
+            raise RuntimeError(
+                f"Persisted spawn mandate exceeds its parent's feature ceiling: {error}"
+            ) from error
+
+        parent_did = _loaded_agent_did(parent_agent)
+        parent_name = self._agent_names.get(parent_did) if parent_did else None
+        parent_mandate = (
+            self._child_mandates.get(parent_name) if parent_name else None
+        )
+        if parent_mandate is None:
+            return
+        allowed = parent_mandate.max_child_depth - 1
+        if allowed < 0 or mandate.max_child_depth > allowed:
+            raise RuntimeError(
+                "Persisted spawn mandate exceeds its parent's depth ceiling"
+            )
+
     # ------------------------------------------------------------------
     # Per-child spawn budgets (#2113): hold from the parent on spawn, route the
     # child's spend through a ceiling'd DelegatedWallet, release the unspent hold
@@ -6519,12 +6547,14 @@ class AgentManager:
         """
         return list(self._parent_children.get(parent_did, []))
 
-    def _verified_spawn_relations(self) -> dict[str, tuple[str, str]]:
+    async def _verified_spawn_relations(self) -> dict[str, tuple[str, str]]:
         """Return ``child_did -> (parent_did, child_name)`` after revalidation."""
 
         from kestrel_sovereign.spawn.mandate import verify_mandate
+        from kestrel_sovereign.spawn.mandate_reload import read_spawn_mandate
 
         relations: dict[str, tuple[str, str]] = {}
+        authority_ceiling_inputs: dict[str, tuple[KestrelAgent, SpawnMandate]] = {}
         names_seen: set[str] = set()
         for child_name, mandate in sorted(
             self._child_mandates.items(),
@@ -6545,6 +6575,40 @@ class AgentManager:
                 # Unsigned legacy projections remain attribution/restriction
                 # data only and cannot enter the authority graph.
                 continue
+
+            child = self.get_agent(child_name)
+            if child is not None:
+                child_did = _loaded_agent_did(child)
+                if child_did != mandate.child_did:
+                    raise SpawnAuthorityGraphError(
+                        "Signed spawn authority child DID does not match routing"
+                    )
+                storage = vars(child).get("storage") or vars(child).get(
+                    "_raw_storage"
+                )
+                if storage is None:
+                    raise SpawnAuthorityGraphError(
+                        "Signed spawn authority child has no durable receipt store"
+                    )
+                try:
+                    durable = await read_spawn_mandate(storage, child_did)
+                except Exception as error:
+                    raise SpawnAuthorityGraphError(
+                        "Signed spawn authority durable receipt is unreadable"
+                    ) from error
+                if durable is None or not durable.parent_signature:
+                    # Another host may revoke or downgrade the edge while this
+                    # process still has a cache projection. Absence is the
+                    # immediate absence of authority.
+                    continue
+                if (
+                    durable.parent_signature != mandate.parent_signature
+                    or durable._signable_payload() != mandate._signable_payload()
+                ):
+                    raise SpawnAuthorityGraphError(
+                        "Signed spawn authority durable receipt changed after publication"
+                    )
+                mandate = durable
 
             parent_matches = [
                 candidate
@@ -6575,15 +6639,7 @@ class AgentManager:
                 raise SpawnAuthorityGraphError(
                     "Signed spawn authority contains an invalid mandate"
                 )
-
-            child = self.get_agent(child_name)
-            if child is not None:
-                child_did = _loaded_agent_did(child)
-                if child_did != mandate.child_did:
-                    raise SpawnAuthorityGraphError(
-                        "Signed spawn authority child DID does not match routing"
-                    )
-            else:
+            if child is None:
                 retained_did = self._budgeted_child_agent_id(child_name)
                 if retained_did is not None and retained_did != mandate.child_did:
                     raise SpawnAuthorityGraphError(
@@ -6606,6 +6662,7 @@ class AgentManager:
                     "Signed spawn authority assigns one child DID more than once"
                 )
             relations[mandate.child_did] = relation
+            authority_ceiling_inputs[mandate.child_did] = (parent, mandate)
 
         # Validate the complete graph before returning even one edge. A query
         # must never grant a safe-looking branch beside a corrupt cycle.
@@ -6623,6 +6680,11 @@ class AgentManager:
                     )
                 visited.add(cursor)
                 cursor = parent_by_child[cursor]
+        for parent, mandate in authority_ceiling_inputs.values():
+            try:
+                self._validate_restored_mandate_ceiling(parent, mandate)
+            except RuntimeError as error:
+                raise SpawnAuthorityGraphError(str(error)) from error
         return relations
 
     async def get_authoritative_children(self, parent_did: str) -> list[str]:
@@ -6630,7 +6692,7 @@ class AgentManager:
 
         if not isinstance(parent_did, str) or not parent_did:
             return []
-        relations = self._verified_spawn_relations()
+        relations = await self._verified_spawn_relations()
         return sorted(
             (
                 child_name
@@ -6645,7 +6707,7 @@ class AgentManager:
 
         if not isinstance(parent_did, str) or not parent_did:
             return []
-        relations = self._verified_spawn_relations()
+        relations = await self._verified_spawn_relations()
         by_parent: dict[str, list[tuple[str, str]]] = {}
         for child_did, (relation_parent, child_name) in relations.items():
             by_parent.setdefault(relation_parent, []).append((child_did, child_name))
@@ -6665,6 +6727,13 @@ class AgentManager:
             descendants.append(child_name)
             queue.extend(by_parent.get(child_did, ()))
         return descendants
+
+    async def get_authoritative_spawn_relations(
+        self,
+    ) -> dict[str, tuple[str, str]]:
+        """Return one verified relation snapshot for read-only tree rendering."""
+
+        return dict(await self._verified_spawn_relations())
 
     def get_mandate(self, child_name: str) -> Optional[SpawnMandate]:
         """Get the SpawnMandate for a child agent."""

@@ -62,6 +62,21 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
     agent.initialize = AsyncMock()
     agent.shutdown = AsyncMock()
     agent.get_agent_card = AsyncMock()
+
+    async def durable_edges(node_id: str):
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if not isinstance(mandate, SpawnMandate):
+            return []
+        return [
+            SimpleNamespace(
+                label="spawned_by",
+                source_id=node_id,
+                target_id=mandate.parent_did,
+                properties=mandate.to_edge_properties(),
+            )
+        ]
+
+    agent.storage = SimpleNamespace(get_edges_from=durable_edges)
     return agent
 
 
@@ -1020,7 +1035,12 @@ async def test_authoritative_descendants_rebuild_from_signed_receipts_not_cache(
     zeta._private_key = zeta_private
     zeta.identity = None
     zeta._persisted_spawn_mandate = sign_mandate(
-        SpawnMandate(parent_did=root_did, child_did=zeta_did, ttl_seconds=0),
+        SpawnMandate(
+            parent_did=root_did,
+            child_did=zeta_did,
+            ttl_seconds=0,
+            max_child_depth=1,
+        ),
         root_private,
     )
     leaf = _make_mock_agent(leaf_did)
@@ -1067,6 +1087,92 @@ async def test_authoritative_query_reverifies_projected_receipt(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_authoritative_query_rejects_deleted_durable_receipt(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xRevokedParent"
+    child_did = "did:pkh:eip155:1:0xRevokedChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Parent", parent)
+    manager._register_agent("Child", child)
+
+    child.storage.get_edges_from = AsyncMock(return_value=[])
+
+    assert await manager.get_authoritative_children(parent_did) == []
+
+
+def test_cold_restore_rejects_features_beyond_parent_ceiling(tmp_path):
+    root_did = "did:pkh:eip155:1:0xCeilingRoot"
+    parent_did = "did:pkh:eip155:1:0xCeilingParent"
+    child_did = "did:pkh:eip155:1:0xCeilingChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        features_allowed=["MemoryFeature"],
+        max_child_depth=2,
+    )
+    root.features = {"MemoryFeature": object()}
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent.features = {"MemoryFeature": object()}
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            features_allowed=["WebSearchFeature"],
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("Parent", parent)
+
+    with pytest.raises(RuntimeError, match="feature ceiling"):
+        manager._register_agent("Child", child)
+
+    assert manager.get_agent("Child") is None
+
+
+def test_cold_restore_rejects_non_decreasing_depth(tmp_path):
+    root_did = "did:pkh:eip155:1:0xDepthRoot"
+    parent_did = "did:pkh:eip155:1:0xDepthParent"
+    child_did = "did:pkh:eip155:1:0xDepthChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        max_child_depth=1,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("Parent", parent)
+
+    with pytest.raises(RuntimeError, match="depth ceiling"):
+        manager._register_agent("Child", child)
+
+    assert manager.get_agent("Child") is None
+
+
+@pytest.mark.asyncio
 async def test_authoritative_query_rejects_signed_cycle(tmp_path):
     first_did = "did:pkh:eip155:1:0xQueryCycleFirst"
     second_did = "did:pkh:eip155:1:0xQueryCycleSecond"
@@ -1081,17 +1187,18 @@ async def test_authoritative_query_rejects_signed_cycle(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
     manager._agents.update({"First": first, "Second": second})
     manager._agent_names.update({first_did: "First", second_did: "Second"})
+    first_mandate = sign_mandate(
+        SpawnMandate(parent_did=second_did, child_did=first_did),
+        second_private,
+    )
+    second_mandate = sign_mandate(
+        SpawnMandate(parent_did=first_did, child_did=second_did),
+        first_private,
+    )
+    first._persisted_spawn_mandate = first_mandate
+    second._persisted_spawn_mandate = second_mandate
     manager._child_mandates.update(
-        {
-            "First": sign_mandate(
-                SpawnMandate(parent_did=second_did, child_did=first_did),
-                second_private,
-            ),
-            "Second": sign_mandate(
-                SpawnMandate(parent_did=first_did, child_did=second_did),
-                first_private,
-            ),
-        }
+        {"First": first_mandate, "Second": second_mandate}
     )
 
     with pytest.raises(SpawnAuthorityGraphError, match="cycle"):

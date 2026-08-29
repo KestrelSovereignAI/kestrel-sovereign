@@ -60,7 +60,15 @@ async def get_spawn_children(request: Request):
         return {"children": [], "count": 0, "delegation_chain": {}, "history": []}
 
     parent_did = agent.agent_id
-    child_names = await manager.get_authoritative_children(parent_did)
+    relations = await manager.get_authoritative_spawn_relations()
+    child_names = sorted(
+        (
+            child_name
+            for _child_did, (relation_parent, child_name) in relations.items()
+            if relation_parent == parent_did
+        ),
+        key=lambda name: (name.casefold(), name),
+    )
 
     children = []
     now = datetime.now(timezone.utc)
@@ -114,7 +122,7 @@ async def get_spawn_children(request: Request):
 
     # Build delegation chain tree
     delegation_chain = await _build_delegation_chain(
-        manager, parent_did, agent.agent_id
+        manager, parent_did, agent.agent_id, relations=relations
     )
 
     # Build spawn history from lifecycle results
@@ -129,39 +137,42 @@ async def get_spawn_children(request: Request):
 
 
 async def _build_delegation_chain(
-    manager, parent_did: str, parent_name: str
+    manager,
+    parent_did: str,
+    parent_name: str,
+    *,
+    relations: dict[str, tuple[str, str]] | None = None,
 ) -> dict:
     """Build a tree structure showing Parent -> Child -> Grandchild relationships."""
-    child_names = await manager.get_authoritative_children(parent_did)
-    children_nodes = []
+    if relations is None:
+        relations = await manager.get_authoritative_spawn_relations()
+    by_parent: dict[str, list[tuple[str, str]]] = {}
+    for child_did, (relation_parent, child_name) in relations.items():
+        by_parent.setdefault(relation_parent, []).append((child_did, child_name))
+    for children in by_parent.values():
+        children.sort(key=lambda item: (item[1].casefold(), item[1], item[0]))
 
-    for child_name in child_names:
-        child_agent = manager.get_agent(child_name)
-        child_did = child_agent.agent_id if child_agent else ""
-        mandate = manager.get_mandate(child_name)
-
-        child_node = {
-            "name": child_name,
-            "did": child_did,
-            "purpose": mandate.purpose if mandate else "",
-            "status": "running" if child_agent is not None else "stopped",
-            "children": [],
-        }
-
-        # Recurse for grandchildren
-        if child_did:
-            descendant_tree = await _build_delegation_chain(
-                manager, child_did, child_name
+    def render_children(current_parent: str) -> list[dict]:
+        children_nodes = []
+        for child_did, child_name in by_parent.get(current_parent, ()):
+            child_agent = manager.get_agent(child_name)
+            mandate = manager.get_mandate(child_name)
+            children_nodes.append(
+                {
+                    "name": child_name,
+                    "did": child_did,
+                    "purpose": mandate.purpose if mandate else "",
+                    "status": "running" if child_agent is not None else "stopped",
+                    "children": render_children(child_did),
+                }
             )
-            child_node["children"] = descendant_tree.get("children", [])
-
-        children_nodes.append(child_node)
+        return children_nodes
 
     return {
         "name": parent_name,
         "did": parent_did,
         "status": "running",
-        "children": children_nodes,
+        "children": render_children(parent_did),
     }
 
 

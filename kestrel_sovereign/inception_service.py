@@ -630,6 +630,14 @@ async def create_kestrel_identity_async(
                        demo callers should identify deterministic injected
                        auditors rather than bypassing the lifecycle.
     """
+    # A SpawnMandate is persisted as a JSON edge receipt. Normalize and prove
+    # that representation before creating a directory, database, or key file;
+    # otherwise a supported Decimal that cannot survive JSON conversion can
+    # strand a half-created identity at the late edge-write step.
+    spawn_edge_properties = (
+        spawn_mandate.to_edge_properties() if spawn_mandate is not None else None
+    )
+
     # Generate test cycle ID if needed
     if is_test_instance and not test_cycle_id:
         import uuid
@@ -1002,9 +1010,7 @@ async def create_kestrel_identity_async(
 
     # 6b. If spawned by a parent, record the delegation relationship
     if parent_did:
-        edge_properties = (
-            spawn_mandate.to_edge_properties() if spawn_mandate else {}
-        )
+        edge_properties = dict(spawn_edge_properties or {})
         # Inception generates the child's DID, so a caller normally cannot
         # sign a mandate that is already bound to that final identity.  Keep
         # the initial edge useful for restrictions and attribution, but never

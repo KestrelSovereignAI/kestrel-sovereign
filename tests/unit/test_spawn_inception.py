@@ -4,6 +4,7 @@ import json
 import pytest
 import tempfile
 import os
+from decimal import Decimal
 from pathlib import Path
 
 from kestrel_sovereign.inception_service import (
@@ -157,3 +158,27 @@ async def test_inception_with_spawn_mandate_records_properties(tmp_dir, constitu
     assert edge.properties["parent_signature"] is None
 
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_unrepresentable_mandate_budget_fails_before_identity_creation(
+    tmp_path,
+    constitution_path,
+):
+    output = tmp_path / "never-created"
+    mandate = SpawnMandate(
+        parent_did="did:pkh:eip155:1:0xParentBudget",
+        budget_allocation=Decimal("1e-400"),
+    )
+
+    with pytest.raises(ValueError, match="JSON numeric range"):
+        await create_kestrel_identity_async(
+            output_dir=str(output),
+            constitution_path=constitution_path,
+            identity_method="did:pkh",
+            is_test_instance=True,
+            parent_did=mandate.parent_did,
+            spawn_mandate=mandate,
+        )
+
+    assert not output.exists()

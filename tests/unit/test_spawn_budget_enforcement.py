@@ -442,6 +442,7 @@ async def test_spawn_holds_budget_and_terminate_releases():
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
+    _use_runtime_projection_as_authority_test_double(mgr)
     mgr._agents["Parent"] = parent
     mgr._agent_names[parent.agent_id] = "Parent"
 
