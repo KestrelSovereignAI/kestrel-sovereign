@@ -185,6 +185,52 @@ async def test_same_actor_cancel_retry_returns_existing_receipt_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancel_retry_reconciles_terminal_projection_after_interruption(
+    tmp_path,
+):
+    """A committed cancel is replayable when its first SSE projection dies."""
+
+    manager = await create_task_manager(str(tmp_path / "cancel-reconcile.db"))
+    try:
+        await manager.create_task(
+            _params("cancel-reconcile"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        project = manager._project_status_transition
+        manager._project_status_transition = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await manager.cancel_task(
+                "cancel-reconcile",
+                reason="withdrawn",
+                agent_name="did:test:creator",
+                recipient_agent_id="did:test:recipient",
+            )
+        assert (
+            await manager.get_task("cancel-reconcile")
+        ).status.state is TaskState.CANCELED
+
+        terminal_events = asyncio.Queue()
+        manager._subscribers["cancel-reconcile"] = [terminal_events]
+        manager._project_status_transition = project
+        retry = await manager.cancel_task(
+            "cancel-reconcile",
+            reason="withdrawn",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+
+        event = terminal_events.get_nowait()
+        assert retry.status.state is TaskState.CANCELED
+        assert event["event"] == "status"
+        assert event["final"] is True
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_artifact_append_cannot_mutate_an_authoritatively_canceled_task(tmp_path):
     manager = await create_task_manager(str(tmp_path / "artifact-after-cancel.db"))
     try:

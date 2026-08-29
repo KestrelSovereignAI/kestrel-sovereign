@@ -502,6 +502,32 @@ class TestOnTaskSubmittedCallback:
         )
 
     @pytest.mark.asyncio
+    async def test_committed_task_wakes_before_cancellable_projection(self, db_path):
+        """Cancellation after commit cannot strand an accepted task unwoken."""
+
+        from kestrel_sovereign.a2a.task_manager import create_task_manager
+
+        received = []
+        manager = await create_task_manager(db_path)
+        manager._on_task_submitted = received.append
+        manager.session_service.get_session = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+        track_manager(manager)
+        params = TaskSendParams(
+            id="cancel-during-admission-projection",
+            message=Message(role="user", parts=[TextPart(text="wake me")]),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await manager.create_task(params, agent_name="did:test:recipient")
+
+        persisted = await manager.task_store.get(params.id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+        assert [task.id for task in received] == [params.id]
+
+    @pytest.mark.asyncio
     async def test_callback_exception_does_not_break_create_task(self, db_path):
         """A failing on_task_submitted callback must NOT roll back the
         task creation. The task is the source of truth; the callback
