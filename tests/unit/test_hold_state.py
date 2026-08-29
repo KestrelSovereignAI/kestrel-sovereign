@@ -419,6 +419,40 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
 
 
 @pytest.mark.asyncio
+async def test_postgres_factory_closes_pool_when_core_schema_init_fails(
+    monkeypatch,
+):
+    """A factory failure cannot hide its newly connected pool from cleanup."""
+
+    from kestrel_sovereign.storage import async_database as database_module
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    events: list[str] = []
+
+    class _Backend:
+        backend_type = "postgres"
+
+        async def connect(self):
+            events.append("connect")
+
+        async def close(self):
+            events.append("close")
+
+    async def _fail_schema(_self):
+        events.append("schema")
+        raise RuntimeError("core schema failed")
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", lambda dsn: _Backend())
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
+
+    with pytest.raises(RuntimeError, match="core schema failed"):
+        await database_module.AsyncDatabase.postgres("postgresql://durable/host")
+
+    assert events == ["connect", "schema", "close"]
+
+
+@pytest.mark.asyncio
 async def test_cancelled_host_context_bootstrap_closes_partial_resources(
     monkeypatch,
     tmp_path,
