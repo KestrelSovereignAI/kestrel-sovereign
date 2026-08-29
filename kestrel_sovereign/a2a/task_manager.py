@@ -1046,9 +1046,18 @@ class TaskManager:
         """Get all tasks in a session."""
         return await self.task_store.list_tasks(session_id=session_id, limit=limit)
 
-    async def get_pending_tasks(self, limit: int = 100) -> list[Task]:
-        """Get all pending (submitted) tasks ready for processing."""
-        return await self.task_store.get_pending_tasks(limit=limit)
+    async def get_pending_tasks(
+        self,
+        limit: int = 100,
+        *,
+        recipient_agent_id: Optional[str] = None,
+    ) -> list[Task]:
+        """Get pending tasks, with durable recipient scoping for workers."""
+
+        return await self.task_store.get_pending_tasks(
+            limit=limit,
+            recipient_agent_id=recipient_agent_id,
+        )
 
     async def list_tasks(
         self,

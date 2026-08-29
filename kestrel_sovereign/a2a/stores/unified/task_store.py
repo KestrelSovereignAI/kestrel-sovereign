@@ -544,16 +544,36 @@ class TaskStore(UnifiedStoreBase):
         )
         return row is not None
 
-    async def get_pending_tasks(self, limit: int = 10) -> list[Task]:
-        """Get tasks ready for processing (SUBMITTED state)."""
+    async def get_pending_tasks(
+        self,
+        limit: int = 10,
+        *,
+        recipient_agent_id: Optional[str] = None,
+    ) -> list[Task]:
+        """Get submitted work, optionally constrained to one worker recipient."""
+
+        if recipient_agent_id is not None and (
+            not isinstance(recipient_agent_id, str)
+            or not recipient_agent_id.strip()
+        ):
+            raise ValueError("Pending-task recipient must be a concrete identity")
+        recipient_predicate = (
+            " AND recipient_agent_id = ?" if recipient_agent_id is not None else ""
+        )
+        params = (
+            (recipient_agent_id, limit)
+            if recipient_agent_id is not None
+            else (limit,)
+        )
         rows = await self._backend.fetch_all(
-            """
+            f"""
             SELECT * FROM a2a_tasks
             WHERE status = 'submitted'
+            {recipient_predicate}
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            (limit,),
+            params,
         )
         return [self._row_to_task(row) for row in rows]
 
