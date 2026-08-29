@@ -861,10 +861,25 @@ class TaskManager:
         # A recipient wake can race these best-effort projections and move the
         # canonical row before create_task returns. Never publish an older
         # SUBMITTED snapshot after a terminal transition already committed.
-        canonical = await self.task_store.get(task.id)
+        readback_succeeded = False
+        try:
+            canonical = await self.task_store.get(task.id)
+            readback_succeeded = canonical is not None
+        except (Exception, asyncio.CancelledError):
+            canonical = None
+            logger.warning(
+                "Task %s was created but its canonical readback failed",
+                task.id,
+                exc_info=True,
+            )
         if canonical is None:
-            raise RuntimeError("Created task disappeared before readback")
-        if canonical.status.state is TaskState.SUBMITTED:
+            # The insert is the acceptance boundary.  A read outage after that
+            # commit must not turn a successful submission into a transport
+            # failure whose exact retry is rejected as a duplicate.  The local
+            # snapshot is safe to return, but not to publish as a status event:
+            # the recipient may already have advanced the canonical row.
+            canonical = task
+        if readback_succeeded and canonical.status.state is TaskState.SUBMITTED:
             await self._notify_status_update(canonical, final=False)
 
         logger.info(f"Task created: {task.id} in session {params.sessionId}")

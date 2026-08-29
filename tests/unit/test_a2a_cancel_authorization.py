@@ -309,6 +309,85 @@ async def test_create_task_never_publishes_a_stale_submitted_snapshot(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "read_error",
+    [RuntimeError("read outage"), asyncio.CancelledError()],
+)
+async def test_create_task_returns_accepted_snapshot_when_final_readback_fails(
+    tmp_path,
+    read_error,
+):
+    manager = await create_task_manager(str(tmp_path / "create-readback-failure.db"))
+    try:
+        original_get = manager.task_store.get
+        manager.task_store.get = AsyncMock(side_effect=read_error)
+
+        created = await manager.create_task(
+            _params("accepted-before-readback-failure"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+
+        assert created.id == "accepted-before-readback-failure"
+        assert created.status.state is TaskState.SUBMITTED
+        manager.task_store.get = original_get
+        persisted = await manager.get_task(created.id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_payload", [False, True])
+async def test_cancel_commit_does_not_depend_on_a_post_commit_read(
+    tmp_path,
+    with_payload,
+):
+    manager = await create_task_manager(str(tmp_path / "cancel-readback-failure.db"))
+    try:
+        submitted = await manager.create_task(
+            _params("cancel-without-readback"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        completions = []
+        cancellations = []
+        manager._on_task_complete = lambda task: completions.append(task.id)
+        manager._on_task_cancelled = lambda task: cancellations.append(task.id)
+        task_payload = None
+        if with_payload:
+            task_payload = submitted.model_copy(deep=True)
+            task_payload.status = TaskStatus(state=TaskState.CANCELED)
+            task_payload.artifacts = [
+                Artifact(name="partial", parts=[TextPart(text="preserved")])
+            ]
+
+        original_get = manager.task_store.get
+        manager.task_store.get = AsyncMock(
+            side_effect=RuntimeError("post-commit reads unavailable")
+        )
+        canceled = await manager.cancel_task(
+            submitted.id,
+            reason="withdrawn",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+            task_payload=task_payload,
+        )
+
+        assert canceled.status.state is TaskState.CANCELED
+        assert cancellations == [submitted.id]
+        assert completions == [submitted.id]
+        manager.task_store.get = original_get
+        persisted = await manager.get_task(submitted.id)
+        assert persisted.status.state is TaskState.CANCELED
+        if with_payload:
+            assert persisted.artifacts[0].name == "partial"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_artifact_append_cannot_mutate_an_authoritatively_canceled_task(tmp_path):
     manager = await create_task_manager(str(tmp_path / "artifact-after-cancel.db"))
     try:
