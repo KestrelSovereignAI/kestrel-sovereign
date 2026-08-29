@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -25,6 +26,7 @@ from kestrel_sovereign.operator import (
     OperatorRegistrationIdentityError,
     OperatorRuntimeRegistry,
 )
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
 from kestrel_sovereign.ui_contributions import compute_ui_manifest
@@ -135,6 +137,49 @@ async def test_explicit_context_config_refresh_rerenders_without_recollecting(tm
     assert refreshed[0].body == "updated persisted configuration"
     assert feature.contribution_calls["context"] == 1
     assert feature.context_renderer_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_republishes_all_active_context_clauses(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+
+    feature.context_text = "privacy-safe replacement"
+    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
+    agent.privacy_agent = SimpleNamespace(
+        set_mode=lambda _mode: "Privacy mode changed.",
+        privacy_config=None,
+    )
+    agent._privacy_mode = PrivacyMode.NORMAL
+    agent.features = {}
+    agent.llm_service = None
+
+    await agent._apply_privacy_mode_locked(PrivacyMode.NORMAL)
+
+    assert runtime.active_context_clauses()[0].body == "privacy-safe replacement"
+    assert feature.context_renderer_calls == 2
+
+
+def test_host_refresh_failure_suppresses_stale_context_without_rerendering(
+    tmp_path, caplog
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+
+    def fail_renderer():
+        raise RuntimeError("PRIVATE-RENDERER-FAILURE-DETAIL")
+
+    object.__setattr__(feature.context_registration, "renderer", fail_renderer)
+
+    refreshed = agent.refresh_all_feature_context_clauses(fail_closed=True)
+
+    assert refreshed[0].body == ""
+    assert runtime.active_context_clauses()[0].body == ""
+    assert "PRIVATE-RENDERER-FAILURE-DETAIL" not in caplog.text
 
 
 def test_context_getter_absent_on_older_sdk_feature_is_skipped(tmp_path):

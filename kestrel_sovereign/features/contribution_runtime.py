@@ -1004,6 +1004,76 @@ class FeatureContributionRuntime:
         self._active[id(feature)] = replace(active, context_clauses=committed)
         return committed
 
+    def refresh_all_context_clauses(
+        self,
+    ) -> tuple[ResolvedContextClause, ...]:
+        """Atomically republish every active clause after a host transition.
+
+        Privacy and other host-owned configuration can change what an
+        out-of-tree renderer is allowed to disclose without invoking a feature
+        tool. Resolve every renderer before touching the registry, then replace
+        the complete agent-owned set in one validated mutation so prompts never
+        observe a mixture of pre- and post-transition bytes.
+        """
+
+        active_items = tuple(self._active.items())
+        replacements = tuple(
+            (
+                key,
+                active,
+                self._resolve_context_clauses(active.prepared),
+            )
+            for key, active in active_items
+        )
+        return self._commit_all_context_clause_replacements(replacements)
+
+    def suppress_all_context_clauses(
+        self,
+    ) -> tuple[ResolvedContextClause, ...]:
+        """Fail closed to empty bodies without executing feature code."""
+
+        replacements = tuple(
+            (
+                key,
+                active,
+                tuple(replace(clause, body="") for clause in active.context_clauses),
+            )
+            for key, active in tuple(self._active.items())
+        )
+        return self._commit_all_context_clause_replacements(replacements)
+
+    def _commit_all_context_clause_replacements(
+        self,
+        replacements: tuple[
+            tuple[
+                int,
+                ActiveFeatureContributions,
+                tuple[ResolvedContextClause, ...],
+            ],
+            ...,
+        ],
+    ) -> tuple[ResolvedContextClause, ...]:
+        current = tuple(
+            clause
+            for _key, active, _replacement in replacements
+            for clause in active.context_clauses
+        )
+        requested = tuple(
+            clause
+            for _key, _active, replacement in replacements
+            for clause in replacement
+        )
+        committed = self.context_clause_registry.replace_batch(current, requested)
+        offset = 0
+        for key, active, replacement in replacements:
+            end = offset + len(replacement)
+            self._active[key] = replace(
+                active,
+                context_clauses=committed[offset:end],
+            )
+            offset = end
+        return committed
+
     @staticmethod
     def _resolve_context_clauses(
         prepared: PreparedFeatureContributions,

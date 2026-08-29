@@ -3824,6 +3824,14 @@ class KestrelAgent(
         self._privacy_mode = mode
         status_message = self.privacy_agent.set_mode(mode)
 
+        # Context clauses are immutable between deliberate transitions. A
+        # privacy change can make a feature's cached user-authored context
+        # ineligible even though no feature tool runs, so republish while the
+        # privacy-transition lock is still held. Renderer failure must never
+        # preserve pre-transition bytes: suppress every optional feature clause
+        # without executing feature code and continue in the safer mode.
+        self.refresh_all_feature_context_clauses(fail_closed=True)
+
         config = privacy_mode_to_config(mode)
         model_switched = self._apply_privacy_model_transition(config)
         voice_switched, biometric_warning = await self._apply_privacy_voice_transition(config)
@@ -4368,6 +4376,26 @@ class KestrelAgent(
         return self._ensure_feature_contribution_runtime().refresh_context_clauses(
             feature
         )
+
+    def refresh_all_feature_context_clauses(self, *, fail_closed: bool = False):
+        """Republish clauses after a host-owned configuration transition."""
+
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is None:
+            return ()
+        try:
+            return runtime.refresh_all_context_clauses()
+        except Exception as exc:
+            if not fail_closed:
+                raise
+            # Do not log the exception or its chained renderer cause: an
+            # out-of-tree renderer may have included private bytes in either.
+            logging.error(
+                "Feature context refresh failed during a host transition; "
+                "suppressing contributed context (%s)",
+                type(exc).__name__,
+            )
+            return runtime.suppress_all_context_clauses()
 
     def _record_contribution_rejections(self, transition) -> None:
         """Log and RETAIN the features refused activation.
