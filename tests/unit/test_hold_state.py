@@ -813,9 +813,13 @@ async def test_state_read_validates_projection_inside_one_locked_snapshot(
             finally:
                 active = False
 
-    async def inspect_projection(latch, scope, target_id):
-        assert active, "latch and receipt graph escaped their read snapshot"
-        return await original_validate(latch, scope, target_id)
+    async def inspect_projection(latch, scope, target_id, **kwargs):
+        if read == "one":
+            assert active, "latch and receipt graph escaped their read snapshot"
+        else:
+            assert not active, "effective admission occupied a writer transaction"
+            assert kwargs.get("receipt_rows") is not None
+        return await original_validate(latch, scope, target_id, **kwargs)
 
     async def inspect_locks(targets):
         locked_targets.append(tuple(targets))
@@ -830,13 +834,8 @@ async def test_state_read_validates_projection_inside_one_locked_snapshot(
     else:
         effective = await store.get_effective("did:agent:snapshot")
         assert effective.agent == held.current
-        assert locked_targets == [
-            (
-                (HoldScope.HOST, "host"),
-                (HoldScope.AGENT, "did:agent:snapshot"),
-            )
-        ]
-    assert transaction_modes == [True]
+        assert locked_targets == []
+    assert transaction_modes == ([True] if read == "one" else [])
 
 
 @pytest.mark.asyncio
@@ -862,6 +861,28 @@ async def test_postgres_read_targets_take_shared_locks_in_global_order():
             ("kestrel:hold:target:host:host",),
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_effective_read_does_not_wait_for_writer_guard(hold_db):
+    """Turn admission reads the last commit while an unrelated writer is open."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:hot-read",
+        actor_id="did:sovereign:operator",
+        reason="snapshot authority",
+        operation_id="hot-read-hold",
+    )
+
+    async with db.transaction(immediate=True):
+        read = asyncio.create_task(
+            store.get_effective("did:agent:hot-read")
+        )
+        effective = await asyncio.wait_for(read, timeout=0.5)
+
+    assert effective.agent == held.current
 
 
 def test_authority_graph_walk_is_linear_in_number_of_receipts():

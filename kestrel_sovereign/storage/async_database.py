@@ -3187,6 +3187,16 @@ class AsyncDatabase:
         if fetch is None:
             fetch = self._backend.fetch_all
         return await fetch(sql, params)
+
+    async def fetchall_snapshot(
+        self, sql: str, params: tuple = ()
+    ) -> List[Tuple[Any, ...]]:
+        """Fetch one committed statement snapshot without a SQLite writer lock."""
+
+        fetch = getattr(self._backend, "fetch_all_snapshot", None)
+        if fetch is None:
+            fetch = self._backend.fetch_all
+        return await fetch(sql, params)
     
     async def fetchval(self, sql: str, params: tuple = ()) -> Optional[Any]:
         """Fetch a single value."""

@@ -358,6 +358,41 @@ async def run_training_cycle(
     wait_between: float = 5.0,
     stop_when_healthy: bool = True,
 ):
+    """Run one training cycle with a load-bearing standalone Hold context."""
+
+    lifecycle = {}
+    try:
+        return await _run_training_cycle(
+            db_path=db_path,
+            max_iterations=max_iterations,
+            depth=depth,
+            create_tickets=create_tickets,
+            wait_between=wait_between,
+            stop_when_healthy=stop_when_healthy,
+            lifecycle=lifecycle,
+        )
+    finally:
+        agent = lifecycle.get("agent")
+        context = lifecycle.get("hold_context")
+        try:
+            if agent is not None:
+                await agent.shutdown()
+        finally:
+            if context is not None:
+                from kestrel_sovereign.hold import close_bound_host_context
+
+                await close_bound_host_context(context)
+
+
+async def _run_training_cycle(
+    db_path: str,
+    max_iterations: int = 5,
+    depth: str = "normal",
+    create_tickets: bool = False,
+    wait_between: float = 5.0,
+    stop_when_healthy: bool = True,
+    lifecycle: Optional[dict] = None,
+):
     """Run the intensive training cycle.
 
     Args:
@@ -399,6 +434,13 @@ async def run_training_cycle(
 
     llm_service = LLMService()
     agent = KestrelAgent(did=agent_did, storage_path=db_path, llm_service=llm_service)
+    if lifecycle is not None:
+        lifecycle["agent"] = agent
+    from kestrel_sovereign.hold import build_bound_host_context
+
+    hold_context = await build_bound_host_context(agent)
+    if lifecycle is not None:
+        lifecycle["hold_context"] = hold_context
     await agent.initialize()
 
     if not agent.features.get("ReflectionFeature"):
@@ -488,10 +530,6 @@ async def run_training_cycle(
     print(f"""
 {Colors.CYAN}{'='*60}{Colors.END}
 """)
-
-    # Cleanup
-    await agent.shutdown()
-
 
 def main():
     parser = argparse.ArgumentParser(

@@ -456,6 +456,8 @@ class HoldStore:
         latch: Optional[HoldState],
         scope: HoldScope,
         target_id: str,
+        *,
+        receipt_rows: Optional[list[Any]] = None,
     ) -> None:
         """Prove the append-only authority graph agrees with its latch.
 
@@ -467,11 +469,13 @@ class HoldStore:
         well-formed latch row.
         """
 
-        rows = await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
-            "WHERE scope = ? AND target_id = ?",
-            (scope.value, target_id),
-        )
+        rows = receipt_rows
+        if rows is None:
+            rows = await self._db.fetchall(
+                f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
+                "WHERE scope = ? AND target_id = ?",
+                (scope.value, target_id),
+            )
         receipts = [_receipt_from_row(row) for row in rows]
         receipt_ids = {receipt.receipt_id for receipt in receipts}
         if len(receipt_ids) != len(receipts):
@@ -534,7 +538,18 @@ class HoldStore:
 
         receipt = authorities.get(latch.hold_receipt_id)
         if receipt is None:
-            referenced_row = await self._read_receipt_by_id(latch.hold_receipt_id)
+            referenced_row = next(
+                (
+                    row
+                    for row in rows
+                    if str(row[0]) == latch.hold_receipt_id
+                ),
+                None,
+            )
+            if referenced_row is None and receipt_rows is None:
+                referenced_row = await self._read_receipt_by_id(
+                    latch.hold_receipt_id
+                )
             if referenced_row is not None:
                 _receipt_from_row(referenced_row)
                 raise HoldCorruptStateError(
@@ -563,8 +578,15 @@ class HoldStore:
         latch: Optional[HoldState],
         scope: HoldScope,
         target_id: str,
+        *,
+        receipt_rows: Optional[list[Any]] = None,
     ) -> None:
-        await self._validate_receipt_authority_graph(latch, scope, target_id)
+        await self._validate_receipt_authority_graph(
+            latch,
+            scope,
+            target_id,
+            receipt_rows=receipt_rows,
+        )
 
     @staticmethod
     def _assert_replay(
@@ -912,6 +934,8 @@ class HoldStore:
         """Read host + agent latches in one locked database snapshot."""
 
         agent = _required_text(agent_id, "agent_id")
+        if getattr(self._db, "backend_type", "") == "sqlite":
+            return await self._get_effective_sqlite_snapshot(agent)
         targets = (
             (HoldScope.HOST, HOST_HOLD_TARGET),
             (HoldScope.AGENT, agent),
@@ -956,6 +980,89 @@ class HoldStore:
                 agent_state, HoldScope.AGENT, agent
             )
             return EffectiveHoldState(host=host, agent=agent_state)
+
+    async def _get_effective_sqlite_snapshot(
+        self, agent: str
+    ) -> EffectiveHoldState:
+        """Validate both latches from one independent committed statement."""
+
+        rows = await self._db.fetchall_snapshot(
+            "SELECT 'latch', scope, target_id, active, hold_receipt_id, "
+            "reason, actor_id, set_at, revision, "
+            "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL "
+            "FROM hold_latches WHERE scope = ? OR (scope = ? AND target_id = ?) "
+            "UNION ALL "
+            "SELECT 'receipt', scope, target_id, NULL, NULL, NULL, NULL, NULL, NULL, "
+            "receipt_id, operation_id, action, disposition, reason, actor_id, "
+            "occurred_at, expected_hold_receipt_id, prior_hold_receipt_id, "
+            "resulting_hold_receipt_id FROM hold_receipts "
+            "WHERE scope = ? OR (scope = ? AND target_id = ?)",
+            (
+                HoldScope.HOST.value,
+                HoldScope.AGENT.value,
+                agent,
+                HoldScope.HOST.value,
+                HoldScope.AGENT.value,
+                agent,
+            ),
+        )
+        latches: dict[tuple[str, str], Optional[HoldState]] = {}
+        receipts: dict[tuple[str, str], list[Any]] = {}
+        for row in rows:
+            if row is None or len(row) != 19:
+                raise HoldCorruptStateError(
+                    "effective Hold snapshot has an unexpected shape"
+                )
+            kind = str(row[0])
+            scope = str(row[1])
+            target_id = str(row[2])
+            if scope == HoldScope.HOST.value and target_id != HOST_HOLD_TARGET:
+                raise HoldCorruptStateError(
+                    "host hold state has a foreign target identity"
+                )
+            key = (scope, target_id)
+            if kind == "latch":
+                if key in latches:
+                    raise HoldCorruptStateError("duplicate hold latch key")
+                latches[key] = _latch_from_row(row[1:9])
+                continue
+            if kind != "receipt":
+                raise HoldCorruptStateError(
+                    "effective Hold snapshot has an invalid row kind"
+                )
+            receipt_row = (
+                row[9],
+                row[10],
+                row[11],
+                row[12],
+                row[1],
+                row[2],
+                row[13],
+                row[14],
+                row[15],
+                row[16],
+                row[17],
+                row[18],
+            )
+            receipts.setdefault(key, []).append(receipt_row)
+
+        host_key = (HoldScope.HOST.value, HOST_HOLD_TARGET)
+        agent_key = (HoldScope.AGENT.value, agent)
+        host = latches.get(host_key)
+        agent_state = latches.get(agent_key)
+        await self._validate_latch_projection(
+            host,
+            HoldScope.HOST,
+            HOST_HOLD_TARGET,
+            receipt_rows=receipts.get(host_key, []),
+        )
+        await self._validate_latch_projection(
+            agent_state,
+            HoldScope.AGENT,
+            agent,
+            receipt_rows=receipts.get(agent_key, []),
+        )
+        return EffectiveHoldState(host=host, agent=agent_state)
 
     async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
         operation = _required_text(operation_id, "operation_id")

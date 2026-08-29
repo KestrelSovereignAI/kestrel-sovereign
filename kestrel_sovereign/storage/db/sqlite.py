@@ -1255,6 +1255,39 @@ class SQLiteBackend(DatabaseBackend):
     ) -> List[Row]:
         """Fetch committed rows without waiting for retained write cleanup."""
         return await self._fetch_all(query, params, diagnostic=True)
+
+    async def fetch_all_snapshot(
+        self, query: str, params: Params = ()
+    ) -> List[Row]:
+        """Read one committed snapshot without occupying the writer guard.
+
+        File-backed SQLite opens an independent query-only connection, so a
+        potentially large read cannot serialize unrelated writers on the
+        shared connection. The statement itself is the snapshot boundary.
+        """
+
+        if self.db_path == ":memory:":
+            return await self.fetch_all(query, params)
+        record_write_query(query)
+        try:
+            await self._wait_for_cancelled_write_drain()
+            self._raise_cancelled_write_drain_error()
+            read_conn = await self._open_snapshot_read_connection()
+            try:
+                rows = await self._fetch_on_connection(
+                    read_conn, query, params, one=False
+                )
+                assert isinstance(rows, list)
+                return rows
+            finally:
+                await _close_aiosqlite_connection(
+                    read_conn,
+                    retained_closes=self._retired_connection_closes,
+                )
+        except Exception as error:
+            raise QueryError(
+                f"Snapshot query failed: {error}\nQuery: {query}"
+            ) from error
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""
