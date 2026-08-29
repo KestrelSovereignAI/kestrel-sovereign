@@ -786,6 +786,21 @@ class TaskManager:
             recipient_agent_id=recipient_agent_id,
         )
 
+        # Admission is complete only when the durable reservation can wake its
+        # recipient.  Fire the synchronous bridge immediately after commit,
+        # before any cancellable session/observability await.  The bridge owns
+        # its asynchronous delivery through the agent's background-task
+        # tracker, so cancellation of this transport coroutine cannot strand a
+        # durably SUBMITTED row with no cognition wake.
+        if self._on_task_submitted is not None:
+            try:
+                self._on_task_submitted(task)
+            except Exception as e:
+                logger.warning(
+                    "on_task_submitted callback failed for %s: %s",
+                    task.id, e, exc_info=True,
+                )
+
         # The insert-only task reservation is deliberately first: a duplicate
         # caller-supplied ID must be rejected before it can append another user
         # message to the existing session. Session and observability projections
@@ -827,23 +842,6 @@ class TaskManager:
                 task.id,
                 exc_info=True,
             )
-
-        # Inbound-task callback: agent bridges this into the signal
-        # dispatcher so the cognition loop wakes up and acts on the new
-        # task. Mirrors `_on_task_complete` for the complete-direction
-        # signal; without this hook, a peer-submitted task sits
-        # SUBMITTED with no one processing it (the Emma/Meridian
-        # symptom). Synchronous callback; agent-side handler dispatches
-        # the actual async enqueue via background-task tracking
-        # (see KestrelAgent._on_task_submitted).
-        if self._on_task_submitted is not None:
-            try:
-                self._on_task_submitted(task)
-            except Exception as e:
-                logger.warning(
-                    "on_task_submitted callback failed for %s: %s",
-                    task.id, e, exc_info=True,
-                )
 
         # Notify subscribers
         await self._notify_status_update(task, final=False)
@@ -1084,10 +1082,24 @@ class TaskManager:
             ):
                 # The first atomic cancellation may have committed while its
                 # transport response was lost. Return that exact durable
-                # receipt without replaying notifications/projections. Keep
-                # the just-acquired local execution exemption: this retry is
-                # still the same authorized recipient decline and its monitor
-                # must not cancel the response after observing CANCELED.
+                # receipt, but reconcile its derived projections: cancellation
+                # may have interrupted session, observability, SSE, or memory
+                # after the canonical row committed. Projections are designed
+                # to tolerate replay; without it an already-connected SSE
+                # subscriber can remain stale until it reports an expiry.
+                await self._project_status_transition(
+                    current,
+                    old_state=str(
+                        receipt.get("status_before") or TaskState.UNKNOWN.value
+                    ),
+                    new_state=TaskState.CANCELED,
+                    agent_name=agent_name,
+                    is_final=True,
+                    reason=receipt.get("reason"),
+                )
+                # Keep the just-acquired local execution exemption: this retry
+                # is still the same authorized recipient decline and its
+                # monitor must not cancel the response after seeing CANCELED.
                 return current
             if rollback_local_intent is not None:
                 rollback_local_intent()
