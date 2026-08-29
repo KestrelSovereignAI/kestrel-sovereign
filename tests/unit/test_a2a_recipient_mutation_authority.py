@@ -2,6 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,6 +11,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskMutationAuthorizationError,
 )
 from kestrel_sovereign.a2a.task_manager import create_task_manager
+from kestrel_sovereign.a2a.task_worker import TaskWorker
 from kestrel_sovereign.a2a.types import (
     Artifact,
     Message,
@@ -139,6 +141,48 @@ async def test_worker_lifecycle_has_only_typed_recipient_owned_save(tmp_path):
         assert (await manager.get_task(task.id)).status.state is TaskState.WORKING
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_recipient_poll_is_not_starved_by_older_foreign_rows(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "worker-poll.db"))
+    try:
+        await manager.create_task(
+            _params("older-foreign"),
+            agent_name=PEER,
+            creator_agent_id=CREATOR,
+        )
+        await manager.create_task(
+            _params("later-owned"),
+            agent_name=RECIPIENT,
+            creator_agent_id=CREATOR,
+        )
+
+        pending = await manager.get_pending_tasks(
+            limit=1,
+            recipient_agent_id=RECIPIENT,
+        )
+
+        assert [task.id for task in pending] == ["later-owned"]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_wires_its_recipient_into_pending_poll():
+    manager = SimpleNamespace(get_pending_tasks=AsyncMock(return_value=[]))
+    worker = TaskWorker(
+        manager,
+        agent_name=RECIPIENT,
+        max_concurrent=3,
+    )
+
+    await worker._poll_and_process()
+
+    manager.get_pending_tasks.assert_awaited_once_with(
+        limit=3,
+        recipient_agent_id=RECIPIENT,
+    )
 
 
 @pytest.mark.asyncio
