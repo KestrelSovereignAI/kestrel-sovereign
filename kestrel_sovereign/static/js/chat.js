@@ -115,6 +115,14 @@ function unconfirmedStopRequestIds() {
     return currentState.unconfirmedStopRequestIds;
 }
 
+function unconfirmedStopCorrelationIds() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopCorrelationIds instanceof Map)) {
+        currentState.unconfirmedStopCorrelationIds = new Map();
+    }
+    return currentState.unconfirmedStopCorrelationIds;
+}
+
 function isAgentBusy(agentName) {
     return deps().state.waitingAgents.has(agentName)
         || unconfirmedStopAgents().has(agentName);
@@ -2625,15 +2633,25 @@ export async function stopAgent(agentName) {
     }
 
     const retainedRequestIds = unconfirmedStopRequestIds();
+    const retainedCorrelationIds = unconfirmedStopCorrelationIds();
     let requestId = retainedRequestIds.get(agentName) || null;
     if (!requestId) {
         requestId = deps().api.getCurrentStreamRequestId(agentName);
         if (requestId) retainedRequestIds.set(agentName, requestId);
     }
+    let correlationId = retainedCorrelationIds.get(agentName) || null;
+    if (!correlationId) {
+        correlationId = newChatRequestId();
+        retainedCorrelationIds.set(agentName, correlationId);
+    }
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
-        const response = await deps().api.stop(requestId, agentName);
+        const response = await deps().api.stop(
+            requestId,
+            agentName,
+            correlationId,
+        );
         const stopOutcomes = Array.isArray(response?.stop_outcomes)
             ? response.stop_outcomes
             : [];
@@ -2657,6 +2675,7 @@ export async function stopAgent(agentName) {
 
     unconfirmedStopAgents().delete(agentName);
     retainedRequestIds.delete(agentName);
+    retainedCorrelationIds.delete(agentName);
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === deps().api.getHostAgent()) {

@@ -554,3 +554,19 @@ def record_llm_attempt_failure(provider_name, error, *, redact_content: bool = F
         )
     except Exception:  # pragma: no cover - events must never break the call
         logger.debug("Failed to record LLM attempt event", exc_info=True)
+
+
+def current_trace_identity() -> tuple[Optional[str], Optional[str]]:
+    """Return the current W3C trace/span identities when one is available."""
+
+    if not _OTEL_AVAILABLE:
+        return None, None
+    try:
+        span = trace.get_current_span()
+        context = span.get_span_context() if span is not None else None
+        if context is None or not context.is_valid:
+            return None, None
+        return f"{context.trace_id:032x}", f"{context.span_id:016x}"
+    except Exception:  # pragma: no cover - correlation is best-effort
+        logger.debug("Failed to read current trace identity", exc_info=True)
+        return None, None
