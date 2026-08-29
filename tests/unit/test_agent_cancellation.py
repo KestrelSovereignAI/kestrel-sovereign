@@ -413,6 +413,90 @@ def test_request_lifecycle_logs_only_one_way_correlation(caplog):
 
 
 @pytest.mark.asyncio
+async def test_durable_stop_fence_survives_expired_memory_race_window():
+    import httpx
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.rate_limit import limiter
+
+    request_id = "delayed-after-durable-stop"
+
+    class DurableStopStore:
+        def __init__(self):
+            self.lookups = []
+
+        async def has_acknowledged_turn_stop(self, agent_id, turn_id):
+            self.lookups.append((agent_id, turn_id))
+            return (agent_id, turn_id) == ("did:test:durable", request_id)
+
+    class Agent(RequestLifecycleMixin):
+        agent_id = "did:test:durable"
+
+        def __init__(self):
+            self.storage = MagicMock()
+            self.storage.resolve_session_id = AsyncMock(return_value=None)
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+            self.cognition_started = False
+
+        async def process_input(self, *_args, **_kwargs):
+            self.cognition_started = True
+            return "must not run"
+
+        def _conversation_response_identity(self, **_kwargs):
+            return {}
+
+    agent = Agent()
+    agent.reserve_request_cancellation(request_id)
+    agent._pending_request_cancellations[request_id] -= 60.0
+    store = DurableStopStore()
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.state.agent = agent
+    app.state.stop_receipt_store = store
+    app.include_router(router)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/agent/invoke",
+            json={"input": "work", "request_id": request_id},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "Request stopped before execution."
+    assert not agent.cognition_started
+    assert store.lookups == [("did:test:durable", request_id)]
+
+
+def test_every_http_turn_door_primes_the_durable_stop_fence():
+    """Mutation tripwire: no HTTP retry door may bypass durable Stop truth."""
+
+    from pathlib import Path
+
+    agent_source = Path("kestrel_sovereign/endpoints/agent.py").read_text()
+    bridge_source = Path(
+        "kestrel_sovereign/features/bridge/router.py"
+    ).read_text()
+    call = "await prime_durable_stop_fence(request, agent, request_id)"
+
+    assert agent_source.count(call) == 2
+    assert bridge_source.count(call) == 2
+
+
+@pytest.mark.asyncio
 async def test_invoke_operation_task_name_redacts_opaque_request_id():
     import httpx
     from fastapi import FastAPI
@@ -623,10 +707,7 @@ class TestAgentCancellation:
         from kestrel_sovereign.agent.invocation import (
             bind_async_generator_invocation,
         )
-        from kestrel_sovereign.agent.request_lifecycle import (
-            RequestCompletionDisposition,
-            RequestLifecycleMixin,
-        )
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
         inner_cleanup_started = asyncio.Event()
@@ -725,10 +806,7 @@ class TestAgentCancellation:
             bind_async_generator_invocation,
         )
         from kestrel_sovereign.agent.parts import part_collector
-        from kestrel_sovereign.agent.request_lifecycle import (
-            RequestCompletionDisposition,
-            RequestLifecycleMixin,
-        )
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
         from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
@@ -902,10 +980,7 @@ class TestAgentCancellation:
         from fastapi import FastAPI
         from starlette.requests import Request
 
-        from kestrel_sovereign.agent.request_lifecycle import (
-            RequestCompletionDisposition,
-            RequestLifecycleMixin,
-        )
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
         class FencedAgent(RequestLifecycleMixin):

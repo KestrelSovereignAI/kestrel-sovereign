@@ -22,6 +22,7 @@ from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
+    prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
 )
@@ -403,6 +404,7 @@ async def invoke_agent(request: Request, http_response: Response):
             request,
             source_locator="POST:/api/agent/invoke",
         )
+        await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
             agent.register_active_request(request_id)
         else:
@@ -711,6 +713,7 @@ async def stream_agent_response(request: Request):
             request,
             source_locator="POST:/api/agent/stream",
         )
+        await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
             agent.register_active_request(request_id)
         else:
