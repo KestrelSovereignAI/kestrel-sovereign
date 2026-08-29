@@ -293,6 +293,30 @@ class SpawnedAgentLifecycle:
             return None
         return tracked.child_did
 
+    def cleanup_authority_children(
+        self,
+        *,
+        parent_did: str,
+    ) -> tuple[tuple[str, str], ...]:
+        """Snapshot every child currently owned by a cleanup finalizer.
+
+        Governance queries intentionally exclude expired or revoked mandates.
+        A cascading teardown has a separate obligation: it must still visit a
+        descendant whose lifecycle finalizer already claimed cleanup before
+        that authority expired. Return exact name/DID pairs so manager removal
+        can retain its same-name replacement fence.
+        """
+
+        return tuple(
+            (tracked.child_name, tracked.child_did)
+            for tracked in self._tracked.values()
+            if tracked.parent_did == parent_did
+            and self._finalization_owner_counts.get(
+                (tracked.child_name, tracked.child_did), 0
+            )
+            > 0
+        )
+
     @staticmethod
     def _remaining_ttl_seconds(created_at: str, ttl_seconds: int) -> float:
         """Return a persisted mandate's remaining lifetime, never a fresh TTL."""

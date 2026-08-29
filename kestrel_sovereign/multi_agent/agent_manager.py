@@ -3369,6 +3369,14 @@ class AgentManager:
             join_cancelled = await self._join_active_spawn_before_removal(name)
             if join_cancelled:
                 raise asyncio.CancelledError()
+            async with self._lock:
+                if self._quarantined_cleanup_name_is_reserved(
+                    self._canonical_agent_name(name)
+                ):
+                    raise RuntimeError(
+                        f"Agent {name!r} has unresolved quarantined cleanup; "
+                        "removal was refused."
+                    )
 
         if offboarding_admission is not None and (
             not offboard_runtime
@@ -5712,6 +5720,11 @@ class AgentManager:
             raise ValueError(
                 "Spawn mandate child DID must be unset until inception"
             )
+        parent_name = self._agent_names.get(parent_did)
+        if parent_name is None or self._agents.get(parent_name) is not parent_agent:
+            raise ValueError(
+                "Spawn parent must be the exact agent registered in this manager"
+            )
         # The caller may address a rotated parent by its successor signing DID.
         # New receipts persist the manager's stable routing DID so graph edges,
         # termination, and restart indexes retain one canonical parent key.
@@ -7025,7 +7038,18 @@ class AgentManager:
         Returns:
             Number of children terminated.
         """
-        children = await self.get_authoritative_children(parent_did)
+        children = list(await self.get_authoritative_children(parent_did))
+        lifecycle = vars(self).get("_lifecycle")
+        cleanup_children = getattr(
+            type(lifecycle), "cleanup_authority_children", None
+        )
+        if callable(cleanup_children):
+            for child_name, _child_did in cleanup_children(
+                lifecycle,
+                parent_did=parent_did,
+            ):
+                if child_name not in children:
+                    children.append(child_name)
         if type(offboard_runtime) is not bool:
             raise TypeError("offboard_runtime must be a bool")
         count = 0
