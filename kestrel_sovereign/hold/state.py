@@ -184,6 +184,14 @@ def _target(scope: HoldScope, target_id: Optional[str]) -> str:
     return _required_text(target_id, "target_id")
 
 
+def _exact_nonnegative_revision(value: object) -> int:
+    """Accept only the exact integer representation the latch schema promises."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HoldCorruptStateError("hold latch revision is invalid")
+    return value
+
+
 def _latch_from_row(row: Any) -> Optional[HoldState]:
     if row is None:
         return None
@@ -193,13 +201,11 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
         scope = HoldScope(str(row[0]))
         target_id = str(row[1])
         active = int(row[2])
-        revision = int(row[7])
+        revision = _exact_nonnegative_revision(row[7])
     except (TypeError, ValueError) as exc:
         raise HoldCorruptStateError("hold latch row has invalid typed fields") from exc
     if active not in (0, 1):
         raise HoldCorruptStateError("hold latch active flag is invalid")
-    if revision < 0:
-        raise HoldCorruptStateError("hold latch revision is invalid")
     hold_receipt_id = str(row[3] or "")
     reason = str(row[4] or "")
     actor_id = str(row[5] or "")
@@ -440,10 +446,15 @@ class HoldStore:
             )
 
     async def _read_receipt_by_operation(self, operation_id: str) -> Any:
-        return await self._db.fetchone(
+        rows = await self._db.fetchall(
             f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE operation_id = ?",
             (operation_id,),
         )
+        if len(rows) > 1:
+            raise HoldCorruptStateError(
+                "Hold receipt history has a duplicate operation identity"
+            )
+        return rows[0] if rows else None
 
     async def _read_receipt_by_id(self, receipt_id: str) -> Any:
         return await self._db.fetchone(
@@ -489,7 +500,9 @@ class HoldStore:
                     "hold latch row has an unexpected shape"
                 )
             try:
-                projection_revision = int(projection_row[7])
+                projection_revision = _exact_nonnegative_revision(
+                    projection_row[7]
+                )
             except (TypeError, ValueError) as exc:
                 raise HoldCorruptStateError(
                     "hold latch row has invalid typed fields"

@@ -429,6 +429,8 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
 
     events: list[object] = []
     schema_entered = asyncio.Event()
+    factory_close_started = asyncio.Event()
+    release_factory_close = asyncio.Event()
 
     class _DB:
         def __init__(self, backend_type):
@@ -441,7 +443,10 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
         engine = object()
 
         async def close(self):
-            events.append("factory-close")
+            events.append("factory-close-started")
+            factory_close_started.set()
+            await release_factory_close.wait()
+            events.append("factory-close-finished")
 
     fake_host_db = _DB("sqlite")
     fake_hold_db = _DB("postgres")
@@ -470,12 +475,16 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
     )
     await schema_entered.wait()
     bootstrap.cancel()
+    await factory_close_started.wait()
+    bootstrap.cancel()
+    release_factory_close.set()
 
     with pytest.raises(asyncio.CancelledError):
         await bootstrap
 
     assert events == [
-        "factory-close",
+        "factory-close-started",
+        "factory-close-finished",
         ("db-close", "postgres"),
         ("db-close", "sqlite"),
     ]
@@ -594,6 +603,94 @@ async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
             reason="inspect",
             operation_id="same-operation",
         )
+
+
+@pytest.mark.asyncio
+async def test_legacy_duplicate_operation_ids_fail_closed(tmp_path):
+    """Runtime reads cannot trust a UNIQUE constraint an old table may lack."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-duplicate-operation.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (scope, target_id))"
+    )
+    await db.execute(
+        "CREATE TABLE hold_receipts ("
+        "receipt_id TEXT NOT NULL PRIMARY KEY, operation_id TEXT NOT NULL, "
+        "action TEXT NOT NULL, disposition TEXT NOT NULL, scope TEXT NOT NULL, "
+        "target_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
+        "actor_id TEXT NOT NULL, occurred_at TEXT NOT NULL, "
+        "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '')"
+    )
+    store = HoldStore(db)
+    await store.ensure_schema()
+    try:
+        for suffix in ("one", "two"):
+            receipt_id = f"duplicate-operation-receipt-{suffix}"
+            target_id = f"did:agent:{suffix}"
+            await db.execute(
+                "INSERT INTO hold_receipts ("
+                "receipt_id, operation_id, action, disposition, scope, "
+                "target_id, reason, actor_id, occurred_at, "
+                "resulting_hold_receipt_id"
+                ") VALUES (?, ?, 'hold', 'applied', 'agent', ?, ?, ?, ?, ?)",
+                (
+                    receipt_id,
+                    "duplicate-operation",
+                    target_id,
+                    "legacy import",
+                    "did:sovereign:operator",
+                    "2026-08-28T00:00:00+00:00",
+                    receipt_id,
+                ),
+            )
+            await db.execute(
+                "INSERT INTO hold_latches ("
+                "scope, target_id, active, hold_receipt_id, reason, actor_id, "
+                "set_at, revision"
+                ") VALUES ('agent', ?, 1, ?, ?, ?, ?, 1)",
+                (
+                    target_id,
+                    receipt_id,
+                    "legacy import",
+                    "did:sovereign:operator",
+                    "2026-08-28T00:00:00+00:00",
+                ),
+            )
+
+        with pytest.raises(HoldCorruptStateError, match="duplicate operation"):
+            await store.get_receipt("duplicate-operation")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fractional_latch_revision_fails_closed(hold_db):
+    """SQLite integer affinity cannot turn 1.9 into a valid revision one."""
+
+    db, store = hold_db
+    await store.set_hold(
+        scope="agent",
+        target_id="did:agent:fractional-revision",
+        actor_id="did:sovereign:operator",
+        reason="inspect revision",
+        operation_id="fractional-revision-hold",
+    )
+    await db.execute(
+        "UPDATE hold_latches SET revision = ? "
+        "WHERE scope = 'agent' AND target_id = ?",
+        (1.9, "did:agent:fractional-revision"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="revision"):
+        await store.get_hold("agent", "did:agent:fractional-revision")
 
 
 @pytest.mark.asyncio
