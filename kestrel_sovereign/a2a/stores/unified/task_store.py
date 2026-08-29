@@ -25,7 +25,7 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
-_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v1"
+_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v2"
 
 
 class TaskAlreadyExistsError(ValueError):
@@ -91,7 +91,8 @@ class TaskStore(UnifiedStoreBase):
                 recipient_agent_id TEXT,
                 canceled_by TEXT,
                 cancel_reason TEXT,
-                cancel_previous_status TEXT
+                cancel_previous_status TEXT,
+                cancel_operation_id TEXT
             )
         """)
 
@@ -170,7 +171,7 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 5
+                    SELECT COUNT(*) = 6
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -179,7 +180,8 @@ class TaskStore(UnifiedStoreBase):
                           'recipient_agent_id',
                           'canceled_by',
                           'cancel_reason',
-                          'cancel_previous_status'
+                          'cancel_previous_status',
+                          'cancel_operation_id'
                       )
                 )
                 AND EXISTS (
@@ -189,7 +191,7 @@ class TaskStore(UnifiedStoreBase):
                       ON namespace.oid = procedure.pronamespace
                     WHERE namespace.nspname = current_schema()
                       AND procedure.proname =
-                          'a2a_tasks_enforce_canceled_terminal'
+                          'a2a_tasks_enforce_authority_fence'
                       AND pg_get_function_identity_arguments(procedure.oid) = ''
                 )
                 AND EXISTS (
@@ -201,7 +203,7 @@ class TaskStore(UnifiedStoreBase):
                       ON namespace.oid = relation.relnamespace
                     WHERE namespace.nspname = current_schema()
                       AND relation.relname = 'a2a_tasks'
-                      AND trigger.tgname = 'a2a_tasks_canceled_terminal_v1'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
                       AND NOT trigger.tgisinternal
                 )
                 AND (
@@ -234,6 +236,7 @@ class TaskStore(UnifiedStoreBase):
             "canceled_by",
             "cancel_reason",
             "cancel_previous_status",
+            "cancel_operation_id",
         )
         for column in authority_columns:
             await self.add_column_if_missing("a2a_tasks", column, "TEXT")
@@ -267,42 +270,66 @@ class TaskStore(UnifiedStoreBase):
         )
 
     async def _install_canceled_terminal_fence(self) -> None:
-        """Install an idempotent database guard against canceled resurrection."""
+        """Fence legacy writers from live authority gaps and canceled mutation."""
 
         if self.is_postgres:
             await self._backend.execute_script("""
-                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_canceled_terminal()
+                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence()
                 RETURNS trigger AS $a2a_fence_function$
                 BEGIN
-                    IF OLD.status = 'canceled'
-                       AND NEW.status IS DISTINCT FROM 'canceled' THEN
+                    IF TG_OP = 'UPDATE' AND OLD.status = 'canceled' THEN
                         RAISE EXCEPTION 'canceled A2A task is terminal'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    IF NEW.status IN ('submitted', 'working', 'input-required')
+                       AND (NEW.creator_agent_id IS NULL
+                            OR NEW.recipient_agent_id IS NULL) THEN
+                        RAISE EXCEPTION 'live A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
                     END IF;
                     RETURN NEW;
                 END;
                 $a2a_fence_function$ LANGUAGE plpgsql;
 
-                DO $a2a_fence_install$
-                BEGIN
-                    CREATE TRIGGER a2a_tasks_canceled_terminal_v1
-                    BEFORE UPDATE OF status ON a2a_tasks
-                    FOR EACH ROW
-                    EXECUTE FUNCTION a2a_tasks_enforce_canceled_terminal();
-                EXCEPTION
-                    WHEN duplicate_object THEN NULL;
-                END;
-                $a2a_fence_install$;
+                DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1
+                    ON a2a_tasks;
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v2
+                    ON a2a_tasks;
+                CREATE TRIGGER a2a_tasks_authority_fence_v2
+                BEFORE INSERT OR UPDATE ON a2a_tasks
+                FOR EACH ROW
+                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence();
             """)
             return
 
         await self._backend.execute_script("""
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_terminal_v1
-            BEFORE UPDATE OF status ON a2a_tasks
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_terminal_v2
+            BEFORE UPDATE ON a2a_tasks
             FOR EACH ROW
-            WHEN OLD.status = 'canceled' AND NEW.status IS NOT 'canceled'
+            WHEN OLD.status = 'canceled'
             BEGIN
                 SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
+            BEFORE INSERT ON a2a_tasks
+            FOR EACH ROW
+            WHEN NEW.status IN ('submitted', 'working', 'input-required')
+              AND (NEW.creator_agent_id IS NULL
+                   OR NEW.recipient_agent_id IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_update_v2
+            BEFORE UPDATE ON a2a_tasks
+            FOR EACH ROW
+            WHEN NEW.status IN ('submitted', 'working', 'input-required')
+              AND (NEW.creator_agent_id IS NULL
+                   OR NEW.recipient_agent_id IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
             END;
         """)
 
@@ -445,6 +472,15 @@ class TaskStore(UnifiedStoreBase):
             actor_agent_id=row[1],
         )
 
+    async def get_cancellation_operation_id(self, task_id: str) -> Optional[str]:
+        """Return the private attempt token proving which cancel committed."""
+
+        row = await self._backend.fetch_one(
+            "SELECT cancel_operation_id FROM a2a_tasks WHERE id = ?",
+            (task_id,),
+        )
+        return row[0] if row else None
+
     async def is_task_recipient(self, task_id: str, agent_id: str) -> bool:
         """Whether ``agent_id`` is the durable execution recipient of ``task_id``."""
 
@@ -494,6 +530,7 @@ class TaskStore(UnifiedStoreBase):
         expected_recipient_agent_id: Optional[str] = None,
         reason: Optional[str] = None,
         task_payload: Optional[Task] = None,
+        operation_id: Optional[str] = None,
     ) -> Optional[Task]:
         """Atomically cancel one live task owned by or delegated to ``actor``.
 
@@ -506,6 +543,10 @@ class TaskStore(UnifiedStoreBase):
         """
         if not isinstance(actor_agent_id, str) or not actor_agent_id:
             raise ValueError("Cancellation actor must be a concrete agent identity")
+        if operation_id is not None and (
+            not isinstance(operation_id, str) or not operation_id
+        ):
+            raise ValueError("Cancellation operation ID must be a concrete string")
         if expected_recipient_agent_id is not None and (
             not isinstance(expected_recipient_agent_id, str)
             or not expected_recipient_agent_id
@@ -608,6 +649,7 @@ class TaskStore(UnifiedStoreBase):
                         metadata = ?,
                         canceled_by = ?,
                         cancel_reason = ?,
+                        cancel_operation_id = ?,
                         updated_at = {self.now_sql()}
                     WHERE id = ?
                       AND status IN ('submitted', 'working', 'input-required')
@@ -623,6 +665,7 @@ class TaskStore(UnifiedStoreBase):
                         json_dumps(merged_metadata),
                         actor_agent_id,
                         reason,
+                        operation_id,
                         task_id,
                         actor_agent_id,
                         actor_agent_id,
@@ -680,6 +723,7 @@ class TaskStore(UnifiedStoreBase):
                     {payload_assignment}
                     canceled_by = ?,
                     cancel_reason = ?,
+                    cancel_operation_id = ?,
                     updated_at = {self.now_sql()}
                 WHERE id = ?
                   AND status IN ('submitted', 'working', 'input-required')
@@ -691,6 +735,7 @@ class TaskStore(UnifiedStoreBase):
                     *payload_values,
                     actor_agent_id,
                     reason,
+                    operation_id,
                     task_id,
                     actor_agent_id,
                     actor_agent_id,
@@ -848,7 +893,7 @@ class TaskStore(UnifiedStoreBase):
         5: message, 6: artifacts, 7: history, 8: metadata,
         9: created_at, 10: updated_at, 11: creator_agent_id,
         12: recipient_agent_id, 13: canceled_by, 14: cancel_reason,
-        15: cancel_previous_status
+        15: cancel_previous_status, 16: cancel_operation_id
         """
         artifacts_data = json_loads(row[6]) if row[6] else []
         history_data = json_loads(row[7]) if row[7] else []

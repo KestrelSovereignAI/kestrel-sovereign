@@ -389,6 +389,46 @@ async def test_ambiguous_cancel_commit_reconciles_projections_before_rethrow(
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_cancel_does_not_claim_an_older_same_actor_receipt(
+    tmp_path,
+):
+    """Only this attempt's durable token can prove an ambiguous commit."""
+
+    manager = await create_task_manager(str(tmp_path / "old-receipt.db"))
+    try:
+        await manager.create_task(
+            _params("old-receipt"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "old-receipt",
+            agent_name="did:test:creator",
+        )
+        canceled_callbacks: list[str] = []
+        completions: list[str] = []
+        manager._on_task_cancelled = (
+            lambda task: canceled_callbacks.append(task.id)
+        )
+        manager._on_task_complete = lambda task: completions.append(task.id)
+
+        async def fail_before_commit(*_args, **_kwargs):
+            raise RuntimeError("transport failed before this attempt committed")
+
+        manager.task_store.cancel_if_authorized = fail_before_commit
+        with pytest.raises(RuntimeError, match="before this attempt committed"):
+            await manager.cancel_task(
+                "old-receipt",
+                agent_name="did:test:creator",
+            )
+
+        assert canceled_callbacks == []
+        assert completions == []
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_create_task_never_publishes_a_stale_submitted_snapshot(tmp_path):
     manager = await create_task_manager(str(tmp_path / "create-readback.db"))
     try:
@@ -2529,6 +2569,57 @@ async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
 
 
 @pytest.mark.asyncio
+async def test_database_fence_blocks_all_mutation_of_canceled_task(tmp_path):
+    """A mixed-version writer cannot alter payload while retaining CANCELED."""
+
+    manager = await create_task_manager(str(tmp_path / "canceled-write-fence.db"))
+    try:
+        await manager.create_task(
+            _params("immutable-cancel"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "immutable-cancel",
+            agent_name="did:test:creator",
+        )
+
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await manager.task_store.backend.execute(
+                "UPDATE a2a_tasks SET metadata = ? WHERE id = ?",
+                ('{"legacy":"overwrite"}', "immutable-cancel"),
+            )
+
+        assert "legacy" not in (
+            (await manager.get_task("immutable-cancel")).metadata or {}
+        )
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_database_fence_rejects_legacy_live_insert_without_authority(
+    tmp_path,
+):
+    """Late old-code inserts cannot recreate uncancellable live work."""
+
+    manager = await create_task_manager(str(tmp_path / "live-authority-fence.db"))
+    try:
+        with pytest.raises(Exception, match="requires durable authority"):
+            await manager.task_store.backend.execute(
+                """
+                INSERT INTO a2a_tasks (id, task_type, status)
+                VALUES (?, ?, 'submitted')
+                """,
+                ("late-legacy-live", "generic"),
+            )
+
+        assert await manager.get_task("late-legacy-live") is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_database_fence_blocks_legacy_writer_on_available_backends(db_backend):
     store = TaskStore(db_backend)
@@ -2627,9 +2718,10 @@ async def test_postgres_initialization_installs_canceled_terminal_trigger():
     scripts = "\n".join(
         call.args[0] for call in backend.execute_script.await_args_list
     )
-    assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_canceled_terminal" in scripts
-    assert "NEW.status IS DISTINCT FROM 'canceled'" in scripts
-    assert "CREATE TRIGGER a2a_tasks_canceled_terminal_v1" in scripts
+    assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence" in scripts
+    assert "OLD.status = 'canceled'" in scripts
+    assert "live A2A task requires durable authority" in scripts
+    assert "CREATE TRIGGER a2a_tasks_authority_fence_v2" in scripts
 
 
 @pytest.mark.asyncio
@@ -2657,7 +2749,7 @@ async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
         return (False,)
 
     async def execute_script(script):
-        if "a2a_tasks_enforce_canceled_terminal" in script:
+        if "a2a_tasks_enforce_authority_fence" in script:
             events.append("fence-ddl")
 
     backend = SimpleNamespace(
@@ -2696,7 +2788,7 @@ async def test_postgres_cancellation_schema_waiter_skips_completed_ddl():
     scripts = "\n".join(
         call.args[0] for call in backend.execute_script.await_args_list
     )
-    assert "a2a_tasks_enforce_canceled_terminal" not in scripts
+    assert "a2a_tasks_enforce_authority_fence" not in scripts
     statements = "\n".join(
         call.args[0] for call in backend.execute.await_args_list
     )

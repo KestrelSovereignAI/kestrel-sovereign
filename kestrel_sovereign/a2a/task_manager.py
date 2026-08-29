@@ -1067,6 +1067,8 @@ class TaskManager:
             "actor_agent_id": agent_name,
             "reason": reason,
         }
+        operation_id = uuid4().hex
+        cancel_kwargs["operation_id"] = operation_id
         if recipient_agent_id is not None:
             cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
         if task_payload is not None:
@@ -1110,6 +1112,8 @@ class TaskManager:
                 committed_here = (
                     current is not None
                     and await is_this_actor_receipt(current)
+                    and await self.task_store.get_cancellation_operation_id(task_id)
+                    == operation_id
                 )
             except BaseException as reconciliation_failure:
                 if rollback_local_intent is not None:
