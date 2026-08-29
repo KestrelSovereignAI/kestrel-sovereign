@@ -344,12 +344,21 @@ def _make_cm(
     cm.context_builder = MagicMock()
     cm.context_builder.measure_mandatory_system_tokens = MagicMock(return_value=0)
     cm.context_builder.build_system_prompt = MagicMock(return_value="SYSTEM_PROMPT_BASE")
+    cm.context_builder.build_system_prompt_with_subsections = MagicMock(
+        return_value=(
+            "SYSTEM_PROMPT_BASE",
+            [("assembled_system_prompt", "SYSTEM_PROMPT_BASE")],
+        )
+    )
     if injected_clauses is not None or dropped_clauses is not None:
         cm.context_builder.build_system_prompt_with_tracking = MagicMock(
             return_value=SimpleNamespace(
                 prompt="SYSTEM_PROMPT_TRACKED",
                 injected_clauses=injected_clauses or [],
                 dropped_clauses=dropped_clauses or [],
+                subsections=[
+                    ("assembled_system_prompt", "SYSTEM_PROMPT_TRACKED")
+                ],
             )
         )
     cm.context_builder.retrieve_context = AsyncMock(return_value=rag_result)

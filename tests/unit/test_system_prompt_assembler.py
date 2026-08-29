@@ -25,6 +25,7 @@ from kestrel_sovereign.agent.system_prompt_assembler import (
     CLAUSE_STYLE_REMINDER,
     PRIORITY_ANCHORED_DOCTRINE,
     PRIORITY_CONSTITUTION,
+    PRIORITY_CONTRIBUTED_CONTEXT,
     PRIORITY_OTHER_BOOTSTRAP,
     PRIORITY_SOUL,
     PRIORITY_STATE_OF_MIND,
@@ -228,6 +229,70 @@ def test_truncation_drops_highest_priority_number_first():
     assert len(result.prompt.encode("utf-8")) <= 400
 
 
+def test_contributed_context_is_deterministic_audited_and_drops_first():
+    clauses = (
+        ("tests:z", "z-low", 30, "low-priority body"),
+        ("tests:a", "a-high", 10, "high-priority body"),
+        ("tests:b", "b-high", 10, "second high-priority body"),
+    )
+    result = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(),
+        style_reminder="style",
+        context_clauses=reversed(clauses),
+    )
+
+    assert result.injected_clauses == [
+        CLAUSE_KESTREL_CONSTITUTION,
+        CLAUSE_STYLE_REMINDER,
+        "a-high",
+        "b-high",
+        "z-low",
+    ]
+    assert result.prompt.endswith(
+        "high-priority body\n\nsecond high-priority body\n\nlow-priority body"
+    )
+    assert [name for name, _body in result.subsections[-3:]] == [
+        "a-high",
+        "b-high",
+        "z-low",
+    ]
+
+    squeezed = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(),
+        style_reminder="style",
+        context_clauses=clauses,
+        budget_bytes=len(result.prompt.encode("utf-8")) - 1,
+    )
+    assert squeezed.dropped_clauses[0] == "z-low"
+    assert CLAUSE_STYLE_REMINDER in squeezed.injected_clauses
+
+
+def test_contributed_context_alone_over_budget_never_drops_constitution():
+    result = assemble_system_prompt(
+        constitution="governance",
+        bootstrap_files=OrderedDict(),
+        context_clauses=(("tests:huge", "huge", 0, "x" * 2_000),),
+        budget_bytes=200,
+    )
+
+    assert result.injected_clauses == [CLAUSE_KESTREL_CONSTITUTION]
+    assert result.dropped_clauses == ["huge"]
+
+
+def test_zero_contributed_context_is_byte_identical_to_omitted_parameter():
+    kwargs = {
+        "constitution": "C",
+        "bootstrap_files": OrderedDict([("SOUL.md", "soul")]),
+        "style_reminder": "style",
+    }
+
+    assert assemble_system_prompt(**kwargs).prompt.encode() == assemble_system_prompt(
+        **kwargs, context_clauses=()
+    ).prompt.encode()
+
+
 def test_truncation_within_priority_drops_latest_emit_first():
     """Two entries at the same priority (other bootstrap): the later-
     emitted one drops first. Pin the deterministic order."""
@@ -317,6 +382,7 @@ def test_priority_ladder_is_strictly_increasing():
         < PRIORITY_STATE_OF_MIND
         < PRIORITY_OTHER_BOOTSTRAP
         < PRIORITY_STYLE_REMINDER
+        < PRIORITY_CONTRIBUTED_CONTEXT
     )
     # Constitution is canonically priority 1 — never dropped.
     assert PRIORITY_CONSTITUTION == 1

@@ -1321,6 +1321,7 @@ class KestrelAgent(
         self.feature_contribution_runtime = None
         self.permission_defaults_registry = None
         self.setup_step_registry = None
+        self.context_clause_registry = None
         # Bootstrap service is constructed in initialize(); default it here so
         # any code path that runs before/without full initialization (e.g. a
         # COGNITION signal dispatch reaching process_input's bootstrap check)
@@ -3213,6 +3214,9 @@ class KestrelAgent(
             semantic_inference_limits=self.semantic_inference_limits,
             semantic_maintenance_limits=self.semantic_maintenance_limits,
             semantic_answerability_gate=self.memory_system.retriever.answerability_gate,
+            context_clause_registry=(
+                self._ensure_feature_contribution_runtime().context_clause_registry
+            ),
         )
         # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
         # persistence) into the loader before the first system-prompt
@@ -4299,7 +4303,18 @@ class KestrelAgent(
         self.feature_contribution_runtime = runtime
         self.permission_defaults_registry = runtime.permission_defaults_registry
         self.setup_step_registry = runtime.setup_step_registry
+        self.context_clause_registry = runtime.context_clause_registry
+        context_builder = getattr(self, "context_builder", None)
+        if context_builder is not None:
+            context_builder._context_clause_registry = runtime.context_clause_registry
         return runtime
+
+    def refresh_feature_context_clauses(self, feature: object):
+        """Commit fresh feature context bytes after an explicit config change."""
+
+        return self._ensure_feature_contribution_runtime().refresh_context_clauses(
+            feature
+        )
 
     def _record_contribution_rejections(self, transition) -> None:
         """Log and RETAIN the features refused activation.

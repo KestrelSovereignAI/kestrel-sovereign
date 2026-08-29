@@ -605,6 +605,7 @@ class ContextManager:
             assembly.system_prompt,
             assembly.injected_clauses,
             assembly.dropped_clauses,
+            system_subsections,
         ) = self._assemble_system_prompt(
             constitution=constitution,
             include_briefing=include_briefing,
@@ -635,6 +636,12 @@ class ContextManager:
             )
         if reflection_included:
             system_provenance.append("reflection_guidance")
+            system_subsections.append(
+                (
+                    "reflection_guidance",
+                    build_reflection_guidance_block(reflection_guidance or []),
+                )
+            )
         system_tokens_before_episodes = self.counter.count(assembly.system_prompt)
         sections["system"] = ContextSectionPlan(
             name="system",
@@ -645,12 +652,9 @@ class ContextManager:
             items=1,
             provenance=tuple(system_provenance),
             details={
-                "subsections": [
-                    {
-                        "name": "assembled_system_prompt",
-                        "tokens": system_tokens_before_episodes,
-                    }
-                ],
+                "subsections": self._measure_system_subsections(
+                    system_subsections
+                ),
                 "injected_clauses": assembly.injected_clauses,
                 "dropped_clauses": assembly.dropped_clauses,
             },
@@ -1060,9 +1064,15 @@ class ContextManager:
             self.counter.count(assembly.system_prompt)
             - (sections["episodes"].tokens or 0),
         )
-        sections["system"].details["subsections"][0]["tokens"] = sections[
-            "system"
-        ].tokens
+        subsection_rows = sections["system"].details["subsections"]
+        attributed = sum(row["tokens"] for row in subsection_rows)
+        if subsection_rows:
+            # Episodes are accounted as their own section. Assign only the
+            # tokenizer boundary delta from their late append to the final
+            # base-system subsection so all attribution remains exact.
+            subsection_rows[-1]["tokens"] += (
+                sections["system"].tokens - attributed
+            )
         total_tokens = (
             self.counter.count(assembly.system_prompt)
             + history_tokens
@@ -1308,7 +1318,12 @@ class ContextManager:
         system_prompt_addendum: Optional[str],
         system_prompt_budget_bytes: Optional[int],
         anchored_doctrine: Optional["OrderedDict[str, str]"],
-    ) -> Tuple[str, Optional[List[str]], Optional[List[str]]]:
+    ) -> Tuple[
+        str,
+        Optional[List[str]],
+        Optional[List[str]],
+        List[Tuple[str, str]],
+    ]:
         """Assemble the stable system prefix and optional injection tracking.
 
         Routes to the priority-aware tracking assembler when the caller sets
@@ -1319,11 +1334,12 @@ class ContextManager:
         bytes are reserved BEFORE the assembler truncates (codex round-12 P2)
         so the final ``assembler output + joiner + addendum`` fits the cap.
 
-        Returns ``(system_prompt, injected_clauses, dropped_clauses)``; the
-        clause lists are ``None`` for the legacy path.
+        Returns ``(system_prompt, injected_clauses, dropped_clauses,
+        subsections)``; the clause lists are ``None`` for the legacy path.
         """
         injected_clauses: Optional[List[str]] = None
         dropped_clauses: Optional[List[str]] = None
+        subsections: List[Tuple[str, str]]
         if system_prompt_budget_bytes is not None or anchored_doctrine:
             effective_budget: Optional[int]
             if system_prompt_budget_bytes is None:
@@ -1348,17 +1364,40 @@ class ContextManager:
             system_prompt = tracking_result.prompt
             injected_clauses = list(tracking_result.injected_clauses)
             dropped_clauses = list(tracking_result.dropped_clauses)
+            subsections = list(tracking_result.subsections)
             if system_prompt_addendum:
                 system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
+                subsections.append(
+                    ("system_prompt_addendum", system_prompt_addendum)
+                )
         else:
-            system_prompt = self.context_builder.build_system_prompt(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                system_prompt_addendum=system_prompt_addendum,
+            system_prompt, subsections = (
+                self.context_builder.build_system_prompt_with_subsections(
+                    constitution=constitution,
+                    include_briefing=include_briefing,
+                    prompt_adaptation=prompt_adaptation,
+                    state_of_mind=None,
+                    system_prompt_addendum=system_prompt_addendum,
+                )
             )
-        return system_prompt, injected_clauses, dropped_clauses
+        return system_prompt, injected_clauses, dropped_clauses, subsections
+
+    def _measure_system_subsections(
+        self, subsections: List[Tuple[str, str]]
+    ) -> List[Dict[str, Any]]:
+        """Attribute exact prefix-token deltas to ordered subsection bodies."""
+
+        rows: List[Dict[str, Any]] = []
+        prefix = ""
+        prior_tokens = 0
+        for name, body in subsections:
+            prefix = body if not prefix else f"{prefix}\n\n{body}"
+            current_tokens = self.counter.count(prefix)
+            rows.append(
+                {"name": name, "tokens": current_tokens - prior_tokens}
+            )
+            prior_tokens = current_tokens
+        return rows
 
     def _record_system_usage(
         self, assembly: ContextAssembly, budget: TokenBudget

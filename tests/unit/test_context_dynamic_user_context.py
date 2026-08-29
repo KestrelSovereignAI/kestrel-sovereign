@@ -65,6 +65,12 @@ def _make_cm(
     cm.context_builder.build_system_prompt = MagicMock(
         return_value="SYSTEM_PROMPT_BASE"
     )
+    cm.context_builder.build_system_prompt_with_subsections = MagicMock(
+        return_value=(
+            "SYSTEM_PROMPT_BASE",
+            [("assembled_system_prompt", "SYSTEM_PROMPT_BASE")],
+        )
+    )
     cm.context_builder.retrieve_context = AsyncMock(return_value=rag_result)
     cm.context_builder.format_conversation_history = MagicMock(
         side_effect=lambda history, max_tokens: list(history)

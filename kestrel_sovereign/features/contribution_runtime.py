@@ -12,6 +12,7 @@ from typing import Iterable
 
 from kestrel_sdk.features import (
     ContributionContractError,
+    ContextClauseRegistration,
     FeatureContributionSet,
     FeaturePermissionDefaults,
     SetupStepClassification,
@@ -57,6 +58,8 @@ class FeatureContributionCollectionError(FeatureContributionRuntimeError):
         "get_workflow_registrations": "workflow collection",
         "get_feature_permission_defaults": "permission-default collection",
         "get_setup_step_registrations": "setup-step collection",
+        "get_context_clause_registrations": "context-clause collection",
+        "render_context_clauses": "context-clause rendering",
         "validate_feature_contributions": "contribution validation",
         "validate_contribution_owner_uniqueness": "contribution validation",
     }
@@ -83,6 +86,104 @@ class PermissionDefaultRegistration:
     owner: str
     feature_name: str
     defaults: FeaturePermissionDefaults
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedContextClause:
+    """Immutable prompt bytes resolved at one feature lifecycle transition."""
+
+    owner: str
+    name: str
+    priority: int
+    body: str
+    registration: ContextClauseRegistration
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return (self.owner, self.name)
+
+
+class ContextClauseRegistry:
+    """Lifecycle-owned cache of already-rendered feature context clauses."""
+
+    def __init__(self) -> None:
+        self._clauses: dict[tuple[str, str], ResolvedContextClause] = {}
+
+    def validate_register_batch(
+        self, clauses: Iterable[ResolvedContextClause]
+    ) -> tuple[ResolvedContextClause, ...]:
+        values = tuple(clauses)
+        identities = [clause.identity for clause in values]
+        if len(set(identities)) != len(identities):
+            raise FeatureContributionRuntimeError(
+                "duplicate context-clause registration identity"
+            )
+        conflict = next(
+            (identity for identity in identities if identity in self._clauses),
+            None,
+        )
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context clause is already registered for {conflict!r}"
+            )
+        return values
+
+    def register_batch(
+        self, clauses: Iterable[ResolvedContextClause]
+    ) -> tuple[ResolvedContextClause, ...]:
+        values = self.validate_register_batch(clauses)
+        self._clauses.update((clause.identity, clause) for clause in values)
+        return values
+
+    def validate_unregister_batch(
+        self, clauses: Iterable[ResolvedContextClause]
+    ) -> tuple[ResolvedContextClause, ...]:
+        values = tuple(clauses)
+        if any(self._clauses.get(clause.identity) is not clause for clause in values):
+            raise FeatureContributionRuntimeError(
+                "active context-clause registration identity does not match"
+            )
+        return values
+
+    def unregister_batch(self, clauses: Iterable[ResolvedContextClause]) -> None:
+        values = self.validate_unregister_batch(clauses)
+        for clause in values:
+            del self._clauses[clause.identity]
+
+    def replace_batch(
+        self,
+        current: Iterable[ResolvedContextClause],
+        replacement: Iterable[ResolvedContextClause],
+    ) -> tuple[ResolvedContextClause, ...]:
+        old_values = self.validate_unregister_batch(current)
+        new_values = tuple(replacement)
+        old_identities = {clause.identity for clause in old_values}
+        new_identities = [clause.identity for clause in new_values]
+        if len(set(new_identities)) != len(new_identities):
+            raise FeatureContributionRuntimeError(
+                "duplicate context-clause registration identity"
+            )
+        if any(
+            identity in self._clauses and identity not in old_identities
+            for identity in new_identities
+        ):
+            raise FeatureContributionRuntimeError(
+                "replacement context clause conflicts with an active registration"
+            )
+        for clause in old_values:
+            del self._clauses[clause.identity]
+        self._clauses.update((clause.identity, clause) for clause in new_values)
+        return new_values
+
+    def snapshot(self) -> tuple[ResolvedContextClause, ...]:
+        """Return a load-order-independent immutable prompt snapshot."""
+
+        return tuple(
+            sorted(
+                self._clauses.values(),
+                key=lambda clause: (clause.priority, clause.name, clause.owner),
+            )
+        )
 
 
 class PermissionDefaultsRegistry:
@@ -286,6 +387,7 @@ class ActiveFeatureContributions:
     prepared: PreparedFeatureContributions
     operator_registrations: OperatorRegistrationSet
     permission_registration: PermissionDefaultRegistration | None
+    context_clauses: tuple[ResolvedContextClause, ...] = ()
     execution_target_registrations: tuple[OperatorRegistrationSet, ...] = ()
 
 
@@ -307,6 +409,7 @@ class FeatureContributionRuntime:
         source_registry: SourceRegistry,
         permission_defaults_registry: PermissionDefaultsRegistry | None = None,
         setup_step_registry: SetupStepRegistry | None = None,
+        context_clause_registry: ContextClauseRegistry | None = None,
     ) -> None:
         self.operator_registry = operator_registry
         self.wait_registry = wait_registry
@@ -320,6 +423,11 @@ class FeatureContributionRuntime:
             setup_step_registry
             if setup_step_registry is not None
             else SetupStepRegistry()
+        )
+        self.context_clause_registry = (
+            context_clause_registry
+            if context_clause_registry is not None
+            else ContextClauseRegistry()
         )
         self._active: dict[int, ActiveFeatureContributions] = {}
 
@@ -389,11 +497,16 @@ class FeatureContributionRuntime:
             raise FeatureContributionRuntimeError(rejections[0].reason)
 
         values = prepared.contributions
+        resolved_context_clauses = self._resolve_context_clauses(prepared)
+        self.context_clause_registry.validate_register_batch(
+            resolved_context_clauses
+        )
         operator_set: OperatorRegistrationSet | None = None
         registered_waits = []
         registered_sources = []
         permission_registration: PermissionDefaultRegistration | None = None
         setup_registered = False
+        context_registered = False
         try:
             operator_set = self.operator_registry.register(
                 prepared.owner,
@@ -443,7 +556,13 @@ class FeatureContributionRuntime:
                 values.setup_steps, prevalidated=True
             )
             setup_registered = True
+            self.context_clause_registry.register_batch(resolved_context_clauses)
+            context_registered = True
         except Exception:
+            if context_registered:
+                self.context_clause_registry.unregister_batch(
+                    resolved_context_clauses
+                )
             if setup_registered:
                 self.setup_step_registry.unregister_batch(values.setup_steps)
             if permission_registration is not None:
@@ -466,6 +585,7 @@ class FeatureContributionRuntime:
             prepared=prepared,
             operator_registrations=operator_set,
             permission_registration=permission_registration,
+            context_clauses=resolved_context_clauses,
         )
         self._active[id(prepared.feature)] = active
         return active
@@ -573,6 +693,9 @@ class FeatureContributionRuntime:
                 raise FeatureContributionRuntimeError(
                     "active setup-step registration identity does not match"
                 )
+        self.context_clause_registry.validate_unregister_batch(
+            active.context_clauses
+        )
         self.operator_registry.validate_registration_set(
             active.operator_registrations
         )
@@ -589,6 +712,7 @@ class FeatureContributionRuntime:
                 active.permission_registration
             )
         self.setup_step_registry.unregister_batch(values.setup_steps)
+        self.context_clause_registry.unregister_batch(active.context_clauses)
         # Past every validation, in the same mutating stretch as the other
         # unregistrations: drop this feature's claims. The registry removes each
         # source only when its last holder lets go.
@@ -602,6 +726,53 @@ class FeatureContributionRuntime:
 
     def active_owners(self) -> tuple[str, ...]:
         return tuple(item.prepared.owner for item in self._active.values())
+
+    def active_context_clauses(self) -> tuple[ResolvedContextClause, ...]:
+        """Return only core-owned rendered bytes; no feature code runs here."""
+
+        return self.context_clause_registry.snapshot()
+
+    def refresh_context_clauses(
+        self, feature: object
+    ) -> tuple[ResolvedContextClause, ...]:
+        """Resolve a deliberate configuration transition, never a turn read."""
+
+        active = self._active.get(id(feature))
+        if active is None or active.prepared.feature is not feature:
+            raise FeatureContributionRuntimeError(
+                "context-clause refresh requires an active owning feature"
+            )
+        replacement = self._resolve_context_clauses(active.prepared)
+        committed = self.context_clause_registry.replace_batch(
+            active.context_clauses, replacement
+        )
+        self._active[id(feature)] = replace(active, context_clauses=committed)
+        return committed
+
+    @staticmethod
+    def _resolve_context_clauses(
+        prepared: PreparedFeatureContributions,
+    ) -> tuple[ResolvedContextClause, ...]:
+        try:
+            resolved = []
+            for registration in prepared.contributions.context_clauses:
+                body = registration.renderer()
+                if not isinstance(body, str):
+                    raise TypeError("context clause renderer must return str")
+                resolved.append(
+                    ResolvedContextClause(
+                        owner=registration.owner,
+                        name=registration.name,
+                        priority=registration.priority,
+                        body=body,
+                        registration=registration,
+                    )
+                )
+            return tuple(resolved)
+        except Exception as exc:
+            raise FeatureContributionCollectionError(
+                prepared.feature, "render_context_clauses"
+            ) from exc
 
     @staticmethod
     def _collect(feature: object) -> PreparedFeatureContributions:
@@ -623,6 +794,7 @@ class FeatureContributionRuntime:
                 workflows=(),
                 permission_defaults=None,
                 setup_steps=(),
+                context_clauses=(),
             )
             return PreparedFeatureContributions(
                 feature=feature,
@@ -664,6 +836,12 @@ class FeatureContributionRuntime:
         setup_steps = FeatureContributionRuntime._call_collection_getter(
             feature, "get_setup_step_registrations", materialize=True
         )
+        context_clauses = FeatureContributionRuntime._call_collection_getter(
+            feature,
+            "get_context_clause_registrations",
+            materialize=True,
+            optional=True,
+        )
         try:
             contributions = validate_feature_contributions(
                 owner,
@@ -673,6 +851,7 @@ class FeatureContributionRuntime:
                 workflows=workflows,
                 permission_defaults=permissions,
                 setup_steps=setup_steps,
+                context_clauses=context_clauses,
             )
             if isinstance(feature, Feature):
                 agent_id = getattr(feature.agent, "agent_id", None) or getattr(

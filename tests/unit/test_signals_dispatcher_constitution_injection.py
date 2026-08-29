@@ -1232,6 +1232,118 @@ async def test_dispatcher_passes_budget_to_agent_when_accepted(
 
 
 @pytest.mark.asyncio
+async def test_contributed_clause_names_persist_to_signal_log(
+    tmp_path, template_path
+):
+    """Round-trip real context assembly through the dispatcher's audit store."""
+
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kestrel_sdk.features import ContextClauseRegistration
+
+    from kestrel_sovereign.agent.context_builder import ContextBuilder
+    from kestrel_sovereign.agent.context_manager import ContextManager
+    from kestrel_sovereign.features.contribution_runtime import (
+        ContextClauseRegistry,
+        ResolvedContextClause,
+    )
+
+    registration = ContextClauseRegistration(
+        owner="tests:signal-audit",
+        name="audited-feature-clause",
+        priority=10,
+        renderer=lambda: "feature clause body",
+    )
+    registry = ContextClauseRegistry()
+    registry.register_batch(
+        (
+            ResolvedContextClause(
+                owner=registration.owner,
+                name=registration.name,
+                priority=registration.priority,
+                body=registration.renderer(),
+                registration=registration,
+            ),
+        )
+    )
+    storage = MagicMock()
+    storage.search_chunks = AsyncMock(return_value=[])
+    agent_data = tmp_path / "agent-data"
+    agent_data.mkdir()
+    builder = ContextBuilder(
+        storage,
+        agent_data_path=agent_data,
+        context_clause_registry=registry,
+    )
+    manager = ContextManager(storage=storage, context_builder=builder)
+
+    class _ContextBuildingAgent(_AuditingAgent):
+        async def process_input(
+            self,
+            prompt: str,
+            *,
+            system_prompt_budget_bytes=None,
+            **_kwargs,
+        ):
+            self.process_input_calls.append(prompt)
+            await manager.build_context(
+                query=prompt,
+                constitution="C",
+                include_briefing=False,
+                include_memories=False,
+                include_rag=False,
+                conversation_history=[],
+                system_prompt_budget_bytes=system_prompt_budget_bytes,
+            )
+            return "ok"
+
+    agent = _ContextBuildingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="clause_included",
+            constitution_injection="full",
+            system_prompt_budget_bytes=100_000,
+        )
+    )
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="clause_dropped",
+            constitution_injection="full",
+            system_prompt_budget_bytes=32,
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("clause_included"))
+    await _drain(env)
+    await env.dispatcher.dispatch_signal(_signal("clause_dropped"))
+    await _drain(env)
+
+    rows = await env.backend.fetch_all(
+        "SELECT source, injected_clauses_json, dropped_clauses_json "
+        "FROM signal_log WHERE source IN (?, ?) ORDER BY source",
+        ("clause_dropped", "clause_included"),
+    )
+    by_source = {
+        source: (
+            json.loads(injected_json) if injected_json else [],
+            json.loads(dropped_json) if dropped_json else [],
+        )
+        for source, injected_json, dropped_json in rows
+    }
+    assert "audited-feature-clause" in by_source["clause_included"][0]
+    assert "audited-feature-clause" in by_source["clause_dropped"][1]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_does_not_retry_on_internal_typeerror(
     tmp_path, template_path
 ):

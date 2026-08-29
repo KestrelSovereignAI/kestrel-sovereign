@@ -10,6 +10,7 @@ from kestrel_sdk.features import ContributionContractError
 from kestrel_sdk.operator import ExecutionTargetDescriptor
 
 from kestrel_sovereign import server
+from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.contribution_runtime import (
     FeatureContributionCollectionError,
@@ -81,18 +82,87 @@ async def test_agent_lifecycle_registers_exact_sdk_contributions_once(tmp_path):
         "workflows": 1,
         "permissions": 1,
         "setup": 1,
+        "context": 1,
     }
+    assert feature.context_renderer_calls == 1
+    clauses = agent.feature_contribution_runtime.active_context_clauses()
+    assert [clause.body for clause in clauses] == [
+        "stable context from agent-fixture"
+    ]
     _assert_live(agent, feature, True)
 
+    builder = ContextBuilder(
+        agent.storage,
+        context_clause_registry=(
+            agent.feature_contribution_runtime.context_clause_registry
+        ),
+    )
+    first_prompt = builder.build_system_prompt("C", include_briefing=False)
+    second_prompt = builder.build_system_prompt("C", include_briefing=False)
+    assert first_prompt.encode() == second_prompt.encode()
+    assert feature.context_renderer_calls == 1
+
     await agent._unregister_feature_runtime(feature, unload=False)
+    assert agent.feature_contribution_runtime.active_context_clauses() == ()
     _assert_live(agent, feature, False)
 
     await agent._activate_feature_runtime(feature)
     assert set(feature.contribution_calls.values()) == {2}
+    assert feature.context_renderer_calls == 2
     _assert_live(agent, feature, True)
 
     await agent._unregister_feature_runtime(feature, unload=True)
     _assert_live(agent, feature, False)
+
+
+@pytest.mark.asyncio
+async def test_explicit_context_config_refresh_rerenders_without_recollecting(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    await agent._register_feature(feature)
+
+    feature.context_text = "updated persisted configuration"
+    runtime = agent.feature_contribution_runtime
+    assert runtime.active_context_clauses()[0].body == (
+        "stable context from agent-fixture"
+    )
+
+    refreshed = agent.refresh_feature_context_clauses(feature)
+
+    assert refreshed[0].body == "updated persisted configuration"
+    assert feature.contribution_calls["context"] == 1
+    assert feature.context_renderer_calls == 2
+
+
+def test_context_getter_absent_on_older_sdk_feature_is_skipped(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    feature.get_context_clause_registrations = None
+
+    prepared = agent._prepare_feature_contribution_transition((feature,)).only()
+
+    assert prepared.contributions.context_clauses == ()
+
+
+def test_context_renderer_failure_precedes_registry_mutation(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+
+    def fail_renderer():
+        raise RuntimeError("renderer secret must stay behind typed boundary")
+
+    object.__setattr__(feature.context_registration, "renderer", fail_renderer)
+    runtime = agent._ensure_feature_contribution_runtime()
+    prepared = runtime.prepare_transition((feature,)).only()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.activate(prepared)
+
+    assert exc_info.value.getter == "render_context_clauses"
+    assert runtime.active_owners() == ()
+    assert runtime.active_context_clauses() == ()
+    assert len(agent.wait_registry.kinds()) == 0
+    assert len(agent.signal_registry) == 0
 
 
 @pytest.mark.asyncio

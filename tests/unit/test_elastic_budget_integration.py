@@ -163,6 +163,10 @@ class TestHistoryOverBudgetPrune:
         cb.get_episodes_for_context = AsyncMock(return_value=[])
         cb.retrieve_context = AsyncMock(return_value=None)
         cb.build_system_prompt = lambda **kw: "sys"
+        cb.build_system_prompt_with_subsections = lambda **kw: (
+            "sys",
+            [("assembled_system_prompt", "sys")],
+        )
 
         # Force the formatter to return a giant history that blows
         # both the static slice and the elastic pool. Return a fresh
@@ -214,6 +218,10 @@ class TestHistoryAbsorbsReleasedSlack:
 
         cb.format_conversation_history = fake_format
         cb.build_system_prompt = lambda **kw: "system body"
+        cb.build_system_prompt_with_subsections = lambda **kw: (
+            "system body",
+            [("assembled_system_prompt", "system body")],
+        )
 
         cm = ContextManager(storage=MagicMock(), context_builder=cb)
         cm.conversation_manager = MagicMock()

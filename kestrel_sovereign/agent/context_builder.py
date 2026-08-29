@@ -130,6 +130,7 @@ class ContextBuilder:
         semantic_inference_limits=None,
         semantic_maintenance_limits=None,
         semantic_answerability_gate=None,
+        context_clause_registry=None,
     ):
         """
         Initialize the context builder.
@@ -161,6 +162,9 @@ class ContextBuilder:
         self._semantic_answerability_gate = semantic_answerability_gate
         self.last_semantic_recall_metadata: Dict[str, Any] = {"status": "disabled"}
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
+        # This is a core-owned cache of immutable rendered bytes. Reading its
+        # snapshot during a turn never invokes a feature getter or renderer.
+        self._context_clause_registry = context_clause_registry
 
         # Load bootstrap config from kestrel.toml
         max_chars_per_file = DEFAULT_MAX_CHARS_PER_FILE
@@ -936,10 +940,51 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 )
             )
 
+        for clause in self._resolved_context_clauses():
+            if clause.body:
+                groups.append((clause.name, [clause.body]))
+
         if system_prompt_addendum:
             groups.append(("system_prompt_addendum", [system_prompt_addendum]))
 
         return groups
+
+    def _resolved_context_clauses(self):
+        registry = getattr(self, "_context_clause_registry", None)
+        return () if registry is None else registry.snapshot()
+
+    @staticmethod
+    def _join_system_prompt_groups(
+        groups: List[Tuple[str, List[str]]],
+    ) -> Tuple[str, List[Tuple[str, str]]]:
+        subsections = [
+            (name, "\n\n".join(parts)) for name, parts in groups
+        ]
+        return (
+            "\n\n".join(body for _name, body in subsections),
+            subsections,
+        )
+
+    def build_system_prompt_with_subsections(
+        self,
+        constitution: str,
+        include_briefing: bool = True,
+        additional_context: Optional[str] = None,
+        prompt_adaptation: Optional['PromptAdaptation'] = None,
+        state_of_mind: Optional['StateOfMind'] = None,
+        system_prompt_addendum: Optional[str] = None,
+    ) -> Tuple[str, List[Tuple[str, str]]]:
+        """Build once and retain the exact subsection bodies for accounting."""
+
+        groups = self._collect_system_prompt_parts(
+            constitution=constitution,
+            include_briefing=include_briefing,
+            additional_context=additional_context,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind,
+            system_prompt_addendum=system_prompt_addendum,
+        )
+        return self._join_system_prompt_groups(groups)
 
     def measure_mandatory_system_tokens(
         self,
@@ -1027,7 +1072,7 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         # this method and ``measure_context_breakdown`` read from
         # ``_collect_system_prompt_parts`` so per-subsection attribution
         # cannot drift from the assembled bytes.
-        groups = self._collect_system_prompt_parts(
+        prompt, _subsections = self.build_system_prompt_with_subsections(
             constitution=constitution,
             include_briefing=include_briefing,
             additional_context=additional_context,
@@ -1035,8 +1080,7 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
             state_of_mind=state_of_mind,
             system_prompt_addendum=system_prompt_addendum,
         )
-        flat_parts: List[str] = [p for _, parts in groups for p in parts]
-        return "\n\n".join(flat_parts)
+        return prompt
 
     def build_system_prompt_with_tracking(
         self,
@@ -1124,6 +1168,10 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
             state_of_mind_block=state_of_mind_block,
             style_reminder=style_reminder,
             additional_context=additional_context,
+            context_clauses=tuple(
+                (clause.owner, clause.name, clause.priority, clause.body)
+                for clause in self._resolved_context_clauses()
+            ),
             budget_bytes=budget_bytes,
         )
 

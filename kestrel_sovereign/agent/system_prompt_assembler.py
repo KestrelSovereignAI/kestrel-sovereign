@@ -10,6 +10,7 @@ Produces the full in-agent system prompt by combining:
 5. Other BootstrapLoader files (priority 6)
 6. Style reminder (priority 7)
 7. Caller-supplied additional context (priority 7)
+8. Lifecycle-resolved feature context (priority 8+)
 
 When the assembled prompt exceeds a configured byte budget, clauses
 are dropped highest-priority-number first (within a priority, in
@@ -35,7 +36,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 
 # Priority ladder. Lower number = higher priority = kept first.
@@ -49,6 +50,7 @@ PRIORITY_SOUL = 4
 PRIORITY_STATE_OF_MIND = 5
 PRIORITY_OTHER_BOOTSTRAP = 6
 PRIORITY_STYLE_REMINDER = 7
+PRIORITY_CONTRIBUTED_CONTEXT = 8
 
 # Canonical clause names. Used in `signal_log.injected_clauses_json`
 # and `dropped_clauses_json`. Filenames stay literal (e.g. "AGENTS.md")
@@ -93,6 +95,7 @@ class SystemPromptResult:
     prompt: str
     injected_clauses: List[str]
     dropped_clauses: List[str]
+    subsections: List[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -147,6 +150,7 @@ def assemble_system_prompt(
     state_of_mind_block: Optional[str] = None,
     style_reminder: Optional[str] = None,
     additional_context: Optional[str] = None,
+    context_clauses: Iterable[tuple[str, str, int, str]] = (),
     budget_bytes: Optional[int] = None,
 ) -> SystemPromptResult:
     """Assemble the system prompt with priority-ordered truncation.
@@ -277,6 +281,29 @@ def assemble_system_prompt(
             body=_wrap("ADDITIONAL CONTEXT", additional_context),
         )
 
+    # Feature context is already rendered and cached by the contribution
+    # runtime. Sort by the SDK contract, never entry-point load order. Map the
+    # feature's arbitrary integer priorities into a host band strictly below
+    # STYLE_REMINDER while preserving their relative drop order.
+    ordered_context = sorted(
+        context_clauses,
+        key=lambda clause: (clause[2], clause[1], clause[0]),
+    )
+    priority_ranks = {
+        priority: rank
+        for rank, priority in enumerate(
+            sorted({clause[2] for clause in ordered_context})
+        )
+    }
+    for _owner, name, priority, body in ordered_context:
+        if not body:
+            continue
+        add(
+            name=name,
+            priority=PRIORITY_CONTRIBUTED_CONTEXT + priority_ranks[priority],
+            body=body,
+        )
+
     # --------------------------------------------------------------
     # Truncation.
     # --------------------------------------------------------------
@@ -290,6 +317,7 @@ def assemble_system_prompt(
         prompt=prompt,
         injected_clauses=[c.name for c in kept_sorted],
         dropped_clauses=[c.name for c in dropped_in_drop_order],
+        subsections=[(c.name, c.body) for c in kept_sorted],
     )
 
 
