@@ -530,6 +530,8 @@ async def _run_shell(agent_dir: Path, args) -> int:
         llm_service=llm_service,
     )
     from kestrel_sovereign.hold import (
+        HOLD_TURN_CONSOLE_MESSAGE,
+        HoldTurnRefusal,
         build_bound_host_context,
         close_bound_host_context,
     )
@@ -562,6 +564,8 @@ async def _run_shell(agent_dir: Path, args) -> int:
                 response = await agent.process_input(user_input)
                 decryption_error_count = 0
                 print(f"\nKestrel: {response}")
+            except HoldTurnRefusal:
+                print(f"\n{HOLD_TURN_CONSOLE_MESSAGE}")
             except DecryptionError:
                 decryption_error_count += 1
                 print(f"\n\U0001f510 DECRYPTION ERROR: Cannot read encrypted data.")

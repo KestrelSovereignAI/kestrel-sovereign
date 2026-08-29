@@ -852,6 +852,70 @@ class TestGetRouter:
         )
         assert "private bridge Hold reason" not in response.text
 
+    def test_late_bridge_stream_hold_refusal_is_typed_sse(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.features.bridge.router import get_router
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+            HoldTurnRefusal,
+        )
+        from kestrel_sovereign.rate_limit import limiter
+
+        latch = HoldState(
+            scope=HoldScope.AGENT,
+            target_id="did:test:late-bridge-held",
+            reason="private late bridge reason",
+            actor_id="did:sovereign:operator",
+            set_at="2026-08-28T12:00:00+00:00",
+            hold_receipt_id="hold:late-bridge",
+            revision=1,
+        )
+        refusal = HoldTurnRefusal(
+            agent_id="did:test:late-bridge-held",
+            effective_state=EffectiveHoldState(host=None, agent=latch),
+        )
+
+        async def held_after_preflight(*_args, **_kwargs):
+            raise refusal
+            yield  # pragma: no cover
+
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent = MagicMock()
+        agent.did = "did:test:late-bridge-held"
+        agent.agent_id = "did:test:late-bridge-held"
+        agent.features = {"BridgeFeature": bridge}
+        agent.__dict__["_hold_store"] = MagicMock(
+            get_effective=AsyncMock(
+                return_value=EffectiveHoldState(host=None, agent=None)
+            )
+        )
+        agent.process_input_streaming = held_after_preflight
+        agent.register_active_request = MagicMock()
+        agent._cleanup_cancelled_request = MagicMock()
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.state.agent = agent
+        app.include_router(get_router())
+
+        response = TestClient(app).post(
+            "/api/bridge/stream",
+            json={"message": "race the Hold", "channel_type": "api"},
+        )
+
+        assert response.status_code == 200
+        assert '"code": "agent_held"' in response.text
+        assert '"disposition": "refused"' in response.text
+        assert "Agent processing error" not in response.text
+        assert "private late bridge reason" not in response.text
+
 
 # ============================================================================
 # Graceful Degradation Tests

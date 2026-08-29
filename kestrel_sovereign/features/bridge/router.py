@@ -269,6 +269,10 @@ def get_router() -> APIRouter:
                     content_preview=response_text,
                     duration_ms=elapsed_ms,
                 )
+            except HoldTurnRefusal as refusal:
+                from kestrel_sovereign.hold import held_turn_sse_event
+
+                yield held_turn_sse_event(refusal)
             except Exception as e:
                 # The SSE client gets only the stable safe payload built by
                 # the same shared boundary /api/agent/stream uses.  Logging

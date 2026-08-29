@@ -141,3 +141,15 @@ def test_held_refusal_cannot_be_built_from_an_unheld_snapshot() -> None:
             agent_id="did:test:held",
             effective_state=EffectiveHoldState(host=None, agent=None),
         )
+
+
+def test_both_local_shells_catch_typed_hold_refusals() -> None:
+    """Mutation tripwire: a refused input must not terminate either shell."""
+
+    from pathlib import Path
+
+    cli_source = Path("kestrel_sovereign/cli.py").read_text()
+    legacy_source = Path("kestrel_sovereign/main.py").read_text()
+
+    assert "except HoldTurnRefusal:" in cli_source
+    assert "except HoldTurnRefusal:" in legacy_source

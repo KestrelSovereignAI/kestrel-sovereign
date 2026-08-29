@@ -1641,7 +1641,7 @@ async def _shutdown_phoenix(app: FastAPI) -> bool:
 
 
 async def _shutdown_host_features(app: FastAPI) -> None:
-    """Release host-scoped resources without leaving later resources behind."""
+    """Unmount host features while keeping the Hold backend alive for agents."""
     from kestrel_sovereign import host_features as _hf
 
     host_features = getattr(app.state, "host_features", []) or []
@@ -1654,7 +1654,8 @@ async def _shutdown_host_features(app: FastAPI) -> None:
     finally:
         # Router/UI state must not outlive a failed feature shutdown.  Each
         # following cleanup is in a ``finally`` so one bad unmount cannot leave
-        # the host session factory or database live.
+        # the host session factory live. The Hold database intentionally stays
+        # open until the later agent drain completes.
         session_factory = (
             getattr(host_context, "session_factory", None)
             if host_context is not None
@@ -1672,24 +1673,26 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                     try:
                         if session_factory is not None:
                             await session_factory.close()
-                    except Exception as exc:  # noqa: BLE001 - close host DB too
+                    except Exception as exc:  # noqa: BLE001 - keep unmounting
                         logger.warning(
                             "Host feature session-factory shutdown failed: %s", exc
                         )
-                    finally:
-                        host_db = (
-                            getattr(host_context, "db", None)
-                            if host_context is not None
-                            else None
-                        )
-                        if host_db is not None and hasattr(host_db, "close"):
-                            try:
-                                await host_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Host feature database shutdown failed: %s", exc
-                                )
-                        app.state.host_context = None
+
+
+async def _shutdown_host_context(app: FastAPI) -> None:
+    """Close the host control backend after every bound agent has stopped."""
+
+    host_context = getattr(app.state, "host_context", None)
+    try:
+        host_db = (
+            getattr(host_context, "db", None)
+            if host_context is not None
+            else None
+        )
+        if host_db is not None and hasattr(host_db, "close"):
+            await host_db.close()
+    finally:
+        app.state.host_context = None
 
 
 def _uses_shared_postgres_scheduler() -> bool:
@@ -2130,6 +2133,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # onboarding can remount routes or UI after their only teardown pass.
         ("host-features", lambda: _shutdown_host_features(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        ("host-context", lambda: _shutdown_host_context(app)),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
         phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(

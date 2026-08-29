@@ -7,6 +7,7 @@ when neither the host nor the addressed agent latch is active.
 
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Any
 
@@ -56,6 +57,39 @@ class HoldTurnRefusal(RuntimeError):
             "agent_hold": effective_state.agent,
         }
         super().__init__(f"Agent {agent_id!r} is held and cannot begin a turn")
+
+
+HOLD_TURN_CONSOLE_MESSAGE = (
+    "⏸️ Agent held (agent_held; disposition=refused). "
+    "This input was not started."
+)
+
+
+def held_turn_stream_block(refusal: HoldTurnRefusal) -> str:
+    """Return the fixed text-stream disposition for a late Hold refusal."""
+
+    if not isinstance(refusal, HoldTurnRefusal):
+        raise TypeError("stream Hold translation requires HoldTurnRefusal")
+    return (
+        "\n\n---\n⏸️ **Agent held** "
+        "(`agent_held`; disposition=refused). This request was not started."
+    )
+
+
+def held_turn_sse_event(refusal: HoldTurnRefusal) -> str:
+    """Return a typed, content-free SSE event for a late Hold refusal."""
+
+    if not isinstance(refusal, HoldTurnRefusal):
+        raise TypeError("SSE Hold translation requires HoldTurnRefusal")
+    payload = json.dumps(
+        {
+            "type": "held",
+            "code": refusal.code,
+            "disposition": HeldWorkDisposition.REFUSED.value,
+            "message": "The agent is held and this request was not started.",
+        }
+    )
+    return f"data: {payload}\n\n"
 
 
 def require_context_hold_store(context: Any) -> Any:
@@ -146,12 +180,15 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
 
 
 __all__ = [
+    "HOLD_TURN_CONSOLE_MESSAGE",
     "HoldEnforcementUnavailableError",
     "HoldTurnRefusal",
     "HeldWorkDisposition",
     "build_bound_host_context",
     "close_bound_host_context",
     "get_effective_hold_state",
+    "held_turn_sse_event",
+    "held_turn_stream_block",
     "require_context_hold_store",
     "require_turn_start_allowed",
 ]

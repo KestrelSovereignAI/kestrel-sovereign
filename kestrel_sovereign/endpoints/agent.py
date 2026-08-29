@@ -751,6 +751,10 @@ async def stream_agent_response(request: Request):
                 ):
                     yield stop_notice
                     stop_notice_emitted = True
+            except HoldTurnRefusal as refusal:
+                from kestrel_sovereign.hold import held_turn_stream_block
+
+                yield held_turn_stream_block(refusal)
             except Exception as e:
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation

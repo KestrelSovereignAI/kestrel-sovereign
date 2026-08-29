@@ -420,8 +420,8 @@ async def test_server_lifespan_wires_and_closes_host_features(
         "host-stop",
         "host-unmount",
         "session-close",
-        "db-close",
         "agents-stop",
+        "db-close",
     ]
 
 

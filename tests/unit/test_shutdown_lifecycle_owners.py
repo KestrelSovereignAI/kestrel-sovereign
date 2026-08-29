@@ -353,13 +353,19 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
         phases.append("phoenix")
         return False
 
+    async def close_context(_app) -> None:
+        phases.append("context")
+
     monkeypatch.setattr(server, "_shutdown_host_features", fail_host)
     monkeypatch.setattr(server, "_shutdown_server_agents", fail_agents)
+    monkeypatch.setattr(
+        server, "_shutdown_host_context", close_context, raising=False
+    )
     monkeypatch.setattr(server, "_shutdown_phoenix", finish_phoenix)
 
     cancelled, failure = await server._shutdown_server_resources(app)
 
-    assert phases == ["host", "agents", "phoenix"]
+    assert phases == ["host", "agents", "context", "phoenix"]
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
     assert str(failure) == "host failure"

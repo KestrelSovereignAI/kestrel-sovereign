@@ -212,6 +212,8 @@ async def main():
     llm_service = LLMService()
     agent = KestrelAgent(did=agent_did, storage_path=storage_path, llm_service=llm_service)
     from kestrel_sovereign.hold import (
+        HOLD_TURN_CONSOLE_MESSAGE,
+        HoldTurnRefusal,
         build_bound_host_context,
         close_bound_host_context,
     )
@@ -246,6 +248,8 @@ async def main():
                 response = await agent.process_input(user_input)
                 decryption_error_count = 0  # Reset on success
                 print(f"\nKestrel: {response}")
+            except HoldTurnRefusal:
+                print(f"\n{HOLD_TURN_CONSOLE_MESSAGE}")
             except DecryptionError as e:
                 decryption_error_count += 1
                 logger.error(f"DecryptionError during processing: {e}")

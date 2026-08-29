@@ -441,6 +441,67 @@ class TestStopEndpoint:
         assert "private operator reason" not in response.text
         mock_agent._cleanup_cancelled_request.assert_called_once()
 
+    def test_late_stream_hold_refusal_keeps_typed_in_band_disposition(self):
+        """A Hold that wins after preflight must not become a generic 200 error."""
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+            HoldTurnRefusal,
+        )
+        from kestrel_sovereign.rate_limit import limiter
+
+        latch = HoldState(
+            scope=HoldScope.AGENT,
+            target_id="did:test:late-held",
+            reason="private late Hold reason",
+            actor_id="did:sovereign:operator",
+            set_at="2026-08-28T12:00:00+00:00",
+            hold_receipt_id="hold:late-http",
+            revision=1,
+        )
+        refusal = HoldTurnRefusal(
+            agent_id="did:test:late-held",
+            effective_state=EffectiveHoldState(host=None, agent=latch),
+        )
+
+        async def held_after_preflight(*_args, **_kwargs):
+            raise refusal
+            yield  # pragma: no cover
+
+        agent = MagicMock()
+        agent.did = "did:test:late-held"
+        agent.agent_id = "did:test:late-held"
+        agent.__dict__["_hold_store"] = MagicMock(
+            get_effective=AsyncMock(
+                return_value=EffectiveHoldState(host=None, agent=None)
+            )
+        )
+        agent.process_input_streaming = held_after_preflight
+        agent.register_active_request = MagicMock()
+        agent._cleanup_cancelled_request = MagicMock()
+        agent.is_request_cancelled = MagicMock(return_value=False)
+        agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.state.agent = agent
+        app.include_router(router)
+
+        response = TestClient(app).post(
+            "/api/agent/stream", json={"input": "race the Hold"}
+        )
+
+        assert response.status_code == 200
+        assert "agent_held" in response.text
+        assert "disposition=refused" in response.text
+        assert "Error generating response" not in response.text
+        assert "private late Hold reason" not in response.text
+
     def test_stream_iterator_is_never_split_across_asgi_tasks(self):
         """The endpoint and StreamingResponse must not share one generator."""
 

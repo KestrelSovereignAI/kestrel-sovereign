@@ -130,6 +130,30 @@ async def test_custom_env_path_is_supported_hardened_and_reopened(
         await _close_context(reopened)
 
 
+@pytest.mark.asyncio
+async def test_explicit_host_db_env_override_beats_agent_postgres_backend(
+    tmp_path,
+    monkeypatch,
+):
+    private_parent = tmp_path / "host-override"
+    private_parent.mkdir(mode=0o700)
+    db_path = private_parent / "authoritative-host.db"
+    monkeypatch.setenv(HOST_DB_PATH_ENV, str(db_path))
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://must-not-be-opened.invalid/kestrel",
+    )
+
+    ctx = await build_host_context()
+    try:
+        assert ctx.db is not None
+        assert ctx.db.backend_type == "sqlite"
+        assert ctx.db.backend.db_path == str(db_path)
+    finally:
+        await _close_context(ctx)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX custody contract")
 def test_custom_path_refuses_shared_parent_without_chmod(tmp_path):
     shared_parent = tmp_path / "shared"

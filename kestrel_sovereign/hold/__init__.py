@@ -19,17 +19,21 @@ from .state import (
     HoldStore,
 )
 from .enforcement import (
+    HOLD_TURN_CONSOLE_MESSAGE,
     HeldWorkDisposition,
     HoldEnforcementUnavailableError,
     HoldTurnRefusal,
     build_bound_host_context,
     close_bound_host_context,
     get_effective_hold_state,
+    held_turn_sse_event,
+    held_turn_stream_block,
     require_context_hold_store,
     require_turn_start_allowed,
 )
 
 __all__ = [
+    "HOLD_TURN_CONSOLE_MESSAGE",
     "HeldWorkDisposition",
     "HOST_HOLD_TARGET",
     "EffectiveHoldState",
@@ -48,6 +52,8 @@ __all__ = [
     "build_bound_host_context",
     "close_bound_host_context",
     "get_effective_hold_state",
+    "held_turn_sse_event",
+    "held_turn_stream_block",
     "require_context_hold_store",
     "require_turn_start_allowed",
 ]

@@ -202,6 +202,7 @@ async def build_host_context(
     backend_error = ""
     try:
         from kestrel_sovereign.host_features.storage import (
+            HOST_DB_PATH_ENV,
             prepare_host_database,
             validate_sqlite_family_private,
         )
@@ -210,6 +211,7 @@ async def build_host_context(
 
         use_postgres = (
             db_path is None
+            and not os.environ.get(HOST_DB_PATH_ENV)
             and os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
             == "postgres"
         )

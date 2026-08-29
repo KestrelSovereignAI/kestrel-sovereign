@@ -339,6 +339,7 @@ async def test_host_context_uses_shared_postgres_for_hold_state(
     prepare = MagicMock(side_effect=AssertionError("SQLite must not open"))
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://shared/hold")
+    monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
     monkeypatch.setattr(AsyncDatabase, "postgres", postgres)
     monkeypatch.setattr(storage, "prepare_host_database", prepare)
 
