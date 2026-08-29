@@ -629,6 +629,7 @@ async def test_orchestrator_loop_streams_followup_text_in_real_time():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -725,6 +726,7 @@ async def test_orchestrator_loop_timeout_surfaces_failed_marker(monkeypatch):
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -824,6 +826,7 @@ async def test_orchestrator_loop_timeout_marker_precedes_separator():
 
         for method_name in (
             "_handle_orchestrator_response_streaming",
+            "_execute_tool_batch_at_stop_boundary",
             "_execute_tool_with_hooks", "_execute_tool_batch",
             "_partition_tool_calls", "_dispatch_tool_call",
             "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -929,6 +932,7 @@ async def test_orchestrator_loop_follow_up_tool_call_emits_revise_sentinel():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -1043,6 +1047,7 @@ async def test_orchestrator_loop_followup_separator_emitted_once_per_turn():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
