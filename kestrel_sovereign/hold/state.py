@@ -403,6 +403,11 @@ class HoldStore:
                 "CHECK (scope IN ('host', 'agent')), "
                 "CHECK (scope <> 'host' OR target_id = 'host'))"
             )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_operation_witnesses ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "receipt_id TEXT NOT NULL UNIQUE)"
+            )
             # Seed the witness exactly once for upgraded databases. Future
             # schema checks never recompute an existing count from mutable
             # receipt rows, so a later receipt deletion remains detectable.
@@ -417,10 +422,15 @@ class HoldStore:
             # One-time backfill for upgraded databases. A witness is never
             # overwritten from receipt rows after it exists, so later in-place
             # mutation remains detectable across schema checks and restarts.
-            existing_receipts = await self._db.fetchall(
-                f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts"
+            missing_content_witnesses = await self._db.fetchall(
+                "SELECT r.receipt_id, r.operation_id, r.action, r.disposition, "
+                "r.scope, r.target_id, r.reason, r.actor_id, r.occurred_at, "
+                "r.expected_hold_receipt_id, r.prior_hold_receipt_id, "
+                "r.resulting_hold_receipt_id FROM hold_receipts AS r "
+                "LEFT JOIN hold_receipt_content_witnesses AS w "
+                "ON w.receipt_id = r.receipt_id WHERE w.receipt_id IS NULL"
             )
-            for row in existing_receipts:
+            for row in missing_content_witnesses:
                 receipt = _receipt_from_row(row)
                 await self._db.execute(
                     "INSERT INTO hold_receipt_content_witnesses "
@@ -434,6 +444,19 @@ class HoldStore:
                         _receipt_content_digest(row),
                     ),
                 )
+            # Operation identities are global, not target-local. Keep a
+            # separate append-only tombstone so deleting a receipt cannot make
+            # its operation id available to a different target. The anti-join
+            # keeps repeat startup proportional to genuinely missing legacy
+            # witnesses rather than total receipt history.
+            await self._db.execute(
+                "INSERT INTO hold_operation_witnesses (operation_id, receipt_id) "
+                "SELECT r.operation_id, r.receipt_id FROM hold_receipts AS r "
+                "LEFT JOIN hold_operation_witnesses AS w "
+                "ON w.operation_id = r.operation_id "
+                "WHERE w.operation_id IS NULL "
+                "ON CONFLICT (operation_id) DO NOTHING"
+            )
             await self._db.execute(
                 "INSERT INTO hold_receipt_witnesses "
                 "(scope, target_id, receipt_count) "
@@ -539,6 +562,35 @@ class HoldStore:
                 "Hold receipt history has a duplicate operation identity"
             )
         return rows[0] if rows else None
+
+    async def _validate_operation_witness(self, operation_id: str) -> Any:
+        """Return the receipt row only when its global identity is intact."""
+
+        witnesses = await self._db.fetchall(
+            "SELECT receipt_id FROM hold_operation_witnesses "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        )
+        if len(witnesses) > 1:
+            raise HoldCorruptStateError(
+                "Hold operation witness has a duplicate operation identity"
+            )
+        receipt_row = await self._read_receipt_by_operation(operation_id)
+        if not witnesses:
+            if receipt_row is not None:
+                raise HoldCorruptStateError(
+                    "Hold receipt is missing its global operation witness"
+                )
+            return None
+        if receipt_row is None:
+            raise HoldCorruptStateError(
+                "Hold operation witness refers to a missing receipt"
+            )
+        if str(witnesses[0][0]) != str(receipt_row[0]):
+            raise HoldCorruptStateError(
+                "Hold operation witness does not match receipt identity"
+            )
+        return receipt_row
 
     async def _read_receipt_by_id(self, receipt_id: str) -> Any:
         return await self._db.fetchone(
@@ -805,6 +857,11 @@ class HoldStore:
         receipt_row = await self._read_receipt_by_operation(operation_id)
         receipt = _receipt_from_row(receipt_row)
         await self._db.execute(
+            "INSERT INTO hold_operation_witnesses (operation_id, receipt_id) "
+            "VALUES (?, ?)",
+            (receipt.operation_id, receipt.receipt_id),
+        )
+        await self._db.execute(
             "INSERT INTO hold_receipt_content_witnesses "
             "(receipt_id, scope, target_id, receipt_digest) "
             "VALUES (?, ?, ?, ?)",
@@ -881,7 +938,7 @@ class HoldStore:
             await self._validate_latch_projection(
                 prior, resolved_scope, resolved_target
             )
-            replay_row = await self._read_receipt_by_operation(operation)
+            replay_row = await self._validate_operation_witness(operation)
             if replay_row is not None:
                 replay = _receipt_from_row(replay_row)
                 self._assert_replay(
@@ -1003,7 +1060,7 @@ class HoldStore:
             await self._validate_latch_projection(
                 prior, resolved_scope, resolved_target
             )
-            replay_row = await self._read_receipt_by_operation(operation)
+            replay_row = await self._validate_operation_witness(operation)
             if replay_row is not None:
                 replay = _receipt_from_row(replay_row)
                 self._assert_replay(
@@ -1157,7 +1214,7 @@ class HoldStore:
 
         operation = _required_text(operation_id, "operation_id")
         async with self._db.transaction():
-            row = await self._read_receipt_by_operation(operation)
+            row = await self._validate_operation_witness(operation)
             if row is None:
                 return None
             receipt = _receipt_from_row(row)
