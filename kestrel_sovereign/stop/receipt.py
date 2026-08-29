@@ -37,6 +37,15 @@ class StopReceiptCorruptError(StopReceiptError):
 
 
 @dataclass(frozen=True, slots=True)
+class StopOperationClaim:
+    """Durable ownership of one operation before cancellation side effects."""
+
+    operation_id: str
+    request_fingerprint: str
+    claim_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class StopReceipt:
     receipt_id: str
     operation_id: str
@@ -117,6 +126,13 @@ class StopReceiptStore:
                 "('stopped', 'already_complete', 'refused', 'unreachable')))"
             )
             await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS stop_operation_claims ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "request_fingerprint TEXT NOT NULL, "
+                "claim_id TEXT NOT NULL UNIQUE, "
+                "claimed_at TEXT NOT NULL)"
+            )
+            await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stop_receipts_target "
                 "ON stop_receipts(scope, requested_target, occurred_at, receipt_id)"
             )
@@ -144,10 +160,65 @@ class StopReceiptStore:
         self._assert_request_matches_receipt(request, receipt, expected)
         return receipt
 
+    async def claim(
+        self,
+        request: StopRequest,
+    ) -> StopReceipt | StopOperationClaim | None:
+        """Claim an operation before effects, replay it, or report in-flight.
+
+        A claim without a receipt is deliberately durable. If an owner dies
+        after performing cancellation but before recording its outcomes, an
+        exact retry must refuse instead of guessing that the effect is safe to
+        repeat.
+        """
+
+        fingerprint = _fingerprint(request)
+        claim_id = str(uuid4())
+        async with self._db.transaction(immediate=True):
+            await self._lock_operation(request.correlation_id)
+            replay_row = await self._db.fetchone(
+                f"SELECT {_RECEIPT_COLUMNS} FROM stop_receipts "
+                "WHERE operation_id = ?",
+                (request.correlation_id,),
+            )
+            if replay_row is not None:
+                replay = await self._receipt_from_row(replay_row)
+                self._assert_request_matches_receipt(
+                    request, replay, fingerprint
+                )
+                return replay
+
+            claim_row = await self._db.fetchone(
+                "SELECT request_fingerprint, claim_id "
+                "FROM stop_operation_claims WHERE operation_id = ?",
+                (request.correlation_id,),
+            )
+            if claim_row is not None:
+                if claim_row[0] != fingerprint:
+                    raise StopReceiptConflict(
+                        "Stop operation identity was reused for a different request"
+                    )
+                return None
+
+            now_sql = database_now_sql(self._db)
+            await self._db.execute(
+                "INSERT INTO stop_operation_claims ("
+                "operation_id, request_fingerprint, claim_id, claimed_at"
+                f") VALUES (?, ?, ?, {now_sql})",
+                (request.correlation_id, fingerprint, claim_id),
+            )
+            return StopOperationClaim(
+                operation_id=request.correlation_id,
+                request_fingerprint=fingerprint,
+                claim_id=claim_id,
+            )
+
     async def persist(
         self,
         request: StopRequest,
         outcomes: tuple[StopOutcome, ...],
+        *,
+        claim_id: str | None = None,
     ) -> StopReceipt:
         """Atomically append one request and its ordered per-target outcomes."""
 
@@ -168,6 +239,26 @@ class StopReceiptStore:
                         request, replay, fingerprint
                     )
                     return replay
+
+                claim_row = await self._db.fetchone(
+                    "SELECT request_fingerprint, claim_id "
+                    "FROM stop_operation_claims WHERE operation_id = ?",
+                    (request.correlation_id,),
+                )
+                claim_matches = bool(
+                    claim_row is not None
+                    and len(claim_row) == 2
+                    and claim_row[0] == fingerprint
+                    and claim_row[1] == claim_id
+                )
+                if claim_row is not None and not claim_matches:
+                    raise StopReceiptConflict(
+                        "Stop operation claim is owned elsewhere"
+                    )
+                if claim_id is not None and not claim_matches:
+                    raise StopReceiptConflict(
+                        "Stop operation claim is missing"
+                    )
 
                 now_sql = database_now_sql(self._db)
                 await self._db.execute(
@@ -214,6 +305,16 @@ class StopReceiptStore:
                 self._assert_request_matches_receipt(
                     request, stored, fingerprint
                 )
+                if claim_id is not None:
+                    deleted = await self._db.execute(
+                        "DELETE FROM stop_operation_claims "
+                        "WHERE operation_id = ? AND claim_id = ?",
+                        (request.correlation_id, claim_id),
+                    )
+                    if deleted != 1:
+                        raise StopReceiptConflict(
+                            "Stop operation claim changed before receipt commit"
+                        )
                 return stored
         except Exception as error:
             domain = self._domain_error(error)
@@ -253,10 +354,8 @@ class StopReceiptStore:
         if cascade_int not in (0, 1):
             raise StopReceiptCorruptError("Stop receipt cascade flag is invalid")
         for field_name, value in (
-            ("requested_target", row[5]),
             ("target_agent_id", row[6]),
             ("reason", row[7]),
-            ("turn_id", row[10]),
             ("span_id", row[11]),
             ("trace_id", row[12]),
         ):
@@ -266,6 +365,16 @@ class StopReceiptStore:
                 raise StopReceiptCorruptError(
                     f"Stop receipt {field_name} is invalid"
                 )
+        if row[5] is not None and (
+            not isinstance(row[5], str) or not row[5]
+        ):
+            raise StopReceiptCorruptError(
+                "Stop receipt requested_target is invalid"
+            )
+        if row[10] is not None and (
+            not isinstance(row[10], str) or not row[10]
+        ):
+            raise StopReceiptCorruptError("Stop receipt turn_id is invalid")
         outcome_rows = await self._db.fetchall(
             f"SELECT {_OUTCOME_COLUMNS} FROM stop_receipt_outcomes "
             "WHERE receipt_id = ? ORDER BY ordinal",
@@ -418,6 +527,7 @@ class UnavailableStopReceiptStore:
 
 __all__ = [
     "StopReceipt",
+    "StopOperationClaim",
     "StopReceiptConflict",
     "StopReceiptCorruptError",
     "StopReceiptError",

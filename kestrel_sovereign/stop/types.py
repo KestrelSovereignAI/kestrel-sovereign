@@ -111,8 +111,11 @@ class StopRequest:
                 object.__setattr__(self, "turn_id", self.target)
             elif self.turn_id != self.target:
                 raise ValueError("turn Stop identity must match its target")
+        if self.turn_id is not None and (
+            not isinstance(self.turn_id, str) or not self.turn_id
+        ):
+            raise ValueError("turn_id must be a non-empty string when supplied")
         for field_name, value in (
-            ("turn_id", self.turn_id),
             ("span_id", self.span_id),
             ("trace_id", self.trace_id),
         ):
