@@ -33,7 +33,7 @@ API_KEY = "test-bridge-key"
 pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 
-def _boot(process_input_streaming, *, cancellation_after_stream=False):
+def _boot(process_input_streaming, *, cancel_on_check=None):
     """Boot the real app with a single agent exposing a BridgeFeature and the
     given ``process_input_streaming`` async generator. Returns ``(app, restore)``.
     """
@@ -66,7 +66,7 @@ def _boot(process_input_streaming, *, cancellation_after_stream=False):
     def _is_request_cancelled(_request_id):
         nonlocal cancellation_checks
         cancellation_checks += 1
-        return cancellation_after_stream and cancellation_checks >= 2
+        return cancel_on_check is not None and cancellation_checks >= cancel_on_check
 
     agent.is_request_cancelled = MagicMock(side_effect=_is_request_cancelled)
 
@@ -84,11 +84,11 @@ def _boot(process_input_streaming, *, cancellation_after_stream=False):
     return app, restore
 
 
-def _post_stream(process_input_streaming, *, cancellation_after_stream=False):
+def _post_stream(process_input_streaming, *, cancel_on_check=None):
     os.environ["KESTREL_API_KEY"] = API_KEY
     app, restore = _boot(
         process_input_streaming,
-        cancellation_after_stream=cancellation_after_stream,
+        cancel_on_check=cancel_on_check,
     )
     try:
         with TestClient(app) as client:
@@ -104,14 +104,14 @@ def _post_stream(process_input_streaming, *, cancellation_after_stream=False):
 def _post_stream_with_agent(
     process_input_streaming,
     *,
-    cancellation_after_stream=False,
+    cancel_on_check=None,
 ):
     """Drive the real bridge route and retain its test agent for assertions."""
 
     os.environ["KESTREL_API_KEY"] = API_KEY
     app, restore = _boot(
         process_input_streaming,
-        cancellation_after_stream=cancellation_after_stream,
+        cancel_on_check=cancel_on_check,
     )
     agent = app.state.agent
     try:
@@ -166,7 +166,7 @@ def test_bridge_stream_reports_stopped_command_instead_of_success():
 
     response = _post_stream(
         _stopped_command,
-        cancellation_after_stream=True,
+        cancel_on_check=5,
     )
 
     assert response.status_code == 200
@@ -266,7 +266,7 @@ def test_bridge_stream_withholds_chunk_queued_before_stop():
 
     response, agent = _post_stream_with_agent(
         _queued,
-        cancellation_after_stream=True,
+        cancel_on_check=5,
     )
 
     assert response.status_code == 200
@@ -284,7 +284,7 @@ def test_bridge_stream_reports_stop_after_clean_producer_eof():
 
     response, agent = _post_stream_with_agent(
         _clean_eof,
-        cancellation_after_stream=True,
+        cancel_on_check=5,
     )
 
     assert response.status_code == 200
