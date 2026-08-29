@@ -45,6 +45,13 @@ class RequestLifecycleMixin:
         """Track an active delivery and bind its generation to this task."""
         if not hasattr(self, "_active_request_ids"):
             self._active_request_ids = set()
+        if not isinstance(getattr(self, "_cancelled_requests", None), set):
+            self._cancelled_requests = set()
+        if not isinstance(
+            getattr(self, "_cancelled_request_generations", None),
+            set,
+        ):
+            self._cancelled_request_generations = set()
         if not isinstance(getattr(self, "_active_request_counts", None), dict):
             self._active_request_counts = {}
         counts = self._active_request_counts
