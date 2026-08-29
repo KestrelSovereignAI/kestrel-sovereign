@@ -55,6 +55,35 @@ async def test_get_agent_by_did_closes_hold_context_when_initialize_fails(
     assert agent._standalone_hold_context is None
 
 
+@pytest.mark.asyncio
+async def test_standalone_main_closes_hold_context_when_initialize_fails(
+    monkeypatch, tmp_path
+):
+    agent = MagicMock()
+    agent.initialize = AsyncMock(side_effect=RuntimeError("initialize failed"))
+    context = object()
+    build_context = AsyncMock(return_value=context)
+    close_context = AsyncMock()
+    monkeypatch.setattr(main_module, "KestrelAgent", MagicMock(return_value=agent))
+    monkeypatch.setattr(main_module, "LLMService", MagicMock(return_value=object()))
+    monkeypatch.setattr(
+        main_module, "get_agent_did_async", AsyncMock(return_value="did:test:broken")
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.build_bound_host_context", build_context
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.close_bound_host_context", close_context
+    )
+    monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["kestrel-sovereign"])
+
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        await main_module.main()
+
+    close_context.assert_awaited_once_with(context)
+
+
 def _write_anchor(agent_dir: Path, *dids: str) -> Path:
     """Write the birth record the way inception leaves it.
 

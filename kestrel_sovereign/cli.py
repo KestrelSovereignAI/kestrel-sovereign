@@ -537,7 +537,17 @@ async def _run_shell(agent_dir: Path, args) -> int:
     )
 
     hold_context = await build_bound_host_context(agent)
-    await agent.initialize()
+    try:
+        await agent.initialize()
+    except BaseException as error:
+        try:
+            await close_bound_host_context(hold_context)
+        except BaseException as close_error:
+            error.add_note(
+                "Standalone Hold context cleanup also failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        raise
 
     # Load extension if requested
     if hasattr(args, 'app') and args.app:

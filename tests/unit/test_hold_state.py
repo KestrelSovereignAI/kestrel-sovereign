@@ -716,6 +716,43 @@ async def test_non_applied_receipt_prior_must_reference_applied_authority(
 
 
 @pytest.mark.asyncio
+async def test_same_state_receipt_must_match_the_referenced_authority(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="maintenance",
+        operation_id="original-hold-authority",
+    )
+    authority = held.receipt.receipt_id
+    await db.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+        "prior_hold_receipt_id, resulting_hold_receipt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "forged-same-state-receipt",
+            "forged-same-state-operation",
+            "hold",
+            "already_in_state",
+            "agent",
+            "did:agent:kite",
+            "different reason",
+            "did:sovereign:someone-else",
+            "2026-08-28T00:00:00+00:00",
+            "",
+            authority,
+            authority,
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="same-state.*authority"):
+        await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("read", ["one", "effective"])
 async def test_state_read_validates_projection_inside_one_locked_snapshot(
     hold_db,

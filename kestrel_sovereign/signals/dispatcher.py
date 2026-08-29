@@ -1418,6 +1418,27 @@ class SignalDispatcher:
             self._held_durable_claim_consumers.add(consumer_id)
         return True
 
+    async def _fence_claimed_durable_delivery_after_hold_race(
+        self,
+        *,
+        consumer_id: str,
+        delivery: DurableDelivery,
+    ) -> Optional[DurableDelivery]:
+        """Publish a lease only if Hold still permits the handoff."""
+
+        if not await self._durable_claim_deferred_by_hold(consumer_id):
+            return self._delivery_with_transient_handoff(delivery)
+        if delivery.lease_token:
+            await self._durable_store.release_delivery_for_hold(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                delivery_id=delivery.delivery_id,
+                lease_token=delivery.lease_token,
+            )
+        # If the exact token expired during this recheck, normal durable
+        # recovery still owns the row. Never disclose a lease after Hold won.
+        return None
+
     async def claim_durable_delivery(
         self, *, consumer_id: str, executor_id: str
     ) -> Optional[DurableDelivery]:
@@ -1436,7 +1457,10 @@ class SignalDispatcher:
                 ),
             )
             if delivery is not None:
-                return self._delivery_with_transient_handoff(delivery)
+                return await self._fence_claimed_durable_delivery_after_hold_race(
+                    consumer_id=consumer_id,
+                    delivery=delivery,
+                )
 
             # A payload-elided event is initially an unclaimable reservation in
             # the transaction that writes its durable privacy marker. It becomes a
@@ -1478,7 +1502,10 @@ class SignalDispatcher:
                         self._discard_transient_durable_handoff(delivery_id)
                         continue
                     handoff.initial_lease_token = None
-                    return self._delivery_with_transient_handoff(delivery)
+                    return await self._fence_claimed_durable_delivery_after_hold_race(
+                        consumer_id=consumer_id,
+                        delivery=delivery,
+                    )
             return None
 
     async def claim_durable_delivery_for_event(
@@ -1507,7 +1534,10 @@ class SignalDispatcher:
                 ),
             )
             if delivery is not None:
-                return self._delivery_with_transient_handoff(delivery)
+                return await self._fence_claimed_durable_delivery_after_hold_race(
+                    consumer_id=consumer_id,
+                    delivery=delivery,
+                )
 
             async with self._transient_durable_initial_claim_lock:
                 reserved = await self._durable_store.get_delivery_for_event(
@@ -1534,7 +1564,10 @@ class SignalDispatcher:
                     self._discard_transient_durable_handoff(reserved.delivery_id)
                     return None
                 handoff.initial_lease_token = None
-                return self._delivery_with_transient_handoff(delivery)
+                return await self._fence_claimed_durable_delivery_after_hold_race(
+                    consumer_id=consumer_id,
+                    delivery=delivery,
+                )
 
     async def get_durable_delivery_for_event(
         self, *, consumer_id: str, event_id: str
@@ -3267,6 +3300,22 @@ class SignalDispatcher:
                 durable=True,
             )
             if held_result is not None:
+                # Persistence already owns this cursor event. If Hold won the
+                # lease-transfer race, the public claim seam rolled the exact
+                # lease back to RETRY without spending an attempt. The source
+                # may still advance: the dispatcher-owned drainer will resume
+                # this accepted row after Release.
+                if durable_admission is not None and not durable_admission.done():
+                    durable_admission.set_result(
+                        DurableAdmissionResult(
+                            (
+                                DurableAdmissionDisposition.COMMITTED
+                                if durable_created
+                                else DurableAdmissionDisposition.DUPLICATE
+                            ),
+                            signal.id,
+                        )
+                    )
                 return held_result
             existing = await self.get_durable_delivery_for_event(
                 consumer_id=consumer_id,

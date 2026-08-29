@@ -4581,6 +4581,56 @@ class DurableSignalStore(UnifiedStoreBase):
             agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id
         )
 
+    async def release_delivery_for_hold(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Undo an exact lease transfer when Hold wins admission.
+
+        Claim increments ``attempts`` as part of the ownership handoff. A Hold
+        observed immediately afterward means no executor received the work,
+        so the aborted handoff must not consume the retry budget.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("lease_token", lease_token)
+        now = _as_utc(now or self.now_utc())
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.DELIVERIES}
+            SET status = ?, attempts = CASE
+                    WHEN attempts > 0 THEN attempts - 1 ELSE 0
+                END,
+                lease_owner = NULL, lease_token = NULL,
+                lease_expires_at = NULL, next_attempt_at = ?,
+                last_error = COALESCE(
+                    last_error, 'hold committed during lease transfer'
+                ),
+                updated_at = ?
+            WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+              AND status = ? AND lease_token = ? AND lease_expires_at > ?
+            """,
+            (
+                RETRY,
+                self.to_timestamp_param(now),
+                self.to_timestamp_param(now),
+                agent_id,
+                consumer_id,
+                delivery_id,
+                LEASED,
+                lease_token,
+                self.to_timestamp_param(now),
+            ),
+        )
+        return updated == 1
+
     async def release_managed_delivery_after_task(
         self,
         *,

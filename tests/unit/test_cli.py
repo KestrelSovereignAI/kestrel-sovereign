@@ -6,7 +6,8 @@ Tests argument parsing, command dispatch, and individual command handlers.
 
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import toml
@@ -26,6 +27,7 @@ from kestrel_sovereign.cli import (
     cmd_storage,
     _agent_http_timeout,
     _DEFAULT_ASK_READ_TIMEOUT,
+    _run_shell,
 )
 from kestrel_sovereign.cli_lifecycle import (
     _REANCHOR_RUNBOOK,
@@ -1593,6 +1595,38 @@ class TestCmdShell:
         assert rc == 1
         output = capsys.readouterr().out
         assert "not found" in output
+
+    @pytest.mark.asyncio
+    async def test_local_shell_closes_hold_context_when_initialize_fails(
+        self, tmp_path
+    ):
+        storage = MagicMock()
+        storage.initialize = AsyncMock()
+        storage.get_nodes_by_type = AsyncMock(
+            return_value=[SimpleNamespace(node_id="did:test:broken-shell")]
+        )
+        storage.close = AsyncMock()
+        agent = MagicMock()
+        agent.initialize = AsyncMock(side_effect=RuntimeError("initialize failed"))
+        context = object()
+        build_context = AsyncMock(return_value=context)
+        close_context = AsyncMock()
+
+        with patch(
+            "kestrel_sovereign.storage.AsyncStorage", return_value=storage
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.KestrelAgent", return_value=agent
+        ), patch(
+            "kestrel_sovereign.llm.service.LLMService", return_value=object()
+        ), patch(
+            "kestrel_sovereign.hold.build_bound_host_context", build_context
+        ), patch(
+            "kestrel_sovereign.hold.close_bound_host_context", close_context
+        ):
+            with pytest.raises(RuntimeError, match="initialize failed"):
+                await _run_shell(tmp_path, SimpleNamespace(app=None))
+
+        close_context.assert_awaited_once_with(context)
 
     def test_shell_missing_db(self, multi_agent_env, capsys):
         """Shell should fail if agent database not found."""

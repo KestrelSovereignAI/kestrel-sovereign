@@ -495,6 +495,19 @@ class HoldStore:
                 raise HoldCorruptStateError(
                     "non-applied Hold receipt references missing authority"
                 )
+            if (
+                receipt.action is HoldAction.HOLD
+                and receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+                and receipt.prior_hold_receipt_id
+            ):
+                authority = authorities[receipt.prior_hold_receipt_id]
+                if (
+                    receipt.actor_id != authority.actor_id
+                    or receipt.reason != authority.reason
+                ):
+                    raise HoldCorruptStateError(
+                        "same-state Hold receipt does not match its authority"
+                    )
         consumers: dict[str, HoldReceipt] = {}
         for receipt in applied:
             prior = receipt.prior_hold_receipt_id

@@ -1773,6 +1773,50 @@ async def test_generic_durable_delivery_remains_unclaimed_until_release(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_hold_winning_during_claim_releases_the_new_lease(tmp_path):
+    """A Hold committed during storage admission owns the claim boundary."""
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "hold-wins-during-claim.db", "did:agent:claim-race"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-worker",
+        source="provider.message",
+        agent_id=agent.did,
+    )
+    unheld = EffectiveHoldState(host=None, agent=None)
+    store = _HoldSnapshots(unheld)
+    agent._hold_store = store
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did),
+            source_event_id="provider:claim-race",
+        )
+        claim_delivery = dispatcher._durable_store.claim_delivery
+
+        async def claim_then_hold(**kwargs):
+            delivery = await claim_delivery(**kwargs)
+            store.snapshots[:] = [_held_state(agent.did)]
+            return delivery
+
+        dispatcher._durable_store.claim_delivery = claim_then_hold
+
+        assert await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="workflow-executor",
+        ) is None
+        [deferred] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert deferred.status == RETRY
+        assert deferred.lease_token is None
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 async def test_hold_defers_cursor_cognition_before_claim_then_runs_after_release(
     tmp_path,
 ):
@@ -1874,7 +1918,7 @@ async def test_hold_winning_after_durable_claim_requeues_exact_lease(tmp_path):
         assert result.status is Status.COALESCED
         assert result.error == "hold_deferred"
         assert delivery is not None and delivery.status == RETRY
-        assert delivery.attempts == 1
+        assert delivery.attempts == 0
         agent.process_input.assert_not_awaited()
     finally:
         await dispatcher.shutdown_durable_delivery()
