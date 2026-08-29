@@ -157,6 +157,58 @@ async def test_acknowledged_turn_stop_is_queryable_by_durable_target(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_opaque_stop_identities_are_blinded_in_claims_and_receipts(tmp_path):
+    """Caller retry/turn IDs remain usable without a plaintext footprint."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-blinded-ids.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        request = replace(
+            _request(correlation_id="private correlation: patient@example.test"),
+            target="private turn: diagnosis-123",
+            turn_id="private turn: diagnosis-123",
+        )
+
+        claim = await store.claim(request)
+        assert claim is not None
+        claim_rows = await db.fetchall(
+            "SELECT operation_id FROM stop_operation_claims"
+        )
+        assert len(claim_rows) == 1
+        assert request.correlation_id not in claim_rows[0][0]
+
+        receipt = await store.persist(
+            request,
+            _outcomes(request),
+            claim_id=claim.claim_id,
+        )
+        header = await db.fetchone(
+            "SELECT operation_id, requested_target, turn_id "
+            "FROM stop_receipts WHERE receipt_id = ?",
+            (receipt.receipt_id,),
+        )
+        outcomes = await db.fetchall(
+            "SELECT resolved_target, agent_id FROM stop_receipt_outcomes "
+            "WHERE receipt_id = ?",
+            (receipt.receipt_id,),
+        )
+        durable_text = json.dumps([header, outcomes])
+        assert request.correlation_id not in durable_text
+        assert request.target not in durable_text
+        assert await store.load(request) == receipt
+        assert receipt.operation_id == request.correlation_id
+        assert receipt.requested_target == request.target
+        assert receipt.turn_id == request.turn_id
+        assert receipt.outcomes[0].correlation_id == request.correlation_id
+        assert receipt.outcomes[0].requested_target == request.target
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_receipt_survives_sqlite_connection_restart(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -277,10 +329,10 @@ async def test_request_fingerprint_cannot_bless_a_corrupt_receipt_header(tmp_pat
         store = StopReceiptStore(db)
         await store.ensure_schema()
         request = _request()
-        await store.persist(request, _outcomes(request))
+        receipt = await store.persist(request, _outcomes(request))
         await db.execute(
-            "UPDATE stop_receipts SET actor_id = ? WHERE operation_id = ?",
-            ("did:test:forged", request.correlation_id),
+            "UPDATE stop_receipts SET actor_id = ? WHERE receipt_id = ?",
+            ("did:test:forged", receipt.receipt_id),
         )
 
         with pytest.raises(StopReceiptCorruptError, match="header"):
@@ -400,10 +452,11 @@ async def test_concurrent_exact_writers_return_one_receipt(tmp_path):
 
         assert one.receipt_id == two.receipt_id
         rows = await first_db.fetchall(
-            "SELECT receipt_id FROM stop_receipts WHERE operation_id = ?",
-            (request.correlation_id,),
+            "SELECT receipt_id, operation_id FROM stop_receipts"
         )
-        assert rows == [(one.receipt_id,)]
+        assert len(rows) == 1
+        assert rows[0][0] == one.receipt_id
+        assert rows[0][1] != request.correlation_id
     finally:
         await first_db.close()
         await second_db.close()
@@ -488,7 +541,7 @@ async def test_host_receipt_rejects_empty_ambiguous_fanout(tmp_path):
 @pytest.mark.asyncio
 async def test_host_receipt_reader_rejects_legacy_empty_fanout(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
-    from kestrel_sovereign.stop.receipt import _fingerprint
+    from kestrel_sovereign.stop.receipt import _fingerprint, _identifier_digest
 
     db = await AsyncDatabase.sqlite(str(tmp_path / "stop-empty-host-read.db"))
     try:
@@ -506,7 +559,7 @@ async def test_host_receipt_reader_rejects_legacy_empty_fanout(tmp_path):
             "turn_id, span_id, trace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "legacy-empty-receipt",
-                request.correlation_id,
+                _identifier_digest("operation", request.correlation_id),
                 _fingerprint(request),
                 StopScope.HOST.value,
                 request.actor_id,
