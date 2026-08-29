@@ -903,6 +903,39 @@ async def test_repeated_semantic_hold_is_receipted_without_replacing_latch(hold_
 
 
 @pytest.mark.asyncio
+async def test_mutated_receipt_content_cannot_reopen_an_operation_id(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:mutated-receipt",
+        actor_id="did:sovereign:operator",
+        reason="inspect",
+        operation_id="immutable-hold-operation",
+    )
+    await store.release_hold(
+        scope="agent",
+        target_id="did:agent:mutated-receipt",
+        actor_id="did:sovereign:operator",
+        reason="clear",
+        operation_id="immutable-release-operation",
+        expected_hold_receipt_id=held.receipt.receipt_id,
+    )
+    await db.execute(
+        "UPDATE hold_receipts SET operation_id = ? WHERE operation_id = ?",
+        ("tampered-operation", "immutable-hold-operation"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="content witness"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:mutated-receipt",
+            actor_id="did:sovereign:operator",
+            reason="inspect",
+            operation_id="immutable-hold-operation",
+        )
+
+
+@pytest.mark.asyncio
 async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
