@@ -211,6 +211,84 @@ async def test_surviving_hold_authority_fails_closed_after_projection_loss(
 
 
 @pytest.mark.asyncio
+async def test_cyclic_applied_hold_history_fails_closed_when_projection_is_unheld(
+    hold_db,
+):
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="first hold",
+        operation_id="cycle-first",
+    )
+    second = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="second hold",
+        operation_id="cycle-second",
+    )
+    await db.execute(
+        "UPDATE hold_receipts SET prior_hold_receipt_id = ? "
+        "WHERE receipt_id = ?",
+        (second.receipt.receipt_id, first.receipt.receipt_id),
+    )
+    await db.execute(
+        "UPDATE hold_latches SET active = 0, hold_receipt_id = '', "
+        "reason = '', actor_id = '', set_at = '' "
+        "WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:kite"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="cycle"):
+        await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
+async def test_release_rejects_latch_rewound_to_consumed_hold_authority(hold_db):
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="first hold",
+        operation_id="rewind-first",
+    )
+    await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="second hold",
+        operation_id="rewind-second",
+    )
+    await db.execute(
+        "UPDATE hold_latches SET active = 1, hold_receipt_id = ?, "
+        "reason = ?, actor_id = ?, set_at = ? "
+        "WHERE scope = ? AND target_id = ?",
+        (
+            first.receipt.receipt_id,
+            first.receipt.reason,
+            first.receipt.actor_id,
+            first.receipt.occurred_at,
+            "agent",
+            "did:agent:kite",
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="terminal authority"):
+        await store.release_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="must not release rewound projection",
+            operation_id="rewind-release",
+            expected_hold_receipt_id=first.receipt.receipt_id,
+        )
+    assert await store.get_receipt("rewind-release") is None
+
+
+@pytest.mark.asyncio
 async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_path):
     """The host boot context, not an agent-local DB, owns the durable latch."""
 

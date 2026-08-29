@@ -388,41 +388,20 @@ class HoldStore:
             (receipt_id,),
         )
 
-    async def _validate_active_latch_receipt(self, latch: Optional[HoldState]) -> None:
-        """Prove an active latch is backed by its exact applied-Hold receipt."""
-
-        if latch is None:
-            return
-        row = await self._read_receipt_by_id(latch.hold_receipt_id)
-        if row is None:
-            raise HoldCorruptStateError(
-                "active hold latch references a missing authority receipt"
-            )
-        receipt = _receipt_from_row(row)
-        if (
-            receipt.action is not HoldAction.HOLD
-            or receipt.disposition is not HoldDisposition.APPLIED
-            or receipt.receipt_id != latch.hold_receipt_id
-            or receipt.scope is not latch.scope
-            or receipt.target_id != latch.target_id
-            or receipt.reason != latch.reason
-            or receipt.actor_id != latch.actor_id
-            or receipt.occurred_at != latch.set_at
-        ):
-            raise HoldCorruptStateError(
-                "active hold latch does not match its authority receipt"
-            )
-
-    async def _validate_unheld_receipt_history(
-        self, scope: HoldScope, target_id: str
+    async def _validate_receipt_authority_graph(
+        self,
+        latch: Optional[HoldState],
+        scope: HoldScope,
+        target_id: str,
     ) -> None:
-        """Prove an absent/inactive latch has no surviving Hold authority.
+        """Prove the append-only authority graph agrees with its latch.
 
-        The latch is a mutable projection of append-only receipts.  If that
-        projection is deleted or reset, an applied Hold receipt must not become
-        an accidental permission to resume work.  Reconstruct the authority
-        graph for this target and require every applied Hold to have exactly
-        one later applied successor before accepting an unheld projection.
+        Each applied Hold creates one authority. A later applied Hold or
+        Release may consume it exactly once. Every chain must be acyclic and
+        terminate either in an applied Release or in the one active authority
+        named by the latch. This catches projection deletion, latch rewind,
+        forked successors, and closed cycles rather than trusting a locally
+        well-formed latch row.
         """
 
         rows = await self._db.fetchall(
@@ -430,13 +409,17 @@ class HoldStore:
             "WHERE scope = ? AND target_id = ?",
             (scope.value, target_id),
         )
+        receipts = [_receipt_from_row(row) for row in rows]
+        receipt_ids = {receipt.receipt_id for receipt in receipts}
+        if len(receipt_ids) != len(receipts):
+            raise HoldCorruptStateError("Hold receipt graph has duplicate identities")
         applied = [
             receipt
-            for receipt in (_receipt_from_row(row) for row in rows)
+            for receipt in receipts
             if receipt.disposition is HoldDisposition.APPLIED
         ]
         authorities = {
-            receipt.receipt_id
+            receipt.receipt_id: receipt
             for receipt in applied
             if receipt.action is HoldAction.HOLD
         }
@@ -455,10 +438,53 @@ class HoldStore:
                 )
             consumers[prior] = receipt
 
-        surviving = authorities.difference(consumers)
-        if surviving:
+        terminal_authorities: set[str] = set()
+        for authority_id in authorities:
+            cursor = authority_id
+            path: set[str] = set()
+            while True:
+                if cursor in path:
+                    raise HoldCorruptStateError("Hold receipt graph contains a cycle")
+                path.add(cursor)
+                successor = consumers.get(cursor)
+                if successor is None:
+                    terminal_authorities.add(cursor)
+                    break
+                if successor.action is HoldAction.RELEASE:
+                    break
+                cursor = successor.receipt_id
+
+        if latch is None:
+            if not terminal_authorities:
+                return
             raise HoldCorruptStateError(
                 "unheld projection retains active Hold authority"
+            )
+
+        receipt = authorities.get(latch.hold_receipt_id)
+        if receipt is None:
+            referenced_row = await self._read_receipt_by_id(latch.hold_receipt_id)
+            if referenced_row is not None:
+                _receipt_from_row(referenced_row)
+                raise HoldCorruptStateError(
+                    "active hold latch does not match its authority receipt"
+                )
+            raise HoldCorruptStateError(
+                "active hold latch references a missing authority receipt"
+            )
+        if (
+            receipt.scope is not latch.scope
+            or receipt.target_id != latch.target_id
+            or receipt.reason != latch.reason
+            or receipt.actor_id != latch.actor_id
+            or receipt.occurred_at != latch.set_at
+        ):
+            raise HoldCorruptStateError(
+                "active hold latch does not match its authority receipt"
+            )
+        if terminal_authorities != {latch.hold_receipt_id}:
+            raise HoldCorruptStateError(
+                "active hold latch is not the receipt graph's terminal authority"
             )
 
     async def _validate_latch_projection(
@@ -467,10 +493,7 @@ class HoldStore:
         scope: HoldScope,
         target_id: str,
     ) -> None:
-        if latch is None:
-            await self._validate_unheld_receipt_history(scope, target_id)
-        else:
-            await self._validate_active_latch_receipt(latch)
+        await self._validate_receipt_authority_graph(latch, scope, target_id)
 
     @staticmethod
     def _assert_replay(
