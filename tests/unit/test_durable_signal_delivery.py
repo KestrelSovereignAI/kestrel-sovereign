@@ -51,7 +51,12 @@ from kestrel_sovereign.signals.sources.channels import (
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
-from kestrel_sovereign.hold import EffectiveHoldState, HoldScope, HoldState
+from kestrel_sovereign.hold import (
+    EffectiveHoldState,
+    HoldEnforcementUnavailableError,
+    HoldScope,
+    HoldState,
+)
 
 
 class _Agent:
@@ -1925,7 +1930,7 @@ async def test_hold_read_failure_after_claim_releases_exact_lease(
         hold_store = _FailingHoldRead(fail_on=2)
         agent._hold_store = hold_store
 
-        with pytest.raises(RuntimeError, match="hold backend unavailable"):
+        with pytest.raises(HoldEnforcementUnavailableError) as caught:
             if exact_event:
                 await dispatcher.claim_durable_delivery_for_event(
                     consumer_id=consumer.consumer_id,
@@ -1937,6 +1942,9 @@ async def test_hold_read_failure_after_claim_releases_exact_lease(
                     consumer_id=consumer.consumer_id,
                     executor_id="workflow-executor",
                 )
+
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert str(caught.value.__cause__) == "hold backend unavailable"
 
         [deferred] = await dispatcher.list_durable_deliveries(
             consumer_id=consumer.consumer_id
@@ -2139,6 +2147,7 @@ async def test_late_hold_refusal_preserves_finite_retry_budget(tmp_path):
     backend, agent, dispatcher = await _channel_dispatcher(
         tmp_path / "held-late-refusal-budget.db",
         "did:agent:held-late-refusal",
+        rate_limit=RateLimit(per_minute=1, per_hour=1, burst=1),
     )
     consumer = DurableConsumerRegistration(
         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
@@ -2209,6 +2218,7 @@ async def test_cognition_hold_read_failure_preserves_finite_retry_budget(tmp_pat
     backend, agent, dispatcher = await _channel_dispatcher(
         tmp_path / "hold-read-failure-budget.db",
         "did:agent:hold-read-failure-budget",
+        rate_limit=RateLimit(per_minute=1, per_hour=1, burst=1),
     )
     consumer = DurableConsumerRegistration(
         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
@@ -2237,12 +2247,107 @@ async def test_cognition_hold_read_failure_preserves_finite_retry_budget(tmp_pat
         )
         assert hold_store.reads == 4
         assert result.status is Status.FAILED
-        assert result.error == "hold_state_unavailable: RuntimeError"
+        assert (
+            result.error
+            == "hold_state_unavailable: HoldEnforcementUnavailableError"
+        )
         assert delivery.status == RETRY
         assert delivery.attempts == 0
         assert delivery.lease_owner is None
         assert delivery.lease_token is None
         agent.process_input.assert_not_awaited()
+
+        # The failed final Hold read did not admit a turn and therefore must
+        # not consume this source's only rate slot.  Once the one-shot outage
+        # clears, the exact unspent delivery is immediately executable.
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        for _ in range(100):
+            [delivery] = await dispatcher.list_durable_deliveries(
+                consumer_id=consumer.consumer_id
+            )
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED, (
+            delivery.status,
+            delivery.attempts,
+            delivery.last_error,
+        )
+        assert delivery.attempts == 1
+        agent.process_input.assert_awaited_once()
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_final_turn_gate_hold_outage_is_unattempted_and_rate_neutral(
+    tmp_path,
+):
+    """The process_input admission seam retains a typed durable disposition."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "final-hold-read-failure.db",
+        "did:agent:final-hold-read-failure",
+        rate_limit=RateLimit(per_minute=1, per_hour=1, burst=1),
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=1,
+    )
+    agent._hold_store = _HoldSnapshots(EffectiveHoldState(host=None, agent=None))
+
+    async def fail_at_final_gate(_prompt):
+        try:
+            raise RuntimeError("hold database disconnected")
+        except RuntimeError as exc:
+            raise HoldEnforcementUnavailableError(
+                "Durable Hold state could not be read"
+            ) from exc
+
+    agent.process_input = fail_at_final_gate
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "final-hold-outage"),
+            source_event_id="telegram:update:final-hold-outage",
+            consumer_id=consumer.consumer_id,
+        )
+
+        result = await handle.wait()
+        [delivery] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert result.status is Status.FAILED
+        assert (
+            result.error
+            == "hold_state_unavailable: HoldEnforcementUnavailableError"
+        )
+        assert delivery.status == RETRY
+        assert delivery.attempts == 0
+
+        agent.process_input = AsyncMock(return_value="resumed")
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        for _ in range(100):
+            [delivery] = await dispatcher.list_durable_deliveries(
+                consumer_id=consumer.consumer_id
+            )
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED, (
+            delivery.status,
+            delivery.attempts,
+            delivery.last_error,
+        )
+        assert delivery.attempts == 1
+        agent.process_input.assert_awaited_once()
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)

@@ -41,6 +41,11 @@ class _Store:
         return self.effective
 
 
+class _FailingStore:
+    async def get_effective(self, _agent_id: str) -> EffectiveHoldState:
+        raise RuntimeError("database unavailable")
+
+
 def _bare_agent(store: _Store) -> KestrelAgent:
     agent = KestrelAgent.__new__(KestrelAgent)
     agent.did = "did:test:held"
@@ -169,6 +174,19 @@ async def test_unheld_snapshot_admits_turn_at_the_same_boundary() -> None:
 
     assert effective == EffectiveHoldState(host=None, agent=None)
     assert store.calls == ["did:test:held"]
+
+
+@pytest.mark.asyncio
+async def test_hold_backend_failure_is_a_typed_admission_outage() -> None:
+    """Mutation tripwire: backend failures must not look like turn failures."""
+
+    agent = _bare_agent(_FailingStore())
+
+    with pytest.raises(HoldEnforcementUnavailableError) as caught:
+        await require_turn_start_allowed(agent)
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "database unavailable"
 
 
 def test_production_context_without_hold_store_fails_closed() -> None:

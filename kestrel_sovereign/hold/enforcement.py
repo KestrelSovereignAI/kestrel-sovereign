@@ -160,7 +160,18 @@ async def get_effective_hold_state(agent: Any) -> EffectiveHoldState | None:
         raise HoldEnforcementUnavailableError(
             "Cannot enforce Hold without a concrete agent DID"
         )
-    return await store.get_effective(agent_id)
+    try:
+        return await store.get_effective(agent_id)
+    except HoldStateError:
+        raise
+    except Exception as exc:
+        # The durable store is part of the turn-admission boundary.  Do not
+        # let a backend-specific exception fall through as an ordinary model
+        # or handler failure: callers must be able to preserve the work as
+        # unattempted when the load-bearing Hold read is unavailable.
+        raise HoldEnforcementUnavailableError(
+            "Durable Hold state could not be read"
+        ) from exc
 
 
 async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:

@@ -604,6 +604,25 @@ class _RateLimitState:
         times.append(now)
         return False
 
+    def discard(self, source: str, *, recorded_at: float) -> None:
+        """Remove this dispatch's exact rate event after admission refusal."""
+
+        times = self._times.get(source)
+        if not times:
+            return
+        # The event being unwound is normally the newest.  Prefer the tail so
+        # a deterministic/frozen test clock cannot remove an older equal
+        # timestamp and leave the refused attempt charged.
+        if times[-1] == recorded_at:
+            times.pop()
+        else:
+            try:
+                times.remove(recorded_at)
+            except ValueError:
+                return
+        if not times:
+            self._times.pop(source, None)
+
     def reset(self) -> None:
         """Drop all recorded dispatch timestamps. Called on host-resume:
         these are ``time.monotonic()`` values, which DON'T advance during
@@ -3760,13 +3779,7 @@ class SignalDispatcher:
             )
             return ack_rejected
 
-        hold_prevented_execution = (
-            result.status is Status.COALESCED and result.error == "hold_deferred"
-        ) or (
-            result.status is Status.FAILED
-            and result.error is not None
-            and result.error.startswith("hold_state_unavailable:")
-        )
+        hold_prevented_execution = self._hold_prevented_execution(result)
         if hold_prevented_execution:
             # HoldTurnRefusal may win only after cognition has crossed the
             # durable claim boundary. A failed load-bearing Hold read likewise
@@ -4065,8 +4078,9 @@ class SignalDispatcher:
                 )
 
         # Step 5: rate limit
+        rate_recorded_at = time.monotonic()
         if self._rate.check_and_record(
-            signal.source, registration.rate_limit, now=time.monotonic()
+            signal.source, registration.rate_limit, now=rate_recorded_at
         ):
             return self._fail(
                 signal,
@@ -4076,8 +4090,24 @@ class SignalDispatcher:
                 registration=registration,
             )
 
-        # Step 6 + 7: acquire locks and route
-        return await self._route_under_locks(signal, registration, start)
+        # Step 6 + 7: acquire locks and route.  The unconditional turn gate is
+        # deliberately later than this source policy.  If Hold wins there (or
+        # its load-bearing read fails), no turn was admitted, so unwind this
+        # exact rate event rather than charging unrelated later work.
+        result = await self._route_under_locks(signal, registration, start)
+        if self._hold_prevented_execution(result):
+            self._rate.discard(signal.source, recorded_at=rate_recorded_at)
+        return result
+
+    @staticmethod
+    def _hold_prevented_execution(result: SignalResult) -> bool:
+        """Whether Hold prevented admission before cognition executed."""
+
+        return result.error in {"hold_deferred", "hold_skipped"} or (
+            result.status is Status.FAILED
+            and result.error is not None
+            and result.error.startswith("hold_state_unavailable:")
+        )
 
     async def _agent_is_held(self) -> bool:
         """Read the load-bearing Hold latch without beginning a turn."""
@@ -4332,7 +4362,7 @@ class SignalDispatcher:
         from kestrel_sovereign.agent.context_manager import (
             reset_injection_tracking,
         )
-        from kestrel_sovereign.hold import HoldTurnRefusal
+        from kestrel_sovereign.hold import HoldStateError, HoldTurnRefusal
 
         reset_injection_tracking()
 
@@ -4394,6 +4424,25 @@ class SignalDispatcher:
                 registration,
                 start,
                 durable=self._durable_cognition_route.get(),
+                audit=audit,
+            )
+        except HoldStateError as e:
+            # A final turn-start Hold read can fail after the dispatcher's
+            # earlier snapshot.  Classify that as an admission outage so the
+            # durable owner releases the exact lease without spending an
+            # attempt, and so rate accounting can be unwound above.
+            logger.exception(
+                "Load-bearing Hold read failed at cognition admission for "
+                "signal %s (source=%s)",
+                signal.id,
+                signal.source,
+            )
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error=f"hold_state_unavailable: {type(e).__name__}",
+                registration=registration,
                 audit=audit,
             )
         except Exception as e:
