@@ -22,6 +22,7 @@ _RECEIPT_COLUMNS = (
 _OUTCOME_COLUMNS = (
     "receipt_id, ordinal, resolved_target, agent_id, disposition, detail"
 )
+_OPAQUE_ID_DOMAIN = b"kestrel:stop-receipt-opaque-id:v1\0"
 
 
 class StopReceiptError(RuntimeError):
@@ -77,6 +78,39 @@ def _fingerprint(request: StopRequest) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _identifier_digest(kind: str, value: str) -> str:
+    """Return a domain-separated, non-reversible durable lookup identity."""
+
+    encoded_kind = kind.encode("ascii")
+    encoded_value = value.encode("utf-8")
+    digest = hashlib.sha256(
+        _OPAQUE_ID_DOMAIN
+        + len(encoded_kind).to_bytes(2, "big")
+        + encoded_kind
+        + len(encoded_value).to_bytes(4, "big")
+        + encoded_value
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _optional_identifier_digest(kind: str, value: str | None) -> str | None:
+    return None if value is None else _identifier_digest(kind, value)
+
+
+def _stored_outcome_identity(value: str, request: StopRequest) -> str:
+    if request.target is not None and value == request.target:
+        return _identifier_digest("target", value)
+    return value
+
+
+def _public_outcome_identity(value: str, request: StopRequest) -> str:
+    if request.target is not None and value == _identifier_digest(
+        "target", request.target
+    ):
+        return request.target
+    return value
 
 
 def _required_text(value: object, field: str) -> str:
@@ -142,7 +176,10 @@ class StopReceiptStore:
             return
         await self._db.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-            (f"kestrel:stop:operation:{operation_id}",),
+            (
+                "kestrel:stop:operation:"
+                f"{_identifier_digest('operation', operation_id)}",
+            ),
         )
 
     async def load(self, request: StopRequest) -> StopReceipt | None:
@@ -151,11 +188,11 @@ class StopReceiptStore:
         row = await self._db.fetchone(
             f"SELECT {_RECEIPT_COLUMNS} FROM stop_receipts "
             "WHERE operation_id = ?",
-            (request.correlation_id,),
+            (_identifier_digest("operation", request.correlation_id),),
         )
         if row is None:
             return None
-        receipt = await self._receipt_from_row(row)
+        receipt = await self._receipt_from_row(row, request=request)
         expected = _fingerprint(request)
         self._assert_request_matches_receipt(request, receipt, expected)
         return receipt
@@ -185,7 +222,7 @@ class StopReceiptStore:
             "AND receipt.requested_target = ? "
             "AND outcome.disposition IN ('stopped', 'already_complete') "
             "LIMIT 1",
-            (agent_id, turn_id),
+            (agent_id, _identifier_digest("target", turn_id)),
         )
         return row is not None
 
@@ -202,16 +239,21 @@ class StopReceiptStore:
         """
 
         fingerprint = _fingerprint(request)
+        stored_operation_id = _identifier_digest(
+            "operation", request.correlation_id
+        )
         claim_id = str(uuid4())
         async with self._db.transaction(immediate=True):
             await self._lock_operation(request.correlation_id)
             replay_row = await self._db.fetchone(
                 f"SELECT {_RECEIPT_COLUMNS} FROM stop_receipts "
                 "WHERE operation_id = ?",
-                (request.correlation_id,),
+                (stored_operation_id,),
             )
             if replay_row is not None:
-                replay = await self._receipt_from_row(replay_row)
+                replay = await self._receipt_from_row(
+                    replay_row, request=request
+                )
                 self._assert_request_matches_receipt(
                     request, replay, fingerprint
                 )
@@ -220,7 +262,7 @@ class StopReceiptStore:
             claim_row = await self._db.fetchone(
                 "SELECT request_fingerprint, claim_id "
                 "FROM stop_operation_claims WHERE operation_id = ?",
-                (request.correlation_id,),
+                (stored_operation_id,),
             )
             if claim_row is not None:
                 if claim_row[0] != fingerprint:
@@ -234,7 +276,7 @@ class StopReceiptStore:
                 "INSERT INTO stop_operation_claims ("
                 "operation_id, request_fingerprint, claim_id, claimed_at"
                 f") VALUES (?, ?, ?, {now_sql})",
-                (request.correlation_id, fingerprint, claim_id),
+                (stored_operation_id, fingerprint, claim_id),
             )
             return StopOperationClaim(
                 operation_id=request.correlation_id,
@@ -253,6 +295,9 @@ class StopReceiptStore:
 
         self._validate_outcomes(request, outcomes)
         fingerprint = _fingerprint(request)
+        stored_operation_id = _identifier_digest(
+            "operation", request.correlation_id
+        )
         receipt_id = str(uuid4())
         try:
             async with self._db.transaction(immediate=True):
@@ -260,10 +305,12 @@ class StopReceiptStore:
                 replay_row = await self._db.fetchone(
                     f"SELECT {_RECEIPT_COLUMNS} FROM stop_receipts "
                     "WHERE operation_id = ?",
-                    (request.correlation_id,),
+                    (stored_operation_id,),
                 )
                 if replay_row is not None:
-                    replay = await self._receipt_from_row(replay_row)
+                    replay = await self._receipt_from_row(
+                        replay_row, request=request
+                    )
                     self._assert_request_matches_receipt(
                         request, replay, fingerprint
                     )
@@ -272,7 +319,7 @@ class StopReceiptStore:
                 claim_row = await self._db.fetchone(
                     "SELECT request_fingerprint, claim_id "
                     "FROM stop_operation_claims WHERE operation_id = ?",
-                    (request.correlation_id,),
+                    (stored_operation_id,),
                 )
                 claim_matches = bool(
                     claim_row is not None
@@ -298,15 +345,15 @@ class StopReceiptStore:
                     f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?)",
                     (
                         receipt_id,
-                        request.correlation_id,
+                        stored_operation_id,
                         fingerprint,
                         request.scope.value,
                         request.actor_id,
-                        request.target,
+                        _optional_identifier_digest("target", request.target),
                         request.target_agent_id,
                         request.reason,
                         int(request.cascade),
-                        request.turn_id,
+                        _optional_identifier_digest("target", request.turn_id),
                         request.span_id,
                         request.trace_id,
                     ),
@@ -319,8 +366,10 @@ class StopReceiptStore:
                         (
                             receipt_id,
                             ordinal,
-                            outcome.resolved_target,
-                            outcome.agent_id,
+                            _stored_outcome_identity(
+                                outcome.resolved_target, request
+                            ),
+                            _stored_outcome_identity(outcome.agent_id, request),
                             outcome.disposition.value,
                             outcome.detail,
                         ),
@@ -330,7 +379,9 @@ class StopReceiptStore:
                     "WHERE receipt_id = ?",
                     (receipt_id,),
                 )
-                stored = await self._receipt_from_row(stored_row)
+                stored = await self._receipt_from_row(
+                    stored_row, request=request
+                )
                 self._assert_request_matches_receipt(
                     request, stored, fingerprint
                 )
@@ -338,7 +389,7 @@ class StopReceiptStore:
                     deleted = await self._db.execute(
                         "DELETE FROM stop_operation_claims "
                         "WHERE operation_id = ? AND claim_id = ?",
-                        (request.correlation_id, claim_id),
+                        (stored_operation_id, claim_id),
                     )
                     if deleted != 1:
                         raise StopReceiptConflict(
@@ -357,17 +408,36 @@ class StopReceiptStore:
                 return replay
             raise
 
-    async def _receipt_from_row(self, row: Any) -> StopReceipt:
+    async def _receipt_from_row(
+        self, row: Any, *, request: StopRequest
+    ) -> StopReceipt:
         if row is None or len(row) != 13:
             raise StopReceiptCorruptError(
                 "Stop receipt row has an unexpected shape"
             )
         receipt_id = _required_text(row[0], "receipt_id")
-        operation_id = _required_text(row[1], "operation_id")
+        stored_operation_id = _required_text(row[1], "operation_id")
         fingerprint = _required_text(row[2], "request_fingerprint")
         scope = _required_text(row[3], "scope")
         actor_id = _required_text(row[4], "actor_id")
         occurred_at = _required_text(row[9], "occurred_at")
+        expected_operation_id = _identifier_digest(
+            "operation", request.correlation_id
+        )
+        expected_requested_target = _optional_identifier_digest(
+            "target", request.target
+        )
+        expected_turn_id = _optional_identifier_digest(
+            "target", request.turn_id
+        )
+        if stored_operation_id != expected_operation_id:
+            raise StopReceiptCorruptError(
+                "Stop receipt operation lookup identity is invalid"
+            )
+        if row[5] != expected_requested_target or row[10] != expected_turn_id:
+            raise StopReceiptCorruptError(
+                "Stop receipt opaque target identity is invalid"
+            )
         try:
             cascade_int = int(row[8])
         except (TypeError, ValueError) as error:
@@ -430,11 +500,15 @@ class StopReceiptStore:
                     StopOutcome.from_dict(
                         {
                             "scope": scope,
-                            "requested_target": row[5],
-                            "resolved_target": outcome_row[2],
-                            "agent_id": outcome_row[3],
+                            "requested_target": request.target,
+                            "resolved_target": _public_outcome_identity(
+                                outcome_row[2], request
+                            ),
+                            "agent_id": _public_outcome_identity(
+                                outcome_row[3], request
+                            ),
                             "disposition": outcome_row[4],
-                            "correlation_id": operation_id,
+                            "correlation_id": request.correlation_id,
                             "detail": outcome_row[5],
                             "receipt_id": receipt_id,
                         }
@@ -450,16 +524,16 @@ class StopReceiptStore:
             )
         return StopReceipt(
             receipt_id=receipt_id,
-            operation_id=operation_id,
+            operation_id=request.correlation_id,
             request_fingerprint=fingerprint,
             scope=scope,
             actor_id=actor_id,
-            requested_target=row[5],
+            requested_target=request.target,
             target_agent_id=row[6],
             reason=row[7],
             cascade=bool(cascade_int),
             occurred_at=occurred_at,
-            turn_id=row[10],
+            turn_id=request.turn_id,
             span_id=row[11],
             trace_id=row[12],
             outcomes=tuple(outcomes),
