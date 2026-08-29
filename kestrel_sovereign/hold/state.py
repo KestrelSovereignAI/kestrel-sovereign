@@ -286,6 +286,7 @@ class HoldStore:
                 "revision INTEGER NOT NULL DEFAULT 0, "
                 "PRIMARY KEY (scope, target_id), "
                 "CHECK (scope IN ('host', 'agent')), "
+                "CHECK (scope <> 'host' OR target_id = 'host'), "
                 "CHECK (active IN (0, 1)), "
                 "CHECK (revision >= 0))"
             )
@@ -350,6 +351,23 @@ class HoldStore:
             f"WHERE scope = ? AND target_id = ?{suffix}",
             (scope.value, target_id),
         )
+
+    async def _assert_host_latch_shape(self, *, for_update: bool = False) -> None:
+        """Fail closed if an upgraded/shared database has a foreign host row."""
+
+        suffix = (
+            " FOR UPDATE"
+            if for_update and getattr(self._db, "backend_type", "") == "postgres"
+            else ""
+        )
+        rows = await self._db.fetchall(
+            "SELECT target_id FROM hold_latches WHERE scope = ?" + suffix,
+            (HoldScope.HOST.value,),
+        )
+        if any(str(row[0]) != HOST_HOLD_TARGET for row in rows):
+            raise HoldCorruptStateError(
+                "host hold latch has a foreign target identity"
+            )
 
     async def _read_receipt_by_operation(self, operation_id: str) -> Any:
         return await self._db.fetchone(
@@ -472,6 +490,7 @@ class HoldStore:
         operation = _required_text(operation_id, "operation_id")
 
         async with self._db.transaction(immediate=True):
+            await self._assert_host_latch_shape(for_update=True)
             await self._lock_operation_and_target(
                 operation, resolved_scope, resolved_target
             )
@@ -588,6 +607,7 @@ class HoldStore:
         )
 
         async with self._db.transaction(immediate=True):
+            await self._assert_host_latch_shape(for_update=True)
             await self._lock_operation_and_target(
                 operation, resolved_scope, resolved_target
             )
@@ -653,6 +673,7 @@ class HoldStore:
     ) -> Optional[HoldState]:
         resolved_scope = _coerce_scope(scope)
         resolved_target = _target(resolved_scope, target_id)
+        await self._assert_host_latch_shape()
         return _latch_from_row(
             await self._read_latch_row(resolved_scope, resolved_target)
         )
@@ -661,6 +682,7 @@ class HoldStore:
         """Read host + agent latches in one database snapshot."""
 
         agent = _required_text(agent_id, "agent_id")
+        await self._assert_host_latch_shape()
         rows = await self._db.fetchall(
             f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
             "WHERE (scope = ? AND target_id = ?) "
