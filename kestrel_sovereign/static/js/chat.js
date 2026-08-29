@@ -2606,9 +2606,12 @@ function stopFailureRequiresFreshOperation(error) {
         outcome
         && typeof outcome === 'object'
         && !outcome.receipt_id
-        && outcome.detail === (
-            'Cancellation may have completed, but its durable '
-            + 'Stop receipt could not be persisted'
+        && (
+            outcome.detail === (
+                'Cancellation may have completed, but its durable '
+                + 'Stop receipt could not be persisted'
+            )
+            || outcome.detail === 'An exact Stop operation is already in progress'
         )
     ));
 }
