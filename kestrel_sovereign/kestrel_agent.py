@@ -5400,7 +5400,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    @bind_async_invocation("invocation_id")
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,

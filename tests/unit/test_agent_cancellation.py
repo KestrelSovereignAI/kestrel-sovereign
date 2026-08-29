@@ -9,6 +9,142 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 
 
+@pytest.mark.asyncio
+async def test_process_input_is_the_canonical_active_turn_inventory():
+    """Every transport reaches Stop tracking through ``process_input`` itself."""
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    started = asyncio.Event()
+
+    class CanonicalAgent(RequestLifecycleMixin):
+        process_input = KestrelAgent.process_input
+
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._abandoned_request_generations = {}
+            self._abandoned_request_dispositions = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+            self.storage = object()
+
+        async def _maybe_refresh_user_byok_resolver(self, _passphrase):
+            return None
+
+        async def _genesis_audit_cognition_block(self, _user_input):
+            started.set()
+            await asyncio.Event().wait()
+
+    agent = CanonicalAgent()
+    turn = asyncio.create_task(
+        agent.process_input("work", invocation_id="all-transports-turn")
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert agent._active_request_ids == {"all-transports-turn"}
+    assert agent.cancel_current_request("all-transports-turn") is True
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    assert agent._active_request_ids == set()
+    assert agent._request_operation_tasks == {}
+
+
+def test_request_lifecycle_logs_only_one_way_correlation(caplog):
+    from kestrel_sovereign.agent.invocation import invocation_log_correlation
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    class Agent(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    request_id = "private customer text in retry id"
+    agent = Agent()
+    agent.reserve_request_cancellation(request_id)
+    with caplog.at_level("INFO"):
+        agent.register_active_request(request_id)
+        agent.cancel_current_request(request_id)
+
+    assert request_id not in caplog.text
+    assert invocation_log_correlation(request_id) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_invoke_operation_task_name_redacts_opaque_request_id():
+    import httpx
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.agent.invocation import invocation_log_correlation
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.rate_limit import limiter
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    request_id = "private text must not enter asyncio diagnostics"
+
+    class Agent:
+        def __init__(self):
+            self.storage = MagicMock()
+            self.storage.resolve_session_id = AsyncMock(
+                side_effect=lambda value: value
+            )
+
+        def register_active_request(self, _request_id):
+            return None
+
+        def bind_request_operation(self, _request_id, _operation):
+            return None
+
+        def is_request_cancelled(self, _request_id):
+            return False
+
+        def _cleanup_cancelled_request(self, _request_id):
+            return None
+
+        def _conversation_response_identity(self, **_kwargs):
+            return {}
+
+        async def process_input(self, *_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return "done"
+
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.state.agent = Agent()
+    app.include_router(router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        request = asyncio.create_task(
+            client.post(
+                "/api/agent/invoke",
+                json={"input": "work", "request_id": request_id},
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task_names = [task.get_name() for task in asyncio.all_tasks()]
+        assert all(request_id not in name for name in task_names)
+        assert any(
+            invocation_log_correlation(request_id) in name
+            for name in task_names
+        )
+        release.set()
+        response = await request
+
+    assert response.status_code == 200
+
+
 class TestAgentCancellation:
     """Tests for request cancellation functionality."""
 

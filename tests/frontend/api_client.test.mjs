@@ -701,6 +701,36 @@ test('streamInvoke keeps opaque request ids logical while sending RFC 3986 wire 
     for await (const _ of iter) { /* drain */ }
 });
 
+test('streamInvoke measures request ids by Unicode code point', async () => {
+    const accepted = '🐢'.repeat(256);
+    const stream = pendingStreamResponse({
+        'X-Request-ID': encodeURIComponent(accepted),
+    });
+    const fetchFn = createFetchQueue(stream.response);
+    const { client } = createClient({ fetchFn });
+    client.setHostAgent('agent-A');
+
+    const allowed = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, accepted,
+    );
+    await allowed.next();
+    assert.equal(
+        fetchFn.calls[0].options.headers['X-Request-ID'],
+        encodeURIComponent(accepted),
+    );
+    stream.finish();
+    for await (const _ of allowed) { /* drain */ }
+
+    const rejected = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, '🐢'.repeat(257),
+    );
+    await assert.rejects(
+        rejected.next(),
+        /stream request id must be 1-256 characters/,
+    );
+    assert.equal(fetchFn.calls.length, 1);
+});
+
 test('streamInvoke captures dispatch agent BEFORE awaiting auth headers (PR #874)', async () => {
     // Pre-fix, streamInvoke awaited buildHeaders() before snapshotting
     // selectedHostAgent. With an async auth provider, switching agents

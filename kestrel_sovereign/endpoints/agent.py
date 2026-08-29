@@ -27,6 +27,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.agent.invocation import (
+    invocation_log_correlation,
     invocation_id_response_header,
     new_stream_delivery_id,
 )
@@ -469,7 +470,7 @@ async def invoke_agent(request: Request, http_response: Response):
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             ),
-            name=f"invoke-turn:{request_id}",
+            name=f"invoke-turn:{invocation_log_correlation(request_id)}",
         )
         bind_operation = getattr(type(agent), "bind_request_operation", None)
         if callable(bind_operation):

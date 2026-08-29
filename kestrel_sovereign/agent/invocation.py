@@ -8,6 +8,7 @@ operation identity with the task that is actually executing the turn.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -253,8 +254,16 @@ def invocation_scope(
 
 def bind_async_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., Awaitable[_T]]], Callable[..., Awaitable[_T]]]:
-    """Bind/generate ``parameter`` for an async top-level turn method."""
+    """Bind/generate ``parameter`` for an async top-level turn method.
+
+    ``track_request_lifecycle`` makes the decorated method the canonical
+    inventory boundary for every transport that calls it. This avoids a Stop
+    implementation that works only for endpoints which remembered to install
+    their own lifecycle wrapper.
+    """
     def decorate(function: Callable[..., Awaitable[_T]]) -> Callable[..., Awaitable[_T]]:
         signature = inspect.signature(function)
 
@@ -266,7 +275,35 @@ def bind_async_invocation(
                 provenance=bound.arguments.get("invocation_provenance"),
             ) as invocation_id:
                 bound.arguments[parameter] = invocation_id
-                return await function(*bound.args, **bound.kwargs)
+                lifecycle_owner = args[0] if args else None
+                registered = False
+                if track_request_lifecycle and lifecycle_owner is not None:
+                    register = getattr(
+                        type(lifecycle_owner),
+                        "register_active_request",
+                        None,
+                    )
+                    if callable(register):
+                        register(lifecycle_owner, invocation_id)
+                        registered = True
+                try:
+                    if registered:
+                        bind_operation = getattr(
+                            type(lifecycle_owner),
+                            "bind_request_operation",
+                            None,
+                        )
+                        operation = asyncio.current_task()
+                        if callable(bind_operation) and operation is not None:
+                            bind_operation(
+                                lifecycle_owner,
+                                invocation_id,
+                                operation,
+                            )
+                    return await function(*bound.args, **bound.kwargs)
+                finally:
+                    if registered:
+                        lifecycle_owner._cleanup_cancelled_request(invocation_id)
 
         return wrapped
 

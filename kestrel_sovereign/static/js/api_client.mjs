@@ -1088,8 +1088,11 @@ export function createApiClient({
             const dispatchAgent = agent === undefined ? state.selectedHostAgent : agent;
 
             const clientRequestId = requestId === null ? null : String(requestId);
+            const clientRequestIdLength = clientRequestId === null
+                ? 0
+                : Array.from(clientRequestId).length;
             if (clientRequestId !== null && (
-                clientRequestId.length < 1 || clientRequestId.length > 256
+                clientRequestIdLength < 1 || clientRequestIdLength > 256
             )) {
                 throw new Error('stream request id must be 1-256 characters');
             }

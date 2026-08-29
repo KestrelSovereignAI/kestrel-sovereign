@@ -18,6 +18,8 @@ from contextvars import ContextVar
 from enum import Enum
 from typing import Dict, List, Optional
 
+from kestrel_sovereign.agent.invocation import invocation_log_correlation
+
 
 _PENDING_REQUEST_CANCELLATION_TTL_SECONDS = 30.0
 _PENDING_REQUEST_CANCELLATION_LIMIT = 1024
@@ -130,7 +132,7 @@ class RequestLifecycleMixin:
         cancelled_requests.add(request_id)
         logging.info(
             "Consumed pre-registration cancellation for request lifecycle: %s",
-            request_id,
+            invocation_log_correlation(request_id),
         )
         return True
 
@@ -335,7 +337,10 @@ class RequestLifecycleMixin:
                     operations.get((target_request_id, generation), set())
                 ):
                     operation.cancel()
-        logging.info("Cancelled request lifecycle: %s", target_request_id)
+        logging.info(
+            "Cancelled request lifecycle: %s",
+            invocation_log_correlation(target_request_id),
+        )
         return True
 
     def is_request_cancelled(self, request_id: Optional[str] = None) -> bool:
