@@ -1653,6 +1653,17 @@ async def test_create_task_rejects_duplicate_id_without_mutating_owner_or_payloa
         assert (
             await _feature(manager, "did:test:creator-a").cancel_task("same-id")
         ).status is ToolResultStatus.OK
+
+        with pytest.raises(ValueError, match="already exists"):
+            await manager.create_task(
+                _params("same-id", metadata={"payload": "after-cancel"}),
+                agent_name="did:test:recipient-b",
+                creator_agent_id="did:test:creator-b",
+            )
+
+        canceled = await manager.task_store._get_unscoped("same-id")
+        assert canceled.status.state is TaskState.CANCELED
+        assert canceled.metadata["payload"] == "original"
     finally:
         await manager.close()
 
