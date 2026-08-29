@@ -959,6 +959,7 @@ class TestUpdateFeatureConfig:
 
         assert resp.status_code == 200
         feature.set_config.assert_awaited_once_with({"enabled": False})
+        agent.refresh_feature_context_clauses.assert_called_once_with(feature)
 
     def test_validates_required_fields(self):
         schema = {

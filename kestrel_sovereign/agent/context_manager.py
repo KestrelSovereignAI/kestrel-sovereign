@@ -43,6 +43,7 @@ from .context_stages import (
 )
 from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, create_budget, DegradedModeError
+from .system_prompt_assembler import MandatorySystemPromptBudgetError
 from .conversation_manager import ConversationManager
 from .salvage import (
     SalvageReason,
@@ -629,34 +630,49 @@ class ContextManager:
                 mode=mode,
             )
 
-        tool_aware_system_budget = min(
-            budget.allocations["system"].budget,
-            budget.total_budget - tools_tokens,
-        )
-        # The removed capacity is the tool-schema reservation. Keeping it out
-        # of the allocation also prevents later system appenders from borrowing
-        # the same payload space a second time.
-        budget.allocations["system"].budget = tool_aware_system_budget
+        # Tool schemas occupy the same request window but are not a context
+        # section. Remove them from the complete allocation set before any
+        # section can spend or release slack into the elastic pool.
+        budget.reserve_external(tools_tokens)
+        tool_aware_system_budget = budget.allocations["system"].budget
 
         # 1. Assemble the stable system prefix (constitution/identity/doctrine)
         # and record its usage. Kept separate from the per-turn dynamic user
         # context by construction (ContextAssembly). The tracking assembler is
         # used when a per-source byte budget, anchored doctrine, or lifecycle-
         # owned context is present; otherwise the byte-stable legacy assembler.
-        (
-            assembly.system_prompt,
-            assembly.injected_clauses,
-            assembly.dropped_clauses,
-            system_subsections,
-        ) = self._assemble_system_prompt(
-            constitution=constitution,
-            include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation,
-            system_prompt_addendum=system_prompt_addendum,
-            system_prompt_budget_bytes=system_prompt_budget_bytes,
-            system_prompt_budget_tokens=tool_aware_system_budget,
-            anchored_doctrine=anchored_doctrine,
-        )
+        try:
+            (
+                assembly.system_prompt,
+                assembly.injected_clauses,
+                assembly.dropped_clauses,
+                system_subsections,
+            ) = self._assemble_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                system_prompt_addendum=system_prompt_addendum,
+                system_prompt_budget_bytes=system_prompt_budget_bytes,
+                system_prompt_budget_tokens=tool_aware_system_budget,
+                anchored_doctrine=anchored_doctrine,
+            )
+        except MandatorySystemPromptBudgetError as exc:
+            reason = str(exc)
+            logger.error(
+                "degraded-mode: %s — caller MUST refuse the LLM call",
+                reason,
+            )
+            assembly.warnings.append(
+                f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                "surface this to the operator."
+            )
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
         self._record_system_usage(assembly, budget)
 
         # 1b. Reflection guidance (into the system prompt, budget-gated).
@@ -1004,9 +1020,28 @@ class ContextManager:
         # 5. Format conversation history with the remaining (elastic) budget,
         # lumpy-anchored for a cache-stable prefix, then reconciled to fit.
         self._apply_history(assembly, budget, history)
-        self._final_prune_to_payload_budget(
+        rendered_payload_tokens = self._final_prune_to_payload_budget(
             assembly, budget, extra_tokens=tools_tokens
         )
+        if rendered_payload_tokens > budget.total_budget:
+            reason = (
+                "rendered non-history context does not fit the model payload "
+                f"budget ({rendered_payload_tokens} > {budget.total_budget} tokens)"
+            )
+            assembly.warnings.append(
+                f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                "surface this to the operator."
+            )
+            assembly.system_prompt = ""
+            assembly.dynamic_blocks.clear()
+            assembly.formatted_history.clear()
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
 
         raw_history_tokens = sum(
             self.counter.count(m.get("content", "") or "") for m in history
@@ -1823,7 +1858,7 @@ class ContextManager:
         budget: TokenBudget,
         *,
         extra_tokens: int = 0,
-    ) -> None:
+    ) -> int:
         """Enforce the final rendered-byte ceiling after wrapper accounting.
 
         Section budgets charge the historical raw memory/RAG block costs, but
@@ -1843,7 +1878,7 @@ class ContextManager:
 
         before = rendered_tokens()
         if before <= budget.total_budget:
-            return
+            return before
 
         target = int(budget.total_budget * self.PRUNE_TARGET_FRAC)
         dropped_tokens = 0
@@ -1870,6 +1905,7 @@ class ContextManager:
                 f"Rendered non-history context remains over budget "
                 f"({after}/{budget.total_budget} tokens)"
             )
+        return after
 
     def _degraded_result(
         self,
@@ -1984,6 +2020,38 @@ class ContextManager:
             else False
         )
 
+        required_suffix = "\n\n".join(
+            part
+            for part in (system_prompt_addendum, ephemeral_notice)
+            if part
+        )
+        mandatory_system_tokens = self._measure_mandatory_system_tokens(
+            constitution,
+            prompt_adaptation,
+            anchored_doctrine=anchored_doctrine,
+            required_suffix=required_suffix,
+            tracked_prompt=system_prompt_budget_bytes is not None,
+        )
+        if mandatory_system_tokens + tools_tokens > total_budget:
+            reason = (
+                "mandatory governance floor and tool schemas do not fit "
+                f"the model payload budget ({mandatory_system_tokens} + "
+                f"{tools_tokens} > {total_budget} tokens)"
+            )
+            assembly = ContextAssembly(
+                warnings=[
+                    f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                    "surface this to the operator."
+                ]
+            )
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
+
         ephemeral_tracking = None
         injected_clauses_for_audit: Optional[List[str]] = None
         dropped_clauses_for_audit: Optional[List[str]] = None
@@ -1992,23 +2060,36 @@ class ContextManager:
             or anchored_doctrine
             or has_context_clauses
         ):
-            required_suffix = "\n\n".join(
-                part
-                for part in (system_prompt_addendum, ephemeral_notice)
-                if part
-            )
-            ephemeral_tracking = self.context_builder.build_system_prompt_with_tracking(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                budget_bytes=system_prompt_budget_bytes,
-                budget_tokens=(
-                    system_token_budget if has_context_clauses else None
-                ),
-                required_suffix=required_suffix,
-                anchored_doctrine=anchored_doctrine,
-            )
+            try:
+                ephemeral_tracking = (
+                    self.context_builder.build_system_prompt_with_tracking(
+                        constitution=constitution,
+                        include_briefing=include_briefing,
+                        prompt_adaptation=prompt_adaptation,
+                        state_of_mind=None,
+                        budget_bytes=system_prompt_budget_bytes,
+                        budget_tokens=(
+                            system_token_budget if has_context_clauses else None
+                        ),
+                        required_suffix=required_suffix,
+                        anchored_doctrine=anchored_doctrine,
+                    )
+                )
+            except MandatorySystemPromptBudgetError as exc:
+                reason = str(exc)
+                assembly = ContextAssembly(
+                    warnings=[
+                        f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                        "surface this to the operator."
+                    ]
+                )
+                return self._degraded_plan(
+                    assembly,
+                    reason=reason,
+                    mandatory_system_tokens=mandatory_system_tokens,
+                    state_of_mind=state_of_mind,
+                    mode=mode,
+                )
             system_prompt = ephemeral_tracking.prompt
             injected_clauses_for_audit = list(ephemeral_tracking.injected_clauses)
             dropped_clauses_for_audit = list(ephemeral_tracking.dropped_clauses)
@@ -2029,6 +2110,26 @@ class ContextManager:
             system_prompt = f"{system_prompt}\n\n{ephemeral_notice}"
 
         tokens = self.counter.count(system_prompt)
+
+        if tokens + tools_tokens > total_budget:
+            reason = (
+                "rendered EPHEMERAL system prompt and tool schemas do not fit "
+                f"the model payload budget ({tokens} + {tools_tokens} > "
+                f"{total_budget} tokens)"
+            )
+            assembly = ContextAssembly(
+                warnings=[
+                    f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                    "surface this to the operator."
+                ]
+            )
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
 
         assembly = ContextAssembly(
             system_prompt=system_prompt,

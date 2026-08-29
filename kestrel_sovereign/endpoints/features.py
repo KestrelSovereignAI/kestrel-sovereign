@@ -881,6 +881,12 @@ async def update_feature_config(
 
         await feature.set_config(incoming)
 
+    refresh_context = getattr(agent, "refresh_feature_context_clauses", None)
+    if callable(refresh_context):
+        refreshed = refresh_context(feature)
+        if inspect.isawaitable(refreshed):
+            await refreshed
+
     updated = await feature.get_config()
 
     # Never echo secret values back to the client.

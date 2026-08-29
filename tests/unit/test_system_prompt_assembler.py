@@ -307,6 +307,20 @@ def test_contributed_context_alone_over_budget_never_drops_constitution():
 
 
 def test_budget_never_drops_mandatory_identity_or_operator_policy():
+    unbounded = assemble_system_prompt(
+        constitution="governance",
+        bootstrap_files=OrderedDict(
+            [
+                ("SOUL.md", "identity"),
+                ("AGENTS.md", "operator policy"),
+                ("TOOLS.md", "optional tools"),
+            ]
+        ),
+    )
+    optional_body = next(
+        body for name, body in unbounded.subsections if name == "TOOLS.md"
+    )
+    optional_bytes = len(optional_body.encode("utf-8"))
     result = assemble_system_prompt(
         constitution="governance",
         bootstrap_files=OrderedDict(
@@ -316,7 +330,7 @@ def test_budget_never_drops_mandatory_identity_or_operator_policy():
                 ("TOOLS.md", "optional tools"),
             ]
         ),
-        budget_bytes=1,
+        budget_bytes=len(unbounded.prompt.encode("utf-8")) - optional_bytes,
     )
 
     assert result.injected_clauses == [
@@ -378,18 +392,29 @@ def test_truncation_within_priority_drops_latest_emit_first():
     assert "TOOLS.md" in result.injected_clauses
 
 
-def test_constitution_never_dropped_even_when_oversized():
-    """If the constitution alone exceeds budget, keep it. The design
-    treats integrity as load-bearing; an oversized constitution is
-    an operator-config problem, not something to silently truncate."""
-    result = assemble_system_prompt(
-        constitution="C" * 10_000,
-        bootstrap_files=OrderedDict([("TOOLS.md", "x" * 100)]),
-        budget_bytes=1000,
-    )
-    assert CLAUSE_KESTREL_CONSTITUTION in result.injected_clauses
-    assert "TOOLS.md" in result.dropped_clauses
-    assert len(result.prompt.encode("utf-8")) > 1000
+def test_oversized_mandatory_floor_is_explicit_not_silently_returned():
+    """The assembler surfaces an irreducible floor for caller fail-closed."""
+
+    with pytest.raises(ValueError, match="mandatory.*byte.*budget"):
+        assemble_system_prompt(
+            constitution="C" * 10_000,
+            bootstrap_files=OrderedDict([("TOOLS.md", "x" * 100)]),
+            budget_bytes=1000,
+        )
+
+
+def test_anchored_doctrine_rejects_synthetic_host_audit_names_before_emission():
+    with pytest.raises(
+        ValueError,
+        match="anchored doctrine.*reserved host audit name",
+    ):
+        assemble_system_prompt(
+            constitution="C",
+            bootstrap_files=OrderedDict(),
+            anchored_doctrine=OrderedDict(
+                [(CLAUSE_KESTREL_CONSTITUTION, "operator text")]
+            ),
+        )
 
 
 def test_drop_order_in_dropped_clauses_is_drop_time_order():

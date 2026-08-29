@@ -88,6 +88,54 @@ AGENTS_FILENAME = "AGENTS.md"
 _JOINER = "\n\n"
 
 
+class SystemPromptNamespaceError(ValueError):
+    """A host-owned prompt source claims a synthetic audit identity."""
+
+
+class MandatorySystemPromptBudgetError(ValueError):
+    """The non-droppable prompt floor exceeds an explicit ceiling."""
+
+    def __init__(
+        self,
+        *,
+        actual_bytes: int,
+        budget_bytes: Optional[int],
+        actual_tokens: Optional[int],
+        budget_tokens: Optional[int],
+    ) -> None:
+        self.actual_bytes = actual_bytes
+        self.budget_bytes = budget_bytes
+        self.actual_tokens = actual_tokens
+        self.budget_tokens = budget_tokens
+        overruns = []
+        if budget_bytes is not None and actual_bytes > budget_bytes:
+            overruns.append(f"byte budget ({actual_bytes} > {budget_bytes})")
+        if (
+            budget_tokens is not None
+            and actual_tokens is not None
+            and actual_tokens > budget_tokens
+        ):
+            overruns.append(f"token budget ({actual_tokens} > {budget_tokens})")
+        super().__init__(
+            "mandatory system prompt exceeds " + " and ".join(overruns)
+        )
+
+
+def validate_anchored_doctrine_names(names: Iterable[str]) -> tuple[str, ...]:
+    """Reject anchors that impersonate synthetic host audit clauses."""
+
+    values = tuple(names)
+    conflict = next(
+        (name for name in values if name in SYNTHETIC_HOST_AUDIT_NAMES),
+        None,
+    )
+    if conflict is not None:
+        raise SystemPromptNamespaceError(
+            f"anchored doctrine name {conflict!r} is a reserved host audit name"
+        )
+    return values
+
+
 @dataclass(frozen=True)
 class SystemPromptResult:
     """Structured output of priority-aware system-prompt assembly.
@@ -233,6 +281,7 @@ def assemble_system_prompt(
     # excluded if anchored_doctrine already supplies the same audit name;
     # the anchored copy has higher authority and priority.
     anchored = anchored_doctrine or OrderedDict()
+    validate_anchored_doctrine_names(anchored)
 
     for filename, content in bootstrap_files.items():
         if filename == "HEARTBEAT.md":
@@ -436,8 +485,19 @@ def _drop_to_fit(
         droppable = [c for c in kept if not c.mandatory]
         if not droppable:
             # Only mandatory governance remains and it is still over budget.
-            # Preserve it; the caller's floor preflight must fail closed.
-            break
+            # Never return the oversized bytes as a normal result: callers
+            # convert this typed boundary into degraded mode and refuse the
+            # LLM request. Direct assembler callers get an explicit error.
+            rendered = joined(kept)
+            actual_tokens = (
+                count_tokens(rendered) if count_tokens is not None else None
+            )
+            raise MandatorySystemPromptBudgetError(
+                actual_bytes=len(rendered.encode("utf-8")),
+                budget_bytes=budget_bytes,
+                actual_tokens=actual_tokens,
+                budget_tokens=budget_tokens,
+            )
         droppable.sort(key=lambda c: (-c.priority, -c.emit_index))
         victim = droppable[0]
         kept.remove(victim)

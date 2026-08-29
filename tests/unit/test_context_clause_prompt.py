@@ -416,6 +416,33 @@ async def test_ordinary_turn_reserves_tool_schema_tokens_before_context_clauses(
 
 
 @pytest.mark.asyncio
+async def test_tool_reservation_reduces_all_optional_payload_allocations():
+    """A large schema cannot coexist with untouched system and RAG slices."""
+
+    registry = _ClauseRegistry(_clause("optional", 10, "c " * 4_700))
+    storage = MagicMock()
+    storage.search_chunks = AsyncMock(
+        return_value=[{"document_name": "d", "content": "r " * 4_700}]
+    )
+    builder = ContextBuilder(storage, context_clause_registry=registry)
+    manager = ContextManager(storage=storage, context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="explain the architecture in detail",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=True,
+        conversation_history=[],
+        tools=[{"name": "large", "description": "y " * 22_400}],
+    )
+
+    assert plan.degraded_mode is False
+    assert plan.total_tokens <= plan.total_budget
+    assert plan.sections["rag"].included is False
+
+
+@pytest.mark.asyncio
 async def test_tool_schema_larger_than_payload_budget_fails_closed():
     registry = _ClauseRegistry(_clause("small", 10, "small context"))
     builder = ContextBuilder(MagicMock(), context_clause_registry=registry)
@@ -499,6 +526,45 @@ async def test_required_system_suffix_is_preflighted_before_assembly():
 
     assert plan.degraded_mode is True
     assert plan.mandatory_system_tokens > plan.total_budget
+
+
+@pytest.mark.asyncio
+async def test_mandatory_bytes_over_explicit_system_cap_fail_closed():
+    builder = _builder()
+    manager = ContextManager(storage=MagicMock(), context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="mandatory constitution",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        conversation_history=[],
+        system_prompt_budget_bytes=16,
+    )
+
+    assert plan.degraded_mode is True
+    assert plan.total_tokens == 0
+    assert "byte budget" in (plan.degraded_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_mandatory_floor_plus_tools_fail_closed():
+    storage = MagicMock()
+    builder = ContextBuilder(storage)
+    manager = ContextManager(storage=storage, context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="mandatory " * 18_000,
+        include_briefing=False,
+        privacy_mode="EPHEMERAL",
+        tools=[{"name": "large", "description": "y " * 18_000}],
+    )
+
+    assert plan.degraded_mode is True
+    assert plan.total_tokens == 0
+    assert "tool schemas" in (plan.degraded_reason or "")
 
 
 @pytest.mark.asyncio

@@ -385,6 +385,14 @@ class ConstitutionMixin:
         # only the prompt-injection set excludes it.
         skip_names = {"KESTREL_CONSTITUTION.md"}
 
+        from kestrel_sovereign.agent.system_prompt_assembler import (
+            validate_anchored_doctrine_names,
+        )
+
+        validate_anchored_doctrine_names(
+            path.name for path in anchored_paths if path.name not in skip_names
+        )
+
         # Codex round-23 P2: keys are basenames so the assembler's
         # section labels match. Operators who declare two anchored
         # paths with the same basename get a logged warning and only

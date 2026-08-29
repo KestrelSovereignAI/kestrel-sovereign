@@ -1317,7 +1317,9 @@ async def test_contributed_clause_names_persist_to_signal_log(
             template_path,
             name="clause_dropped",
             constitution_injection="full",
-            system_prompt_budget_bytes=32,
+            # Fits the mandatory constitution block but not the optional
+            # contributed clause joined after it.
+            system_prompt_budget_bytes=80,
         )
     )
 
@@ -1653,6 +1655,46 @@ async def test_constitution_mixin_get_anchored_files_skips_duplicate_basenames(
     assert files["AGENTS.md"].startswith("original ")
     # The basename "AGENTS.md" appears exactly once.
     assert sum(1 for k in files if k == "AGENTS.md") == 1
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_rejects_reserved_anchored_audit_name(
+    tmp_path, monkeypatch,
+):
+    """Invalid operator doctrine fails before prompt assembly, with its name."""
+
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import (
+        DEFAULT_ANCHORED_PATHS,
+        PROP_BUNDLE_ANCHORED_PATHS,
+    )
+    from unittest.mock import AsyncMock, MagicMock
+
+    for rel in DEFAULT_ANCHORED_PATHS:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"original {rel}", encoding="utf-8")
+    reserved = tmp_path / "operator" / "KESTREL_CONSTITUTION"
+    reserved.parent.mkdir()
+    reserved.write_text("must not collide", encoding="utf-8")
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test"
+
+        def __init__(self):
+            self.storage = MagicMock()
+            node = MagicMock()
+            node.properties = {
+                PROP_BUNDLE_ANCHORED_PATHS: ["operator/KESTREL_CONSTITUTION"],
+            }
+            self.storage.get_node = AsyncMock(return_value=node)
+
+    with pytest.raises(
+        ValueError,
+        match="anchored doctrine.*reserved host audit name",
+    ):
+        await _Agent().get_anchored_doctrine_files()
 
 
 @pytest.mark.asyncio

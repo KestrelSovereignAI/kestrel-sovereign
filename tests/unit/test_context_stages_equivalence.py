@@ -1303,10 +1303,7 @@ async def test_live_dry_plan_equivalence_for_exact_final_payload_pruning():
 
     assert len(dry.assembly.formatted_history) < len(history)
     assert dry.total_tokens <= dry.total_budget
-    assert any(
-        "Final payload pruning removed" in warning
-        for warning in dry.warnings
-    )
+    assert dry.budget_summary["external_reserved_tokens"] > 0
     assert live.sections["history"].tokens == dry.sections["history"].tokens
 
 
