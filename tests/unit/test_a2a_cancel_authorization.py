@@ -1,6 +1,7 @@
 """Authority and atomicity regressions for A2A task cancellation (#3134)."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -320,6 +321,69 @@ async def test_cancel_readback_is_atomic_with_authorized_transition(
         assert (
             await canonical_get("cancel-readback")
         ).status.state is TaskState.CANCELED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_cancel_commit_reconciles_projections_before_rethrow(
+    tmp_path,
+):
+    """A lost COMMIT acknowledgement cannot strand canonical cancellation."""
+
+    manager = await create_task_manager(str(tmp_path / "ambiguous-commit.db"))
+    try:
+        await manager.create_task(
+            _params("ambiguous-commit"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        terminal_events = asyncio.Queue()
+        manager._subscribers["ambiguous-commit"] = [terminal_events]
+        canceled_callbacks: list[str] = []
+        completions: list[str] = []
+        manager._on_task_cancelled = (
+            lambda task: canceled_callbacks.append(task.id)
+        )
+        manager._on_task_complete = lambda task: completions.append(task.id)
+        canonical_cancel = manager.task_store.cancel_if_authorized
+
+        async def commit_then_lose_ack(*args, **kwargs):
+            committed = await canonical_cancel(*args, **kwargs)
+            assert committed is not None
+            raise RuntimeError("lost PostgreSQL COMMIT acknowledgement")
+
+        manager.task_store.cancel_if_authorized = commit_then_lose_ack
+
+        with pytest.raises(RuntimeError, match="COMMIT acknowledgement"):
+            await manager.cancel_task(
+                "ambiguous-commit",
+                reason="withdrawn",
+                agent_name="did:test:creator",
+                recipient_agent_id="did:test:recipient",
+            )
+
+        persisted = await manager.get_task("ambiguous-commit")
+        assert persisted.status.state is TaskState.CANCELED
+        assert canceled_callbacks == ["ambiguous-commit"]
+        assert completions == ["ambiguous-commit"]
+        event = terminal_events.get_nowait()
+        assert event["event"] == "status"
+        assert event["final"] is True
+        assert terminal_events.empty()
+
+        manager.task_store.cancel_if_authorized = canonical_cancel
+        retry = await manager.cancel_task(
+            "ambiguous-commit",
+            reason="withdrawn",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+
+        assert retry.status.state is TaskState.CANCELED
+        assert canceled_callbacks == ["ambiguous-commit"]
+        assert completions == ["ambiguous-commit"]
+        assert terminal_events.empty()
     finally:
         await manager.close()
 
@@ -2546,10 +2610,16 @@ async def test_cancel_readback_failure_rolls_back_transition_on_available_backen
 
 @pytest.mark.asyncio
 async def test_postgres_initialization_installs_canceled_terminal_trigger():
+    @asynccontextmanager
+    async def transaction():
+        yield
+
     backend = SimpleNamespace(
         backend_type="postgres",
         execute_script=AsyncMock(),
         execute=AsyncMock(return_value=0),
+        fetch_one=AsyncMock(return_value=(False,)),
+        transaction=transaction,
     )
 
     await TaskStore(backend).initialize()
@@ -2560,6 +2630,78 @@ async def test_postgres_initialization_installs_canceled_terminal_trigger():
     assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_canceled_terminal" in scripts
     assert "NEW.status IS DISTINCT FROM 'canceled'" in scripts
     assert "CREATE TRIGGER a2a_tasks_canceled_terminal_v1" in scripts
+
+
+@pytest.mark.asyncio
+async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("transaction-enter")
+        try:
+            yield
+        finally:
+            events.append("transaction-exit")
+
+    async def execute(query, _params=()):
+        normalized = " ".join(query.split())
+        if "pg_advisory_xact_lock" in normalized:
+            events.append("advisory-lock")
+        elif "CREATE INDEX" in normalized:
+            events.append("index-ddl")
+        return 0
+
+    async def fetch_one(_query, _params=()):
+        events.append("schema-reprobe")
+        return (False,)
+
+    async def execute_script(script):
+        if "a2a_tasks_enforce_canceled_terminal" in script:
+            events.append("fence-ddl")
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        execute_script=AsyncMock(side_effect=execute_script),
+        execute=AsyncMock(side_effect=execute),
+        fetch_one=AsyncMock(side_effect=fetch_one),
+        transaction=transaction,
+    )
+
+    await TaskStore(backend).initialize()
+
+    lock_index = events.index("advisory-lock")
+    probe_index = events.index("schema-reprobe")
+    fence_index = events.index("fence-ddl")
+    assert events.index("transaction-enter") < lock_index < probe_index
+    assert probe_index < fence_index < events.index("transaction-exit")
+
+
+@pytest.mark.asyncio
+async def test_postgres_cancellation_schema_waiter_skips_completed_ddl():
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        execute_script=AsyncMock(),
+        execute=AsyncMock(return_value=0),
+        fetch_one=AsyncMock(return_value=(True,)),
+        transaction=transaction,
+    )
+
+    await TaskStore(backend).initialize()
+
+    scripts = "\n".join(
+        call.args[0] for call in backend.execute_script.await_args_list
+    )
+    assert "a2a_tasks_enforce_canceled_terminal" not in scripts
+    statements = "\n".join(
+        call.args[0] for call in backend.execute.await_args_list
+    )
+    assert "pg_advisory_xact_lock" in statements
+    assert "CREATE INDEX" not in statements
 
 
 @pytest.mark.asyncio

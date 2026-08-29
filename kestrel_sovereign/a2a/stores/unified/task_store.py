@@ -25,6 +25,8 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
+_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v1"
+
 
 class TaskAlreadyExistsError(ValueError):
     """A caller attempted to create a second task under an occupied ID."""
@@ -110,25 +112,21 @@ class TaskStore(UnifiedStoreBase):
         except Exception as e:
             logger.debug(f"Migration check for user_id: {e}")
 
-        # Durable task authority and cancellation receipt (#3134).  These are
-        # separate columns rather than caller-controlled metadata so a shared
-        # PostgreSQL table has the same security boundary as per-agent SQLite.
-        authority_columns = (
-            "creator_agent_id",
-            "recipient_agent_id",
-            "canceled_by",
-            "cancel_reason",
-            "cancel_previous_status",
-        )
-        for column in authority_columns:
-            await self.add_column_if_missing("a2a_tasks", column, "TEXT")
-
-        # Cancellation is terminal at the storage boundary, including for
-        # pre-upgrade writers still running during a PostgreSQL rollout. The
-        # application predicates below protect current code, while this fence
-        # prevents an older unconditional UPDATE/upsert from resurrecting a
-        # row after a new worker has committed its cancellation receipt.
-        await self._install_canceled_terminal_fence()
+        # Durable task authority and cancellation receipt (#3134). PostgreSQL
+        # hosts initialize several agents concurrently, so serialize the whole
+        # schema bundle and re-probe after acquiring the database-wide lock.
+        # Without that second probe, every waiter would still replay DDL based
+        # on the stale pre-lock schema it observed.
+        if self.is_postgres:
+            async with self._backend.transaction():
+                await self._backend.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                    (_CANCELLATION_SCHEMA_LOCK,),
+                )
+                if not await self._postgres_cancellation_schema_ready():
+                    await self._ensure_cancellation_schema_objects()
+        else:
+            await self._ensure_cancellation_schema_objects()
 
         # Pre-#3134 live rows have no trustworthy creator/recipient columns.
         # Metadata was caller-controlled and a shared PostgreSQL table contains
@@ -164,6 +162,89 @@ class TaskStore(UnifiedStoreBase):
                 settled,
             )
 
+        logger.info(f"TaskStore initialized ({self._backend.backend_type})")
+
+    async def _postgres_cancellation_schema_ready(self) -> bool:
+        """Re-probe every PostgreSQL object protected by the migration lock."""
+
+        row = await self._backend.fetch_one("""
+            SELECT
+                (
+                    SELECT COUNT(*) = 5
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'a2a_tasks'
+                      AND column_name IN (
+                          'creator_agent_id',
+                          'recipient_agent_id',
+                          'canceled_by',
+                          'cancel_reason',
+                          'cancel_previous_status'
+                      )
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = procedure.pronamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND procedure.proname =
+                          'a2a_tasks_enforce_canceled_terminal'
+                      AND pg_get_function_identity_arguments(procedure.oid) = ''
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_trigger trigger
+                    JOIN pg_class relation
+                      ON relation.oid = trigger.tgrelid
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND relation.relname = 'a2a_tasks'
+                      AND trigger.tgname = 'a2a_tasks_canceled_terminal_v1'
+                      AND NOT trigger.tgisinternal
+                )
+                AND (
+                    SELECT COUNT(*) = 5
+                    FROM pg_class index_relation
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = index_relation.relnamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND index_relation.relkind = 'i'
+                      AND index_relation.relname IN (
+                          'idx_tasks_status',
+                          'idx_tasks_session',
+                          'idx_tasks_user',
+                          'idx_tasks_creator',
+                          'idx_tasks_recipient'
+                      )
+                )
+        """)
+        return bool(row and row[0])
+
+    async def _ensure_cancellation_schema_objects(self) -> None:
+        """Install the authority columns, terminal fence, and query indexes."""
+
+        # Separate columns rather than caller-controlled metadata give a
+        # shared PostgreSQL table the same security boundary as per-agent
+        # SQLite.
+        authority_columns = (
+            "creator_agent_id",
+            "recipient_agent_id",
+            "canceled_by",
+            "cancel_reason",
+            "cancel_previous_status",
+        )
+        for column in authority_columns:
+            await self.add_column_if_missing("a2a_tasks", column, "TEXT")
+
+        # Cancellation is terminal at the storage boundary, including for
+        # pre-upgrade writers still running during a PostgreSQL rollout. The
+        # application predicates below protect current code, while this fence
+        # prevents an older unconditional UPDATE/upsert from resurrecting a
+        # row after a new worker has committed its cancellation receipt.
+        await self._install_canceled_terminal_fence()
+
         # Create indexes
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_status ON a2a_tasks(status)"
@@ -184,8 +265,6 @@ class TaskStore(UnifiedStoreBase):
             "CREATE INDEX IF NOT EXISTS idx_tasks_recipient "
             "ON a2a_tasks(recipient_agent_id)"
         )
-
-        logger.info(f"TaskStore initialized ({self._backend.backend_type})")
 
     async def _install_canceled_terminal_fence(self) -> None:
         """Install an idempotent database guard against canceled resurrection."""
