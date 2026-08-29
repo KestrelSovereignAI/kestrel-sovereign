@@ -481,6 +481,19 @@ class HoldStore:
             for receipt in receipts
             if receipt.disposition is HoldDisposition.APPLIED
         ]
+        projection_row = await self._read_latch_row(scope, target_id)
+        projection_revision = 0
+        if projection_row is not None:
+            if len(projection_row) != 8:
+                raise HoldCorruptStateError(
+                    "hold latch row has an unexpected shape"
+                )
+            try:
+                projection_revision = int(projection_row[7])
+            except (TypeError, ValueError) as exc:
+                raise HoldCorruptStateError(
+                    "hold latch row has invalid typed fields"
+                ) from exc
         authorities = {
             receipt.receipt_id: receipt
             for receipt in applied
@@ -519,6 +532,10 @@ class HoldStore:
 
         if latch is None:
             if not terminal_authorities:
+                if projection_revision != len(applied):
+                    raise HoldCorruptStateError(
+                        "hold latch revision does not match applied receipt history"
+                    )
                 return
             raise HoldCorruptStateError(
                 "unheld projection retains active Hold authority"
@@ -548,6 +565,10 @@ class HoldStore:
         if terminal_authorities != {latch.hold_receipt_id}:
             raise HoldCorruptStateError(
                 "active hold latch is not the receipt graph's terminal authority"
+            )
+        if projection_revision != len(applied):
+            raise HoldCorruptStateError(
+                "hold latch revision does not match applied receipt history"
             )
 
     async def _validate_latch_projection(
@@ -878,7 +899,7 @@ class HoldStore:
         resolved_scope = _coerce_scope(scope)
         resolved_target = _target(resolved_scope, target_id)
         targets = ((resolved_scope, resolved_target),)
-        async with self._db.transaction(immediate=True):
+        async with self._db.transaction():
             await self._lock_read_targets(targets)
             await self._assert_host_latch_shape()
             latch = _latch_from_row(
@@ -908,7 +929,7 @@ class HoldStore:
             (HoldScope.HOST, HOST_HOLD_TARGET),
             (HoldScope.AGENT, agent),
         )
-        async with self._db.transaction(immediate=True):
+        async with self._db.transaction():
             await self._lock_read_targets(targets)
             await self._assert_host_latch_shape()
             rows = await self._db.fetchall(
@@ -962,7 +983,7 @@ class HoldStore:
         """Read one receipt only after proving its target authority graph."""
 
         operation = _required_text(operation_id, "operation_id")
-        async with self._db.transaction(immediate=True):
+        async with self._db.transaction():
             row = await self._read_receipt_by_operation(operation)
             if row is None:
                 return None

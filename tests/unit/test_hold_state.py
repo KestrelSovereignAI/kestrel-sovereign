@@ -251,6 +251,35 @@ async def test_cyclic_applied_hold_history_fails_closed_when_projection_is_unhel
 
 
 @pytest.mark.asyncio
+async def test_inactive_revision_rejects_deleted_closed_receipt_chain(hold_db):
+    """Mutation tripwire: an empty graph cannot erase proven prior mutations."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:closed-history",
+        actor_id="did:sovereign:operator",
+        reason="closed history",
+        operation_id="closed-history-hold",
+    )
+    await store.release_hold(
+        scope="agent",
+        target_id="did:agent:closed-history",
+        actor_id="did:sovereign:operator",
+        reason="closed history release",
+        operation_id="closed-history-release",
+        expected_hold_receipt_id=held.receipt.receipt_id,
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:closed-history"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="revision"):
+        await store.get_effective("did:agent:closed-history")
+
+
+@pytest.mark.asyncio
 async def test_release_rejects_latch_rewound_to_consumed_hold_authority(hold_db):
     db, store = hold_db
     first = await store.set_hold(
@@ -839,7 +868,7 @@ async def test_state_read_validates_projection_inside_one_locked_snapshot(
                 (HoldScope.AGENT, "did:agent:snapshot"),
             )
         ]
-    assert transaction_modes == [True]
+    assert transaction_modes == [False]
 
 
 @pytest.mark.asyncio
