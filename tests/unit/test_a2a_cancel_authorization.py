@@ -1452,7 +1452,10 @@ async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
     try:
         legacy = await manager.task_store._get_unscoped("legacy-forged-receipt")
         assert "cancellation_receipt" not in (legacy.metadata or {})
-        with pytest.raises(ValueError, match="Invalid state transition"):
+        with pytest.raises(
+            TaskCancellationAuthorizationError,
+            match="not authorized or task was not found",
+        ):
             await manager.cancel_task(
                 "legacy-forged-receipt",
                 agent_name="did:test:evil",
@@ -1574,6 +1577,41 @@ async def test_cancel_task_terminal_state_is_unchanged(tmp_path):
         unchanged = await manager.task_store._get_unscoped("finished")
         assert unchanged.status.state is TaskState.COMPLETED
         assert "cancellation_receipt" not in (unchanged.metadata or {})
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_terminal_and_absent_cancel_are_indistinguishable(tmp_path):
+    manager = await create_task_manager(str(tmp_path / "terminal-privacy.db"))
+    try:
+        task = await manager.create_task(
+            _params("foreign-finished"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.update_status(
+            task.id,
+            TaskState.WORKING,
+            agent_name="did:test:recipient",
+            recipient_agent_id="did:test:recipient",
+        )
+        await manager.update_status(
+            task.id,
+            TaskState.COMPLETED,
+            agent_name="did:test:recipient",
+            recipient_agent_id="did:test:recipient",
+        )
+
+        for task_id in ("foreign-finished", "absent-task"):
+            with pytest.raises(
+                TaskCancellationAuthorizationError,
+                match="not authorized or task was not found",
+            ):
+                await manager.cancel_task(
+                    task_id,
+                    agent_name="did:test:foreign",
+                )
     finally:
         await manager.close()
 
@@ -2726,6 +2764,47 @@ async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
         assert (
             await manager.get_task("terminal-cancel")
         ).status.state is TaskState.CANCELED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_database_fence_blocks_legacy_replace_of_canceled_task(tmp_path):
+    """SQLite REPLACE cannot delete and recreate a canceled authority row."""
+
+    manager = await create_task_manager(str(tmp_path / "legacy-replace-fence.db"))
+    try:
+        await manager.create_task(
+            _params("terminal-replace"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "terminal-replace",
+            agent_name="did:test:creator",
+        )
+
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await manager.task_store.backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks
+                    (id, task_type, status, creator_agent_id, recipient_agent_id)
+                VALUES (?, ?, 'completed', ?, ?)
+                """,
+                (
+                    "terminal-replace",
+                    "generic",
+                    "did:test:replacement-creator",
+                    "did:test:replacement-recipient",
+                ),
+            )
+
+        canceled = await manager.get_task_for_creator(
+            "terminal-replace",
+            "did:test:creator",
+        )
+        assert canceled is not None
+        assert canceled.status.state is TaskState.CANCELED
     finally:
         await manager.close()
 

@@ -1308,7 +1308,10 @@ class TaskManager:
             # original store outcome only after that reconciliation completes.
             store_failure = error
             try:
-                current = await self.task_store._get_unscoped(task_id)
+                current = await self.task_store.get_for_principal(
+                    task_id,
+                    agent_name,
+                )
                 committed_here = (
                     current is not None
                     and await is_this_actor_receipt(current)
@@ -1326,7 +1329,10 @@ class TaskManager:
             task = current
         if task is None:
             try:
-                current = await self.task_store._get_unscoped(task_id)
+                current = await self.task_store.get_for_principal(
+                    task_id,
+                    agent_name,
+                )
             except BaseException:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
@@ -1334,7 +1340,10 @@ class TaskManager:
             if current is None:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
-                raise ValueError(f"Task not found: {task_id}")
+                raise TaskCancellationAuthorizationError(
+                    "Task cancellation was not authorized or task was not found: "
+                    f"{task_id}"
+                )
             if await is_this_actor_receipt(current):
                 # The first atomic cancellation owns every derived projection.
                 # Its cancellation-safe projection join completes those side
