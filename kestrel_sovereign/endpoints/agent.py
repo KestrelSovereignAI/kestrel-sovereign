@@ -26,6 +26,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     resolve_request_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     invocation_log_correlation,
@@ -2419,8 +2420,9 @@ async def _create_a2a_task_under_lifecycle_lease(
     sender_artifacts,
     manager,
     hosted_policy=None,
+    commit=None,
 ):
-    """Verify, authorize, and persist one task under a stable hosted topology."""
+    """Verify, authorize, and commit one A2A action under stable topology."""
     from kestrel_sovereign.a2a.envelope_signing import (
         canonical_message,
         verify_inbound_envelope,
@@ -2477,6 +2479,16 @@ async def _create_a2a_task_under_lifecycle_lease(
             status_code=403,
             detail=f"A2A sender verification failed: {sender_verdict.reason}",
         )
+    if callable(commit) and not sender_verdict.verified:
+        # Legacy unsigned envelopes are a narrow task-creation compatibility
+        # lane. They cannot authorize a destructive lifecycle transition: the
+        # shared host API key authenticates transport access, not the peer name
+        # in caller-controlled metadata. Local Core callers use the separate
+        # host-attested submission/cancellation contract instead.
+        raise HTTPException(
+            status_code=403,
+            detail="A2A cancellation requires a verified sender signature",
+        )
     if hosted_policy is not None:
         if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
             raise HTTPException(
@@ -2520,6 +2532,7 @@ async def _create_a2a_task_under_lifecycle_lease(
             agent,
             inbound_authorizer,
         )
+    authorized_legacy_sender_id = None
     if sender_verdict.verified:
         if inbound_authorizer is not None:
             if (
@@ -2605,10 +2618,10 @@ async def _create_a2a_task_under_lifecycle_lease(
             "authorize_a2a_legacy_unsigned_sender",
             None,
         )
-        authorized = False
+        authorized_sender_id = None
         if callable(authorize_legacy):
             try:
-                authorized = await authorize_legacy(
+                authorized_sender_id = await authorize_legacy(
                     agent,
                     claimed_sender,
                     hosted_policy,
@@ -2618,11 +2631,12 @@ async def _create_a2a_task_under_lifecycle_lease(
                     "Hosted legacy unsigned A2A sender authorization failed",
                     exc_info=True,
                 )
-        if authorized is not True:
+        if not isinstance(authorized_sender_id, str) or not authorized_sender_id:
             raise HTTPException(
                 status_code=403,
                 detail="A2A unsigned sender is not an authorized local legacy peer",
             )
+        authorized_legacy_sender_id = authorized_sender_id
         if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
             raise HTTPException(
                 status_code=403,
@@ -2635,6 +2649,60 @@ async def _create_a2a_task_under_lifecycle_lease(
         )
 
     params.metadata["sender_verified"] = sender_verdict.verified
+    authorized_sender_id = (
+        sender_verdict.sender
+        if sender_verdict.verified
+        else authorized_legacy_sender_id
+    )
+    # A same-host agent may create a task before its hybrid ceremony and
+    # cancel it afterward with its successor signing DID.  The manager witness
+    # cryptographically bound that successor DID to the exact live local agent;
+    # persist and compare the manager's stable routing DID so the principal
+    # does not change merely because its signing key advanced.  External
+    # senders retain their verified signing DID because this host has no local
+    # lifecycle witness with which to normalize them.
+    if (
+        sender_verdict.verified
+        and sender_witness is not None
+        and sender_witness[0] == "local"
+    ):
+        witnessed_agent = sender_witness[1]
+        stable_sender_id = None
+        for attribute in ("did", "agent_id"):
+            candidate = getattr(witnessed_agent, attribute, None)
+            if isinstance(candidate, str) and candidate:
+                stable_sender_id = candidate
+                break
+        witnessed_identity = sender_witness[2]
+        bound_dids = {
+            candidate
+            for candidate in (
+                getattr(witnessed_identity, "legacy_did", None),
+                getattr(witnessed_identity, "new_did", None),
+            )
+            if isinstance(candidate, str) and candidate
+        }
+        if (
+            isinstance(stable_sender_id, str)
+            and stable_sender_id in bound_dids
+            and sender_verdict.sender in bound_dids
+        ):
+            authorized_sender_id = stable_sender_id
+    if callable(commit):
+        try:
+            return await commit(authorized_sender_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Failed to commit verified A2A action: %s",
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500, detail="Failed to commit A2A action"
+            ) from exc
+
     local_name = (
         getattr(agent, "did", None)
         or getattr(agent, "_agent_name", None)
@@ -2645,7 +2713,10 @@ async def _create_a2a_task_under_lifecycle_lease(
             params=params,
             agent_name=local_name,
             artifacts=sender_artifacts or None,
+            creator_agent_id=authorized_sender_id,
         )
+    except TaskAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         logger.error(
             "Failed to create A2A task from peer submission: %s",
@@ -2661,6 +2732,7 @@ async def _create_verified_a2a_task(
     parts,
     raw_artifacts,
     sender_artifacts,
+    commit=None,
 ):
     """Use a shared manager lease for hosted recipients; preserve standalone flow."""
     manager = getattr(agent, "_a2a_host_manager", None)
@@ -2689,6 +2761,7 @@ async def _create_verified_a2a_task(
                 sender_artifacts,
                 manager,
                 hosted_policy,
+                commit,
             )
     return await _create_a2a_task_under_lifecycle_lease(
         agent,
@@ -2697,6 +2770,8 @@ async def _create_verified_a2a_task(
         raw_artifacts,
         sender_artifacts,
         None,
+        None,
+        commit,
     )
 
 
@@ -2901,6 +2976,104 @@ async def get_task(request: Request, task_id: str):
         "message": message_text,
         "artifacts": artifacts_payload,
         "metadata": task.metadata or {},
+    }
+
+
+@router.post("/tasks/{task_id:path}/cancel")
+@limiter.limit("120/minute")
+async def cancel_task_from_peer(request: Request, task_id: str):
+    """Cancel an A2A task through the recipient's authoritative store.
+
+    The API key authenticates the host connection, not the peer actor. The
+    cancellation therefore carries the same DID-signed, replay-protected
+    envelope as task creation and repeats the recipient's live peer-scope
+    authorization before the atomic creator/recipient predicate is applied.
+    """
+    agent = get_agent(request)
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(status_code=404, detail="TaskManager not available")
+
+    body = await _parse_json_body(request)
+    reason = body.get("reason") or "Task canceled by creator"
+    session_id = body.get("sessionId") or ""
+    metadata = body.get("metadata") or {}
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 4096:
+        raise HTTPException(
+            status_code=400,
+            detail="Cancellation reason must be a non-empty string up to 4096 characters",
+        )
+    if not isinstance(session_id, str) or not session_id:
+        raise HTTPException(status_code=400, detail="sessionId is required")
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="metadata must be an object")
+    if metadata.get("a2a_verb") != "cancel_task":
+        raise HTTPException(
+            status_code=400,
+            detail="Cancellation envelope must bind a2a_verb=cancel_task",
+        )
+
+    from kestrel_sovereign.a2a.task_manager import (
+        TaskCancellationAuthorizationError,
+    )
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    params = TaskSendParams(
+        id=task_id,
+        sessionId=session_id,
+        message=Message(role="user", parts=[TextPart(text=reason)]),
+        metadata=metadata,
+    )
+    recipient_agent_id = next(
+        (
+            candidate
+            for candidate in (
+                getattr(agent.task_manager, "host_agent_id", None),
+                getattr(agent, "did", None),
+                getattr(agent, "agent_id", None),
+            )
+            if isinstance(candidate, str) and candidate
+        ),
+        None,
+    )
+    if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="A2A task cancellation requires a durable recipient identity",
+        )
+
+    async def _cancel(authorized_sender_id: str):
+        if not isinstance(authorized_sender_id, str) or not authorized_sender_id:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A task cancellation requires an authenticated agent",
+            )
+        try:
+            return await agent.task_manager.cancel_task(
+                task_id,
+                reason=reason,
+                agent_name=authorized_sender_id,
+                recipient_agent_id=recipient_agent_id,
+            )
+        except TaskCancellationAuthorizationError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            status_code = 404 if str(exc) == f"Task not found: {task_id}" else 409
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    task = await _create_verified_a2a_task(
+        agent,
+        params,
+        params.message.parts,
+        [],
+        [],
+        commit=_cancel,
+    )
+    return {
+        "id": task.id,
+        "status": task.status.state.value,
+        "cancellation_receipt": (task.metadata or {}).get(
+            "cancellation_receipt"
+        ),
     }
 
 

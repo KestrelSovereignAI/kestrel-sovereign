@@ -32,8 +32,15 @@ class _Router:
 
 
 class _TaskManager:
-    async def create_task(self, *, params, agent_name, artifacts):
-        return SimpleNamespace(metadata=dict(params.metadata), agent_name=agent_name, artifacts=artifacts)
+    async def create_task(
+        self, *, params, agent_name, artifacts, creator_agent_id=None
+    ):
+        return SimpleNamespace(
+            metadata=dict(params.metadata),
+            agent_name=agent_name,
+            artifacts=artifacts,
+            creator_agent_id=creator_agent_id,
+        )
 
 
 def _recipient(router):
@@ -62,6 +69,7 @@ async def test_local_submission_is_recipient_authorized_and_not_cryptographicall
 
     assert router.calls == [(recipient.peer_requester, "did:frinz:sender")]
     assert task.metadata["sender_verified"] is False
+    assert task.creator_agent_id == "did:frinz:sender"
     assert task.metadata["sender_trust"] == "host_attested_local"
     assert "signature" not in task.metadata
     assert task.metadata[HOST_ATTESTED_LOCAL_SUBMISSION_METADATA] == {
