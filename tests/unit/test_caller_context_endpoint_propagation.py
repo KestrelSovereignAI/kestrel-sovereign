@@ -199,6 +199,73 @@ def test_bridge_stream_propagates_sovereign_caller_from_api_key():
         _restore_app(app, original)
 
 
+@pytest.mark.parametrize("path", ["invoke", "stream"])
+def test_bridge_lifecycle_precedes_session_and_log_side_effects(path):
+    """A concurrent exact Stop must see the bridge turn as live."""
+
+    events = []
+    agent, _captured = _capturing_agent()
+    agent.register_active_request = MagicMock(
+        side_effect=lambda request_id: events.append(("register", request_id))
+    )
+    agent._cleanup_cancelled_request = MagicMock()
+    agent.is_request_cancelled = MagicMock(return_value=False)
+    session = MagicMock(id="bridge-session-1")
+
+    async def _session(**_kwargs):
+        events.append(("session", None))
+        assert events[0] == ("register", "bridge-ordering")
+        return session
+
+    async def _log(**_kwargs):
+        events.append(("log", None))
+        assert events[0] == ("register", "bridge-ordering")
+
+    bridge = MagicMock()
+    bridge.get_or_create_session = AsyncMock(side_effect=_session)
+    bridge.log_invocation = AsyncMock(side_effect=_log)
+    agent.features = {"BridgeFeature": bridge}
+
+    app, original = _prepare_app(agent)
+    try:
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        app.include_router(get_router())
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                if path == "stream":
+                    with client.stream(
+                        "POST",
+                        "/api/bridge/stream",
+                        headers={"X-API-Key": "test-key"},
+                        json={
+                            "message": "work",
+                            "channel_type": "api",
+                            "request_id": "bridge-ordering",
+                        },
+                    ) as response:
+                        assert response.status_code == 200, response.read()
+                        list(response.iter_text())
+                else:
+                    response = client.post(
+                        "/api/bridge/invoke",
+                        headers={"X-API-Key": "test-key"},
+                        json={
+                            "message": "work",
+                            "channel_type": "api",
+                            "request_id": "bridge-ordering",
+                        },
+                    )
+                    assert response.status_code == 200, response.text
+
+        assert events[0] == ("register", "bridge-ordering")
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "bridge-ordering"
+        )
+    finally:
+        _restore_app(app, original)
+
+
 def test_bridge_invoke_forwards_header_retry_id_and_trusted_provenance():
     """Bridge redeliveries must not mint a new canonical tool operation."""
     from kestrel_sovereign.agent.invocation import invocation_id_response_header

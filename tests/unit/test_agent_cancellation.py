@@ -500,7 +500,7 @@ def test_every_http_turn_door_primes_the_durable_stop_fence():
     assert agent_source.count(call) == 2
     assert bridge_source.count(call) == 2
     assert models_source.count(call) == 1
-    assert rasa_source.count(call) == 1
+    assert rasa_source.count(call) == 2
     assert sovereignty_source.count(call) == 1
 
 

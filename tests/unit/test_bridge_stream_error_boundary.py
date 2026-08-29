@@ -237,7 +237,7 @@ def test_bridge_stream_withholds_queued_chunk_after_stop():
 
     response, agent = _post_stream_with_agent(
         _queued,
-        cancel_on_check=2,
+        cancel_on_check=5,
     )
 
     assert response.status_code == 200
@@ -256,7 +256,7 @@ def test_bridge_stream_reports_stop_after_clean_producer_eof():
 
     response, agent = _post_stream_with_agent(
         _clean_eof,
-        cancel_on_check=2,
+        cancel_on_check=5,
     )
 
     assert response.status_code == 200
