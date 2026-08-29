@@ -38,6 +38,30 @@ async def hold_db(tmp_path):
         await db.close()
 
 
+async def _create_legacy_hold_tables(db) -> None:
+    """Create the pre-witness Hold tables used by upgrade regressions."""
+
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (scope, target_id))"
+    )
+    await db.execute(
+        "CREATE TABLE hold_receipts ("
+        "receipt_id TEXT NOT NULL PRIMARY KEY, operation_id TEXT NOT NULL, "
+        "action TEXT NOT NULL, disposition TEXT NOT NULL, scope TEXT NOT NULL, "
+        "target_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
+        "actor_id TEXT NOT NULL, occurred_at TEXT NOT NULL, "
+        "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '')"
+    )
+
+
 @pytest.mark.asyncio
 async def test_host_and_agent_holds_compose_and_release_independently(hold_db):
     _db, store = hold_db
@@ -758,29 +782,66 @@ async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
 
 
 @pytest.mark.asyncio
+async def test_legacy_receipts_gain_witnesses_once_before_marker(tmp_path):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-witness-upgrade.db"))
+    await _create_legacy_hold_tables(db)
+    receipt_id = "legacy-upgrade-receipt"
+    target_id = "did:agent:legacy-upgrade"
+    occurred_at = "2026-08-28T00:00:00+00:00"
+    await db.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, resulting_hold_receipt_id"
+        ") VALUES (?, ?, 'hold', 'applied', 'agent', ?, ?, ?, ?, ?)",
+        (
+            receipt_id,
+            "legacy-upgrade-operation",
+            target_id,
+            "legacy import",
+            "did:sovereign:operator",
+            occurred_at,
+            receipt_id,
+        ),
+    )
+    await db.execute(
+        "INSERT INTO hold_latches ("
+        "scope, target_id, active, hold_receipt_id, reason, actor_id, "
+        "set_at, revision"
+        ") VALUES ('agent', ?, 1, ?, ?, ?, ?, 1)",
+        (
+            target_id,
+            receipt_id,
+            "legacy import",
+            "did:sovereign:operator",
+            occurred_at,
+        ),
+    )
+    store = HoldStore(db)
+    try:
+        await store.ensure_schema()
+
+        effective = await store.get_effective(target_id)
+        receipt = await store.get_receipt("legacy-upgrade-operation")
+        marker = await db.fetchone(
+            "SELECT 1 FROM hold_schema_migrations "
+            "WHERE name = 'hold_state_witness_ledgers_v1'"
+        )
+
+        assert effective.held is True
+        assert effective.agent is not None
+        assert effective.agent.hold_receipt_id == receipt_id
+        assert receipt is not None and receipt.receipt_id == receipt_id
+        assert marker is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_duplicate_operation_ids_fail_closed(tmp_path):
     """Runtime reads cannot trust a UNIQUE constraint an old table may lack."""
 
     db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-duplicate-operation.db"))
-    await db.execute(
-        "CREATE TABLE hold_latches ("
-        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
-        "active INTEGER NOT NULL DEFAULT 0, "
-        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
-        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
-        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, "
-        "PRIMARY KEY (scope, target_id))"
-    )
-    await db.execute(
-        "CREATE TABLE hold_receipts ("
-        "receipt_id TEXT NOT NULL PRIMARY KEY, operation_id TEXT NOT NULL, "
-        "action TEXT NOT NULL, disposition TEXT NOT NULL, scope TEXT NOT NULL, "
-        "target_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
-        "actor_id TEXT NOT NULL, occurred_at TEXT NOT NULL, "
-        "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
-        "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
-        "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '')"
-    )
+    await _create_legacy_hold_tables(db)
     store = HoldStore(db)
     await store.ensure_schema()
     try:
@@ -974,45 +1035,49 @@ async def test_deleted_receipt_operation_id_cannot_be_rebound_to_other_target(
 
 
 @pytest.mark.asyncio
-async def test_repeat_schema_check_hashes_only_missing_content_witnesses(
-    hold_db, monkeypatch
+@pytest.mark.parametrize("witness_kind", ["content", "operation", "receipt-count"])
+async def test_completed_witness_migration_never_reblesses_missing_evidence(
+    hold_db, witness_kind
 ):
-    """Startup backfill work is bounded by missing legacy witnesses."""
+    """A later boot treats missing ledgers as corruption, not legacy state."""
 
     db, store = hold_db
-    first = await store.set_hold(
+    held = await store.set_hold(
         scope="agent",
         target_id="did:agent:backfill",
         actor_id="did:sovereign:operator",
-        reason="seed witness",
-        operation_id="content-witness-present",
+        reason="original evidence",
+        operation_id="witness-must-survive",
     )
-    second = await store.set_hold(
-        scope="agent",
-        target_id="did:agent:backfill",
-        actor_id="did:sovereign:operator",
-        reason="replace witness",
-        operation_id="content-witness-missing",
-    )
-    await db.execute(
-        "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id = ?",
-        (second.receipt.receipt_id,),
-    )
+    if witness_kind == "content":
+        # Deleting the digest after mutating the row was the dangerous case:
+        # repeat startup used to hash the attacker-controlled replacement and
+        # thereby bless it as the new integrity witness.
+        await db.execute(
+            "UPDATE hold_receipts SET reason = ? WHERE receipt_id = ?",
+            ("tampered evidence", held.receipt.receipt_id),
+        )
+        await db.execute(
+            "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id = ?",
+            (held.receipt.receipt_id,),
+        )
+    elif witness_kind == "operation":
+        await db.execute(
+            "DELETE FROM hold_operation_witnesses WHERE operation_id = ?",
+            (held.receipt.operation_id,),
+        )
+    else:
+        await db.execute(
+            "DELETE FROM hold_receipt_witnesses "
+            "WHERE scope = 'agent' AND target_id = ?",
+            (held.receipt.target_id,),
+        )
 
-    from kestrel_sovereign.hold import state as hold_state
-
-    original_digest = hold_state._receipt_content_digest
-    hashed_receipt_ids: list[str] = []
-
-    def _record_digest(row):
-        hashed_receipt_ids.append(str(row[0]))
-        return original_digest(row)
-
-    monkeypatch.setattr(hold_state, "_receipt_content_digest", _record_digest)
-    await store.ensure_schema()
-
-    assert hashed_receipt_ids == [second.receipt.receipt_id]
-    assert first.receipt.receipt_id not in hashed_receipt_ids
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="completed Hold witness migration",
+    ):
+        await store.ensure_schema()
 
 
 @pytest.mark.asyncio
