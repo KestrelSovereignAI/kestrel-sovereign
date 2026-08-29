@@ -48,7 +48,7 @@ def _bare_agent(store: _Store) -> KestrelAgent:
 
 
 @pytest.mark.asyncio
-async def test_process_input_refuses_at_unconditional_hold_seam() -> None:
+async def test_process_input_refuses_at_unconditional_hold_seam(monkeypatch) -> None:
     """Mutation tripwire: deleting the non-streaming check must run onward."""
 
     host = _latch(HoldScope.HOST, "hold:host", target="host")
@@ -57,6 +57,11 @@ async def test_process_input_refuses_at_unconditional_hold_seam() -> None:
     )
     store = _Store(EffectiveHoldState(host=host, agent=agent_hold))
     agent = _bare_agent(store)  # deliberately has no hooks manager or turn state
+    dispositions: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.metrics.record_held_work_disposition",
+        lambda *, disposition, source: dispositions.append((disposition, source)),
+    )
 
     with pytest.raises(HoldTurnRefusal) as caught:
         await agent.process_input("do not begin")
@@ -66,6 +71,8 @@ async def test_process_input_refuses_at_unconditional_hold_seam() -> None:
     assert caught.value.effective_state.agent is agent_hold
     assert caught.value.metadata["host_hold"] is host
     assert caught.value.metadata["agent_hold"] is agent_hold
+    assert caught.value.metadata["disposition"] == "refused"
+    assert dispositions == [("refused", "turn")]
 
 
 @pytest.mark.asyncio

@@ -715,6 +715,15 @@ class SignalDispatcher:
                 f"durable_retry_skips_coalescing:{id(self)}", default=False
             )
         )
+        # The durable route task must retain the public three-argument
+        # ``_route_after_durable_persistence`` seam used by embeddings and
+        # tests.  Context propagation marks only that child as defer-not-skip
+        # Hold work without adding a signature-breaking keyword.
+        self._durable_cognition_route: contextvars.ContextVar[bool] = (
+            contextvars.ContextVar(
+                f"durable_cognition_route:{id(self)}", default=False
+            )
+        )
         # Cancellation-resistant cognition turns are intentionally retained
         # rather than abandoned.  Both sets are bounded by the one in-flight
         # cursor delivery per dispatcher/consumer and expose exact ownership
@@ -728,6 +737,11 @@ class SignalDispatcher:
         self._durable_cognition_drainers: dict[str, asyncio.Task[None]] = {}
         self._durable_cognition_drain_timers: dict[str, asyncio.TimerHandle] = {}
         self._started_durable_cognition_consumers: set[str] = set()
+        # One bounded observability edge per durable consumer while Hold is
+        # continuously active. Polling discovers cross-host release without
+        # inflating the deferred counter once per second.
+        self._held_durable_cognition_consumers: set[str] = set()
+        self._held_durable_claim_consumers: set[str] = set()
         # A live provider callback owns the first exact claim for its own
         # event. The recovery drainer may execute only rows that survived that
         # admission attempt; otherwise it could steal a just-persisted PENDING
@@ -1180,6 +1194,26 @@ class SignalDispatcher:
                 statuses=[PENDING, RETRY],
                 limit=100,
             )
+            if candidates and await self._agent_is_held():
+                # Hold is checked before the lease transfer: at-least-once
+                # work stays visibly pending and another runtime cannot
+                # mistake a transient lease for execution progress.  Polling
+                # is bounded to one timer per consumer and is what discovers a
+                # release committed by another PostgreSQL host.
+                from kestrel_sovereign.hold import HeldWorkDisposition
+                from kestrel_sovereign.hold.metrics import (
+                    record_held_work_disposition,
+                )
+
+                if consumer_id not in self._held_durable_cognition_consumers:
+                    record_held_work_disposition(
+                        disposition=HeldWorkDisposition.DEFERRED.value,
+                        source=candidates[0].event.source,
+                    )
+                    self._held_durable_cognition_consumers.add(consumer_id)
+                self._schedule_durable_cognition_drain(consumer_id, delay=1.0)
+                return
+            self._held_durable_cognition_consumers.discard(consumer_id)
             delivery = None
             blocked_by_live_admission = False
             for candidate in candidates:
@@ -1353,10 +1387,29 @@ class SignalDispatcher:
                 if handoff.consumer_id == consumer_id:
                     self._discard_transient_durable_handoff(delivery_id)
             self._started_durable_cognition_consumers.discard(consumer_id)
+            self._held_durable_cognition_consumers.discard(consumer_id)
+            self._held_durable_claim_consumers.discard(consumer_id)
             timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
             if timer is not None:
                 timer.cancel()
             return True
+
+    async def _durable_claim_deferred_by_hold(self, consumer_id: str) -> bool:
+        """Fence every durable lease API while Hold is active."""
+
+        if not await self._agent_is_held():
+            self._held_durable_claim_consumers.discard(consumer_id)
+            return False
+        if consumer_id not in self._held_durable_claim_consumers:
+            from kestrel_sovereign.hold import HeldWorkDisposition
+            from kestrel_sovereign.hold.metrics import record_held_work_disposition
+
+            record_held_work_disposition(
+                disposition=HeldWorkDisposition.DEFERRED.value,
+                source="durable_consumer",
+            )
+            self._held_durable_claim_consumers.add(consumer_id)
+        return True
 
     async def claim_durable_delivery(
         self, *, consumer_id: str, executor_id: str
@@ -1364,6 +1417,8 @@ class SignalDispatcher:
         """Atomically claim one delivery for this agent-scoped consumer."""
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
+            if await self._durable_claim_deferred_by_hold(consumer_id):
+                return None
             self._discard_expired_transient_durable_handoffs()
             delivery = await self._durable_store.claim_delivery(
                 agent_id=self._agent.did,
@@ -1432,6 +1487,8 @@ class SignalDispatcher:
         """
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
+            if await self._durable_claim_deferred_by_hold(consumer_id):
+                return None
             self._discard_expired_transient_durable_handoffs()
             delivery = await self._durable_store.claim_delivery_for_event(
                 agent_id=self._agent.did,
@@ -1720,6 +1777,8 @@ class SignalDispatcher:
             timer.cancel()
         self._durable_cognition_drain_timers.clear()
         self._started_durable_cognition_consumers.clear()
+        self._held_durable_cognition_consumers.clear()
+        self._held_durable_claim_consumers.clear()
         drainers = tuple(self._durable_cognition_drainers.values())
         for task in drainers:
             if not task.done():
@@ -3160,6 +3219,25 @@ class SignalDispatcher:
     ) -> SignalResult:
         """Route cursor-owned work and ACK only its durable cognition lease."""
         delivery = claimed_delivery
+        held_result = await self._held_signal_result(
+            signal,
+            registration,
+            start,
+            durable=True,
+        )
+        if held_result is not None:
+            if delivery is not None:
+                # A Hold can win after the drainer's pre-claim snapshot.  Give
+                # back that exact lease before returning the deferred receipt;
+                # release never terminalizes or advances a provider cursor.
+                await self.nack_durable_delivery(
+                    consumer_id=consumer_id,
+                    delivery_id=delivery.delivery_id,
+                    lease_token=delivery.lease_token or "",
+                    error="hold_deferred",
+                    retry_delay=retry_delay or _DURABLE_COGNITION_RETRY_DELAY,
+                )
+            return held_result
         if delivery is None:
             delivery = await self.claim_durable_delivery_for_event(
                 consumer_id=consumer_id,
@@ -3281,6 +3359,7 @@ class SignalDispatcher:
                 coalescing_token = self._durable_retry_skips_coalescing.set(
                     delivery.attempts > 1
                 )
+                durable_route_token = self._durable_cognition_route.set(True)
                 try:
                     routing_task = asyncio.create_task(
                         self._route_after_durable_persistence(
@@ -3291,6 +3370,7 @@ class SignalDispatcher:
                         name=f"durable_cognition_route:{delivery.delivery_id}",
                     )
                 finally:
+                    self._durable_cognition_route.reset(durable_route_token)
                     self._durable_retry_skips_coalescing.reset(coalescing_token)
                     self._deferred_outcome_logs.reset(deferred_token)
 
@@ -3679,6 +3759,15 @@ class SignalDispatcher:
         start: float,
     ) -> SignalResult:
         """Run the post-commit policy and cognition stages for a signal."""
+        durable = self._durable_cognition_route.get()
+        held_result = await self._held_signal_result(
+            signal,
+            registration,
+            start,
+            durable=durable,
+        )
+        if held_result is not None:
+            return held_result
         # Step 3: quiet-hours
         if self._in_quiet_hours(signal, registration.attention_policy):
             return self._fail(
@@ -3726,6 +3815,64 @@ class SignalDispatcher:
 
         # Step 6 + 7: acquire locks and route
         return await self._route_under_locks(signal, registration, start)
+
+    async def _agent_is_held(self) -> bool:
+        """Read the load-bearing Hold latch without beginning a turn."""
+
+        from kestrel_sovereign.hold import get_effective_hold_state
+
+        effective = await get_effective_hold_state(self._agent)
+        return effective is not None and effective.held
+
+    async def _held_signal_result(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        start: float,
+        *,
+        durable: bool,
+    ) -> SignalResult | None:
+        """Return the typed, audited Hold disposition for one signal unit."""
+
+        try:
+            if not await self._agent_is_held():
+                return None
+        except Exception as exc:
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error=f"hold_state_unavailable: {type(exc).__name__}",
+                registration=registration,
+            )
+
+        from kestrel_sovereign.hold import HeldWorkDisposition
+        from kestrel_sovereign.hold.metrics import record_held_work_disposition
+
+        disposition = (
+            HeldWorkDisposition.DEFERRED
+            if durable
+            else HeldWorkDisposition.SKIPPED
+        )
+        record_held_work_disposition(
+            disposition=disposition.value,
+            source=signal.source,
+        )
+        # Existing SDK statuses retain wire compatibility.  The stable error
+        # code is the receipt discriminator: scheduled surfaces already treat
+        # DROPPED_QUIET_HOURS as a benign skip, while COALESCED is a benign
+        # no-execution result and leaves durable delivery state untouched.
+        return self._fail(
+            signal,
+            start,
+            (
+                Status.COALESCED
+                if durable
+                else Status.DROPPED_QUIET_HOURS
+            ),
+            error=f"hold_{disposition.value}",
+            registration=registration,
+        )
 
     # ------------------------------------------------------------------
     # Cycle detection (precise rules — see SIGNAL_DISPATCHER.md §6)
@@ -3823,6 +3970,19 @@ class SignalDispatcher:
             label=f"{signal.source} {signal.kind}",
         ):
             try:
+                # This second snapshot is the signal-unit admission point.
+                # It closes the race in which Hold commits while the dispatch
+                # waits for a declared resource lock.  A Hold committed after
+                # this point applies to the next unit, matching turn-start
+                # linearization for interactive cognition.
+                held_result = await self._held_signal_result(
+                    signal,
+                    registration,
+                    start,
+                    durable=self._durable_cognition_route.get(),
+                )
+                if held_result is not None:
+                    return held_result
                 if signal.mode == SignalMode.ACTION:
                     assert registration.handler is not None
                     write_audit_callback = requested_handler_write_audit_callback()

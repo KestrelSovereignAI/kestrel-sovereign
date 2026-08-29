@@ -14,10 +14,12 @@ from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_S
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    held_turn_http_exception,
     privacy_hides_persisted,
     request_invocation_provenance,
     resolve_request_invocation_id,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.agent.invocation import invocation_id_response_header
 
 logger = logging.getLogger(__name__)
@@ -312,6 +314,8 @@ async def trigger_sovereignty_import(request: Request, http_response: Response):
 
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return {"success": True, "message": result}
+    except HoldTurnRefusal as refusal:
+        raise held_turn_http_exception(refusal) from refusal
     except HTTPException:
         raise
     except Exception as e:

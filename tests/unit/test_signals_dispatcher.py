@@ -20,7 +20,7 @@ import tempfile
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from kestrel_sdk.signals import (
@@ -47,6 +47,7 @@ from kestrel_sovereign.signals import (
     SourceRegistrationWithPromptOverride,
     SourceRegistry,
 )
+from kestrel_sovereign.hold import EffectiveHoldState, HoldScope, HoldState
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -181,9 +182,85 @@ def _signal(
     )
 
 
+def _held_state(agent_id: str) -> EffectiveHoldState:
+    return EffectiveHoldState(
+        host=None,
+        agent=HoldState(
+            scope=HoldScope.AGENT,
+            target_id=agent_id,
+            reason="maintenance",
+            actor_id="did:sovereign:operator",
+            set_at="2026-08-28T12:00:00+00:00",
+            hold_receipt_id="hold:test",
+            revision=1,
+        ),
+    )
+
+
+class _HoldSnapshots:
+    def __init__(self, *snapshots: EffectiveHoldState) -> None:
+        self.snapshots = list(snapshots)
+
+    async def get_effective(self, _agent_id: str) -> EffectiveHoldState:
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_held_periodic_signal_is_audited_as_benign_skip(
+    dispatcher_components,
+    monkeypatch,
+):
+    """Mutation tripwire: the periodic handler must remain uncalled."""
+
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    c.registry.register(_action_reg("cron.test", handler=handler))
+    c.agent._hold_store = _HoldSnapshots(_held_state(c.agent.did))
+    metric = Mock()
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.metrics.record_held_work_disposition",
+        metric,
+    )
+
+    result = await c.dispatcher.dispatch_signal(_signal("cron.test"))
+
+    assert result.status is Status.DROPPED_QUIET_HOURS
+    assert result.error == "hold_skipped"
+    handler.assert_not_awaited()
+    row = await c.backend.fetch_one(
+        "SELECT status, error FROM signal_log WHERE id = ?",
+        (result.signal_id,),
+    )
+    assert row == (Status.DROPPED_QUIET_HOURS.value, "hold_skipped")
+    metric.assert_called_once_with(disposition="skipped", source="cron.test")
+
+
+@pytest.mark.asyncio
+async def test_hold_committed_while_waiting_for_signal_lock_skips_handler(
+    dispatcher_components,
+):
+    """The under-lock admission snapshot closes the scheduled-work race."""
+
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    c.registry.register(_action_reg("cron.race", handler=handler))
+    c.agent._hold_store = _HoldSnapshots(
+        EffectiveHoldState(host=None, agent=None),
+        _held_state(c.agent.did),
+    )
+
+    result = await c.dispatcher.dispatch_signal(_signal("cron.race"))
+
+    assert result.status is Status.DROPPED_QUIET_HOURS
+    assert result.error == "hold_skipped"
+    handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio

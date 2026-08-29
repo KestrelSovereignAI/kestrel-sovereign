@@ -7,6 +7,7 @@ when neither the host nor the addressed agent latch is active.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 from .state import EffectiveHoldState, HoldStateError
@@ -14,6 +15,14 @@ from .state import EffectiveHoldState, HoldStateError
 
 class HoldEnforcementUnavailableError(HoldStateError):
     """A production runtime could not bind its load-bearing Hold store."""
+
+
+class HeldWorkDisposition(str, Enum):
+    """The exhaustive treatment of work observed while Hold is active."""
+
+    SKIPPED = "skipped"
+    DEFERRED = "deferred"
+    REFUSED = "refused"
 
 
 class HoldTurnRefusal(RuntimeError):
@@ -41,6 +50,7 @@ class HoldTurnRefusal(RuntimeError):
         self.agent_hold = effective_state.agent
         self.metadata = {
             "code": self.code,
+            "disposition": HeldWorkDisposition.REFUSED.value,
             "agent_id": agent_id,
             "host_hold": effective_state.host,
             "agent_hold": effective_state.agent,
@@ -85,6 +95,28 @@ async def close_bound_host_context(context: Any) -> None:
             await db.close()
 
 
+async def get_effective_hold_state(agent: Any) -> EffectiveHoldState | None:
+    """Read the effective Hold snapshot for a bound runtime object.
+
+    Unbound library/test objects retain their pre-Hold construction contract.
+    Production factories bind the load-bearing store before initialization.
+    """
+
+    # Mock/proxy objects may synthesize arbitrary attributes from ``getattr``.
+    # A Hold store is load-bearing only after the runtime explicitly binds the
+    # concrete instance attribute, so inspect the instance namespace directly.
+    namespace = getattr(agent, "__dict__", None)
+    store = namespace.get("_hold_store") if isinstance(namespace, dict) else None
+    if store is None:
+        return None
+    agent_id = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
+    if not isinstance(agent_id, str) or not agent_id:
+        raise HoldEnforcementUnavailableError(
+            "Cannot enforce Hold without a concrete agent DID"
+        )
+    return await store.get_effective(agent_id)
+
+
 async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     """Linearize one turn admission against host and agent Hold latches.
 
@@ -98,16 +130,17 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     initialization, and fail closed through :func:`require_context_hold_store`.
     """
 
-    store = getattr(agent, "_hold_store", None)
-    if store is None:
-        return None
     agent_id = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
-    if not isinstance(agent_id, str) or not agent_id:
-        raise HoldEnforcementUnavailableError(
-            "Cannot enforce Hold without a concrete agent DID"
-        )
-    effective = await store.get_effective(agent_id)
+    effective = await get_effective_hold_state(agent)
+    if effective is None:
+        return None
     if effective.held:
+        from .metrics import record_held_work_disposition
+
+        record_held_work_disposition(
+            disposition=HeldWorkDisposition.REFUSED.value,
+            source="turn",
+        )
         raise HoldTurnRefusal(agent_id=agent_id, effective_state=effective)
     return effective
 
@@ -115,8 +148,10 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
 __all__ = [
     "HoldEnforcementUnavailableError",
     "HoldTurnRefusal",
+    "HeldWorkDisposition",
     "build_bound_host_context",
     "close_bound_host_context",
+    "get_effective_hold_state",
     "require_context_hold_store",
     "require_turn_start_allowed",
 ]

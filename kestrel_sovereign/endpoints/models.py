@@ -20,9 +20,11 @@ from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    held_turn_http_exception,
     request_invocation_provenance,
     resolve_request_invocation_id,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.agent.invocation import invocation_id_response_header
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
@@ -3224,6 +3226,8 @@ async def chat_completions(request: Request, http_response: Response):
         }
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return resp
+    except HoldTurnRefusal as refusal:
+        raise held_turn_http_exception(refusal) from refusal
     except HTTPException:
         # Preserve the original status code (notably 503 from get_agent
         # when no agent is bound — multi-agent mode requires the

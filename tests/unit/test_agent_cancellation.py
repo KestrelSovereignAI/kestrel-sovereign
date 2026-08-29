@@ -369,6 +369,73 @@ class TestStopEndpoint:
         mock_agent.register_active_request.assert_called_once_with(request_id)
         mock_agent._cleanup_cancelled_request.assert_called_once_with(request_id)
 
+    @pytest.mark.parametrize("path", ["/api/agent/invoke", "/api/agent/stream"])
+    def test_held_interactive_endpoint_returns_423_before_response_body(self, path):
+        """Streaming must not bury the typed Hold refusal inside a 200 body."""
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.endpoints.agent_helpers import held_turn_http_exception
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+            HoldTurnRefusal,
+        )
+        from kestrel_sovereign.rate_limit import limiter
+
+        latch = HoldState(
+            scope=HoldScope.AGENT,
+            target_id="did:test:http-held",
+            reason="private operator reason",
+            actor_id="did:sovereign:operator",
+            set_at="2026-08-28T12:00:00+00:00",
+            hold_receipt_id="hold:http-test",
+            revision=1,
+        )
+        refusal = HoldTurnRefusal(
+            agent_id="did:test:http-held",
+            effective_state=EffectiveHoldState(host=None, agent=latch),
+        )
+        mapped = held_turn_http_exception(refusal)
+        assert mapped.code == "agent_held"
+        assert mapped.details == [
+            {
+                "disposition": "refused",
+                "agent_id": "did:test:http-held",
+                "host_held": False,
+                "agent_held": True,
+                "host_hold_receipt_id": None,
+                "agent_hold_receipt_id": "hold:http-test",
+            }
+        ]
+
+        async def _held_stream(*_args, **_kwargs):
+            raise refusal
+            yield  # pragma: no cover
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.process_input = AsyncMock(side_effect=refusal)
+        mock_agent.process_input_streaming = _held_stream
+        mock_agent.register_active_request = MagicMock()
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.is_request_cancelled = MagicMock(return_value=False)
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+        mock_agent._conversation_response_identity = MagicMock(return_value={})
+        app.state.agent = mock_agent
+
+        response = TestClient(app).post(path, json={"input": "do not begin"})
+
+        assert response.status_code == 423
+        assert response.json()["detail"] == "The agent is held and cannot begin a turn."
+        assert "private operator reason" not in response.text
+        mock_agent._cleanup_cancelled_request.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):
         """#2674 P2: a strict (fail-closed) response audit stopped before dispatch

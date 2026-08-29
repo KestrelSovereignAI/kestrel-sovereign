@@ -10,6 +10,33 @@ from kestrel_sovereign.agent.invocation import (
     resolve_transport_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.hold import HoldTurnRefusal
+
+
+def held_turn_http_exception(refusal: HoldTurnRefusal) -> ApiHTTPException:
+    """Translate the typed turn refusal without exposing free-form Hold text."""
+
+    host = refusal.host_hold
+    agent = refusal.agent_hold
+    return ApiHTTPException(
+        status_code=423,
+        code=refusal.code,
+        message="The agent is held and cannot begin a turn.",
+        details=[
+            {
+                "disposition": "refused",
+                "agent_id": refusal.agent_id,
+                "host_held": host is not None,
+                "agent_held": agent is not None,
+                "host_hold_receipt_id": (
+                    host.hold_receipt_id if host is not None else None
+                ),
+                "agent_hold_receipt_id": (
+                    agent.hold_receipt_id if agent is not None else None
+                ),
+            }
+        ],
+    )
 
 
 def get_caller(request: Request):
