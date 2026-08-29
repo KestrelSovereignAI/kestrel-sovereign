@@ -1,5 +1,7 @@
 """Authenticated caller authority stays task-local and clears on signal turns."""
 
+import asyncio
+
 import pytest
 
 from kestrel_sovereign.agent.invocation import (
@@ -43,3 +45,22 @@ async def test_absent_caller_clears_inherited_authority_for_unattended_turn():
         assert current_caller_context() is sovereign
 
     assert current_caller_context() is None
+
+
+@pytest.mark.asyncio
+async def test_detached_task_cannot_retain_caller_after_scope_exit():
+    """A copied ContextVar must not outlive the endpoint-owned auth scope."""
+
+    sovereign = CallerContext.sovereign(identity="operator")
+    release = asyncio.Event()
+
+    async def detached_reader():
+        await release.wait()
+        return current_caller_context()
+
+    with caller_context_scope(sovereign):
+        task = asyncio.create_task(detached_reader())
+        assert current_caller_context() is sovereign
+
+    release.set()
+    assert await task is None

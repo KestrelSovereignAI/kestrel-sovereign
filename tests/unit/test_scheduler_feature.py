@@ -1116,6 +1116,26 @@ class TestScheduleAdd:
         assert result.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
+    async def test_add_rejects_authority_bound_restart_tool(self, feature):
+        """An unattended scheduler tick cannot supply sovereign authority."""
+
+        restart_tool = MagicMock()
+        restart_tool.name = "request_restart"
+        restart_feature = MagicMock()
+        restart_feature.get_tools = MagicMock(return_value=[restart_tool])
+        feature.agent.features = {"RestartCoordinatorFeature": restart_feature}
+
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="request_restart",
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "unknown scheduled task" in result.error.lower()
+        assert "request_restart" not in result.data["valid_task_names"]
+        feature._db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_add_rejects_disabled_feature_tool(self, feature):
         """#2522: a soft-disabled feature's tool is not executable, so it is
         not schedulable — ``schedule_add`` rejects it as an unknown task (a
