@@ -59,6 +59,42 @@ from .protocol import (
 logger = logging.getLogger(__name__)
 
 
+class _PreStartCleanupIterator:
+    """Release endpoint state when an SSE body is closed before first pull."""
+
+    def __init__(self, iterator, *, started, cleanup) -> None:
+        self._iterator = iterator
+        self._started = started
+        self._cleanup = cleanup
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await anext(self._iterator)
+        except BaseException:
+            self._closed = True
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._iterator.aclose()
+        finally:
+            # Closing an async generator before its first ``anext`` does not
+            # execute its body or ``finally``. The endpoint has already
+            # registered the request, so this outer response iterator owns that
+            # otherwise-unreachable pre-start cleanup boundary.
+            if not self._started():
+                self._cleanup()
+
+
 def _get_bridge_feature(request: Request):
     """
     Resolve the BridgeFeature from the running agent.
@@ -287,7 +323,11 @@ def get_router() -> APIRouter:
                 cleanup(request_id)
             raise
 
+        response_body_started = False
+
         async def event_generator():
+            nonlocal response_body_started
+            response_body_started = True
             full_response = []
             agent_stream = None
 
@@ -422,8 +462,13 @@ def get_router() -> APIRouter:
                             agent._cleanup_cancelled_request(request_id)
 
         try:
-            return StreamingResponse(
+            response_iterator = _PreStartCleanupIterator(
                 event_generator(),
+                started=lambda: response_body_started,
+                cleanup=lambda: agent._cleanup_cancelled_request(request_id),
+            )
+            return StreamingResponse(
+                response_iterator,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",

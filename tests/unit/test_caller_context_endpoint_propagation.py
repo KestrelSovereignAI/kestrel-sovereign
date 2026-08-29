@@ -572,3 +572,62 @@ def test_bridge_stream_registers_and_releases_the_request_lifecycle():
         )
     finally:
         _restore_app(app, original)
+
+
+@pytest.mark.asyncio
+async def test_bridge_unstarted_response_body_releases_request_lifecycle():
+    """A disconnect before first body pull cannot strand Stop registration."""
+
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+    from kestrel_sovereign.features.bridge.router import get_router
+
+    entered_stream = False
+
+    async def _stream(_input, **_kwargs):
+        nonlocal entered_stream
+        entered_stream = True
+        yield "unreachable"
+
+    agent = MagicMock()
+    agent.process_input_streaming = _stream
+    agent.is_request_cancelled = MagicMock(return_value=False)
+    _wire_bridge_feature(agent)
+    app = FastAPI()
+    app.state.agent = agent
+    app.state.agent_manager = None
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/bridge/stream",
+            "raw_path": b"/api/bridge/stream",
+            "query_string": b"",
+            "headers": [],
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "app": app,
+        }
+    )
+    route = next(
+        route for route in get_router().routes if route.path == "/api/bridge/stream"
+    )
+    endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+
+    response = await endpoint(
+        request,
+        BridgeRequest(message="work", request_id="bridge-unstarted-body"),
+    )
+    assert entered_stream is False
+    agent.register_active_request.assert_called_once_with("bridge-unstarted-body")
+
+    await response.body_iterator.aclose()
+
+    assert entered_stream is False
+    agent._cleanup_cancelled_request.assert_called_once_with(
+        "bridge-unstarted-body"
+    )
