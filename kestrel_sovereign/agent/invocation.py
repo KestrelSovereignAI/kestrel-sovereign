@@ -370,7 +370,7 @@ def bind_async_invocation(
                     # cancellation is a successful lifecycle completion, not a
                     # cleanup failure.
                     raise
-                except BaseException:
+                except BaseException as error:
                     if registered:
                         request_cancelled = getattr(
                             type(lifecycle_owner),
@@ -378,8 +378,15 @@ def bind_async_invocation(
                             None,
                         )
                         try:
+                            caller = asyncio.current_task()
+                            caller_cancelled = bool(
+                                isinstance(error, asyncio.CancelledError)
+                                and caller is not None
+                                and caller.cancelling()
+                            )
                             cleanup_abandoned = bool(
-                                callable(request_cancelled)
+                                not caller_cancelled
+                                and callable(request_cancelled)
                                 and request_cancelled(
                                     lifecycle_owner, invocation_id
                                 )

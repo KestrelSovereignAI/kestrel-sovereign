@@ -42,6 +42,7 @@ def test_stop_request_and_outcome_round_trip_exact_wire_values() -> None:
         reason="unsafe loop",
         cascade=False,
         correlation_id="stop-7",
+        target_is_turn_id=True,
     )
     assert StopRequest.from_dict(request.to_dict()) == request
 
@@ -461,12 +462,69 @@ async def test_authority_resolves_turn_address_to_live_cancellation_key() -> Non
             "did:test:operator",
             "turn-visible",
             target_agent_id="did:test:a",
+            target_is_turn_id=True,
         )
     )
 
     assert observed_targets == ["request-private"]
     assert outcomes[0].requested_target == "turn-visible"
     assert outcomes[0].resolved_target == "request-private"
+
+
+@pytest.mark.asyncio
+async def test_request_address_collision_is_not_remapped_as_public_turn() -> None:
+    """Address kind, not string membership, selects turn-ID remapping."""
+
+    observed_targets: list[str | None] = []
+
+    async def stop(request: StopRequest) -> StopDisposition:
+        observed_targets.append(request.target)
+        return StopDisposition.STOPPED
+
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget(
+                "agent-a",
+                "did:test:a",
+                stop,
+                turn_ids=frozenset({"collision"}),
+                turn_request_ids={"collision": "another-request"},
+            )
+        ]
+    )
+
+    outcome = await authority.stop(
+        StopRequest(
+            StopScope.TURN,
+            "did:test:operator",
+            "collision",
+            target_agent_id="did:test:a",
+            target_is_turn_id=False,
+        )
+    )
+
+    assert observed_targets == ["collision"]
+    assert outcome[0].resolved_target == "agent-a"
+
+
+def test_turn_stop_preserves_accepted_opaque_whitespace_request_id() -> None:
+    request = StopRequest(
+        StopScope.TURN,
+        "did:test:operator",
+        " ",
+        target_agent_id="did:test:a",
+    )
+    outcome = StopOutcome(
+        scope=StopScope.TURN,
+        requested_target=" ",
+        resolved_target=" ",
+        agent_id="did:test:a",
+        disposition=StopDisposition.STOPPED,
+        correlation_id="opaque-whitespace",
+    )
+
+    assert StopRequest.from_dict(request.to_dict()) == request
+    assert StopOutcome.from_dict(outcome.to_dict()) == outcome
 
 
 @pytest.mark.asyncio
@@ -633,6 +691,37 @@ def test_live_stop_endpoint_accepts_turn_id_and_resolves_inside_authority() -> N
         request_id="request-private"
     )
     agent.wait_for_request_completion.assert_awaited_once_with("request-private")
+
+
+def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+    )
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"collision", "another-request"}
+    agent._current_request_id = "another-request"
+    agent.active_turn_request_ids = MagicMock(
+        return_value={"collision": "another-request"}
+    )
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(
+        return_value=RequestCompletionDisposition.COMPLETED
+    )
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": "collision"},
+    )
+
+    assert response.status_code == 200
+    agent.cancel_current_request.assert_called_once_with(request_id="collision")
+    agent.wait_for_request_completion.assert_awaited_once_with("collision")
 
 
 def test_unknown_turn_does_not_fall_back_to_agent_wide_stop() -> None:

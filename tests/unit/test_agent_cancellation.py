@@ -178,6 +178,48 @@ async def test_cancelled_isolated_turn_cleanup_failure_is_abandoned():
 
 
 @pytest.mark.asyncio
+async def test_caller_cancellation_after_stop_marker_is_clean_completion():
+    """A canceled transport owner does not imply failed child cleanup."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
+
+    started = asyncio.Event()
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            started.set()
+            await asyncio.Event().wait()
+
+    owner = Owner()
+    turn = asyncio.create_task(owner.run(invocation_id="caller-shutdown"))
+    await started.wait()
+    assert owner.cancel_current_request("caller-shutdown") is True
+    completion = asyncio.create_task(
+        owner.wait_for_request_completion("caller-shutdown")
+    )
+    turn.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert await completion is RequestCompletionDisposition.COMPLETED
+    assert not owner._abandoned_generations("caller-shutdown")
+
+
+@pytest.mark.asyncio
 async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
     from kestrel_sovereign.agent.invocation import bind_async_invocation
     from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
