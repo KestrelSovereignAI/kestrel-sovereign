@@ -1066,6 +1066,14 @@ class TaskFeature(Feature):
                 data={"task_id": task_id, "state": terminal.value},
             )
 
+        # CANCELED is not an ordinary response-state write. Delegate before a
+        # local task lookup: with the normal per-agent SQLite topology, an
+        # outbound row exists only in the recipient store and the sender must
+        # resolve it through its durable PeersFeature route. Shared PostgreSQL
+        # visibility likewise cannot replace current peer-scope authorization.
+        if terminal == TaskState.CANCELED:
+            return await self.cancel_task(task_id, reason=content)
+
         try:
             task = await self.task_manager.get_task(task_id)
         except Exception as e:
@@ -1085,13 +1093,6 @@ class TaskFeature(Feature):
                 f"Task {task_id} is already terminal: {current.value}",
                 data={"task_id": task_id, "state": current.value},
             )
-
-        # CANCELED is not an ordinary response-state write. Delegate to the
-        # canonical cancellation tool so a sender-owned task follows its
-        # durable outbound route (and peer-scope reauthorization) even when a
-        # shared PostgreSQL store also exposes the recipient's row locally.
-        if terminal == TaskState.CANCELED:
-            return await self.cancel_task(task_id, reason=content)
 
         agent_name = getattr(self.agent, "did", None) or type(self.agent).__name__
         response_message = Message(

@@ -1112,6 +1112,8 @@ class TaskManager:
             "actor_agent_id": agent_name,
             "reason": reason,
         }
+        operation_id = uuid4().hex
+        cancel_kwargs["operation_id"] = operation_id
         if recipient_agent_id is not None:
             cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
         if task_payload is not None:
@@ -1122,15 +1124,51 @@ class TaskManager:
                 task_id,
                 agent_name,
             )
+        store_failure: BaseException | None = None
+
+        async def is_this_actor_receipt(candidate: Task) -> bool:
+            receipt = (candidate.metadata or {}).get("cancellation_receipt") or {}
+            return (
+                candidate.status.state is TaskState.CANCELED
+                and receipt.get("actor_agent_id") == agent_name
+                and (
+                    recipient_agent_id is None
+                    or await self.task_store.is_task_recipient(
+                        task_id,
+                        recipient_agent_id,
+                    )
+                )
+            )
+
         try:
             task = await self.task_store.cancel_if_authorized(
                 task_id,
                 **cancel_kwargs,
             )
-        except BaseException:
-            if rollback_local_intent is not None:
-                rollback_local_intent()
-            raise
+        except BaseException as error:
+            # PostgreSQL can commit and then lose the COMMIT acknowledgement.
+            # Re-read before declaring this a pre-commit failure: the task that
+            # owns the durable receipt must still cancel its queued wake and
+            # finish session/SSE/memory/completion projections.  Preserve the
+            # original store outcome only after that reconciliation completes.
+            store_failure = error
+            try:
+                current = await self.task_store.get(task_id)
+                committed_here = (
+                    current is not None
+                    and await is_this_actor_receipt(current)
+                    and await self.task_store.get_cancellation_operation_id(task_id)
+                    == operation_id
+                )
+            except BaseException as reconciliation_failure:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise error from reconciliation_failure
+            if not committed_here:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise
+            task = current
         if task is None:
             try:
                 current = await self.task_store.get(task_id)
@@ -1142,18 +1180,7 @@ class TaskManager:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
                 raise ValueError(f"Task not found: {task_id}")
-            receipt = (current.metadata or {}).get("cancellation_receipt") or {}
-            if (
-                current.status.state is TaskState.CANCELED
-                and receipt.get("actor_agent_id") == agent_name
-                and (
-                    recipient_agent_id is None
-                    or await self.task_store.is_task_recipient(
-                        task_id,
-                        recipient_agent_id,
-                    )
-                )
-            ):
+            if await is_this_actor_receipt(current):
                 # The first atomic cancellation owns every derived projection.
                 # Its cancellation-safe projection join completes those side
                 # effects before propagating a lost transport response, so a
@@ -1206,6 +1233,8 @@ class TaskManager:
             previous_state,
             TaskState.CANCELED.value,
         )
+        if store_failure is not None:
+            raise store_failure
         return task
 
     async def _finish_status_projection(

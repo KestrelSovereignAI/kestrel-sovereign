@@ -1,8 +1,10 @@
 """Authority and atomicity regressions for A2A task cancellation (#3134)."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -277,6 +279,156 @@ async def test_cancel_retry_reconciles_terminal_projection_after_interruption(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_payload", [False, True])
+async def test_cancel_readback_is_atomic_with_authorized_transition(
+    tmp_path,
+    with_payload,
+):
+    """A failed public read cannot split a committed cancel from projections."""
+
+    manager = await create_task_manager(str(tmp_path / f"cancel-read-{with_payload}.db"))
+    try:
+        await manager.create_task(
+            _params("cancel-readback"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        canonical_get = manager.task_store.get
+        current = await canonical_get("cancel-readback")
+        task_payload = (
+            current.model_copy(
+                update={"status": TaskStatus(state=TaskState.CANCELED)}
+            )
+            if with_payload
+            else None
+        )
+        canceled_callbacks: list[str] = []
+        manager._on_task_cancelled = lambda task: canceled_callbacks.append(task.id)
+        manager.task_store.get = AsyncMock(
+            side_effect=RuntimeError("injected post-update public read failure")
+        )
+
+        canceled = await manager.cancel_task(
+            "cancel-readback",
+            reason="withdrawn",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+            task_payload=task_payload,
+        )
+
+        assert canceled.status.state is TaskState.CANCELED
+        assert canceled_callbacks == ["cancel-readback"]
+        assert (
+            await canonical_get("cancel-readback")
+        ).status.state is TaskState.CANCELED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_cancel_commit_reconciles_projections_before_rethrow(
+    tmp_path,
+):
+    """A lost COMMIT acknowledgement cannot strand canonical cancellation."""
+
+    manager = await create_task_manager(str(tmp_path / "ambiguous-commit.db"))
+    try:
+        await manager.create_task(
+            _params("ambiguous-commit"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        terminal_events = asyncio.Queue()
+        manager._subscribers["ambiguous-commit"] = [terminal_events]
+        canceled_callbacks: list[str] = []
+        completions: list[str] = []
+        manager._on_task_cancelled = (
+            lambda task: canceled_callbacks.append(task.id)
+        )
+        manager._on_task_complete = lambda task: completions.append(task.id)
+        canonical_cancel = manager.task_store.cancel_if_authorized
+
+        async def commit_then_lose_ack(*args, **kwargs):
+            committed = await canonical_cancel(*args, **kwargs)
+            assert committed is not None
+            raise RuntimeError("lost PostgreSQL COMMIT acknowledgement")
+
+        manager.task_store.cancel_if_authorized = commit_then_lose_ack
+
+        with pytest.raises(RuntimeError, match="COMMIT acknowledgement"):
+            await manager.cancel_task(
+                "ambiguous-commit",
+                reason="withdrawn",
+                agent_name="did:test:creator",
+                recipient_agent_id="did:test:recipient",
+            )
+
+        persisted = await manager.get_task("ambiguous-commit")
+        assert persisted.status.state is TaskState.CANCELED
+        assert canceled_callbacks == ["ambiguous-commit"]
+        assert completions == ["ambiguous-commit"]
+        event = terminal_events.get_nowait()
+        assert event["event"] == "status"
+        assert event["final"] is True
+        assert terminal_events.empty()
+
+        manager.task_store.cancel_if_authorized = canonical_cancel
+        retry = await manager.cancel_task(
+            "ambiguous-commit",
+            reason="withdrawn",
+            agent_name="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+
+        assert retry.status.state is TaskState.CANCELED
+        assert canceled_callbacks == ["ambiguous-commit"]
+        assert completions == ["ambiguous-commit"]
+        assert terminal_events.empty()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_cancel_does_not_claim_an_older_same_actor_receipt(
+    tmp_path,
+):
+    """Only this attempt's durable token can prove an ambiguous commit."""
+
+    manager = await create_task_manager(str(tmp_path / "old-receipt.db"))
+    try:
+        await manager.create_task(
+            _params("old-receipt"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "old-receipt",
+            agent_name="did:test:creator",
+        )
+        canceled_callbacks: list[str] = []
+        completions: list[str] = []
+        manager._on_task_cancelled = (
+            lambda task: canceled_callbacks.append(task.id)
+        )
+        manager._on_task_complete = lambda task: completions.append(task.id)
+
+        async def fail_before_commit(*_args, **_kwargs):
+            raise RuntimeError("transport failed before this attempt committed")
+
+        manager.task_store.cancel_if_authorized = fail_before_commit
+        with pytest.raises(RuntimeError, match="before this attempt committed"):
+            await manager.cancel_task(
+                "old-receipt",
+                agent_name="did:test:creator",
+            )
+
+        assert canceled_callbacks == []
+        assert completions == []
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_create_task_never_publishes_a_stale_submitted_snapshot(tmp_path):
     manager = await create_task_manager(str(tmp_path / "create-readback.db"))
     try:
@@ -319,7 +471,10 @@ async def test_create_task_returns_accepted_snapshot_when_final_readback_fails(
 ):
     manager = await create_task_manager(str(tmp_path / "create-readback-failure.db"))
     try:
-        original_get = manager.task_store.get
+        accepted: list[str] = []
+        manager._on_task_submitted = lambda task: accepted.append(task.id)
+        manager._notify_status_update = AsyncMock()
+        canonical_get = manager.task_store.get
         manager.task_store.get = AsyncMock(side_effect=read_error)
 
         created = await manager.create_task(
@@ -330,8 +485,9 @@ async def test_create_task_returns_accepted_snapshot_when_final_readback_fails(
 
         assert created.id == "accepted-before-readback-failure"
         assert created.status.state is TaskState.SUBMITTED
-        manager.task_store.get = original_get
-        persisted = await manager.get_task(created.id)
+        assert accepted == ["accepted-before-readback-failure"]
+        manager._notify_status_update.assert_not_awaited()
+        persisted = await canonical_get(created.id)
         assert persisted is not None
         assert persisted.status.state is TaskState.SUBMITTED
     finally:
@@ -1052,6 +1208,45 @@ async def test_live_cancellation_monitor_uses_lightweight_snapshot():
     assert "was canceled while" in withdrawal
     task_manager.get_task_cancellation_snapshot.assert_awaited_once_with(task_id)
     task_manager.get_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_cancellation_monitor_backs_off_durable_reads(monkeypatch):
+    """Long cognition turns must not poll shared storage at a fixed rate."""
+
+    snapshots = [
+        SimpleNamespace(state="submitted", actor_agent_id=None),
+        SimpleNamespace(state="submitted", actor_agent_id=None),
+        SimpleNamespace(state="submitted", actor_agent_id=None),
+        SimpleNamespace(state="canceled", actor_agent_id="did:test:creator"),
+    ]
+    task_manager = SimpleNamespace(
+        get_task_cancellation_snapshot=AsyncMock(side_effect=snapshots),
+    )
+    slept = []
+
+    async def record_sleep(delay):
+        slept.append(delay)
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.agent.event_manager.asyncio.sleep",
+        record_sleep,
+    )
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+    recipient = Recipient()
+    recipient.task_manager = task_manager
+    signal = SimpleNamespace(
+        source="a2a.task_submitted",
+        payload={"task_id": "backing-off-monitor"},
+    )
+
+    withdrawal = await recipient.monitor_cognition_signal_execution(signal)
+
+    assert "was canceled while" in withdrawal
+    assert slept == [0.1, 0.2, 0.4]
 
 
 @pytest.mark.asyncio
@@ -2386,6 +2581,301 @@ async def test_respond_canceled_uses_outbound_route_before_shared_task_row():
 
 
 @pytest.mark.asyncio
+async def test_respond_canceled_routes_outbound_when_local_task_row_is_absent():
+    """Per-agent SQLite keeps sender audit and recipient rows in different DBs."""
+
+    routed_result = MagicMock(status=ToolResultStatus.OK)
+    route_feature = SimpleNamespace(
+        cancel_outbound_task=AsyncMock(return_value=routed_result)
+    )
+    actor = SimpleNamespace(
+        did="did:test:creator",
+        features={"PeersFeature": route_feature},
+    )
+    local_manager = MagicMock(
+        get_task=AsyncMock(return_value=None),
+        is_task_recipient=AsyncMock(return_value=False),
+        cancel_task=AsyncMock(),
+    )
+    feature = TaskFeature(actor)
+    feature.set_task_manager(local_manager)
+
+    result = await feature.respond_to_a2a_task(
+        "outbound-only-task",
+        content="withdrawn from sender-side storage",
+        state="canceled",
+    )
+
+    assert result is routed_result
+    route_feature.cancel_outbound_task.assert_awaited_once_with(
+        "outbound-only-task",
+        reason="withdrawn from sender-side storage",
+        local_recipient_match=False,
+    )
+    local_manager.get_task.assert_not_awaited()
+    local_manager.cancel_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
+    tmp_path,
+):
+    """An unconditional pre-upgrade UPDATE cannot undo committed cancellation."""
+
+    manager = await create_task_manager(str(tmp_path / "legacy-writer-fence.db"))
+    try:
+        await manager.create_task(
+            _params("terminal-cancel"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "terminal-cancel",
+            agent_name="did:test:creator",
+        )
+
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await manager.task_store.backend.execute(
+                "UPDATE a2a_tasks SET status = 'completed' WHERE id = ?",
+                ("terminal-cancel",),
+            )
+
+        assert (
+            await manager.get_task("terminal-cancel")
+        ).status.state is TaskState.CANCELED
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_database_fence_blocks_all_mutation_of_canceled_task(tmp_path):
+    """A mixed-version writer cannot alter payload while retaining CANCELED."""
+
+    manager = await create_task_manager(str(tmp_path / "canceled-write-fence.db"))
+    try:
+        await manager.create_task(
+            _params("immutable-cancel"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.cancel_task(
+            "immutable-cancel",
+            agent_name="did:test:creator",
+        )
+
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await manager.task_store.backend.execute(
+                "UPDATE a2a_tasks SET metadata = ? WHERE id = ?",
+                ('{"legacy":"overwrite"}', "immutable-cancel"),
+            )
+
+        assert "legacy" not in (
+            (await manager.get_task("immutable-cancel")).metadata or {}
+        )
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_database_fence_rejects_legacy_live_insert_without_authority(
+    tmp_path,
+):
+    """Late old-code inserts cannot recreate uncancellable live work."""
+
+    manager = await create_task_manager(str(tmp_path / "live-authority-fence.db"))
+    try:
+        with pytest.raises(Exception, match="requires durable authority"):
+            await manager.task_store.backend.execute(
+                """
+                INSERT INTO a2a_tasks (id, task_type, status)
+                VALUES (?, ?, 'submitted')
+                """,
+                ("late-legacy-live", "generic"),
+            )
+
+        assert await manager.get_task("late-legacy-live") is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_database_fence_blocks_legacy_writer_on_available_backends(db_backend):
+    store = TaskStore(db_backend)
+    await store.initialize()
+    task_id = f"terminal-cancel-{uuid4().hex}"
+    try:
+        await store.create(
+            Task(id=task_id, status=TaskStatus(state=TaskState.SUBMITTED)),
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+        canceled = await store.cancel_if_authorized(
+            task_id,
+            actor_agent_id="did:test:creator",
+        )
+        assert canceled is not None
+
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await db_backend.execute(
+                "UPDATE a2a_tasks SET status = 'completed' WHERE id = ?",
+                (task_id,),
+            )
+
+        assert (await store.get(task_id)).status.state is TaskState.CANCELED
+    finally:
+        await db_backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("with_payload", [False, True])
+async def test_cancel_readback_failure_rolls_back_transition_on_available_backends(
+    db_backend,
+    monkeypatch,
+    with_payload,
+):
+    store = TaskStore(db_backend)
+    await store.initialize()
+    task_id = f"cancel-readback-rollback-{uuid4().hex}"
+    try:
+        submitted = Task(
+            id=task_id,
+            status=TaskStatus(state=TaskState.SUBMITTED),
+        )
+        await store.create(
+            submitted,
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+        payload = (
+            submitted.model_copy(
+                update={"status": TaskStatus(state=TaskState.CANCELED)}
+            )
+            if with_payload
+            else None
+        )
+        fetch_one = db_backend.fetch_one
+
+        async def fail_canonical_read(sql, params=()):
+            if "SELECT * FROM a2a_tasks WHERE id" in sql:
+                raise RuntimeError("injected in-transaction readback failure")
+            return await fetch_one(sql, params)
+
+        monkeypatch.setattr(db_backend, "fetch_one", fail_canonical_read)
+        with pytest.raises(Exception, match="in-transaction readback failure"):
+            await store.cancel_if_authorized(
+                task_id,
+                actor_agent_id="did:test:creator",
+                task_payload=payload,
+            )
+        monkeypatch.setattr(db_backend, "fetch_one", fetch_one)
+
+        persisted = await store.get(task_id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+    finally:
+        await db_backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task_id,))
+
+
+@pytest.mark.asyncio
+async def test_postgres_initialization_installs_canceled_terminal_trigger():
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        execute_script=AsyncMock(),
+        execute=AsyncMock(return_value=0),
+        fetch_one=AsyncMock(return_value=(False,)),
+        transaction=transaction,
+    )
+
+    await TaskStore(backend).initialize()
+
+    scripts = "\n".join(
+        call.args[0] for call in backend.execute_script.await_args_list
+    )
+    assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence" in scripts
+    assert "OLD.status = 'canceled'" in scripts
+    assert "live A2A task requires durable authority" in scripts
+    assert "CREATE TRIGGER a2a_tasks_authority_fence_v2" in scripts
+
+
+@pytest.mark.asyncio
+async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("transaction-enter")
+        try:
+            yield
+        finally:
+            events.append("transaction-exit")
+
+    async def execute(query, _params=()):
+        normalized = " ".join(query.split())
+        if "pg_advisory_xact_lock" in normalized:
+            events.append("advisory-lock")
+        elif "CREATE INDEX" in normalized:
+            events.append("index-ddl")
+        return 0
+
+    async def fetch_one(_query, _params=()):
+        events.append("schema-reprobe")
+        return (False,)
+
+    async def execute_script(script):
+        if "a2a_tasks_enforce_authority_fence" in script:
+            events.append("fence-ddl")
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        execute_script=AsyncMock(side_effect=execute_script),
+        execute=AsyncMock(side_effect=execute),
+        fetch_one=AsyncMock(side_effect=fetch_one),
+        transaction=transaction,
+    )
+
+    await TaskStore(backend).initialize()
+
+    lock_index = events.index("advisory-lock")
+    probe_index = events.index("schema-reprobe")
+    fence_index = events.index("fence-ddl")
+    assert events.index("transaction-enter") < lock_index < probe_index
+    assert probe_index < fence_index < events.index("transaction-exit")
+
+
+@pytest.mark.asyncio
+async def test_postgres_cancellation_schema_waiter_skips_completed_ddl():
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        execute_script=AsyncMock(),
+        execute=AsyncMock(return_value=0),
+        fetch_one=AsyncMock(return_value=(True,)),
+        transaction=transaction,
+    )
+
+    await TaskStore(backend).initialize()
+
+    scripts = "\n".join(
+        call.args[0] for call in backend.execute_script.await_args_list
+    )
+    assert "a2a_tasks_enforce_authority_fence" not in scripts
+    statements = "\n".join(
+        call.args[0] for call in backend.execute.await_args_list
+    )
+    assert "pg_advisory_xact_lock" in statements
+    assert "CREATE INDEX" not in statements
+
+
+@pytest.mark.asyncio
 async def test_outbound_cancel_reports_lifecycle_conflict_not_transport(monkeypatch):
     from kestrel_sovereign.a2a import outbound_store
 
@@ -2428,6 +2918,42 @@ async def test_outbound_cancel_reports_lifecycle_conflict_not_transport(monkeypa
     assert result.status is ToolResultStatus.ERROR
     assert result.data["error_type"] == "lifecycle_conflict"
     assert "terminal state" in result.error
+
+
+@pytest.mark.asyncio
+async def test_outbound_cancel_without_route_store_cannot_fall_back_to_shared_row():
+    actor = SimpleNamespace(did="did:test:creator", identity=None, features={})
+    peers = PeersFeature(actor)
+    peers._db = None
+    peers._outbound_route_store_ready = False
+    peers._own_name = "creator"
+    actor.features["PeersFeature"] = peers
+    shared_manager = MagicMock(
+        is_task_recipient=AsyncMock(return_value=False),
+        cancel_task=AsyncMock(
+            return_value=Task(
+                id="shared-recipient-row",
+                status=TaskStatus(state=TaskState.CANCELED),
+                metadata={
+                    "cancellation_receipt": {
+                        "actor_agent_id": actor.did,
+                        "reason": None,
+                        "status_before": "working",
+                    }
+                },
+            )
+        ),
+    )
+    tasks = TaskFeature(actor)
+    tasks.set_task_manager(shared_manager)
+
+    result = await tasks.cancel_task(
+        "shared-recipient-row",
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "route store is unavailable" in result.error
+    shared_manager.cancel_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio

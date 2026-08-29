@@ -130,7 +130,7 @@ class TestTaskManager:
         canceled_task = None
 
         async def cancel_if_authorized(
-            task_id, *, actor_agent_id, reason=None
+            task_id, *, actor_agent_id, reason=None, operation_id=None
         ):
             nonlocal canceled_task
             if canceled_task is not None:
