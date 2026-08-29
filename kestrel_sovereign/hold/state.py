@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 from uuid import uuid4
 
 from kestrel_sovereign.storage.database_clock import database_now_sql
@@ -123,6 +123,42 @@ class HoldReceipt:
 class HoldMutation:
     receipt: HoldReceipt
     current: Optional[HoldState]
+
+
+def _terminal_authority_ids(
+    authorities: Mapping[str, HoldReceipt],
+    consumers: Mapping[str, HoldReceipt],
+) -> set[str]:
+    """Return open Hold authorities with one linear visit per authority.
+
+    Applied receipts form a functional graph: an authority has at most one
+    successor, and a Hold successor is itself an authority.  Remembering every
+    completed suffix avoids re-walking the full history from each ancestor.
+    Any path that revisits its own unfinished suffix is a closed cycle.
+    """
+
+    terminal_authorities: set[str] = set()
+    completed: set[str] = set()
+    for authority_id in authorities:
+        if authority_id in completed:
+            continue
+        cursor = authority_id
+        path: list[str] = []
+        path_positions: dict[str, int] = {}
+        while cursor not in completed:
+            if cursor in path_positions:
+                raise HoldCorruptStateError("Hold receipt graph contains a cycle")
+            path_positions[cursor] = len(path)
+            path.append(cursor)
+            successor = consumers.get(cursor)
+            if successor is None:
+                terminal_authorities.add(cursor)
+                break
+            if successor.action is HoldAction.RELEASE:
+                break
+            cursor = successor.receipt_id
+        completed.update(path)
+    return terminal_authorities
 
 
 def _required_text(value: object, field: str) -> str:
@@ -314,7 +350,8 @@ class HoldStore:
                 "CHECK (action IN ('hold', 'release')), "
                 "CHECK (disposition IN "
                 "('applied', 'already_in_state', 'refused_stale')), "
-                "CHECK (scope IN ('host', 'agent')))"
+                "CHECK (scope IN ('host', 'agent')), "
+                "CHECK (scope <> 'host' OR target_id = 'host'))"
             )
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
@@ -335,6 +372,25 @@ class HoldStore:
         ):
             await self._db.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                (key,),
+            )
+
+    async def _lock_read_targets(
+        self, targets: tuple[tuple[HoldScope, str], ...]
+    ) -> None:
+        """Serialize a PostgreSQL read snapshot with legitimate target writers."""
+
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        keys = sorted(
+            {
+                f"kestrel:hold:target:{scope.value}:{target_id}"
+                for scope, target_id in targets
+            }
+        )
+        for key in keys:
+            await self._db.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
                 (key,),
             )
 
@@ -367,13 +423,20 @@ class HoldStore:
             if for_update and getattr(self._db, "backend_type", "") == "postgres"
             else ""
         )
-        rows = await self._db.fetchall(
+        latch_rows = await self._db.fetchall(
             "SELECT target_id FROM hold_latches WHERE scope = ?" + suffix,
             (HoldScope.HOST.value,),
         )
-        if any(str(row[0]) != HOST_HOLD_TARGET for row in rows):
+        receipt_rows = await self._db.fetchall(
+            "SELECT target_id FROM hold_receipts WHERE scope = ?" + suffix,
+            (HoldScope.HOST.value,),
+        )
+        if any(
+            str(row[0]) != HOST_HOLD_TARGET
+            for row in (*latch_rows, *receipt_rows)
+        ):
             raise HoldCorruptStateError(
-                "host hold latch has a foreign target identity"
+                "host hold state has a foreign target identity"
             )
 
     async def _read_receipt_by_operation(self, operation_id: str) -> Any:
@@ -438,21 +501,7 @@ class HoldStore:
                 )
             consumers[prior] = receipt
 
-        terminal_authorities: set[str] = set()
-        for authority_id in authorities:
-            cursor = authority_id
-            path: set[str] = set()
-            while True:
-                if cursor in path:
-                    raise HoldCorruptStateError("Hold receipt graph contains a cycle")
-                path.add(cursor)
-                successor = consumers.get(cursor)
-                if successor is None:
-                    terminal_authorities.add(cursor)
-                    break
-                if successor.action is HoldAction.RELEASE:
-                    break
-                cursor = successor.receipt_id
+        terminal_authorities = _terminal_authority_ids(authorities, consumers)
 
         if latch is None:
             if not terminal_authorities:
@@ -801,50 +850,90 @@ class HoldStore:
     async def get_hold(
         self, scope: HoldScope | str, target_id: Optional[str] = None
     ) -> Optional[HoldState]:
+        try:
+            return await self._get_hold(scope, target_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _get_hold(
+        self, scope: HoldScope | str, target_id: Optional[str] = None
+    ) -> Optional[HoldState]:
         resolved_scope = _coerce_scope(scope)
         resolved_target = _target(resolved_scope, target_id)
-        await self._assert_host_latch_shape()
-        latch = _latch_from_row(
-            await self._read_latch_row(resolved_scope, resolved_target)
-        )
-        await self._validate_latch_projection(
-            latch, resolved_scope, resolved_target
-        )
-        return latch
+        targets = ((resolved_scope, resolved_target),)
+        async with self._db.transaction(immediate=True):
+            await self._lock_read_targets(targets)
+            await self._assert_host_latch_shape()
+            latch = _latch_from_row(
+                await self._read_latch_row(resolved_scope, resolved_target)
+            )
+            await self._validate_latch_projection(
+                latch, resolved_scope, resolved_target
+            )
+            return latch
 
     async def get_effective(self, agent_id: str) -> EffectiveHoldState:
         """Read host + agent latches in one database snapshot."""
 
+        try:
+            return await self._get_effective(agent_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            raise
+
+    async def _get_effective(self, agent_id: str) -> EffectiveHoldState:
+        """Read host + agent latches in one locked database snapshot."""
+
         agent = _required_text(agent_id, "agent_id")
-        await self._assert_host_latch_shape()
-        rows = await self._db.fetchall(
-            f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
-            "WHERE (scope = ? AND target_id = ?) "
-            "OR (scope = ? AND target_id = ?)",
-            (HoldScope.HOST.value, HOST_HOLD_TARGET, HoldScope.AGENT.value, agent),
+        targets = (
+            (HoldScope.HOST, HOST_HOLD_TARGET),
+            (HoldScope.AGENT, agent),
         )
-        host: Optional[HoldState] = None
-        agent_state: Optional[HoldState] = None
-        seen: set[tuple[str, str]] = set()
-        for row in rows:
-            key = (str(row[0]), str(row[1]))
-            if key in seen:
-                raise HoldCorruptStateError("duplicate hold latch key")
-            seen.add(key)
-            state = _latch_from_row(row)
-            if state is None:
-                continue
-            if state.scope is HoldScope.HOST:
-                host = state
-            elif state.target_id == agent:
-                agent_state = state
-            else:
-                raise HoldCorruptStateError("effective hold query returned a foreign agent")
-        await self._validate_latch_projection(
-            host, HoldScope.HOST, HOST_HOLD_TARGET
-        )
-        await self._validate_latch_projection(agent_state, HoldScope.AGENT, agent)
-        return EffectiveHoldState(host=host, agent=agent_state)
+        async with self._db.transaction(immediate=True):
+            await self._lock_read_targets(targets)
+            await self._assert_host_latch_shape()
+            rows = await self._db.fetchall(
+                f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
+                "WHERE (scope = ? AND target_id = ?) "
+                "OR (scope = ? AND target_id = ?)",
+                (
+                    HoldScope.HOST.value,
+                    HOST_HOLD_TARGET,
+                    HoldScope.AGENT.value,
+                    agent,
+                ),
+            )
+            host: Optional[HoldState] = None
+            agent_state: Optional[HoldState] = None
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                key = (str(row[0]), str(row[1]))
+                if key in seen:
+                    raise HoldCorruptStateError("duplicate hold latch key")
+                seen.add(key)
+                state = _latch_from_row(row)
+                if state is None:
+                    continue
+                if state.scope is HoldScope.HOST:
+                    host = state
+                elif state.target_id == agent:
+                    agent_state = state
+                else:
+                    raise HoldCorruptStateError(
+                        "effective hold query returned a foreign agent"
+                    )
+            await self._validate_latch_projection(
+                host, HoldScope.HOST, HOST_HOLD_TARGET
+            )
+            await self._validate_latch_projection(
+                agent_state, HoldScope.AGENT, agent
+            )
+            return EffectiveHoldState(host=host, agent=agent_state)
 
     async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
         operation = _required_text(operation_id, "operation_id")

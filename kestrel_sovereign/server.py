@@ -3148,12 +3148,10 @@ async def _lifespan_startup(app: FastAPI):
         features = _hf.instantiate_host_features(
             manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
         )
+        host_cfg = getattr(app.state, "multi_agent_config", None)
+        ctx = await _hf.build_host_context(config=_host_config_mapping(host_cfg))
+        candidate_ctx = ctx
         if features:
-            host_cfg = getattr(app.state, "multi_agent_config", None)
-            ctx = await _hf.build_host_context(
-                config=_host_config_mapping(host_cfg)
-            )
-            candidate_ctx = ctx
             # Validate and activate the complete prospective contribution set
             # before changing any already-valid mounted host surface.
             started_features = await _hf.start_host_features(features, ctx)
@@ -3201,6 +3199,13 @@ async def _lifespan_startup(app: FastAPI):
                         host_context_registry
                     )
             logger.info("Host features initialized: %d", len(started_features))
+        else:
+            # The fleet control store is host infrastructure, not an optional
+            # feature side effect. Hold authority must therefore exist on the
+            # default zero-feature installation as well.
+            app.state.host_features = []
+            app.state.host_context = ctx
+            logger.info("Host features initialized: 0")
     except (ContributionContractError, FeatureContributionRuntimeError):
         # Complete prospective-set rejection is a startup failure, not an
         # optional-feature warning. No candidate was mounted and prior valid

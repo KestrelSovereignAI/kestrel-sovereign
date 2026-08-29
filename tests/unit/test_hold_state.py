@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from kestrel_sovereign.hold import (
+    HoldAction,
     HoldDisposition,
     HoldIdempotencyConflict,
+    HoldReceipt,
     HoldScope,
     HoldStateError,
     HoldStore,
 )
 from kestrel_sovereign.hold.state import (
     HoldCorruptStateError,
+    _terminal_authority_ids,
     _receipt_from_row,
 )
 from kestrel_sovereign.host_features.context import build_host_context
@@ -564,6 +569,193 @@ async def test_greenfield_schema_rejects_foreign_host_target(hold_db):
             "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?)",
             ("host", "foreign"),
         )
+    with pytest.raises(Exception, match="CHECK constraint"):
+        await db.execute(
+            "INSERT INTO hold_receipts ("
+            "receipt_id, operation_id, action, disposition, scope, target_id, "
+            "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+            "prior_hold_receipt_id, resulting_hold_receipt_id"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "foreign-host-receipt",
+                "foreign-host-operation",
+                "hold",
+                "applied",
+                "host",
+                "foreign",
+                "invalid imported authority",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                "",
+                "",
+                "foreign-host-receipt",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_foreign_host_receipt_fails_closed_on_every_state_path(
+    hold_db,
+):
+    """Runtime validation remains load-bearing for upgraded/imported schemas."""
+
+    db, store = hold_db
+    await db.execute("PRAGMA ignore_check_constraints = ON")
+    await db.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+        "prior_hold_receipt_id, resulting_hold_receipt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "imported-foreign-host-receipt",
+            "imported-foreign-host-operation",
+            "hold",
+            "applied",
+            "host",
+            "foreign",
+            "invalid imported authority",
+            "did:sovereign:operator",
+            "2026-08-28T00:00:00+00:00",
+            "",
+            "",
+            "imported-foreign-host-receipt",
+        ),
+    )
+    await db.execute("PRAGMA ignore_check_constraints = OFF")
+
+    with pytest.raises(HoldCorruptStateError, match="foreign target"):
+        await store.get_hold("host")
+    with pytest.raises(HoldCorruptStateError, match="foreign target"):
+        await store.get_effective("did:agent:kite")
+    with pytest.raises(HoldCorruptStateError, match="foreign target"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="must fail closed",
+            operation_id="foreign-host-receipt-mutation",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read", ["one", "effective"])
+async def test_state_read_validates_projection_inside_one_locked_snapshot(
+    hold_db,
+    monkeypatch,
+    read,
+):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:snapshot",
+        actor_id="did:sovereign:operator",
+        reason="snapshot authority",
+        operation_id="snapshot-hold",
+    )
+    original_transaction = db.transaction
+    original_validate = store._validate_latch_projection
+    active = False
+    transaction_modes: list[bool] = []
+    locked_targets: list[tuple[tuple[HoldScope, str], ...]] = []
+
+    @asynccontextmanager
+    async def traced_transaction(*, immediate=False):
+        nonlocal active
+        transaction_modes.append(immediate)
+        async with original_transaction(immediate=immediate):
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    async def inspect_projection(latch, scope, target_id):
+        assert active, "latch and receipt graph escaped their read snapshot"
+        return await original_validate(latch, scope, target_id)
+
+    async def inspect_locks(targets):
+        locked_targets.append(tuple(targets))
+
+    monkeypatch.setattr(db, "transaction", traced_transaction)
+    monkeypatch.setattr(store, "_validate_latch_projection", inspect_projection)
+    monkeypatch.setattr(store, "_lock_read_targets", inspect_locks)
+
+    if read == "one":
+        assert await store.get_hold("agent", "did:agent:snapshot") == held.current
+        assert locked_targets == [((HoldScope.AGENT, "did:agent:snapshot"),)]
+    else:
+        effective = await store.get_effective("did:agent:snapshot")
+        assert effective.agent == held.current
+        assert locked_targets == [
+            (
+                (HoldScope.HOST, "host"),
+                (HoldScope.AGENT, "did:agent:snapshot"),
+            )
+        ]
+    assert transaction_modes == [True]
+
+
+@pytest.mark.asyncio
+async def test_postgres_read_targets_take_shared_locks_in_global_order():
+    execute = AsyncMock()
+    store = HoldStore(SimpleNamespace(backend_type="postgres", execute=execute))
+
+    await store._lock_read_targets(
+        (
+            (HoldScope.HOST, "host"),
+            (HoldScope.AGENT, "did:agent:snapshot"),
+            (HoldScope.HOST, "host"),
+        )
+    )
+
+    assert [call.args for call in execute.await_args_list] == [
+        (
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+            ("kestrel:hold:target:agent:did:agent:snapshot",),
+        ),
+        (
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+            ("kestrel:hold:target:host:host",),
+        ),
+    ]
+
+
+def test_authority_graph_walk_is_linear_in_number_of_receipts():
+    class CountingConsumers(dict[str, HoldReceipt]):
+        get_count = 0
+
+        def get(self, key, default=None):
+            self.get_count += 1
+            return super().get(key, default)
+
+    authorities: dict[str, HoldReceipt] = {}
+    consumers = CountingConsumers()
+    previous = ""
+    count = 2_000
+    for index in range(count):
+        receipt_id = f"hold-{index}"
+        receipt = HoldReceipt(
+            receipt_id=receipt_id,
+            operation_id=f"operation-{index}",
+            action=HoldAction.HOLD,
+            disposition=HoldDisposition.APPLIED,
+            scope=HoldScope.AGENT,
+            target_id="did:agent:linear",
+            reason="linear history",
+            actor_id="did:sovereign:operator",
+            occurred_at=f"2026-08-28T00:00:{index:05d}+00:00",
+            expected_hold_receipt_id="",
+            prior_hold_receipt_id=previous,
+            resulting_hold_receipt_id=receipt_id,
+        )
+        authorities[receipt_id] = receipt
+        if previous:
+            consumers[previous] = receipt
+        previous = receipt_id
+
+    assert _terminal_authority_ids(authorities, consumers) == {previous}
+    assert consumers.get_count <= count
 
 
 @pytest.mark.asyncio

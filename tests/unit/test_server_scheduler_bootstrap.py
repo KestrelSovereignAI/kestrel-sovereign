@@ -334,6 +334,11 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         agents={"RecoveredChild": object()},
     )
     events: list[str] = []
+    hold_store = object()
+    host_context = SimpleNamespace(
+        hold_store=hold_store,
+        feature_contribution_runtime=None,
+    )
 
     class _Manager:
         init_failures = []
@@ -375,6 +380,11 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert config is effective_config
         events.append("host-start")
 
+    async def _build_host_context(*, config):
+        assert isinstance(config, dict)
+        events.append("context-build")
+        return host_context
+
     shared_backend = object()
 
     async def _shared_backend(_app):
@@ -406,8 +416,12 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
     monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
+    monkeypatch.setattr(hf, "build_host_context", _build_host_context)
 
-    async with server._lifespan_startup(FastAPI()):
+    app = FastAPI()
+    async with server._lifespan_startup(app):
         pass
 
-    assert events == ["reconcile", "preflight", "load", "host-start"]
+    assert events == ["reconcile", "preflight", "load", "host-start", "context-build"]
+    assert app.state.host_context is host_context
+    assert app.state.host_context.hold_store is hold_store
