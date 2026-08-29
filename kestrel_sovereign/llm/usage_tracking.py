@@ -159,6 +159,8 @@ class UsageTrackingMixin:
                 if cache_read_input_tokens is not None
                 else 0
             )
+            cache_creation_reported = int(cache_creation_input_tokens is not None)
+            cache_read_reported = int(cache_read_input_tokens is not None)
 
             async def write_usage_transaction() -> None:
                 # Keep the legacy lifetime aggregate and UTC daily bucket in
@@ -171,9 +173,11 @@ class UsageTrackingMixin:
                         INSERT INTO model_usage (
                             model_id, provider, last_used, use_count, total_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
+                            cache_creation_input_tokens_report_count,
+                            cache_read_input_tokens_report_count,
                             created_at
                         )
-                        VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(model_id) DO UPDATE SET
                             last_used = ?,
                             use_count = model_usage.use_count + 1,
@@ -181,7 +185,11 @@ class UsageTrackingMixin:
                             cache_creation_input_tokens =
                                 model_usage.cache_creation_input_tokens + ?,
                             cache_read_input_tokens =
-                                model_usage.cache_read_input_tokens + ?
+                                model_usage.cache_read_input_tokens + ?,
+                            cache_creation_input_tokens_report_count =
+                                model_usage.cache_creation_input_tokens_report_count + ?,
+                            cache_read_input_tokens_report_count =
+                                model_usage.cache_read_input_tokens_report_count + ?
                     """, (
                         model_id,
                         provider,
@@ -189,26 +197,36 @@ class UsageTrackingMixin:
                         tokens,
                         cache_creation_tokens,
                         cache_read_tokens,
+                        cache_creation_reported,
+                        cache_read_reported,
                         now,
                         now,
                         tokens,
                         cache_creation_tokens,
                         cache_read_tokens,
+                        cache_creation_reported,
+                        cache_read_reported,
                     ))
                     await self._usage_db.execute("""
                         INSERT INTO model_usage_periods (
                             period_start, model_id, provider, use_count,
                             total_tokens, cache_creation_input_tokens,
-                            cache_read_input_tokens
+                            cache_read_input_tokens,
+                            cache_creation_input_tokens_report_count,
+                            cache_read_input_tokens_report_count
                         )
-                        VALUES (?, ?, ?, 1, ?, ?, ?)
+                        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
                         ON CONFLICT(period_start, model_id, provider) DO UPDATE SET
                             use_count = model_usage_periods.use_count + 1,
                             total_tokens = model_usage_periods.total_tokens + ?,
                             cache_creation_input_tokens =
                                 model_usage_periods.cache_creation_input_tokens + ?,
                             cache_read_input_tokens =
-                                model_usage_periods.cache_read_input_tokens + ?
+                                model_usage_periods.cache_read_input_tokens + ?,
+                            cache_creation_input_tokens_report_count =
+                                model_usage_periods.cache_creation_input_tokens_report_count + ?,
+                            cache_read_input_tokens_report_count =
+                                model_usage_periods.cache_read_input_tokens_report_count + ?
                     """, (
                         period_start,
                         model_id,
@@ -216,9 +234,13 @@ class UsageTrackingMixin:
                         tokens,
                         cache_creation_tokens,
                         cache_read_tokens,
+                        cache_creation_reported,
+                        cache_read_reported,
                         tokens,
                         cache_creation_tokens,
                         cache_read_tokens,
+                        cache_creation_reported,
+                        cache_read_reported,
                     ))
 
             retries_done = 0

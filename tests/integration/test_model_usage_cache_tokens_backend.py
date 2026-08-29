@@ -81,15 +81,20 @@ async def test_fresh_schema_accumulates_reported_cache_tokens(db_backend) -> Non
 
         assert await db.fetchone(
             "SELECT provider, use_count, total_tokens, "
-            "cache_creation_input_tokens, cache_read_input_tokens "
+            "cache_creation_input_tokens, cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count "
             "FROM model_usage WHERE model_id = ?",
             ("claude-cache-test",),
-        ) == ("anthropic", 3, 38, 3_000_000_021, 10)
+        ) == ("anthropic", 3, 38, 3_000_000_021, 10, 2, 2)
         assert await db.fetchone(
             "SELECT total_tokens, cache_creation_input_tokens, "
-            "cache_read_input_tokens FROM model_usage WHERE model_id = ?",
+            "cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count "
+            "FROM model_usage WHERE model_id = ?",
             ("legacy-cache-test",),
-        ) == (13, 0, 0)
+        ) == (13, 0, 0, 0, 0)
 
         period_start = datetime.now(UTC).replace(
             hour=0, minute=0, second=0, microsecond=0, tzinfo=None
@@ -97,11 +102,13 @@ async def test_fresh_schema_accumulates_reported_cache_tokens(db_backend) -> Non
         period_end = period_start + timedelta(days=1)
         assert await db.fetchone(
             "SELECT provider, use_count, total_tokens, "
-            "cache_creation_input_tokens, cache_read_input_tokens "
+            "cache_creation_input_tokens, cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count "
             "FROM model_usage_periods WHERE model_id = ? "
             "AND period_start >= ? AND period_start < ?",
             ("claude-cache-test", period_start, period_end),
-        ) == ("anthropic", 3, 38, 3_000_000_021, 10)
+        ) == ("anthropic", 3, 38, 3_000_000_021, 10, 2, 2)
 
         # Exercise the exact old-revision statement after migration. A rolling
         # deployment may keep serving from an older process while this schema
@@ -118,9 +125,12 @@ async def test_fresh_schema_accumulates_reported_cache_tokens(db_backend) -> Non
         )
         assert await db.fetchone(
             "SELECT use_count, total_tokens, cache_creation_input_tokens, "
-            "cache_read_input_tokens FROM model_usage WHERE model_id = ?",
+            "cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count "
+            "FROM model_usage WHERE model_id = ?",
             ("claude-cache-test",),
-        ) == (4, 49, 3_000_000_021, 10)
+        ) == (4, 49, 3_000_000_021, 10, 2, 2)
         # Old writers have no cache telemetry, so they leave the new period's
         # cache totals untouched while continuing to update the lifetime row.
         assert await db.fetchone(
@@ -238,15 +248,20 @@ async def test_postgres_concurrent_usage_writes_preserve_every_update(
             )
         )
 
-        expected = (24, 24, 48, 72)
+        expected = (24, 24, 48, 72, 24, 24)
         assert await db.fetchone(
             "SELECT use_count, total_tokens, cache_creation_input_tokens, "
-            "cache_read_input_tokens FROM model_usage WHERE model_id = ?",
+            "cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count "
+            "FROM model_usage WHERE model_id = ?",
             ("contended-cache-model",),
         ) == expected
         assert await db.fetchone(
             "SELECT use_count, total_tokens, cache_creation_input_tokens, "
-            "cache_read_input_tokens FROM model_usage_periods "
+            "cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count FROM model_usage_periods "
             "WHERE model_id = ? AND provider = ?",
             ("contended-cache-model", "anthropic"),
         ) == expected

@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS model_usage_periods (
     total_tokens BIGINT NOT NULL DEFAULT 0,
     cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_creation_input_tokens_report_count BIGINT NOT NULL DEFAULT 0,
+    cache_read_input_tokens_report_count BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (period_start, model_id, provider)
 )
 """
@@ -290,6 +292,8 @@ CREATE TABLE IF NOT EXISTS model_usage (
     total_tokens INTEGER DEFAULT 0,
     cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_creation_input_tokens_report_count BIGINT NOT NULL DEFAULT 0,
+    cache_read_input_tokens_report_count BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -1066,8 +1070,10 @@ class AsyncDatabase:
 
         # Cache-effectiveness observability (#3019). Existing model_usage
         # databases predate these provider-reported counters, so the greenfield
-        # CREATE shape above is insufficient on upgrade. Keep both additions in
-        # one concurrency-safe migration; legacy rows honestly start at zero.
+        # CREATE shape above is insufficient on upgrade. Keep the additions in
+        # one concurrency-safe migration. Legacy rows start with zero cache
+        # totals and zero report counts: consumers can therefore distinguish
+        # unknown historical/provider telemetry from a reported cache miss.
         await self.migrate_columns_once(
             "model_usage",
             (
@@ -1077,6 +1083,14 @@ class AsyncDatabase:
                 ),
                 (
                     "cache_read_input_tokens",
+                    "BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "cache_creation_input_tokens_report_count",
+                    "BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "cache_read_input_tokens_report_count",
                     "BIGINT NOT NULL DEFAULT 0",
                 ),
             ),
@@ -1988,6 +2002,22 @@ class AsyncDatabase:
                 "model_usage_periods was not created; cache-token usage "
                 "cannot be reported by period"
             )
+        # Development builds of #3019 may already have created the table before
+        # report availability became part of the aggregate contract. Keep this
+        # additive path safe and truthful too.
+        await self.migrate_columns_once(
+            table,
+            (
+                (
+                    "cache_creation_input_tokens_report_count",
+                    "BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "cache_read_input_tokens_report_count",
+                    "BIGINT NOT NULL DEFAULT 0",
+                ),
+            ),
+        )
         await self.ensure_index(*_MODEL_USAGE_PERIODS_INDEX)
 
     async def ensure_index(

@@ -97,8 +97,12 @@ async def test_preexisting_usage_database_gains_cache_columns_without_data_loss(
         }
         assert "cache_creation_input_tokens" in columns
         assert "cache_read_input_tokens" in columns
+        assert "cache_creation_input_tokens_report_count" in columns
+        assert "cache_read_input_tokens_report_count" in columns
         assert columns["cache_creation_input_tokens"][2] == "BIGINT"
         assert columns["cache_read_input_tokens"][2] == "BIGINT"
+        assert columns["cache_creation_input_tokens_report_count"][2] == "BIGINT"
+        assert columns["cache_read_input_tokens_report_count"][2] == "BIGINT"
         # #3019 is an additive migration. Retaining the legacy model_id key is
         # what lets old-revision ON CONFLICT(model_id) writers coexist with a
         # newly migrated process during a rolling deployment.
@@ -108,10 +112,12 @@ async def test_preexisting_usage_database_gains_cache_columns_without_data_loss(
         ) == (0,)
         assert await db.fetchone(
             "SELECT provider, use_count, total_tokens, "
-            "cache_creation_input_tokens, cache_read_input_tokens "
+            "cache_creation_input_tokens, cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count "
             "FROM model_usage WHERE model_id = ?",
             ("legacy-model",),
-        ) == ("anthropic", 3, 120, 0, 0)
+        ) == ("anthropic", 3, 120, 0, 0, 0, 0)
     finally:
         await db.close()
 
@@ -148,5 +154,52 @@ async def test_concurrent_period_schema_initializers_create_the_table_once(
             )
 
         assert len(creates) == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_preexisting_period_table_gains_report_availability_counts(
+    tmp_path,
+) -> None:
+    """A development-era #3019 table must preserve rows while upgrading."""
+    db = await AsyncDatabase.sqlite(str(tmp_path / "period-report-counts.db"))
+    try:
+        await db.execute("DROP TABLE model_usage_periods")
+        await db.execute("""
+            CREATE TABLE model_usage_periods (
+                period_start TIMESTAMP NOT NULL,
+                model_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                total_tokens BIGINT NOT NULL DEFAULT 0,
+                cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+                cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (period_start, model_id, provider)
+            )
+        """)
+        await db.execute(
+            "INSERT INTO model_usage_periods "
+            "(period_start, model_id, provider, use_count, total_tokens, "
+            "cache_creation_input_tokens, cache_read_input_tokens) "
+            "VALUES (CURRENT_TIMESTAMP, ?, ?, 2, 20, 4, 8)",
+            ("development-model", "anthropic"),
+        )
+
+        await db._ensure_model_usage_periods()
+
+        columns = {
+            row[1]: row
+            for row in await db.fetchall("PRAGMA table_info(model_usage_periods)")
+        }
+        assert columns["cache_creation_input_tokens_report_count"][2] == "BIGINT"
+        assert columns["cache_read_input_tokens_report_count"][2] == "BIGINT"
+        assert await db.fetchone(
+            "SELECT use_count, total_tokens, cache_creation_input_tokens, "
+            "cache_read_input_tokens, cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count FROM model_usage_periods "
+            "WHERE model_id = ?",
+            ("development-model",),
+        ) == (2, 20, 4, 8, 0, 0)
     finally:
         await db.close()

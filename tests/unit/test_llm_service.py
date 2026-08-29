@@ -1024,6 +1024,63 @@ class TestMeteringAndCost:
         assert seen == [(120, 5, None)]
 
     @pytest.mark.asyncio
+    async def test_kwargs_callback_does_not_implicitly_opt_into_cache_split(
+        self, llm_service, mock_adapter
+    ):
+        """A legacy extensible callback must keep inclusive prompt billing."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=40,
+            output_tokens=5,
+            total_tokens=45,
+            cache_read_input_tokens=80,
+        ))
+        seen = []
+
+        async def _cb(
+            *, companion_id, user_id, provider, model,
+            prompt_tokens, completion_tokens, **kwargs,
+        ):
+            seen.append((prompt_tokens, completion_tokens, kwargs))
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(120, 5, {"cost": None})]
+
+    @pytest.mark.asyncio
+    async def test_required_cache_parameter_receives_unknown_as_none(
+        self, llm_service, mock_adapter
+    ):
+        """Explicit cache opt-in remains callable when telemetry is absent."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+        ))
+        seen = []
+
+        async def _cb(
+            *, companion_id, user_id, provider, model,
+            prompt_tokens, completion_tokens, cache_read_input_tokens,
+        ):
+            seen.append((prompt_tokens, completion_tokens, cache_read_input_tokens))
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(10, 5, None)]
+
+    @pytest.mark.asyncio
     async def test_legacy_callback_without_cost_still_called(self, llm_service):
         """A callback written against the original signature (no cost kwarg)
         is not handed an unexpected kwarg — backward compatible (#1806)."""

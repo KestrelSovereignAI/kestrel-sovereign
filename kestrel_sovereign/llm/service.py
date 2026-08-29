@@ -3300,11 +3300,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         The callback MAY additionally accept optional ``cost``,
         ``cache_creation_input_tokens``, and ``cache_read_input_tokens``
-        keywords. For a cache-aware callback, ``prompt_tokens`` follows the SDK
-        contract and excludes the separately supplied cache buckets. For a
-        callback that does not accept a cache bucket, that bucket is folded
-        back into ``prompt_tokens`` so existing billing integrations never
-        silently lose billable usage.
+        keywords. A callback opts into cache-aware prompt semantics only by
+        explicitly naming at least one cache keyword in its signature;
+        ``**kwargs`` alone remains a legacy, inclusive-prompt callback. For a
+        cache-aware callback, ``prompt_tokens`` follows the SDK contract and
+        excludes the separately supplied cache buckets. For a callback that
+        does not explicitly accept a cache bucket, that bucket is folded back
+        into ``prompt_tokens`` so existing billing integrations never silently
+        lose billable usage.
 
         ``cost`` is the provider-reported per-call cost in USD (e.g. OpenRouter
         ``usage.cost``; ``None`` when the provider does not report one).
@@ -3328,9 +3331,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             accepts_all = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
-            accepted_optional = (
-                optional_names if accepts_all else optional_names.intersection(params)
-            )
+            accepted_optional = optional_names.intersection(params)
+            # ``cost`` predates the cache split and historically treated
+            # ``**kwargs`` as acceptance. Preserve that extension contract,
+            # while cache semantics require an explicit named parameter: a
+            # generic kwargs sink may ignore unfamiliar fields and bill only
+            # from prompt_tokens.
+            if accepts_all:
+                accepted_optional.add("cost")
         except (ValueError, TypeError):
             accepted_optional = set()
         self._metering_callback_optional_kwargs = frozenset(accepted_optional)
@@ -3974,9 +3982,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 }
                 # Only pass optional fields to callbacks that opted in; this
                 # keeps callbacks written against the original signature live.
+                # An explicitly named cache parameter receives ``None`` when
+                # the provider omitted that metric, just like ``cost``. This
+                # supports required keyword-only parameters without inventing
+                # a reported zero or dropping the whole billing event.
                 for name in accepted_optional:
-                    if name != "cost" and optional_values[name] is None:
-                        continue
                     meter_kwargs[name] = optional_values[name]
                 try:
                     await metering_callback(**meter_kwargs)
