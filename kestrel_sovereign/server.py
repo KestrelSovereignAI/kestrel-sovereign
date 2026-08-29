@@ -37,7 +37,10 @@ from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
-from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
+from kestrel_sovereign.security.sovereign_key import (
+    mark_ephemeral_sovereign_key,
+    normalize_sovereign_api_key,
+)
 from kestrel_sovereign.api_errors import (
     api_error_response,
     api_unhandled_exception_handler,
