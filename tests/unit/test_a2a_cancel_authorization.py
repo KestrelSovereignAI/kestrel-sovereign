@@ -87,8 +87,8 @@ async def test_cancel_task_creator_and_execution_delegate_are_authorized(tmp_pat
 
         assert owner_result.status is ToolResultStatus.OK
         assert delegate_result.status is ToolResultStatus.OK
-        owner_task = await manager.get_task("by-owner")
-        delegate_task = await manager.get_task("by-delegate")
+        owner_task = await manager.task_store._get_unscoped("by-owner")
+        delegate_task = await manager.task_store._get_unscoped("by-delegate")
         assert owner_task.metadata["cancellation_receipt"] == {
             "actor_agent_id": "did:test:creator",
             "reason": "assignment withdrawn",
@@ -127,7 +127,7 @@ async def test_cancel_task_binds_atomic_transition_to_routed_recipient(tmp_path)
             )
 
         assert (
-            await manager.get_task("recipient-bound")
+            await manager.task_store._get_unscoped("recipient-bound")
         ).status.state is TaskState.SUBMITTED
         canceled = await manager.cancel_task(
             "recipient-bound",
@@ -209,7 +209,7 @@ async def test_cancel_retry_reconciles_terminal_projection_after_interruption(
                 recipient_agent_id="did:test:recipient",
             )
         assert (
-            await manager.get_task("cancel-reconcile")
+            await manager.task_store._get_unscoped("cancel-reconcile")
         ).status.state is TaskState.CANCELED
 
         terminal_events = asyncio.Queue()
@@ -252,7 +252,7 @@ async def test_artifact_append_cannot_mutate_an_authoritatively_canceled_task(tm
                 recipient_agent_id="did:test:recipient",
             )
 
-        canceled = await manager.get_task("artifact-after-cancel")
+        canceled = await manager.task_store._get_unscoped("artifact-after-cancel")
         assert canceled.status.state is TaskState.CANCELED
         assert not canceled.artifacts
     finally:
@@ -286,7 +286,7 @@ async def test_cancel_task_refuses_peer_lineage_and_causation(
 
         assert result.status is ToolResultStatus.ERROR
         assert "not authorized" in result.error
-        unchanged = await manager.get_task("protected")
+        unchanged = await manager.task_store._get_unscoped("protected")
         assert unchanged.status.state is TaskState.SUBMITTED
         assert "cancellation_receipt" not in (unchanged.metadata or {})
     finally:
@@ -314,7 +314,7 @@ async def test_cancel_task_does_not_trust_stale_or_spoofed_sender_metadata(tmp_p
         result = await _feature(manager, "did:test:revoked").cancel_task("spoofed")
 
         assert result.status is ToolResultStatus.ERROR
-        assert (await manager.get_task("spoofed")).status.state is TaskState.SUBMITTED
+        assert (await manager.task_store._get_unscoped("spoofed")).status.state is TaskState.SUBMITTED
     finally:
         await manager.close()
 
@@ -346,7 +346,7 @@ async def test_task_creation_strips_sender_authored_cancellation_receipt(tmp_pat
         assert "cancellation_receipt" not in (created.metadata or {})
         assert len(submitted) == 1
         assert "cancellation_receipt" not in (submitted[0].metadata or {})
-        persisted = await manager.get_task("forged-receipt")
+        persisted = await manager.task_store._get_unscoped("forged-receipt")
         assert persisted.status.state is TaskState.SUBMITTED
         assert "cancellation_receipt" not in (persisted.metadata or {})
         assert persisted.metadata["sender"] == "did:test:creator"
@@ -893,7 +893,10 @@ async def test_live_cancellation_monitor_uses_lightweight_snapshot():
     withdrawal = await recipient.monitor_cognition_signal_execution(signal)
 
     assert "was canceled while" in withdrawal
-    task_manager.get_task_cancellation_snapshot.assert_awaited_once_with(task_id)
+    task_manager.get_task_cancellation_snapshot.assert_awaited_once_with(
+        task_id,
+        recipient_agent_id=recipient.did,
+    )
     task_manager.get_task.assert_not_awaited()
 
 
@@ -908,11 +911,14 @@ async def test_cancellation_snapshot_selects_only_authority_columns():
     )
     store = TaskStore(backend)
 
-    snapshot = await store.get_cancellation_snapshot("task-1")
+    snapshot = await store.get_cancellation_snapshot(
+        "task-1",
+        recipient_agent_id="did:test:recipient",
+    )
 
     query, params = backend.fetch_one.await_args.args
-    assert query == "SELECT status, canceled_by FROM a2a_tasks WHERE id = ?"
-    assert params == ("task-1",)
+    assert "recipient_agent_id = ?" in query
+    assert params == ("task-1", "did:test:recipient")
     assert snapshot.state == "canceled"
     assert snapshot.actor_agent_id == "did:test:creator"
 
@@ -950,7 +956,7 @@ async def test_refused_cancellation_rolls_back_local_execution_exemption(
 
         assert local_intents == set()
         assert (
-            await manager.get_task("refused-intent")
+            await manager.task_store._get_unscoped("refused-intent")
         ).status.state is TaskState.SUBMITTED
     finally:
         await manager.close()
@@ -1027,7 +1033,7 @@ async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
             ),
         )
 
-        legacy = await manager.get_task("legacy-forged-receipt")
+        legacy = await manager.task_store._get_unscoped("legacy-forged-receipt")
         assert "cancellation_receipt" not in (legacy.metadata or {})
         with pytest.raises(ValueError, match="Invalid state transition"):
             await manager.cancel_task(
@@ -1054,7 +1060,7 @@ async def test_task_cannot_be_created_already_canceled(tmp_path):
                 recipient_agent_id="did:test:recipient",
             )
 
-        assert await manager.get_task("born-canceled") is None
+        assert await manager.task_store._get_unscoped("born-canceled") is None
     finally:
         await manager.close()
 
@@ -1081,7 +1087,7 @@ async def test_lifecycle_save_strips_forged_cancellation_receipt(tmp_path):
             recipient_agent_id="did:test:recipient",
         ) is True
 
-        persisted = await manager.get_task("forged-save-receipt")
+        persisted = await manager.task_store._get_unscoped("forged-save-receipt")
         assert persisted.metadata == {"payload": "retained"}
     finally:
         await manager.close()
@@ -1114,7 +1120,7 @@ async def test_task_save_cannot_reassign_cancellation_authority(tmp_path):
 
         assert stale.status is ToolResultStatus.ERROR
         assert revoked.status is ToolResultStatus.ERROR
-        assert (await manager.get_task("immutable")).status.state is TaskState.SUBMITTED
+        assert (await manager.task_store._get_unscoped("immutable")).status.state is TaskState.SUBMITTED
         assert (
             await _feature(manager, "did:test:creator").cancel_task("immutable")
         ).status is ToolResultStatus.OK
@@ -1147,7 +1153,7 @@ async def test_cancel_task_terminal_state_is_unchanged(tmp_path):
         result = await _feature(manager, "did:test:creator").cancel_task("finished")
 
         assert result.status is ToolResultStatus.ERROR
-        unchanged = await manager.get_task("finished")
+        unchanged = await manager.task_store._get_unscoped("finished")
         assert unchanged.status.state is TaskState.COMPLETED
         assert "cancellation_receipt" not in (unchanged.metadata or {})
     finally:
@@ -1173,7 +1179,7 @@ async def test_cancel_task_authorization_and_transition_are_one_winner(tmp_path)
         )
 
         assert sorted(result.status.value for result in results) == ["error", "ok"]
-        task = await manager.get_task("race")
+        task = await manager.task_store._get_unscoped("race")
         assert task.status.state is TaskState.CANCELED
         receipt = task.metadata["cancellation_receipt"]
         assert (receipt["actor_agent_id"], receipt["reason"]) in {
@@ -1191,7 +1197,7 @@ async def test_cancel_task_manager_requires_concrete_actor(tmp_path):
         await manager.create_task(_params("owned"), agent_name="did:test:owner")
         with pytest.raises(TaskCancellationAuthorizationError, match="concrete"):
             await manager.cancel_task("owned", reason="anonymous")
-        assert (await manager.get_task("owned")).status.state is TaskState.SUBMITTED
+        assert (await manager.task_store._get_unscoped("owned")).status.state is TaskState.SUBMITTED
     finally:
         await manager.close()
 
@@ -1213,9 +1219,9 @@ async def test_respond_canceled_cannot_bypass_task_authority(tmp_path):
         )
 
         assert result.status is ToolResultStatus.ERROR
-        assert "not authorized" in result.error
+        assert "not found" in result.error
         assert (
-            await manager.get_task("respond-protected")
+            await manager.task_store._get_unscoped("respond-protected")
         ).status.state is TaskState.SUBMITTED
     finally:
         await manager.close()
@@ -1243,7 +1249,7 @@ async def test_create_task_rejects_duplicate_id_without_mutating_owner_or_payloa
                 creator_agent_id="did:test:creator-b",
             )
 
-        original = await manager.get_task("same-id")
+        original = await manager.task_store._get_unscoped("same-id")
         assert original.metadata["payload"] == "original"
         assert original.history[0].parts[0].text == "Do the work"
         session_after = await manager.session_service.get_session("session-same-id")
@@ -1284,7 +1290,7 @@ async def test_create_task_projection_failure_does_not_report_durable_commit_as_
             "did:test:recipient",
         ).respond_to_a2a_task(created.id, "completed despite projection outage")
         assert result.status is ToolResultStatus.OK
-        assert (await manager.get_task(created.id)).status.state is TaskState.COMPLETED
+        assert (await manager.task_store._get_unscoped(created.id)).status.state is TaskState.COMPLETED
     finally:
         await manager.close()
 
@@ -1345,7 +1351,7 @@ async def test_stale_worker_save_cannot_overwrite_authorized_cancellation(tmp_pa
             agent_name="did:test:recipient",
             creator_agent_id="did:test:creator",
         )
-        stale_worker_copy = await manager.get_task("stale-worker")
+        stale_worker_copy = await manager.task_store._get_unscoped("stale-worker")
         await manager.cancel_task(
             "stale-worker",
             reason="withdrawn",
@@ -1358,7 +1364,7 @@ async def test_stale_worker_save_cannot_overwrite_authorized_cancellation(tmp_pa
             recipient_agent_id="did:test:recipient",
         )
 
-        persisted = await manager.get_task("stale-worker")
+        persisted = await manager.task_store._get_unscoped("stale-worker")
         assert persisted.status.state is TaskState.CANCELED
         assert persisted.metadata["cancellation_receipt"]["reason"] == "withdrawn"
     finally:
@@ -1377,7 +1383,7 @@ async def test_lifecycle_save_without_authority_cannot_create_task(tmp_path):
                 )
             )
 
-        assert await manager.get_task("authority-less") is None
+        assert await manager.task_store._get_unscoped("authority-less") is None
     finally:
         await manager.close()
 
@@ -1414,7 +1420,7 @@ async def test_generic_status_and_store_writes_cannot_cancel_task(tmp_path):
                 recipient_agent_id="did:test:recipient",
             )
 
-        assert (await manager.get_task(task.id)).status.state is TaskState.SUBMITTED
+        assert (await manager.task_store._get_unscoped(task.id)).status.state is TaskState.SUBMITTED
     finally:
         await manager.close()
 
@@ -1457,7 +1463,7 @@ async def test_shutdown_cancellation_uses_authorized_host_identity(tmp_path):
         )
         await manager.drain_execution_tasks(cancel=True)
 
-        persisted = await manager.get_task(task.id)
+        persisted = await manager.task_store._get_unscoped(task.id)
         assert persisted.status.state is TaskState.CANCELED
         assert persisted.metadata["cancellation_receipt"] == {
             "actor_agent_id": host_did,
@@ -1557,7 +1563,7 @@ async def test_async_handler_cancellation_emits_one_terminal_notification(tmp_pa
         )
         await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(task.id)
+        persisted = await manager.task_store._get_unscoped(task.id)
         assert persisted.status.state is TaskState.CANCELED
         assert persisted.artifacts[0].name == "partial"
         assert persisted.metadata["handler_state"] == "declined_after_partial_work"
@@ -1693,8 +1699,10 @@ async def test_handler_cancellation_merges_concurrently_committed_payload(tmp_pa
             )
         )
         await entered.wait()
-        pending = (await manager.get_pending_tasks())[0]
-        concurrent = await manager.get_task(pending.id)
+        pending = (await manager.get_pending_tasks(
+            recipient_agent_id=host_did,
+        ))[0]
+        concurrent = await manager.task_store._get_unscoped(pending.id)
         concurrent.artifacts = [
             Artifact(name="concurrent", parts=[TextPart(text="keep")])
         ]
@@ -1778,7 +1786,9 @@ async def test_sync_handler_returns_concurrent_winning_cancellation(tmp_path):
             )
         )
         await entered.wait()
-        pending = (await manager.get_pending_tasks())[0]
+        pending = (await manager.get_pending_tasks(
+            recipient_agent_id=host_did,
+        ))[0]
         await manager.cancel_task(
             pending.id,
             reason="external winner",
@@ -1846,8 +1856,10 @@ async def test_async_canceling_handler_preserves_concurrent_completed_winner(tmp
             "canceling-agent", "canceling-skill", {}, sync=False
         )
         await entered.wait()
-        pending = (await manager.get_pending_tasks())[0]
-        winning = await manager.get_task(pending.id)
+        pending = (await manager.get_pending_tasks(
+            recipient_agent_id=host_did,
+        ))[0]
+        winning = await manager.task_store._get_unscoped(pending.id)
         winning.status = TaskStatus(
             state=TaskState.COMPLETED,
             message=Message(
@@ -1863,7 +1875,7 @@ async def test_async_canceling_handler_preserves_concurrent_completed_winner(tmp
         release.set()
         await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(pending.id)
+        persisted = await manager.task_store._get_unscoped(pending.id)
         assert persisted.status.state is TaskState.COMPLETED
         assert persisted.status.message.parts[0].text == "concurrent completion"
     finally:
@@ -2024,7 +2036,7 @@ async def test_manager_attests_pre_ceremony_local_cancellation():
         },
     )
     task_manager = SimpleNamespace(
-        get_task=AsyncMock(return_value=current),
+        get_task_for_creator=AsyncMock(return_value=current),
         cancel_task=AsyncMock(return_value=canceled),
     )
     recipient = SimpleNamespace(
@@ -2135,7 +2147,7 @@ async def test_manager_attested_local_cancellation_transitions_live_task(tmp_pat
         )
 
         assert result["status"] == "canceled"
-        persisted = await task_manager.get_task(task.id)
+        persisted = await task_manager.task_store._get_unscoped(task.id)
         assert persisted.status.state is TaskState.CANCELED
         assert persisted.metadata["cancellation_receipt"]["actor_agent_id"] == (
             sender.did
@@ -2206,7 +2218,7 @@ async def test_respond_canceled_uses_outbound_route_before_shared_task_row():
         status=TaskStatus(state=TaskState.WORKING),
     )
     local_manager = MagicMock(
-        get_task=AsyncMock(return_value=visible_recipient_row),
+        get_task_for_recipient=AsyncMock(return_value=visible_recipient_row),
         is_task_recipient=AsyncMock(return_value=False),
         cancel_task=AsyncMock(),
     )

@@ -65,7 +65,7 @@ async def test_response_authority_is_recipient_not_creator_or_metadata(tmp_path)
 
         assert creator_result.status is ToolResultStatus.ERROR
         assert peer_result.status is ToolResultStatus.ERROR
-        assert (await manager.get_task("recipient-response")).status.state is (
+        assert (await manager.task_store._get_unscoped("recipient-response")).status.state is (
             TaskState.SUBMITTED
         )
 
@@ -74,7 +74,7 @@ async def test_response_authority_is_recipient_not_creator_or_metadata(tmp_path)
             "recipient answer",
         )
         assert recipient_result.status is ToolResultStatus.OK
-        task = await manager.get_task("recipient-response")
+        task = await manager.task_store._get_unscoped("recipient-response")
         assert task.status.state is TaskState.COMPLETED
         assert task.status.message.parts[0].text == "recipient answer"
     finally:
@@ -97,7 +97,7 @@ async def test_artifact_authority_is_recipient_and_predicated_in_store(tmp_path)
             "must not persist",
         )
         assert denied.status is ToolResultStatus.ERROR
-        assert not (await manager.get_task("recipient-artifact")).artifacts
+        assert not (await manager.task_store._get_unscoped("recipient-artifact")).artifacts
 
         accepted = await _feature(manager, RECIPIENT).attach_artifact_to_a2a_task(
             "recipient-artifact",
@@ -105,7 +105,7 @@ async def test_artifact_authority_is_recipient_and_predicated_in_store(tmp_path)
             "persist this",
         )
         assert accepted.status is ToolResultStatus.OK
-        task = await manager.get_task("recipient-artifact")
+        task = await manager.task_store._get_unscoped("recipient-artifact")
         assert [artifact.name for artifact in task.artifacts] == [
             "recipient-output"
         ]
@@ -130,13 +130,13 @@ async def test_worker_lifecycle_has_only_typed_recipient_owned_save(tmp_path):
             task,
             recipient_agent_id=CREATOR,
         )
-        assert (await manager.get_task(task.id)).status.state is TaskState.SUBMITTED
+        assert (await manager.task_store._get_unscoped(task.id)).status.state is TaskState.SUBMITTED
 
         assert await manager.task_store.save_recipient_lifecycle(
             task,
             recipient_agent_id=RECIPIENT,
         )
-        assert (await manager.get_task(task.id)).status.state is TaskState.WORKING
+        assert (await manager.task_store._get_unscoped(task.id)).status.state is TaskState.WORKING
     finally:
         await manager.close()
 
@@ -173,7 +173,7 @@ async def test_unauthorized_status_race_cannot_win_or_change_payload(tmp_path):
 
         assert accepted.status.state is TaskState.WORKING
         assert isinstance(denied, TaskMutationAuthorizationError)
-        task = await manager.get_task("status-race")
+        task = await manager.task_store._get_unscoped("status-race")
         assert task.status.state is TaskState.WORKING
         assert task.status.message is None
     finally:

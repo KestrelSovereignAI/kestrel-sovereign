@@ -163,7 +163,10 @@ class TaskWorker:
     async def _poll_and_process(self) -> None:
         """Poll for pending tasks and dispatch them."""
         # Get pending tasks
-        pending = await self.task_manager.get_pending_tasks(limit=self.max_concurrent)
+        pending = await self.task_manager.get_pending_tasks(
+            recipient_agent_id=self.agent_name,
+            limit=self.max_concurrent,
+        )
 
         for task in pending:
             # Find handler

@@ -1016,6 +1016,157 @@ class AgentManager:
             return None
         return sender_id if result is True else None
 
+    async def _authorize_host_attested_local_a2a_route(
+        self,
+        *,
+        sender: object,
+        requester: object,
+        peer: object,
+    ) -> tuple[str, object]:
+        """Resolve one live sender→recipient route under the caller's lease."""
+
+        from kestrel_sovereign.features.peers.directory import (
+            PeerAccessDeniedError,
+            PeerIdentity,
+            PeerNotFoundError,
+            PeerProtocolError,
+            PeerRequester,
+        )
+
+        if not isinstance(requester, PeerRequester) or not isinstance(
+            peer, PeerIdentity
+        ):
+            raise PeerProtocolError("Local A2A route is malformed")
+        sender_policy = self.a2a_hosted_policy_for(sender)
+        sender_id = _loaded_agent_did(sender)
+        if (
+            sender_policy is None
+            or sender_policy.requester is not requester
+            or requester.identity != sender_id
+        ):
+            raise PeerAccessDeniedError("Local A2A sender is no longer published")
+
+        recipient_name = self._agent_names.get(peer.agent_id)
+        recipient = (
+            self._agents.get(recipient_name)
+            if isinstance(recipient_name, str)
+            else None
+        )
+        recipient_policy = (
+            self.a2a_hosted_policy_for(recipient)
+            if recipient is not None
+            else None
+        )
+        if (
+            recipient is None
+            or recipient_policy is None
+            or recipient_policy.recipient_id != peer.agent_id
+            or recipient_name != peer.routing_key
+        ):
+            raise PeerNotFoundError("Local A2A recipient is no longer published")
+
+        authorize = getattr(
+            recipient_policy.router,
+            "authorize_inbound_sender",
+            None,
+        )
+        if not callable(authorize):
+            raise PeerAccessDeniedError("Local A2A recipient policy is unavailable")
+        authorized = authorize(recipient_policy.requester, sender_id)
+        if inspect.isawaitable(authorized):
+            authorized = await authorized
+        if (
+            authorized is not True
+            or self.a2a_hosted_policy_for(sender) is not sender_policy
+            or self.a2a_hosted_policy_for(recipient) is not recipient_policy
+        ):
+            raise PeerAccessDeniedError("Local A2A sender is not authorized")
+        return sender_id, recipient
+
+    async def get_host_attested_local_a2a_task(
+        self,
+        *,
+        sender: object,
+        requester: object,
+        peer: object,
+        task_id: str,
+    ) -> dict[str, object]:
+        """Read a same-host result only through its durable creator."""
+
+        from kestrel_sovereign.features.peers.directory import (
+            PeerNotFoundError,
+            PeerProtocolError,
+        )
+
+        if not isinstance(task_id, str) or not task_id:
+            raise PeerProtocolError("Local A2A task read is malformed")
+        async with self.a2a_execution_lease():
+            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
+                sender=sender,
+                requester=requester,
+                peer=peer,
+            )
+            task_manager = getattr(recipient, "task_manager", None)
+            if task_manager is None:
+                raise PeerNotFoundError("Local A2A task does not exist")
+            task = await task_manager.get_task_for_creator(task_id, sender_id)
+            if task is None:
+                # Unknown and cross-principal ids share one public result.
+                raise PeerNotFoundError("Local A2A task does not exist")
+            return task.model_dump()
+
+    async def subscribe_host_attested_local_a2a_task(
+        self,
+        *,
+        sender: object,
+        requester: object,
+        peer: object,
+        task_id: str,
+    ):
+        """Stream a same-host task only after creator-scoped admission."""
+
+        from kestrel_sovereign.features.peers.directory import (
+            PeerNotFoundError,
+            PeerProtocolError,
+            PeerSubscriptionEvent,
+        )
+
+        if not isinstance(task_id, str) or not task_id:
+            raise PeerProtocolError("Local A2A task subscription is malformed")
+        subscription = None
+        async with self.a2a_execution_lease():
+            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
+                sender=sender,
+                requester=requester,
+                peer=peer,
+            )
+            task_manager = getattr(recipient, "task_manager", None)
+            if task_manager is None or await task_manager.get_task_for_creator(
+                task_id,
+                sender_id,
+            ) is None:
+                raise PeerNotFoundError("Local A2A task does not exist")
+            subscription = task_manager.subscribe(
+                task_id,
+                creator_agent_id=sender_id,
+            )
+            try:
+                first = await anext(subscription)
+            except StopAsyncIteration as exc:
+                raise PeerNotFoundError("Local A2A task does not exist") from exc
+        try:
+            yield PeerSubscriptionEvent(
+                event=first.get("event"),
+                data=first.get("data"),
+            )
+            async for event in subscription:
+                yield PeerSubscriptionEvent(
+                    event=event.get("event"),
+                    data=event.get("data"),
+                )
+        finally:
+            await subscription.aclose()
+
     async def cancel_host_attested_local_a2a_task(
         self,
         *,
@@ -1041,17 +1192,13 @@ class AgentManager:
         )
         from kestrel_sovereign.features.peers.directory import (
             PeerAccessDeniedError,
-            PeerIdentity,
             PeerNotFoundError,
             PeerProtocolError,
-            PeerRequester,
             PeerTaskConflictError,
         )
 
         if (
-            not isinstance(requester, PeerRequester)
-            or not isinstance(peer, PeerIdentity)
-            or not isinstance(task_id, str)
+            not isinstance(task_id, str)
             or not task_id
             or not isinstance(payload, Mapping)
         ):
@@ -1061,63 +1208,16 @@ class AgentManager:
             raise PeerProtocolError("Local cancellation reason is invalid")
 
         async with self.a2a_execution_lease():
-            sender_policy = self.a2a_hosted_policy_for(sender)
-            sender_id = _loaded_agent_did(sender)
-            if (
-                sender_policy is None
-                or sender_policy.requester is not requester
-                or requester.identity != sender_id
-            ):
-                raise PeerAccessDeniedError(
-                    "Local cancellation sender is no longer published"
-                )
-
-            recipient_name = self._agent_names.get(peer.agent_id)
-            recipient = (
-                self._agents.get(recipient_name)
-                if isinstance(recipient_name, str)
-                else None
+            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
+                sender=sender,
+                requester=requester,
+                peer=peer,
             )
-            recipient_policy = (
-                self.a2a_hosted_policy_for(recipient)
-                if recipient is not None
-                else None
-            )
-            if (
-                recipient is None
-                or recipient_policy is None
-                or recipient_policy.recipient_id != peer.agent_id
-                or recipient_name != peer.routing_key
-            ):
-                raise PeerNotFoundError(
-                    "Local cancellation recipient is no longer published"
-                )
-
-            authorize = getattr(
-                recipient_policy.router,
-                "authorize_inbound_sender",
-                None,
-            )
-            if not callable(authorize):
-                raise PeerAccessDeniedError(
-                    "Local cancellation recipient policy is unavailable"
-                )
-            authorized = authorize(recipient_policy.requester, sender_id)
-            if inspect.isawaitable(authorized):
-                authorized = await authorized
-            if (
-                authorized is not True
-                or self.a2a_hosted_policy_for(sender) is not sender_policy
-                or self.a2a_hosted_policy_for(recipient) is not recipient_policy
-            ):
-                raise PeerAccessDeniedError(
-                    "Local cancellation sender is not authorized"
-                )
 
             task_manager = getattr(recipient, "task_manager", None)
             if task_manager is None:
                 raise PeerNotFoundError("Local cancellation recipient is unavailable")
-            current = await task_manager.get_task(task_id)
+            current = await task_manager.get_task_for_creator(task_id, sender_id)
             if current is None:
                 raise PeerNotFoundError("Local cancellation task does not exist")
             try:

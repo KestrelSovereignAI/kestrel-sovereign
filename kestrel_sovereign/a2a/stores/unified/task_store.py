@@ -314,11 +314,46 @@ class TaskStore(UnifiedStoreBase):
         if rows_affected != 1:
             raise TaskAlreadyExistsError(f"Task already exists: {task.id}")
 
-    async def get(self, task_id: str) -> Optional[Task]:
-        """Retrieve a task by ID."""
+    async def _get_unscoped(self, task_id: str) -> Optional[Task]:
+        """Internal canonical-row read after an already-authorized mutation."""
         row = await self._backend.fetch_one(
             "SELECT * FROM a2a_tasks WHERE id = ?",
             (task_id,),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    async def get_for_creator(
+        self,
+        task_id: str,
+        creator_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a sender-owned result through its durable creator."""
+
+        if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
+            raise ValueError("Task creator lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? AND creator_agent_id = ?",
+            (task_id, creator_agent_id),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    async def get_for_principal(
+        self,
+        task_id: str,
+        principal_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a task visible to either one of its durable principals."""
+
+        if not isinstance(principal_agent_id, str) or not principal_agent_id.strip():
+            raise ValueError("Task principal lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? "
+            "AND (creator_agent_id = ? OR recipient_agent_id = ?)",
+            (task_id, principal_agent_id, principal_agent_id),
         )
         if not row:
             return None
@@ -344,12 +379,18 @@ class TaskStore(UnifiedStoreBase):
     async def get_cancellation_snapshot(
         self,
         task_id: str,
+        *,
+        recipient_agent_id: str,
     ) -> Optional[TaskCancellationSnapshot]:
         """Read cancellation authority without loading task payload columns."""
 
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+            raise ValueError("Cancellation snapshot requires a concrete recipient")
+
         row = await self._backend.fetch_one(
-            "SELECT status, canceled_by FROM a2a_tasks WHERE id = ?",
-            (task_id,),
+            "SELECT status, canceled_by FROM a2a_tasks "
+            "WHERE id = ? AND recipient_agent_id = ?",
+            (task_id, recipient_agent_id),
         )
         if not row:
             return None
@@ -369,16 +410,23 @@ class TaskStore(UnifiedStoreBase):
         )
         return row is not None
 
-    async def get_pending_tasks(self, limit: int = 10) -> list[Task]:
-        """Get tasks ready for processing (SUBMITTED state)."""
+    async def get_pending_tasks(
+        self,
+        *,
+        recipient_agent_id: str,
+        limit: int = 10,
+    ) -> list[Task]:
+        """Get SUBMITTED work addressed to one durable recipient."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Pending-task reads require a concrete recipient")
         rows = await self._backend.fetch_all(
             """
             SELECT * FROM a2a_tasks
-            WHERE status = 'submitted'
+            WHERE status = 'submitted' AND recipient_agent_id = ?
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            (limit,),
+            (recipient_agent_id, limit),
         )
         return [self._row_to_task(row) for row in rows]
 
@@ -554,7 +602,7 @@ class TaskStore(UnifiedStoreBase):
                 )
             if rows_affected != 1:
                 return None
-            return await self.get(task_id)
+            return await self.get_for_principal(task_id, actor_agent_id)
 
         if self.is_postgres:
             payload_assignment = (
@@ -604,7 +652,7 @@ class TaskStore(UnifiedStoreBase):
         )
         if rows_affected != 1:
             return None
-        return await self.get(task_id)
+        return await self.get_for_principal(task_id, actor_agent_id)
 
     async def add_artifact(
         self,
@@ -680,14 +728,18 @@ class TaskStore(UnifiedStoreBase):
 
     async def list_tasks(
         self,
+        *,
+        recipient_agent_id: str,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         status: Optional[TaskState] = None,
         limit: int = 100,
     ) -> list[Task]:
-        """List tasks with optional filters."""
-        conditions = []
-        params = []
+        """List only tasks addressed to one durable recipient."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task listing requires a concrete recipient")
+        conditions = ["recipient_agent_id = ?"]
+        params = [recipient_agent_id]
 
         if session_id:
             conditions.append("session_id = ?")
