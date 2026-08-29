@@ -1,6 +1,7 @@
 """Durability and fail-closed evidence gates for cooperative Stop (#3152)."""
 
 import asyncio
+import json
 from dataclasses import replace
 from uuid import uuid4
 from unittest.mock import AsyncMock, MagicMock
@@ -586,7 +587,7 @@ def test_live_endpoint_without_receipt_store_refuses_before_cancellation():
     agent.cancel_current_request.assert_not_called()
 
 
-@pytest.mark.parametrize("correlation_id", ["", "   ", 7])
+@pytest.mark.parametrize("correlation_id", ["", "   ", 7, "\ud800"])
 def test_live_endpoint_rejects_invalid_stop_correlation_identity(correlation_id):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -596,14 +597,20 @@ def test_live_endpoint_rejects_invalid_stop_correlation_identity(correlation_id)
     app = FastAPI()
     app.include_router(router)
 
+    # Encode explicitly with JSON escapes so a lone surrogate reaches the
+    # application parser. httpx's convenience ``json=`` path encodes with
+    # ensure_ascii=False and rejects it in the client before the endpoint runs.
     response = TestClient(app).post(
         "/api/agent/stop",
-        json={"correlation_id": correlation_id},
+        content=json.dumps(
+            {"correlation_id": correlation_id}, ensure_ascii=True
+        ).encode("ascii"),
+        headers={"Content-Type": "application/json"},
     )
 
     assert response.status_code == 400
     assert response.json()["detail"] == (
-        "Stop correlation_id must be a non-empty string."
+        "Stop correlation_id must be a non-empty valid Unicode string."
     )
 
 

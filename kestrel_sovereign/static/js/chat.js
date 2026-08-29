@@ -2597,6 +2597,22 @@ function hasTerminalStopReceipt(error) {
     ));
 }
 
+function stopFailureRequiresFreshOperation(error) {
+    if (hasTerminalStopReceipt(error)) return true;
+    const canonicalError = error?.body?.error;
+    if (canonicalError?.code !== 'stop_not_confirmed') return false;
+    const details = canonicalError.details;
+    return Array.isArray(details) && details.some((outcome) => (
+        outcome
+        && typeof outcome === 'object'
+        && !outcome.receipt_id
+        && outcome.detail === (
+            'Cancellation may have completed, but its durable '
+            + 'Stop receipt could not be persisted'
+        )
+    ));
+}
+
 /**
  * Stop a specific agent's in-flight stream. Aborts client-side via
  * the per-agent AbortController, and tells the server to halt by
@@ -2681,7 +2697,7 @@ export async function stopAgent(agentName) {
         // reconciliation allocate a fresh operation so it can observe that
         // the old turn subsequently completed. Transport/malformed failures
         // remain ambiguous and must replay the original durable operation.
-        if (hasTerminalStopReceipt(e)) {
+        if (stopFailureRequiresFreshOperation(e)) {
             retainedCorrelationIds.delete(agentName);
         }
         refreshAgentThinkingDot(agentName);
