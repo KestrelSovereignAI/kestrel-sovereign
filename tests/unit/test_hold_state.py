@@ -321,7 +321,8 @@ async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db)
             operation_id="old-idempotent-operation",
         )
 
-    assert await store.get_receipt("old-idempotent-operation") is None
+    with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.get_receipt("old-idempotent-operation")
     with pytest.raises(HoldCorruptStateError, match="receipt-count"):
         await store.get_hold("agent", "did:agent:non-applied-loss")
 
@@ -936,6 +937,85 @@ async def test_mutated_receipt_content_cannot_reopen_an_operation_id(hold_db):
 
 
 @pytest.mark.asyncio
+async def test_deleted_receipt_operation_id_cannot_be_rebound_to_other_target(
+    hold_db,
+):
+    """A global operation tombstone survives loss of its receipt row."""
+
+    db, store = hold_db
+    original = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:original-operation-owner",
+        actor_id="did:sovereign:operator",
+        reason="first use",
+        operation_id="globally-retired-operation",
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (original.receipt.receipt_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:attempted-new-owner",
+            actor_id="did:sovereign:operator",
+            reason="second use",
+            operation_id="globally-retired-operation",
+        )
+
+    assert (
+        await db.fetchone(
+            "SELECT operation_id FROM hold_receipts WHERE target_id = ?",
+            ("did:agent:attempted-new-owner",),
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeat_schema_check_hashes_only_missing_content_witnesses(
+    hold_db, monkeypatch
+):
+    """Startup backfill work is bounded by missing legacy witnesses."""
+
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:backfill",
+        actor_id="did:sovereign:operator",
+        reason="seed witness",
+        operation_id="content-witness-present",
+    )
+    second = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:backfill",
+        actor_id="did:sovereign:operator",
+        reason="replace witness",
+        operation_id="content-witness-missing",
+    )
+    await db.execute(
+        "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id = ?",
+        (second.receipt.receipt_id,),
+    )
+
+    from kestrel_sovereign.hold import state as hold_state
+
+    original_digest = hold_state._receipt_content_digest
+    hashed_receipt_ids: list[str] = []
+
+    def _record_digest(row):
+        hashed_receipt_ids.append(str(row[0]))
+        return original_digest(row)
+
+    monkeypatch.setattr(hold_state, "_receipt_content_digest", _record_digest)
+    await store.ensure_schema()
+
+    assert hashed_receipt_ids == [second.receipt.receipt_id]
+    assert first.receipt.receipt_id not in hashed_receipt_ids
+
+
+@pytest.mark.asyncio
 async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
@@ -1388,7 +1468,7 @@ async def test_malformed_applied_hold_replay_fails_closed(
     _db, store = hold_db
     monkeypatch.setattr(
         store,
-        "_read_receipt_by_operation",
+        "_validate_operation_witness",
         AsyncMock(
             return_value=(
                 "receipt-id",
@@ -1440,7 +1520,7 @@ async def test_impossible_receipt_state_combinations_fail_closed(
     _db, store = hold_db
     monkeypatch.setattr(
         store,
-        "_read_receipt_by_operation",
+        "_validate_operation_witness",
         AsyncMock(
             return_value=(
                 "receipt-id",
