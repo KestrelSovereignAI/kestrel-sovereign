@@ -605,11 +605,13 @@ class AgentManager:
         self,
         base_data_dir: Optional[Path] = None,
         *,
+        hold_store: object = None,
         hosted_telegram_route_attestation_resolver_factory: Optional[
             Callable[[str, str, LocalAgentConfig], object]
         ] = None,
     ):
         self._agents: dict[str, KestrelAgent] = {}
+        self._hold_store = hold_store
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
         self._child_mandates: dict[str, SpawnMandate] = {}  # child_name -> mandate
@@ -1470,6 +1472,11 @@ class AgentManager:
                     ),
                 )
 
+            # Hold is checked at the very first turn seam, including feature
+            # ready hooks fired during initialize().  Bind before initialize,
+            # never at routing publication time.
+            agent._hold_store = self._hold_store
+
             # Publish this before feature initialization. A shared PostgreSQL
             # host must never briefly arm an agent-scoped runner that lacks the
             # manager's live authority and per-DID lifecycle lock.
@@ -1683,6 +1690,8 @@ class AgentManager:
 
     def _register_agent(self, name: str, agent: KestrelAgent) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
+        if self._hold_store is not None:
+            agent._hold_store = self._hold_store
         agent_id = _loaded_agent_did(agent)
         if not isinstance(agent_id, str) or not agent_id:
             raise RuntimeError(

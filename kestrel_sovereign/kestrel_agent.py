@@ -686,6 +686,11 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
+        # A production launcher binds the fleet control store before
+        # ``initialize()``.  Keeping construction optional preserves Kestrel as
+        # an embeddable library while the production factories fail closed if
+        # their host context cannot supply this load-bearing dependency.
+        self._hold_store = None
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
         effective_db_backend = db_backend or os.environ.get(
@@ -5422,6 +5427,11 @@ Expected Duration: {expected_duration}
                 transport metadata. This is task-local only; tools cannot
                 provide or override it through their arguments.
         """
+        from kestrel_sovereign.hold import require_turn_start_allowed
+
+        # Universal willingness-to-begin gate.  It precedes credentials,
+        # genesis, hooks, context, turn lifecycle, tools, and provider work.
+        await require_turn_start_allowed(self)
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
         # USER_BYOK credentials are a non-cognitive readiness input. Refresh

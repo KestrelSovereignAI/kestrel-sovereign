@@ -263,7 +263,11 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
     monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
-    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_k: manager)
+    def _manager_factory(**kwargs):
+        assert kwargs["hold_store"] is hold_store
+        return manager
+
+    monkeypatch.setattr(agent_manager, "AgentManager", _manager_factory)
     monkeypatch.setattr(
         server, "_prepare_shared_postgres_scheduler_protocol", _preflight
     )
@@ -281,6 +285,6 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     async with server._lifespan_startup(app):
         pass
 
-    assert events == ["preflight", "load", "host-start", "context-build"]
+    assert events == ["context-build", "preflight", "load", "host-start"]
     assert app.state.host_context is host_context
     assert app.state.host_context.hold_store is hold_store

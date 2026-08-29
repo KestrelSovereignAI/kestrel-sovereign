@@ -150,6 +150,11 @@ async def get_agent_by_did(did: str) -> KestrelAgent:
     storage_path = os.environ.get("KESTREL_DB_PATH", os.getcwd())
     llm_service = LLMService()
     agent = KestrelAgent(did=did, storage_path=storage_path, llm_service=llm_service)
+    from kestrel_sovereign.hold import build_bound_host_context
+
+    # This legacy helper transfers both agent and context lifetime to its
+    # caller.  Main process paths below close their context explicitly.
+    agent._standalone_hold_context = await build_bound_host_context(agent)
     await agent.initialize()
     return agent
 
@@ -206,6 +211,12 @@ async def main():
     storage_path = os.path.join(storage_dir, "kestrel_prime.db")
     llm_service = LLMService()
     agent = KestrelAgent(did=agent_did, storage_path=storage_path, llm_service=llm_service)
+    from kestrel_sovereign.hold import (
+        build_bound_host_context,
+        close_bound_host_context,
+    )
+
+    hold_context = await build_bound_host_context(agent)
     await agent.initialize()
 
     if args.app:
@@ -284,6 +295,7 @@ async def main():
             logger.debug(f"Error during shutdown: {e}")
             print("Agent deactivated (with errors).")
         cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 

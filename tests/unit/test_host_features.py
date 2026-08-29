@@ -347,10 +347,12 @@ async def test_server_lifespan_wires_and_closes_host_features(
         async def close(self):
             events.append(self.event)
 
+    hold_store = object()
     ctx = SovereignHostContext(
         db=Closeable("db-close"),
         config={},
         session_factory=Closeable("session-close"),
+        hold_store=hold_store,
     )
 
     async def build_context(*, config):
@@ -371,7 +373,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
     monkeypatch.setenv("PORT", "9090")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda env: config_path)
     monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *a, **k: fake_config)
-    monkeypatch.setattr(agent_manager, "AgentManager", lambda **k: fake_manager)
+    def manager_factory(**kwargs):
+        assert kwargs["hold_store"] is hold_store
+        return fake_manager
+
+    monkeypatch.setattr(agent_manager, "AgentManager", manager_factory)
     monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *a, **k: None)
     monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda agents: True)
     monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda app: None)
@@ -403,8 +409,8 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert test_app.state.host_features == [feature]
         assert test_app.state.host_context is ctx
         assert events == [
-            "agents-load",
             "context-build",
+            "agents-load",
             "host-start",
             "host-router-mount",
             "host-ui-mount",

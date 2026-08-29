@@ -4530,6 +4530,43 @@ class TestLoadFromConfig:
         assert "isolated_runtime_hosted" not in kwargs
 
     @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_hold_store_is_bound_before_agent_initialize(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """Ready hooks during initialize cannot outrun restart Hold state."""
+
+        mock_get_did.return_value = "did:held:at-boot"
+        agent = _make_mock_agent("did:held:at-boot")
+        hold_store = object()
+
+        async def initialize():
+            assert agent._hold_store is hold_store
+
+        agent.initialize.side_effect = initialize
+        mock_agent_cls.return_value = agent
+        manager = AgentManager(base_data_dir=tmp_path, hold_store=hold_store)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data/held"),
+            port=8801,
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            initialized = await manager._initialize_agent("Held", config)
+
+        assert initialized is agent
+        agent.initialize.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_postgres_factory_constructs_real_agent_with_derived_namespace(
         self, monkeypatch, tmp_path
     ):
