@@ -510,6 +510,48 @@ async def test_effective_anchored_policy_is_preflighted_before_assembly():
 
 
 @pytest.mark.asyncio
+async def test_optional_anchored_doctrine_is_evicted_to_model_budget():
+    builder = _builder()
+    manager = ContextManager(storage=MagicMock(), context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        conversation_history=[],
+        anchored_doctrine=OrderedDict(
+            [("OPTIONAL.txt", "optional anchored context " * 40_000)]
+        ),
+    )
+
+    assert plan.degraded_mode is False
+    assert plan.total_tokens <= plan.total_budget
+    assert "OPTIONAL.txt" in (plan.assembly.dropped_clauses or [])
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_optional_anchor_is_evicted_to_model_budget():
+    builder = _builder()
+    manager = ContextManager(storage=MagicMock(), context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        privacy_mode="EPHEMERAL",
+        anchored_doctrine=OrderedDict(
+            [("OPTIONAL.txt", "optional anchored context " * 40_000)]
+        ),
+    )
+
+    assert plan.degraded_mode is False
+    assert plan.total_tokens <= plan.total_budget
+    assert "OPTIONAL.txt" in (plan.assembly.dropped_clauses or [])
+
+
+@pytest.mark.asyncio
 async def test_required_system_suffix_is_preflighted_before_assembly():
     builder = _builder()
     manager = ContextManager(storage=MagicMock(), context_builder=builder)

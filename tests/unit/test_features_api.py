@@ -961,6 +961,21 @@ class TestUpdateFeatureConfig:
         feature.set_config.assert_awaited_once_with({"enabled": False})
         agent.refresh_feature_context_clauses.assert_called_once_with(feature)
 
+    def test_updates_disabled_feature_without_refreshing_inactive_context(self):
+        feature = _make_feature(config={"enabled": False}, enabled=False)
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"enabled": True}},
+            )
+
+        assert resp.status_code == 200
+        feature.set_config.assert_awaited_once_with({"enabled": True})
+        agent.refresh_feature_context_clauses.assert_not_called()
+
     def test_validates_required_fields(self):
         schema = {
             "type": "object",

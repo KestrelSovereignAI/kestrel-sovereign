@@ -1445,9 +1445,7 @@ class ContextManager:
                 prompt_adaptation=prompt_adaptation,
                 state_of_mind=None,
                 budget_bytes=system_prompt_budget_bytes,
-                budget_tokens=(
-                    system_prompt_budget_tokens if has_context_clauses else None
-                ),
+                budget_tokens=system_prompt_budget_tokens,
                 required_suffix=system_prompt_addendum,
                 anchored_doctrine=anchored_doctrine,
             )
@@ -2068,9 +2066,7 @@ class ContextManager:
                         prompt_adaptation=prompt_adaptation,
                         state_of_mind=None,
                         budget_bytes=system_prompt_budget_bytes,
-                        budget_tokens=(
-                            system_token_budget if has_context_clauses else None
-                        ),
+                        budget_tokens=system_token_budget,
                         required_suffix=required_suffix,
                         anchored_doctrine=anchored_doctrine,
                     )

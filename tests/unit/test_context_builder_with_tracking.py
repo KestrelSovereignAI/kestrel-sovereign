@@ -53,6 +53,7 @@ def _stub_builder(bootstrap: dict) -> ContextBuilder:
     cb._llm_service = None
     cb._model_fallback = "test-model"
     cb._counter = MagicMock()
+    cb._counter.count.side_effect = lambda text: len(text.split())
     cb._counter_model = "test-model"
     cb._bootstrap_loader = MagicMock()
     cb._bootstrap_loader.load = MagicMock(return_value=OrderedDict(bootstrap))
@@ -62,10 +63,8 @@ def _stub_builder(bootstrap: dict) -> ContextBuilder:
     cb.storage = MagicMock()
     # ``ContextManager.build_context`` (#1309 elastic budget) calls
     # ``measure_mandatory_system_tokens`` to size the non-borrowable
-    # governance floor. The MagicMock counter in this stub returns
-    # MagicMock from ``count()``, which would propagate into the
-    # ElasticTokenBudget constructor as a non-int. Override with a
-    # zero-floor stub so the tests focus on the tracking assembler.
+    # governance floor. Override it with a zero-floor stub so these tests
+    # focus on tracking assembly rather than the fixture's synthetic content.
     cb.measure_mandatory_system_tokens = lambda *a, **kw: 0
     return cb
 
