@@ -315,6 +315,74 @@ test('sendMessage does not dispatch a replacement when Stop is unconfirmed', asy
 });
 
 
+test('terminal failed Stop receipt retries with a new durable operation ID', async () => {
+    const agent = 'agent-stop-terminal-reconcile';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-terminal-request';
+    const correlationIds = [];
+    const requestIds = [];
+    let stopAttempts = 0;
+    apiModule.default.stop = async (requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        requestIds.push(requestId);
+        correlationIds.push(correlationId);
+        if (stopAttempts === 1) {
+            const error = new Error('terminal stop receipt');
+            error.body = {
+                error: {
+                    code: 'stop_not_confirmed',
+                    details: [{
+                        disposition: 'unreachable',
+                        receipt_id: 'durable-terminal-receipt',
+                    }],
+                },
+            };
+            throw error;
+        }
+        return confirmedStopResponse();
+    };
+    const ctrl = controlledStream();
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return ctrl.iter;
+    };
+    apiModule.default.invoke = async () => ({ response: '' });
+
+    messageInput.value = 'first reconciliation attempt';
+    await sendMessage();
+    assert.equal(replacementStarted, false);
+    assert.equal(state.unconfirmedStopAgents.has(agent), true);
+
+    state.waitingAgents.delete(agent);
+    messageInput.value = 'retry after terminal evidence';
+    const retry = sendMessage();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(replacementStarted, true);
+    ctrl.end();
+    await retry;
+
+    assert.deepEqual(
+        requestIds,
+        ['prior-terminal-request', 'prior-terminal-request'],
+        'reconciliation retains the exact stopped turn address',
+    );
+    assert.equal(typeof correlationIds[0], 'string');
+    assert.equal(typeof correlationIds[1], 'string');
+    assert.notEqual(
+        correlationIds[1],
+        correlationIds[0],
+        'a terminal receipt cannot be replayed as the next Stop operation',
+    );
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+});
+
+
 test('queue mode preserves composer input behind an unconfirmed Stop', async () => {
     const agent = 'agent-queue-stop-failed';
     const pane = getOrCreateChatPane(agent);
