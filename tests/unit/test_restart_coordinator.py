@@ -634,6 +634,28 @@ async def test_request_restart_fails_without_stable_sovereign_key(
 
 
 @pytest.mark.asyncio
+async def test_request_restart_rejects_server_generated_temporary_key(
+    tmp_path, monkeypatch,
+):
+    """Local bootstrap access is not durable whole-host authority."""
+
+    from kestrel_sovereign.server import get_api_key
+
+    feat, backend = await _make_feature(tmp_path)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    with patch("kestrel_sovereign.server.secrets.token_urlsafe") as generate:
+        generate.return_value = "process-only-bootstrap-key"
+        assert get_api_key() == "process-only-bootstrap-key"
+
+    result = await feat.request_restart(reason="cannot survive restart")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "temporary sovereign key" in result.error
+    assert "stable KESTREL_API_KEY" in result.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
 async def test_request_restart_rejects_unknown_urgency(tmp_path):
     feat, _ = await _make_feature(tmp_path)
     result = await feat.request_restart(reason="r", urgency="bogus")
@@ -1400,6 +1422,38 @@ async def test_executor_rejects_tampered_signed_request_bounds(tmp_path):
     assert row.status == "rejected"
     assert "do not match signed authority bounds" in row.status_reason
     mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_malformed_signature_rejects_row_and_continues_scan(tmp_path):
+    """Hostile signature bytes cannot wedge later coordinator candidates."""
+
+    feat, backend = await _make_feature(tmp_path)
+    malformed = await feat.request_restart(
+        reason="malformed first candidate",
+        urgency="critical",
+    )
+    later = await feat.request_restart(
+        reason="later candidate must still be inspected",
+        urgency="low",
+        policy="manual_only",
+    )
+    malformed_id = malformed.data["request"]["id"]
+    later_id = later.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET authority_signature = ? WHERE id = ?",
+        ("é" * 64, malformed_id),
+    )
+
+    result = await feat.restart_coordinator()
+
+    rejected = await get_request(backend, malformed_id)
+    untouched = await get_request(backend, later_id)
+    assert rejected.status == "rejected"
+    assert "signature is malformed" in rejected.status_reason
+    assert untouched.status == "pending"
+    assert result.status is ToolResultStatus.OK
+    assert [item["request_id"] for item in result.data["deferred"]] == [later_id]
 
 
 @pytest.mark.asyncio

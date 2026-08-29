@@ -16,10 +16,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from kestrel_sovereign.auth import current_caller_context
+from kestrel_sovereign.security.sovereign_key import is_ephemeral_sovereign_key
 
 
 AUTHORITY_KIND = "sovereign_api_key_hmac_v1"
@@ -38,6 +40,11 @@ def _sovereign_secret() -> bytes:
     if not raw:
         raise RestartAuthorityError(
             "whole-host restart authority is unavailable: no stable sovereign key"
+        )
+    if is_ephemeral_sovereign_key(raw):
+        raise RestartAuthorityError(
+            "whole-host restart authority is unavailable: the server generated "
+            "a temporary sovereign key; configure a stable KESTREL_API_KEY"
         )
     return raw.encode("utf-8")
 
@@ -201,6 +208,8 @@ def verify_restart_authority(request: Any) -> tuple[bool, str]:
         return False, "unsigned legacy restart request"
     if not isinstance(signature, str) or not signature:
         return False, "restart authority signature is absent"
+    if re.fullmatch(r"[0-9a-f]{64}", signature) is None:
+        return False, "restart authority signature is malformed"
     try:
         document = json.loads(evidence)
     except (TypeError, ValueError):
