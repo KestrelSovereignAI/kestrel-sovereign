@@ -77,6 +77,34 @@ async def test_get_spawn_children_falls_back_to_app_state_manager(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_spawn_children_surfaces_cleanup_retained_child(monkeypatch):
+    """Expired authority stays absent while operator cleanup stays visible."""
+
+    lifecycle = MagicMock()
+    lifecycle.get_cleanup_retained_children.return_value = ["ExpiredChild"]
+    lifecycle._tracked = {}
+    lifecycle._results = {}
+    manager = MagicMock()
+    manager._lifecycle = lifecycle
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
+    manager.get_agent.return_value = SimpleNamespace(
+        agent_id="did:child:expired"
+    )
+    manager.get_mandate.return_value = None
+    agent = SimpleNamespace(agent_id="did:parent:A", _agent_manager=manager)
+    request = _make_request(agent_manager=None)
+    monkeypatch.setattr(spawn_endpoints, "get_agent", lambda r: agent)
+
+    result = await spawn_endpoints.get_spawn_children(request)
+
+    assert [child["name"] for child in result["children"]] == ["ExpiredChild"]
+    assert result["delegation_chain"]["children"] == []
+    lifecycle.get_cleanup_retained_children.assert_called_once_with(
+        parent_did="did:parent:A"
+    )
+
+
+@pytest.mark.asyncio
 async def test_spawn_history_filtered_by_parent_did(monkeypatch):
     """In multi-agent mode the lifecycle's ``_tracked`` and
     ``_results`` are shared across all loaded parents. The spawn

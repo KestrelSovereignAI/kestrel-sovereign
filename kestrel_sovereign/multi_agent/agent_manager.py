@@ -3045,8 +3045,8 @@ class AgentManager:
                                     arm_restored_ttl=False,
                                 )
                                 await self._on_agent_registered(name, result)
-                                self._commit_dynamic_scheduler_registration(result)
                                 self._commit_restored_child_ttl(name, result)
+                                self._commit_dynamic_scheduler_registration(result)
                             except BaseException:
                                 # Mirror the single-load path: an onboarding
                                 # rejection is withdrawn before releasing the

@@ -61,14 +61,20 @@ async def get_spawn_children(request: Request):
 
     parent_did = agent.agent_id
     relations = await manager.get_authoritative_spawn_relations()
-    child_names = sorted(
-        (
-            child_name
-            for _child_did, (relation_parent, child_name) in relations.items()
-            if relation_parent == parent_did
-        ),
-        key=lambda name: (name.casefold(), name),
-    )
+    child_names = [
+        child_name
+        for _child_did, (relation_parent, child_name) in relations.items()
+        if relation_parent == parent_did
+    ]
+    lifecycle = _get_lifecycle(agent, request=request)
+    retained_children = getattr(lifecycle, "get_cleanup_retained_children", None)
+    if callable(retained_children):
+        known = {name.casefold() for name in child_names}
+        for retained_name in retained_children(parent_did=parent_did):
+            if retained_name.casefold() not in known:
+                child_names.append(retained_name)
+                known.add(retained_name.casefold())
+    child_names.sort(key=lambda name: (name.casefold(), name))
 
     children = []
     now = datetime.now(timezone.utc)
@@ -100,7 +106,6 @@ async def get_spawn_children(request: Request):
                 pass
 
         # Try to get budget info from lifecycle tracker
-        lifecycle = _get_lifecycle(agent, request=request)
         if lifecycle is not None:
             tracked = lifecycle._tracked.get(child_name)
             if tracked and tracked.result:

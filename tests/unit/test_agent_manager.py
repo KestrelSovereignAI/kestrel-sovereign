@@ -350,6 +350,33 @@ async def test_restored_ttl_validation_precedes_scheduler_commit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_batch_restored_ttl_validation_precedes_scheduler_commit(tmp_path):
+    """Batch startup cannot leave scheduler scope for a rejected child."""
+
+    child = _make_mock_agent("did:pkh:eip155:1:0xExpiredBatchSchedulerChild")
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._initialize_agent = AsyncMock(return_value=child)
+    manager._commit_dynamic_scheduler_registration = MagicMock()
+    manager._commit_restored_child_ttl = MagicMock(
+        side_effect=RuntimeError("Persisted spawn mandate expired during onboarding")
+    )
+    config = MultiAgentConfig(
+        agents={
+            "ExpiredBatchSchedulerChild": LocalAgentConfig(
+                data_dir="unused", port=8801
+            )
+        }
+    )
+
+    assert await manager.load_from_config(config) == 0
+
+    manager._commit_dynamic_scheduler_registration.assert_not_called()
+    manager._commit_restored_child_ttl.assert_called_once_with(
+        "ExpiredBatchSchedulerChild", child
+    )
+
+
+@pytest.mark.asyncio
 async def test_restored_ttl_cancels_ready_hook_at_signed_deadline(tmp_path):
     """Wake-capable readiness cannot run past an ephemeral mandate expiry."""
 
