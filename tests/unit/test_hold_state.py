@@ -419,6 +419,69 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_host_context_bootstrap_closes_partial_resources(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancellation before context handoff cannot strand either database."""
+
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[object] = []
+    schema_entered = asyncio.Event()
+
+    class _DB:
+        def __init__(self, backend_type):
+            self.backend_type = backend_type
+
+        async def close(self):
+            events.append(("db-close", self.backend_type))
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close")
+
+    fake_host_db = _DB("sqlite")
+    fake_hold_db = _DB("postgres")
+
+    async def _sqlite(_cls, _path):
+        return fake_host_db
+
+    async def _postgres(_cls, _dsn):
+        return fake_hold_db
+
+    async def _ensure_schema(_self):
+        schema_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module, "make_session_factory", lambda _db: _InnerFactory()
+    )
+    monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
+
+    bootstrap = asyncio.create_task(
+        build_host_context(db_path=str(tmp_path / "host.db"))
+    )
+    await schema_entered.wait()
+    bootstrap.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await bootstrap
+
+    assert events == [
+        "factory-close",
+        ("db-close", "postgres"),
+        ("db-close", "sqlite"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_receipt_lookup_rejects_missing_authority_history(hold_db):
     db, store = hold_db
     held = await store.set_hold(
