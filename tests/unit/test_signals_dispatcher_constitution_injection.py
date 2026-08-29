@@ -1378,6 +1378,57 @@ async def test_dispatch_clears_stale_tracking_before_processing(
 
 
 @pytest.mark.asyncio
+async def test_monitored_cognition_records_child_task_injection_tracking(
+    tmp_path, template_path
+):
+    """Tracking produced inside the monitored execution task reaches audit."""
+
+    from kestrel_sovereign.agent.context_manager import (
+        _INJECTION_TRACKING_VAR,
+    )
+
+    class _MonitoredAgent(_AuditingAgent):
+        async def process_input(self, prompt: str, **kwargs):
+            _INJECTION_TRACKING_VAR.set(
+                (["CHILD_TASK_INJECTED"], ["CHILD_TASK_DROPPED"])
+            )
+            return await super().process_input(prompt, **kwargs)
+
+        async def monitor_cognition_signal_execution(self, _signal):
+            await asyncio.Event().wait()
+
+        def finish_cognition_signal_execution(self, _signal):
+            return None
+
+    agent = _MonitoredAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="monitored_tracking",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("monitored_tracking"))
+    await _drain(env)
+
+    assert result.status is Status.OK
+    row = (await env.backend.fetch_all(
+        "SELECT injected_clauses_json, dropped_clauses_json FROM signal_log"
+    ))[0]
+    import json as _json
+
+    assert "CHILD_TASK_INJECTED" in _json.loads(row[0])
+    assert "CHILD_TASK_DROPPED" in _json.loads(row[1])
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_codex_format_inlines_doctrine_in_prompt(
     tmp_path, template_path
 ):
