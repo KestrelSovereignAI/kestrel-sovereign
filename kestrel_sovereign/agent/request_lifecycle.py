@@ -12,6 +12,7 @@ permanently blocks ``idle_agents_only`` restarts (#1558).
 """
 
 import asyncio
+import inspect
 import logging
 import time
 from contextvars import ContextVar
@@ -36,6 +37,24 @@ _current_request_generation: ContextVar[tuple[int, str, int] | None] = ContextVa
     "kestrel_current_request_generation",
     default=None,
 )
+
+
+def bind_request_operation_if_supported(
+    agent: object,
+    request_id: str,
+    operation: asyncio.Task,
+) -> bool:
+    """Bind a real lifecycle implementation without trusting dynamic proxies."""
+
+    try:
+        inspect.getattr_static(agent, "bind_request_operation")
+    except AttributeError:
+        return False
+    binder = getattr(agent, "bind_request_operation")
+    if not callable(binder):
+        raise TypeError("request operation binder must be callable")
+    binder(request_id, operation)
+    return True
 
 
 class RequestLifecycleMixin:

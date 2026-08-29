@@ -44,6 +44,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
+    bind_request_operation_if_supported,
 )
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 
@@ -269,6 +270,11 @@ def get_router() -> APIRouter:
                         invocation_provenance=invocation_provenance,
                     ),
                     operation="bridge agent stream cleanup",
+                )
+                bind_request_operation_if_supported(
+                    agent,
+                    request_id,
+                    agent_stream.owner_task,
                 )
                 async for chunk in agent_stream:
                     # The iterator owner and this SSE serializer are separate
