@@ -3206,25 +3206,34 @@ async def _lifespan_startup(app: FastAPI):
             app.state.host_features = []
             app.state.host_context = ctx
             logger.info("Host features initialized: 0")
-    except (ContributionContractError, FeatureContributionRuntimeError):
-        # Complete prospective-set rejection is a startup failure, not an
-        # optional-feature warning. No candidate was mounted and prior valid
-        # state remains visible.
-        if candidate_ctx is not None:
-            try:
-                if candidate_started:
-                    await _hf.stop_host_features(candidate_started, candidate_ctx)
-            finally:
-                await _hf.close_host_context(candidate_ctx)
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Host feature initialization failed: %s", exc)
-        if candidate_ctx is not None:
-            try:
-                if candidate_started:
-                    await _hf.stop_host_features(candidate_started, candidate_ctx)
-            finally:
-                await _hf.close_host_context(candidate_ctx)
+    except BaseException as exc:  # noqa: BLE001 - close unpublished context
+        fatal = isinstance(
+            exc,
+            (ContributionContractError, FeatureContributionRuntimeError),
+        ) or not isinstance(exc, Exception)
+        if not fatal:
+            logger.warning("Host feature initialization failed: %s", exc)
+        try:
+            if candidate_ctx is not None and candidate_started:
+                await _hf.stop_host_features(candidate_started, candidate_ctx)
+        finally:
+            # Until publication, outer lifespan teardown cannot see this
+            # context. Close its distinct Hold pool and host resources here on
+            # validation, activation, mounting, cancellation, or process
+            # control failure. A published context remains teardown-owned.
+            if (
+                candidate_ctx is not None
+                and getattr(app.state, "host_context", None) is not candidate_ctx
+            ):
+                from kestrel_sovereign.host_features.context import (
+                    close_host_context_resources,
+                )
+
+                await close_host_context_resources(candidate_ctx)
+        if fatal:
+            # Complete prospective-set rejection is a startup failure, not an
+            # optional-feature warning. Prior valid state remains visible.
+            raise
 
     # No cognition turn may cross startup with the agent-only clause view.
     # This includes overdue standalone schedules armed from on_agent_ready and
