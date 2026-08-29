@@ -1433,8 +1433,7 @@ class SignalDispatcher:
         if not await self._durable_claim_deferred_by_hold(consumer_id):
             return self._delivery_with_transient_handoff(delivery)
         if delivery.lease_token:
-            await self._durable_store.release_delivery_for_hold(
-                agent_id=self._agent.did,
+            await self._release_durable_delivery_for_hold(
                 consumer_id=consumer_id,
                 delivery_id=delivery.delivery_id,
                 lease_token=delivery.lease_token,
@@ -1702,6 +1701,15 @@ class SignalDispatcher:
                 # Future claims use the row's normal lease path while the
                 # still-bounded sidecar remains available until its timer.
                 handoff.initial_lease_token = None
+            if handoff is not None:
+                # Claiming narrows volatile custody to the lease deadline.
+                # Hold returned that lease to RETRY without executing it, so
+                # restore the original durable-event retention window before
+                # the old lease timer can discard the only payload copy.
+                handoff.expires_at = handoff.retention_until
+                self._schedule_transient_durable_handoff_expiry(
+                    delivery_id, handoff.expires_at
+                )
             if consumer_id in self._started_durable_cognition_consumers:
                 self._schedule_durable_cognition_drain(consumer_id, delay=1.0)
             return True

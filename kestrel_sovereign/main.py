@@ -323,8 +323,10 @@ async def main():
         except Exception as e:
             logger.debug(f"Error during shutdown: {e}")
             print("Agent deactivated (with errors).")
-        cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        await close_bound_host_context(hold_context)
+        try:
+            cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        finally:
+            await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 

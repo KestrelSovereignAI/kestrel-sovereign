@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -3613,6 +3613,18 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
     tmp_path, monkeypatch,
 ) -> None:
     """Interactive entry points must not let a live backend disappear on error."""
+    main_context = object()
+    cli_context = object()
+    build_context = AsyncMock(side_effect=[main_context, cli_context])
+    close_context = AsyncMock()
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.build_bound_host_context",
+        build_context,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.close_bound_host_context",
+        close_context,
+    )
     main_agent = _TerminalFailureShutdownAgent()
     monkeypatch.setattr(main, "KestrelAgent", lambda **_kwargs: main_agent)
     monkeypatch.setattr(main, "LLMService", MagicMock())
@@ -3623,6 +3635,7 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
 
     with pytest.raises(RuntimeError, match="durable cleanup failed"):
         await main.main()
+    close_context.assert_awaited_once_with(main_context)
 
     cli_agent = _TerminalFailureShutdownAgent()
     storage = MagicMock()
@@ -3640,3 +3653,7 @@ async def test_main_and_cli_do_not_swallow_terminal_cleanup_failure(
 
     with pytest.raises(RuntimeError, match="durable cleanup failed"):
         await cli._run_shell(Path(tmp_path), SimpleNamespace(app=None))
+    assert close_context.await_args_list == [
+        call(main_context),
+        call(cli_context),
+    ]

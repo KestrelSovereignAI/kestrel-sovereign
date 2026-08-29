@@ -1949,7 +1949,8 @@ async def test_hold_releases_volatile_initial_cognition_lease(
         ),
         max_attempts=1,
     )
-    held = _HoldSnapshots(_held_state(agent.did))
+    unheld = EffectiveHoldState(host=None, agent=None)
+    held = _HoldSnapshots(unheld, unheld, _held_state(agent.did))
     agent._hold_store = held
     agent.process_input = AsyncMock(return_value="ok")
     try:
@@ -1969,6 +1970,12 @@ async def test_hold_releases_volatile_initial_cognition_lease(
         assert delivery.status == RETRY
         assert delivery.attempts == 0
         assert delivery.lease_token is None
+        handoff = dispatcher._transient_durable_handoffs[
+            delivery.delivery_id
+        ]
+        assert handoff.initial_lease_token is None
+        assert handoff.expires_at == handoff.retention_until
+        assert handoff.expires_at > datetime.now(timezone.utc) + timedelta(days=13)
 
         held.snapshots[:] = [EffectiveHoldState(host=None, agent=None)]
         dispatcher._start_durable_cognition_drain(consumer.consumer_id)

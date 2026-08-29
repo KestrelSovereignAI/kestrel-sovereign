@@ -620,8 +620,10 @@ async def _run_shell(agent_dir: Path, args) -> int:
             print("Agent shutdown cancelled.")
         except Exception:
             print("Agent deactivated (with errors).")
-        cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        await close_bound_host_context(hold_context)
+        try:
+            cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        finally:
+            await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 
