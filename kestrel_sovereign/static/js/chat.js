@@ -2933,6 +2933,9 @@ export async function sendMessage(overrideText, overrideAgent) {
     };
 
     let wasAborted = false;
+    // Allocate one exact turn address for streaming, fallback, and explicitly
+    // non-streaming delivery. The API publishes it before either fetch awaits.
+    const clientRequestId = newChatRequestId();
 
     try {
         if (deps().state.useStreaming) {
@@ -2982,7 +2985,6 @@ export async function sendMessage(overrideText, overrideAgent) {
                 // no visible char after it; consumed when the next
                 // packet's leading visible text is welded onto fullContent.
                 let pendingReviseBoundary = false;
-                const clientRequestId = newChatRequestId();
                 for await (const rawChunk of deps().api.streamInvoke(
                     text,
                     null,
@@ -3303,7 +3305,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // unprefixed invoke() routes via the currently
                     // selected agent and would land on the wrong
                     // backend if the user has switched.
-                    const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+                    const response = await deps().api.invokeForAgent(
+                        text, null, sessionId, null, dispatchAgent, clientRequestId,
+                    );
                     if (response && response.session_id && !pane.sessionId) {
                         pane.sessionId = response.session_id;
                     }
@@ -3321,7 +3325,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                 }
             }
         } else {
-            const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+            const response = await deps().api.invokeForAgent(
+                text, null, sessionId, null, dispatchAgent, clientRequestId,
+            );
             if (response && response.session_id && !pane.sessionId) {
                 pane.sessionId = response.session_id;
             }

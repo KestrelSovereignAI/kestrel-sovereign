@@ -27,6 +27,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     invocation_log_correlation,
     invocation_id_response_header,
     new_stream_delivery_id,
@@ -487,7 +488,7 @@ async def invoke_agent(request: Request, http_response: Response):
                     "model": None,
                     "provider": None,
                 }
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, InvocationCancelledError):
             if callable(request_cancelled) and request_cancelled(request_id) is True:
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)

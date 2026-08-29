@@ -1018,19 +1018,58 @@ export function createApiClient({
         // pane. invokeForAgent pins the URL to the captured dispatch
         // agent so the request always reaches the agent the chat was
         // sent to.
-        invokeForAgent: async (input, model = null, sessionId = null, provider = null, agent) => {
+        invokeForAgent: async (
+            input,
+            model = null,
+            sessionId = null,
+            provider = null,
+            agent,
+            requestId = null,
+        ) => {
+            const clientRequestId = requestId === null ? null : String(requestId);
+            const clientRequestIdLength = clientRequestId === null
+                ? 0
+                : Array.from(clientRequestId).length;
+            if (clientRequestId !== null && (
+                clientRequestIdLength < 1 || clientRequestIdLength > 256
+            )) {
+                throw new Error('invoke request id must be 1-256 characters');
+            }
             const opts = {
                 method: 'POST',
-                body: JSON.stringify({ input, model, session_id: sessionId, provider }),
+                body: JSON.stringify({
+                    input,
+                    model,
+                    session_id: sessionId,
+                    provider,
+                    ...(clientRequestId !== null
+                        ? { request_id: clientRequestId }
+                        : {}),
+                }),
             };
             const dispatchAgent = agent === undefined ? state.selectedHostAgent : agent;
-            const result = agent !== undefined
-                ? await client.requestForAgent('/api/agent/invoke', opts, agent)
-                : await client.request('/api/agent/invoke', opts);
-            if (result && typeof result === 'object' && result.session_id) {
-                state.effectiveSessionIds.set(dispatchAgent, result.session_id);
+            // Publish the exact turn before the first await so Stop cannot
+            // widen a pending non-streaming invoke to agent scope.
+            if (clientRequestId !== null) {
+                state.currentStreamRequestIds.set(dispatchAgent, clientRequestId);
             }
-            return result;
+            try {
+                const result = agent !== undefined
+                    ? await client.requestForAgent('/api/agent/invoke', opts, agent)
+                    : await client.request('/api/agent/invoke', opts);
+                if (result && typeof result === 'object' && result.session_id) {
+                    state.effectiveSessionIds.set(dispatchAgent, result.session_id);
+                }
+                return result;
+            } finally {
+                if (
+                    clientRequestId !== null
+                    && state.currentStreamRequestIds.get(dispatchAgent)
+                        === clientRequestId
+                ) {
+                    state.currentStreamRequestIds.delete(dispatchAgent);
+                }
+            }
         },
         // Two-arg overload: pass `agent` to target a specific agent's
         // /stop endpoint regardless of which agent is currently

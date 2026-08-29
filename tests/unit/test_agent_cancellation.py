@@ -4,6 +4,7 @@ Unit tests for agent request cancellation (stop button).
 
 import asyncio
 import json
+from contextvars import ContextVar
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock
@@ -12,10 +13,13 @@ from unittest.mock import MagicMock, AsyncMock
 @pytest.mark.asyncio
 async def test_process_input_is_the_canonical_active_turn_inventory():
     """Every transport reaches Stop tracking through ``process_input`` itself."""
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
     from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
     started = asyncio.Event()
+    owner_continued = asyncio.Event()
+    release_owner = asyncio.Event()
 
     class CanonicalAgent(RequestLifecycleMixin):
         process_input = KestrelAgent.process_input
@@ -43,17 +47,53 @@ async def test_process_input_is_the_canonical_active_turn_inventory():
             await asyncio.Event().wait()
 
     agent = CanonicalAgent()
-    turn = asyncio.create_task(
-        agent.process_input("work", invocation_id="all-transports-turn")
-    )
+    async def persistent_owner():
+        with pytest.raises(InvocationCancelledError):
+            await agent.process_input(
+                "work", invocation_id="all-transports-turn"
+            )
+        owner_continued.set()
+        await release_owner.wait()
+
+    turn = asyncio.create_task(persistent_owner())
     await asyncio.wait_for(started.wait(), timeout=1)
 
     assert agent._active_request_ids == {"all-transports-turn"}
     assert agent.cancel_current_request("all-transports-turn") is True
-    with pytest.raises(asyncio.CancelledError):
-        await turn
+    await asyncio.wait_for(owner_continued.wait(), timeout=1)
+    assert turn.done() is False
+    assert turn.cancelling() == 0
     assert agent._active_request_ids == set()
     assert agent._request_operation_tasks == {}
+    release_owner.set()
+    await turn
+
+
+@pytest.mark.asyncio
+async def test_isolated_turn_preserves_context_outputs_for_caller_audit():
+    """Task isolation retains sequential-await ContextVar semantics."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+
+    audit_value = ContextVar("isolated_turn_audit_value", default=None)
+
+    class Owner:
+        def register_active_request(self, _request_id):
+            return None
+
+        def bind_request_operation(self, _request_id, _operation):
+            return None
+
+        def _cleanup_cancelled_request(self, _request_id):
+            return None
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            audit_value.set("published-by-turn")
+            return "done"
+
+    assert await Owner().run(invocation_id="audit-turn") == "done"
+    assert audit_value.get() == "published-by-turn"
 
 
 def test_request_lifecycle_logs_only_one_way_correlation(caplog):

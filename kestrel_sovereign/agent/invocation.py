@@ -12,7 +12,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from functools import wraps
 import hashlib
 import inspect
@@ -54,6 +54,10 @@ _current_invocation_provenance: ContextVar[InvocationProvenance | None] = Contex
 )
 
 _T = TypeVar("_T")
+
+
+class InvocationCancelledError(Exception):
+    """An isolated turn ended without cancelling its long-lived caller."""
 
 
 def validate_invocation_id(value: object) -> str:
@@ -293,13 +297,51 @@ def bind_async_invocation(
                             "bind_request_operation",
                             None,
                         )
-                        operation = asyncio.current_task()
-                        if callable(bind_operation) and operation is not None:
+                        parent_context = copy_context()
+                        operation_context = parent_context.copy()
+                        operation = asyncio.create_task(
+                            function(*bound.args, **bound.kwargs),
+                            name=(
+                                "invocation-turn:"
+                                f"{invocation_log_correlation(invocation_id)}"
+                            ),
+                            context=operation_context,
+                        )
+                        if callable(bind_operation):
                             bind_operation(
                                 lifecycle_owner,
                                 invocation_id,
                                 operation,
                             )
+                        try:
+                            return await operation
+                        except asyncio.CancelledError as error:
+                            caller = asyncio.current_task()
+                            if caller is not None and caller.cancelling():
+                                raise
+                            raise InvocationCancelledError(
+                                "isolated invocation was cancelled "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            ) from error
+                        finally:
+                            # A normal ``await function(...)`` shares ContextVar
+                            # updates with its caller. Isolating the cancellable
+                            # task must preserve that contract (notably the
+                            # constitution-injection audit read immediately
+                            # after process_input returns).
+                            missing = object()
+                            for variable in operation_context:
+                                child_value = operation_context.get(
+                                    variable, missing
+                                )
+                                parent_value = parent_context.get(
+                                    variable, missing
+                                )
+                                if (
+                                    child_value is not missing
+                                    and child_value != parent_value
+                                ):
+                                    variable.set(child_value)
                     return await function(*bound.args, **bound.kwargs)
                 finally:
                     if registered:
