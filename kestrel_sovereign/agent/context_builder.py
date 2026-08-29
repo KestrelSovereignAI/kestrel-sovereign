@@ -211,14 +211,31 @@ class ContextBuilder:
     def _validate_bootstrap_audit_names(
         self, names=None
     ) -> None:
-        """Preflight the live bootstrap namespace against context clauses."""
+        """Preflight bootstrap names against host and feature audit owners."""
+
+        from kestrel_sovereign.agent.system_prompt_assembler import (
+            SYNTHETIC_HOST_AUDIT_NAMES,
+        )
+        from kestrel_sovereign.features.contribution_runtime import (
+            FeatureContributionRuntimeError,
+        )
+
+        values = tuple(
+            self._bootstrap_loader.file_order if names is None else names
+        )
+        conflict = next(
+            (name for name in values if name in SYNTHETIC_HOST_AUDIT_NAMES),
+            None,
+        )
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"bootstrap name {conflict!r} is a reserved host audit name"
+            )
 
         registry = getattr(self, "_context_clause_registry", None)
         validator = getattr(registry, "validate_reserved_audit_names", None)
         if callable(validator):
-            validator(
-                self._bootstrap_loader.file_order if names is None else names
-            )
+            validator(values)
 
     async def load_bootstrap_db_config(self) -> None:
         """Merge DB-backed bootstrap config into the loader (#2135, F099).

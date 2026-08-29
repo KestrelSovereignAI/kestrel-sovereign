@@ -64,6 +64,20 @@ CLAUSE_STYLE_REMINDER = "STYLE_REMINDER"
 CLAUSE_ADDITIONAL_CONTEXT = "ADDITIONAL_CONTEXT"
 CLAUSE_SESSION_BRIEFING = "SESSION_BRIEFING"
 
+# Synthetic host-owned audit names can never be filenames or feature clause
+# names. Keep the namespace in this pure assembly module so every preflight
+# boundary consumes the same source of truth.
+SYNTHETIC_HOST_AUDIT_NAMES = frozenset(
+    {
+        CLAUSE_ADDITIONAL_CONTEXT,
+        CLAUSE_KESTREL_CONSTITUTION,
+        CLAUSE_PROMPT_ADAPTATION,
+        CLAUSE_SESSION_BRIEFING,
+        CLAUSE_STATE_OF_MIND,
+        CLAUSE_STYLE_REMINDER,
+    }
+)
+
 # The Tortoise Doctrine file is a special-cased anchored doctrine
 # entry that gets priority 2 (between constitution and AGENTS.md).
 # Other anchored files default to priority 3.

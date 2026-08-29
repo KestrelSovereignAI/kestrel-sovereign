@@ -217,6 +217,38 @@ def test_bootstrap_add_rejects_active_context_name_without_mutation():
     assert builder._bootstrap_loader.file_order == before
 
 
+@pytest.mark.parametrize(
+    "synthetic_name",
+    [
+        "KESTREL_CONSTITUTION",
+        "STATE_OF_MIND",
+        "PROMPT_ADAPTATION",
+        "STYLE_REMINDER",
+        "ADDITIONAL_CONTEXT",
+        "SESSION_BRIEFING",
+    ],
+)
+@pytest.mark.parametrize("with_registry", [False, True])
+def test_bootstrap_add_rejects_synthetic_host_audit_names_without_mutation(
+    synthetic_name, with_registry
+):
+    builder = ContextBuilder(
+        MagicMock(),
+        context_clause_registry=(
+            ContextClauseRegistry() if with_registry else None
+        ),
+    )
+    before = builder._bootstrap_loader.file_order
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        builder._bootstrap_loader.add_file(synthetic_name)
+
+    assert builder._bootstrap_loader.file_order == before
+
+
 def test_bound_agents_can_share_names_and_unbind_without_stale_host_conflicts():
     host = ContextClauseRegistry()
     first = ContextClauseRegistry()
@@ -358,6 +390,50 @@ async def test_ordinary_turn_evicts_contributed_clauses_to_model_budget():
     assert "x x x x" not in plan.assembly.system_prompt
     assert "small" in (plan.assembly.injected_clauses or [])
     assert "huge" in (plan.assembly.dropped_clauses or [])
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_reserves_tool_schema_tokens_before_context_clauses():
+    registry = _ClauseRegistry(_clause("optional", 10, "x " * 4_500))
+    storage = MagicMock()
+    storage.search_chunks = AsyncMock(return_value=[])
+    builder = ContextBuilder(storage, context_clause_registry=registry)
+    manager = ContextManager(storage=storage, context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        conversation_history=[],
+        tools=[{"name": "large", "description": "y " * 28_000}],
+    )
+
+    assert plan.degraded_mode is False
+    assert plan.total_tokens <= plan.total_budget
+    assert "optional" in (plan.assembly.dropped_clauses or [])
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_larger_than_payload_budget_fails_closed():
+    registry = _ClauseRegistry(_clause("small", 10, "small context"))
+    builder = ContextBuilder(MagicMock(), context_clause_registry=registry)
+    manager = ContextManager(storage=MagicMock(), context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        conversation_history=[],
+        tools=[{"name": "too-large", "description": "y " * 40_000}],
+    )
+
+    assert plan.degraded_mode is True
+    assert plan.total_tokens == 0
+    assert any("tool schemas" in warning for warning in plan.warnings)
 
 
 @pytest.mark.asyncio

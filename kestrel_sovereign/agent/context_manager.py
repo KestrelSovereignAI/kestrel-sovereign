@@ -562,6 +562,12 @@ class ContextManager:
             else message_count_override
         )
 
+        # Tool schemas share the provider payload window with every context
+        # section. Measure them before admitting optional system clauses so a
+        # large direct-tool surface cannot make an otherwise-valid system
+        # slice overflow the actual request ceiling.
+        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
+
         # Measure the non-borrowable mandatory governance floor and build the
         # #1309 elastic budget (Emma 2026-05-20). A floor that cannot fit
         # raises DegradedModeError → surface a degraded-mode ContextResult so
@@ -600,6 +606,38 @@ class ContextManager:
                 mode=mode,
             )
 
+        required_payload_tokens = mandatory_system_tokens + tools_tokens
+        if required_payload_tokens > budget.total_budget:
+            reason = (
+                "mandatory governance floor and tool schemas do not fit "
+                f"the model payload budget ({mandatory_system_tokens} + "
+                f"{tools_tokens} > {budget.total_budget} tokens)"
+            )
+            logger.error(
+                "degraded-mode: %s — caller MUST refuse the LLM call",
+                reason,
+            )
+            assembly.warnings.append(
+                f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                "surface this to the operator."
+            )
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
+
+        tool_aware_system_budget = min(
+            budget.allocations["system"].budget,
+            budget.total_budget - tools_tokens,
+        )
+        # The removed capacity is the tool-schema reservation. Keeping it out
+        # of the allocation also prevents later system appenders from borrowing
+        # the same payload space a second time.
+        budget.allocations["system"].budget = tool_aware_system_budget
+
         # 1. Assemble the stable system prefix (constitution/identity/doctrine)
         # and record its usage. Kept separate from the per-turn dynamic user
         # context by construction (ContextAssembly). The tracking assembler is
@@ -616,7 +654,7 @@ class ContextManager:
             prompt_adaptation=prompt_adaptation,
             system_prompt_addendum=system_prompt_addendum,
             system_prompt_budget_bytes=system_prompt_budget_bytes,
-            system_prompt_budget_tokens=budget.allocations["system"].budget,
+            system_prompt_budget_tokens=tool_aware_system_budget,
             anchored_doctrine=anchored_doctrine,
         )
         self._record_system_usage(assembly, budget)
@@ -965,7 +1003,6 @@ class ContextManager:
 
         # 5. Format conversation history with the remaining (elastic) budget,
         # lumpy-anchored for a cache-stable prefix, then reconciled to fit.
-        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
         self._apply_history(assembly, budget, history)
         self._final_prune_to_payload_budget(
             assembly, budget, extra_tokens=tools_tokens

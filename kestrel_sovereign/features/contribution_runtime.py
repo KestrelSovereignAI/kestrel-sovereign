@@ -27,12 +27,7 @@ from kestrel_sdk.operator import ServiceScope
 
 from kestrel_sovereign.agent.system_prompt_assembler import (
     AGENTS_FILENAME,
-    CLAUSE_ADDITIONAL_CONTEXT,
-    CLAUSE_KESTREL_CONSTITUTION,
-    CLAUSE_PROMPT_ADAPTATION,
-    CLAUSE_SESSION_BRIEFING,
-    CLAUSE_STATE_OF_MIND,
-    CLAUSE_STYLE_REMINDER,
+    SYNTHETIC_HOST_AUDIT_NAMES,
     TORTOISE_DOCTRINE_FILENAME,
 )
 from kestrel_sovereign.features.bootstrap.loader import DEFAULT_BOOTSTRAP_FILES
@@ -132,18 +127,11 @@ class ContextClauseRegistry:
             Callable[[], Iterable[str]] | None
         ) = None
 
+    _SYNTHETIC_HOST_AUDIT_NAMES = SYNTHETIC_HOST_AUDIT_NAMES
     _RESERVED_AUDIT_NAMES = frozenset(
         set(DEFAULT_BOOTSTRAP_FILES)
-        | {
-            AGENTS_FILENAME,
-            TORTOISE_DOCTRINE_FILENAME,
-            CLAUSE_ADDITIONAL_CONTEXT,
-            CLAUSE_KESTREL_CONSTITUTION,
-            CLAUSE_PROMPT_ADAPTATION,
-            CLAUSE_SESSION_BRIEFING,
-            CLAUSE_STATE_OF_MIND,
-            CLAUSE_STYLE_REMINDER,
-        }
+        | {AGENTS_FILENAME, TORTOISE_DOCTRINE_FILENAME}
+        | _SYNTHETIC_HOST_AUDIT_NAMES
     )
 
     def _local_reserved_audit_names(self) -> frozenset[str]:
@@ -220,6 +208,19 @@ class ContextClauseRegistry:
         if len(set(values)) != len(values):
             raise FeatureContributionRuntimeError(
                 "duplicate bootstrap audit name"
+            )
+        synthetic_conflict = next(
+            (
+                name
+                for name in values
+                if name in self._SYNTHETIC_HOST_AUDIT_NAMES
+            ),
+            None,
+        )
+        if synthetic_conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"bootstrap name {synthetic_conflict!r} is a reserved host "
+                "audit name"
             )
         resident_names = {
             clause.name
