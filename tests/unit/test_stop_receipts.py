@@ -320,7 +320,7 @@ async def test_initialize_and_shutdown_host_owned_receipt_store(
 
 
 @pytest.mark.asyncio
-async def test_initialize_receipts_uses_configured_shared_postgres(
+async def test_initialize_receipts_uses_bounded_dedicated_postgres_pool(
     tmp_path,
     monkeypatch,
 ):
@@ -331,20 +331,32 @@ async def test_initialize_receipts_uses_configured_shared_postgres(
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
     db = await AsyncDatabase.sqlite(str(tmp_path / "postgres-double.db"))
+    create = AsyncMock(return_value=db)
     postgres = AsyncMock(return_value=db)
     prepare = MagicMock(side_effect=AssertionError("SQLite path must not open"))
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://shared/stop")
+    monkeypatch.setattr(AsyncDatabase, "create", create)
     monkeypatch.setattr(AsyncDatabase, "postgres", postgres)
     monkeypatch.setattr(storage, "prepare_host_database", prepare)
     app = FastAPI()
 
-    await server._initialize_stop_receipts(app)
+    try:
+        await server._initialize_stop_receipts(app)
 
-    postgres.assert_awaited_once_with("postgresql://shared/stop")
-    prepare.assert_not_called()
-    assert isinstance(app.state.stop_receipt_store, StopReceiptStore)
-    await server._shutdown_stop_receipts(app)
+        create.assert_awaited_once_with(
+            {
+                "backend": "postgres",
+                "dsn": "postgresql://shared/stop",
+                "min_pool_size": 1,
+                "max_pool_size": 1,
+            }
+        )
+        postgres.assert_not_awaited()
+        prepare.assert_not_called()
+        assert isinstance(app.state.stop_receipt_store, StopReceiptStore)
+    finally:
+        await server._shutdown_stop_receipts(app)
 
 
 @pytest.mark.asyncio

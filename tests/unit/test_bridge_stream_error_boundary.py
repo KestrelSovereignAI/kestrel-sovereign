@@ -11,15 +11,22 @@ auth and assert the SSE error payload is a stable, content-free constant while t
 marker (and any provider/underlying text) never surfaces.
 """
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
+from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
+from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+from kestrel_sovereign.features.bridge.router import get_router
 
 
 API_KEY = "test-bridge-key"
@@ -137,6 +144,89 @@ def _events(text: str):
         if isinstance(payload, dict):
             events.append(payload)
     return events
+
+
+@pytest.mark.asyncio
+async def test_bridge_stop_interrupts_producer_blocked_before_first_event():
+    """Bridge binds the same blocked producer owner to its request generation."""
+
+    producer_started = asyncio.Event()
+    release_producer = asyncio.Event()
+    producer_finalized = asyncio.Event()
+    bridge = MagicMock()
+    bridge.get_or_create_session = AsyncMock(
+        return_value=SimpleNamespace(id="bridge-session")
+    )
+    bridge.log_invocation = AsyncMock()
+
+    class BlockedBridgeAgent(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+            self.features = {"BridgeFeature": bridge}
+
+        async def process_input_streaming(self, *_args, **_kwargs):
+            try:
+                producer_started.set()
+                await release_producer.wait()
+                yield "late"
+            finally:
+                producer_finalized.set()
+
+    agent = BlockedBridgeAgent()
+    app = FastAPI()
+    app.state.agent = agent
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/bridge/stream",
+            "raw_path": b"/api/bridge/stream",
+            "query_string": b"",
+            "headers": [],
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "app": app,
+        }
+    )
+    route = next(
+        route
+        for route in get_router().routes
+        if getattr(route, "path", None) == "/api/bridge/stream"
+    )
+    endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+    response = await endpoint(
+        request,
+        BridgeRequest(message="work", request_id="blocked-bridge"),
+    )
+    consumer = asyncio.create_task(anext(response.body_iterator))
+
+    await asyncio.wait_for(producer_started.wait(), timeout=1)
+    assert agent.cancel_current_request("blocked-bridge") is True
+    try:
+        assert '"type": "stopped"' in await asyncio.wait_for(
+            consumer,
+            timeout=0.2,
+        )
+    finally:
+        release_producer.set()
+        if not consumer.done():
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        await response.body_iterator.aclose()
+
+    assert producer_finalized.is_set()
+    await asyncio.wait_for(
+        agent.wait_for_request_completion("blocked-bridge"),
+        timeout=1,
+    )
 
 
 def test_bridge_stream_withholds_queued_chunk_after_stop():

@@ -826,6 +826,109 @@ class TestAgentCancellation:
         await asyncio.wait_for(completion, timeout=1)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "emit_first",
+        [
+            pytest.param(False, id="before-first"),
+            pytest.param(True, id="after-partial"),
+        ],
+    )
+    async def test_stop_interrupts_stream_blocked_between_chunks(
+        self,
+        emit_first,
+    ):
+        """The registered generation owns every producer blocked in ``anext``."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        producer_started = asyncio.Event()
+        release_producer = asyncio.Event()
+        producer_finalized = asyncio.Event()
+
+        class BlockedStreamAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+
+            async def process_input_streaming(self, *_args, **_kwargs):
+                try:
+                    if emit_first:
+                        yield "first"
+                    producer_started.set()
+                    await release_producer.wait()
+                    yield "late"
+                finally:
+                    producer_finalized.set()
+
+        agent = BlockedStreamAgent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "blocked-stream"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+        if emit_first:
+            assert await anext(response.body_iterator) == "first"
+        consumer = asyncio.create_task(anext(response.body_iterator))
+
+        await asyncio.wait_for(producer_started.wait(), timeout=1)
+        assert agent.cancel_current_request("blocked-stream") is True
+        try:
+            assert "Request stopped" in await asyncio.wait_for(
+                consumer,
+                timeout=0.2,
+            )
+        finally:
+            release_producer.set()
+            if not consumer.done():
+                consumer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await consumer
+            await response.body_iterator.aclose()
+
+        assert producer_finalized.is_set()
+        await asyncio.wait_for(
+            agent.wait_for_request_completion("blocked-stream"),
+            timeout=1,
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_closes_context_bound_turn_in_its_owner_task(self):
         """Nested turn ContextVars must be reset in the task that bound them."""
 

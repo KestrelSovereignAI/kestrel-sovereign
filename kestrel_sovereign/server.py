@@ -128,6 +128,11 @@ SSE_PATHS = {
     "/agent/stream",
 }
 
+# Stop receipts execute short primary-key lookups and serial inserts. One
+# dedicated PostgreSQL connection keeps this evidence lane independent without
+# consuming the host's operational/advisory pool budget a second time.
+STOP_RECEIPT_POSTGRES_POOL_SIZE = 1
+
 
 def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
     """Compute the multi_agent.toml path the lifespan should load (#868).
@@ -1575,7 +1580,14 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 raise RuntimeError(
                     "PostgreSQL Stop receipt storage requires KESTREL_DATABASE_URL"
                 )
-            db = await AsyncDatabase.postgres(dsn)
+            db = await AsyncDatabase.create(
+                {
+                    "backend": "postgres",
+                    "dsn": dsn,
+                    "min_pool_size": STOP_RECEIPT_POSTGRES_POOL_SIZE,
+                    "max_pool_size": STOP_RECEIPT_POSTGRES_POOL_SIZE,
+                }
+            )
         else:
             path = prepare_host_database()
             db = await AsyncDatabase.sqlite(str(path))
