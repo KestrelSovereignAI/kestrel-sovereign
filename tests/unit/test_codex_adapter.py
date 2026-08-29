@@ -419,6 +419,47 @@ class TestUsageProjection:
             "cache_read_input_tokens": 40,
         }
 
+    @pytest.mark.parametrize(
+        ("last_key", "latest"),
+        [
+            (
+                "lastTokenUsage",
+                {
+                    "totalTokens": 100,
+                    "inputTokens": 90,
+                    "cachedInputTokens": 40,
+                    "outputTokens": 10,
+                },
+            ),
+            (
+                "last_token_usage",
+                {
+                    "total_tokens": 100,
+                    "input_tokens": 90,
+                    "cached_input_tokens": 40,
+                    "output_tokens": 10,
+                },
+            ),
+        ],
+    )
+    def test_reused_thread_accepts_supported_latest_turn_spellings(
+        self, last_key, latest
+    ):
+        assert _usage_from({
+            "total": {
+                "totalTokens": 300,
+                "inputTokens": 270,
+                "cachedInputTokens": 120,
+                "outputTokens": 30,
+            },
+            last_key: latest,
+        }) == {
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "total_tokens": 60,
+            "cache_read_input_tokens": 40,
+        }
+
 
 class TestThreadOccupancy:
     """#1844: codex's TRUE server-side thread occupancy capture.
@@ -621,6 +662,45 @@ class TestAdapterTextPath:
         assert r.cache_read_input_tokens == 3
         cached_id, cached_fp = a._session_threads["s1"]
         assert cached_id == "thr-1" and cached_fp  # fingerprint set
+
+    @pytest.mark.asyncio
+    async def test_snake_case_usage_event_drives_per_turn_accounting(self):
+        events = [
+            {"method": "item/agentMessage/delta", "params": {"delta": "Hi"}},
+            {
+                "method": "thread/token_usage/updated",
+                "params": {
+                    "token_usage": {
+                        "total": {
+                            "input_tokens": 270,
+                            "cached_input_tokens": 120,
+                            "output_tokens": 30,
+                            "total_tokens": 300,
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 90,
+                            "cached_input_tokens": 40,
+                            "output_tokens": 10,
+                            "total_tokens": 100,
+                        },
+                    }
+                },
+            },
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        response = await _adapter_with(events).get_response(
+            client="ignored",
+            model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="snake-usage",
+        )
+
+        assert (
+            response.input_tokens,
+            response.output_tokens,
+            response.total_tokens,
+            response.cache_read_input_tokens,
+        ) == (50, 10, 60, 40)
 
     @pytest.mark.asyncio
     async def test_multimodal_user_turn_materializes_app_server_local_image(self):

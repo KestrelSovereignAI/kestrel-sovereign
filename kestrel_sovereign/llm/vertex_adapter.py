@@ -43,6 +43,52 @@ class VertexAIConfig:
     credentials_file: Optional[str] = None
 
 
+def _normalized_vertex_usage(
+    usage: Any,
+) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """Return SDK-semantic Vertex usage with cached prompt tokens split out.
+
+    google-genai reports ``prompt_token_count`` and ``total_token_count``
+    inclusive of ``cached_content_token_count``. ``LLMResponse`` defines its
+    input and total fields as excluding separately reported cache buckets, so
+    normalize that provider shape at the adapter boundary for both streaming
+    and non-streaming calls.
+    """
+
+    def field(name: str) -> Any:
+        if isinstance(usage, dict):
+            return usage.get(name)
+        return getattr(usage, name, None)
+
+    def token_count(name: str) -> Optional[int]:
+        value = field(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+
+    input_tokens = token_count("prompt_token_count")
+    output_tokens = token_count("candidates_token_count")
+    total_tokens = token_count("total_token_count")
+    cache_read_input_tokens = token_count("cached_content_token_count")
+
+    if cache_read_input_tokens is not None:
+        if input_tokens is not None:
+            input_tokens = max(0, input_tokens - cache_read_input_tokens)
+        if total_tokens is not None:
+            total_tokens = max(0, total_tokens - cache_read_input_tokens)
+    if total_tokens is None and (
+        input_tokens is not None or output_tokens is not None
+    ):
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+    return (
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cache_read_input_tokens,
+    )
+
+
 class VertexAIAdapter(LLMAdapter):
     """
     Adapter for Google Vertex AI using google-genai SDK.
@@ -421,17 +467,15 @@ class VertexAIAdapter(LLMAdapter):
 
             # Extract token usage from response
             # Google/Vertex uses usage_metadata with prompt_token_count and candidates_token_count
-            input_tokens = None
-            output_tokens = None
-            total_tokens = None
+            input_tokens = output_tokens = total_tokens = None
+            cache_read_input_tokens = None
             if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                usage = response.usage_metadata
-                input_tokens = getattr(usage, 'prompt_token_count', None)
-                output_tokens = getattr(usage, 'candidates_token_count', None)
-                total_tokens = getattr(usage, 'total_token_count', None)
-                # Compute total if not provided
-                if total_tokens is None and input_tokens is not None and output_tokens is not None:
-                    total_tokens = input_tokens + output_tokens
+                (
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_read_input_tokens,
+                ) = _normalized_vertex_usage(response.usage_metadata)
 
             return LLMResponse(
                 content=content,
@@ -440,6 +484,7 @@ class VertexAIAdapter(LLMAdapter):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except Exception as e:
@@ -518,18 +563,21 @@ class VertexAIAdapter(LLMAdapter):
                                     yield part.text
 
             input_tokens = output_tokens = total_tokens = None
+            cache_read_input_tokens = None
             if usage_meta is not None:
-                input_tokens = getattr(usage_meta, 'prompt_token_count', None)
-                output_tokens = getattr(usage_meta, 'candidates_token_count', None)
-                total_tokens = getattr(usage_meta, 'total_token_count', None)
-                if total_tokens is None and input_tokens is not None and output_tokens is not None:
-                    total_tokens = input_tokens + output_tokens
+                (
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_read_input_tokens,
+                ) = _normalized_vertex_usage(usage_meta)
             yield LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except Exception as e:

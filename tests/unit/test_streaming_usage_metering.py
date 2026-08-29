@@ -504,7 +504,11 @@ def test_vertex_text_stream_emits_terminal_llmresponse_with_usage(monkeypatch):
         SimpleNamespace(text="hello ", usage_metadata=None),
         SimpleNamespace(text="world", usage_metadata=None),
         SimpleNamespace(text="", usage_metadata=SimpleNamespace(
-            prompt_token_count=5, candidates_token_count=3, total_token_count=8)),
+            prompt_token_count=5,
+            candidates_token_count=3,
+            total_token_count=8,
+            cached_content_token_count=3,
+        )),
     ]
 
     async def fake_with_retry(fn, **kwargs):
@@ -530,8 +534,10 @@ def test_vertex_text_stream_emits_terminal_llmresponse_with_usage(monkeypatch):
     assert "".join(i for i in items if isinstance(i, str)) == "hello world"
     terminals = [i for i in items if isinstance(i, LLMResponse)]
     assert len(terminals) == 1, items
-    assert terminals[0].input_tokens == 5
+    assert terminals[0].input_tokens == 2
     assert terminals[0].output_tokens == 3
+    assert terminals[0].total_tokens == 5
+    assert terminals[0].cache_read_input_tokens == 3
 
     # And the public text-only contract still drops the terminal response.
     text_items = _collect(VertexAIAdapter().get_streaming_response(
@@ -541,6 +547,51 @@ def test_vertex_text_stream_emits_terminal_llmresponse_with_usage(monkeypatch):
     ))
     assert all(isinstance(i, str) for i in text_items)
     assert "".join(text_items) == "hello world"
+
+
+def test_vertex_nonstream_normalizes_cached_prompt_usage(monkeypatch):
+    from kestrel_sovereign.llm import vertex_adapter as vx_mod
+    from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
+
+    raw_response = SimpleNamespace(
+        candidates=[],
+        text="hello",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=11,
+            candidates_token_count=4,
+            total_token_count=15,
+            cached_content_token_count=7,
+        ),
+    )
+
+    async def fake_with_retry(fn, **kwargs):
+        return raw_response
+
+    monkeypatch.setattr(vx_mod, "with_retry", fake_with_retry)
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(generate_content=lambda **k: None))
+    )
+
+    response = asyncio.run(VertexAIAdapter().get_response(
+        client=fake_client,
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+    ))
+
+    assert response.input_tokens == 4
+    assert response.output_tokens == 4
+    assert response.total_tokens == 8
+    assert response.cache_read_input_tokens == 7
+
+
+def test_vertex_usage_without_cache_telemetry_stays_inclusive():
+    from kestrel_sovereign.llm.vertex_adapter import _normalized_vertex_usage
+
+    assert _normalized_vertex_usage(SimpleNamespace(
+        prompt_token_count=5,
+        candidates_token_count=3,
+        total_token_count=8,
+    )) == (5, 3, 8, None)
 
 
 def test_vertex_text_with_tools_path_emits_terminal_response(monkeypatch):
