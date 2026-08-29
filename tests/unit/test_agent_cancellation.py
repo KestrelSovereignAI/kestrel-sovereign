@@ -208,7 +208,10 @@ async def test_invoke_operation_task_name_redacts_opaque_request_id():
     import httpx
     from fastapi import FastAPI
 
-    from kestrel_sovereign.agent.invocation import invocation_log_correlation
+    from kestrel_sovereign.agent.invocation import (
+        bind_async_invocation,
+        invocation_log_correlation,
+    )
     from kestrel_sovereign.endpoints.agent import router
     from kestrel_sovereign.rate_limit import limiter
 
@@ -238,7 +241,13 @@ async def test_invoke_operation_task_name_redacts_opaque_request_id():
         def _conversation_response_identity(self, **_kwargs):
             return {}
 
-        async def process_input(self, *_args, **_kwargs):
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def process_input(
+            self,
+            *_args,
+            invocation_id=None,
+            **_kwargs,
+        ):
             started.set()
             await release.wait()
             return "done"
@@ -684,7 +693,10 @@ class TestAgentCancellation:
         from fastapi import FastAPI
         from starlette.requests import Request
 
-        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
         class FencedAgent(RequestLifecycleMixin):
@@ -1685,7 +1697,11 @@ class TestStopEndpoint:
         from fastapi import FastAPI, Response
         from starlette.requests import Request
 
-        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.agent.invocation import bind_async_invocation
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
         from kestrel_sovereign.endpoints.agent import invoke_agent
 
         started = asyncio.Event()
@@ -1702,7 +1718,13 @@ class TestStopEndpoint:
                 self.storage = MagicMock()
                 self.storage.resolve_session_id = AsyncMock(return_value="session")
 
-            async def process_input(self, *_args, **_kwargs):
+            @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+            async def process_input(
+                self,
+                *_args,
+                invocation_id=None,
+                **_kwargs,
+            ):
                 started.set()
                 try:
                     await asyncio.Event().wait()
@@ -1752,6 +1774,10 @@ class TestStopEndpoint:
 
         assert result["response"] == "Request stopped during execution."
         assert agent._active_request_ids == set()
+        assert (
+            await agent.wait_for_request_completion("active-invoke")
+            is RequestCompletionDisposition.COMPLETED
+        )
 
     @pytest.mark.asyncio
     async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):

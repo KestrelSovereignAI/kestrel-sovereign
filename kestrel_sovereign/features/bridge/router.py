@@ -36,8 +36,12 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     get_caller,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    stopped_invocation_http_error,
 )
-from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    invocation_id_response_header,
+)
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
 )
@@ -142,6 +146,8 @@ def get_router() -> APIRouter:
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             )
+        except InvocationCancelledError as error:
+            raise stopped_invocation_http_error(request_id) from error
         except Exception:
             # Exception text and tracebacks can contain bridge message/context
             # content.  The client receives only the fixed HTTP detail below;
