@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -449,6 +450,28 @@ def test_host_context_satisfies_sdk_protocol():
 
     ctx = SovereignHostContext(db=object(), backplane=object(), config={})
     assert isinstance(ctx, HostContext)
+
+
+@pytest.mark.asyncio
+async def test_host_shutdown_closes_separate_hold_backend_once():
+    from kestrel_sovereign import server
+
+    host_db = SimpleNamespace(close=AsyncMock())
+    hold_db = SimpleNamespace(close=AsyncMock())
+    session_factory = SimpleNamespace(close=AsyncMock())
+    app = FastAPI()
+    app.state.host_features = []
+    app.state.host_context = SovereignHostContext(
+        db=host_db,
+        session_factory=session_factory,
+        hold_db=hold_db,
+    )
+
+    await server._shutdown_host_features(app)
+
+    session_factory.close.assert_awaited_once()
+    hold_db.close.assert_awaited_once()
+    host_db.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

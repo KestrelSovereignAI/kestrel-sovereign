@@ -1677,11 +1677,27 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                             "Host feature session-factory shutdown failed: %s", exc
                         )
                     finally:
+                        hold_db = (
+                            getattr(host_context, "hold_db", None)
+                            if host_context is not None
+                            else None
+                        )
                         host_db = (
                             getattr(host_context, "db", None)
                             if host_context is not None
                             else None
                         )
+                        if (
+                            hold_db is not None
+                            and hold_db is not host_db
+                            and hasattr(hold_db, "close")
+                        ):
+                            try:
+                                await hold_db.close()
+                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
+                                logger.warning(
+                                    "Hold database shutdown failed: %s", exc
+                                )
                         if host_db is not None and hasattr(host_db, "close"):
                             try:
                                 await host_db.close()
