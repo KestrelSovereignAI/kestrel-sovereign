@@ -45,6 +45,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerRequester,
     PeerSelfTargetError,
     PeerSubscriptionUnavailableError,
+    PeerTaskConflictError,
     PeerTransportError,
     PeerUnavailableError,
     iter_sse_events,
@@ -388,6 +389,7 @@ class PeersFeature(Feature):
             client_factory=lambda *args, **kwargs: httpx.AsyncClient(
                 *args, **kwargs,
             ),
+            local_cancel=getattr(self, "_local_host_cancel", None),
         )
 
     def _peer_directory_context(
@@ -440,6 +442,7 @@ class PeersFeature(Feature):
         *,
         host_url: str,
         api_key: str,
+        local_cancel=None,
     ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
         """Refresh only the local compatibility adapter for hosted policy.
 
@@ -460,6 +463,7 @@ class PeersFeature(Feature):
             return self._peer_directory_context()
         self._host_url = host_url.rstrip("/")
         self._api_key = api_key
+        self._local_host_cancel = local_cancel
         self._peer_router = None
         self._peer_requester = None
         self._install_local_host_router()
@@ -1908,6 +1912,229 @@ class PeersFeature(Feature):
                 # results, etc.).
                 "artifact_bodies": artifact_bodies,
                 "artifact_group_complete": artifact_group_complete,
+            },
+        )
+
+    async def cancel_outbound_task(
+        self,
+        task_id: str,
+        reason: Optional[str] = None,
+        *,
+        local_recipient_match: bool = False,
+    ) -> Optional[ToolResult]:
+        """Route a creator's cancellation to the durable task recipient.
+
+        This is intentionally not a second public tool. ``TaskFeature`` owns
+        the user-facing cancellation surface and checks this seam before its
+        local TaskStore because a shared PostgreSQL backend also exposes the
+        recipient's row to the sender. ``None`` means the exact sender-owned
+        outbound route is absent; every unreadable or unsafe route returns a
+        fail-closed result. The durable route supplies the recipient; neither
+        a display name nor possession of the task id is routing authority.
+        """
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+        if not getattr(self, "_outbound_route_store_ready", False):
+            return ToolResult.failed(
+                "The durable outbound route store is unavailable",
+                data={"task_id": task_id},
+            )
+
+        try:
+            from kestrel_sovereign.a2a.outbound_store import (
+                ROUTE_STATE_ROUTABLE,
+                get_outbound_task,
+            )
+
+            audit_agent_id = str(
+                getattr(self.agent, "did", None) or self._own_name
+            )
+            outbound = await get_outbound_task(
+                db,
+                agent_id=audit_agent_id,
+                task_id=task_id,
+            )
+            if outbound is None:
+                if local_recipient_match:
+                    return None
+                return ToolResult.failed(
+                    "No unambiguous local or outbound task route exists",
+                    data={"task_id": task_id},
+                )
+            if local_recipient_match:
+                return ToolResult.failed(
+                    "Task ID is ambiguous between inbound and outbound work",
+                    data={"task_id": task_id, "error_type": "ambiguous_direction"},
+                )
+            recipient_agent_id = outbound.recipient_agent_id
+            if (
+                outbound.route_state != ROUTE_STATE_ROUTABLE
+                or not isinstance(recipient_agent_id, str)
+                or not recipient_agent_id
+            ):
+                raise PeerNotFoundError(
+                    "No durable stable identity exists for this peer task"
+                )
+            router, requester, peer = await self._resolve_retained_automatic_peer(
+                outbound.recipient,
+                recipient_agent_id,
+            )
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+            return ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"task_id": task_id},
+            )
+        except PeerDirectoryConfigurationError:
+            return ToolResult.failed(
+                "Peer routing is not configured safely",
+                data={"task_id": task_id},
+            )
+        except PeerDirectoryError:
+            return ToolResult.failed(
+                "Could not resolve the durable outbound task recipient",
+                data={"task_id": task_id},
+            )
+        except Exception:  # noqa: BLE001 - durable route backend boundary
+            logger.exception(
+                "Could not read durable outbound route for task %s", task_id
+            )
+            return ToolResult.failed(
+                "Could not read the durable outbound task route",
+                data={"task_id": task_id},
+            )
+
+        reason_text = reason or "Task canceled by creator"
+        session_id = f"a2a-cancel:{task_id}"
+        payload: Dict[str, Any] = {
+            "reason": reason_text,
+            "sessionId": session_id,
+            "metadata": {
+                "sender": self._current_legacy_outbound_sender(),
+                "a2a_verb": "cancel_task",
+            },
+        }
+        try:
+            self._maybe_sign_outbound(
+                payload,
+                task_id=task_id,
+                sess_id=session_id,
+                message=reason_text,
+            )
+            response = await router.cancel_a2a_task(
+                requester,
+                peer,
+                task_id,
+                payload,
+            )
+        except OutboundSigningError as exc:
+            return ToolResult.failed(
+                "Could not authenticate task cancellation",
+                data={"task_id": task_id, "error_type": exc.code},
+            )
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+            return ToolResult.failed(
+                "Task cancellation is not authorized",
+                data={"task_id": task_id},
+            )
+        except PeerTaskConflictError:
+            return ToolResult.failed(
+                "Task cancellation conflicts with the recipient's terminal state",
+                data={"task_id": task_id, "error_type": "lifecycle_conflict"},
+            )
+        except PeerTransportError:
+            return ToolResult.failed(
+                "Could not reach the task recipient",
+                data={"task_id": task_id},
+            )
+        except PeerDirectoryError:
+            return ToolResult.failed(
+                "Peer task cancellation failed",
+                data={"task_id": task_id},
+            )
+        except Exception:  # noqa: BLE001 - provider extension boundary
+            logger.exception(
+                "Peer router raised unexpectedly canceling task %s", task_id
+            )
+            return ToolResult.failed(
+                "Peer task cancellation failed",
+                data={"task_id": task_id},
+            )
+        if not isinstance(response, Mapping):
+            return ToolResult.failed(
+                "Peer returned an invalid cancellation receipt",
+                data={"task_id": task_id},
+            )
+        receipt = response.get("cancellation_receipt")
+        if (
+            response.get("id") != task_id
+            or response.get("status") != "canceled"
+            or not isinstance(receipt, Mapping)
+            or not isinstance(receipt.get("status_before"), str)
+        ):
+            return ToolResult.failed(
+                "Peer returned an invalid cancellation receipt",
+                data={"task_id": task_id},
+            )
+        durable_reason = receipt.get("reason", reason_text)
+
+        try:
+            from kestrel_sovereign.a2a.outbound_store import (
+                update_outbound_terminal_state,
+            )
+
+            stamped = await update_outbound_terminal_state(
+                db,
+                agent_id=audit_agent_id,
+                task_id=task_id,
+                terminal_state="canceled",
+            )
+        except Exception:  # noqa: BLE001 - audit backend boundary
+            logger.exception(
+                "Cancellation succeeded but its outbound audit stamp failed: %s",
+                task_id,
+            )
+            stamped = 0
+        audit_confirmed = stamped == 1
+        if not audit_confirmed:
+            # A question's terminal SSE can win the race and stamp this exact
+            # sender-owned row before the cancellation response returns. A
+            # zero-row CAS (or uncertain post-commit backend exception) is
+            # successful only when a fresh read proves the desired state.
+            try:
+                refreshed = await get_outbound_task(
+                    db,
+                    agent_id=audit_agent_id,
+                    task_id=task_id,
+                )
+            except Exception:  # noqa: BLE001 - audit reconciliation boundary
+                logger.exception(
+                    "Could not reconcile outbound cancellation audit row: %s",
+                    task_id,
+                )
+                refreshed = None
+            audit_confirmed = (
+                refreshed is not None
+                and refreshed.terminal_state == "canceled"
+            )
+        if not audit_confirmed:
+            return ToolResult.partial(
+                confirmation=f"Cancelled outbound task {task_id[:8]}",
+                error="Cancellation succeeded but its outbound audit row was not updated",
+                data={
+                    "task_id": task_id,
+                    "status": "canceled",
+                    "status_before": receipt["status_before"],
+                    "reason": durable_reason,
+                },
+            )
+        return ToolResult.ok(
+            confirmation=f"Cancelled outbound task {task_id[:8]}",
+            data={
+                "task_id": task_id,
+                "status": "canceled",
+                "status_before": receipt["status_before"],
+                "reason": durable_reason,
             },
         )
 

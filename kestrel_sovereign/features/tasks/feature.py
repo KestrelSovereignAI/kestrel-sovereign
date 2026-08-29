@@ -34,13 +34,6 @@ logger = logging.getLogger(__name__)
 # Pattern for step-output references: {{steps.0.result}}, {{prev.result}}
 _STEP_REF_PATTERN = re.compile(r"\{\{(steps\.(\d+)\.(\w+)|prev\.(\w+))\}\}")
 
-# Terminal task states that block cancellation. The set is duplicated
-# here (rather than imported at module load) because importing
-# ``kestrel_sovereign.a2a.types`` at decoration time triggers a circular
-# import in some test fixtures; the values themselves are stable wire
-# tokens.
-_TERMINAL_STATES = {"completed", "failed", "canceled"}
-
 # ``list_my_tasks`` filters ``task_type`` (a metadata field, no SQL column) in
 # Python. When that filter is active we over-fetch at least this many rows so
 # the caller's ``limit`` bounds matching rows, not pre-filter rows (a larger
@@ -1093,6 +1086,13 @@ class TaskFeature(Feature):
                 data={"task_id": task_id, "state": current.value},
             )
 
+        # CANCELED is not an ordinary response-state write. Delegate to the
+        # canonical cancellation tool so a sender-owned task follows its
+        # durable outbound route (and peer-scope reauthorization) even when a
+        # shared PostgreSQL store also exposes the recipient's row locally.
+        if terminal == TaskState.CANCELED:
+            return await self.cancel_task(task_id, reason=content)
+
         agent_name = getattr(self.agent, "did", None) or type(self.agent).__name__
         response_message = Message(
             role="agent",
@@ -1109,13 +1109,23 @@ class TaskFeature(Feature):
                     task_id=task_id,
                     new_state=TaskState.WORKING,
                     agent_name=agent_name,
+                    recipient_agent_id=agent_name,
                 )
-            updated = await self.task_manager.update_status(
-                task_id=task_id,
-                new_state=terminal,
-                message=response_message,
-                agent_name=agent_name,
-            )
+                updated = await self.task_manager.update_status(
+                    task_id=task_id,
+                    new_state=terminal,
+                    message=response_message,
+                    agent_name=agent_name,
+                    recipient_agent_id=agent_name,
+                )
+            else:
+                updated = await self.task_manager.update_status(
+                    task_id=task_id,
+                    new_state=terminal,
+                    message=response_message,
+                    agent_name=agent_name,
+                    recipient_agent_id=agent_name,
+                )
         except ValueError as e:
             # Transition validator caught an illegal sequence (rare —
             # only happens if another path mutates the task between
@@ -1226,6 +1236,7 @@ class TaskFeature(Feature):
                 task_id=task_id,
                 artifact=artifact,
                 agent_name=agent_name,
+                recipient_agent_id=agent_name,
             )
         except ValueError as e:
             return ToolResult.failed(
@@ -1275,30 +1286,83 @@ class TaskFeature(Feature):
         if not self.task_manager:
             return ToolResult.failed("Task manager not available")
 
-        try:
-            task = await self.task_manager.get_task(task_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch task {task_id} for cancel: {e}")
-            return ToolResult.failed(str(e))
-
-        if not task:
-            return ToolResult.failed(f"Task {task_id} not found")
-
-        current_state = task.status.state.value
-        if current_state in _TERMINAL_STATES:
+        actor_agent_id = None
+        if self.agent is not None:
+            for attribute in ("did", "agent_id"):
+                value = getattr(self.agent, attribute, None)
+                if isinstance(value, str) and value:
+                    actor_agent_id = value
+                    break
+        if actor_agent_id is None:
             return ToolResult.failed(
-                f"Cannot cancel task in state: {current_state}",
-                data={"task_id": task_id, "status": current_state},
+                "Task cancellation requires this agent's durable identity",
+                data={"task_id": task_id},
             )
 
+        # Check the sender-owned route before touching the local task table.
+        # SQLite agents normally cannot see a recipient's row, but hosted
+        # agents may share one PostgreSQL table.  In that topology, using mere
+        # row visibility as proof that this is a recipient-local task bypasses
+        # current peer-scope reauthorization and recipient-side notification.
+        # ``None`` is the PeersFeature contract for an exact absent outbound
+        # route; every unsafe/unreadable route is a fail-closed ToolResult.
+        features = getattr(self.agent, "features", None)
+        values = (
+            features.values()
+            if hasattr(features, "values")
+            else features or ()
+        )
+        for feature in values:
+            cancel_outbound = getattr(feature, "cancel_outbound_task", None)
+            if callable(cancel_outbound):
+                try:
+                    local_recipient_match = (
+                        await self.task_manager.is_task_recipient(
+                            task_id,
+                            actor_agent_id,
+                        )
+                    )
+                except Exception as error:
+                    logger.error(
+                        "Could not resolve task direction for %s: %s",
+                        task_id,
+                        error,
+                        exc_info=True,
+                    )
+                    return ToolResult.failed(
+                        "Could not resolve task cancellation direction",
+                        data={"task_id": task_id},
+                    )
+                outbound_result = await cancel_outbound(
+                    task_id,
+                    reason=reason,
+                    local_recipient_match=local_recipient_match,
+                )
+                if outbound_result is not None:
+                    return outbound_result
+
         try:
-            await self.task_manager.cancel_task(task_id, reason=reason)
+            task = await self.task_manager.cancel_task(
+                task_id,
+                reason=reason,
+                agent_name=actor_agent_id,
+            )
+        except ValueError as e:
+            logger.error(f"Failed to cancel task {task_id}: {e}", exc_info=True)
+            return ToolResult.failed(
+                str(e),
+                data={"task_id": task_id},
+            )
         except Exception as e:
             logger.error(f"Failed to cancel task {task_id}: {e}", exc_info=True)
             return ToolResult.failed(
                 str(e),
-                data={"task_id": task_id, "status_before": current_state},
+                data={"task_id": task_id},
             )
+
+        receipt = (task.metadata or {}).get("cancellation_receipt") or {}
+        current_state = receipt.get("status_before")
+        durable_reason = receipt.get("reason")
 
         return ToolResult.ok(
             confirmation=f"Cancelled task {task_id[:8]} (was: {current_state})",
@@ -1306,6 +1370,6 @@ class TaskFeature(Feature):
                 "task_id": task_id,
                 "status": "canceled",
                 "status_before": current_state,
-                "reason": reason,
+                "reason": durable_reason,
             },
         )

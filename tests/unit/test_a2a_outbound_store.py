@@ -232,6 +232,38 @@ limit=10)
 
 
 @pytest.mark.asyncio
+async def test_authoritative_cancellation_supersedes_provisional_expiry(tmp_path):
+    db = await _backend(tmp_path)
+    try:
+        await record_outbound_dispatch(
+            db,
+            agent_id="emma",
+            task_id="late-cancel",
+            recipient="claw",
+            verb="question",
+            session_id="s",
+            dispatch_tool="send_a2a_question",
+        )
+        assert await update_outbound_terminal_state(
+            db,
+            agent_id="emma",
+            task_id="late-cancel",
+            terminal_state="expired",
+        ) == 1
+
+        assert await update_outbound_terminal_state(
+            db,
+            agent_id="emma",
+            task_id="late-cancel",
+            terminal_state="canceled",
+        ) == 1
+        row = (await list_outbound_tasks(db, agent_id="emma"))[0]
+        assert row.terminal_state == "canceled"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_rekey_outbound_task_moves_only_its_reserved_stable_binding(tmp_path):
     db = await _backend(tmp_path)
     reserved = await record_outbound_dispatch(

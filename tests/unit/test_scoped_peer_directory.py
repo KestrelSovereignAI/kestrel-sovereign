@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, AsyncIterator, Mapping, Optional, Sequence
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
@@ -20,6 +21,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerNotFoundError,
     PeerRequester,
     PeerSubscriptionEvent,
+    PeerTaskConflictError,
     PeerTransportError,
 )
 from kestrel_sovereign.features.peers.feature import PeersFeature
@@ -420,6 +422,90 @@ async def test_local_host_inbound_authorization_uses_live_stable_identity():
         is False
     )
     assert adapter._directory_entries.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_local_host_cancellation_reauthorizes_and_routes_to_current_key():
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [
+        {
+            "id": "did:local:recipient",
+            "name": "Recipient",
+            "routing_name": "current-route",
+        }
+    ]
+    cancel_response = MagicMock(status_code=200)
+    cancel_response.raise_for_status.return_value = None
+    cancel_response.json.return_value = {
+        "id": "task/with slash",
+        "status": "canceled",
+        "cancellation_receipt": {"status_before": "working"},
+    }
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    client.post.return_value = cancel_response
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        client_factory=lambda *args, **kwargs: client,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    retained_peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="current-route",
+    )
+    payload = {"reason": "withdrawn", "metadata": {"signature": {}}}
+
+    result = await adapter.cancel_a2a_task(
+        requester, retained_peer, "task/with slash", payload
+    )
+
+    assert result["status"] == "canceled"
+    client.post.assert_awaited_once()
+    assert client.post.await_args.args[0] == (
+        "http://local-host/api/agents/current-route/"
+        "api/agent/tasks/task%2Fwith%20slash/cancel"
+    )
+    assert client.post.await_args.kwargs["json"] == payload
+
+
+@pytest.mark.asyncio
+async def test_local_host_cancellation_preserves_recipient_lifecycle_conflict():
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [
+        {
+            "id": "did:local:recipient",
+            "name": "Recipient",
+            "routing_name": "current-route",
+        }
+    ]
+    conflict_response = httpx.Response(
+        409,
+        json={"detail": "already terminal"},
+        request=httpx.Request("POST", "http://local-host/cancel"),
+    )
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+    client.post.return_value = conflict_response
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        client_factory=lambda *args, **kwargs: client,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="current-route",
+    )
+
+    with pytest.raises(PeerTaskConflictError):
+        await adapter.cancel_a2a_task(requester, peer, "already-terminal", {})
 
 
 @pytest.mark.asyncio
