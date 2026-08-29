@@ -2828,12 +2828,22 @@ class AgentManager:
                             await await_lifecycle_task_completion(rollback_task)
                         )
                     if rollback_failure is None:
-                        cleanup_cancelled = (
-                            await self._discard_unpublished_initialized_agents(
-                                [(name, agent)],
-                                already_withdrawn=withdrawn_after_onboarding_failure,
+                        if admission.kind in {"spawn", "direct-spawn-test"}:
+                            # Receipt revocation succeeded, but this initialized
+                            # spawn can already own an isolated runtime tree.
+                            # Preserve the object for the outer spawn rollback,
+                            # which owns destructive offboarding after shutdown.
+                            admission.unpublished_cleanup_deferred_to_spawn = True
+                            cleanup_cancelled = False
+                        else:
+                            cleanup_cancelled = (
+                                await self._discard_unpublished_initialized_agents(
+                                    [(name, agent)],
+                                    already_withdrawn=(
+                                        withdrawn_after_onboarding_failure
+                                    ),
+                                )
                             )
-                        )
                         if cleanup_cancelled or rollback_cancelled:
                             raise asyncio.CancelledError()
                     else:
@@ -6203,12 +6213,40 @@ class AgentManager:
         """Remove the live child and budget after its receipt is withdrawn."""
 
         if admission.unpublished_cleanup_deferred_to_spawn:
-            await self._discard_unpublished_initialized_agent(
-                admission.name,
-                child,
-            )
-            admission.unpublished_cleanup_deferred_to_spawn = False
-            return False
+            try:
+                await self._discard_unpublished_initialized_agent(
+                    admission.name,
+                    child,
+                )
+                async with self._lock:
+                    if self._quarantined_shutdown_handoffs_sealed:
+                        raise RuntimeOffboardingRetainedError(
+                            agent_name=admission.name,
+                            agent_id=_loaded_agent_did(child) or "<unknown>",
+                            runtime_path=_agent_runtime_path(child),
+                            cause=RuntimeError(
+                                "runtime offboarding admission is sealed"
+                            ),
+                        )
+                    offboarding = self._start_agent_runtime_offboarding(
+                        name=admission.name,
+                        agent=child,
+                    )
+                cancelled, failure = await self._finish_agent_runtime_offboarding(
+                    offboarding,
+                    cancellation_already_observed=False,
+                )
+                if failure is not None:
+                    no_hosted_cancellation = (
+                        _uncommitted_spawn_not_hosted_cancellation(failure)
+                    )
+                    if no_hosted_cancellation is None:
+                        admission.rollback_incomplete = True
+                        raise failure
+                    cancelled = cancelled or no_hosted_cancellation
+                return cancelled
+            finally:
+                admission.unpublished_cleanup_deferred_to_spawn = False
 
         cleanup = asyncio.create_task(
             self.remove_agent(

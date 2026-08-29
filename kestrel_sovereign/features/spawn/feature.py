@@ -876,6 +876,14 @@ class SpawnFeature(Feature):
         parent_did = self.agent.agent_id
         child_names = await manager.get_authoritative_children(parent_did)
         lifecycle = self._get_lifecycle(manager)
+        if lifecycle is not None:
+            known = {name.casefold() for name in child_names}
+            for retained_name in lifecycle.get_cleanup_retained_children(
+                parent_did=parent_did
+            ):
+                if retained_name.casefold() not in known:
+                    child_names.append(retained_name)
+                    known.add(retained_name.casefold())
 
         children = []
         for child_name in child_names:
@@ -1102,10 +1110,21 @@ class SpawnFeature(Feature):
         if type(offboard_runtime) is not bool:
             return ToolResult.failed(error="offboard_runtime must be a bool")
 
-        # Verify this is our child
         parent_did = self.agent.agent_id
         authoritative_children = await manager.get_authoritative_children(parent_did)
-        if child_name not in authoritative_children:
+        lifecycle = self._get_lifecycle(manager)
+        cleanup_retained_did = (
+            lifecycle.cleanup_retained_child_did(
+                parent_did=parent_did,
+                child_name=child_name,
+            )
+            if lifecycle is not None
+            else None
+        )
+        if (
+            child_name not in authoritative_children
+            and cleanup_retained_did is None
+        ):
             return ToolResult.failed(
                 error=f"Agent '{child_name}' is not a child of this agent"
             )
@@ -1127,7 +1146,6 @@ class SpawnFeature(Feature):
             public_exception_type_name,
         )
 
-        lifecycle = self._get_lifecycle(manager)
         try:
             if lifecycle is not None:
                 if offboard_runtime:

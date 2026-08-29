@@ -687,6 +687,44 @@ class SpawnedAgentLifecycle:
         """Return names of all currently tracked children."""
         return list(self._tracked.keys())
 
+    def cleanup_retained_child_did(
+        self,
+        *,
+        parent_did: str,
+        child_name: str,
+    ) -> Optional[str]:
+        """Return cleanup-only identity after signed governance expires.
+
+        This does not restore the parent's delegation authority. It only lets
+        the lifecycle owner expose and retry termination for an ephemeral
+        child whose TTL has elapsed but whose cleanup is still pending.
+        """
+
+        tracked = self._tracked.get(child_name)
+        if tracked is None or tracked.parent_did != parent_did:
+            return None
+        cleanup_retained = tracked.termination_refusal is not None or (
+            tracked.mode is SpawnMode.EPHEMERAL
+            and tracked.ttl_seconds > 0
+            and self._remaining_ttl_seconds(
+                tracked.started_at, tracked.ttl_seconds
+            ) <= 0
+        )
+        return tracked.child_did if cleanup_retained else None
+
+    def get_cleanup_retained_children(self, *, parent_did: str) -> list[str]:
+        """List one parent's expired children without granting governance."""
+
+        return [
+            child_name
+            for child_name in self._tracked
+            if self.cleanup_retained_child_did(
+                parent_did=parent_did,
+                child_name=child_name,
+            )
+            is not None
+        ]
+
     def get_termination_refusal(
         self, child_name: str
     ) -> Optional[Dict[str, Any]]:

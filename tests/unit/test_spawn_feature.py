@@ -399,6 +399,41 @@ class TestSpawnFeatureWithManager:
         await lifecycle.terminate("helper")
 
     @pytest.mark.asyncio
+    async def test_expired_refused_child_stays_visible_and_operator_retryable(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = MagicMock()
+        manager.get_authoritative_children = AsyncMock(return_value=[])
+        manager.get_agent = MagicMock(return_value=child)
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.terminate_child = AsyncMock(return_value=False)
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=0.01,
+        )
+        for _ in range(100):
+            if lifecycle.get_termination_refusal("helper") is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        listed = await feature.list_children()
+
+        assert listed.data["count"] == 1
+        assert listed.data["children"][0]["name"] == "helper"
+        assert listed.data["children"][0]["operator_action_required"] is True
+
+        manager.terminate_child.return_value = True
+        terminated = await feature.terminate_child(child_name="helper")
+
+        assert terminated.status is ToolResultStatus.OK
+        assert not lifecycle.is_tracked("helper")
+
+    @pytest.mark.asyncio
     async def test_delegate_task_success(self):
         parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")

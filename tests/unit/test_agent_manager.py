@@ -623,6 +623,39 @@ async def test_failed_spawn_quarantine_retains_cap_slot_until_child_is_removed(
 
 
 @pytest.mark.asyncio
+async def test_unpublished_spawn_rollback_offboards_initialized_runtime(tmp_path):
+    """A withdrawn onboarding failure still owns its isolated namespace."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    child = _make_mock_agent("did:test:unpublished-onboarding-failure")
+    child.did = child.agent_id
+    scope = resolve_isolated_runtime_namespace(
+        manager._isolated_runtime_root,
+        derive_isolated_runtime_namespace(child.agent_id),
+    )
+    prepare_isolated_runtime_namespace(scope, child.agent_id)
+    (scope.path / "credential").write_text("must not be orphaned")
+    child.isolated_runtime_scope = scope
+    admission = AgentOperationAdmission(
+        name="FailedChild",
+        canonical_name="failedchild",
+        kind="spawn",
+        registration_epoch=0,
+        owner_task=asyncio.current_task(),
+        child=child,
+        unpublished_cleanup_deferred_to_spawn=True,
+    )
+
+    assert await manager._rollback_uncommitted_spawn_runtime(
+        admission, child
+    ) is False
+
+    child.shutdown.assert_awaited_once_with()
+    assert not scope.path.exists()
+    assert admission.unpublished_cleanup_deferred_to_spawn is False
+
+
+@pytest.mark.asyncio
 async def test_failed_spawn_cleanup_waits_out_terminal_handoff_seal(tmp_path):
     """A terminal drain seal cannot orphan a newly-created cleanup task."""
 
