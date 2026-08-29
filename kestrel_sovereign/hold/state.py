@@ -8,6 +8,7 @@ turn-start refusal is the separate enforcement seam tracked by #3162.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping, Optional
@@ -321,6 +322,18 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
     return receipt
 
 
+def _receipt_content_digest(row: Any) -> str:
+    """Hash every typed receipt field with unambiguous length framing."""
+
+    _receipt_from_row(row)
+    digest = hashlib.sha256()
+    for value in row:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
 class HoldStore:
     """Durable latch + append-only receipt store on an ``AsyncDatabase``."""
 
@@ -381,6 +394,15 @@ class HoldStore:
                 "CHECK (scope <> 'host' OR target_id = 'host'), "
                 "CHECK (receipt_count >= 0))"
             )
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hold_receipt_content_witnesses ("
+                "receipt_id TEXT NOT NULL PRIMARY KEY, "
+                "scope TEXT NOT NULL, "
+                "target_id TEXT NOT NULL, "
+                "receipt_digest TEXT NOT NULL, "
+                "CHECK (scope IN ('host', 'agent')), "
+                "CHECK (scope <> 'host' OR target_id = 'host'))"
+            )
             # Seed the witness exactly once for upgraded databases. Future
             # schema checks never recompute an existing count from mutable
             # receipt rows, so a later receipt deletion remains detectable.
@@ -392,6 +414,26 @@ class HoldStore:
                 "GROUP BY scope, target_id "
                 "ON CONFLICT (scope, target_id) DO NOTHING"
             )
+            # One-time backfill for upgraded databases. A witness is never
+            # overwritten from receipt rows after it exists, so later in-place
+            # mutation remains detectable across schema checks and restarts.
+            existing_receipts = await self._db.fetchall(
+                f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts"
+            )
+            for row in existing_receipts:
+                receipt = _receipt_from_row(row)
+                await self._db.execute(
+                    "INSERT INTO hold_receipt_content_witnesses "
+                    "(receipt_id, scope, target_id, receipt_digest) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (receipt_id) DO NOTHING",
+                    (
+                        receipt.receipt_id,
+                        receipt.scope.value,
+                        receipt.target_id,
+                        _receipt_content_digest(row),
+                    ),
+                )
             await self._db.execute(
                 "INSERT INTO hold_receipt_witnesses "
                 "(scope, target_id, receipt_count) "
@@ -529,6 +571,31 @@ class HoldStore:
         receipt_ids = {receipt.receipt_id for receipt in receipts}
         if len(receipt_ids) != len(receipts):
             raise HoldCorruptStateError("Hold receipt graph has duplicate identities")
+        witness_rows = await self._db.fetchall(
+            "SELECT receipt_id, receipt_digest "
+            "FROM hold_receipt_content_witnesses "
+            "WHERE scope = ? AND target_id = ?",
+            (scope.value, target_id),
+        )
+        content_witnesses: dict[str, str] = {}
+        content_witness_valid = True
+        for witness in witness_rows:
+            if (
+                len(witness) != 2
+                or not isinstance(witness[0], str)
+                or not witness[0]
+                or not isinstance(witness[1], str)
+                or len(witness[1]) != 64
+                or witness[0] in content_witnesses
+            ):
+                content_witness_valid = False
+                continue
+            content_witnesses[witness[0]] = witness[1]
+        if set(content_witnesses) != receipt_ids:
+            content_witness_valid = False
+        for row, receipt in zip(rows, receipts):
+            if content_witnesses.get(receipt.receipt_id) != _receipt_content_digest(row):
+                content_witness_valid = False
         projection_row = await self._read_latch_row(scope, target_id)
         projection_revision = 0
         if projection_row is not None:
@@ -611,6 +678,10 @@ class HoldStore:
                     raise HoldCorruptStateError(
                         "hold latch revision does not match applied receipt history"
                     )
+                if not content_witness_valid:
+                    raise HoldCorruptStateError(
+                        "Hold receipt content witness does not match receipt history"
+                    )
                 return
             raise HoldCorruptStateError(
                 "unheld projection retains active Hold authority"
@@ -648,6 +719,10 @@ class HoldStore:
         if projection_revision != len(applied):
             raise HoldCorruptStateError(
                 "hold latch revision does not match applied receipt history"
+            )
+        if not content_witness_valid:
+            raise HoldCorruptStateError(
+                "Hold receipt content witness does not match receipt history"
             )
 
     async def _validate_latch_projection(
@@ -727,13 +802,26 @@ class HoldStore:
                 resulting_hold_receipt_id,
             ),
         )
+        receipt_row = await self._read_receipt_by_operation(operation_id)
+        receipt = _receipt_from_row(receipt_row)
+        await self._db.execute(
+            "INSERT INTO hold_receipt_content_witnesses "
+            "(receipt_id, scope, target_id, receipt_digest) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                receipt.receipt_id,
+                receipt.scope.value,
+                receipt.target_id,
+                _receipt_content_digest(receipt_row),
+            ),
+        )
         await self._db.execute(
             "UPDATE hold_receipt_witnesses "
             "SET receipt_count = receipt_count + 1 "
             "WHERE scope = ? AND target_id = ?",
             (scope.value, target_id),
         )
-        return _receipt_from_row(await self._read_receipt_by_operation(operation_id))
+        return receipt
 
     async def set_hold(
         self,
