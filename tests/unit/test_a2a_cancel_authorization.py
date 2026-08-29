@@ -3,6 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -2385,6 +2386,35 @@ async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
         ).status.state is TaskState.CANCELED
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_database_fence_blocks_legacy_writer_on_available_backends(db_backend):
+    store = TaskStore(db_backend)
+    await store.initialize()
+    task_id = f"terminal-cancel-{uuid4().hex}"
+    try:
+        await store.create(
+            Task(id=task_id, status=TaskStatus(state=TaskState.SUBMITTED)),
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+        canceled = await store.cancel_if_authorized(
+            task_id,
+            actor_agent_id="did:test:creator",
+        )
+        assert canceled is not None
+
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await db_backend.execute(
+                "UPDATE a2a_tasks SET status = 'completed' WHERE id = ?",
+                (task_id,),
+            )
+
+        assert (await store.get(task_id)).status.state is TaskState.CANCELED
+    finally:
+        await db_backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task_id,))
 
 
 @pytest.mark.asyncio
