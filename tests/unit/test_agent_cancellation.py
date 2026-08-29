@@ -3,6 +3,7 @@ Unit tests for agent request cancellation (stop button).
 """
 
 import asyncio
+import inspect
 import json
 from contextvars import ContextVar
 from dataclasses import replace
@@ -186,6 +187,79 @@ async def test_stop_racing_with_isolated_completion_suppresses_normal_result():
 
     with pytest.raises(InvocationCancelledError, match="after operation completion"):
         await Owner().run(invocation_id="completion-race")
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_side_effecting_tool_batch_boundary():
+    """A synchronous Stop cannot cancel a tool halfway through its effect."""
+
+    from kestrel_sovereign.agent.invocation import (
+        InvocationCancelledError,
+        bind_async_invocation,
+    )
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    batch_started = asyncio.Event()
+    release_batch = asyncio.Event()
+    batch_completed = asyncio.Event()
+
+    class Owner(RequestLifecycleMixin):
+        _execute_tool_batch_at_stop_boundary = (
+            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
+        )
+
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+
+        async def _execute_tool_batch(self):
+            batch_started.set()
+            await release_batch.wait()
+            batch_completed.set()
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            await self._execute_tool_batch_at_stop_boundary()
+            return "must not publish"
+
+    owner = Owner()
+    turn = asyncio.create_task(owner.run(invocation_id="safe-tool-batch"))
+    await batch_started.wait()
+
+    assert owner.cancel_current_request("safe-tool-batch") is True
+    await asyncio.sleep(0)
+    assert batch_completed.is_set() is False
+    assert turn.done() is False
+
+    release_batch.set()
+    with pytest.raises(InvocationCancelledError):
+        await turn
+    assert batch_completed.is_set() is True
+
+
+def test_orchestrator_paths_wire_every_tool_batch_through_stop_boundary():
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    for handler in (
+        OrchestratorEngineMixin._handle_orchestrator_response,
+        OrchestratorEngineMixin._handle_orchestrator_response_streaming,
+    ):
+        source = inspect.getsource(handler)
+        assert "await self._execute_tool_batch_at_stop_boundary(" in source
+        assert "await self._execute_tool_batch(" not in source
 
 
 @pytest.mark.asyncio

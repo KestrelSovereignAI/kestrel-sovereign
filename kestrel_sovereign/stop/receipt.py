@@ -415,9 +415,9 @@ class StopReceiptStore:
                 raise StopReceiptCorruptError(
                     "Stop outcome row violates its typed contract"
                 ) from error
-        if scope != "host" and not outcomes:
+        if not outcomes:
             raise StopReceiptCorruptError(
-                "Non-host Stop receipt is missing its target outcome"
+                "Stop receipt is missing its target outcome"
             )
         return StopReceipt(
             receipt_id=receipt_id,
@@ -478,8 +478,8 @@ class StopReceiptStore:
     ) -> None:
         if not isinstance(outcomes, tuple):
             raise TypeError("Stop receipt outcomes must be a tuple")
-        if request.scope.value != "host" and not outcomes:
-            raise ValueError("Non-host Stop requires one target outcome")
+        if not outcomes:
+            raise ValueError("Stop requires at least one target outcome")
         seen: set[str] = set()
         for outcome in outcomes:
             if not isinstance(outcome, StopOutcome):

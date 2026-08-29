@@ -313,14 +313,19 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
 
 
 @pytest.mark.asyncio
-async def test_empty_host_inventory_returns_no_agent_outcomes() -> None:
+async def test_empty_host_inventory_returns_authority_level_failure() -> None:
     authority = _authority(list)
 
     outcomes = await authority.stop(
         StopRequest(StopScope.HOST, "did:test:operator")
     )
 
-    assert outcomes == ()
+    assert len(outcomes) == 1
+    assert outcomes[0].resolved_target == StopScope.HOST.value
+    assert outcomes[0].agent_id == StopScope.HOST.value
+    assert outcomes[0].disposition is StopDisposition.UNREACHABLE
+    assert outcomes[0].receipt_id is not None
+    assert outcomes[0].detail == "No cooperative Stop targets were discovered"
 
 
 @pytest.mark.asyncio

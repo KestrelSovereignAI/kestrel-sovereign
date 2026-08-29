@@ -2710,6 +2710,7 @@ export async function stopAgent(agentName) {
     unconfirmedStopAgents().delete(agentName);
     retainedRequestIds.delete(agentName);
     retainedCorrelationIds.delete(agentName);
+    deps().api.completeCurrentStreamRequestId(agentName, requestId);
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === deps().api.getHostAgent()) {
@@ -3364,13 +3365,13 @@ export async function sendMessage(overrideText, overrideAgent) {
                     if (response && response.session_id && !pane.sessionId) {
                         pane.sessionId = response.session_id;
                     }
-                    if (isPaneFresh()) {
+                    if (isPaneFresh() && ownsStream()) {
                         await addMessage(
                             'agent', response.response, pane.element, null,
                             { model: response.model, provider: response.provider },
                         );
                     }
-                    if (isCurrentVisible()) {
+                    if (isCurrentVisible() && ownsStream()) {
                         await checkForModelChange(response.response);
                     }
                 } else {
@@ -3384,20 +3385,20 @@ export async function sendMessage(overrideText, overrideAgent) {
             if (response && response.session_id && !pane.sessionId) {
                 pane.sessionId = response.session_id;
             }
-            if (isPaneFresh()) {
+            if (isPaneFresh() && ownsStream()) {
                 await addMessage(
                     'agent', response.response, pane.element, null,
                     { model: response.model, provider: response.provider },
                 );
             }
-            if (isCurrentVisible()) {
+            if (isCurrentVisible() && ownsStream()) {
                 await checkForModelChange(response.response);
             }
         }
     } catch (e) {
         if (e && e.name === 'AbortError') {
             wasAborted = true;
-        } else if (isPaneFresh()) {
+        } else if (isPaneFresh() && ownsStream()) {
             addTextMessage('agent', `Error: ${e && e.message ? e.message : 'Request failed.'}`, pane.element);
         } else {
             console.warn(
@@ -3427,6 +3428,10 @@ export async function sendMessage(overrideText, overrideAgent) {
             // skips the interrupt path. The newest dispatch always owns,
             // so the last turn to settle does the real cleanup.
             deps().state.waitingAgents.delete(dispatchAgent);
+            deps().api.completeCurrentStreamRequestId(
+                dispatchAgent,
+                clientRequestId,
+            );
         }
         refreshAgentThinkingDot(dispatchAgent);
         // Drive the visible thinking indicator from whatever agent the

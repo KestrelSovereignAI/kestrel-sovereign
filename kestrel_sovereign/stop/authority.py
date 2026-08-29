@@ -188,10 +188,22 @@ class CancellationAuthority:
 
         if not targets:
             if request.scope is StopScope.HOST:
-                # HOST fan-out has one outcome per resolved agent.  An empty
-                # inventory is a successful empty fan-out, not a fabricated
-                # agent with an empty DID.
-                outcomes: tuple[StopOutcome, ...] = ()
+                # An empty snapshot is not evidence that every host agent was
+                # stopped. Represent the authority-level failure explicitly;
+                # persisting an empty tuple would otherwise make an inventory
+                # failure indistinguishable from a successful fan-out and the
+                # endpoint could acknowledge Stop without reaching anything.
+                outcomes: tuple[StopOutcome, ...] = (
+                    StopOutcome(
+                        scope=request.scope,
+                        requested_target=None,
+                        resolved_target=StopScope.HOST.value,
+                        agent_id=StopScope.HOST.value,
+                        disposition=StopDisposition.UNREACHABLE,
+                        correlation_id=request.correlation_id,
+                        detail="No cooperative Stop targets were discovered",
+                    ),
+                )
             else:
                 outcomes = (
                     StopOutcome(

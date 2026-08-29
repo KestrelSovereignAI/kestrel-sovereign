@@ -20,6 +20,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
@@ -2284,6 +2288,28 @@ class OrchestratorEngineMixin:
                 # parts once after the gather and attach to the last event.
                 _collect_parts()
 
+    async def _execute_tool_batch_at_stop_boundary(self, *args, **kwargs):
+        """Finish a side-effecting batch before propagating cancellation.
+
+        Cooperative Stop may cancel the top-level invocation task at any
+        await.  A tool batch is not such a boundary: cancelling it halfway can
+        leave an external effect committed while the corresponding tool result
+        is absent from history.  Give the batch its own lifecycle owner, join
+        it through repeated caller cancellation, and only then let Stop unwind
+        the turn.  The next loop checkpoint observes the cancellation flag and
+        prevents another tool or provider round-trip.
+        """
+
+        owner = asyncio.create_task(
+            self._execute_tool_batch(*args, **kwargs),
+            name="orchestrator-tool-batch",
+        )
+        outcome = await await_owned_task(owner)
+        return raise_owned_outcome(
+            outcome,
+            operation="side-effecting orchestrator tool batch",
+        )
+
     # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler
     # ------------------------------------------------------------------
@@ -2474,7 +2500,7 @@ class OrchestratorEngineMixin:
 
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._known_tool_names()
-            await self._execute_tool_batch(
+            await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_results=tool_results,
@@ -2955,7 +2981,7 @@ class OrchestratorEngineMixin:
             # as (terminal_event_index, [parts]). Lets us yield each component
             # bubble right after its producing tool's card in a multi-tool batch.
             part_emit_buffer: list = []
-            await self._execute_tool_batch(
+            await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
