@@ -1430,7 +1430,28 @@ class SignalDispatcher:
     ) -> Optional[DurableDelivery]:
         """Publish a lease only if Hold still permits the handoff."""
 
-        if not await self._durable_claim_deferred_by_hold(consumer_id):
+        try:
+            deferred = await self._durable_claim_deferred_by_hold(consumer_id)
+        except Exception:
+            # The lease was acquired only so this dispatcher could decide
+            # whether it may publish the handoff.  A failed Hold read cannot
+            # silently turn that private admission step into a worker-visible
+            # attempt or leave it leased until expiry.
+            if delivery.lease_token:
+                try:
+                    await self._release_durable_delivery_for_hold(
+                        consumer_id=consumer_id,
+                        delivery_id=delivery.delivery_id,
+                        lease_token=delivery.lease_token,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not release durable lease after Hold-state "
+                        "read failure: delivery=%s",
+                        delivery.delivery_id,
+                    )
+            raise
+        if not deferred:
             return self._delivery_with_transient_handoff(delivery)
         if delivery.lease_token:
             await self._release_durable_delivery_for_hold(
@@ -1442,6 +1463,52 @@ class SignalDispatcher:
         # recovery still owns the row. Never disclose a lease after Hold won.
         return None
 
+    async def _release_initial_reservations_deferred_by_hold(
+        self,
+        *,
+        consumer_id: str,
+        event_id: str | None = None,
+    ) -> None:
+        """Return this process's unpublished volatile leases under Hold.
+
+        Payload-eliding persistence activates an initial lease before the
+        public claim seam runs.  A Hold precheck must therefore release that
+        private capability as well as refusing ordinary storage claims, or the
+        delivery remains invisible until lease expiry.  Holding the same lock
+        as post-commit activation closes the activation/precheck race.
+        """
+
+        async with self._transient_durable_initial_claim_lock:
+            self._discard_expired_transient_durable_handoffs()
+            delivery_id_for_event: str | None = None
+            if event_id is not None:
+                reserved = await self._durable_store.get_delivery_for_event(
+                    agent_id=self._agent.did,
+                    consumer_id=consumer_id,
+                    event_id=event_id,
+                )
+                if reserved is not None:
+                    delivery_id_for_event = reserved.delivery_id
+            reservations = tuple(
+                (delivery_id, handoff.initial_lease_token)
+                for delivery_id, handoff in self._transient_durable_handoffs.items()
+                if (
+                    handoff.consumer_id == consumer_id
+                    and handoff.initial_lease_token is not None
+                    and (
+                        event_id is None
+                        or delivery_id == delivery_id_for_event
+                    )
+                )
+            )
+            for delivery_id, lease_token in reservations:
+                assert lease_token is not None
+                await self._release_durable_delivery_for_hold(
+                    consumer_id=consumer_id,
+                    delivery_id=delivery_id,
+                    lease_token=lease_token,
+                )
+
     async def claim_durable_delivery(
         self, *, consumer_id: str, executor_id: str
     ) -> Optional[DurableDelivery]:
@@ -1449,6 +1516,9 @@ class SignalDispatcher:
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
             if await self._durable_claim_deferred_by_hold(consumer_id):
+                await self._release_initial_reservations_deferred_by_hold(
+                    consumer_id=consumer_id,
+                )
                 return None
             self._discard_expired_transient_durable_handoffs()
             delivery = await self._durable_store.claim_delivery(
@@ -1525,6 +1595,10 @@ class SignalDispatcher:
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
             if await self._durable_claim_deferred_by_hold(consumer_id):
+                await self._release_initial_reservations_deferred_by_hold(
+                    consumer_id=consumer_id,
+                    event_id=event_id,
+                )
                 return None
             self._discard_expired_transient_durable_handoffs()
             delivery = await self._durable_store.claim_delivery_for_event(
@@ -3686,11 +3760,19 @@ class SignalDispatcher:
             )
             return ack_rejected
 
-        if result.status is Status.COALESCED and result.error == "hold_deferred":
+        hold_prevented_execution = (
+            result.status is Status.COALESCED and result.error == "hold_deferred"
+        ) or (
+            result.status is Status.FAILED
+            and result.error is not None
+            and result.error.startswith("hold_state_unavailable:")
+        )
+        if hold_prevented_execution:
             # HoldTurnRefusal may win only after cognition has crossed the
-            # durable claim boundary. That refusal means the turn did not run;
-            # ordinary NACK would spend the attempt and can terminalize a
-            # max_attempts=1 delivery without execution.
+            # durable claim boundary. A failed load-bearing Hold read likewise
+            # prevents admission. Neither case ran a turn, so ordinary NACK
+            # would spend an attempt and can terminalize a max_attempts=1
+            # delivery without execution.
             await self._release_cognition_hold_lease(
                 consumer_id=consumer_id,
                 persisted_event_id=persisted_event_id,

@@ -104,6 +104,18 @@ class _HoldSnapshots:
         return self.snapshots[0]
 
 
+class _FailingHoldRead:
+    def __init__(self, *, fail_on: int) -> None:
+        self.fail_on = fail_on
+        self.reads = 0
+
+    async def get_effective(self, _agent_id: str) -> EffectiveHoldState:
+        self.reads += 1
+        if self.reads == self.fail_on:
+            raise RuntimeError("hold backend unavailable")
+        return EffectiveHoldState(host=None, agent=None)
+
+
 def _registration(agent: _Agent, source: str = "provider.message") -> SourceRegistration:
     async def handler(payload):
         agent.action_calls += 1
@@ -1817,6 +1829,129 @@ async def test_hold_winning_during_claim_releases_the_new_lease(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exact_event", (False, True), ids=("poll", "exact-event"))
+async def test_hold_precheck_releases_volatile_initial_reservation(
+    tmp_path, exact_event
+):
+    """Hold returns preactivated volatile work before refusing its claim."""
+
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / f"held-initial-precheck-{exact_event}.db",
+        f"did:agent:held-initial-precheck:{exact_event}",
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-worker",
+        source="provider.message",
+        agent_id=agent.did,
+        max_attempts=1,
+    )
+    store = _HoldSnapshots(EffectiveHoldState(host=None, agent=None))
+    agent._hold_store = store
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        result = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did),
+            source_event_id=f"provider:held-initial:{exact_event}",
+        )
+        [activated] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        handoff = dispatcher._transient_durable_handoffs[activated.delivery_id]
+        assert activated.status == LEASED
+        assert activated.attempts == 0
+        assert handoff.initial_lease_token is not None
+
+        store.snapshots[:] = [_held_state(agent.did)]
+        if exact_event:
+            claimed = await dispatcher.claim_durable_delivery_for_event(
+                consumer_id=consumer.consumer_id,
+                event_id=result.signal_id,
+                executor_id="workflow-executor",
+            )
+        else:
+            claimed = await dispatcher.claim_durable_delivery(
+                consumer_id=consumer.consumer_id,
+                executor_id="workflow-executor",
+            )
+        assert claimed is None
+        [deferred] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert deferred.status == RETRY
+        assert deferred.attempts == 0
+        assert deferred.lease_owner is None
+        assert deferred.lease_token is None
+        assert handoff.initial_lease_token is None
+        assert handoff.expires_at == handoff.retention_until
+
+        store.snapshots[:] = [EffectiveHoldState(host=None, agent=None)]
+        resumed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="workflow-executor",
+        )
+        assert resumed is not None and resumed.status == LEASED
+        assert resumed.event.payload["message"] == "hello"
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_event", (False, True), ids=("poll", "exact-event"))
+async def test_hold_read_failure_after_claim_releases_exact_lease(
+    tmp_path, exact_event
+):
+    """An unavailable Hold backend cannot strand an unpublished claim."""
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / f"hold-read-fails-after-claim-{exact_event}.db",
+        f"did:agent:hold-read-fails:{exact_event}",
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-worker",
+        source="provider.message",
+        agent_id=agent.did,
+        max_attempts=1,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        result = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did),
+            source_event_id=f"provider:hold-read-fails:{exact_event}",
+        )
+        hold_store = _FailingHoldRead(fail_on=2)
+        agent._hold_store = hold_store
+
+        with pytest.raises(RuntimeError, match="hold backend unavailable"):
+            if exact_event:
+                await dispatcher.claim_durable_delivery_for_event(
+                    consumer_id=consumer.consumer_id,
+                    event_id=result.signal_id,
+                    executor_id="workflow-executor",
+                )
+            else:
+                await dispatcher.claim_durable_delivery(
+                    consumer_id=consumer.consumer_id,
+                    executor_id="workflow-executor",
+                )
+
+        [deferred] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert hold_store.reads == 2
+        assert deferred.status == RETRY
+        assert deferred.attempts == 0
+        assert deferred.lease_owner is None
+        assert deferred.lease_token is None
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 async def test_hold_defers_cursor_cognition_before_claim_then_runs_after_release(
     tmp_path,
 ):
@@ -2062,6 +2197,52 @@ async def test_late_hold_refusal_preserves_finite_retry_budget(tmp_path):
             delivery.status, delivery.attempts, delivery.last_error
         )
         assert delivery.attempts == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_cognition_hold_read_failure_preserves_finite_retry_budget(tmp_path):
+    """A load-bearing Hold read outage is attempt-neutral before cognition."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "hold-read-failure-budget.db",
+        "did:agent:hold-read-failure-budget",
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=1,
+    )
+    hold_store = _FailingHoldRead(fail_on=4)
+    agent._hold_store = hold_store
+    agent.process_input = AsyncMock(return_value="must not run")
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "hold-read-failure"),
+            source_event_id="telegram:update:hold-read-failure",
+            consumer_id=consumer.consumer_id,
+        )
+
+        result = await handle.wait()
+        [delivery] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert hold_store.reads == 4
+        assert result.status is Status.FAILED
+        assert result.error == "hold_state_unavailable: RuntimeError"
+        assert delivery.status == RETRY
+        assert delivery.attempts == 0
+        assert delivery.lease_owner is None
+        assert delivery.lease_token is None
+        agent.process_input.assert_not_awaited()
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
