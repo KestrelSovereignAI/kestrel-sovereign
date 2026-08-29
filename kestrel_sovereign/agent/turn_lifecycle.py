@@ -181,7 +181,7 @@ class TurnLifecycleMixin:
         """Return the current agent turn id for per-turn observability."""
         return _CURRENT_TURN_ID.get()
 
-    def _turn_request_index(self) -> dict[str, str]:
+    def _turn_request_index(self) -> dict[str, tuple[str, int | None]]:
         """Return the live turn-to-request index, creating it for test doubles."""
 
         index = getattr(self, "_turn_request_ids", None)
@@ -192,42 +192,73 @@ class TurnLifecycleMixin:
             raise TypeError("turn request index has an invalid type")
         return index
 
-    def _register_turn_request_id(self, turn_id: str, request_id: str) -> None:
+    def _register_turn_request_id(
+        self,
+        turn_id: str,
+        request_id: str,
+        generation: int | None,
+    ) -> None:
         """Bind one freshly-created observable turn to its cancellation key."""
 
         for field_name, value in (("turn_id", turn_id), ("request_id", request_id)):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field_name} must be a concrete string")
+        if generation is not None and (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+        ):
+            raise ValueError("request generation must be a positive integer")
         index = self._turn_request_index()
         if turn_id in index:
             raise RuntimeError("turn_id is already bound to a request")
-        index[turn_id] = request_id
+        index[turn_id] = (request_id, generation)
 
     def resolve_turn_request_id(self, turn_id: str) -> Optional[str]:
         """Resolve an active observable turn to its process-local cancel key."""
 
         if not isinstance(turn_id, str) or not turn_id.strip():
             return None
-        request_id = self._turn_request_index().get(turn_id)
-        if request_id is not None and (
-            not isinstance(request_id, str) or not request_id.strip()
+        binding = self._turn_request_index().get(turn_id)
+        if binding is None:
+            return None
+        if (
+            not isinstance(binding, tuple)
+            or len(binding) != 2
+            or not isinstance(binding[0], str)
+            or not binding[0].strip()
         ):
             raise TypeError("turn request index contains an invalid request identity")
-        return request_id
+        return binding[0]
+
+    def active_turn_request_bindings(
+        self,
+    ) -> dict[str, tuple[str, int | None]]:
+        """Snapshot exact live turn cancellation addresses atomically."""
+
+        return dict(self._turn_request_index())
 
     def active_turn_request_ids(self) -> dict[str, str]:
         """Snapshot live observable-turn addresses for cancellation inventory."""
 
-        return dict(self._turn_request_index())
+        return {
+            turn_id: binding[0]
+            for turn_id, binding in self.active_turn_request_bindings().items()
+        }
 
-    def _unregister_turn_request_id(self, turn_id: str, request_id: str) -> None:
+    def _unregister_turn_request_id(
+        self,
+        turn_id: str,
+        request_id: str,
+        generation: int | None,
+    ) -> None:
         """Remove only the exact lifecycle binding that this turn registered."""
 
         index = self._turn_request_index()
         current = index.get(turn_id)
         if current is None:
             return
-        if current != request_id:
+        if current != (request_id, generation):
             raise RuntimeError("turn request cleanup does not own the live binding")
         del index[turn_id]
 
@@ -372,16 +403,32 @@ class TurnLifecycleMixin:
             # remains intact (#2928 review P1).
             bound_token = _BOUND_TURN_SESSION.set(None)
             request_id = current_invocation_id()
+            request_generation = None
             request_binding_registered = False
             try:
                 if request_id is not None:
-                    self._register_turn_request_id(turn_id, request_id)
+                    generation_accessor = getattr(
+                        self,
+                        "_request_generation_for_current_task",
+                        None,
+                    )
+                    if callable(generation_accessor):
+                        request_generation = generation_accessor(request_id)
+                    self._register_turn_request_id(
+                        turn_id,
+                        request_id,
+                        request_generation,
+                    )
                     request_binding_registered = True
                 yield turn_id
             finally:
                 try:
                     if request_binding_registered:
-                        self._unregister_turn_request_id(turn_id, request_id)
+                        self._unregister_turn_request_id(
+                            turn_id,
+                            request_id,
+                            request_generation,
+                        )
                 finally:
                     _BOUND_TURN_SESSION.reset(bound_token)
                     _CURRENT_TURN_ID.reset(token)

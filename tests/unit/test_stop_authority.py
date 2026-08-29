@@ -46,6 +46,16 @@ def test_stop_request_and_outcome_round_trip_exact_wire_values() -> None:
     )
     assert StopRequest.from_dict(request.to_dict()) == request
 
+    resolved_request = StopRequest(
+        scope=StopScope.TURN,
+        target="request-private",
+        target_agent_id="did:test:target",
+        actor_id="did:test:operator",
+        correlation_id="stop-resolved",
+        request_generation=7,
+    )
+    assert StopRequest.from_dict(resolved_request.to_dict()) == resolved_request
+
     outcome = StopOutcome(
         scope=request.scope,
         requested_target=request.target,
@@ -373,6 +383,11 @@ def test_stop_outcome_rejects_scope_target_contradictions(payload) -> None:
         {"turn_ids": "turn-10"},
         {"turn_request_ids": {"": "request-10"}},
         {"turn_request_ids": {"turn-10": ""}},
+        {"turn_request_generations": {"turn-10": 1}},
+        {
+            "turn_request_ids": {"turn-10": "request-10"},
+            "turn_request_generations": {"turn-10": 0},
+        },
         {"tool_call_ids": frozenset({""})},
     ],
 )
@@ -438,10 +453,10 @@ async def test_authority_resolves_turn_and_tool_addresses() -> None:
 
 @pytest.mark.asyncio
 async def test_authority_resolves_turn_address_to_live_cancellation_key() -> None:
-    observed_targets: list[str | None] = []
+    observed_targets: list[tuple[str | None, int | None]] = []
 
     async def stop(request: StopRequest) -> StopDisposition:
-        observed_targets.append(request.target)
+        observed_targets.append((request.target, request.request_generation))
         return StopDisposition.STOPPED
 
     authority = _authority(
@@ -452,6 +467,7 @@ async def test_authority_resolves_turn_address_to_live_cancellation_key() -> Non
                 stop,
                 turn_ids=frozenset({"turn-visible"}),
                 turn_request_ids={"turn-visible": "request-private"},
+                turn_request_generations={"turn-visible": 7},
             )
         ]
     )
@@ -466,7 +482,7 @@ async def test_authority_resolves_turn_address_to_live_cancellation_key() -> Non
         )
     )
 
-    assert observed_targets == ["request-private"]
+    assert observed_targets == [("request-private", 7)]
     assert outcomes[0].requested_target == "turn-visible"
     assert outcomes[0].resolved_target == "request-private"
 
@@ -691,6 +707,53 @@ def test_live_stop_endpoint_accepts_turn_id_and_resolves_inside_authority() -> N
         request_id="request-private"
     )
     agent.wait_for_request_completion.assert_awaited_once_with("request-private")
+
+
+def test_turn_stop_cannot_cancel_a_reused_request_generation() -> None:
+    """A stale turn snapshot must not widen onto a fresh same-ID delivery."""
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+
+    class LiveAgent(RequestLifecycleMixin):
+        agent_id = "did:test:generation-race"
+
+        def __init__(self) -> None:
+            self._current_request_id = "reused-request"
+            self._active_request_ids = {"reused-request"}
+            self._active_request_counts = {"reused-request": 1}
+            self._active_request_started_at = {
+                "reused-request": time.monotonic()
+            }
+            self._active_request_generations = {"reused-request": 2}
+            self._next_request_generation = 2
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._request_completion_events = {}
+
+        def active_turn_request_bindings(self):
+            # Inventory captured turn generation 1 immediately before that
+            # turn completed and generation 2 reused its request ID.
+            return {"old-public-turn": ("reused-request", 1)}
+
+    agent = LiveAgent()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "old-public-turn"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stop_outcomes"][0]["disposition"] == (
+        "already_complete"
+    )
+    assert ("reused-request", 2) not in agent._cancelled_request_generations
+    assert "reused-request" not in getattr(
+        agent, "_pending_request_cancellations", {}
+    )
 
 
 def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:

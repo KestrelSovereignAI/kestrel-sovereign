@@ -41,6 +41,7 @@ class StopRequest:
     cascade: bool = True
     correlation_id: str = field(default_factory=lambda: uuid4().hex)
     target_is_turn_id: bool = False
+    request_generation: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, StopScope):
@@ -77,6 +78,17 @@ class StopRequest:
             raise TypeError("target_is_turn_id must be boolean")
         if self.target_is_turn_id and self.scope is not StopScope.TURN:
             raise ValueError("only turn Stop may carry a public turn address")
+        if self.request_generation is not None and (
+            self.scope is not StopScope.TURN
+            or self.target_is_turn_id
+            or not isinstance(self.request_generation, int)
+            or isinstance(self.request_generation, bool)
+            or self.request_generation <= 0
+        ):
+            raise ValueError(
+                "request_generation requires a resolved turn request and a "
+                "positive integer"
+            )
         if (
             not isinstance(self.correlation_id, str)
             or not self.correlation_id.strip()
@@ -93,6 +105,7 @@ class StopRequest:
             "cascade": self.cascade,
             "correlation_id": self.correlation_id,
             "target_is_turn_id": self.target_is_turn_id,
+            "request_generation": self.request_generation,
         }
 
     @classmethod
@@ -106,6 +119,7 @@ class StopRequest:
             cascade=value.get("cascade", True),
             correlation_id=value["correlation_id"],
             target_is_turn_id=value.get("target_is_turn_id", False),
+            request_generation=value.get("request_generation"),
         )
 
 
