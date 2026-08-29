@@ -550,9 +550,21 @@ class TaskStore(UnifiedStoreBase):
                         *recipient_values,
                     ),
                 )
-            if rows_affected != 1:
-                return None
-            return await self.get(task_id)
+                if rows_affected != 1:
+                    return None
+                # Read the canonical canceled form before committing. A
+                # readback failure must roll the transition back rather than
+                # strand a durable CANCELED row before TaskManager can finish
+                # its queued-wake, SSE, session, and completion projections.
+                canceled_row = await self._backend.fetch_one(
+                    "SELECT * FROM a2a_tasks WHERE id = ?",
+                    (task_id,),
+                )
+                if canceled_row is None:
+                    raise RuntimeError(
+                        "Canceled task disappeared inside its transition"
+                    )
+                return self._row_to_task(canceled_row)
 
         if self.is_postgres:
             payload_assignment = (
@@ -574,35 +586,49 @@ class TaskStore(UnifiedStoreBase):
             if expected_recipient_agent_id is not None
             else ()
         )
-        rows_affected = await self._backend.execute(
-            f"""
-            UPDATE a2a_tasks
-            SET cancel_previous_status = status,
-                status = 'canceled',
-                message = ?,
-                {payload_assignment}
-                canceled_by = ?,
-                cancel_reason = ?,
-                updated_at = {self.now_sql()}
-            WHERE id = ?
-              AND status IN ('submitted', 'working', 'input-required')
-              AND (creator_agent_id = ? OR recipient_agent_id = ?)
-              {recipient_predicate}
-            """,
-            (
-                message.model_dump_json(),
-                *payload_values,
-                actor_agent_id,
-                reason,
-                task_id,
-                actor_agent_id,
-                actor_agent_id,
-                *recipient_values,
-            ),
+        transaction = (
+            self._backend.transaction(immediate=True)
+            if self.is_sqlite
+            else self._backend.transaction()
         )
-        if rows_affected != 1:
-            return None
-        return await self.get(task_id)
+        async with transaction:
+            rows_affected = await self._backend.execute(
+                f"""
+                UPDATE a2a_tasks
+                SET cancel_previous_status = status,
+                    status = 'canceled',
+                    message = ?,
+                    {payload_assignment}
+                    canceled_by = ?,
+                    cancel_reason = ?,
+                    updated_at = {self.now_sql()}
+                WHERE id = ?
+                  AND status IN ('submitted', 'working', 'input-required')
+                  AND (creator_agent_id = ? OR recipient_agent_id = ?)
+                  {recipient_predicate}
+                """,
+                (
+                    message.model_dump_json(),
+                    *payload_values,
+                    actor_agent_id,
+                    reason,
+                    task_id,
+                    actor_agent_id,
+                    actor_agent_id,
+                    *recipient_values,
+                ),
+            )
+            if rows_affected != 1:
+                return None
+            canceled_row = await self._backend.fetch_one(
+                "SELECT * FROM a2a_tasks WHERE id = ?",
+                (task_id,),
+            )
+            if canceled_row is None:
+                raise RuntimeError(
+                    "Canceled task disappeared inside its transition"
+                )
+            return self._row_to_task(canceled_row)
 
     async def add_artifact(self, task_id: str, artifact: Artifact) -> None:
         """Append an artifact without crossing a terminal-state transition.

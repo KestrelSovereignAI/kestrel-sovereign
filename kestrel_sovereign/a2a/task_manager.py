@@ -851,10 +851,28 @@ class TaskManager:
         # A recipient wake can race these best-effort projections and move the
         # canonical row before create_task returns. Never publish an older
         # SUBMITTED snapshot after a terminal transition already committed.
-        canonical = await self.task_store.get(task.id)
+        canonical_read_succeeded = False
+        try:
+            canonical = await self.task_store.get(task.id)
+            canonical_read_succeeded = canonical is not None
+        except Exception:
+            canonical = None
+            logger.warning(
+                "Task %s was accepted but its canonical readback failed",
+                task.id,
+                exc_info=True,
+            )
         if canonical is None:
-            raise RuntimeError("Created task disappeared before readback")
-        if canonical.status.state is TaskState.SUBMITTED:
+            # The insert-only durable reservation and recipient wake already
+            # committed. Return the accepted snapshot so a transient read
+            # outage cannot make the sender abandon work the recipient owns.
+            # Suppress the SUBMITTED SSE projection because a raced recipient
+            # may already have moved the unreadable canonical row terminal.
+            canonical = task
+        if (
+            canonical_read_succeeded
+            and canonical.status.state is TaskState.SUBMITTED
+        ):
             await self._notify_status_update(canonical, final=False)
 
         logger.info(f"Task created: {task.id} in session {params.sessionId}")
