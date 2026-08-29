@@ -148,6 +148,131 @@ async def test_isolated_turn_preserves_context_outputs_for_caller_audit():
     assert audit_value.get() == "published-by-turn"
 
 
+@pytest.mark.asyncio
+async def test_stop_racing_with_isolated_completion_suppresses_normal_result():
+    """A completed child cannot outrun Stop before its owner publishes output."""
+
+    from kestrel_sovereign.agent.invocation import (
+        InvocationCancelledError,
+        bind_async_invocation,
+    )
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+
+        def bind_request_operation(self, request_id, operation):
+            super().bind_request_operation(request_id, operation)
+            # Done callbacks registered before ``await operation`` wakes its
+            # owner.  This deterministically models Stop linearizing after the
+            # child result exists but before the wrapper can return it.
+            operation.add_done_callback(
+                lambda _done: self.cancel_current_request(request_id)
+            )
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            return "must-not-escape"
+
+    with pytest.raises(InvocationCancelledError, match="after operation completion"):
+        await Owner().run(invocation_id="completion-race")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_isolated_turn_cleanup_failure_is_abandoned():
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
+
+    started = asyncio.Event()
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                raise RuntimeError("isolated cleanup failed")
+
+    owner = Owner()
+    turn = asyncio.create_task(owner.run(invocation_id="failed-cleanup"))
+    await started.wait()
+    assert owner.cancel_current_request("failed-cleanup") is True
+    completion = asyncio.create_task(
+        owner.wait_for_request_completion("failed-cleanup")
+    )
+
+    with pytest.raises(RuntimeError, match="isolated cleanup failed"):
+        await turn
+
+    assert await completion is RequestCompletionDisposition.ABANDONED
+
+
+@pytest.mark.asyncio
+async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    started = asyncio.Event()
+
+    class CommandAgent(StreamingMixin, RequestLifecycleMixin):
+        def __init__(self):
+            self.storage = object()
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        async def _genesis_audit_cognition_block(self, _user_input):
+            return None
+
+        async def _maybe_audit(self):
+            return None
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def process_input(self, *_args, invocation_id=None, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+    agent = CommandAgent()
+    stream = agent.process_input_streaming(
+        "!continue",
+        request_id="command-stop",
+    )
+    advance = asyncio.create_task(anext(stream))
+    await started.wait()
+    assert agent.cancel_current_request("command-stop") is True
+
+    with pytest.raises(StopAsyncIteration):
+        await advance
+
+    assert agent._active_request_ids == set()
+
+
 def test_request_lifecycle_logs_only_one_way_correlation(caplog):
     from kestrel_sovereign.agent.invocation import invocation_log_correlation
     from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
@@ -175,7 +300,10 @@ async def test_invoke_operation_task_name_redacts_opaque_request_id():
     import httpx
     from fastapi import FastAPI
 
-    from kestrel_sovereign.agent.invocation import invocation_log_correlation
+    from kestrel_sovereign.agent.invocation import (
+        bind_async_invocation,
+        invocation_log_correlation,
+    )
     from kestrel_sovereign.endpoints.agent import router
     from kestrel_sovereign.rate_limit import limiter
 
@@ -205,7 +333,13 @@ async def test_invoke_operation_task_name_redacts_opaque_request_id():
         def _conversation_response_identity(self, **_kwargs):
             return {}
 
-        async def process_input(self, *_args, **_kwargs):
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def process_input(
+            self,
+            *_args,
+            invocation_id=None,
+            **_kwargs,
+        ):
             started.set()
             await release.wait()
             return "done"
@@ -651,7 +785,10 @@ class TestAgentCancellation:
         from fastapi import FastAPI
         from starlette.requests import Request
 
-        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
         class FencedAgent(RequestLifecycleMixin):
@@ -1658,7 +1795,11 @@ class TestStopEndpoint:
         from fastapi import FastAPI, Response
         from starlette.requests import Request
 
-        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.agent.invocation import bind_async_invocation
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
         from kestrel_sovereign.endpoints.agent import invoke_agent
 
         started = asyncio.Event()
@@ -1675,7 +1816,13 @@ class TestStopEndpoint:
                 self.storage = MagicMock()
                 self.storage.resolve_session_id = AsyncMock(return_value="session")
 
-            async def process_input(self, *_args, **_kwargs):
+            @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+            async def process_input(
+                self,
+                *_args,
+                invocation_id=None,
+                **_kwargs,
+            ):
                 started.set()
                 try:
                     await asyncio.Event().wait()
@@ -1725,6 +1872,10 @@ class TestStopEndpoint:
 
         assert result["response"] == "Request stopped during execution."
         assert agent._active_request_ids == set()
+        assert (
+            await agent.wait_for_request_completion("active-invoke")
+            is RequestCompletionDisposition.COMPLETED
+        )
 
     @pytest.mark.asyncio
     async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):
