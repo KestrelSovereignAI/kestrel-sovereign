@@ -459,8 +459,8 @@ async def invoke_agent(request: Request, http_response: Response):
         except Exception:
             effective_session_id = session_id  # fall back; never block the request
 
-        try:
-            response = await agent.process_input(
+        operation = asyncio.create_task(
+            agent.process_input(
                 user_input,
                 model_override=model_override,
                 session_id=effective_session_id,
@@ -468,7 +468,36 @@ async def invoke_agent(request: Request, http_response: Response):
                 user_passphrase=user_passphrase,
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
-            )
+            ),
+            name=f"invoke-turn:{request_id}",
+        )
+        bind_operation = getattr(type(agent), "bind_request_operation", None)
+        if callable(bind_operation):
+            bind_operation(agent, request_id, operation)
+        try:
+            response = await operation
+            if callable(request_cancelled) and request_cancelled(request_id) is True:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": effective_session_id,
+                    "model": None,
+                    "provider": None,
+                }
+        except asyncio.CancelledError:
+            if callable(request_cancelled) and request_cancelled(request_id) is True:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": effective_session_id,
+                    "model": None,
+                    "provider": None,
+                }
+            raise
         finally:
             agent._cleanup_cancelled_request(request_id)
         # Extract model/provider identity for frontend footer rendering (#1373)

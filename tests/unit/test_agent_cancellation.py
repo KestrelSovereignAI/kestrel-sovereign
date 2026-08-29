@@ -33,6 +33,10 @@ class TestAgentCancellation:
         agent._forget_pruned_cleanup_generation = KestrelAgent._forget_pruned_cleanup_generation.__get__(agent)
         agent._abandoned_generations = KestrelAgent._abandoned_generations.__get__(agent)
         agent.cancel_current_request = KestrelAgent.cancel_current_request.__get__(agent)
+        agent.reserve_request_cancellation = KestrelAgent.reserve_request_cancellation.__get__(agent)
+        agent._prune_pending_request_cancellations = KestrelAgent._prune_pending_request_cancellations.__get__(agent)
+        agent._consume_pending_request_cancellation = KestrelAgent._consume_pending_request_cancellation.__get__(agent)
+        agent.bind_request_operation = KestrelAgent.bind_request_operation.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)
         agent.wait_for_request_completion = KestrelAgent.wait_for_request_completion.__get__(agent)
         agent._resolve_request_completion = KestrelAgent._resolve_request_completion.__get__(agent)
@@ -1004,11 +1008,11 @@ class TestAgentCancellation:
         assert "stale-waiter" in mock_agent._cancelled_requests
 
     @pytest.mark.asyncio
-    async def test_abandoned_generation_does_not_poison_same_id_redelivery(
+    async def test_exact_stop_fence_cancels_same_id_redelivery_in_race_window(
         self,
         mock_agent,
     ):
-        """The old turn stays canceled while a fresh retry gets a clean key."""
+        """An exact Stop remains authoritative across transport redelivery."""
 
         old_registered = asyncio.Event()
         inspect_old = asyncio.Event()
@@ -1030,13 +1034,44 @@ class TestAgentCancellation:
         assert mock_agent.prune_stale_active_requests(900) == ["reused-id"]
 
         mock_agent.register_active_request("reused-id")
-        assert mock_agent.is_request_cancelled("reused-id") is False
+        assert mock_agent.is_request_cancelled("reused-id") is True
 
         inspect_old.set()
         await old_task
         assert old_observation == [True]
         assert "reused-id" in mock_agent._active_request_ids
+        assert mock_agent.is_request_cancelled("reused-id") is True
         mock_agent._cleanup_cancelled_request("reused-id")
+
+        # A second transport redelivery in the same Stop race window is also
+        # fenced; the tombstone is TTL-bounded, not one-shot.
+        mock_agent.register_active_request("reused-id")
+        assert mock_agent.is_request_cancelled("reused-id") is True
+        mock_agent._cleanup_cancelled_request("reused-id")
+
+    @pytest.mark.asyncio
+    async def test_cancel_current_request_cancels_bound_turn_operation(
+        self,
+        mock_agent,
+    ):
+        """The active non-streaming turn observes cooperative Stop promptly."""
+
+        request_id = "bound-invoke"
+        mock_agent.register_active_request(request_id)
+        started = asyncio.Event()
+
+        async def run() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        operation = asyncio.create_task(run())
+        mock_agent.bind_request_operation(request_id, operation)
+        await started.wait()
+
+        assert mock_agent.cancel_current_request(request_id) is True
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        mock_agent._cleanup_cancelled_request(request_id)
 
     @pytest.mark.asyncio
     async def test_fresh_stop_waiter_includes_still_running_abandoned_generation(
@@ -1381,6 +1416,81 @@ class TestStopEndpoint:
         assert mock_agent.process_input.await_args.kwargs["invocation_id"] == request_id
         mock_agent.register_active_request.assert_called_once_with(request_id)
         mock_agent._cleanup_cancelled_request.assert_called_once_with(request_id)
+
+    @pytest.mark.asyncio
+    async def test_active_invoke_is_cancelled_by_exact_stop(self):
+        """A Stop after process_input starts interrupts the live invoke turn."""
+
+        from fastapi import FastAPI, Response
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.endpoints.agent import invoke_agent
+
+        started = asyncio.Event()
+        process_stopped = asyncio.Event()
+
+        class LiveInvokeAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value="session")
+
+            async def process_input(self, *_args, **_kwargs):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    process_stopped.set()
+
+            def _conversation_response_identity(self, **_kwargs):
+                return {}
+
+        agent = LiveInvokeAgent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps({"input": "work", "request_id": "active-invoke"}).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/invoke",
+                "raw_path": b"/api/agent/invoke",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(invoke_agent, "__wrapped__", invoke_agent)
+        http_response = Response()
+        invocation = asyncio.create_task(endpoint(request, http_response))
+
+        await started.wait()
+        assert agent.cancel_current_request("active-invoke") is True
+        assert await asyncio.wait_for(process_stopped.wait(), timeout=0.1) is True
+        result = await asyncio.wait_for(invocation, timeout=1)
+
+        assert result["response"] == "Request stopped during execution."
+        assert agent._active_request_ids == set()
 
     @pytest.mark.asyncio
     async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):

@@ -89,9 +89,9 @@ class RequestLifecycleMixin:
 
         Stop and request registration are separate HTTP requests.  A Stop can
         therefore arrive after the client dispatched a request but before its
-        handler has registered the lifecycle.  This short-lived tombstone is
-        consumed by that first registration, which cannot begin cognition even
-        if Stop already returned ``already_complete`` for the empty snapshot.
+        handler has registered the lifecycle.  This short-lived tombstone
+        fences every same-ID redelivery in the race window; a transport retry
+        cannot resurrect work after an exact Stop was acknowledged.
         """
 
         if not isinstance(request_id, str) or not request_id:
@@ -112,7 +112,7 @@ class RequestLifecycleMixin:
         now = time.monotonic()
         self._prune_pending_request_cancellations(now)
         pending = self._pending_request_cancellations
-        if pending.pop(request_id, None) is None:
+        if pending.get(request_id) is None:
             return False
         cancelled_generations = getattr(
             self,
@@ -133,6 +133,38 @@ class RequestLifecycleMixin:
             request_id,
         )
         return True
+
+    def bind_request_operation(
+        self,
+        request_id: str,
+        operation: asyncio.Task,
+    ) -> None:
+        """Bind cancellable turn work to the current request generation."""
+
+        if not isinstance(operation, asyncio.Task):
+            raise TypeError("request operation must be an asyncio task")
+        generation = self._request_generation_for_current_task(request_id)
+        if generation is None:
+            raise RuntimeError("request operation requires an active generation")
+        operations = getattr(self, "_request_operation_tasks", None)
+        if not isinstance(operations, dict):
+            operations = {}
+            self._request_operation_tasks = operations
+        key = (request_id, generation)
+        owners = operations.setdefault(key, set())
+        owners.add(operation)
+
+        def release(completed: asyncio.Task) -> None:
+            current = operations.get(key)
+            if not isinstance(current, set):
+                return
+            current.discard(completed)
+            if not current:
+                operations.pop(key, None)
+
+        operation.add_done_callback(release)
+        if self.is_request_cancelled(request_id):
+            operation.cancel()
 
     def _request_generation_for_current_task(
         self,
@@ -248,6 +280,9 @@ class RequestLifecycleMixin:
         target_request_id = request_id or self._current_request_id
         if not target_request_id:
             return False
+        # Install the exact-ID fence even for a currently active generation.
+        # Same-ID transport redeliveries must not resume after Stop returns.
+        self.reserve_request_cancellation(target_request_id)
 
         generations: set[int] = self._abandoned_generations(target_request_id)
         if (
@@ -293,6 +328,13 @@ class RequestLifecycleMixin:
             (target_request_id, generation) for generation in generations
         )
         self._cancelled_requests.add(target_request_id)
+        operations = getattr(self, "_request_operation_tasks", None)
+        if isinstance(operations, dict):
+            for generation in generations:
+                for operation in tuple(
+                    operations.get((target_request_id, generation), set())
+                ):
+                    operation.cancel()
         logging.info("Cancelled request lifecycle: %s", target_request_id)
         return True
 

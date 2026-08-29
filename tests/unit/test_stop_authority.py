@@ -595,7 +595,7 @@ def test_stop_before_registration_fences_the_late_request_generation() -> None:
 
     assert agent.is_request_cancelled("in-transit-turn") is True
     assert ("in-transit-turn", generation) in agent._cancelled_request_generations
-    assert "in-transit-turn" not in agent._pending_request_cancellations
+    assert "in-transit-turn" in agent._pending_request_cancellations
 
 
 def test_expired_pre_registration_stop_does_not_poison_a_future_reuse() -> None:

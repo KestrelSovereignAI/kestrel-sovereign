@@ -1093,6 +1093,16 @@ export function createApiClient({
             )) {
                 throw new Error('stream request id must be 1-256 characters');
             }
+            // Invocation IDs are logical Unicode values, while HTTP headers
+            // carry the server's one-pass RFC 3986 wire representation. Keep
+            // those identities separate so opaque IDs survive auth retries
+            // and response-header comparison without double encoding.
+            const wireRequestId = clientRequestId === null
+                ? null
+                : encodeURIComponent(clientRequestId).replace(
+                    /[!'()*]/g,
+                    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+                );
 
             // Chat allocates its cancellation address before opening the fetch.
             // Publish that address before the first await so an immediate Stop
@@ -1114,8 +1124,8 @@ export function createApiClient({
             try {
                 let headers = await buildHeaders({
                     'Content-Type': 'application/json',
-                    ...(clientRequestId !== null
-                        ? { 'X-Request-ID': clientRequestId }
+                    ...(wireRequestId !== null
+                        ? { 'X-Request-ID': wireRequestId }
                         : {}),
                 });
                 const url = applyHostAgentPrefix('/api/agent/stream', dispatchAgent);
@@ -1163,7 +1173,12 @@ export function createApiClient({
                             // not allow a recursive retry to resurrect it.
                             alreadyRetried = true;
                             try {
-                                headers = await buildHeaders({ 'Content-Type': 'application/json' });
+                                headers = await buildHeaders({
+                                    'Content-Type': 'application/json',
+                                    ...(wireRequestId !== null
+                                        ? { 'X-Request-ID': wireRequestId }
+                                        : {}),
+                                });
                                 // applyAuth may complete after Stop aborted the
                                 // request with an arbitrary reason. Do not
                                 // start the refreshed fetch in that state.
@@ -1187,11 +1202,11 @@ export function createApiClient({
                     if (
                         clientRequestId !== null
                         && responseRequestId !== null
-                        && responseRequestId !== clientRequestId
+                        && responseRequestId !== wireRequestId
                     ) {
                         throw new Error('server changed the client-issued stream request id');
                     }
-                    activeRequestId = responseRequestId || clientRequestId;
+                    activeRequestId = clientRequestId || responseRequestId;
                     if (activeRequestId !== null) {
                         state.currentStreamRequestIds.set(
                             dispatchAgent,

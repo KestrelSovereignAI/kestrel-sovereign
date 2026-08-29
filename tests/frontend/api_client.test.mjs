@@ -262,10 +262,12 @@ test('streamInvoke posts canonical /agent/stream (#863)', async () => {
 });
 
 test('streamInvoke with API key refreshes bootstrap key once and retries the stream', async () => {
+    const logicalRequestId = 'retry-☃';
+    const wireRequestId = 'retry-%E2%98%83';
     const fetchFn = createFetchQueue(
         jsonResponse(401, { detail: 'expired stream key' }),
         jsonResponse(200, { key: 'fresh-key' }),
-        streamResponse(['hel', 'lo'], { 'X-Request-ID': 'stream-1' }),
+        streamResponse(['hel', 'lo'], { 'X-Request-ID': wireRequestId }),
     );
     const { client, sessionStorage } = createClient({
         fetchFn,
@@ -275,7 +277,9 @@ test('streamInvoke with API key refreshes bootstrap key once and retries the str
     await client.init();
 
     const chunks = [];
-    for await (const chunk of client.streamInvoke('hello')) {
+    for await (const chunk of client.streamInvoke(
+        'hello', null, null, null, false, undefined, null, logicalRequestId,
+    )) {
         chunks.push(chunk);
     }
 
@@ -288,6 +292,8 @@ test('streamInvoke with API key refreshes bootstrap key once and retries the str
     ]);
     assert.equal(fetchFn.calls[0].options.headers['X-API-Key'], 'stale-key');
     assert.equal(fetchFn.calls[2].options.headers['X-API-Key'], 'fresh-key');
+    assert.equal(fetchFn.calls[0].options.headers['X-Request-ID'], wireRequestId);
+    assert.equal(fetchFn.calls[2].options.headers['X-Request-ID'], wireRequestId);
 });
 
 test('applyHostAgentPrefix preserves host-level routes and prefixes per-agent routes in multi_agent mode', () => {
@@ -673,6 +679,26 @@ test('streamInvoke publishes and sends a client request id before response heade
     stream.finish();
     for await (const _ of iter) { /* drain */ }
     assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
+});
+
+test('streamInvoke keeps opaque request ids logical while sending RFC 3986 wire form', async () => {
+    const logicalRequestId = "turn ☃ / 100% !'()*";
+    const wireRequestId = 'turn%20%E2%98%83%20%2F%20100%25%20%21%27%28%29%2A';
+    const stream = pendingStreamResponse({ 'X-Request-ID': wireRequestId });
+    const fetchFn = createFetchQueue(stream.response);
+    const { client } = createClient({ fetchFn });
+    client.setHostAgent('agent-A');
+
+    const iter = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, logicalRequestId,
+    );
+    await iter.next();
+
+    assert.equal(fetchFn.calls[0].options.headers['X-Request-ID'], wireRequestId);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), logicalRequestId);
+
+    stream.finish();
+    for await (const _ of iter) { /* drain */ }
 });
 
 test('streamInvoke captures dispatch agent BEFORE awaiting auth headers (PR #874)', async () => {
