@@ -38,6 +38,7 @@ from kestrel_sovereign.a2a.stores import (
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskCancellationSnapshot,
+    TaskMutationAuthorizationError,
     without_reserved_cancellation_receipt,
 )
 from typing import Protocol, runtime_checkable, TYPE_CHECKING
@@ -427,14 +428,20 @@ class TaskManager:
                 saved: Optional[bool] = None
                 try:
                     async with self.task_store._backend.transaction():
-                        saved = await self.task_store.save(task)
+                        saved = await self.task_store.save_recipient_lifecycle(
+                            task,
+                            recipient_agent_id=authority_agent_id,
+                        )
                 except Exception as save_err:
                     logger.error(
                         f"Failed to save completed task {task.id}: {save_err}. "
                         "Retrying outside transaction..."
                     )
                     try:
-                        saved = await self.task_store.save(task)
+                        saved = await self.task_store.save_recipient_lifecycle(
+                            task,
+                            recipient_agent_id=authority_agent_id,
+                        )
                     except Exception as retry_err:
                         logger.critical(
                             f"Task {task.id} completed but save failed permanently: {retry_err}. "
@@ -619,7 +626,10 @@ class TaskManager:
                 False,
             )
 
-        saved = await self.task_store.save(task)
+        saved = await self.task_store.save_recipient_lifecycle(
+            task,
+            recipient_agent_id=authority_agent_id,
+        )
         if saved is False:
             # Another terminal writer won its CAS and owns the corresponding
             # completion signal. Returning its durable state must not emit the
@@ -884,6 +894,8 @@ class TaskManager:
         new_state: TaskState,
         message: Optional[Message] = None,
         agent_name: Optional[str] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Update task status with state transition validation.
@@ -892,7 +904,8 @@ class TaskManager:
             task_id: ID of the task to update
             new_state: New state to transition to
             message: Optional status message
-            agent_name: Agent performing the update (for observability)
+            agent_name: Agent performing the update (for observability only)
+            recipient_agent_id: Trusted durable recipient performing the write
 
         Returns:
             Updated Task object
@@ -905,9 +918,14 @@ class TaskManager:
                 "CANCELED is an authorized transition; use cancel_task"
             )
 
-        task = await self.task_store.get(task_id)
+        task = await self.task_store.get_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
         if not task:
-            raise ValueError(f"Task not found: {task_id}")
+            raise TaskMutationAuthorizationError(
+                f"Task mutation was not authorized or task was not found: {task_id}"
+            )
 
         # Validate state transition
         current_state = task.status.state
@@ -928,9 +946,15 @@ class TaskManager:
             task.history.append(message)
 
         # Save updated task (use save() to persist both status and history)
-        saved = await self.task_store.save(task)
+        saved = await self.task_store.save_recipient_lifecycle(
+            task,
+            recipient_agent_id=recipient_agent_id,
+        )
         if saved is False:
-            persisted = await self.task_store.get(task_id)
+            persisted = await self.task_store.get_for_recipient(
+                task_id,
+                recipient_agent_id,
+            )
             state = persisted.status.state if persisted else TaskState.UNKNOWN
             raise ValueError(
                 f"Invalid state transition: task is already {state}"
@@ -954,6 +978,8 @@ class TaskManager:
         task_id: str,
         artifact: Artifact,
         agent_name: Optional[str] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Add an artifact to a task.
@@ -961,20 +987,33 @@ class TaskManager:
         Args:
             task_id: ID of the task
             artifact: Artifact to add
-            agent_name: Agent producing the artifact (for observability)
+            agent_name: Agent producing the artifact (for observability only)
+            recipient_agent_id: Trusted durable recipient performing the write
 
         Returns:
             Updated Task object
         """
-        task = await self.task_store.get(task_id)
+        task = await self.task_store.get_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
         if not task:
-            raise ValueError(f"Task not found: {task_id}")
+            raise TaskMutationAuthorizationError(
+                f"Task mutation was not authorized or task was not found: {task_id}"
+            )
 
         # Add artifact
-        await self.task_store.add_artifact(task_id, artifact)
+        await self.task_store.add_artifact(
+            task_id,
+            artifact,
+            recipient_agent_id=recipient_agent_id,
+        )
 
         # Refresh task
-        task = await self.task_store.get(task_id)
+        task = await self.task_store.get_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
 
         # Notify subscribers
         await self._notify_artifact_update(task_id, artifact)
@@ -1226,6 +1265,8 @@ class TaskManager:
         task_id: str,
         error: str,
         agent_name: Optional[str] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Mark a task as failed.
@@ -1259,6 +1300,7 @@ class TaskManager:
             new_state=TaskState.FAILED,
             message=message,
             agent_name=agent_name,
+            recipient_agent_id=recipient_agent_id,
         )
 
     async def complete_task(
@@ -1267,6 +1309,8 @@ class TaskManager:
         response: str,
         agent_name: Optional[str] = None,
         artifacts: Optional[list[Artifact]] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Complete a task with a response.
@@ -1283,7 +1327,12 @@ class TaskManager:
         # Add artifacts if provided
         if artifacts:
             for artifact in artifacts:
-                await self.add_artifact(task_id, artifact, agent_name)
+                await self.add_artifact(
+                    task_id,
+                    artifact,
+                    agent_name,
+                    recipient_agent_id=recipient_agent_id,
+                )
 
         message = Message(
             role="agent",
@@ -1295,6 +1344,7 @@ class TaskManager:
             new_state=TaskState.COMPLETED,
             message=message,
             agent_name=agent_name,
+            recipient_agent_id=recipient_agent_id,
         )
 
     async def _project_status_transition(

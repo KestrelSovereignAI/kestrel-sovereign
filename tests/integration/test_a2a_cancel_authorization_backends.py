@@ -77,7 +77,10 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             f"Task canceled by {recipient}: delegate stopped work"
         )
         stale = Task(id=task_id, status=TaskStatus(state=TaskState.COMPLETED))
-        assert await store.save(stale) is False
+        assert not await store.save_recipient_lifecycle(
+            stale,
+            recipient_agent_id=recipient,
+        )
         assert (await store.get(task_id)).status.state is TaskState.CANCELED
 
         initial = Task(
@@ -99,7 +102,10 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             Message(role="agent", parts=[TextPart(text="concurrent")])
         )
         concurrent.metadata["concurrent"] = True
-        assert await store.save(concurrent) is True
+        assert await store.save_recipient_lifecycle(
+            concurrent,
+            recipient_agent_id=recipient,
+        )
 
         handler_payload = Task(
             id=payload_task_id,
@@ -144,7 +150,11 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
             parts=[TextPart(text="keep if append won")],
         )
         append_result, cancel_result = await asyncio.gather(
-            store.add_artifact(artifact_race_task_id, racing_artifact),
+            store.add_artifact(
+                artifact_race_task_id,
+                racing_artifact,
+                recipient_agent_id=recipient,
+            ),
             store.cancel_if_authorized(
                 artifact_race_task_id,
                 actor_agent_id=creator,
