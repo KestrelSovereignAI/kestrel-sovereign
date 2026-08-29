@@ -32,6 +32,12 @@ EVENT_BUFFERED = "buffered"
 EVENT_ACCEPTED = "accepted"
 EVENT_REJECTED = "rejected"
 
+# Cross-worker cancellation cannot rely on a process-local Event.  Keep the
+# durable fallback responsive at first, then cap its steady-state database
+# load for long LLM/tool turns.
+A2A_CANCELLATION_POLL_INITIAL_SECONDS = 0.1
+A2A_CANCELLATION_POLL_MAX_SECONDS = 2.0
+
 
 @dataclass(frozen=True)
 class EventDeliveryReceipt:
@@ -519,6 +525,7 @@ class EventManagerMixin:
         if not isinstance(task_id, str) or not task_id:
             return "a2a.task_submitted has no concrete durable task id"
 
+        poll_delay = A2A_CANCELLATION_POLL_INITIAL_SECONDS
         while True:
             snapshot = await self.task_manager.get_task_cancellation_snapshot(
                 task_id
@@ -545,7 +552,11 @@ class EventManagerMixin:
                     f"A2A task {task_id!r} was canceled while its "
                     "submission wake was executing"
                 )
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(poll_delay)
+            poll_delay = min(
+                poll_delay * 2,
+                A2A_CANCELLATION_POLL_MAX_SECONDS,
+            )
 
     def finish_cognition_signal_execution(self, signal) -> None:
         """Release any process-local exemption owned by a completed wake."""

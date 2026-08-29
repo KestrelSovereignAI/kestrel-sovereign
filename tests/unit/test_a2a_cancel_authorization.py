@@ -974,6 +974,45 @@ async def test_live_cancellation_monitor_uses_lightweight_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_live_cancellation_monitor_backs_off_durable_reads(monkeypatch):
+    """Long cognition turns must not poll shared storage at a fixed rate."""
+
+    snapshots = [
+        SimpleNamespace(state="submitted", actor_agent_id=None),
+        SimpleNamespace(state="submitted", actor_agent_id=None),
+        SimpleNamespace(state="submitted", actor_agent_id=None),
+        SimpleNamespace(state="canceled", actor_agent_id="did:test:creator"),
+    ]
+    task_manager = SimpleNamespace(
+        get_task_cancellation_snapshot=AsyncMock(side_effect=snapshots),
+    )
+    slept = []
+
+    async def record_sleep(delay):
+        slept.append(delay)
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.agent.event_manager.asyncio.sleep",
+        record_sleep,
+    )
+
+    class Recipient(EventManagerMixin):
+        did = "did:test:recipient"
+
+    recipient = Recipient()
+    recipient.task_manager = task_manager
+    signal = SimpleNamespace(
+        source="a2a.task_submitted",
+        payload={"task_id": "backing-off-monitor"},
+    )
+
+    withdrawal = await recipient.monitor_cognition_signal_execution(signal)
+
+    assert "was canceled while" in withdrawal
+    assert slept == [0.1, 0.2, 0.4]
+
+
+@pytest.mark.asyncio
 async def test_cancellation_snapshot_selects_only_authority_columns():
     """Polling must not fetch message, history, artifacts, or metadata."""
 
