@@ -1568,9 +1568,18 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.stop import StopReceiptStore
 
-        path = prepare_host_database()
-        db = await AsyncDatabase.sqlite(str(path))
-        validate_sqlite_family_private(path)
+        backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+        if backend == "postgres":
+            dsn = os.environ.get("KESTREL_DATABASE_URL")
+            if not dsn:
+                raise RuntimeError(
+                    "PostgreSQL Stop receipt storage requires KESTREL_DATABASE_URL"
+                )
+            db = await AsyncDatabase.postgres(dsn)
+        else:
+            path = prepare_host_database()
+            db = await AsyncDatabase.sqlite(str(path))
+            validate_sqlite_family_private(path)
         store = StopReceiptStore(db)
         await store.ensure_schema()
         app.state.stop_receipt_db = db
@@ -1596,6 +1605,22 @@ async def _shutdown_stop_receipts(app: FastAPI) -> None:
     app.state.stop_receipt_db = None
     if db is not None:
         await db.close()
+
+
+async def _shutdown_stop_cleanup(app: FastAPI) -> None:
+    """Drain application-owned Stop tails before their agents are released."""
+
+    from kestrel_sovereign.stop import StopCleanupRegistry
+
+    registry = getattr(app.state, "stop_cleanup_registry", None)
+    if registry is None:
+        return
+    if not isinstance(registry, StopCleanupRegistry):
+        raise TypeError("app Stop cleanup registry has an invalid type")
+    try:
+        await registry.drain()
+    finally:
+        app.state.stop_cleanup_registry = None
 
 
 async def _shutdown_phoenix(app: FastAPI) -> bool:
@@ -2173,6 +2198,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # it before unmounting host and feature surfaces, otherwise that late
         # onboarding can remount routes or UI after their only teardown pass.
         ("host-features", lambda: _shutdown_host_features(app)),
+        ("stop-cleanup", lambda: _shutdown_stop_cleanup(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
         ("stop-receipts", lambda: _shutdown_stop_receipts(app)),
         ("phoenix", lambda: _shutdown_phoenix(app)),

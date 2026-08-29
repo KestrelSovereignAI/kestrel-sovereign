@@ -7,6 +7,9 @@ from typing import Any
 from uuid import uuid4
 
 
+MAX_STOP_CORRELATION_ID_BYTES = 256
+
+
 class StopScope(str, Enum):
     """The addressable work boundary affected by a cooperative Stop.
 
@@ -81,9 +84,13 @@ class StopRequest:
         ):
             raise ValueError("correlation_id must be a concrete string")
         try:
-            self.correlation_id.encode("utf-8")
+            encoded_correlation_id = self.correlation_id.encode("utf-8")
         except UnicodeEncodeError as error:
             raise ValueError("correlation_id must be valid Unicode text") from error
+        if len(encoded_correlation_id) > MAX_STOP_CORRELATION_ID_BYTES:
+            raise ValueError(
+                "correlation_id must be no longer than 256 UTF-8 bytes"
+            )
         if self.scope is StopScope.TURN:
             if self.turn_id is None:
                 object.__setattr__(self, "turn_id", self.target)

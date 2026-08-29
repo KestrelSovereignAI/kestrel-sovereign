@@ -17,11 +17,18 @@ from .receipt import (
     StopReceiptStore,
     UnavailableStopReceiptStore,
 )
-from .types import StopDisposition, StopOutcome, StopRequest, StopScope
+from .types import (
+    MAX_STOP_CORRELATION_ID_BYTES,
+    StopDisposition,
+    StopOutcome,
+    StopRequest,
+    StopScope,
+)
 
 __all__ = [
     "CancellationAuthority",
     "CooperativeStopTarget",
+    "MAX_STOP_CORRELATION_ID_BYTES",
     "StopDisposition",
     "StopCleanupRegistry",
     "StopOutcome",

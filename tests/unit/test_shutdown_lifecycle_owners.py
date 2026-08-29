@@ -356,14 +356,24 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
     async def finish_stop_receipts(_app) -> None:
         phases.append("stop-receipts")
 
+    async def finish_stop_cleanup(_app) -> None:
+        phases.append("stop-cleanup")
+
     monkeypatch.setattr(server, "_shutdown_host_features", fail_host)
     monkeypatch.setattr(server, "_shutdown_server_agents", fail_agents)
+    monkeypatch.setattr(server, "_shutdown_stop_cleanup", finish_stop_cleanup)
     monkeypatch.setattr(server, "_shutdown_stop_receipts", finish_stop_receipts)
     monkeypatch.setattr(server, "_shutdown_phoenix", finish_phoenix)
 
     cancelled, failure = await server._shutdown_server_resources(app)
 
-    assert phases == ["host", "agents", "stop-receipts", "phoenix"]
+    assert phases == [
+        "host",
+        "stop-cleanup",
+        "agents",
+        "stop-receipts",
+        "phoenix",
+    ]
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
     assert str(failure) == "host failure"

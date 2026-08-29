@@ -144,6 +144,16 @@ def test_stop_request_rejects_non_utf8_correlation_identity() -> None:
         )
 
 
+def test_stop_request_bounds_correlation_identity_by_encoded_bytes() -> None:
+    with pytest.raises(ValueError, match="256 UTF-8 bytes"):
+        StopRequest(
+            scope=StopScope.AGENT,
+            actor_id="did:test:operator",
+            target="did:test:target",
+            correlation_id="é" * 129,
+        )
+
+
 def test_host_scope_rejects_a_target() -> None:
     with pytest.raises(ValueError, match="cannot carry a target"):
         StopRequest(
@@ -310,6 +320,35 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert cleanup_registry._tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_registry_drain_owns_tails_through_caller_cancellation() -> None:
+    release = asyncio.Event()
+
+    async def cleanup_tail() -> StopOutcome:
+        await release.wait()
+        return StopOutcome(
+            scope=StopScope.HOST,
+            requested_target=None,
+            resolved_target="tail",
+            agent_id="did:test:tail",
+            disposition=StopDisposition.STOPPED,
+            correlation_id="shutdown-tail",
+        )
+
+    registry = StopCleanupRegistry()
+    registry.retain(asyncio.create_task(cleanup_tail()))
+    drain = asyncio.create_task(registry.drain())
+    await asyncio.sleep(0)
+    drain.cancel()
+    await asyncio.sleep(0)
+    assert not drain.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await drain
+    assert registry._tasks == set()
 
 
 @pytest.mark.asyncio
@@ -721,7 +760,6 @@ def test_expired_pre_registration_stop_does_not_poison_a_future_reuse() -> None:
 async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     """The endpoint must not confuse a cancel marker with completed execution."""
     from kestrel_sovereign.agent.request_lifecycle import (
-        RequestCompletionDisposition,
         RequestLifecycleMixin,
     )
     from kestrel_sovereign.endpoints.agent import router

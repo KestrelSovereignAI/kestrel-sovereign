@@ -77,6 +77,21 @@ class StopCleanupRegistry:
 
         task.add_done_callback(consume)
 
+    async def drain(self) -> None:
+        """Join every retained cleanup tail before application teardown."""
+
+        pending_cancellation: asyncio.CancelledError | None = None
+        while self._tasks:
+            task = next(iter(self._tasks))
+            outcome = await await_owned_task(task, pending_cancellation)
+            if pending_cancellation is None:
+                pending_cancellation = outcome.cancellation
+            # The callback normally removes completed work. Discard explicitly
+            # as well so drain does not depend on callback scheduling order.
+            self._tasks.discard(task)
+        if pending_cancellation is not None:
+            raise pending_cancellation
+
 
 class CancellationAuthority:
     """Resolve Stop scopes and report every cooperative target independently."""
