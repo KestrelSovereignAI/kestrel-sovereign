@@ -2053,11 +2053,57 @@ async def test_stopped_persistent_registration_keeps_spawn_cap_slot(tmp_path):
     manager._persistent_spawn_offboarding.add(
         (manager._canonical_agent_name("PersistentChild"), child.agent_id)
     )
-    manager._prune_child_relationship_and_mandate(
-        parent.agent_id,
+    manager._retire_persistent_spawn_registration(
         "PersistentChild",
+        child.agent_id,
     )
     assert manager._committed_spawn_cap_slots() == 0
+
+
+@pytest.mark.asyncio
+async def test_persistent_registration_reserves_name_from_new_spawn(tmp_path):
+    """A stopped persistent child may cold-load, but cannot be replaced."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    canonical_name = manager._canonical_agent_name("PersistentChild")
+    manager._persistent_spawn_registrations[canonical_name] = (
+        "PersistentChild",
+        "did:test:persistent-name-owner",
+    )
+
+    with pytest.raises(ValueError, match="persistent spawn registration"):
+        await manager._admit_agent_operation("persistentchild", kind="spawn")
+
+    assert manager._agent_operations == {}
+
+
+def test_persistent_preflight_reserves_cap_before_feature_initialization(tmp_path):
+    """Verified startup authority consumes its slot even if initialize fails."""
+
+    parent_did = "did:test:preflight-reservation-parent"
+    child_did = "did:test:preflight-reservation-child"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Parent", parent)
+
+    manager._restore_persisted_spawn_authority(
+        "PersistentChild",
+        child,
+        child_did,
+        project=False,
+    )
+
+    assert manager._persistent_spawn_registrations[
+        manager._canonical_agent_name("PersistentChild")
+    ] == ("PersistentChild", child_did)
+    assert manager.get_mandate("PersistentChild") is None
+    assert manager._committed_spawn_cap_slots() == 1
 
 
 @pytest.mark.asyncio
@@ -2101,6 +2147,59 @@ async def test_endpoint_offboarding_retires_persistent_spawn_cap_slot(tmp_path):
     )
     assert admission.started is True
     assert manager._committed_spawn_cap_slots() == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_persistent_runtime_offboarding_keeps_registration_slot(tmp_path):
+    """Removing the startup row is not proof that runtime deletion succeeded."""
+
+    parent_did = "did:test:retained-persistent-parent"
+    child_did = "did:test:retained-persistent-child"
+    child = _make_mock_agent(child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["PersistentChild"] = child
+    manager._agent_names[child_did] = "PersistentChild"
+    manager._child_mandates["PersistentChild"] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=child_did,
+        ttl_seconds=0,
+    )
+    manager._parent_children[parent_did] = ["PersistentChild"]
+    canonical_name = manager._canonical_agent_name("PersistentChild")
+    manager._persistent_spawn_registrations[canonical_name] = (
+        "PersistentChild",
+        child_did,
+    )
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child_did: (parent_did, "PersistentChild")}
+    )
+
+    async def remove_registration(_name, _child_did):
+        return AsyncMock()
+
+    manager.set_created_agent_registration_removal_hook(remove_registration)
+    retained = RuntimeOffboardingRetainedError(
+        agent_name="PersistentChild",
+        agent_id=child_did,
+        runtime_path=Path("operator/runtime/persistent-child"),
+        cause=IsolatedRuntimeNamespaceError("foreign owner"),
+    )
+    manager._finish_agent_runtime_offboarding = AsyncMock(
+        return_value=(False, retained)
+    )
+
+    with pytest.raises(RuntimeOffboardingRetainedError):
+        await manager.terminate_child(
+            parent_did,
+            "PersistentChild",
+            offboard_runtime=True,
+        )
+
+    assert manager._persistent_spawn_registrations[canonical_name] == (
+        "PersistentChild",
+        child_did,
+    )
+    assert manager._committed_spawn_cap_slots() == 1
 
 
 @pytest.mark.asyncio
@@ -2388,6 +2487,132 @@ async def test_spawn_expired_before_commit_rolls_back_signed_receipt(tmp_path):
         )
 
     assert graph.add_trusted_cross_agent_edge.await_count == 2
+    revoked = graph.add_trusted_cross_agent_edge.await_args_list[-1]
+    assert revoked.kwargs["properties"]["parent_signature"] is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_expired_during_final_receipt_write_rolls_back_authority(
+    tmp_path,
+):
+    """The receipt write cannot consume the last instant of child authority."""
+
+    private_key, _ = generate_secp256k1_keypair()
+    parent = _make_mock_agent("did:test:post-write-deadline-parent")
+    parent._private_key = private_key
+    parent.identity = None
+    parent.features = {}
+    graph = SimpleNamespace(
+        add_trusted_cross_agent_edge=AsyncMock(),
+        delete_edge=AsyncMock(),
+    )
+    child = _make_mock_agent("did:test:post-write-deadline-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+
+    async def create_child(name, **_kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    with (
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+            side_effect=[1, 0],
+        ),
+        pytest.raises(RuntimeError, match="expired while its durable receipt committed"),
+    ):
+        await manager.spawn_agent(
+            "PostWriteDeadlineChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
+        )
+
+    assert graph.add_trusted_cross_agent_edge.await_count == 3
+    revoked = graph.add_trusted_cross_agent_edge.await_args_list[-1]
+    assert revoked.kwargs["properties"]["parent_signature"] is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_parent_expired_during_child_receipt_write_rolls_back_authority(
+    tmp_path,
+):
+    """A child cannot commit after its spawned parent's authority expires."""
+
+    root_did = "did:test:post-write-root"
+    parent_did = "did:test:post-write-spawned-parent"
+    root, parent_receipt = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=1,
+        max_child_depth=1,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent._persisted_spawn_mandate = parent_receipt
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    final_child_receipt_written = False
+    child_receipt_writes = 0
+
+    async def write_child_receipt(_source, _target, _label, *, properties):
+        nonlocal child_receipt_writes, final_child_receipt_written
+        child_receipt_writes += 1
+        if child_receipt_writes == 2:
+            final_child_receipt_written = True
+
+    graph = SimpleNamespace(
+        add_trusted_cross_agent_edge=AsyncMock(side_effect=write_child_receipt),
+        delete_edge=AsyncMock(),
+    )
+    child = _make_mock_agent("did:test:post-write-grandchild")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("SpawnedParent", parent)
+
+    async def create_child(name, **_kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    def remaining(created_at, _ttl_seconds):
+        if created_at == parent_receipt.created_at and final_child_receipt_written:
+            return 0
+        return 1
+
+    with (
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+            side_effect=remaining,
+        ),
+        pytest.raises(
+            RuntimeError,
+            match="parent durable authority was revoked or expired while child receipt committed",
+        ),
+    ):
+        await manager.spawn_agent(
+            "PostWriteGrandchild",
+            parent,
+            SpawnMandate(parent_did=parent_did, ttl_seconds=1),
+        )
+
+    assert graph.add_trusted_cross_agent_edge.await_count == 3
     revoked = graph.add_trusted_cross_agent_edge.await_args_list[-1]
     assert revoked.kwargs["properties"]["parent_signature"] is None
 

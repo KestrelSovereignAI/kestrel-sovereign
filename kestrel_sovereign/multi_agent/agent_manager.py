@@ -2108,14 +2108,14 @@ class AgentManager:
             raise RuntimeError(
                 "Persisted spawn authority exceeds the configured spawned-agent cap"
             )
-        if not project:
-            return
-
         if mandate.ttl_seconds <= 0:
             self._persistent_spawn_registrations[canonical_name] = (
                 name,
                 agent_id,
             )
+        if not project:
+            return
+
         children = self._parent_children.setdefault(parent_did, [])
         if not any(
             self._canonical_agent_name(child) == canonical_name for child in children
@@ -2751,6 +2751,14 @@ class AgentManager:
                 )
                 if existing_name is not None:
                     raise ValueError(f"Agent '{name}' already exists")
+                if (
+                    kind in {"create", "spawn", "direct-spawn-test"}
+                    and canonical_name in self._persistent_spawn_registrations
+                ):
+                    raise ValueError(
+                        f"Agent '{name}' has a persistent spawn registration; "
+                        "only its exact durable identity may be cold-loaded"
+                    )
                 # A failed quarantined refund restores this exact allocation so
                 # an operator can retry safely.  Reusing its name for a new
                 # identity before that cleanup resolves would make restoration
@@ -3759,16 +3767,11 @@ class AgentManager:
             # is therefore the terminal proof that this durable spawn
             # reservation can leave the cap, even though relationship pruning
             # already ran through the ordinary single-agent path.
-            canonical_name = self._canonical_agent_name(name)
             async with self._lock:
-                persistent_registration = (
-                    self._persistent_spawn_registrations.get(canonical_name)
+                self._retire_persistent_spawn_registration(
+                    name,
+                    known_agent_id,
                 )
-                if (
-                    persistent_registration is not None
-                    and persistent_registration[1] == known_agent_id
-                ):
-                    self._persistent_spawn_registrations.pop(canonical_name, None)
         return removed
 
     async def _join_active_spawn_before_removal(self, name: str) -> bool:
@@ -6411,6 +6414,42 @@ class AgentManager:
                                 parent_identity if parent_is_hybrid else None
                             ),
                         )
+                        if (
+                            mandate.ttl_seconds > 0
+                            and remaining_spawn_ttl_seconds(
+                                mandate.created_at,
+                                mandate.ttl_seconds,
+                            ) <= 0
+                        ):
+                            raise RuntimeError(
+                                "Spawn mandate expired while its durable receipt committed"
+                            )
+                        if admission.spawn_parent_mandate is not None:
+                            relations = (
+                                await self._verified_spawn_relations_under_lease()
+                            )
+                            parent_relation = relations.get(parent_did)
+                            if (
+                                parent_relation is None
+                                or parent_relation[1] != admission.spawn_parent_name
+                            ):
+                                raise RuntimeError(
+                                    "Spawned parent durable authority was revoked or "
+                                    "expired while child receipt committed"
+                                )
+                            # The parent relation read may itself await durable
+                            # storage. Recheck the child's local deadline once
+                            # more at the final governance linearization point.
+                            if (
+                                mandate.ttl_seconds > 0
+                                and remaining_spawn_ttl_seconds(
+                                    mandate.created_at,
+                                    mandate.ttl_seconds,
+                                ) <= 0
+                            ):
+                                raise RuntimeError(
+                                    "Spawn mandate expired while its durable receipt committed"
+                                )
                         async with self._lock:
                             if not self._spawn_operation_is_admitted(
                                 admission, child
@@ -6983,24 +7022,6 @@ class AgentManager:
         """Forget one fully removed child from parent spawn-cap bookkeeping."""
 
         mandate = self._child_mandates.get(child_name)
-        canonical_name = self._canonical_agent_name(child_name)
-        persistent_registration = self._persistent_spawn_registrations.get(
-            canonical_name
-        )
-        registered_did = (
-            persistent_registration[1]
-            if persistent_registration is not None
-            else (
-                mandate.child_did
-                if isinstance(mandate, SpawnMandate)
-                else None
-            )
-        )
-        if isinstance(registered_did, str) and registered_did:
-            offboarding_key = (canonical_name, registered_did)
-            if offboarding_key in self._persistent_spawn_offboarding:
-                self._persistent_spawn_registrations.pop(canonical_name, None)
-                self._persistent_spawn_offboarding.discard(offboarding_key)
         from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 
         lifecycle = getattr(self, "_lifecycle", None)
@@ -7020,6 +7041,21 @@ class AgentManager:
             if not children:
                 self._parent_children.pop(parent_did, None)
         self._child_mandates.pop(child_name, None)
+
+    def _retire_persistent_spawn_registration(
+        self,
+        name: str,
+        expected_agent_id: str,
+    ) -> None:
+        """Retire one exact reservation after runtime offboarding succeeded."""
+
+        canonical_name = self._canonical_agent_name(name)
+        registration = self._persistent_spawn_registrations.get(canonical_name)
+        if registration is not None and registration[1] == expected_agent_id:
+            self._persistent_spawn_registrations.pop(canonical_name, None)
+        self._persistent_spawn_offboarding.discard(
+            (canonical_name, expected_agent_id)
+        )
 
     async def _prune_child_tracking_if_fully_removed(
         self, parent_did: str, child_name: str
@@ -7481,6 +7517,7 @@ class AgentManager:
 
         registration_rollback: Optional[Callable[[], Awaitable[None]]] = None
         offboarding_admission: Optional[RuntimeOffboardingAdmission] = None
+        offboard_child_did: Optional[str] = None
         mandate = self._child_mandates.get(child_name)
         persistent_spawn = (
             isinstance(mandate, SpawnMandate) and mandate.ttl_seconds <= 0
@@ -7645,6 +7682,17 @@ class AgentManager:
                 terminal_outcomes,
             )
             return False
+
+        if offboard_child_did is not None:
+            # The startup row was removed before destructive admission, but the
+            # durable capacity/name reservation remains load-bearing until the
+            # exact runtime tree is proven gone by remove_agent's completed
+            # offboarding result.
+            async with self._lock:
+                self._retire_persistent_spawn_registration(
+                    child_name,
+                    offboard_child_did,
+                )
 
         # ``True`` means routing has been withdrawn, not necessarily that a
         # timeout/cancellation-resistant shutdown or fenced refund is done:
