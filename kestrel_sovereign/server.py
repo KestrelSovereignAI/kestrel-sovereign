@@ -542,7 +542,12 @@ def _bootstrap_key_enabled() -> bool:
 
 def get_api_key():
     """Get or generate the API key."""
-    api_key = os.environ.get("KESTREL_API_KEY")
+    raw_api_key = os.environ.get("KESTREL_API_KEY")
+    api_key = (
+        normalize_sovereign_api_key(raw_api_key)
+        if raw_api_key is not None
+        else ""
+    )
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
@@ -550,8 +555,9 @@ def get_api_key():
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
-    # Strip surrounding quotes (Docker --env-file includes them literally).
-    return normalize_sovereign_api_key(api_key)
+    # Surrounding quotes were stripped above (Docker --env-file includes them
+    # literally) before deciding whether a credential actually exists.
+    return api_key
 
 
 def get_peer_api_key() -> str:

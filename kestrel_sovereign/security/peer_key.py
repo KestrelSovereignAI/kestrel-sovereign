@@ -59,35 +59,36 @@ def ensure_peer_api_key(
 
     target = os.environ if environment is None else environment
     raw_sovereign_key = sovereign_key or target.get("KESTREL_API_KEY")
+    normalized_sovereign_key = (
+        normalize_sovereign_api_key(raw_sovereign_key)
+        if raw_sovereign_key
+        else ""
+    )
     raw_peer_key = target.get("KESTREL_PEER_API_KEY")
-    had_peer_key = bool(raw_peer_key)
+    peer_key = (
+        normalize_sovereign_api_key(raw_peer_key) if raw_peer_key else ""
+    )
+    had_peer_key = bool(peer_key)
     provenance = target.get(_PEER_KEY_PROVENANCE_ENV, "")
     peer_was_automatic = False
-    if raw_peer_key:
-        normalized_existing = normalize_sovereign_api_key(raw_peer_key)
+    if peer_key:
         peer_was_automatic = secrets.compare_digest(
             provenance,
-            _automatic_peer_key_provenance(normalized_existing),
+            _automatic_peer_key_provenance(peer_key),
         )
 
     sovereign_is_durable = bool(
-        raw_sovereign_key
-        and not is_ephemeral_sovereign_key(
-            normalize_sovereign_api_key(raw_sovereign_key)
-        )
+        normalized_sovereign_key
+        and not is_ephemeral_sovereign_key(normalized_sovereign_key)
     )
-    if not raw_peer_key or (peer_was_automatic and sovereign_is_durable):
-        raw_peer_key = (
-            derive_peer_api_key(raw_sovereign_key)
-            if raw_sovereign_key
+    if not peer_key or (peer_was_automatic and sovereign_is_durable):
+        peer_key = (
+            derive_peer_api_key(normalized_sovereign_key)
+            if normalized_sovereign_key
             else secrets.token_urlsafe(32)
         )
-    peer_key = normalize_sovereign_api_key(raw_peer_key)
 
-    if raw_sovereign_key:
-        normalized_sovereign_key = normalize_sovereign_api_key(
-            raw_sovereign_key
-        )
+    if normalized_sovereign_key:
         if secrets.compare_digest(peer_key, normalized_sovereign_key):
             raise RuntimeError(
                 "KESTREL_PEER_API_KEY must be distinct from KESTREL_API_KEY"

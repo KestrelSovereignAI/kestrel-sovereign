@@ -243,6 +243,45 @@ def test_generated_peer_key_is_stable_and_distinct(monkeypatch):
     assert first != "sovereign-key"
 
 
+def test_quoted_empty_sovereign_key_is_replaced_by_ephemeral_bootstrap(monkeypatch):
+    """Docker-style quotes must not turn an absent secret into empty authority."""
+
+    from kestrel_sovereign.security.sovereign_key import (
+        is_ephemeral_sovereign_key,
+    )
+
+    monkeypatch.setenv("KESTREL_API_KEY", '""')
+
+    selected = server_module.get_api_key()
+
+    assert selected
+    assert selected == os.environ["KESTREL_API_KEY"]
+    assert selected != '""'
+    assert is_ephemeral_sovereign_key(selected)
+
+
+def test_quoted_empty_peer_key_is_replaced_not_derived_from_empty_secret(monkeypatch):
+    """An explicitly quoted empty peer key is missing, not operator authority."""
+
+    from kestrel_sovereign.security.peer_key import (
+        derive_peer_api_key,
+        ensure_peer_api_key,
+    )
+
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    monkeypatch.setenv("KESTREL_PEER_API_KEY", '""')
+    monkeypatch.delenv(
+        "KESTREL_INTERNAL_PEER_API_KEY_PROVENANCE",
+        raising=False,
+    )
+
+    selected = ensure_peer_api_key()
+
+    assert selected
+    assert selected == os.environ["KESTREL_PEER_API_KEY"]
+    assert selected != derive_peer_api_key("")
+
+
 def test_random_peer_key_survives_ephemeral_sovereign_bootstrap(monkeypatch):
     """A late temporary API key cannot invalidate already-issued peer keys."""
 
