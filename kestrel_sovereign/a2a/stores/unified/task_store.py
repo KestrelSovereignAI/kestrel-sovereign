@@ -310,6 +310,7 @@ class TaskStore(UnifiedStoreBase):
         await self._backend.execute_script("""
             DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
             DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v2;
+            DROP TRIGGER IF EXISTS a2a_tasks_terminal_replace_v3;
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_update_v3
             BEFORE UPDATE ON a2a_tasks
             FOR EACH ROW
@@ -318,7 +319,7 @@ class TaskStore(UnifiedStoreBase):
                 SELECT RAISE(ABORT, 'terminal A2A task cannot be replaced');
             END;
 
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_replace_v3
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_replace_v4
             BEFORE INSERT ON a2a_tasks
             FOR EACH ROW
             WHEN EXISTS (
@@ -328,7 +329,11 @@ class TaskStore(UnifiedStoreBase):
                    AND status IN ('completed', 'failed', 'canceled')
             )
             BEGIN
-                SELECT RAISE(ABORT, 'terminal A2A task cannot be replaced');
+                -- IGNORE runs before SQLite's REPLACE conflict action deletes
+                -- the occupied row. It therefore fences legacy INSERT OR
+                -- REPLACE while allowing modern INSERT ... ON CONFLICT DO
+                -- NOTHING to report its normal zero-row duplicate outcome.
+                SELECT RAISE(IGNORE);
             END;
 
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_replace_v3

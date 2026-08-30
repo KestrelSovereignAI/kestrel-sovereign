@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from kestrel_sovereign.a2a.stores.unified.task_store import (
+    TaskAlreadyExistsError,
     TaskMutationAuthorizationError,
     TaskStore,
 )
@@ -18,7 +19,6 @@ from kestrel_sovereign.a2a.types import (
     TextPart,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
-from kestrel_sovereign.storage.db.interface import QueryError
 
 
 POSTGRES_URL = (
@@ -204,18 +204,22 @@ async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
         )
         assert canceled is not None
 
-        with pytest.raises(
-            QueryError,
-            match="terminal A2A task cannot be replaced",
-        ):
-            await backend.execute(
-                """
-                INSERT OR REPLACE INTO a2a_tasks
-                    (id, task_type, status, creator_agent_id, recipient_agent_id)
-                VALUES (?, 'generic', 'completed', ?, ?)
-                """,
-                (task_id, creator, recipient),
+        with pytest.raises(TaskAlreadyExistsError):
+            await store.create(
+                Task(id=task_id, status=TaskStatus(state=TaskState.SUBMITTED)),
+                creator_agent_id=creator,
+                recipient_agent_id=recipient,
             )
+
+        rows = await backend.execute(
+            """
+            INSERT OR REPLACE INTO a2a_tasks
+                (id, task_type, status, creator_agent_id, recipient_agent_id)
+            VALUES (?, 'generic', 'completed', ?, ?)
+            """,
+            (task_id, creator, recipient),
+        )
+        assert rows == 0
 
         persisted = await store.get(task_id)
         assert persisted.status.state is TaskState.CANCELED
