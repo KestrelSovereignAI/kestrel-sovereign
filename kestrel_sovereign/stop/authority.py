@@ -307,8 +307,9 @@ class CancellationAuthority:
                 for target in inventory
                 if target.agent_id == request.target_agent_id
                 and (
-                    request.target in target.turn_ids
-                    or request.target in target.turn_request_ids
+                    request.target in target.turn_request_ids
+                    if request.target_is_turn_id
+                    else request.target in target.turn_ids
                 )
             )
         else:

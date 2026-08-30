@@ -136,11 +136,69 @@ function makeConsoleRenderer({ onStop }) {
         stopBtn.title = `Stop ${name}`;
         stopBtn.setAttribute('aria-label', `Stop ${name}`);
         stopBtn.innerHTML = '&times;';
-        stopBtn.addEventListener('click', (e) => {
+        const outcomeEl = doc.createElement('span');
+        outcomeEl.className = 'agent-stop-outcome';
+        outcomeEl.setAttribute('role', 'status');
+        outcomeEl.setAttribute('aria-live', 'polite');
+        outcomeEl.hidden = true;
+        const routedTarget = item.name;
+        stopBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (typeof onStop === 'function') onStop(item.name);
+            if (stopBtn.disabled || typeof onStop !== 'function') return;
+            stopBtn.disabled = true;
+            outcomeEl.hidden = false;
+            outcomeEl.dataset.disposition = 'requested';
+            outcomeEl.textContent = 'Stopping…';
+            try {
+                const result = await onStop(routedTarget);
+                const outcomes = Array.isArray(result?.outcomes)
+                    ? result.outcomes
+                    : (
+                        Array.isArray(result?.stop_outcomes)
+                            ? result.stop_outcomes
+                            : (
+                                Array.isArray(result?.response?.stop_outcomes)
+                                    ? result.response.stop_outcomes
+                                    : []
+                            )
+                    );
+                const targetIds = [
+                    routedTarget,
+                    item.id,
+                    item.raw && item.raw.did,
+                    item.raw && item.raw.id,
+                ].filter((value) => typeof value === 'string' && value);
+                const outcome = outcomes.find((candidate) => (
+                    candidate
+                    && targetIds.includes(candidate.resolved_target || candidate.agent_id)
+                )) || outcomes[0] || null;
+                const disposition = outcome && typeof outcome.disposition === 'string'
+                    ? outcome.disposition
+                    : (result === true ? 'stopped' : 'unreachable');
+                const labels = {
+                    stopped: 'Stopped',
+                    already_complete: 'Already complete',
+                    refused: 'Stop refused',
+                    unreachable: 'Stop unreachable',
+                    indeterminate: 'Stop indeterminate',
+                };
+                outcomeEl.dataset.disposition = disposition;
+                outcomeEl.textContent = labels[disposition] || `Stop: ${disposition}`;
+                outcomeEl.title = outcome && typeof outcome.detail === 'string'
+                    ? outcome.detail
+                    : outcomeEl.textContent;
+            } catch (error) {
+                outcomeEl.dataset.disposition = 'unreachable';
+                outcomeEl.textContent = 'Stop unreachable';
+                outcomeEl.title = error && error.message
+                    ? error.message
+                    : 'Cooperative Stop request failed';
+            } finally {
+                stopBtn.disabled = false;
+            }
         });
         frag.appendChild(stopBtn);
+        frag.appendChild(outcomeEl);
 
         return frag;
     };

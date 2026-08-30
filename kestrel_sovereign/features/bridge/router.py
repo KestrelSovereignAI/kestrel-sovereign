@@ -271,7 +271,34 @@ def get_router() -> APIRouter:
                         request_id
                     ),
                 )
-                async for chunk in agent_stream:
+                bind_stream_owner = getattr(
+                    agent, "bind_request_operation", None
+                )
+                if callable(bind_stream_owner):
+                    bind_stream_owner(request_id, agent_stream.owner_task)
+                first_item = True
+                while True:
+                    if (
+                        not first_item
+                        and agent_stream.owner_task.cancelling()
+                        and callable(request_cancelled)
+                        and request_cancelled(request_id) is True
+                    ):
+                        yield stopped_event()
+                        return
+                    first_item = False
+                    try:
+                        chunk = await anext(agent_stream)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.CancelledError:
+                        if (
+                            callable(request_cancelled)
+                            and request_cancelled(request_id) is True
+                        ):
+                            yield stopped_event()
+                            return
+                        raise
                     if (
                         callable(request_cancelled)
                         and request_cancelled(request_id) is True

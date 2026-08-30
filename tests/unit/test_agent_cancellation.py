@@ -644,6 +644,101 @@ class TestAgentCancellation:
         await asyncio.wait_for(completion, timeout=1)
 
     @pytest.mark.asyncio
+    async def test_stop_interrupts_stream_blocked_before_its_next_chunk(self):
+        """The transport binds the producer task, not only its request marker."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        producer_started = asyncio.Event()
+        producer_closed = asyncio.Event()
+
+        class LiveAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+
+            async def process_input_streaming(self, *_args, **_kwargs):
+                try:
+                    producer_started.set()
+                    await asyncio.Event().wait()
+                    yield "must not escape"
+                finally:
+                    producer_closed.set()
+
+        agent = LiveAgent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "blocked-stream"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+        next_chunk = asyncio.create_task(anext(response.body_iterator))
+        await asyncio.wait_for(producer_started.wait(), timeout=1)
+
+        assert agent.cancel_current_request("blocked-stream") is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion("blocked-stream")
+        )
+        assert "Request stopped" in await asyncio.wait_for(
+            next_chunk, timeout=1
+        )
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(response.body_iterator), timeout=1)
+        await asyncio.wait_for(producer_closed.wait(), timeout=1)
+        await asyncio.wait_for(completion, timeout=1)
+
+    def test_both_stream_transports_bind_the_owned_producer_task(self):
+        """Mutation tripwire for the bridge and direct-stream wiring seams."""
+
+        import inspect
+
+        from kestrel_sovereign.endpoints import agent as agent_endpoint
+        from kestrel_sovereign.features.bridge import router as bridge_router
+
+        direct_source = inspect.getsource(agent_endpoint)
+        bridge_source = inspect.getsource(bridge_router)
+        binding = "bind_stream_owner(request_id, agent_stream.owner_task)"
+
+        assert binding in direct_source
+        assert binding in bridge_source
+
+    @pytest.mark.asyncio
     async def test_stream_closes_context_bound_turn_in_its_owner_task(self):
         """Nested turn ContextVars must be reset in the task that bound them."""
 
@@ -964,8 +1059,8 @@ class TestAgentCancellation:
         completion = asyncio.create_task(
             agent.wait_for_request_completion("natural-cleanup-failure")
         )
-        assert "could not be completed" in await anext(stream)
-        with pytest.raises(StopAsyncIteration):
+        assert "Request stopped" in await anext(stream)
+        with pytest.raises(RuntimeError, match="natural cleanup failed"):
             await anext(stream)
 
         assert (
@@ -2121,12 +2216,14 @@ class TestStopEndpoint:
             yield "The answer "
             yield "is 42."
 
-        # ``is_request_cancelled`` is consulted once before cognition and once
-        # per chunk inside the loop (all must be False so both chunks pass
-        # through). It would return True on
+        # ``is_request_cancelled`` is consulted at the entry and after each
+        # chunk (all must be False so both chunks pass through). An actual
+        # producer-task cancellation adds a before-next boundary without
+        # polling this predicate for a merely late synthetic marker. It would
+        # return True on
         # any later call — modeling a stop that lands only after the final chunk
         # was already yielded. On the pre-fix code the post-loop fallback would
-        # call this a 3rd time, see True, and wrongly append the stop notice; the
+        # make one later call, see True, and wrongly append the stop notice; the
         # fixed fallback short-circuits on ``response_chunk_yielded`` and never
         # reaches this predicate again.
         cancel_calls = {"n": 0}
