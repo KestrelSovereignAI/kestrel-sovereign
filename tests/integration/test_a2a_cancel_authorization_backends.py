@@ -16,6 +16,7 @@ from kestrel_sovereign.a2a.types import (
     TextPart,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.db.interface import QueryError
 
 
 POSTGRES_URL = (
@@ -174,6 +175,52 @@ async def test_cancel_task_authorization_sqlite(tmp_path):
     try:
         await _exercise_authorized_cancel(TaskStore(backend))
     finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_legacy_insert_or_replace_cannot_overwrite_cancellation(tmp_path):
+    """A mixed-version writer cannot erase a committed cancellation receipt."""
+
+    backend = SQLiteBackend(str(tmp_path / "cancel-replace-fence.db"))
+    await backend.connect()
+    store = TaskStore(backend)
+    task_id = f"cancel-replace-{uuid4().hex}"
+    creator = f"did:test:creator:{uuid4().hex}"
+    recipient = f"did:test:recipient:{uuid4().hex}"
+    try:
+        await store.initialize()
+        await store.save(
+            Task(id=task_id, status=TaskStatus(state=TaskState.WORKING)),
+            creator_agent_id=creator,
+            recipient_agent_id=recipient,
+        )
+        assert await store.cancel_if_authorized(
+            task_id,
+            actor_agent_id=creator,
+            reason="committed before stale writer",
+        )
+
+        with pytest.raises(QueryError, match="canceled A2A task is terminal"):
+            await backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks
+                    (id, task_type, status, metadata)
+                VALUES (?, 'generic', 'completed', '{}')
+                """,
+                (task_id,),
+            )
+
+        canceled = await store.get(task_id)
+        assert canceled is not None
+        assert canceled.status.state is TaskState.CANCELED
+        assert canceled.metadata["cancellation_receipt"] == {
+            "actor_agent_id": creator,
+            "reason": "committed before stale writer",
+            "status_before": "working",
+        }
+    finally:
+        await store.delete(task_id)
         await backend.close()
 
 
