@@ -66,11 +66,12 @@ class StopReceipt:
 
 def _fingerprint(request: StopRequest) -> str:
     semantic_request = request.to_dict()
-    # Trace/span identify the transport attempt that first carried an
-    # operation; they are evidence, not Stop semantics.  An exact retry may
-    # arrive on a new span and must still replay the original receipt.
+    # Trace/span/turn identify evidence inferred from the transport attempt;
+    # they are not Stop semantics. An exact request-ID retry can arrive after
+    # the live turn index is gone and must still replay the original receipt.
     semantic_request.pop("span_id", None)
     semantic_request.pop("trace_id", None)
+    semantic_request.pop("turn_id", None)
     canonical = json.dumps(
         semantic_request,
         sort_keys=True,
@@ -448,7 +449,9 @@ class StopReceiptStore:
             raise StopReceiptConflict(
                 "Stop operation identity was reused for a different request"
             )
-        if row[5] != expected_requested_target or row[10] != expected_turn_id:
+        if row[5] != expected_requested_target or (
+            expected_turn_id is not None and row[10] != expected_turn_id
+        ):
             raise StopReceiptCorruptError(
                 "Stop receipt opaque target identity is invalid"
             )
@@ -481,7 +484,13 @@ class StopReceiptStore:
                 "Stop receipt requested_target is invalid"
             )
         if row[10] is not None and (
-            not isinstance(row[10], str) or not row[10]
+            not isinstance(row[10], str)
+            or not row[10].startswith("sha256:")
+            or len(row[10]) != 71
+            or any(
+                character not in "0123456789abcdef"
+                for character in row[10][7:]
+            )
         ):
             raise StopReceiptCorruptError("Stop receipt turn_id is invalid")
         outcome_rows = await self._db.fetchall(
@@ -567,7 +576,6 @@ class StopReceiptStore:
             receipt.target_agent_id,
             receipt.reason,
             receipt.cascade,
-            receipt.turn_id,
         )
         supplied = (
             request.correlation_id,
@@ -577,7 +585,6 @@ class StopReceiptStore:
             request.target_agent_id,
             request.reason,
             request.cascade,
-            request.turn_id,
         )
         if recorded != supplied:
             raise StopReceiptCorruptError(

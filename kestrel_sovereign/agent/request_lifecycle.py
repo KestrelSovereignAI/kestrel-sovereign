@@ -84,6 +84,26 @@ class RequestLifecycleMixin:
             return False
         return True
 
+    async def await_durable_turn_address_binding(
+        self,
+        turn_id: str,
+        request_id: str,
+        generation: int | None,
+    ) -> bool:
+        """Publish a public turn alias before exposing or executing the turn."""
+
+        registry = getattr(self, "_distributed_invocation_registry", None)
+        if registry is None:
+            return True
+        if generation is None:
+            raise RuntimeError(
+                "durable turn binding requires an active request generation"
+            )
+        bind = getattr(registry, "bind_turn_address", None)
+        if not callable(bind):
+            raise TypeError("distributed invocation registry cannot bind turns")
+        return await bind(self, turn_id, request_id, generation)
+
     def _complete_durable_request_generation(
         self,
         request_id: str,

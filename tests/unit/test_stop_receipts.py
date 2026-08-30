@@ -301,6 +301,41 @@ async def test_exact_retry_preserves_first_transport_trace_evidence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_request_id_retry_replays_after_inferred_turn_index_is_gone(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-turn-correlation-retry.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        first = StopRequest(
+            scope=StopScope.TURN,
+            actor_id="did:test:operator",
+            target="request-private",
+            target_agent_id="did:test:agent",
+            correlation_id="same-request-id-stop",
+            turn_id="turn-visible-while-live",
+            target_is_turn_id=False,
+        )
+        written = await store.persist(first, _outcomes(first))
+        retry = replace(first, turn_id=None)
+
+        loaded = await store.load(retry)
+        replayed = await store.persist(
+            retry,
+            _outcomes(retry, StopDisposition.ALREADY_COMPLETE),
+        )
+
+        assert loaded is not None
+        assert loaded.receipt_id == written.receipt_id
+        assert loaded.outcomes == written.outcomes
+        assert replayed.receipt_id == written.receipt_id
+        assert replayed.outcomes == written.outcomes
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_operation_reuse_for_different_request_fails_closed(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -981,6 +1016,43 @@ def test_live_endpoint_waits_for_remote_owner_before_reporting_stopped():
         "did:test:agent", "turn-on-replica-a"
     )
     remote.wait_for_stop.assert_awaited_once()
+
+
+def test_public_turn_stop_resolves_only_through_remote_registry():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    remote = MagicMock()
+    remote.request_turn = AsyncMock(
+        return_value=DistributedStopTicket(("remote-generation",))
+    )
+    remote.wait_for_stop = AsyncMock(return_value=StopDisposition.STOPPED)
+    app.state.distributed_invocation_registry = remote
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = set()
+    agent.active_turn_request_bindings = MagicMock(return_value={})
+    agent.active_turn_trace_identities = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "turn-on-replica-a"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] is True
+    remote.request_turn.assert_awaited_once_with(
+        "did:test:agent", "turn-on-replica-a"
+    )
+    remote.wait_for_stop.assert_awaited_once()
+    agent.cancel_current_request.assert_not_called()
 
 
 @pytest.mark.parametrize(

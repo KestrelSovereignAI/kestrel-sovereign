@@ -27,7 +27,7 @@ from kestrel_sovereign.storage.database_clock import database_now_sql
 from .receipt import StopReceiptStore, opaque_stop_identifier
 from .types import StopDisposition
 
-_SCHEMA_LOCK = "stop_invocations_v1"
+_SCHEMA_LOCK = "stop_invocations_v2"
 _TURN_ID_DOMAIN = b"kestrel:distributed-stop-turn:v1\0"
 _DEFAULT_POLL_SECONDS = 0.1
 _DEFAULT_WAIT_SECONDS = 4.0
@@ -74,6 +74,7 @@ class DistributedInvocationStore:
                 "generation_id TEXT NOT NULL PRIMARY KEY, "
                 "agent_id TEXT NOT NULL, "
                 "turn_digest TEXT NOT NULL, "
+                "turn_address_digest TEXT, "
                 "owner_id TEXT NOT NULL, "
                 "stop_requested INTEGER NOT NULL DEFAULT 0, "
                 "registered_at TEXT NOT NULL, "
@@ -87,9 +88,27 @@ class DistributedInvocationStore:
                 "created_at TEXT NOT NULL, "
                 "PRIMARY KEY (agent_id, turn_digest))"
             )
+            if getattr(self._db, "backend_type", "") == "postgres":
+                await self._db.execute(
+                    "ALTER TABLE stop_active_invocations "
+                    "ADD COLUMN IF NOT EXISTS turn_address_digest TEXT"
+                )
+            else:
+                columns = await self._db.fetchall(
+                    "PRAGMA table_info(stop_active_invocations)"
+                )
+                if "turn_address_digest" not in {str(row[1]) for row in columns}:
+                    await self._db.execute(
+                        "ALTER TABLE stop_active_invocations "
+                        "ADD COLUMN turn_address_digest TEXT"
+                    )
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stop_active_agent_turn "
                 "ON stop_active_invocations(agent_id, turn_digest)"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stop_active_agent_address "
+                "ON stop_active_invocations(agent_id, turn_address_digest)"
             )
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stop_active_owner "
@@ -151,6 +170,74 @@ class DistributedInvocationStore:
                 raise RuntimeError("distributed Stop registration was not durable")
         return True
 
+    async def bind_turn_address(
+        self,
+        *,
+        generation_id: str,
+        agent_id: str,
+        turn_id: str,
+        owner_id: str,
+    ) -> bool:
+        """Bind a public turn address to one admitted transport generation.
+
+        The address is minted after request admission.  Binding therefore has
+        its own fence race: a remote Stop may durably fence the public address
+        before the owning replica publishes it.  That race fails closed and
+        the caller aborts before cognition begins.
+        """
+
+        generation_id = _required_identity(generation_id, "generation identity")
+        agent_id = _required_identity(agent_id, "agent identity")
+        turn_id = _required_identity(turn_id, "turn identity")
+        owner_id = _required_identity(owner_id, "owner identity")
+        digest = _turn_digest(turn_id)
+        async with self._db.transaction(immediate=True):
+            await self._lock_agent(agent_id)
+            row = await self._db.fetchone(
+                "SELECT turn_address_digest FROM stop_active_invocations "
+                "WHERE generation_id = ? AND agent_id = ? AND owner_id = ?",
+                (generation_id, agent_id, owner_id),
+            )
+            if row is None:
+                raise RuntimeError(
+                    "distributed Stop turn binding lost its admitted generation"
+                )
+            if row[0] is not None:
+                if row[0] != digest:
+                    raise RuntimeError(
+                        "distributed Stop generation already has another turn address"
+                    )
+                return True
+            fenced = await self._db.fetchone(
+                "SELECT 1 FROM stop_invocation_fences "
+                "WHERE agent_id = ? AND turn_digest = ?",
+                (agent_id, digest),
+            )
+            acknowledged = await self._db.fetchone(
+                "SELECT 1 FROM stop_receipts AS receipt "
+                "JOIN stop_receipt_outcomes AS outcome "
+                "ON outcome.receipt_id = receipt.receipt_id "
+                "WHERE receipt.scope = 'turn' "
+                "AND receipt.target_agent_id = ? "
+                "AND receipt.requested_target = ? "
+                "AND outcome.disposition IN ('stopped', 'already_complete') "
+                "LIMIT 1",
+                (agent_id, opaque_stop_identifier("target", turn_id)),
+            )
+            if fenced is not None or acknowledged is not None:
+                return False
+            changed = await self._db.execute(
+                "UPDATE stop_active_invocations SET turn_address_digest = ? "
+                "WHERE generation_id = ? AND agent_id = ? AND owner_id = ? "
+                "AND turn_address_digest IS NULL",
+                (digest, generation_id, agent_id, owner_id),
+            )
+            if changed != 1:
+                raise RuntimeError(
+                    "distributed Stop turn binding changed inside its agent lock"
+                )
+        return True
+
     async def complete(self, generation_id: str, owner_id: str) -> None:
         generation_id = _required_identity(generation_id, "generation identity")
         owner_id = _required_identity(owner_id, "owner identity")
@@ -193,16 +280,18 @@ class DistributedInvocationStore:
             )
             rows = await self._db.fetchall(
                 "SELECT generation_id FROM stop_active_invocations "
-                "WHERE agent_id = ? AND turn_digest = ? "
+                "WHERE agent_id = ? "
+                "AND (turn_digest = ? OR turn_address_digest = ?) "
                 "ORDER BY generation_id",
-                (agent_id, digest),
+                (agent_id, digest, digest),
             )
             generation_ids = tuple(str(row[0]) for row in rows)
             if generation_ids:
                 changed = await self._db.execute(
                     "UPDATE stop_active_invocations SET stop_requested = 1 "
-                    "WHERE agent_id = ? AND turn_digest = ?",
-                    (agent_id, digest),
+                    "WHERE agent_id = ? "
+                    "AND (turn_digest = ? OR turn_address_digest = ?)",
+                    (agent_id, digest, digest),
                 )
                 if changed != len(generation_ids):
                     raise RuntimeError(
@@ -303,7 +392,7 @@ class DistributedInvocationRegistry:
         self._store = store
         self._owner_id = uuid4().hex
         self._poll_seconds = float(poll_seconds)
-        self._active: dict[str, tuple[object, str]] = {}
+        self._active: dict[str, tuple[object, str, int]] = {}
         self._by_local_generation: dict[tuple[int, str, int], str] = {}
         self._registration_lock = asyncio.Lock()
         self._registration_tasks: set[asyncio.Task[bool]] = set()
@@ -356,7 +445,7 @@ class DistributedInvocationRegistry:
                 if not admitted:
                     return False
                 self._by_local_generation[key] = generation_id
-                self._active[generation_id] = (agent, turn_id)
+                self._active[generation_id] = (agent, turn_id, generation)
                 return True
 
         owner = asyncio.create_task(publish(), name="distributed-stop-register")
@@ -366,6 +455,29 @@ class DistributedInvocationRegistry:
         return raise_owned_outcome(
             outcome, operation="distributed Stop invocation registration"
         )
+
+    async def bind_turn_address(
+        self,
+        agent: object,
+        turn_id: str,
+        request_id: str,
+        generation: int,
+    ) -> bool:
+        """Publish the lifecycle-owned public alias for an admitted generation."""
+
+        key = (id(agent), request_id, generation)
+        async with self._registration_lock:
+            generation_id = self._by_local_generation.get(key)
+            if generation_id is None:
+                raise RuntimeError(
+                    "distributed Stop turn binding requires durable admission"
+                )
+            return await self._store.bind_turn_address(
+                generation_id=generation_id,
+                agent_id=self._agent_id(agent),
+                turn_id=turn_id,
+                owner_id=self._owner_id,
+            )
 
     def complete_soon(self, agent: object, turn_id: str, generation: int) -> None:
         """Own durable cleanup from the mixin's synchronous finally path."""
@@ -450,10 +562,10 @@ class DistributedInvocationRegistry:
                     target = self._active.get(generation_id)
                     if target is None:
                         continue
-                    agent, turn_id = target
+                    agent, request_id, generation = target
                     cancel = getattr(agent, "cancel_current_request", None)
                     if callable(cancel):
-                        cancel(request_id=turn_id)
+                        cancel(request_id=request_id, generation=generation)
             except asyncio.CancelledError:
                 raise
             except Exception as error:

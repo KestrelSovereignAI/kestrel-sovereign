@@ -28,9 +28,13 @@ from uuid import uuid4
 
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
-from kestrel_sovereign.agent.invocation import current_invocation_id
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    current_invocation_id,
+)
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.telemetry import (
+    KESTREL_TURN_ID,
     current_turn_id as telemetry_current_turn_id,
     span_trace_identity,
     turn_span_scope,
@@ -293,6 +297,12 @@ class TurnLifecycleMixin:
     def bind_current_turn_span(self, span: object) -> bool:
         """Bind a concrete OTel span to the live turn when it is valid."""
 
+        turn_id = self.get_current_turn_id()
+        if turn_id is None or turn_id != getattr(self, "_live_turn_id", None):
+            return False
+        set_attribute = getattr(span, "set_attribute", None)
+        if callable(set_attribute):
+            set_attribute(KESTREL_TURN_ID, turn_id)
         trace_id, span_id = span_trace_identity(span)
         if trace_id is None or span_id is None:
             return False
@@ -478,6 +488,20 @@ class TurnLifecycleMixin:
                         request_generation,
                     )
                     request_binding_registered = True
+                    durable_bind = getattr(
+                        self,
+                        "await_durable_turn_address_binding",
+                        None,
+                    )
+                    if callable(durable_bind) and not await durable_bind(
+                        turn_id,
+                        request_id,
+                        request_generation,
+                    ):
+                        raise InvocationCancelledError(
+                            "invocation was stopped before its public turn "
+                            "address became live"
+                        )
                 yield turn_id
             finally:
                 try:

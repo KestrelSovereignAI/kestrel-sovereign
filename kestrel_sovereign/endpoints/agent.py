@@ -1150,7 +1150,18 @@ async def stop_agent_request(request: Request):
             turn_request_generations = {}
         if not isinstance(turn_request_ids, dict):
             raise TypeError("agent turn request inventory has an invalid type")
+        distributed_stop = getattr(
+            request.app.state,
+            "distributed_invocation_registry",
+            None,
+        )
         turn_addresses = active_request_ids.union(turn_request_ids)
+        if turn_id is not None and distributed_stop is not None:
+            # A public address can belong to another replica and therefore be
+            # absent from this process's live index.  The shared registry is the
+            # authority that resolves it; admit that exact address to the Stop
+            # seam without pretending it is a process-local request ID.
+            turn_addresses.add(turn_id)
 
         trace_accessor = vars(agent).get("active_turn_trace_identities")
         if not callable(trace_accessor):
@@ -1198,11 +1209,6 @@ async def stop_agent_request(request: Request):
         target_span_id = trace_identity[1] if trace_identity is not None else None
 
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
-            distributed_stop = getattr(
-                request.app.state,
-                "distributed_invocation_registry",
-                None,
-            )
             distributed_ticket = None
             if distributed_stop is not None:
                 if stop_request.scope is StopScope.TURN:
@@ -1216,13 +1222,20 @@ async def stop_agent_request(request: Request):
                     )
             cancelled_request_ids: list[Optional[str]] = []
             if stop_request.scope is StopScope.TURN:
-                cancel_kwargs = {"request_id": stop_request.target}
-                if stop_request.request_generation is not None:
-                    cancel_kwargs["generation"] = stop_request.request_generation
-                canceled = agent.cancel_current_request(**cancel_kwargs)
-                if canceled:
-                    cancelled_request_ids.append(stop_request.target)
-                else:
+                # An unresolved public address belongs to the distributed
+                # registry.  Never feed it to the local request-ID API: doing
+                # that reserves a tombstone for an unrelated transport key.
+                canceled = False
+                if not stop_request.target_is_turn_id:
+                    cancel_kwargs = {"request_id": stop_request.target}
+                    if stop_request.request_generation is not None:
+                        cancel_kwargs["generation"] = (
+                            stop_request.request_generation
+                        )
+                    canceled = agent.cancel_current_request(**cancel_kwargs)
+                    if canceled:
+                        cancelled_request_ids.append(stop_request.target)
+                if not canceled and not stop_request.target_is_turn_id:
                     # The matching invoke/stream may have been dispatched by
                     # the client but not yet reached lifecycle registration.
                     # Fence that exact ID briefly; registration consumes the
