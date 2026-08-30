@@ -3,6 +3,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from typing import Any, Dict, List, Optional
 import asyncio
 import inspect
@@ -73,6 +74,36 @@ LEGACY_CONTEXT_MODEL = "legacy/unknown"
 _KITE_EVIDENCE_CONTRACT = "kite-http-evidence-v1"
 _KITE_EVIDENCE_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
 _KITE_EVIDENCE_VALUE_RE = re.compile(r"^kite-evidence-[A-Za-z0-9_-]{20,128}$")
+
+
+class _CloseAwareStreamBody:
+    """Run setup cleanup even when a response body is never first-pulled."""
+
+    def __init__(self, iterator, cleanup) -> None:
+        self._iterator = iterator
+        self._cleanup = cleanup
+        self._started = False
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        self._started = True
+        return await self._iterator.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self._started:
+            self._cleanup()
+            return
+        close = getattr(self._iterator, "aclose", None)
+        if callable(close):
+            await close()
 
 
 def _kite_release_evidence_allowed(agent: Any) -> bool:
@@ -680,9 +711,14 @@ async def stream_agent_response(request: Request):
     stream_delivery_id = None
     request_lifecycle_registered = False
     stream_tap_registered = False
+    setup_cleanup_complete = False
 
     def cleanup_unstarted_stream() -> None:
         """Undo setup if constructing the response fails before generation."""
+        nonlocal setup_cleanup_complete
+        if setup_cleanup_complete:
+            return
+        setup_cleanup_complete = True
         if stream_tap_registered and stream_tap is not None and stream_delivery_id is not None:
             stream_tap.unregister(stream_delivery_id)
         if request_lifecycle_registered and agent is not None and request_id is not None:
@@ -758,6 +794,7 @@ async def stream_agent_response(request: Request):
             effective_session_id = session_id  # fall back; never block the stream
 
         async def generate():
+            nonlocal setup_cleanup_complete
             # Shared stop notice for the in-loop cancel check AND the post-loop
             # fallback (#2674). A strict (fail-closed) response audit that is
             # stopped before dispatch WITHHOLDS every chunk and returns cleanly,
@@ -909,6 +946,7 @@ async def stream_agent_response(request: Request):
                             )
                         else:
                             agent._cleanup_cancelled_request(request_id)
+                        setup_cleanup_complete = True
 
         headers = {
             "Cache-Control": "no-cache",
@@ -919,10 +957,14 @@ async def stream_agent_response(request: Request):
         if effective_session_id:
             headers["X-Session-Id"] = effective_session_id
         return StreamingResponse(
-            generate(),
+            _CloseAwareStreamBody(generate(), cleanup_unstarted_stream),
             media_type="text/plain",
             headers=headers,
+            background=BackgroundTask(cleanup_unstarted_stream),
         )
+    except asyncio.CancelledError:
+        cleanup_unstarted_stream()
+        raise
     except HTTPException:
         cleanup_unstarted_stream()
         raise

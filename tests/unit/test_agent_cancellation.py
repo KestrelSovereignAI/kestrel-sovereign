@@ -2361,6 +2361,126 @@ class TestStopEndpoint:
         assert AgentStreamTap.get_instance()._queues == {}
 
     @pytest.mark.asyncio
+    async def test_stream_cancelled_during_durable_admission_cleans_lifecycle(self):
+        """A committed admission cannot outlive pre-response cancellation."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        admission_started = asyncio.Event()
+
+        class Agent:
+            def __init__(self):
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+                self.register_active_request = MagicMock()
+                self._cleanup_cancelled_request = MagicMock()
+
+            async def await_durable_request_admission(self, _request_id):
+                admission_started.set()
+                await asyncio.Event().wait()
+
+        agent = Agent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "cancelled-admission"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        operation = asyncio.create_task(endpoint(request))
+        await asyncio.wait_for(admission_started.wait(), timeout=1.0)
+
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "cancelled-admission"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unstarted_stream_body_close_cleans_tap_and_lifecycle(self):
+        """Closing a response before its first pull cannot leave a live row."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+        from kestrel_sovereign.streams.tap import AgentStreamTap
+
+        AgentStreamTap.reset()
+        agent = MagicMock()
+        agent.register_active_request = MagicMock()
+        agent._cleanup_cancelled_request = MagicMock()
+        agent.storage.resolve_session_id = AsyncMock(return_value=None)
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "unstarted-response"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+
+        await response.body_iterator.aclose()
+
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "unstarted-response"
+        )
+        assert AgentStreamTap.get_instance()._queues == {}
+
+    @pytest.mark.asyncio
     async def test_stream_endpoint_rejects_invalid_client_request_id(self):
         """Malformed retry ids never reach cancellation or provenance code."""
         from fastapi import FastAPI

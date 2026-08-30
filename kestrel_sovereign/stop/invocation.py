@@ -308,6 +308,7 @@ class DistributedInvocationRegistry:
         self._registration_lock = asyncio.Lock()
         self._registration_tasks: set[asyncio.Task[bool]] = set()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._cleanup_keys: set[tuple[int, str, int]] = set()
         self._relay_task: asyncio.Task[None] | None = None
         self._closing = False
 
@@ -371,13 +372,30 @@ class DistributedInvocationRegistry:
 
         key = (id(agent), turn_id, generation)
         generation_id = self._by_local_generation.get(key)
-        if generation_id is None:
+        if generation_id is None or key in self._cleanup_keys:
             return
+        self._cleanup_keys.add(key)
 
         async def complete() -> None:
-            await self._store.complete(generation_id, self._owner_id)
-            self._by_local_generation.pop(key, None)
-            self._active.pop(generation_id, None)
+            try:
+                while not self._closing:
+                    try:
+                        await self._store.complete(generation_id, self._owner_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        logger.error(
+                            "Distributed Stop completion failed; retrying (%s)",
+                            type(error).__name__,
+                            exc_info=(type(error), error, error.__traceback__),
+                        )
+                        await asyncio.sleep(self._poll_seconds)
+                        continue
+                    self._by_local_generation.pop(key, None)
+                    self._active.pop(generation_id, None)
+                    return
+            finally:
+                self._cleanup_keys.discard(key)
 
         task = asyncio.create_task(
             complete(), name=f"distributed-stop-complete:{generation_id}"
@@ -465,6 +483,7 @@ class DistributedInvocationRegistry:
         await self._store.delete_owner(self._owner_id)
         self._active.clear()
         self._by_local_generation.clear()
+        self._cleanup_keys.clear()
 
 
 __all__ = [

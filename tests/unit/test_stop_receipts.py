@@ -317,6 +317,19 @@ async def test_operation_reuse_for_different_request_fails_closed(tmp_path):
 
         with pytest.raises(StopReceiptConflict):
             await store.load(conflicting)
+
+        target_conflict = StopRequest(
+            scope=StopScope.TURN,
+            actor_id=first.actor_id,
+            target="different-target",
+            target_agent_id=first.target_agent_id,
+            reason=first.reason,
+            cascade=first.cascade,
+            correlation_id=operation,
+            turn_id="different-target",
+        )
+        with pytest.raises(StopReceiptConflict):
+            await store.load(target_conflict)
     finally:
         await db.close()
 
