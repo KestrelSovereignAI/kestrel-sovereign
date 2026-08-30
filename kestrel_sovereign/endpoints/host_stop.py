@@ -171,7 +171,15 @@ async def stop_host(
         if outcome.disposition
         in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
     )
-    if not targets:
+    empty_inventory = (
+        len(outcomes) == 1
+        and outcomes[0].scope is StopScope.HOST
+        and outcomes[0].requested_target is None
+        and outcomes[0].resolved_target == StopScope.HOST.value
+        and outcomes[0].agent_id == StopScope.HOST.value
+    )
+    target_count = 0 if empty_inventory else len(outcomes)
+    if empty_inventory:
         state = "empty"
     elif confirmed and unconfirmed:
         state = "partial"
@@ -180,9 +188,9 @@ async def stop_host(
     else:
         state = "confirmed"
     return {
-        "success": bool(targets) and not unconfirmed,
+        "success": target_count > 0 and not unconfirmed,
         "state": state,
-        "target_count": len(targets),
+        "target_count": target_count,
         "confirmed_count": len(confirmed),
         "unconfirmed_count": len(unconfirmed),
         "correlation_id": stop_request.correlation_id,

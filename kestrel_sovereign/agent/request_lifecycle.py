@@ -88,7 +88,15 @@ class RequestLifecycleMixin:
         self,
         request_id: str,
         generation: int | None,
+        disposition: RequestCompletionDisposition,
     ) -> None:
+        if not isinstance(disposition, RequestCompletionDisposition):
+            raise TypeError("durable completion disposition must be typed")
+        if disposition is RequestCompletionDisposition.ABANDONED:
+            # ABANDONED means local cleanup could not prove that work ended.
+            # Retain its shared inventory so a requester observes durable
+            # indeterminacy rather than an empty set misreported as STOPPED.
+            return
         if generation is None:
             return
         registry = getattr(self, "_distributed_invocation_registry", None)
@@ -680,7 +688,11 @@ class RequestLifecycleMixin:
                 final_disposition,
                 generation=generation,
             )
-            self._complete_durable_request_generation(request_id, generation)
+            self._complete_durable_request_generation(
+                request_id,
+                generation,
+                final_disposition,
+            )
             return
 
         cleans_active_generation = (
@@ -726,7 +738,11 @@ class RequestLifecycleMixin:
                 effective_disposition,
                 generation=generation,
             )
-            self._complete_durable_request_generation(request_id, generation)
+            self._complete_durable_request_generation(
+                request_id,
+                generation,
+                effective_disposition,
+            )
 
     def _release_cancelled_generation(
         self,

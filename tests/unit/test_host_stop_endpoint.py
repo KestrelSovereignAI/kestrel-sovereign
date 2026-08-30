@@ -16,11 +16,12 @@ class _ReceiptStore:
     def __init__(self, on_load=None):
         self.on_load = on_load
         self.persisted = []
+        self.replay = None
 
     async def load(self, request):
         if self.on_load is not None:
             self.on_load()
-        return None
+        return self.replay
 
     async def persist(self, request, outcomes):
         receipt_id = f"receipt-{request.correlation_id}"
@@ -252,6 +253,35 @@ def test_host_stop_rechecks_work_admitted_during_receipt_preflight():
         call(request_id="turn-a"),
         call(request_id="turn-b"),
     ]
+
+
+def test_host_stop_replay_summary_uses_receipted_not_fresh_inventory():
+    original = _agent("did:test:original", {"original-turn"})
+    store = _ReceiptStore()
+    app, manager = _app(
+        agents={"Original": original},
+        caller=CallerContext.sovereign(),
+        receipt_store=store,
+    )
+    client = TestClient(app)
+    body = {"reason": "andon", "correlation_id": "stable-host-stop"}
+
+    first = client.post("/api/host/stop", json=body)
+    assert first.status_code == 200
+    store.replay = store.persisted[0][1]
+    later = _agent("did:test:later", {"later-turn"})
+    manager.list_agents.return_value = {
+        "Later": later,
+        "Original": original,
+    }
+
+    replay = client.post("/api/host/stop", json=body)
+
+    assert replay.status_code == 200
+    assert replay.json()["state"] == first.json()["state"]
+    assert replay.json()["target_count"] == first.json()["target_count"] == 1
+    assert replay.json()["confirmed_count"] == 1
+    later.cancel_current_request.assert_not_called()
 
 
 def test_server_mounts_host_stop_and_implementation_has_no_process_lifecycle():

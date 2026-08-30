@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     CooperativeStopTarget,
+    DistributedStopTicket,
     StopCleanupRegistry,
     StopDisposition,
     StopOutcome,
@@ -877,6 +878,17 @@ def test_turn_stop_cannot_cancel_a_reused_request_generation() -> None:
     agent = LiveAgent()
     app = FastAPI()
     app.state.stop_receipt_store = _MemoryReceiptStore()
+    distributed = MagicMock()
+    distributed.request_generation = AsyncMock(
+        return_value=DistributedStopTicket(())
+    )
+    distributed.request_turn = AsyncMock(
+        side_effect=AssertionError("exact generation widened to request fence")
+    )
+    distributed.wait_for_stop = AsyncMock(
+        return_value=StopDisposition.ALREADY_COMPLETE
+    )
+    app.state.distributed_invocation_registry = distributed
     app.include_router(router)
     app.state.agent = agent
 
@@ -893,6 +905,12 @@ def test_turn_stop_cannot_cancel_a_reused_request_generation() -> None:
     assert "reused-request" not in getattr(
         agent, "_pending_request_cancellations", {}
     )
+    distributed.request_generation.assert_awaited_once_with(
+        agent,
+        "reused-request",
+        1,
+    )
+    distributed.request_turn.assert_not_awaited()
 
 
 def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:

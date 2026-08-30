@@ -1,11 +1,15 @@
 """Cross-replica live-work authority for cooperative Stop (#3152)."""
 
 import asyncio
+from unittest.mock import MagicMock, call
 from uuid import uuid4
 
 import pytest
 
-from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
+)
 from kestrel_sovereign.stop import (
     DistributedInvocationRegistry,
     DistributedInvocationStore,
@@ -42,6 +46,8 @@ async def test_distributed_protocol_has_sqlite_postgres_parity(db_backend):
         turn_id=turn_id,
         owner_id=owner_id,
     )
+    exact_ticket = await store.mark_generation(generation_id, agent_id)
+    assert exact_ticket.generation_ids == (generation_id,)
     ticket = await store.mark_turn(agent_id, turn_id)
     assert ticket.generation_ids == (generation_id,)
     assert len(await store.remaining(ticket.generation_ids)) == 1
@@ -162,6 +168,111 @@ async def test_stop_on_replica_b_cancels_invocation_owned_by_replica_a(tmp_path)
         if not operation.done():
             operation.cancel()
             await asyncio.gather(operation, return_exceptions=True)
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pruned", [False, True])
+async def test_abandoned_cleanup_preserves_indeterminate_durable_generation(
+    tmp_path,
+    pruned,
+):
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:abandoned-agent")
+    replica_a.attach(agent)
+    turn_id = f"abandoned-{'pruned' if pruned else 'active'}"
+    try:
+        generation = agent.register_active_request(turn_id)
+        assert await agent.await_durable_request_admission(turn_id)
+        generation_id = replica_a._by_local_generation[
+            (id(agent), turn_id, generation)
+        ]
+        if pruned:
+            agent._active_request_started_at[turn_id] -= 1000
+            assert agent.prune_stale_active_requests(900) == [turn_id]
+
+        agent._cleanup_cancelled_request(
+            turn_id,
+            disposition=RequestCompletionDisposition.ABANDONED,
+        )
+        await asyncio.sleep(0.05)
+
+        ticket = await replica_b.request_turn(agent.agent_id, turn_id)
+        assert ticket.generation_ids == (generation_id,)
+        assert (
+            await replica_b.wait_for_stop(ticket, timeout_seconds=0.05)
+            is StopDisposition.UNREACHABLE
+        )
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_generation_stop_marks_no_request_id_fence(tmp_path):
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:exact-generation-agent")
+    try:
+        assert await replica_a.register(agent, "reused-turn", 1)
+        assert await replica_a.register(agent, "reused-turn", 2)
+        first_generation = replica_a._by_local_generation[
+            (id(agent), "reused-turn", 1)
+        ]
+        second_generation = replica_a._by_local_generation[
+            (id(agent), "reused-turn", 2)
+        ]
+
+        ticket = await replica_a.request_generation(agent, "reused-turn", 1)
+
+        assert ticket.generation_ids == (first_generation,)
+        assert await store.remaining((first_generation,))
+        assert await store.remaining((second_generation,))
+        assert await first_db.fetchone(
+            "SELECT 1 FROM stop_invocation_fences"
+        ) is None
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_cancels_each_selected_local_generation_exactly(tmp_path):
+    first_db, second_db, _store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:relay-generation-agent")
+    agent.cancel_current_request = MagicMock(return_value=True)
+    try:
+        assert await replica_a.register(agent, "reused-turn", 1)
+        assert await replica_a.register(agent, "reused-turn", 2)
+
+        await replica_b.request_turn(agent.agent_id, "reused-turn")
+        for _ in range(100):
+            if agent.cancel_current_request.call_count >= 2:
+                break
+            await asyncio.sleep(0.01)
+
+        assert call(request_id="reused-turn", generation=1) in (
+            agent.cancel_current_request.call_args_list
+        )
+        assert call(request_id="reused-turn", generation=2) in (
+            agent.cancel_current_request.call_args_list
+        )
+        assert call(request_id="reused-turn") not in (
+            agent.cancel_current_request.call_args_list
+        )
+    finally:
         await replica_a.close()
         await replica_b.close()
         await first_db.close()

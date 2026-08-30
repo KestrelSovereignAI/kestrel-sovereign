@@ -118,10 +118,19 @@ def build_runtime_stop_target(
         distributed_ticket = None
         if distributed_registry is not None:
             if stop_request.scope is StopScope.TURN:
-                distributed_ticket = await distributed_registry.request_turn(
-                    agent_id,
-                    stop_request.target,
-                )
+                if stop_request.request_generation is not None:
+                    distributed_ticket = (
+                        await distributed_registry.request_generation(
+                            agent,
+                            stop_request.target,
+                            stop_request.request_generation,
+                        )
+                    )
+                else:
+                    distributed_ticket = await distributed_registry.request_turn(
+                        agent_id,
+                        stop_request.target,
+                    )
             else:
                 distributed_ticket = await distributed_registry.request_agent(
                     agent_id

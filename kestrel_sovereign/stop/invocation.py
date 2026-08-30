@@ -304,6 +304,41 @@ class DistributedInvocationStore:
                     )
         return DistributedStopTicket(generation_ids)
 
+    async def mark_generation(
+        self,
+        generation_id: str,
+        agent_id: str,
+    ) -> DistributedStopTicket:
+        """Mark one exact durable generation without fencing its request ID."""
+
+        generation_id = _required_identity(generation_id, "generation identity")
+        agent_id = _required_identity(agent_id, "agent identity")
+        async with self._db.transaction(immediate=True):
+            await self._lock_agent(agent_id)
+            row = await self._db.fetchone(
+                "SELECT generation_id, 1 AS is_active "
+                "FROM stop_active_invocations "
+                "WHERE generation_id = ? AND agent_id = ? "
+                "UNION ALL "
+                "SELECT generation_id, 0 AS is_active "
+                "FROM stop_unresolved_invocations "
+                "WHERE generation_id = ? AND agent_id = ?",
+                (generation_id, agent_id, generation_id, agent_id),
+            )
+            if row is None:
+                return DistributedStopTicket(())
+            if int(row[1]) == 1:
+                changed = await self._db.execute(
+                    "UPDATE stop_active_invocations SET stop_requested = 1 "
+                    "WHERE generation_id = ? AND agent_id = ?",
+                    (generation_id, agent_id),
+                )
+                if changed != 1:
+                    raise RuntimeError(
+                        "distributed Stop generation changed inside its lock"
+                    )
+        return DistributedStopTicket((generation_id,))
+
     async def poll_owner(
         self,
         owner_id: str,
@@ -482,7 +517,7 @@ class DistributedInvocationRegistry:
         self._owner_id = uuid4().hex
         self._poll_seconds = float(poll_seconds)
         self._owner_lease_seconds = float(owner_lease_seconds)
-        self._active: dict[str, tuple[object, str]] = {}
+        self._active: dict[str, tuple[object, str, int]] = {}
         self._by_local_generation: dict[tuple[int, str, int], str] = {}
         self._registration_lock = asyncio.Lock()
         self._registration_tasks: set[asyncio.Task[bool]] = set()
@@ -555,7 +590,7 @@ class DistributedInvocationRegistry:
                     await self._store.complete(generation_id, self._owner_id)
                     return False
                 self._by_local_generation[key] = generation_id
-                self._active[generation_id] = (agent, turn_id)
+                self._active[generation_id] = (agent, turn_id, generation)
                 self._last_heartbeat_monotonic = (
                     asyncio.get_running_loop().time()
                 )
@@ -625,6 +660,30 @@ class DistributedInvocationRegistry:
     async def request_turn(self, agent_id: str, turn_id: str) -> DistributedStopTicket:
         return await self._store.mark_turn(agent_id, turn_id)
 
+    async def request_generation(
+        self,
+        agent: object,
+        turn_id: str,
+        generation: int,
+    ) -> DistributedStopTicket:
+        """Stop one locally resolved generation without fencing later reuse."""
+
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+        ):
+            raise ValueError("distributed Stop local generation must be positive")
+        generation_id = self._by_local_generation.get(
+            (id(agent), turn_id, generation)
+        )
+        if generation_id is None:
+            return DistributedStopTicket(())
+        return await self._store.mark_generation(
+            generation_id,
+            self._agent_id(agent),
+        )
+
     async def request_agent(self, agent_id: str) -> DistributedStopTicket:
         return await self._store.mark_agent(agent_id)
 
@@ -657,11 +716,11 @@ class DistributedInvocationRegistry:
         if self._lease_lost:
             return
         self._lease_lost = True
-        for agent, turn_id in tuple(self._active.values()):
+        for agent, turn_id, generation in tuple(self._active.values()):
             cancel = getattr(agent, "cancel_current_request", None)
             if callable(cancel):
                 try:
-                    cancel(request_id=turn_id)
+                    cancel(request_id=turn_id, generation=generation)
                 except Exception:
                     logger.exception(
                         "Distributed Stop owner self-fence cancellation failed"
@@ -687,10 +746,10 @@ class DistributedInvocationRegistry:
                         target = self._active.get(generation_id)
                         if target is None:
                             continue
-                        agent, turn_id = target
+                        agent, turn_id, generation = target
                         cancel = getattr(agent, "cancel_current_request", None)
                         if callable(cancel):
-                            cancel(request_id=turn_id)
+                            cancel(request_id=turn_id, generation=generation)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
