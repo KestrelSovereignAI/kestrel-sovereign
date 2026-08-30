@@ -2164,6 +2164,11 @@ class KestrelAgent(
             # — the missing piece behind every "I sent it, did you
             # get it?" thread (#645 / Emma↔Meridian).
             on_task_submitted=self._on_task_submitted,
+            # Cancellation is durable before this callback fires.  The agent
+            # uses it to suppress the matching queued cognition delivery so a
+            # withdrawn task cannot execute from its inline signal payload.
+            on_task_cancelled=self._on_task_cancelled,
+            on_task_cancellation_started=self._on_task_cancellation_started,
             # Provider returns the in-flight cognition turn's
             # causation chain (serialized) so outbound A2A tasks
             # carry the lineage. The dispatcher sets the chain on
@@ -2172,6 +2177,7 @@ class KestrelAgent(
             # See #905 review P1 — without this, A→B→A loops would
             # restart at depth 1 every iteration.
             causation_chain_provider=self._provide_causation_chain,
+            host_agent_id=self.did,
         )
         # Register teardown BEFORE initialize: ``TaskManager.initialize()`` opens
         # its A2A store connections (task/session/observability/memory/feedback)

@@ -36,8 +36,17 @@ from kestrel_sovereign.a2a.stores import (
     ObservabilityStore,
     FeedbackStore,
 )
+from kestrel_sovereign.a2a.stores.unified.task_store import (
+    TaskCancellationSnapshot,
+    without_reserved_cancellation_receipt,
+)
 from typing import Protocol, runtime_checkable, TYPE_CHECKING
 from uuid import uuid4
+
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
@@ -55,6 +64,10 @@ class TaskHandler(Protocol):
         ...
 
 logger = logging.getLogger(__name__)
+
+
+class TaskCancellationAuthorizationError(PermissionError):
+    """The caller has no durable creator/recipient authority for a task."""
 
 
 # Valid state transitions
@@ -88,6 +101,11 @@ class TaskManager:
         on_task_complete: Optional[Callable[[Task], None]] = None,
         on_task_submitted: Optional[Callable[[Task], None]] = None,
         causation_chain_provider: Optional[Callable[[], Optional[list]]] = None,
+        host_agent_id: Optional[str] = None,
+        on_task_cancelled: Optional[Callable[[Task], None]] = None,
+        on_task_cancellation_started: Optional[
+            Callable[[str, str], Optional[Callable[[], None]]]
+        ] = None,
     ):
         self.task_store = task_store
         self.session_service = session_service
@@ -95,6 +113,11 @@ class TaskManager:
         self.memory_service = memory_service
         self.feedback_store = feedback_store
         self.hooks_manager = hooks_manager
+        if host_agent_id is not None and (
+            not isinstance(host_agent_id, str) or not host_agent_id.strip()
+        ):
+            raise ValueError("host_agent_id must be a concrete durable identity")
+        self.host_agent_id = host_agent_id
 
         # Callback for task completion notifications (for chat notifications)
         self._on_task_complete = on_task_complete
@@ -108,6 +131,15 @@ class TaskManager:
         # task created by a peer agent sits SUBMITTED in the store with
         # nobody acting on it until the next user-driven chat turn.
         self._on_task_submitted = on_task_submitted
+        # Durable cancellation callback.  The owning agent uses this to cancel
+        # an already-queued ``a2a.task_submitted`` cognition delivery after the
+        # task row has atomically reached CANCELED.
+        self._on_task_cancelled = on_task_cancelled
+        # Process-local intent is announced before the shared-store await so a
+        # live execution monitor cannot observe the committed row and cancel
+        # the recipient's own decline before the post-commit callback runs.
+        # The callback returns a rollback closure for refused/failed attempts.
+        self._on_task_cancellation_started = on_task_cancellation_started
 
         # Callback returning the in-flight cognition turn's causation
         # chain (already serialized as list of dicts) or None when no
@@ -134,6 +166,9 @@ class TaskManager:
 
         # Background skill executions started by execute_skill(sync=False).
         self._execution_tasks: set[asyncio.Task[None]] = set()
+        self._execution_authorities: dict[
+            asyncio.Task[None], tuple[str, str]
+        ] = {}
 
     async def initialize(self) -> None:
         """Initialize all stores."""
@@ -305,6 +340,7 @@ class TaskManager:
             raise ValueError(f"Unknown agent: {agent_id}")
 
         _, handler = self._agents[agent_id]
+        authority_agent_id = self.host_agent_id or agent_id
         hook_feature_name = getattr(handler, "name", None) or agent_id
 
         # Create task
@@ -344,7 +380,11 @@ class TaskManager:
                     metadata={"skill": skill_id, "args": args, "agent_id": agent_id, "denied": True},
                     history=[],
                 )
-                await self.task_store.save(task)
+                await self.task_store.save(
+                    task,
+                    creator_agent_id=authority_agent_id,
+                    recipient_agent_id=authority_agent_id,
+                )
                 return task
 
             # Note: SecurityHook handles ASK internally by blocking until
@@ -369,26 +409,39 @@ class TaskManager:
         )
 
         # Save initial task state
-        await self.task_store.save(task)
+        await self.task_store.save(
+            task,
+            creator_agent_id=authority_agent_id,
+            recipient_agent_id=authority_agent_id,
+        )
 
         if sync:
             # Execute synchronously with transaction safety
             task = await handler.handle_task(task)
-            try:
-                async with self.task_store._backend.transaction():
-                    await self.task_store.save(task)
-            except Exception as save_err:
-                logger.error(
-                    f"Failed to save completed task {task.id}: {save_err}. "
-                    "Retrying outside transaction..."
+            if task.status.state is TaskState.CANCELED:
+                task = await self._persist_handler_cancellation(
+                    task,
+                    authority_agent_id=authority_agent_id,
                 )
+            else:
+                saved: Optional[bool] = None
                 try:
-                    await self.task_store.save(task)
-                except Exception as retry_err:
-                    logger.critical(
-                        f"Task {task.id} completed but save failed permanently: {retry_err}. "
-                        f"Result lost for skill={skill_id}, agent={agent_id}"
+                    async with self.task_store._backend.transaction():
+                        saved = await self.task_store.save(task)
+                except Exception as save_err:
+                    logger.error(
+                        f"Failed to save completed task {task.id}: {save_err}. "
+                        "Retrying outside transaction..."
                     )
+                    try:
+                        saved = await self.task_store.save(task)
+                    except Exception as retry_err:
+                        logger.critical(
+                            f"Task {task.id} completed but save failed permanently: {retry_err}. "
+                            f"Result lost for skill={skill_id}, agent={agent_id}"
+                        )
+                if saved is False:
+                    task = await self.task_store.get(task.id) or task
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
@@ -410,14 +463,29 @@ class TaskManager:
 
             return task
         else:
-            self._track_execution_task(self._execute_async(handler, task), task.id)
+            self._track_execution_task(
+                self._execute_async(handler, task, authority_agent_id),
+                task.id,
+                authority_agent_id,
+            )
             return task
 
-    def _track_execution_task(self, coro: Coroutine[Any, Any, None], task_id: str) -> asyncio.Task[None]:
+    def _track_execution_task(
+        self,
+        coro: Coroutine[Any, Any, None],
+        task_id: str,
+        authority_agent_id: str,
+    ) -> asyncio.Task[None]:
         """Own background task execution so close() can cancel and await it."""
         task = asyncio.create_task(coro, name=f"a2a-task-{task_id}")
         self._execution_tasks.add(task)
-        task.add_done_callback(self._execution_tasks.discard)
+        self._execution_authorities[task] = (task_id, authority_agent_id)
+
+        def _discard(done: asyncio.Task[None]) -> None:
+            self._execution_tasks.discard(done)
+            self._execution_authorities.pop(done, None)
+
+        task.add_done_callback(_discard)
         return task
 
     async def drain_execution_tasks(self, *, cancel: bool = False) -> None:
@@ -427,25 +495,100 @@ class TaskManager:
             return
 
         if cancel:
+            caller_cancelled = False
             for task in tasks:
-                task.cancel()
+                binding = self._execution_authorities.get(task)
+                if binding is not None:
+                    task_id, authority_agent_id = binding
+                    try:
+                        await self.cancel_task(
+                            task_id,
+                            reason="Task canceled during shutdown",
+                            agent_name=authority_agent_id,
+                        )
+                    except ValueError:
+                        pass
+                    except asyncio.CancelledError:
+                        caller_cancelled = True
+                    except Exception:
+                        # Shutdown must still stop the in-memory worker when its
+                        # durable receipt cannot be persisted. The backend error
+                        # is observable in logs, but cannot strand the worker or
+                        # prevent the remaining stores from closing.
+                        logger.exception(
+                            "Could not persist shutdown cancellation for task %s",
+                            task_id,
+                        )
+                    finally:
+                        task.cancel()
+                else:
+                    task.cancel()
 
         await asyncio.gather(*tasks, return_exceptions=True)
         self._execution_tasks.difference_update(tasks)
+        if cancel and caller_cancelled:
+            raise asyncio.CancelledError()
 
-    async def _execute_async(self, handler: TaskHandler, task: Task) -> None:
+    @staticmethod
+    def _cancellation_reason(task: Task) -> str:
+        message = task.status.message
+        if message is not None:
+            for part in message.parts:
+                text = getattr(part, "text", None)
+                if isinstance(text, str) and text:
+                    return text
+        return "Task canceled"
+
+    async def _persist_handler_cancellation(
+        self,
+        task: Task,
+        *,
+        authority_agent_id: str,
+    ) -> Task:
+        """Commit handler cancellation or return an earlier terminal winner."""
+
+        try:
+            return await self.cancel_task(
+                task.id,
+                reason=self._cancellation_reason(task),
+                agent_name=authority_agent_id,
+                task_payload=task,
+            )
+        except ValueError:
+            current = await self.task_store.get(task.id)
+            if current is not None and current.status.state in {
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.CANCELED,
+            }:
+                return current
+            raise
+
+    async def _execute_async(
+        self,
+        handler: TaskHandler,
+        task: Task,
+        authority_agent_id: str,
+    ) -> None:
         """Execute a task asynchronously and update the store."""
         try:
             task = await handler.handle_task(task)
-            await self.task_store.save(task)
-            await self._notify_status_update(task, final=True)
-        except asyncio.CancelledError:
-            task.status = TaskStatus(
-                state=TaskState.CANCELED,
-                message=Message(role="agent", parts=[TextPart(text="Task cancelled during shutdown")])
+            task, owns_notification = await self._persist_execution_outcome(
+                task, authority_agent_id=authority_agent_id
             )
-            await self.task_store.save(task)
-            await self._notify_status_update(task, final=True)
+            if owns_notification:
+                await self._notify_status_update(task, final=True)
+        except asyncio.CancelledError:
+            try:
+                await self.cancel_task(
+                    task.id,
+                    reason="Task canceled during shutdown",
+                    agent_name=authority_agent_id,
+                )
+            except ValueError:
+                # An independently authorized cancellation or other terminal
+                # result won the race. Never narrate over that durable state.
+                pass
             raise
         except Exception as e:
             logger.error(f"Async task execution failed: {e}")
@@ -453,8 +596,36 @@ class TaskManager:
                 state=TaskState.FAILED,
                 message=Message(role="agent", parts=[TextPart(text=str(e))])
             )
-            await self.task_store.save(task)
-            await self._notify_status_update(task, final=True)
+            task, owns_notification = await self._persist_execution_outcome(
+                task, authority_agent_id=authority_agent_id
+            )
+            if owns_notification:
+                await self._notify_status_update(task, final=True)
+
+    async def _persist_execution_outcome(
+        self,
+        task: Task,
+        *,
+        authority_agent_id: str,
+    ) -> tuple[Task, bool]:
+        """Persist a worker result and report ownership of terminal notification."""
+
+        if task.status.state is TaskState.CANCELED:
+            return (
+                await self._persist_handler_cancellation(
+                    task,
+                    authority_agent_id=authority_agent_id,
+                ),
+                False,
+            )
+
+        saved = await self.task_store.save(task)
+        if saved is False:
+            # Another terminal writer won its CAS and owns the corresponding
+            # completion signal. Returning its durable state must not emit the
+            # same terminal event a second time.
+            return (await self.task_store.get(task.id) or task), False
+        return task, True
 
     async def execute_command(self, user_input: str) -> Optional[dict]:
         """
@@ -550,6 +721,8 @@ class TaskManager:
         params: TaskSendParams,
         agent_name: str,
         artifacts: Optional[list[Artifact]] = None,
+        *,
+        creator_agent_id: Optional[str] = None,
     ) -> Task:
         """
         Create a new task from send parameters.
@@ -563,29 +736,14 @@ class TaskManager:
                 can retrieve them before producing any response — the
                 send-side mirror of the responder-side
                 ``add_artifact`` flow.
+            creator_agent_id: Trusted identity of the assigning agent.  This
+                must come from verified envelope or host-attested provenance,
+                never from request metadata.  Local tasks default to
+                ``agent_name`` as both creator and recipient.
 
         Returns:
             The created Task object
         """
-        # Create or get session
-        session = await self.session_service.get_session(params.sessionId)
-        if not session:
-            await self.session_service.create_session(
-                session_id=params.sessionId,
-                agent_name=agent_name,
-                metadata=params.metadata or {}
-            )
-
-        # Append user message to session
-        await self.session_service.append_event(
-            session_id=params.sessionId,
-            event_type="user_message",
-            data={
-                "role": params.message.role,
-                "parts": [p.model_dump() for p in params.message.parts],
-            }
-        )
-
         # Attach the in-flight turn's causation chain to outbound task
         # metadata if a provider is registered (KestrelAgent wires this
         # in initialize()). The receiving side reconstructs the chain
@@ -613,29 +771,32 @@ class TaskManager:
             sessionId=params.sessionId,
             status=TaskStatus(state=TaskState.SUBMITTED),
             history=[params.message],
-            metadata=outbound_metadata,
+            metadata=without_reserved_cancellation_receipt(outbound_metadata),
             artifacts=list(artifacts) if artifacts else None,
         )
 
         # Save to store
-        await self.task_store.save(task)
-
-        # Log to observability
-        await self.observability_store.log_tool_call(
-            agent_name=agent_name,
-            tool_name="task_create",
-            session_id=params.sessionId,
-            metadata={"task_id": task.id}
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            raise ValueError("Task authority requires concrete agent identities")
+        recipient_agent_id = agent_name
+        if creator_agent_id is None:
+            creator_id = recipient_agent_id
+        elif isinstance(creator_agent_id, str) and creator_agent_id.strip():
+            creator_id = creator_agent_id
+        else:
+            raise ValueError("Task authority requires concrete agent identities")
+        await self.task_store.save(
+            task,
+            creator_agent_id=creator_id,
+            recipient_agent_id=recipient_agent_id,
         )
 
-        # Inbound-task callback: agent bridges this into the signal
-        # dispatcher so the cognition loop wakes up and acts on the new
-        # task. Mirrors `_on_task_complete` for the complete-direction
-        # signal; without this hook, a peer-submitted task sits
-        # SUBMITTED with no one processing it (the Emma/Meridian
-        # symptom). Synchronous callback; agent-side handler dispatches
-        # the actual async enqueue via background-task tracking
-        # (see KestrelAgent._on_task_submitted).
+        # Admission is complete only when the durable reservation can wake its
+        # recipient.  Fire the synchronous bridge immediately after commit,
+        # before any cancellable session/observability await.  The bridge owns
+        # its asynchronous delivery through the agent's background-task
+        # tracker, so cancellation of this transport coroutine cannot strand a
+        # durably SUBMITTED row with no cognition wake.
         if self._on_task_submitted is not None:
             try:
                 self._on_task_submitted(task)
@@ -645,11 +806,77 @@ class TaskManager:
                     task.id, e, exc_info=True,
                 )
 
-        # Notify subscribers
-        await self._notify_status_update(task, final=False)
+        # The insert-only task reservation is deliberately first: a duplicate
+        # caller-supplied ID must be rejected before it can append another user
+        # message to the existing session. Session and observability projections
+        # are best-effort after the durable task commit; their failure cannot
+        # turn an accepted task into a 500 that a retry experiences as a 409.
+        try:
+            session = await self.session_service.get_session(params.sessionId)
+            if not session:
+                await self.session_service.create_session(
+                    session_id=params.sessionId,
+                    agent_name=agent_name,
+                    metadata=params.metadata or {},
+                )
+            await self.session_service.append_event(
+                session_id=params.sessionId,
+                event_type="user_message",
+                data={
+                    "role": params.message.role,
+                    "parts": [p.model_dump() for p in params.message.parts],
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Task %s was created but its session projection failed",
+                task.id,
+                exc_info=True,
+            )
+
+        try:
+            await self.observability_store.log_tool_call(
+                agent_name=agent_name,
+                tool_name="task_create",
+                session_id=params.sessionId,
+                metadata={"task_id": task.id},
+            )
+        except Exception:
+            logger.warning(
+                "Task %s was created but observability logging failed",
+                task.id,
+                exc_info=True,
+            )
+
+        # A recipient wake can race these best-effort projections and move the
+        # canonical row before create_task returns. Never publish an older
+        # SUBMITTED snapshot after a terminal transition already committed.
+        canonical_read_succeeded = False
+        try:
+            canonical = await self.task_store.get(task.id)
+            canonical_read_succeeded = canonical is not None
+        except Exception:
+            canonical = None
+            logger.warning(
+                "Task %s was accepted but its canonical readback failed",
+                task.id,
+                exc_info=True,
+            )
+        if canonical is None:
+            # The insert-only durable reservation and recipient wake already
+            # committed. Return the accepted snapshot so a transient read
+            # outage cannot make the sender abandon work the recipient owns.
+            # Suppress the SUBMITTED SSE projection because a raced recipient
+            # may already have moved the unreadable canonical row terminal.
+            canonical = task
+        if (
+            canonical_read_succeeded
+            and canonical.status.state is TaskState.SUBMITTED
+        ):
+            await self._notify_status_update(canonical, final=False)
 
         logger.info(f"Task created: {task.id} in session {params.sessionId}")
-        return task
+        return canonical
 
     async def update_status(
         self,
@@ -673,6 +900,11 @@ class TaskManager:
         Raises:
             ValueError: If state transition is invalid
         """
+        if new_state is TaskState.CANCELED:
+            raise TaskCancellationAuthorizationError(
+                "CANCELED is an authorized transition; use cancel_task"
+            )
+
         task = await self.task_store.get(task_id)
         if not task:
             raise ValueError(f"Task not found: {task_id}")
@@ -696,41 +928,23 @@ class TaskManager:
             task.history.append(message)
 
         # Save updated task (use save() to persist both status and history)
-        await self.task_store.save(task)
-
-        # Log to session
-        if task.sessionId:
-            await self.session_service.append_event(
-                session_id=task.sessionId,
-                event_type="status_update",
-                data={
-                    "task_id": task_id,
-                    "old_state": current_state.value,
-                    "new_state": new_state.value,
-                }
-            )
-
-        # Log to observability
-        if agent_name:
-            await self.observability_store.log_agent_response(
-                agent_name=agent_name,
-                duration_ms=0,  # No timing for status updates
-                session_id=task.sessionId,
-                metadata={
-                    "task_id": task_id,
-                    "state_transition": f"{current_state} -> {new_state}"
-                }
+        saved = await self.task_store.save(task)
+        if saved is False:
+            persisted = await self.task_store.get(task_id)
+            state = persisted.status.state if persisted else TaskState.UNKNOWN
+            raise ValueError(
+                f"Invalid state transition: task is already {state}"
             )
 
         # Determine if this is a final state
         is_final = new_state in (TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED)
-
-        # Notify subscribers
-        await self._notify_status_update(task, final=is_final)
-
-        # If completed, optionally save to memory
-        if is_final and self.memory_service and task.sessionId:
-            await self._save_to_memory(task)
+        await self._finish_status_projection(
+            task,
+            old_state=current_state.value,
+            new_state=new_state,
+            agent_name=agent_name,
+            is_final=is_final,
+        )
 
         logger.info(f"Task {task_id} transitioned: {current_state} -> {new_state}")
         return task
@@ -772,6 +986,19 @@ class TaskManager:
         """Get a task by ID."""
         return await self.task_store.get(task_id)
 
+    async def get_task_cancellation_snapshot(
+        self,
+        task_id: str,
+    ) -> Optional[TaskCancellationSnapshot]:
+        """Read the minimal durable state used to withdraw live cognition."""
+
+        return await self.task_store.get_cancellation_snapshot(task_id)
+
+    async def is_task_recipient(self, task_id: str, agent_id: str) -> bool:
+        """Whether this manager's durable task row delegates execution to agent."""
+
+        return await self.task_store.is_task_recipient(task_id, agent_id)
+
     async def get_session_tasks(
         self,
         session_id: str,
@@ -809,6 +1036,8 @@ class TaskManager:
         task_id: str,
         reason: Optional[str] = None,
         agent_name: Optional[str] = None,
+        recipient_agent_id: Optional[str] = None,
+        task_payload: Optional[Task] = None,
     ) -> Task:
         """
         Cancel a task.
@@ -816,23 +1045,180 @@ class TaskManager:
         Args:
             task_id: ID of the task to cancel
             reason: Optional cancellation reason
-            agent_name: Agent performing the cancellation
+            agent_name: Durable DID of the agent performing the cancellation.
+                Display names and causation metadata are not authority.
+            recipient_agent_id: Optional durable DID of the recipient through
+                which a peer cancellation was routed. When present, it joins
+                the atomic authorization predicate so another manager sharing
+                the same task table cannot mutate this row.
+            task_payload: Optional canceled handler result whose artifacts,
+                history, and non-authority metadata must commit atomically with
+                the authorized terminal transition.
 
         Returns:
             Updated Task object
         """
-        message = None
-        if reason:
-            message = Message(
-                role="agent",
-                parts=[TextPart(text=f"Task canceled: {reason}")]
+        if not isinstance(agent_name, str) or not agent_name:
+            raise TaskCancellationAuthorizationError(
+                "Task cancellation requires a concrete agent identity"
             )
 
-        return await self.update_status(
-            task_id=task_id,
+        cancel_kwargs = {
+            "actor_agent_id": agent_name,
+            "reason": reason,
+        }
+        operation_id = uuid4().hex
+        cancel_kwargs["operation_id"] = operation_id
+        if recipient_agent_id is not None:
+            cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
+        if task_payload is not None:
+            cancel_kwargs["task_payload"] = task_payload
+        rollback_local_intent = None
+        if self._on_task_cancellation_started is not None:
+            rollback_local_intent = self._on_task_cancellation_started(
+                task_id,
+                agent_name,
+            )
+        store_failure: BaseException | None = None
+
+        async def is_this_actor_receipt(candidate: Task) -> bool:
+            receipt = (candidate.metadata or {}).get("cancellation_receipt") or {}
+            return (
+                candidate.status.state is TaskState.CANCELED
+                and receipt.get("actor_agent_id") == agent_name
+                and (
+                    recipient_agent_id is None
+                    or await self.task_store.is_task_recipient(
+                        task_id,
+                        recipient_agent_id,
+                    )
+                )
+            )
+
+        try:
+            task = await self.task_store.cancel_if_authorized(
+                task_id,
+                **cancel_kwargs,
+            )
+        except BaseException as error:
+            # PostgreSQL can commit and then lose the COMMIT acknowledgement.
+            # Re-read before declaring this a pre-commit failure: the task that
+            # owns the durable receipt must still cancel its queued wake and
+            # finish session/SSE/memory/completion projections.  Preserve the
+            # original store outcome only after that reconciliation completes.
+            store_failure = error
+            try:
+                current = await self.task_store.get(task_id)
+                committed_here = (
+                    current is not None
+                    and await is_this_actor_receipt(current)
+                    and await self.task_store.get_cancellation_operation_id(task_id)
+                    == operation_id
+                )
+            except BaseException as reconciliation_failure:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise error from reconciliation_failure
+            if not committed_here:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise
+            task = current
+        if task is None:
+            try:
+                current = await self.task_store.get(task_id)
+            except BaseException:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise
+            if current is None:
+                if rollback_local_intent is not None:
+                    rollback_local_intent()
+                raise ValueError(f"Task not found: {task_id}")
+            if await is_this_actor_receipt(current):
+                # The first atomic cancellation owns every derived projection.
+                # Its cancellation-safe projection join completes those side
+                # effects before propagating a lost transport response, so a
+                # retry returns only the canonical receipt and must not append
+                # duplicate memory/session rows or completion wakes.
+                # Keep the just-acquired local execution exemption: this retry
+                # is still the same authorized recipient decline and its
+                # monitor must not cancel the response after seeing CANCELED.
+                return current
+            if rollback_local_intent is not None:
+                rollback_local_intent()
+            if current.status.state not in {
+                TaskState.SUBMITTED,
+                TaskState.WORKING,
+                TaskState.INPUT_REQUIRED,
+            }:
+                raise ValueError(
+                    f"Invalid state transition: {current.status.state} -> "
+                    f"{TaskState.CANCELED}"
+                )
+            raise TaskCancellationAuthorizationError(
+                f"Agent {agent_name!r} is not authorized to cancel task {task_id!r}"
+            )
+
+        receipt = (task.metadata or {}).get("cancellation_receipt") or {}
+        previous_state = receipt.get("status_before")
+        if self._on_task_cancelled is not None:
+            try:
+                self._on_task_cancelled(task)
+            except Exception as exc:
+                logger.warning(
+                    "on_task_cancelled callback failed for %s: %s",
+                    task.id,
+                    exc,
+                    exc_info=True,
+                )
+        await self._finish_status_projection(
+            task,
+            old_state=str(previous_state or TaskState.UNKNOWN.value),
             new_state=TaskState.CANCELED,
-            message=message,
             agent_name=agent_name,
+            is_final=True,
+            reason=reason,
+        )
+
+        logger.info(
+            "Task %s canceled by %s: %s -> %s",
+            task_id,
+            agent_name,
+            previous_state,
+            TaskState.CANCELED.value,
+        )
+        if store_failure is not None:
+            raise store_failure
+        return task
+
+    async def _finish_status_projection(
+        self,
+        task: Task,
+        *,
+        old_state: str,
+        new_state: TaskState,
+        agent_name: Optional[str],
+        is_final: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Join post-commit projections before propagating caller cancellation."""
+
+        projection = asyncio.create_task(
+            self._project_status_transition(
+                task,
+                old_state=old_state,
+                new_state=new_state,
+                agent_name=agent_name,
+                is_final=is_final,
+                reason=reason,
+            ),
+            name="a2a-task-status-projection",
+        )
+        outcome = await await_owned_task(projection)
+        raise_owned_outcome(
+            outcome,
+            operation="A2A task status projection",
         )
 
     async def fail_task(
@@ -910,6 +1296,86 @@ class TaskManager:
             message=message,
             agent_name=agent_name,
         )
+
+    async def _project_status_transition(
+        self,
+        task: Task,
+        *,
+        old_state: str,
+        new_state: TaskState,
+        agent_name: Optional[str],
+        is_final: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Best-effort projections after the durable task row has committed.
+
+        Session history, observability, SSE, and memory are projections of the
+        canonical task row.  None may turn a committed transition into an
+        apparent failure that a retry then experiences as an invalid state.
+        """
+
+        event_data: dict[str, Any] = {
+            "task_id": task.id,
+            "old_state": old_state,
+            "new_state": new_state.value,
+        }
+        if new_state is TaskState.CANCELED:
+            event_data.update(
+                actor_agent_id=agent_name,
+                reason=reason,
+            )
+        if task.sessionId:
+            try:
+                await self.session_service.append_event(
+                    session_id=task.sessionId,
+                    event_type="status_update",
+                    data=event_data,
+                )
+            except Exception:
+                logger.warning(
+                    "Task %s transitioned durably but its session projection failed",
+                    task.id,
+                    exc_info=True,
+                )
+
+        if agent_name:
+            metadata: dict[str, Any] = {
+                "task_id": task.id,
+                "state_transition": f"{old_state} -> {new_state.value}",
+            }
+            if new_state is TaskState.CANCELED:
+                metadata["cancellation_reason"] = reason
+            try:
+                await self.observability_store.log_agent_response(
+                    agent_name=agent_name,
+                    duration_ms=0,
+                    session_id=task.sessionId,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.warning(
+                    "Task %s transitioned durably but observability logging failed",
+                    task.id,
+                    exc_info=True,
+                )
+
+        try:
+            await self._notify_status_update(task, final=is_final)
+        except Exception:
+            logger.warning(
+                "Task %s transitioned durably but subscriber notification failed",
+                task.id,
+                exc_info=True,
+            )
+        if is_final and self.memory_service and task.sessionId:
+            try:
+                await self._save_to_memory(task)
+            except Exception:
+                logger.warning(
+                    "Task %s transitioned durably but memory recording failed",
+                    task.id,
+                    exc_info=True,
+                )
 
     # =========================================================================
     # SSE Streaming
@@ -1075,6 +1541,7 @@ async def create_task_manager(
     db_path: str,
     include_memory: bool = True,
     include_feedback: bool = True,
+    host_agent_id: Optional[str] = None,
 ) -> TaskManager:
     """
     Factory function to create a TaskManager with SQLite stores.
@@ -1083,6 +1550,7 @@ async def create_task_manager(
         db_path: Path to SQLite database
         include_memory: Whether to include MemoryService
         include_feedback: Whether to include FeedbackStore
+        host_agent_id: Durable DID that owns in-process feature tasks
 
     Returns:
         Initialized TaskManager
@@ -1108,6 +1576,7 @@ async def create_task_manager(
         observability_store=observability_store,
         memory_service=memory_service,
         feedback_store=feedback_store,
+        host_agent_id=host_agent_id,
     )
 
     await manager.initialize()
