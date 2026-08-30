@@ -1055,6 +1055,97 @@ class TestAgentCancellation:
         assert agent._active_session_id is None
 
     @pytest.mark.asyncio
+    async def test_bridge_stop_after_dequeue_suppresses_queued_chunk_and_done(
+        self,
+        monkeypatch,
+    ):
+        """Stop linearization wins over a chunk awaiting SSE serialization."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.features.bridge import router as bridge_router
+        from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+
+        request_id = "bridge-post-dequeue-stop"
+
+        class LiveAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+
+            async def process_input_streaming(self, *_args, **_kwargs):
+                yield "source-is-replaced"
+
+        agent = LiveAgent()
+
+        class StopAfterDequeue:
+            def __init__(self, *_args, **_kwargs):
+                self._yielded = False
+                self.cleanup_error = None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._yielded:
+                    raise StopAsyncIteration
+                self._yielded = True
+                assert agent.cancel_current_request(request_id) is True
+                return "must-not-escape"
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(bridge_router, "OwnedAsyncIterator", StopAfterDequeue)
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent.features = {"BridgeFeature": bridge}
+        app = FastAPI()
+        app.state.agent = agent
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/bridge/stream",
+                "raw_path": b"/api/bridge/stream",
+                "query_string": b"",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            }
+        )
+        route = next(
+            route
+            for route in bridge_router.get_router().routes
+            if route.path == "/api/bridge/stream"
+        )
+        endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+        response = await endpoint(
+            request,
+            BridgeRequest(message="work", request_id=request_id),
+        )
+        stream = response.body_iterator
+
+        event = await anext(stream)
+        assert '"type": "stopped"' in event
+        assert "must-not-escape" not in event
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        assert bridge.log_invocation.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_bridge_cleanup_failure_releases_stop_as_abandoned(self):
         """Bridge nested-cleanup failure cannot acknowledge Stop either."""
 

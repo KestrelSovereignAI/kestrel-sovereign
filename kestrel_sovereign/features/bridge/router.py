@@ -268,6 +268,22 @@ def get_router() -> APIRouter:
                     ),
                 )
                 async for chunk in agent_stream:
+                    # The iterator owner and this SSE serializer are separate
+                    # tasks. Stop may linearize after the owner queues a chunk
+                    # but before this task resumes; never publish that stale
+                    # item or the completion event which follows the loop.
+                    if (
+                        callable(request_cancelled)
+                        and request_cancelled(request_id) is True
+                    ):
+                        stopped_data = json.dumps(
+                            {
+                                "type": "stopped",
+                                "request_id": request_id,
+                            }
+                        )
+                        yield f"data: {stopped_data}\n\n"
+                        return
                     chunk = strip_revise_sentinels(chunk)
                     if not chunk:
                         continue
