@@ -54,7 +54,10 @@ async def _insert_sovereign_restart(db, **kwargs):
     """Create a restart through the authority boundary used in production."""
 
     with caller_context_scope(
-        CallerContext.sovereign(identity="scheduler-reliability-test")
+        CallerContext.sovereign(
+            identity="scheduler-reliability-test",
+            credential="scheduler-reliability-test-key",
+        )
     ):
         return await insert_request(db, **kwargs)
 
@@ -2155,7 +2158,10 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(
         assert needs_ack["safe"] is False
         assert "acknowledgement required" in needs_ack["reason"]
         with caller_context_scope(
-            CallerContext.sovereign(identity="scheduler-reliability-test")
+            CallerContext.sovereign(
+                identity="scheduler-reliability-test",
+                credential="scheduler-reliability-test-key",
+            )
         ):
             acknowledged = await feature.acknowledge_restart_escalation(
                 legacy.id

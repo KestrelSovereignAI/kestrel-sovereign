@@ -3319,7 +3319,10 @@ async def auth_middleware(request: Request, call_next):
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
-            caller = CallerContext.sovereign(AuthMethod.API_KEY)
+            caller = CallerContext.sovereign(
+                AuthMethod.API_KEY,
+                credential=api_key_header,
+            )
 
         # Check Bearer token (API key OR JWT)
         if caller is None:
@@ -3328,7 +3331,10 @@ async def auth_middleware(request: Request, call_next):
                 token = auth_header[7:]
                 # First try: API key match
                 if secrets.compare_digest(token, expected_key):
-                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+                    caller = CallerContext.sovereign(
+                        AuthMethod.API_KEY,
+                        credential=token,
+                    )
                 else:
                     # Second try: JWT token
                     try:
@@ -3359,7 +3365,10 @@ async def auth_middleware(request: Request, call_next):
             ) or _scope_path.endswith("/link-qr.png")
             if api_key_query and _query_key_ok:
                 if secrets.compare_digest(api_key_query, expected_key):
-                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+                    caller = CallerContext.sovereign(
+                        AuthMethod.API_KEY,
+                        credential=api_key_query,
+                    )
 
         # Check OAuth session cookie
         if caller is None:

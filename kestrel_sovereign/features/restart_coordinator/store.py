@@ -810,48 +810,53 @@ async def acknowledge_escalation(
             first_blocked_at=current.first_blocked_at,
         )
 
-    result = await db.execute(
-        "UPDATE restart_requests SET escalation_acknowledged = 1, "
-        "authority_evidence = ?, authority_signature = ? "
-        "WHERE id = ? AND requested_by_agent = ? "
-        "AND status IN ('pending', 'approved') "
-        "AND COALESCE(authority_evidence, '') = ? "
-        "AND COALESCE(authority_signature, '') = ?",
-        (
-            authority_evidence,
-            authority_signature,
-            request_id,
-            requested_by_agent,
-            current_evidence,
-            current_signature,
-        ),
-    )
-    landed = await _write_landed(
-        db,
-        result,
-        request_id,
-        lambda row: (
-            row.escalation_acknowledged
-            and row.authority_signature == authority_signature
-        ),
-        requested_by_agent=requested_by_agent,
-    )
-    if not landed:
-        return False
     generation = restart_authority_evidence_generation(authority_evidence)
-    await db.execute(
-        "INSERT INTO restart_authority_issuances "
-        "(request_id, lifecycle_generation, issued_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(request_id) DO NOTHING",
-        (request_id, generation, (await database_clock(db)).isoformat()),
-    )
-    issued = await db.fetchone(
-        "SELECT lifecycle_generation FROM restart_authority_issuances "
-        "WHERE request_id = ?",
-        (request_id,),
-    )
-    if issued is None or issued[0] != generation:
-        return False
+    async with db.transaction(immediate=True):
+        result = await db.execute(
+            "UPDATE restart_requests SET escalation_acknowledged = 1, "
+            "authority_evidence = ?, authority_signature = ? "
+            "WHERE id = ? AND requested_by_agent = ? "
+            "AND status IN ('pending', 'approved') "
+            "AND COALESCE(authority_evidence, '') = ? "
+            "AND COALESCE(authority_signature, '') = ?",
+            (
+                authority_evidence,
+                authority_signature,
+                request_id,
+                requested_by_agent,
+                current_evidence,
+                current_signature,
+            ),
+        )
+        landed = await _write_landed(
+            db,
+            result,
+            request_id,
+            lambda row: (
+                row.escalation_acknowledged
+                and row.authority_signature == authority_signature
+            ),
+            requested_by_agent=requested_by_agent,
+        )
+        if not landed:
+            return False
+        await db.execute(
+            "INSERT INTO restart_authority_issuances "
+            "(request_id, lifecycle_generation, issued_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(request_id) DO NOTHING",
+            (request_id, generation, (await database_clock(db)).isoformat()),
+        )
+        issued = await db.fetchone(
+            "SELECT lifecycle_generation FROM restart_authority_issuances "
+            "WHERE request_id = ?",
+            (request_id,),
+        )
+        if issued is None or issued[0] != generation:
+            # Raising is what makes the context manager roll back the row CAS;
+            # returning False here would commit signed-but-unissued authority.
+            raise RestartAuthorityError(
+                "restart authority issuance conflicts with acknowledged evidence"
+            )
     refreshed = await get_request_for_agent(db, request_id, requested_by_agent)
     return bool(
         refreshed is not None
