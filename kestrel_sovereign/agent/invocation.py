@@ -282,6 +282,7 @@ def bind_async_invocation(
                 lifecycle_owner = args[0] if args else None
                 registered = False
                 cleanup_abandoned = False
+                operation: asyncio.Task[_T] | None = None
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
                         type(lifecycle_owner),
@@ -392,31 +393,35 @@ def bind_async_invocation(
                     raise
                 except BaseException as error:
                     if registered:
-                        request_cancelled = getattr(
-                            type(lifecycle_owner),
-                            "is_request_cancelled",
-                            None,
-                        )
-                        try:
-                            caller = asyncio.current_task()
-                            caller_cancelled = bool(
-                                isinstance(error, asyncio.CancelledError)
-                                and caller is not None
-                                and caller.cancelling()
-                                > caller_cancellation_baseline
-                            )
+                        if isinstance(error, asyncio.CancelledError):
+                            # A caller cancellation propagating through
+                            # ``await operation`` does not resume this wrapper
+                            # until the child has terminally unwound. Classify
+                            # that actual child state, not the Stop marker: the
+                            # endpoint stream owner and this nested command can
+                            # both be cancelled for one generation, and a clean
+                            # child unwind is still COMPLETED.
                             cleanup_abandoned = bool(
-                                not caller_cancelled
-                                and callable(request_cancelled)
-                                and request_cancelled(
-                                    lifecycle_owner, invocation_id
-                                )
+                                operation is not None and not operation.done()
                             )
-                        except Exception:
-                            # Never hide the turn's original failure. A broken
-                            # cancellation predicate is conservatively treated
-                            # as failed cleanup.
-                            cleanup_abandoned = True
+                        else:
+                            request_cancelled = getattr(
+                                type(lifecycle_owner),
+                                "is_request_cancelled",
+                                None,
+                            )
+                            try:
+                                cleanup_abandoned = bool(
+                                    callable(request_cancelled)
+                                    and request_cancelled(
+                                        lifecycle_owner, invocation_id
+                                    )
+                                )
+                            except Exception:
+                                # Never hide the turn's original failure. A
+                                # broken cancellation predicate is
+                                # conservatively treated as failed cleanup.
+                                cleanup_abandoned = True
                     raise
                 finally:
                     if registered:
