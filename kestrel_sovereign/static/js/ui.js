@@ -169,6 +169,7 @@ export const state = {
     // client's finally clears its live request-id projection after aborting,
     // but a retry must never silently widen into an agent-wide Stop.
     unconfirmedStopRequestIds: new Map(),
+    unconfirmedStopCorrelationIds: new Map(),
     conversations: [],
     showDecrypted: true,
     encryptedAtRest: false,

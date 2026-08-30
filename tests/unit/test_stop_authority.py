@@ -5,6 +5,7 @@ import gc
 import inspect
 import time
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -21,14 +22,58 @@ from kestrel_sovereign.stop import (
     StopDisposition,
     StopOutcome,
     StopRequest,
+    StopReceipt,
+    StopReceiptConflict,
     StopScope,
 )
+
+
+class _MemoryReceiptStore:
+    def __init__(self):
+        self.records = {}
+
+    async def load(self, request):
+        record = self.records.get(request.correlation_id)
+        if record is None:
+            return None
+        prior_request, receipt = record
+        if prior_request != request:
+            raise StopReceiptConflict("conflicting replay")
+        return receipt
+
+    async def persist(self, request, outcomes):
+        replay = await self.load(request)
+        if replay is not None:
+            return replay
+        receipt_id = f"receipt-{request.correlation_id}"
+        receipted = tuple(
+            replace(outcome, receipt_id=receipt_id) for outcome in outcomes
+        )
+        receipt = StopReceipt(
+            receipt_id=receipt_id,
+            operation_id=request.correlation_id,
+            request_fingerprint="test-fingerprint",
+            scope=request.scope.value,
+            actor_id=request.actor_id,
+            requested_target=request.target,
+            target_agent_id=request.target_agent_id,
+            reason=request.reason,
+            cascade=request.cascade,
+            occurred_at="2026-08-28T00:00:00+00:00",
+            turn_id=(request.target if request.scope is StopScope.TURN else None),
+            span_id=None,
+            trace_id=None,
+            outcomes=receipted,
+        )
+        self.records[request.correlation_id] = (request, receipt)
+        return receipt
 
 
 def _authority(target_inventory, **kwargs) -> CancellationAuthority:
     return CancellationAuthority(
         target_inventory,
         cleanup_registry=StopCleanupRegistry(),
+        receipt_store=kwargs.pop("receipt_store", _MemoryReceiptStore()),
         **kwargs,
     )
 
@@ -98,6 +143,26 @@ async def test_authority_rejects_unvalidated_request_before_inventory_or_cancel(
 def test_addressed_scopes_require_a_target(scope: StopScope) -> None:
     with pytest.raises(ValueError, match="requires a target"):
         StopRequest(scope=scope, actor_id="did:test:operator")
+
+
+def test_stop_request_rejects_non_utf8_correlation_identity() -> None:
+    with pytest.raises(ValueError, match="valid Unicode"):
+        StopRequest(
+            scope=StopScope.AGENT,
+            actor_id="did:test:operator",
+            target="did:test:target",
+            correlation_id="\ud800",
+        )
+
+
+def test_stop_request_bounds_correlation_identity_by_encoded_bytes() -> None:
+    with pytest.raises(ValueError, match="256 UTF-8 bytes"):
+        StopRequest(
+            scope=StopScope.AGENT,
+            actor_id="did:test:operator",
+            target="did:test:target",
+            correlation_id="é" * 129,
+        )
 
 
 def test_host_scope_rejects_a_target() -> None:
@@ -242,6 +307,7 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
             )
         ],
         cleanup_registry=cleanup_registry,
+        receipt_store=_MemoryReceiptStore(),
         target_timeout_seconds=0.01,
     )
 
@@ -268,14 +334,83 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
 
 
 @pytest.mark.asyncio
-async def test_empty_host_inventory_returns_no_agent_outcomes() -> None:
+async def test_cleanup_registry_drain_owns_tails_through_caller_cancellation() -> None:
+    release = asyncio.Event()
+
+    async def cleanup_tail() -> StopOutcome:
+        await release.wait()
+        return StopOutcome(
+            scope=StopScope.HOST,
+            requested_target=None,
+            resolved_target="tail",
+            agent_id="did:test:tail",
+            disposition=StopDisposition.STOPPED,
+            correlation_id="shutdown-tail",
+        )
+
+    registry = StopCleanupRegistry()
+    registry.retain(asyncio.create_task(cleanup_tail()))
+    drain = asyncio.create_task(registry.drain())
+    await asyncio.sleep(0)
+    drain.cancel()
+    await asyncio.sleep(0)
+    assert not drain.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await drain
+    assert registry._tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_empty_host_inventory_returns_authority_level_failure() -> None:
     authority = _authority(list)
 
     outcomes = await authority.stop(
         StopRequest(StopScope.HOST, "did:test:operator")
     )
 
-    assert outcomes == ()
+    assert len(outcomes) == 1
+    assert outcomes[0].resolved_target == StopScope.HOST.value
+    assert outcomes[0].agent_id == StopScope.HOST.value
+    assert outcomes[0].disposition is StopDisposition.UNREACHABLE
+    assert outcomes[0].receipt_id is not None
+    assert outcomes[0].detail == "No cooperative Stop targets were discovered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["load", "claim"])
+async def test_empty_host_receipt_preflight_returns_authority_refusal(
+    failure_stage: str,
+) -> None:
+    class FailingReceiptStore:
+        async def load(self, _request):
+            if failure_stage == "load":
+                raise RuntimeError("receipt backend unavailable")
+            return None
+
+        async def claim(self, _request):
+            if failure_stage == "claim":
+                raise RuntimeError("receipt backend unavailable")
+            raise AssertionError("claim must not run after load failure")
+
+        async def persist(self, *_args, **_kwargs):
+            raise AssertionError("preflight refusal must not be persisted")
+
+    authority = _authority(list, receipt_store=FailingReceiptStore())
+
+    outcomes = await authority.stop(
+        StopRequest(StopScope.HOST, "did:test:operator")
+    )
+
+    assert len(outcomes) == 1
+    assert outcomes[0].resolved_target == StopScope.HOST.value
+    assert outcomes[0].agent_id == StopScope.HOST.value
+    assert outcomes[0].disposition is StopDisposition.REFUSED
+    assert outcomes[0].receipt_id is None
+    assert outcomes[0].detail == (
+        "Stop receipt storage is unavailable; cancellation not attempted"
+    )
 
 
 @pytest.mark.asyncio
@@ -608,6 +743,7 @@ def test_live_stop_endpoint_routes_request_through_typed_authority() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -631,7 +767,7 @@ def test_live_stop_endpoint_routes_request_through_typed_authority() -> None:
             json={"request_id": "turn-live"},
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert response.json()["cancelled"] is True
     authority_stop.assert_awaited_once()
     routed_request = authority_stop.await_args.args[0]
@@ -645,6 +781,7 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -659,7 +796,7 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
 
     response = TestClient(app).post("/api/agent/stop")
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert response.json()["cancelled"] is True
     assert agent.cancel_current_request.call_args_list == [
         call(request_id="turn-a"),
@@ -678,6 +815,7 @@ def test_live_stop_endpoint_accepts_turn_id_and_resolves_inside_authority() -> N
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -738,6 +876,7 @@ def test_turn_stop_cannot_cancel_a_reused_request_generation() -> None:
 
     agent = LiveAgent()
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -763,6 +902,7 @@ def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -791,6 +931,7 @@ def test_unknown_turn_does_not_fall_back_to_agent_wide_stop() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -867,6 +1008,40 @@ def test_stop_endpoint_rejects_empty_query_request_id() -> None:
     agent.cancel_current_request.assert_not_called()
 
 
+def test_live_agent_stop_rechecks_turns_after_receipt_preflight() -> None:
+    """A turn admitted during receipt I/O belongs to the same agent Stop."""
+    from kestrel_sovereign.endpoints.agent import router
+
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"turn-a"}
+    agent._current_request_id = "turn-a"
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(return_value=None)
+
+    class AdmittingReceiptStore(_MemoryReceiptStore):
+        async def load(self, request):
+            agent._active_request_ids.add("turn-b")
+            return await super().load(request)
+
+    app = FastAPI()
+    app.state.stop_receipt_store = AdmittingReceiptStore()
+    app.include_router(router)
+    app.state.agent = agent
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert agent.cancel_current_request.call_args_list == [
+        call(request_id="turn-a"),
+        call(request_id="turn-b"),
+    ]
+    assert agent.wait_for_request_completion.await_args_list == [
+        call("turn-a"),
+        call("turn-b"),
+    ]
+
+
 def test_stop_before_registration_fences_the_late_request_generation() -> None:
     """An empty Stop snapshot must still prevent its in-transit turn starting."""
 
@@ -886,6 +1061,7 @@ def test_stop_before_registration_fences_the_late_request_generation() -> None:
 
     agent = LiveAgent()
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -931,7 +1107,6 @@ def test_expired_pre_registration_stop_does_not_poison_a_future_reuse() -> None:
 async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     """The endpoint must not confuse a cancel marker with completed execution."""
     from kestrel_sovereign.agent.request_lifecycle import (
-        RequestCompletionDisposition,
         RequestLifecycleMixin,
     )
     from kestrel_sovereign.endpoints.agent import router
@@ -958,6 +1133,7 @@ async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     agent = LiveAgent()
     agent.register_active_request("turn-live")
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -1039,6 +1215,7 @@ async def test_live_stop_stale_prune_is_unreachable_not_stopped() -> None:
     agent.register_active_request("long-turn")
     agent._active_request_started_at["long-turn"] -= 1000
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -1088,6 +1265,7 @@ def test_agent_wide_stop_includes_pruned_unconfirmed_turns() -> None:
     assert agent.prune_stale_active_requests(900) == ["pruned-turn"]
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
     response = TestClient(app).post("/api/agent/stop")
@@ -1133,6 +1311,7 @@ def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"

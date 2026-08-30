@@ -4252,6 +4252,39 @@ class TestLoadFromConfig:
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_host_authority_is_attached_before_agent_initialize(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did
+    ):
+        mock_get_did.return_value = "did:preinitialize"
+        agent = _make_mock_agent("did:preinitialize")
+        mock_agent_cls.return_value = agent
+        manager = AgentManager(base_data_dir=Path("/tmp"))
+        authority = object()
+
+        def attach(_name, initialized_agent):
+            initialized_agent.__dict__["host_authority"] = authority
+
+        async def initialize():
+            assert agent.__dict__.get("host_authority") is authority
+
+        agent.initialize.side_effect = initialize
+        manager.set_agent_pre_initialize_hook(attach)
+        config = LocalAgentConfig(
+            data_dir=Path("/tmp/preinitialize"), port=8801
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("preinitialize", config)
+
+        agent.initialize.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_in_process_agent_receives_resolved_identity_export_override(
         self,
         mock_llm_cls,

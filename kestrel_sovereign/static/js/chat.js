@@ -115,6 +115,14 @@ function unconfirmedStopRequestIds() {
     return currentState.unconfirmedStopRequestIds;
 }
 
+function unconfirmedStopCorrelationIds() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopCorrelationIds instanceof Map)) {
+        currentState.unconfirmedStopCorrelationIds = new Map();
+    }
+    return currentState.unconfirmedStopCorrelationIds;
+}
+
 function isAgentBusy(agentName) {
     return deps().state.waitingAgents.has(agentName)
         || unconfirmedStopAgents().has(agentName);
@@ -2579,6 +2587,36 @@ async function stopRequest() {
     return stopAgent(deps().api.getHostAgent());
 }
 
+function hasTerminalStopReceipt(error) {
+    const details = error?.body?.error?.details;
+    return Array.isArray(details) && details.some((outcome) => (
+        outcome
+        && typeof outcome === 'object'
+        && typeof outcome.receipt_id === 'string'
+        && outcome.receipt_id.length > 0
+    ));
+}
+
+function stopFailureRequiresFreshOperation(error) {
+    if (hasTerminalStopReceipt(error)) return true;
+    const canonicalError = error?.body?.error;
+    if (canonicalError?.code !== 'stop_not_confirmed') return false;
+    const details = canonicalError.details;
+    return Array.isArray(details) && details.some((outcome) => (
+        outcome
+        && typeof outcome === 'object'
+        && !outcome.receipt_id
+        && (
+            outcome.detail === (
+                'Cancellation may have completed, but its durable '
+                + 'Stop receipt could not be persisted'
+            )
+            || outcome.detail === 'An exact Stop operation is already in progress'
+            || outcome.detail === 'Stop operation identity conflicts with durable evidence'
+        )
+    ));
+}
+
 /**
  * Stop a specific agent's in-flight stream. Aborts client-side via
  * the per-agent AbortController, and tells the server to halt by
@@ -2625,15 +2663,25 @@ export async function stopAgent(agentName) {
     }
 
     const retainedRequestIds = unconfirmedStopRequestIds();
+    const retainedCorrelationIds = unconfirmedStopCorrelationIds();
     let requestId = retainedRequestIds.get(agentName) || null;
     if (!requestId) {
         requestId = deps().api.getCurrentStreamRequestId(agentName);
         if (requestId) retainedRequestIds.set(agentName, requestId);
     }
+    let correlationId = retainedCorrelationIds.get(agentName) || null;
+    if (!correlationId) {
+        correlationId = newChatRequestId();
+        retainedCorrelationIds.set(agentName, correlationId);
+    }
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
-        const response = await deps().api.stop(requestId, agentName);
+        const response = await deps().api.stop(
+            requestId,
+            agentName,
+            correlationId,
+        );
         const stopOutcomes = Array.isArray(response?.stop_outcomes)
             ? response.stop_outcomes
             : [];
@@ -2648,6 +2696,14 @@ export async function stopAgent(agentName) {
         }
     } catch (e) {
         console.error(`Error stopping request on ${agentName}:`, e);
+        // A receipt-bearing failure is definitive and immutable for this
+        // operation ID. Retain the exact request address, but let the next
+        // reconciliation allocate a fresh operation so it can observe that
+        // the old turn subsequently completed. Transport/malformed failures
+        // remain ambiguous and must replay the original durable operation.
+        if (stopFailureRequiresFreshOperation(e)) {
+            retainedCorrelationIds.delete(agentName);
+        }
         refreshAgentThinkingDot(agentName);
         if (agentName === deps().api.getHostAgent()) {
             updateThinkingIndicator();
@@ -2657,6 +2713,8 @@ export async function stopAgent(agentName) {
 
     unconfirmedStopAgents().delete(agentName);
     retainedRequestIds.delete(agentName);
+    retainedCorrelationIds.delete(agentName);
+    deps().api.completeCurrentStreamRequestId(agentName, requestId);
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === deps().api.getHostAgent()) {
@@ -3311,13 +3369,13 @@ export async function sendMessage(overrideText, overrideAgent) {
                     if (response && response.session_id && !pane.sessionId) {
                         pane.sessionId = response.session_id;
                     }
-                    if (isPaneFresh()) {
+                    if (isPaneFresh() && ownsStream()) {
                         await addMessage(
                             'agent', response.response, pane.element, null,
                             { model: response.model, provider: response.provider },
                         );
                     }
-                    if (isCurrentVisible()) {
+                    if (isCurrentVisible() && ownsStream()) {
                         await checkForModelChange(response.response);
                     }
                 } else {
@@ -3331,20 +3389,20 @@ export async function sendMessage(overrideText, overrideAgent) {
             if (response && response.session_id && !pane.sessionId) {
                 pane.sessionId = response.session_id;
             }
-            if (isPaneFresh()) {
+            if (isPaneFresh() && ownsStream()) {
                 await addMessage(
                     'agent', response.response, pane.element, null,
                     { model: response.model, provider: response.provider },
                 );
             }
-            if (isCurrentVisible()) {
+            if (isCurrentVisible() && ownsStream()) {
                 await checkForModelChange(response.response);
             }
         }
     } catch (e) {
         if (e && e.name === 'AbortError') {
             wasAborted = true;
-        } else if (isPaneFresh()) {
+        } else if (isPaneFresh() && ownsStream()) {
             addTextMessage('agent', `Error: ${e && e.message ? e.message : 'Request failed.'}`, pane.element);
         } else {
             console.warn(
@@ -3374,6 +3432,10 @@ export async function sendMessage(overrideText, overrideAgent) {
             // skips the interrupt path. The newest dispatch always owns,
             // so the last turn to settle does the real cleanup.
             deps().state.waitingAgents.delete(dispatchAgent);
+            deps().api.completeCurrentStreamRequestId(
+                dispatchAgent,
+                clientRequestId,
+            );
         }
         refreshAgentThinkingDot(dispatchAgent);
         // Drive the visible thinking indicator from whatever agent the

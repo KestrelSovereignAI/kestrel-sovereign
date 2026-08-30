@@ -294,6 +294,18 @@ def bind_async_invocation(
                 caller_cancellation_baseline = 0
                 try:
                     if registered:
+                        await_admission = getattr(
+                            type(lifecycle_owner),
+                            "await_durable_request_admission",
+                            None,
+                        )
+                        if callable(await_admission) and not await await_admission(
+                            lifecycle_owner, invocation_id
+                        ):
+                            raise InvocationCancelledError(
+                                "invocation was stopped before durable admission "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            )
                         bind_operation = getattr(
                             type(lifecycle_owner),
                             "bind_request_operation",
@@ -434,6 +446,8 @@ def bind_async_invocation(
 
 def bind_async_generator_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., AsyncIterator[_T]]], Callable[..., AsyncIterator[_T]]]:
     """Bind/generate ``parameter`` for an async-generator top-level turn.
 
@@ -471,8 +485,34 @@ def bind_async_generator_invocation(
                 if supplied_provenance is not None
                 else _current_invocation_provenance.get()
             )
-            iterator = function(*bound.args, **bound.kwargs)
+            lifecycle_owner = args[0] if args else None
+            registered = False
+            if track_request_lifecycle and lifecycle_owner is not None:
+                register = getattr(
+                    type(lifecycle_owner),
+                    "register_active_request",
+                    None,
+                )
+                if callable(register):
+                    register(lifecycle_owner, effective_id)
+                    registered = True
+            iterator = None
             try:
+                if registered:
+                    await_admission = getattr(
+                        type(lifecycle_owner),
+                        "await_durable_request_admission",
+                        None,
+                    )
+                    if callable(await_admission) and not await await_admission(
+                        lifecycle_owner, effective_id
+                    ):
+                        raise InvocationCancelledError(
+                            "streaming invocation was stopped before durable "
+                            "admission "
+                            f"({invocation_log_correlation(effective_id)})"
+                        )
+                iterator = function(*bound.args, **bound.kwargs)
                 while True:
                     with _exact_invocation_scope(
                         effective_id,
@@ -484,13 +524,17 @@ def bind_async_generator_invocation(
                             return
                     yield item
             finally:
-                close_iterator = getattr(iterator, "aclose", None)
-                if callable(close_iterator):
-                    with _exact_invocation_scope(
-                        effective_id,
-                        effective_provenance,
-                    ):
-                        await close_iterator()
+                try:
+                    close_iterator = getattr(iterator, "aclose", None)
+                    if callable(close_iterator):
+                        with _exact_invocation_scope(
+                            effective_id,
+                            effective_provenance,
+                        ):
+                            await close_iterator()
+                finally:
+                    if registered:
+                        lifecycle_owner._cleanup_cancelled_request(effective_id)
 
         return wrapped
 

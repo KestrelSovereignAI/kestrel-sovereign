@@ -607,10 +607,15 @@ test('streamInvoke stores abort controller + request id keyed by the dispatching
     for await (const _ of aIter) { /* drain */ }
     for await (const _ of bIter) { /* drain */ }
 
-    // Once a stream finishes, its slot is cleared but the *other* agent's
-    // slot must remain untouched if that stream is still in flight.
+    // Once a stream finishes, its controller slot is cleared. The exact turn
+    // address remains until the chat owner clears busy state, so a late Stop
+    // in that handoff window cannot widen to agent scope.
     assert.equal(client.getStreamAbortController('agent-A'), null);
     assert.equal(client.getStreamAbortController('agent-B'), null);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), 'req-A');
+    assert.equal(client.getCurrentStreamRequestId('agent-B'), 'req-B');
+    assert.equal(client.completeCurrentStreamRequestId('agent-A', 'req-A'), true);
+    assert.equal(client.completeCurrentStreamRequestId('agent-B', 'req-B'), true);
     assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
     assert.equal(client.getCurrentStreamRequestId('agent-B'), null);
 });
@@ -678,6 +683,11 @@ test('streamInvoke publishes and sends a client request id before response heade
 
     stream.finish();
     for await (const _ of iter) { /* drain */ }
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), 'client-turn-id');
+    assert.equal(
+        client.completeCurrentStreamRequestId('agent-A', 'client-turn-id'),
+        true,
+    );
     assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
 });
 

@@ -76,6 +76,9 @@ class TestOrchestratorThreadsSessionId:
             ]
         )
         agent._execute_tool_batch = AsyncMock()  # no-op
+        agent._execute_tool_batch_at_stop_boundary = (
+            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
+        )
         agent._build_all_tools = MagicMock(return_value=[])
         agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
