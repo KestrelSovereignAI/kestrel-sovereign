@@ -1371,6 +1371,7 @@ class RestartCoordinatorFeature(Feature):
         reason: str,
         active_status: str = "executing",
         authority_context: str = "failed restart dispatch",
+        emit_status: bool = True,
     ) -> Optional[str]:
         """Make a demonstrably failed dispatch retryable or terminal.
 
@@ -1399,11 +1400,12 @@ class RestartCoordinatorFeature(Feature):
             if moved:
                 self._executing_since.pop(request_id, None)
                 current.status = "pending"
-                await self._emit_status_event(
-                    current,
-                    state="pending",
-                    deferral_reason=reason,
-                )
+                if emit_status:
+                    await self._emit_status_event(
+                        current,
+                        state="pending",
+                        deferral_reason=reason,
+                    )
                 return "pending"
 
             # The verification/update boundary may itself cross a sovereign
@@ -1433,11 +1435,12 @@ class RestartCoordinatorFeature(Feature):
             return None
         self._executing_since.pop(request_id, None)
         current.status = "rejected"
-        await self._emit_status_event(
-            current,
-            state="rejected",
-            status_reason=terminal_reason,
-        )
+        if emit_status:
+            await self._emit_status_event(
+                current,
+                state="rejected",
+                status_reason=terminal_reason,
+            )
         return "rejected"
 
     async def _emit_status_event(
@@ -2213,6 +2216,10 @@ class RestartCoordinatorFeature(Feature):
                 reason=failure_reason,
                 active_status="updating",
                 authority_context="failed update",
+                # The coordinator caller reloads the landed row and emits its
+                # exact outcome. Emitting here as well duplicates the durable
+                # audit row and live SSE transition.
+                emit_status=False,
             )
             return {
                 "request_id": req.id,
