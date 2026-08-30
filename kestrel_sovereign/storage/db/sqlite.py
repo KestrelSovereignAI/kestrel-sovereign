@@ -396,6 +396,13 @@ class SQLiteBackend(DatabaseBackend):
         self._cancelled_write_drain_started_at: Optional[float] = None
         self._cancelled_write_drain_error: Optional[Exception] = None
         self._retired_connection_closes: _RetainedAiosqliteCloses = {}
+        # Snapshot connections do not occupy the writer guard, but they are
+        # still children of this backend's lifecycle. Opening is serialized
+        # with shutdown just long enough to register the connection; close
+        # then interrupts and drains every registered reader before revoking
+        # the primary connection.
+        self._snapshot_lifecycle = asyncio.Condition()
+        self._active_snapshot_connections: set[aiosqlite.Connection] = set()
         self._closing = False
     
     @property
@@ -675,8 +682,15 @@ class SQLiteBackend(DatabaseBackend):
         # A write cancelled from this point onward is retired by connection
         # close itself, so spawning a rollback task would orphan it after the
         # final state reset below.
-        self._closing = True
         try:
+            try:
+                await self._begin_snapshot_close()
+            except asyncio.CancelledError as exc:
+                # Shutdown owns every snapshot worker it opened. Preserve
+                # caller cancellation, but deliver it only after readers have
+                # relinquished their registered connections.
+                pending_cancellation = exc
+                await self._begin_snapshot_close()
             drain = self._cancelled_write_drain
             # Cancelling the Python rollback task does not stop a SQLite VM
             # already executing in aiosqlite's worker.  Interrupt the actual
@@ -791,26 +805,61 @@ class SQLiteBackend(DatabaseBackend):
         # still belong to this backend's lifecycle. Without this check a Hold
         # admission read issued after ``close()`` could silently create a fresh
         # connection after the host context revoked access to its database.
-        if self._closing:
-            raise ConnectionError("SQLite database is closing")
-        self._ensure_connected()
-        conn = await aiosqlite.connect(
-            self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
-        )
-        try:
-            await conn.execute(
-                f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
+        async with self._snapshot_lifecycle:
+            if self._closing:
+                raise ConnectionError("SQLite database is closing")
+            self._ensure_connected()
+            conn = await aiosqlite.connect(
+                self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
             )
-            await conn.execute("PRAGMA foreign_keys=ON")
-            await conn.execute("PRAGMA query_only=ON")
-            conn.row_factory = aiosqlite.Row
-            return conn
-        except BaseException:
+            try:
+                await conn.execute(
+                    f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
+                )
+                await conn.execute("PRAGMA foreign_keys=ON")
+                await conn.execute("PRAGMA query_only=ON")
+                conn.row_factory = aiosqlite.Row
+                self._active_snapshot_connections.add(conn)
+                return conn
+            except BaseException:
+                await _close_aiosqlite_connection(
+                    conn,
+                    retained_closes=self._retired_connection_closes,
+                )
+                raise
+
+    async def _close_snapshot_read_connection(
+        self, conn: aiosqlite.Connection
+    ) -> None:
+        """Close and unregister one backend-owned snapshot connection."""
+
+        try:
             await _close_aiosqlite_connection(
                 conn,
                 retained_closes=self._retired_connection_closes,
             )
-            raise
+        finally:
+            async with self._snapshot_lifecycle:
+                self._active_snapshot_connections.discard(conn)
+                self._snapshot_lifecycle.notify_all()
+
+    async def _begin_snapshot_close(self) -> None:
+        """Fence new snapshots and drain those already owned by the backend."""
+
+        async with self._snapshot_lifecycle:
+            self._closing = True
+            active = tuple(self._active_snapshot_connections)
+        for conn in active:
+            try:
+                await conn.interrupt()
+            except (ValueError, RuntimeError):
+                # The reader may have reached its own close between the
+                # snapshot and this acceleration attempt.
+                pass
+        async with self._snapshot_lifecycle:
+            await self._snapshot_lifecycle.wait_for(
+                lambda: not self._active_snapshot_connections
+            )
 
     @asynccontextmanager
     async def _read_connection(
@@ -848,10 +897,7 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 yield read_conn
             finally:
-                await _close_aiosqlite_connection(
-                    read_conn,
-                    retained_closes=self._retired_connection_closes,
-                )
+                await self._close_snapshot_read_connection(read_conn)
             return
 
         # In-memory databases have no independent committed snapshot. Ordinary
@@ -1290,10 +1336,7 @@ class SQLiteBackend(DatabaseBackend):
                 assert isinstance(rows, list)
                 return rows
             finally:
-                await _close_aiosqlite_connection(
-                    read_conn,
-                    retained_closes=self._retired_connection_closes,
-                )
+                await self._close_snapshot_read_connection(read_conn)
         except Exception as error:
             raise QueryError(
                 f"Snapshot query failed: {error}\nQuery: {query}"

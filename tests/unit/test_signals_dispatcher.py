@@ -383,26 +383,32 @@ async def test_held_durable_outcome_is_not_visible_before_lease_release(
 async def test_turn_gate_hold_refusal_preserves_signal_disposition(
     dispatcher_components,
     tmp_path,
+    monkeypatch,
     durable,
     status,
     error,
 ):
     """A Hold that wins after snapshots is not a failed cognition turn."""
 
-    from kestrel_sovereign.hold import HoldTurnRefusal
+    from kestrel_sovereign.hold import require_turn_start_allowed
 
     c = dispatcher_components
     template = tmp_path / "hold-race.md"
     template.write_text("source={source} payload={payload}")
     registration = _cognition_reg(template, name="hold.turn.race")
     c.registry.register(registration)
-    refusal = HoldTurnRefusal(
-        agent_id=c.agent.did,
-        effective_state=_held_state(c.agent.did),
+    gate_agent = SimpleNamespace(
+        did=c.agent.did,
+        _hold_store=_HoldSnapshots(_held_state(c.agent.did)),
+    )
+    metric = Mock()
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.metrics.record_held_work_disposition",
+        metric,
     )
 
     async def refuse_at_turn_gate(*_args, **_kwargs):
-        raise refusal
+        await require_turn_start_allowed(gate_agent)
 
     c.agent.process_input = refuse_at_turn_gate
     signal = _signal("hold.turn.race", mode=SignalMode.COGNITION)
@@ -422,6 +428,10 @@ async def test_turn_gate_hold_refusal_preserves_signal_disposition(
 
     assert result.status is status
     assert result.error == error
+    metric.assert_called_once_with(
+        disposition=("deferred" if durable else "skipped"),
+        source="hold.turn.race",
+    )
 
 
 @pytest.mark.asyncio

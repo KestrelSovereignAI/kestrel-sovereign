@@ -19,6 +19,9 @@ from .state import EffectiveHoldState, HoldStateError
 _reused_turn_admission: ContextVar[
     tuple[Any, EffectiveHoldState | None] | None
 ] = ContextVar("kestrel_reused_hold_turn_admission", default=None)
+_source_owns_hold_disposition: ContextVar[bool] = ContextVar(
+    "kestrel_source_owns_hold_disposition", default=False
+)
 
 
 class HoldEnforcementUnavailableError(HoldStateError):
@@ -196,12 +199,13 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     if effective is None:
         return None
     if effective.held:
-        from .metrics import record_held_work_disposition
+        if not _source_owns_hold_disposition.get():
+            from .metrics import record_held_work_disposition
 
-        record_held_work_disposition(
-            disposition=HeldWorkDisposition.REFUSED.value,
-            source="turn",
-        )
+            record_held_work_disposition(
+                disposition=HeldWorkDisposition.REFUSED.value,
+                source="turn",
+            )
         raise HoldTurnRefusal(agent_id=agent_id, effective_state=effective)
     return effective
 
@@ -220,6 +224,17 @@ def reuse_turn_start_admission(
         _reused_turn_admission.reset(token)
 
 
+@contextmanager
+def source_owns_hold_disposition():
+    """Let an ingress source record its final treatment of refused work."""
+
+    token = _source_owns_hold_disposition.set(True)
+    try:
+        yield
+    finally:
+        _source_owns_hold_disposition.reset(token)
+
+
 __all__ = [
     "HOLD_TURN_CONSOLE_MESSAGE",
     "HoldEnforcementUnavailableError",
@@ -233,4 +248,5 @@ __all__ = [
     "require_context_hold_store",
     "require_turn_start_allowed",
     "reuse_turn_start_admission",
+    "source_owns_hold_disposition",
 ]

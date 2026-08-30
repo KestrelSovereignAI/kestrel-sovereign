@@ -172,6 +172,50 @@ class TestSQLiteBackend:
             await backend.fetch_all_snapshot("SELECT 1")
 
         opened.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_drains_snapshot_paused_during_connection_open(
+        self, backend, monkeypatch
+    ):
+        """A snapshot opening across close cannot outlive backend revocation."""
+
+        original_connect = sqlite_backend_module.aiosqlite.connect
+        opening = asyncio.Event()
+        release_open = asyncio.Event()
+        events: list[str] = []
+
+        async def paused_connect(*args, **kwargs):
+            opening.set()
+            await release_open.wait()
+            return await original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            sqlite_backend_module.aiosqlite, "connect", paused_connect
+        )
+
+        async def read_snapshot():
+            try:
+                await backend.fetch_all_snapshot("SELECT 1")
+            except QueryError:
+                events.append("read-interrupted")
+            else:
+                events.append("read-completed")
+
+        async def close_backend():
+            await backend.close()
+            events.append("close-completed")
+
+        read_task = asyncio.create_task(read_snapshot())
+        await opening.wait()
+        close_task = asyncio.create_task(close_backend())
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        release_open.set()
+        await asyncio.gather(read_task, close_task)
+
+        assert events[-1] == "close-completed"
+        assert backend.is_connected is False
     
     @pytest.mark.asyncio
     async def test_fetch_val(self, backend):
@@ -1601,10 +1645,7 @@ class TestSQLiteBackend:
             with pytest.raises(
                 ConnectionError, match="connection close did not complete"
             ):
-                await sqlite_backend_module._close_aiosqlite_connection(
-                    snapshot,
-                    retained_closes=backend._retired_connection_closes,
-                )
+                await backend._close_snapshot_read_connection(snapshot)
             assert snapshot_worker.is_alive()
             assert backend.connection_retirement_pending
             retirement_tasks = [

@@ -4863,13 +4863,18 @@ class SignalDispatcher:
                 "mode": signal.mode.value,
             }
 
+        from kestrel_sovereign.hold.enforcement import (
+            source_owns_hold_disposition,
+        )
+
         try:
-            if process_input_kwargs:
-                result = await self._agent.process_input(
-                    prompt, **process_input_kwargs
-                )
-            else:
-                result = await self._agent.process_input(prompt)
+            with source_owns_hold_disposition():
+                if process_input_kwargs:
+                    result = await self._agent.process_input(
+                        prompt, **process_input_kwargs
+                    )
+                else:
+                    result = await self._agent.process_input(prompt)
         except Exception:
             if receipt_tool_registered:
                 clear_receipt = getattr(
