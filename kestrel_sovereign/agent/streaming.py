@@ -914,7 +914,9 @@ class StreamingMixin:
             images.append(data)
         return images
 
-    @bind_async_generator_invocation("request_id")
+    @bind_async_generator_invocation(
+        "request_id", track_request_lifecycle=True
+    )
     async def process_input_streaming(
         self,
         user_input: str,

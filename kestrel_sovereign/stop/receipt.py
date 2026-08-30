@@ -95,6 +95,12 @@ def _identifier_digest(kind: str, value: str) -> str:
     return f"sha256:{digest}"
 
 
+def opaque_stop_identifier(kind: str, value: str) -> str:
+    """Share the receipt store's one-way lookup identity inside Stop."""
+
+    return _identifier_digest(kind, value)
+
+
 def _optional_identifier_digest(kind: str, value: str | None) -> str | None:
     return None if value is None else _identifier_digest(kind, value)
 
