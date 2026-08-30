@@ -173,14 +173,22 @@ export function renderIdentityDangerZone({ container, identity, api, Modal, Toas
     const btn = container.querySelector('#danger-zone-delete-btn');
     if (btn) {
         btn.addEventListener('click', () => {
-            // Re-resolve after any intervening authentication or discovery
-            // refresh. A stale button must not open an actionable modal.
-            const currentAction = resolveDeleteAction({ identity, api, dz });
-            if (!currentAction.show) {
+            // Re-check only caller authority. The target routing key remains
+            // bound to the identity rendered in this panel; a concurrent
+            // selection refresh must never turn an Emma confirmation into a
+            // deletion of the newly selected agent.
+            if (
+                action.native
+                && (
+                    !api
+                    || typeof api.canManageHostAgentLifecycle !== 'function'
+                    || !api.canManageHostAgentLifecycle('delete')
+                )
+            ) {
                 container.innerHTML = '';
                 return;
             }
-            _openConfirmModal({ action: currentAction, identity, Modal, Toast });
+            _openConfirmModal({ action, identity, Modal, Toast });
         });
     }
     return true;
