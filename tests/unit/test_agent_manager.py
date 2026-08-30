@@ -1191,7 +1191,8 @@ def test_hybrid_parent_signing_alias_restores_to_stable_parent(tmp_path):
     assert manager.get_mandate("HybridChild") is mandate
 
 
-def test_rotated_parent_restores_pre_cutoff_classical_child_from_public_key(
+@pytest.mark.asyncio
+async def test_rotated_parent_restores_pre_cutoff_classical_child_from_public_key(
     tmp_path,
 ):
     """Rotation keeps archival verification without legacy private custody."""
@@ -1231,6 +1232,9 @@ def test_rotated_parent_restores_pre_cutoff_classical_child_from_public_key(
 
     assert manager.get_children(legacy_did) == ["ArchivedChild"]
     assert manager.get_mandate("ArchivedChild") is child._persisted_spawn_mandate
+    assert await manager.get_authoritative_children(legacy_did) == [
+        "ArchivedChild"
+    ]
 
 
 @pytest.mark.asyncio

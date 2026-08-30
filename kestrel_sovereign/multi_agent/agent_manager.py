@@ -6861,10 +6861,16 @@ class AgentManager:
             private_key = parent_state.get("_private_key")
             public_key_getter = getattr(private_key, "public_key", None)
             public_key = public_key_getter() if callable(public_key_getter) else None
+            parent_identity = parent_state.get("identity")
+            if public_key is None and parent_identity is not None:
+                legacy_keypair = getattr(
+                    parent_identity, "legacy_keypair", None
+                )
+                public_key = getattr(legacy_keypair, "public_key", None)
             if not verify_mandate(
                 mandate,
                 public_key,
-                parent_identity=parent_state.get("identity"),
+                parent_identity=parent_identity,
             ):
                 raise SpawnAuthorityGraphError(
                     "Signed spawn authority contains an invalid mandate"
