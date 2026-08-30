@@ -767,8 +767,36 @@ async def stream_agent_response(request: Request):
                         request_id
                     ),
                 )
-                async for chunk in agent_stream:
-                    # Check if request was cancelled
+                bind_stream_owner = getattr(
+                    agent, "bind_request_operation", None
+                )
+                if callable(bind_stream_owner):
+                    bind_stream_owner(request_id, agent_stream.owner_task)
+                first_item = True
+                while True:
+                    # Once a yielded chunk is consumed, observe Stop before
+                    # asking a potentially non-cooperative provider for the
+                    # next one. The bound producer task covers Stop while an
+                    # ``anext`` call itself is already blocked.
+                    if (
+                        not first_item
+                        and agent_stream.owner_task.cancelling()
+                        and agent.is_request_cancelled(request_id)
+                    ):
+                        yield stop_notice
+                        stop_notice_emitted = True
+                        break
+                    first_item = False
+                    try:
+                        chunk = await anext(agent_stream)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.CancelledError:
+                        if agent.is_request_cancelled(request_id):
+                            yield stop_notice
+                            stop_notice_emitted = True
+                            return
+                        raise
                     if agent.is_request_cancelled(request_id):
                         yield stop_notice
                         stop_notice_emitted = True

@@ -79,6 +79,21 @@ class OwnedAsyncIterator(Generic[_T]):
 
         return self._cleanup_error
 
+    @property
+    def owner_task(self) -> asyncio.Task[None]:
+        """The exact producer task an external lifecycle may interrupt."""
+
+        return self._owner
+
+    def _cleanup_is_requested(self) -> bool:
+        requested = self._stop.is_set()
+        if not requested and self._cleanup_requested is not None:
+            try:
+                requested = self._cleanup_requested() is True
+            except Exception:
+                requested = False
+        return requested
+
     async def __anext__(self) -> _T:
         if self._closed:
             raise StopAsyncIteration
@@ -114,14 +129,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 # ``anext`` belongs to generator unwinding, not ordinary
                 # source execution. Preserve that distinction for lifecycle
                 # acknowledgement at the transport boundary.
-                cleanup_requested = self._stop.is_set()
-                if not cleanup_requested and self._cleanup_requested is not None:
-                    try:
-                        cleanup_requested = self._cleanup_requested() is True
-                    except Exception:
-                        # An observability predicate must not replace the
-                        # iterator's actual terminal failure.
-                        cleanup_requested = False
+                cleanup_requested = self._cleanup_is_requested()
                 if cleanup_requested and not isinstance(
                     error,
                     asyncio.CancelledError,
@@ -136,7 +144,11 @@ class OwnedAsyncIterator(Generic[_T]):
                         try:
                             await close_iterator()
                         except BaseException as error:
-                            self._cleanup_error = error
+                            if not (
+                                isinstance(error, asyncio.CancelledError)
+                                and self._cleanup_is_requested()
+                            ):
+                                self._cleanup_error = error
                             raise
             finally:
                 self._items.put_nowait((_ITERATOR_TERMINAL, None))
@@ -153,8 +165,11 @@ class OwnedAsyncIterator(Generic[_T]):
         if not self._owner.done():
             owner_cancelled_by_close = self._owner.cancel()
         outcome = await await_owned_task(self._owner)
+        cleanup_requested = (
+            owner_cancelled_by_close or self._cleanup_is_requested()
+        )
         if (
-            owner_cancelled_by_close
+            cleanup_requested
             and isinstance(outcome.error, asyncio.CancelledError)
             and self._cleanup_error is None
         ):
