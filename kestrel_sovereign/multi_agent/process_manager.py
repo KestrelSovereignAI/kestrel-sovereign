@@ -150,7 +150,7 @@ class ProcessManager:
         pm = ProcessManager(project_dir=Path("/path/to/kestrel"))
         pm.start_all(multi_agent_config)
         ...
-        pm.stop_all()
+        pm.terminate_all()
     """
 
     def __init__(self, project_dir: Path):
@@ -984,8 +984,8 @@ class ProcessManager:
         self._agents[name] = ap
         return ap
 
-    def stop_agent(self, name: str, timeout: float = 5.0) -> bool:
-        """Stop a single agent process.
+    def terminate_agent(self, name: str, timeout: float = 5.0) -> bool:
+        """Terminate a single agent process.
 
         Args:
             name: Agent name.
@@ -1101,8 +1101,8 @@ class ProcessManager:
         except (ChildProcessError, OSError):
             pass
 
-    def stop_all(self, timeout: float = 5.0) -> list[str]:
-        """Stop all managed agent processes.
+    def terminate_all(self, timeout: float = 5.0) -> list[str]:
+        """Terminate all managed agent processes.
 
         Args:
             timeout: Seconds to wait per agent for graceful shutdown.
@@ -1115,9 +1115,10 @@ class ProcessManager:
         """
         still_running = []
         for name in list(self._agents):
-            if not self.stop_agent(name, timeout=timeout):
+            if not self.terminate_agent(name, timeout=timeout):
                 still_running.append(name)
         return still_running
+
 
     def get_agent_status(self, name: str) -> dict:
         """Get status info for a single agent.
