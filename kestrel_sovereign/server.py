@@ -1701,11 +1701,27 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                             "Host feature session-factory shutdown failed: %s", exc
                         )
                     finally:
+                        hold_db = (
+                            getattr(host_context, "hold_db", None)
+                            if host_context is not None
+                            else None
+                        )
                         host_db = (
                             getattr(host_context, "db", None)
                             if host_context is not None
                             else None
                         )
+                        if (
+                            hold_db is not None
+                            and hold_db is not host_db
+                            and hasattr(hold_db, "close")
+                        ):
+                            try:
+                                await hold_db.close()
+                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
+                                logger.warning(
+                                    "Hold database shutdown failed: %s", exc
+                                )
                         if host_db is not None and hasattr(host_db, "close"):
                             try:
                                 await host_db.close()
@@ -2583,12 +2599,10 @@ async def _lifespan_startup(app: FastAPI):
         features = _hf.instantiate_host_features(
             manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
         )
+        host_cfg = getattr(app.state, "multi_agent_config", None)
+        ctx = await _hf.build_host_context(config=_host_config_mapping(host_cfg))
+        candidate_ctx = ctx
         if features:
-            host_cfg = getattr(app.state, "multi_agent_config", None)
-            ctx = await _hf.build_host_context(
-                config=_host_config_mapping(host_cfg)
-            )
-            candidate_ctx = ctx
             # Validate and activate the complete prospective contribution set
             # before changing any already-valid mounted host surface.
             started_features = await _hf.start_host_features(features, ctx)
@@ -2614,15 +2628,41 @@ async def _lifespan_startup(app: FastAPI):
                 )
                 app.state.host_setup_step_registry = runtime.setup_step_registry
             logger.info("Host features initialized: %d", len(started_features))
-    except (ContributionContractError, FeatureContributionRuntimeError):
-        # Complete prospective-set rejection is a startup failure, not an
-        # optional-feature warning. No candidate was mounted and prior valid
-        # state remains visible.
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Host feature initialization failed: %s", exc)
-        if candidate_ctx is not None and candidate_started:
-            await _hf.stop_host_features(candidate_started, candidate_ctx)
+        else:
+            # The fleet control store is host infrastructure, not an optional
+            # feature side effect. Hold authority must therefore exist on the
+            # default zero-feature installation as well.
+            app.state.host_features = []
+            app.state.host_context = ctx
+            logger.info("Host features initialized: 0")
+    except BaseException as exc:  # noqa: BLE001 - close unpublished context
+        fatal = isinstance(
+            exc,
+            (ContributionContractError, FeatureContributionRuntimeError),
+        ) or not isinstance(exc, Exception)
+        if not fatal:
+            logger.warning("Host feature initialization failed: %s", exc)
+        try:
+            if candidate_ctx is not None and candidate_started:
+                await _hf.stop_host_features(candidate_started, candidate_ctx)
+        finally:
+            # Until publication, outer lifespan teardown cannot see this
+            # context. Close its distinct Hold pool and host resources here on
+            # validation, activation, mounting, cancellation, or process
+            # control failure. A published context remains teardown-owned.
+            if (
+                candidate_ctx is not None
+                and getattr(app.state, "host_context", None) is not candidate_ctx
+            ):
+                from kestrel_sovereign.host_features.context import (
+                    close_host_context_resources,
+                )
+
+                await close_host_context_resources(candidate_ctx)
+        if fatal:
+            # Complete prospective-set rejection is a startup failure, not an
+            # optional-feature warning. Prior valid state remains visible.
+            raise
 
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
