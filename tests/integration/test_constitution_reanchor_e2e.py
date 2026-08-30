@@ -82,6 +82,24 @@ _ROOT_DID_DOCUMENT = did_document_from_legacy_public_key(
 )
 
 
+async def _seed_legacy_dangling_governance_edge(
+    storage: AsyncStorage,
+    agent_did: str,
+    stale_hash: str,
+) -> None:
+    """Reproduce a pre-fix dangling edge without using the guarded API.
+
+    Public edge admission now rejects missing endpoints.  These recovery tests
+    intentionally need the invalid on-disk shape produced by older releases,
+    so seed that legacy state at the persistence boundary instead.
+    """
+    await storage.db.execute_commit(
+        "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+        "VALUES (?, ?, ?, ?)",
+        (agent_did, stale_hash, "governed_by", "{}"),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_ambient_trust_root(monkeypatch):
     """These tests pass explicit per-test trust-root paths. An operator
@@ -351,7 +369,9 @@ async def test_reanchor_unchanged_force_prunes_stale_edges(tmp_path, monkeypatch
     # Dangling governance edge left behind by a pre-fix reanchor.
     stale_hash = "5" * 64
     async with AsyncStorage(str(db_path)) as storage:
-        await storage.graph.add_edge(creds.agent_did, stale_hash, "governed_by")
+        await _seed_legacy_dangling_governance_edge(
+            storage, creds.agent_did, stale_hash
+        )
 
     artifact_path, trust_root_path = _write_authority_files(
         tmp_path,
@@ -405,7 +425,9 @@ async def test_reanchor_unchanged_stale_edges_unforced_reports_drift(
 
     stale_hash = "5" * 64
     async with AsyncStorage(str(db_path)) as storage:
-        await storage.graph.add_edge(creds.agent_did, stale_hash, "governed_by")
+        await _seed_legacy_dangling_governance_edge(
+            storage, creds.agent_did, stale_hash
+        )
 
     pre = await _snapshot(db_path, creds.agent_did)
 
@@ -445,7 +467,9 @@ async def test_reanchor_unchanged_stale_edges_force_requires_artifact(
 
     stale_hash = "5" * 64
     async with AsyncStorage(str(db_path)) as storage:
-        await storage.graph.add_edge(creds.agent_did, stale_hash, "governed_by")
+        await _seed_legacy_dangling_governance_edge(
+            storage, creds.agent_did, stale_hash
+        )
 
     pre = await _snapshot(db_path, creds.agent_did)
 
@@ -1018,8 +1042,12 @@ async def test_runtime_unchanged_cleanup_rolls_back_on_midprune_failure(
     stale_a = "5" * 64
     stale_b = "6" * 64
     async with AsyncStorage(str(db_path)) as storage:
-        await storage.graph.add_edge(creds.agent_did, stale_a, "governed_by")
-        await storage.graph.add_edge(creds.agent_did, stale_b, "governed_by")
+        await _seed_legacy_dangling_governance_edge(
+            storage, creds.agent_did, stale_a
+        )
+        await _seed_legacy_dangling_governance_edge(
+            storage, creds.agent_did, stale_b
+        )
     artifact_path, trust_root_path = _write_authority_files(
         tmp_path,
         CONSTITUTION_V1,
@@ -1076,8 +1104,8 @@ async def test_runtime_unchanged_cleanup_preserves_document_node(
     v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
     stale_hash = "5" * 64
     async with AsyncStorage(str(db_path)) as storage:
-        await storage.graph.add_edge(
-            creds.agent_did, stale_hash, "governed_by"
+        await _seed_legacy_dangling_governance_edge(
+            storage, creds.agent_did, stale_hash
         )
         pre_doc = await storage.graph.get_node(v1_hash)
     assert pre_doc is not None
