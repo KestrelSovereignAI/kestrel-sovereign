@@ -326,6 +326,9 @@ async def test_server_lifespan_wires_and_closes_host_features(
         def set_created_agent_persistence_hook(self, hook) -> None:
             self.persistence_hook = hook
 
+        def set_created_agent_registration_removal_hook(self, _hook) -> None:
+            return None
+
         async def load_from_config(self, config):
             assert config is fake_config
             events.append("agents-load")

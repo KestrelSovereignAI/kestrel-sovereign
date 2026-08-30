@@ -276,34 +276,56 @@ class SpawnedAgentLifecycle:
         parent_did: str,
         child_name: str,
     ) -> Optional[str]:
-        """Return the exact child owned by a currently active finalizer.
+        """Return the exact child retained for lifecycle cleanup.
 
         A signed TTL ceases to authorize new governance at expiry, and its
         parent may already be unloaded. The lifecycle finalizer still needs a
         cleanup-only capability for the child it claimed before calling the
-        manager. No inactive tracker record grants this authority.
+        manager. An exhausted automatic-finalization refusal retains that same
+        obligation after the finalizer exits so a later parent cascade can
+        retry it. No ordinary inactive tracker record grants this authority.
         """
 
         tracked = self._tracked.get(child_name)
         if tracked is None or tracked.parent_did != parent_did:
             return None
-        if self._finalization_owner_counts.get(
-            (tracked.child_name, tracked.child_did), 0
-        ) <= 0:
+        if not self._tracked_child_has_cleanup_authority(tracked):
             return None
         return tracked.child_did
+
+    def _tracked_child_has_cleanup_authority(self, tracked: _TrackedChild) -> bool:
+        """Whether one exact tracker still owns cleanup, never governance."""
+
+        if self._finalization_owner_counts.get(
+            (tracked.child_name, tracked.child_did), 0
+        ) > 0:
+            return True
+        return self._tracked_child_is_cleanup_retained(tracked)
+
+    def _tracked_child_is_cleanup_retained(self, tracked: _TrackedChild) -> bool:
+        """Whether cleanup remains pending after automatic finalization exits."""
+
+        return tracked.termination_refusal is not None or (
+            tracked.mode is SpawnMode.EPHEMERAL
+            and tracked.ttl_seconds > 0
+            and self._remaining_ttl_seconds(
+                tracked.started_at, tracked.ttl_seconds
+            )
+            <= 0
+        )
 
     def cleanup_authority_children(
         self,
         *,
         parent_did: str,
     ) -> tuple[tuple[str, str], ...]:
-        """Snapshot every child currently owned by a cleanup finalizer.
+        """Snapshot every child currently retained for cleanup.
 
         Governance queries intentionally exclude expired or revoked mandates.
         A cascading teardown has a separate obligation: it must still visit a
         descendant whose lifecycle finalizer already claimed cleanup before
-        that authority expired. Return exact name/DID pairs so manager removal
+        that authority expired, including a refusal retained after bounded
+        automatic retries end. Return exact name/DID pairs so manager removal
         can retain its same-name replacement fence.
         """
 
@@ -311,10 +333,7 @@ class SpawnedAgentLifecycle:
             (tracked.child_name, tracked.child_did)
             for tracked in self._tracked.values()
             if tracked.parent_did == parent_did
-            and self._finalization_owner_counts.get(
-                (tracked.child_name, tracked.child_did), 0
-            )
-            > 0
+            and self._tracked_child_has_cleanup_authority(tracked)
         )
 
     @staticmethod
@@ -727,13 +746,7 @@ class SpawnedAgentLifecycle:
         tracked = self._tracked.get(child_name)
         if tracked is None or tracked.parent_did != parent_did:
             return None
-        cleanup_retained = tracked.termination_refusal is not None or (
-            tracked.mode is SpawnMode.EPHEMERAL
-            and tracked.ttl_seconds > 0
-            and self._remaining_ttl_seconds(
-                tracked.started_at, tracked.ttl_seconds
-            ) <= 0
-        )
+        cleanup_retained = self._tracked_child_is_cleanup_retained(tracked)
         return tracked.child_did if cleanup_retained else None
 
     def get_cleanup_retained_children(self, *, parent_did: str) -> list[str]:

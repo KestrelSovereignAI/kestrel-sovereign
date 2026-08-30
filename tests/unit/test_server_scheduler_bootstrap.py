@@ -226,6 +226,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
 
         def __init__(self) -> None:
             self.created_agent_persistence_hook = None
+            self.created_agent_registration_removal_hook = None
 
         def set_agent_registration_hook(self, _hook) -> None:
             return None
@@ -233,10 +234,18 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         def set_created_agent_persistence_hook(self, hook) -> None:
             self.created_agent_persistence_hook = hook
 
+        def set_created_agent_registration_removal_hook(self, hook) -> None:
+            self.created_agent_registration_removal_hook = hook
+
         async def load_from_config(self, config) -> int:
             assert config is fake_config
             events.append("load")
             return 0
+
+        async def resolve_registered_agent_id(self, name, agent_config) -> str:
+            assert name == "PersistentChild"
+            assert agent_config.port == 8899
+            return "did:test:persistent-child"
 
         def list_agents(self):
             return {}
@@ -276,7 +285,26 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
 
     async with server._lifespan_startup(FastAPI()):
-        pass
+        child_config = ma_config.LocalAgentConfig(
+            data_dir=tmp_path / "persistent-child",
+            port=8899,
+        )
+        await manager.created_agent_persistence_hook(
+            "PersistentChild",
+            child_config,
+        )
+        rollback = await manager.created_agent_registration_removal_hook(
+            "PersistentChild",
+            "did:test:persistent-child",
+        )
+        assert "PersistentChild" not in ma_config.MultiAgentConfig.from_file(
+            config_path
+        ).agents
+        await rollback()
+        assert ma_config.MultiAgentConfig.from_file(config_path).agents[
+            "PersistentChild"
+        ] == child_config
 
     assert events == ["preflight", "load", "host-start"]
     assert callable(manager.created_agent_persistence_hook)
+    assert callable(manager.created_agent_registration_removal_hook)

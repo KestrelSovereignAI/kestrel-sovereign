@@ -2534,6 +2534,102 @@ class TestAgentManagerSpawn:
         assert not scope.path.exists()
 
     @pytest.mark.asyncio
+    async def test_persistent_child_offboard_removes_startup_registration_first(
+        self,
+    ):
+        manager = AgentManager()
+        child = _make_mock_agent("did:child:persistent-offboard")
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+        manager._child_mandates["helper"] = SpawnMandate(
+            parent_did="did:parent",
+            child_did=child.agent_id,
+            ttl_seconds=0,
+        )
+        _use_runtime_projection_as_authority_test_double(manager)
+        registration_removed = False
+        rollback = AsyncMock()
+
+        async def remove_registration(name: str, expected_did: str):
+            nonlocal registration_removed
+            assert name == "helper"
+            assert expected_did == child.agent_id
+            registration_removed = True
+            return rollback
+
+        async def remove_agent(name: str, **kwargs) -> bool:
+            assert name == "helper"
+            assert registration_removed is True
+            kwargs["offboarding_admission"].started = True
+            manager._agents.pop(name, None)
+            manager._agent_names.pop(child.agent_id, None)
+            return True
+
+        manager.set_created_agent_registration_removal_hook(remove_registration)
+        manager.remove_agent = AsyncMock(side_effect=remove_agent)
+
+        assert await manager.terminate_child(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        ) is True
+        rollback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_persistent_child_offboard_restores_registration_if_not_admitted(
+        self,
+    ):
+        manager = AgentManager()
+        child = _make_mock_agent("did:child:persistent-compensation")
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+        manager._child_mandates["helper"] = SpawnMandate(
+            parent_did="did:parent",
+            child_did=child.agent_id,
+            ttl_seconds=0,
+        )
+        _use_runtime_projection_as_authority_test_double(manager)
+        rollback = AsyncMock()
+        manager.set_created_agent_registration_removal_hook(
+            AsyncMock(return_value=rollback)
+        )
+        manager.remove_agent = AsyncMock(return_value=False)
+
+        assert await manager.terminate_child(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        ) is False
+        rollback.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_persistent_child_offboard_refuses_without_registration_inverse(
+        self,
+    ):
+        manager = AgentManager()
+        child = _make_mock_agent("did:child:persistent-refusal")
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+        manager._child_mandates["helper"] = SpawnMandate(
+            parent_did="did:parent",
+            child_did=child.agent_id,
+            ttl_seconds=0,
+        )
+        _use_runtime_projection_as_authority_test_double(manager)
+        manager.remove_agent = AsyncMock(return_value=True)
+
+        with pytest.raises(RuntimeError, match="registration removal hook"):
+            await manager.terminate_child(
+                "did:parent",
+                "helper",
+                offboard_runtime=True,
+            )
+        manager.remove_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_terminate_child_not_found(self):
         manager = AgentManager()
         removed = await manager.terminate_child("did:parent", "ghost")

@@ -56,7 +56,12 @@ from kestrel_sovereign.spawn.mandate import (
     verify_mandate,
 )
 from kestrel_sovereign.spawn.mandate_reload import read_spawn_mandate
-from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+from kestrel_sovereign.spawn.lifecycle import (
+    SpawnedAgentLifecycle,
+    SpawnMode,
+    SpawnStatus,
+    TerminationRefusalState,
+)
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 
 
@@ -1399,6 +1404,54 @@ async def test_authoritative_descendants_rebuild_from_signed_receipts_not_cache(
 
 
 @pytest.mark.asyncio
+async def test_authority_query_withdraws_descendant_of_expired_spawned_parent(
+    tmp_path,
+    monkeypatch,
+):
+    """A spawned parent cannot become a new root when its own edge expires."""
+
+    root_did = "did:pkh:eip155:1:0xLiveQueryRoot"
+    parent_did = "did:pkh:eip155:1:0xExpiredQueryParent"
+    child_did = "did:pkh:eip155:1:0xDisconnectedQueryChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=111,
+        max_child_depth=2,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=222,
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    child._persisted_spawn_mandate = child_mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    for name, agent in (("Root", root), ("Parent", parent), ("Child", child)):
+        manager._register_agent(name, agent)
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+        lambda _created_at, ttl_seconds, **_kwargs: (
+            0 if ttl_seconds == 111 else 999
+        ),
+    )
+
+    assert await manager.get_authoritative_children(root_did) == []
+    assert await manager.get_authoritative_children(parent_did) == []
+    assert await manager.get_authoritative_spawn_relations() == {}
+
+
+@pytest.mark.asyncio
 async def test_authoritative_query_reverifies_projected_receipt(tmp_path):
     parent_did = "did:pkh:eip155:1:0xQueryParent"
     child_did = "did:pkh:eip155:1:0xQueryChild"
@@ -1751,6 +1804,48 @@ async def test_parent_cascade_includes_cleanup_owned_expired_descendant(tmp_path
             "CleanupChild",
             expected_child_did=child_did,
         )
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_includes_child_retained_after_ttl_refusal(tmp_path):
+    """Exhausted automatic retries remain reachable by a later cascade."""
+
+    parent_did = "did:test:refusal-cascade-parent"
+    child_did = "did:test:refusal-cascade-child"
+    child = _make_mock_agent(child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["RefusedChild"] = child
+    manager._agent_names[child_did] = "RefusedChild"
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    await lifecycle.register(
+        "RefusedChild",
+        child_did,
+        parent_did,
+        ttl_seconds=3600,
+        mode=SpawnMode.EPHEMERAL,
+    )
+    lifecycle._tracked["RefusedChild"].termination_refusal = (
+        TerminationRefusalState(
+            automatic_termination_attempts=3,
+            requested_status=SpawnStatus.TIMED_OUT,
+        )
+    )
+
+    async def remove_child(name: str, **kwargs: object) -> bool:
+        assert name == "RefusedChild"
+        assert kwargs["_lifecycle_cleanup_expected_agent_id"] == child_did
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child_did, None)
+        return True
+
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    assert lifecycle.cleanup_authority_children(parent_did=parent_did) == (
+        ("RefusedChild", child_did),
+    )
+    assert await manager.terminate_children(parent_did) == 1
+    manager.remove_agent.assert_awaited_once()
 
 
 @pytest.mark.asyncio

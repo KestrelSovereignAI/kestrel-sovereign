@@ -867,6 +867,16 @@ class AgentManager:
         self._created_agent_persistence_hook: Optional[
             Callable[[str, LocalAgentConfig], Awaitable[None]]
         ] = None
+        # Config-driven hosts install the inverse of the persistence hook.
+        # Persistent spawned children must pass through it before destructive
+        # runtime offboarding, or their startup registration would resurrect
+        # the deleted runtime on the next host boot.
+        self._created_agent_registration_removal_hook: Optional[
+            Callable[
+                [str, str],
+                Awaitable[Optional[Callable[[], Awaitable[None]]]],
+            ]
+        ] = None
 
     def _isolated_runtime_scope(self, agent_did: str) -> tuple[Path, str]:
         """Return this host's canonical mutable runtime scope for one agent.
@@ -933,6 +943,19 @@ class AgentManager:
         hook = self._created_agent_persistence_hook
         if hook is not None:
             await hook(name, config)
+
+    def set_created_agent_registration_removal_hook(
+        self,
+        hook: Optional[
+            Callable[
+                [str, str],
+                Awaitable[Optional[Callable[[], Awaitable[None]]]],
+            ]
+        ],
+    ) -> None:
+        """Install config CAS removal for destructive persistent offboarding."""
+
+        self._created_agent_registration_removal_hook = hook
 
     def set_scheduler_tenant_registration_hook(
         self,
@@ -6935,6 +6958,7 @@ class AgentManager:
 
         relations: dict[str, tuple[str, str]] = {}
         authority_ceiling_inputs: dict[str, tuple[KestrelAgent, SpawnMandate]] = {}
+        signed_spawn_child_dids: set[str] = set()
         names_seen: set[str] = set()
         for child_name, mandate in sorted(
             self._child_mandates.items(),
@@ -6956,6 +6980,11 @@ class AgentManager:
                 # Unsigned legacy projections remain attribution/restriction
                 # data only and cannot enter the authority graph.
                 continue
+            # Record the identity before expiry/revocation filtering. A loaded
+            # agent with a committed signed spawn receipt is not a sovereign
+            # root merely because its incoming edge has since expired. Any of
+            # its descendants require that incoming relation to remain valid.
+            signed_spawn_child_dids.add(mandate.child_did)
 
             child = self.get_agent(child_name)
             if child is not None:
@@ -7066,6 +7095,23 @@ class AgentManager:
                 )
             relations[mandate.child_did] = relation
             authority_ceiling_inputs[mandate.child_did] = (parent, mandate)
+
+        # Withdraw every branch whose spawned parent no longer has an active
+        # incoming relation. This reaches a fixed point so grandchildren cannot
+        # survive merely because their immediate edge still verifies. Genuine
+        # roots are absent from signed_spawn_child_dids and remain valid.
+        while True:
+            disconnected = {
+                child_did
+                for child_did, (parent_did, _name) in relations.items()
+                if parent_did in signed_spawn_child_dids
+                and parent_did not in relations
+            }
+            if not disconnected:
+                break
+            for child_did in disconnected:
+                relations.pop(child_did, None)
+                authority_ceiling_inputs.pop(child_did, None)
 
         # Validate the complete graph before returning even one edge. A query
         # must never grant a safe-looking branch beside a corrupt cycle.
@@ -7204,6 +7250,55 @@ class AgentManager:
                     raise
                 terminal_outcomes.append(exc)
 
+        registration_rollback: Optional[Callable[[], Awaitable[None]]] = None
+        offboarding_admission: Optional[RuntimeOffboardingAdmission] = None
+        mandate = self._child_mandates.get(child_name)
+        persistent_spawn = (
+            isinstance(mandate, SpawnMandate) and mandate.ttl_seconds <= 0
+        )
+        if offboard_runtime and persistent_spawn:
+            removal_hook = self._created_agent_registration_removal_hook
+            if removal_hook is None:
+                raise RuntimeError(
+                    "Destructive offboarding of a persistent spawned child requires "
+                    "a startup-registration removal hook"
+                )
+            expected_child_did = cleanup_child_did
+            if expected_child_did is None and child_agent is not None:
+                expected_child_did = _loaded_agent_did(child_agent)
+            if not expected_child_did:
+                expected_child_did = mandate.child_did
+            if not isinstance(expected_child_did, str) or not expected_child_did:
+                raise RuntimeError(
+                    "Persistent spawned child identity is unavailable; "
+                    "destructive offboarding was refused"
+                )
+            registration_rollback = await removal_hook(
+                child_name,
+                expected_child_did,
+            )
+            if not callable(registration_rollback):
+                raise RuntimeError(
+                    "Persistent startup registration removal did not provide "
+                    "a compensation callback"
+                )
+            offboarding_admission = RuntimeOffboardingAdmission()
+
+        async def compensate_registration_if_not_admitted() -> tuple[
+            bool, Optional[BaseException]
+        ]:
+            if (
+                registration_rollback is None
+                or offboarding_admission is None
+                or offboarding_admission.started
+            ):
+                return False, None
+            rollback_task = asyncio.create_task(
+                registration_rollback(),
+                name=f"restore_persistent_child_registration:{child_name}",
+            )
+            return await await_lifecycle_task_completion(rollback_task)
+
         # NB: the child's own budget hold is released inside remove_agent below
         # (stop-then-release), after the cascade above has already stopped and
         # released every descendant — so refunds flow up leaf-first (#2113).
@@ -7221,6 +7316,8 @@ class AgentManager:
             removal_kwargs: dict[str, object] = {
                 "offboard_runtime": offboard_runtime,
             }
+            if offboarding_admission is not None:
+                removal_kwargs["offboarding_admission"] = offboarding_admission
             if cleanup_child_did is not None:
                 # Bind cleanup-only custody to the exact tracked child so a
                 # same-name replacement cannot be removed after the authority
@@ -7228,7 +7325,31 @@ class AgentManager:
                 removal_kwargs["_lifecycle_cleanup_expected_agent_id"] = (
                     cleanup_child_did
                 )
-            removed = await self.remove_agent(child_name, **removal_kwargs)
+            try:
+                removed = await self.remove_agent(child_name, **removal_kwargs)
+            except BaseException as removal_error:
+                rollback_cancelled, rollback_failure = (
+                    await compensate_registration_if_not_admitted()
+                )
+                rollback_outcomes: list[BaseException] = [removal_error]
+                if rollback_failure is not None:
+                    rollback_outcomes.append(rollback_failure)
+                if rollback_cancelled and not _contains_lifecycle_cancellation(
+                    removal_error
+                ):
+                    rollback_outcomes.append(asyncio.CancelledError())
+                _raise_lifecycle_outcomes(
+                    f"Child {child_name!r} removal and registration compensation failed",
+                    rollback_outcomes,
+                )
+            if not removed:
+                rollback_cancelled, rollback_failure = (
+                    await compensate_registration_if_not_admitted()
+                )
+                if rollback_failure is not None:
+                    raise rollback_failure
+                if rollback_cancelled:
+                    raise asyncio.CancelledError()
         except BaseException as exc:
             if not _is_lifecycle_terminal_outcome(exc):
                 raise
