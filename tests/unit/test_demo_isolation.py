@@ -235,6 +235,7 @@ async def test_audit_summary_redacts_secret_headers():
     request.headers["X-API-Key"] = "secret-api-key"
     request.headers["Authorization"] = "Bearer secret-jwt"
     request.headers["Cookie"] = "session=secret-cookie"
+    request.headers["X-Kestrel-Peer-Key"] = "secret-peer-key"
     request.headers["X-Other-Header"] = "kept"
 
     with pytest.raises(HTTPException):
@@ -244,6 +245,7 @@ async def test_audit_summary_redacts_secret_headers():
     assert "secret-api-key" not in summary
     assert "secret-jwt" not in summary
     assert "secret-cookie" not in summary
+    assert "secret-peer-key" not in summary
     assert "kept" in summary  # non-sensitive headers passed through
 
 
