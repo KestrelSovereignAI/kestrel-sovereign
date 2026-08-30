@@ -4071,9 +4071,21 @@ class SignalDispatcher:
                     if withdrawal is not None:
                         return None, str(withdrawal), None
 
+                execution_context = contextvars.copy_context()
+                # The dispatcher owns registration.resources in its parent task.
+                # A monitored cognition turn needs a child task so durable
+                # withdrawal can race it, but that task boundary must carry the
+                # exact live lock generations into process_input.  The latter
+                # creates its own cancellable invocation child and deliberately
+                # forwards inherited generations again; stale tokens stop
+                # authorizing as soon as this dispatch releases/reacquires.
+                self._locks.bind_current_task_ownership_to_context(
+                    execution_context
+                )
                 execution_task = asyncio.create_task(
                     execute_with_tracking(),
                     name=f"signal_cognition:{signal.id}",
+                    context=execution_context,
                 )
                 done, _ = await asyncio.wait(
                     {execution_task, monitor_task},

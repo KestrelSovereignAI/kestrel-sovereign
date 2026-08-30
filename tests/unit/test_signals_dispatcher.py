@@ -14,6 +14,7 @@ Covers each pipeline step:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import os
 import tempfile
@@ -255,6 +256,51 @@ async def test_monitored_cognition_revalidates_before_execution_handoff(
     assert result.error == "durable work was withdrawn at handoff"
     assert c.agent.validate_cognition_signal_execution.await_count == 2
     assert c.agent.process_input_calls == []
+
+
+@pytest.mark.asyncio
+async def test_monitored_cognition_transfers_resource_lock_generation(
+    dispatcher_components,
+    tmp_path,
+):
+    """The monitor task boundary preserves lock-aware nested turn ownership."""
+
+    c = dispatcher_components
+    template = tmp_path / "monitored-memory-lock.md"
+    template.write_text("payload: {payload}")
+    c.registry.register(
+        _cognition_reg(
+            template,
+            name="monitored_memory_lock",
+            resources=frozenset({ResourceLock.MEMORY}),
+        )
+    )
+
+    async def monitor(_signal):
+        await asyncio.Event().wait()
+
+    c.agent.monitor_cognition_signal_execution = monitor
+    nested_ownership: list[bool] = []
+
+    async def lock_aware_process_input(_prompt):
+        operation_context = contextvars.copy_context()
+        c.locks.bind_current_task_ownership_to_context(operation_context)
+
+        async def nested_turn():
+            owned = c.locks.is_owned_by_current_task(ResourceLock.MEMORY)
+            nested_ownership.append(owned)
+            return owned
+
+        return await asyncio.create_task(nested_turn(), context=operation_context)
+
+    c.agent.process_input = lock_aware_process_input
+
+    result = await c.dispatcher.dispatch_signal(
+        _signal("monitored_memory_lock", mode=SignalMode.COGNITION)
+    )
+
+    assert result.status is Status.OK
+    assert nested_ownership == [True]
 
 
 @pytest.mark.asyncio
