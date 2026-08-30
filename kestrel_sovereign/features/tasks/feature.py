@@ -1341,33 +1341,33 @@ class TaskFeature(Feature):
         # current peer-scope reauthorization and recipient-side notification.
         # ``None`` is the PeersFeature contract for an exact absent outbound
         # route; every unsafe/unreadable route is a fail-closed ToolResult.
+        try:
+            local_recipient_match = await self.task_manager.is_task_recipient(
+                task_id,
+                actor_agent_id,
+            )
+        except Exception as error:
+            logger.error(
+                "Could not resolve task direction for %s: %s",
+                task_id,
+                error,
+                exc_info=True,
+            )
+            return ToolResult.failed(
+                "Could not resolve task cancellation direction",
+                data={"task_id": task_id},
+            )
         features = getattr(self.agent, "features", None)
         values = (
             features.values()
             if hasattr(features, "values")
             else features or ()
         )
+        outbound_router_available = False
         for feature in values:
             cancel_outbound = getattr(feature, "cancel_outbound_task", None)
             if callable(cancel_outbound):
-                try:
-                    local_recipient_match = (
-                        await self.task_manager.is_task_recipient(
-                            task_id,
-                            actor_agent_id,
-                        )
-                    )
-                except Exception as error:
-                    logger.error(
-                        "Could not resolve task direction for %s: %s",
-                        task_id,
-                        error,
-                        exc_info=True,
-                    )
-                    return ToolResult.failed(
-                        "Could not resolve task cancellation direction",
-                        data={"task_id": task_id},
-                    )
+                outbound_router_available = True
                 outbound_result = await cancel_outbound(
                     task_id,
                     reason=reason,
@@ -1376,11 +1376,20 @@ class TaskFeature(Feature):
                 if outbound_result is not None:
                     return outbound_result
 
+        if not local_recipient_match:
+            return ToolResult.failed(
+                f"Task {task_id} not found"
+                if not outbound_router_available
+                else "Task cancellation direction is not unambiguous",
+                data={"task_id": task_id},
+            )
+
         try:
             task = await self.task_manager.cancel_task(
                 task_id,
                 reason=reason,
                 agent_name=actor_agent_id,
+                recipient_agent_id=actor_agent_id,
             )
         except ValueError as e:
             logger.error(f"Failed to cancel task {task_id}: {e}", exc_info=True)

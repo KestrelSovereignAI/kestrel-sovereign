@@ -973,6 +973,7 @@ class TestTaskWorker:
         worker = TaskWorker(
             task_manager=task_manager,
             agent_name="test-worker",
+            recipient_agent_id="did:test:test-worker",
         )
 
         handler = SimpleTaskHandler(

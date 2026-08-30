@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
 from kestrel_sdk.tools.result import ToolResultStatus
+import kestrel_sovereign.endpoints.agent as agent_endpoint
 from kestrel_sovereign.a2a.task_manager import create_task_manager
 from kestrel_sovereign.a2a.types import (
     Message,
@@ -47,6 +53,37 @@ def _feature(manager, did: str) -> TaskFeature:
     feature = TaskFeature(_Agent(did))
     feature.set_task_manager(manager)
     return feature
+
+
+def _principal_action_body(task_id: str, verb: str) -> dict:
+    return {
+        "id": task_id,
+        "sessionId": f"a2a-{verb}:{task_id}",
+        "message": {
+            "role": "user",
+            "parts": [{"type": "text", "text": f"{verb}:{task_id}"}],
+        },
+        "metadata": {
+            "sender": CREATOR_A,
+            "a2a_verb": verb,
+            "signature": {"proof": "test"},
+        },
+    }
+
+
+def _principal_endpoint_app(monkeypatch, agent) -> FastAPI:
+    limiter = Limiter(key_func=get_remote_address)
+    monkeypatch.setattr(agent_endpoint, "limiter", limiter)
+    app = FastAPI()
+    app.state.limiter = limiter
+
+    @app.middleware("http")
+    async def attach_agent(request, call_next):
+        request.state.agent = agent
+        return await call_next(request)
+
+    app.include_router(agent_endpoint.router)
+    return app
 
 
 @pytest.mark.asyncio
@@ -241,3 +278,90 @@ async def test_host_attested_result_read_binds_live_sender_and_recipient(tmp_pat
             )
     finally:
         await task_manager.close()
+
+
+def test_signed_http_read_uses_verified_creator_principal(monkeypatch):
+    task = SimpleNamespace(
+        id="wire-read",
+        status=SimpleNamespace(state=TaskState.COMPLETED, message=None),
+        artifacts=[],
+        metadata={"private": "creator-only"},
+    )
+    manager = SimpleNamespace(
+        get_task_for_creator=AsyncMock(return_value=task),
+    )
+    agent = SimpleNamespace(
+        agent_id=RECIPIENT_A,
+        did=RECIPIENT_A,
+        task_manager=manager,
+    )
+
+    async def verify(_agent, params, _parts, _raw, _artifacts, commit=None):
+        assert params.metadata["a2a_verb"] == "read_task"
+        assert params.metadata["signature"] == {"proof": "test"}
+        return await commit(CREATOR_A)
+
+    monkeypatch.setattr(agent_endpoint, "_create_verified_a2a_task", verify)
+    app = _principal_endpoint_app(monkeypatch, agent)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/tasks/wire-read/read",
+            json=_principal_action_body("wire-read", "read_task"),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["metadata"] == {"private": "creator-only"}
+    manager.get_task_for_creator.assert_awaited_once_with(
+        "wire-read",
+        CREATOR_A,
+    )
+
+
+def test_signed_http_subscription_uses_verified_creator_principal(monkeypatch):
+    task = SimpleNamespace(
+        id="wire-subscribe",
+        status=SimpleNamespace(state=TaskState.SUBMITTED, message=None),
+        artifacts=[],
+        metadata={},
+    )
+    subscribe_calls = []
+
+    async def subscribe(task_id, **kwargs):
+        subscribe_calls.append((task_id, kwargs))
+        yield {
+            "event": "status",
+            "data": '{"id":"wire-subscribe","final":true}',
+            "final": True,
+        }
+
+    manager = SimpleNamespace(
+        get_task_for_creator=AsyncMock(return_value=task),
+        subscribe=subscribe,
+    )
+    agent = SimpleNamespace(
+        agent_id=RECIPIENT_A,
+        did=RECIPIENT_A,
+        task_manager=manager,
+    )
+
+    async def verify(_agent, params, _parts, _raw, _artifacts, commit=None):
+        assert params.metadata["a2a_verb"] == "subscribe_task"
+        return await commit(CREATOR_A)
+
+    monkeypatch.setattr(agent_endpoint, "_create_verified_a2a_task", verify)
+    app = _principal_endpoint_app(monkeypatch, agent)
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/api/agent/tasks/wire-subscribe/subscribe",
+            json=_principal_action_body("wire-subscribe", "subscribe_task"),
+        ) as response:
+            body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "wire-subscribe" in body
+    assert subscribe_calls == [
+        ("wire-subscribe", {"creator_agent_id": CREATOR_A})
+    ]

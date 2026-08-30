@@ -392,6 +392,7 @@ class PeersFeature(Feature):
             local_cancel=getattr(self, "_local_host_cancel", None),
             local_get=getattr(self, "_local_host_get", None),
             local_subscribe=getattr(self, "_local_host_subscribe", None),
+            principal_payload_factory=self._build_principal_action_payload,
         )
 
     def _peer_directory_context(
@@ -761,6 +762,48 @@ class PeersFeature(Feature):
                 type(exc).__name__,
             )
             raise OutboundSigningError("hybrid_signer_error") from exc
+
+    def _build_principal_action_payload(
+        self,
+        task_id: str,
+        verb: str,
+    ) -> Dict[str, Any]:
+        """Build a signed creator-principal envelope for HTTP read/SSE.
+
+        Process-isolated peers cannot carry the host manager's in-memory
+        capability. Binding the action verb, task id, session id, and message
+        into the ordinary replay-protected A2A signature gives the recipient
+        the same durable creator principal without trusting the shared API key.
+        """
+
+        if verb not in {"read_task", "subscribe_task"}:
+            raise OutboundSigningError("unsupported_principal_action")
+        if not isinstance(task_id, str) or not task_id:
+            raise OutboundSigningError("invalid_principal_task_id")
+        session_id = f"a2a-{verb}:{task_id}"
+        message = f"{verb}:{task_id}"
+        payload: Dict[str, Any] = {
+            "id": task_id,
+            "sessionId": session_id,
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": message}],
+            },
+            "metadata": {
+                "sender": self._current_legacy_outbound_sender(),
+                "a2a_verb": verb,
+            },
+        }
+        self._maybe_sign_outbound(
+            payload,
+            task_id=task_id,
+            sess_id=session_id,
+            message=message,
+        )
+        metadata = payload.get("metadata") or {}
+        if not isinstance(metadata, Mapping) or not metadata.get("signature"):
+            raise OutboundSigningError("principal_signature_required")
+        return payload
 
     @tool(
         name="list_peers",
