@@ -639,7 +639,7 @@ def test_hosted_legacy_unsigned_peer_cannot_impersonate_cancellation_actor(
 
     assert response.status_code == 403
     assert response.json()["detail"] == (
-        "A2A cancellation requires a verified sender signature"
+        "A2A principal action requires a verified sender signature"
     )
     assert victim.did == "did:pkh:hosted:victim"
     agent.task_manager.cancel_task.assert_not_awaited()
