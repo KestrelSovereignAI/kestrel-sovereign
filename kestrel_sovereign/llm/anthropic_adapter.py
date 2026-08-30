@@ -1330,6 +1330,8 @@ class AnthropicAdapter(LLMAdapter):
             chunk_count = 0
             input_tokens = None
             output_tokens = None
+            cache_creation_input_tokens = None
+            cache_read_input_tokens = None
             splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with _anthropic_stream_with_retry(client, api_params) as stream:
@@ -1347,12 +1349,33 @@ class AnthropicAdapter(LLMAdapter):
                     # Message start - contains usage info
                     if event_type == 'message_start':
                         if hasattr(event, 'message') and hasattr(event.message, 'usage'):
-                            input_tokens = getattr(event.message.usage, 'input_tokens', None)
+                            usage = event.message.usage
+                            input_tokens = getattr(usage, 'input_tokens', None)
+                            cache_creation_input_tokens = getattr(
+                                usage, 'cache_creation_input_tokens', None
+                            )
+                            cache_read_input_tokens = getattr(
+                                usage, 'cache_read_input_tokens', None
+                            )
                             if usage_sink is not None and input_tokens is not None:
                                 # Flush input usage immediately — Anthropic bills
                                 # input the moment the request is accepted, so an
                                 # abort after this must still record it (#1684).
                                 usage_sink["input_tokens"] = input_tokens
+                            if (
+                                usage_sink is not None
+                                and cache_creation_input_tokens is not None
+                            ):
+                                usage_sink["cache_creation_input_tokens"] = (
+                                    cache_creation_input_tokens
+                                )
+                            if (
+                                usage_sink is not None
+                                and cache_read_input_tokens is not None
+                            ):
+                                usage_sink["cache_read_input_tokens"] = (
+                                    cache_read_input_tokens
+                                )
 
                     # Message delta - contains output token count at end
                     elif event_type == 'message_delta':
@@ -1492,6 +1515,8 @@ class AnthropicAdapter(LLMAdapter):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except Exception as e:
