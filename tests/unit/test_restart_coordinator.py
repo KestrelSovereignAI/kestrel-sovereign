@@ -3045,6 +3045,38 @@ async def test_coordinator_update_failure_leaves_retryable(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failed_update_with_rotated_authority_never_stays_updating(
+    tmp_path, monkeypatch,
+):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="failed update while key rotates",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+
+    async def failed_after_rotation(_req, _profile):
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-failed-update")
+        return {
+            "ok": False,
+            "failed_step": "install",
+            "steps": [],
+            "resolved_ref": "",
+            "migration": {"ran": False},
+        }
+
+    feat._run_update = failed_after_rotation
+    await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "authority revoked during failed update" in row.status_reason
+
+
+@pytest.mark.asyncio
 async def test_run_update_records_steps_and_resolved_ref(tmp_path):
     feat, _ = await _make_feature(tmp_path)
     profile = get_update_profile("sovereign_local_uv_sync")

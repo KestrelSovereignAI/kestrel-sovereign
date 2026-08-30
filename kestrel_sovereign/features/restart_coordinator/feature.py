@@ -1369,19 +1369,21 @@ class RestartCoordinatorFeature(Feature):
         request_id: str,
         *,
         reason: str,
+        active_status: str = "executing",
+        authority_context: str = "failed restart dispatch",
     ) -> Optional[str]:
         """Make a demonstrably failed dispatch retryable or terminal.
 
-        An ``executing`` request owns a one-shot retry capability. If its
+        An active mutation request owns a one-shot retry capability. If its
         sovereign seal was revoked while the host mutation was in flight,
         rotating that capability back to ``pending`` must fail. Leaving the
-        row ``executing`` would strand it outside both polling and cancel
+        row active would strand it outside both polling and cancel
         surfaces, so invalid or missing retry authority is terminalized with
         exact evidence instead.
         """
 
         current = await get_request(self._db, request_id)
-        if current is None or current.status != "executing":
+        if current is None or current.status != active_status:
             return None
 
         verified, authority_reason = verify_restart_authority(current)
@@ -1391,7 +1393,7 @@ class RestartCoordinatorFeature(Feature):
                 request_id,
                 status="pending",
                 status_reason=reason,
-                expected_current_status="executing",
+                expected_current_status=active_status,
                 expected_authority_signature=current.authority_signature,
             )
             if moved:
@@ -1408,12 +1410,12 @@ class RestartCoordinatorFeature(Feature):
             # key rotation. Re-read before deciding whether this was a benign
             # concurrent state transition or revoked authority.
             current = await get_request(self._db, request_id)
-            if current is None or current.status != "executing":
+            if current is None or current.status != active_status:
                 return None
             verified, authority_reason = verify_restart_authority(current)
 
         terminal_reason = (
-            f"{reason}; authority revoked during failed restart dispatch: "
+            f"{reason}; authority revoked during {authority_context}: "
             f"{authority_reason}"
             if not verified
             else f"{reason}; no durable retry authority remains"
@@ -1424,7 +1426,7 @@ class RestartCoordinatorFeature(Feature):
             status="rejected",
             status_reason=terminal_reason,
             completed_at=datetime.now(timezone.utc).isoformat(),
-            expected_current_status="executing",
+            expected_current_status=active_status,
             expected_authority_signature=current.authority_signature,
         )
         if not moved:
@@ -2199,22 +2201,30 @@ class RestartCoordinatorFeature(Feature):
         if not update["ok"]:
             # Fetch/checkout/install failed before any restart. Leave the
             # request retryable — the next poll re-runs the idempotent
-            # profile — with a clear reason naming the failed step.
-            await update_status(
-                self._db, req.id,
-                status="pending",
-                status_reason=(
-                    f"update failed at step {update.get('failed_step')!r}; "
-                    "left retryable (see update_log)"
-                ),
-                expected_current_status="updating",
-                expected_authority_signature=req.authority_signature,
+            # profile — unless sovereign rotation revoked its authority while
+            # the update was in flight. That case becomes terminal instead of
+            # remaining stranded in the unpolled ``updating`` state.
+            failure_reason = (
+                f"update failed at step {update.get('failed_step')!r}; "
+                "left retryable (see update_log)"
+            )
+            recovered_status = await self._recover_failed_restart_dispatch(
+                req.id,
+                reason=failure_reason,
+                active_status="updating",
+                authority_context="failed update",
             )
             return {
                 "request_id": req.id,
                 "reason": (
                     f"update failed at step {update.get('failed_step')!r}; "
-                    "retryable"
+                    + (
+                        "retryable"
+                        if recovered_status == "pending"
+                        else "terminal: authority revoked"
+                        if recovered_status == "rejected"
+                        else "state changed concurrently"
+                    )
                 ),
             }
         return None
