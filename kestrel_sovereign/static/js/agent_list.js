@@ -53,14 +53,24 @@ export function createDefaultAgentAdapter(api = API) {
         // must fail CLOSED while this is false rather than trust the
         // defaults above (codex P1 on #2358).
         classificationLoaded: false,
+        loadGeneration: 0,
         lastPayload: null,
         async listAgents() {
+            const generation = ++adapter.loadGeneration;
+            // Revoke the adapter's cached classification before awaiting the
+            // authenticated discovery request. Security-sensitive consumers
+            // must use API.canManageHostAgentLifecycle(); these mirrors remain
+            // fail-closed for older presentation consumers as well.
+            adapter.classificationLoaded = false;
+            adapter.canCreateAgents = false;
             const data = await api.getAgents();
-            adapter.lastPayload = data;
-            adapter.mode = data.mode === 'standalone' ? 'standalone' : 'multi_agent';
-            adapter.serverDemoMode = data.server_demo_mode === true;
-            adapter.canCreateAgents = data.can_create_agents === true;
-            adapter.classificationLoaded = true;
+            if (generation === adapter.loadGeneration) {
+                adapter.lastPayload = data;
+                adapter.mode = data.mode === 'standalone' ? 'standalone' : 'multi_agent';
+                adapter.serverDemoMode = data.server_demo_mode === true;
+                adapter.canCreateAgents = data.can_create_agents === true;
+                adapter.classificationLoaded = true;
+            }
             const agents = data.agents || [];
             return agents.map((a) => {
                 // `routing_name` is the AgentManager's immutable registration
