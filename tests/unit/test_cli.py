@@ -836,7 +836,7 @@ class TestCmdTerminateReportsOnlyVerifiedTermination:
     def test_an_unresolvable_bind_address_is_not_called_occupied(self):
         """A typo is a configuration fault, not another process holding a port.
 
-        Claiming occupancy would wedge `stop` into permanent failure; the bind
+        Claiming occupancy would wedge `shutdown` into permanent failure; the bind
         error surfaces at `start`, where it names the address.
         """
         assert ProcessManager.is_port_in_use(

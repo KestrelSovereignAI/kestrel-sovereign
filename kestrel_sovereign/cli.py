@@ -1895,6 +1895,7 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _run_uv_pip_install_editable,
     _GitFailedError,
 )
+from kestrel_sovereign.cli_stop import cmd_stop  # noqa: E402
 
 
 # Feature commands live in cli_features.py (#1678); re-export the public
@@ -1962,9 +1963,13 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_serve import add_serve_subparser
     add_serve_subparser(subparsers)
 
-    # kestrel start|stop|restart|update|status|logs
+    # kestrel start|shutdown|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
+
+    # Cooperative Stop is intentionally outside process lifecycle.
+    from kestrel_sovereign.cli_stop import add_stop_subparser
+    add_stop_subparser(subparsers)
 
     # kestrel list
     subparsers.add_parser("list", help="List all agents in multi_agent")
