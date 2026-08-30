@@ -461,7 +461,8 @@ class DistributedInvocationRegistry:
                     return False
                 last_heartbeat = self._last_heartbeat_monotonic
                 if (
-                    last_heartbeat is not None
+                    self._active
+                    and last_heartbeat is not None
                     and asyncio.get_running_loop().time() - last_heartbeat
                     >= self._owner_lease_seconds
                 ):
@@ -522,6 +523,12 @@ class DistributedInvocationRegistry:
                         continue
                     self._by_local_generation.pop(key, None)
                     self._active.pop(generation_id, None)
+                    if not self._active:
+                        # A lease protects durable owner rows, not an idle
+                        # process identity. The next admission starts a fresh
+                        # lease generation instead of inheriting elapsed idle
+                        # time from work that already completed.
+                        self._last_heartbeat_monotonic = None
                     return
             finally:
                 self._cleanup_keys.discard(key)

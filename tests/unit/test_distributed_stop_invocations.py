@@ -350,6 +350,38 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_idle_registry_starts_a_fresh_owner_lease_for_later_work(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "idle-owner-lease.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=0.03,
+    )
+    agent = _ReplicaAgent("did:test:idle-agent")
+    try:
+        assert await registry.register(agent, "first-turn", 1)
+        registry.complete_soon(agent, "first-turn", 1)
+        for _ in range(100):
+            if not registry._active:
+                break
+            await asyncio.sleep(0.01)
+        assert registry._active == {}
+        assert registry._last_heartbeat_monotonic is None
+
+        await asyncio.sleep(0.04)
+
+        assert await registry.register(agent, "later-turn", 2)
+        assert registry._lease_lost is False
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_transient_completion_failure_is_retried_until_row_is_removed(
     tmp_path,
 ):
