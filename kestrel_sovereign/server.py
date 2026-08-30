@@ -560,6 +560,29 @@ def get_peer_api_key() -> str:
     return ensure_peer_api_key(sovereign_key=get_api_key())
 
 
+_LOCAL_PEER_TRANSPORT_ROUTES = (
+    ("GET", re.compile(r"^/api/agents$")),
+    ("POST", re.compile(r"^/api/agents/[^/]+/api/agent/invoke$")),
+    ("POST", re.compile(r"^/api/agents/[^/]+/api/agent/tasks/send$")),
+    ("GET", re.compile(r"^/api/agents/[^/]+/api/agent/tasks/[^/]+$")),
+    (
+        "GET",
+        re.compile(
+            r"^/api/agents/[^/]+/api/agent/tasks/[^/]+/subscribe$"
+        ),
+    ),
+)
+
+
+def _is_local_peer_transport_route(method: str, path: str) -> bool:
+    """Whether the dedicated peer key may authenticate this HTTP request."""
+
+    return any(
+        method == allowed_method and pattern.fullmatch(path) is not None
+        for allowed_method, pattern in _LOCAL_PEER_TRANSPORT_ROUTES
+    )
+
+
 async def verify_api_key(
     request: Request,
     api_key_header: Optional[str] = Security(api_key_header),
@@ -3040,9 +3063,13 @@ async def auth_middleware(request: Request, call_next):
         expected_peer_key = get_peer_api_key()
 
         peer_key_header = request.headers.get(LOCAL_PEER_API_KEY_HEADER)
-        if peer_key_header and secrets.compare_digest(
-            peer_key_header,
-            expected_peer_key,
+        if (
+            peer_key_header
+            and secrets.compare_digest(peer_key_header, expected_peer_key)
+            and _is_local_peer_transport_route(
+                request.method,
+                request.scope.get("path", request.url.path),
+            )
         ):
             caller = CallerContext.local_peer_transport()
 

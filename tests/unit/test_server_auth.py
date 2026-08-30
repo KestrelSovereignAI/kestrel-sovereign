@@ -68,6 +68,15 @@ def _build_app():
             "is_sovereign": caller.is_sovereign,
         }
 
+    @app.get("/api/agents")
+    async def peer_directory_route(request: Request):
+        caller = request.state.caller
+        return {
+            "role": caller.role.value,
+            "auth_method": caller.auth_method.value,
+            "is_sovereign": caller.is_sovereign,
+        }
+
     return app
 
 
@@ -108,7 +117,7 @@ def test_local_peer_transport_key_is_authenticated_but_not_sovereign(client):
         peer_api_key=PEER_KEY,
     )._headers()
 
-    response = client.get("/api/test/caller", headers=headers)
+    response = client.get("/api/agents", headers=headers)
 
     assert response.status_code == 200
     assert response.json() == {
@@ -116,6 +125,42 @@ def test_local_peer_transport_key_is_authenticated_but_not_sovereign(client):
         "auth_method": "internal",
         "is_sovereign": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/agents"),
+        ("POST", "/api/agents/Claw/api/agent/invoke"),
+        ("POST", "/api/agents/Claw/api/agent/tasks/send"),
+        ("GET", "/api/agents/Claw/api/agent/tasks/task-1"),
+        ("GET", "/api/agents/Claw/api/agent/tasks/task-1/subscribe"),
+    ],
+)
+def test_local_peer_transport_route_allowlist_covers_directory_contract(
+    method, path,
+):
+    assert server_module._is_local_peer_transport_route(method, path) is True
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/test/caller"),
+        ("post", "/api/agents"),
+        ("delete", "/api/agents/Claw"),
+        ("post", "/api/features/PeersFeature/disable"),
+    ],
+)
+def test_local_peer_transport_key_is_rejected_outside_peer_routes(
+    client, method, path,
+):
+    response = getattr(client, method)(
+        path,
+        headers={"X-Kestrel-Peer-Key": PEER_KEY},
+    )
+
+    assert response.status_code == 401
 
 
 def test_peer_key_is_not_accepted_on_sovereign_header(client):

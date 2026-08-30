@@ -478,6 +478,10 @@ class TestStartAgent:
 
         with patch("subprocess.Popen", side_effect=processes) as mock_popen:
             pm.start_agent("claw", claw)
+            # Simulate a later, independent launcher process. The project has
+            # no explicit peer key, so only deterministic host derivation can
+            # make this second child converge with the first.
+            monkeypatch.delenv("KESTREL_PEER_API_KEY", raising=False)
             pm.start_agent("testbot", testbot)
 
         first_env = mock_popen.call_args_list[0].kwargs["env"]
