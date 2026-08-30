@@ -22,7 +22,10 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     raise_owned_outcome,
 )
-from kestrel_sovereign.storage.database_clock import database_now_sql
+from kestrel_sovereign.storage.database_clock import (
+    database_backend_type,
+    database_now_sql,
+)
 
 from .receipt import StopReceiptStore, opaque_stop_identifier
 from .types import StopDisposition
@@ -31,6 +34,7 @@ _SCHEMA_LOCK = "stop_invocations_v1"
 _TURN_ID_DOMAIN = b"kestrel:distributed-stop-turn:v1\0"
 _DEFAULT_POLL_SECONDS = 0.1
 _DEFAULT_WAIT_SECONDS = 4.0
+_DEFAULT_OWNER_LEASE_SECONDS = 2.0
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +59,30 @@ class DistributedStopTicket:
     """The exact durable generations selected at Stop linearization."""
 
     generation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnerPoll:
+    """One non-revivable heartbeat result for an invocation owner."""
+
+    live_generation_ids: tuple[str, ...]
+    stop_generation_ids: tuple[str, ...]
+
+
+def _lease_cutoff_sql(db: Any, lease_seconds: float) -> tuple[str, tuple[object, ...]]:
+    backend_type = database_backend_type(db)
+    if backend_type == "postgres":
+        return (
+            "(to_char((clock_timestamp() - (? * INTERVAL '1 second')) "
+            "AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00')",
+            (lease_seconds,),
+        )
+    if backend_type == "sqlite":
+        return (
+            "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', ?)",
+            (f"-{lease_seconds} seconds",),
+        )
+    raise RuntimeError("distributed Stop lease clock is unavailable")
 
 
 class DistributedInvocationStore:
@@ -234,24 +262,97 @@ class DistributedInvocationStore:
                     )
         return DistributedStopTicket(generation_ids)
 
-    async def poll_owner(self, owner_id: str) -> tuple[str, ...]:
-        """Heartbeat this process and return generations it must cancel."""
+    async def poll_owner(
+        self,
+        owner_id: str,
+        *,
+        lease_seconds: float,
+    ) -> _OwnerPoll:
+        """Renew a still-live owner and return its exact durable inventory.
+
+        Expiry is non-revivable.  A process that resumes after its heartbeat
+        crossed the lease boundary must self-fence and start a new registry
+        owner rather than silently reclaiming work another replica may already
+        have reaped.
+        """
 
         owner_id = _required_identity(owner_id, "owner identity")
+        if lease_seconds <= 0:
+            raise ValueError("distributed Stop owner lease must be positive")
         async with self._db.transaction(immediate=True):
             now_sql = database_now_sql(self._db)
+            cutoff_sql, cutoff_args = _lease_cutoff_sql(
+                self._db, float(lease_seconds)
+            )
             await self._db.execute(
                 "UPDATE stop_active_invocations "
-                f"SET heartbeat_at = {now_sql} WHERE owner_id = ?",
-                (owner_id,),
+                f"SET heartbeat_at = {now_sql} WHERE owner_id = ? "
+                f"AND heartbeat_at > {cutoff_sql}",
+                (owner_id, *cutoff_args),
             )
             rows = await self._db.fetchall(
-                "SELECT generation_id FROM stop_active_invocations "
-                "WHERE owner_id = ? AND stop_requested = 1 "
+                "SELECT generation_id, stop_requested "
+                "FROM stop_active_invocations WHERE owner_id = ? "
+                f"AND heartbeat_at > {cutoff_sql} "
                 "ORDER BY generation_id",
-                (owner_id,),
+                (owner_id, *cutoff_args),
             )
-        return tuple(str(row[0]) for row in rows)
+        return _OwnerPoll(
+            live_generation_ids=tuple(str(row[0]) for row in rows),
+            stop_generation_ids=tuple(
+                str(row[0]) for row in rows if int(row[1]) == 1
+            ),
+        )
+
+    async def reap_expired(
+        self,
+        generation_ids: tuple[str, ...],
+        *,
+        lease_seconds: float,
+    ) -> tuple[str, ...]:
+        """CAS-delete selected generations whose owner lease has expired."""
+
+        if not generation_ids:
+            return ()
+        if lease_seconds <= 0:
+            raise ValueError("distributed Stop owner lease must be positive")
+        placeholders = ", ".join("?" for _ in generation_ids)
+        cutoff_sql, cutoff_args = _lease_cutoff_sql(
+            self._db, float(lease_seconds)
+        )
+        reaped: list[str] = []
+        async with self._db.transaction(immediate=True):
+            rows = await self._db.fetchall(
+                "SELECT generation_id, agent_id, heartbeat_at "
+                "FROM stop_active_invocations "
+                f"WHERE generation_id IN ({placeholders}) "
+                f"AND heartbeat_at <= {cutoff_sql} ORDER BY generation_id",
+                (*generation_ids, *cutoff_args),
+            )
+            for agent_id in sorted({str(row[1]) for row in rows}):
+                await self._lock_agent(
+                    _required_identity(agent_id, "stored agent identity")
+                )
+            for generation_id, _agent_id, observed_heartbeat in rows:
+                # heartbeat_at is part of the delete predicate: a renewal that
+                # won the race makes this a no-op instead of reaping a live
+                # owner from a stale read.
+                cutoff_sql, cutoff_args = _lease_cutoff_sql(
+                    self._db, float(lease_seconds)
+                )
+                changed = await self._db.execute(
+                    "DELETE FROM stop_active_invocations "
+                    "WHERE generation_id = ? AND heartbeat_at = ? "
+                    f"AND heartbeat_at <= {cutoff_sql}",
+                    (str(generation_id), observed_heartbeat, *cutoff_args),
+                )
+                if changed == 1:
+                    reaped.append(str(generation_id))
+                elif changed != 0:
+                    raise RuntimeError(
+                        "distributed Stop stale-owner reap changed multiple rows"
+                    )
+        return tuple(reaped)
 
     async def remaining(
         self,
@@ -295,14 +396,20 @@ class DistributedInvocationRegistry:
         store: DistributedInvocationStore,
         *,
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
+        owner_lease_seconds: float = _DEFAULT_OWNER_LEASE_SECONDS,
     ) -> None:
         if not isinstance(store, DistributedInvocationStore):
             raise TypeError("distributed Stop registry requires its typed store")
         if poll_seconds <= 0:
             raise ValueError("distributed Stop poll interval must be positive")
+        if owner_lease_seconds <= poll_seconds:
+            raise ValueError(
+                "distributed Stop owner lease must exceed its poll interval"
+            )
         self._store = store
         self._owner_id = uuid4().hex
         self._poll_seconds = float(poll_seconds)
+        self._owner_lease_seconds = float(owner_lease_seconds)
         self._active: dict[str, tuple[object, str]] = {}
         self._by_local_generation: dict[tuple[int, str, int], str] = {}
         self._registration_lock = asyncio.Lock()
@@ -311,6 +418,8 @@ class DistributedInvocationRegistry:
         self._cleanup_keys: set[tuple[int, str, int]] = set()
         self._relay_task: asyncio.Task[None] | None = None
         self._closing = False
+        self._lease_lost = False
+        self._last_heartbeat_monotonic: float | None = None
 
     def start(self) -> None:
         if self._relay_task is None:
@@ -321,6 +430,8 @@ class DistributedInvocationRegistry:
     def attach(self, agent: object) -> None:
         if self._closing:
             raise RuntimeError("distributed Stop registry is closing")
+        if self._lease_lost:
+            raise RuntimeError("distributed Stop owner lease was lost")
         agent.__dict__["_distributed_invocation_registry"] = self
 
     @staticmethod
@@ -340,10 +451,22 @@ class DistributedInvocationRegistry:
     ) -> bool:
         if self._closing:
             raise RuntimeError("distributed Stop registry is closing")
+        if self._lease_lost:
+            return False
         key = (id(agent), turn_id, generation)
 
         async def publish() -> bool:
             async with self._registration_lock:
+                if self._lease_lost:
+                    return False
+                last_heartbeat = self._last_heartbeat_monotonic
+                if (
+                    last_heartbeat is not None
+                    and asyncio.get_running_loop().time() - last_heartbeat
+                    >= self._owner_lease_seconds
+                ):
+                    self._fail_closed_owner()
+                    return False
                 if key in self._by_local_generation:
                     return True
                 generation_id = uuid4().hex
@@ -355,8 +478,14 @@ class DistributedInvocationRegistry:
                 )
                 if not admitted:
                     return False
+                if self._lease_lost:
+                    await self._store.complete(generation_id, self._owner_id)
+                    return False
                 self._by_local_generation[key] = generation_id
                 self._active[generation_id] = (agent, turn_id)
+                self._last_heartbeat_monotonic = (
+                    asyncio.get_running_loop().time()
+                )
                 return True
 
         owner = asyncio.create_task(publish(), name="distributed-stop-register")
@@ -433,11 +562,31 @@ class DistributedInvocationRegistry:
             remaining = await self._store.remaining(ticket.generation_ids)
             if not remaining:
                 return StopDisposition.STOPPED
+            reaped = await self._store.reap_expired(
+                tuple(generation_id for generation_id, _heartbeat in remaining),
+                lease_seconds=self._owner_lease_seconds,
+            )
+            if reaped:
+                continue
             if asyncio.get_running_loop().time() >= deadline:
                 # A dead or partitioned owner remains UNREACHABLE; liveness
                 # uncertainty is never rewritten as already complete.
                 return StopDisposition.UNREACHABLE
             await asyncio.sleep(self._poll_seconds)
+
+    def _fail_closed_owner(self) -> None:
+        if self._lease_lost:
+            return
+        self._lease_lost = True
+        for agent, turn_id in tuple(self._active.values()):
+            cancel = getattr(agent, "cancel_current_request", None)
+            if callable(cancel):
+                try:
+                    cancel(request_id=turn_id)
+                except Exception:
+                    logger.exception(
+                        "Distributed Stop owner self-fence cancellation failed"
+                    )
 
     async def _relay(self) -> None:
         while not self._closing:
@@ -445,15 +594,24 @@ class DistributedInvocationRegistry:
                 await asyncio.sleep(self._poll_seconds)
                 continue
             try:
-                requested = await self._store.poll_owner(self._owner_id)
-                for generation_id in requested:
-                    target = self._active.get(generation_id)
-                    if target is None:
-                        continue
-                    agent, turn_id = target
-                    cancel = getattr(agent, "cancel_current_request", None)
-                    if callable(cancel):
-                        cancel(request_id=turn_id)
+                polled = await self._store.poll_owner(
+                    self._owner_id,
+                    lease_seconds=self._owner_lease_seconds,
+                )
+                now = asyncio.get_running_loop().time()
+                self._last_heartbeat_monotonic = now
+                live = set(polled.live_generation_ids)
+                if any(generation_id not in live for generation_id in self._active):
+                    self._fail_closed_owner()
+                else:
+                    for generation_id in polled.stop_generation_ids:
+                        target = self._active.get(generation_id)
+                        if target is None:
+                            continue
+                        agent, turn_id = target
+                        cancel = getattr(agent, "cancel_current_request", None)
+                        if callable(cancel):
+                            cancel(request_id=turn_id)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -462,6 +620,13 @@ class DistributedInvocationRegistry:
                     type(error).__name__,
                     exc_info=(type(error), error, error.__traceback__),
                 )
+                last_heartbeat = self._last_heartbeat_monotonic
+                if (
+                    last_heartbeat is not None
+                    and asyncio.get_running_loop().time() - last_heartbeat
+                    >= self._owner_lease_seconds
+                ):
+                    self._fail_closed_owner()
             await asyncio.sleep(self._poll_seconds)
 
     async def close(self) -> None:
