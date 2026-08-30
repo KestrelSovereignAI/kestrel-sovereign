@@ -168,7 +168,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_authorization_sqlite(tmp_path):
+async def test_cancel_task_authorization_sqlite(tmp_path):
     backend = SQLiteBackend(str(tmp_path / "cancel-authority.db"))
     await backend.connect()
     try:
@@ -219,7 +219,7 @@ async def test_upgrade_settles_live_rows_without_trustworthy_authority(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_cancel_authorization_postgres():
+async def test_cancel_task_authorization_postgres():
     if not POSTGRES_URL:  # pragma: no cover - environment gate
         pytest.skip(
             "TEST_POSTGRES_URL / KESTREL_DATABASE_URL / DATABASE_URL required"

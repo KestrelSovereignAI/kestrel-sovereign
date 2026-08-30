@@ -59,7 +59,7 @@ def _feature(manager, agent_did: str) -> TaskFeature:
 
 
 @pytest.mark.asyncio
-async def test_cancel_task_creator_and_execution_delegate_are_authorized(tmp_path):
+async def test_cancel_task_owner_and_delegation_are_authorized(tmp_path):
     manager = await create_task_manager(str(tmp_path / "tasks.db"))
     try:
         await manager.create_task(
@@ -529,7 +529,7 @@ async def test_artifact_append_cannot_mutate_an_authoritatively_canceled_task(tm
         ),
     ],
 )
-async def test_cancel_task_refuses_peer_lineage_and_causation(
+async def test_cancel_task_unauthorized_peer_lineage_and_causation_is_refused(
     tmp_path, caller, metadata
 ):
     manager = await create_task_manager(str(tmp_path / f"{caller.rsplit(':', 1)[-1]}.db"))
