@@ -58,6 +58,39 @@ async def test_distributed_protocol_has_sqlite_postgres_parity(db_backend):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_owner_lease_expiry_has_sqlite_postgres_parity(db_backend):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    store = DistributedInvocationStore(AsyncDatabase(db_backend))
+    await store.ensure_schema()
+    suffix = uuid4().hex
+    generation_id = f"expired-{suffix}"
+    owner_id = f"owner-{suffix}"
+    assert await store.register(
+        generation_id=generation_id,
+        agent_id=f"did:test:agent-{suffix}",
+        turn_id=f"turn-{suffix}",
+        owner_id=owner_id,
+    )
+    stale = "2000-01-01T00:00:00.000+00:00"
+    await store._db.execute(
+        "UPDATE stop_active_invocations SET heartbeat_at = ? "
+        "WHERE generation_id = ?",
+        (stale, generation_id),
+    )
+
+    poll = await store.poll_owner(owner_id, lease_seconds=0.03)
+    reaped = await store.reap_expired(
+        (generation_id,), lease_seconds=0.03
+    )
+
+    assert poll.live_generation_ids == ()
+    assert reaped == (generation_id,)
+    assert await store.remaining((generation_id,)) == ()
+
+
 async def _shared_registries(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -188,6 +221,128 @@ async def test_unjoined_remote_owner_is_unreachable_not_already_complete(tmp_pat
         )
     finally:
         agent._cleanup_cancelled_request("wedged-turn")
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_crashed_owner_is_cas_reaped_and_stop_confirms(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    path = tmp_path / "expired-owner.db"
+    first_db = await AsyncDatabase.sqlite(str(path))
+    second_db = await AsyncDatabase.sqlite(str(path))
+    store = DistributedInvocationStore(first_db)
+    waiter_store = DistributedInvocationStore(second_db)
+    await store.ensure_schema()
+    generation_id = "crashed-generation"
+    try:
+        assert await store.register(
+            generation_id=generation_id,
+            agent_id="did:test:crashed-agent",
+            turn_id="crashed-turn",
+            owner_id="crashed-owner",
+        )
+        await first_db.execute(
+            "UPDATE stop_active_invocations SET heartbeat_at = ? "
+            "WHERE generation_id = ?",
+            ("2000-01-01T00:00:00.000+00:00", generation_id),
+        )
+        waiter = DistributedInvocationRegistry(
+            waiter_store,
+            poll_seconds=0.01,
+            owner_lease_seconds=0.03,
+        )
+        ticket = await waiter.request_turn(
+            "did:test:crashed-agent", "crashed-turn"
+        )
+
+        assert (
+            await waiter.wait_for_stop(ticket, timeout_seconds=0.2)
+            is StopDisposition.STOPPED
+        )
+        assert await store.remaining((generation_id,)) == ()
+    finally:
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_owner_cannot_revive_its_heartbeat(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "non-revivable-owner.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    try:
+        assert await store.register(
+            generation_id="expired-generation",
+            agent_id="did:test:expired-agent",
+            turn_id="expired-turn",
+            owner_id="expired-owner",
+        )
+        stale = "2000-01-01T00:00:00.000+00:00"
+        await db.execute(
+            "UPDATE stop_active_invocations SET heartbeat_at = ?",
+            (stale,),
+        )
+
+        poll = await store.poll_owner(
+            "expired-owner", lease_seconds=0.03
+        )
+        row = await db.fetchone(
+            "SELECT heartbeat_at FROM stop_active_invocations "
+            "WHERE generation_id = ?",
+            ("expired-generation",),
+        )
+
+        assert poll.live_generation_ids == ()
+        assert poll.stop_generation_ids == ()
+        assert row == (stale,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path):
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    replica_a._owner_lease_seconds = 0.04
+    agent = _ReplicaAgent("did:test:self-fenced-agent")
+    replica_a.attach(agent)
+    entered = asyncio.Event()
+
+    async def cognition():
+        agent.register_active_request("partitioned-turn")
+        assert await agent.await_durable_request_admission("partitioned-turn")
+        agent.bind_request_operation("partitioned-turn", asyncio.current_task())
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            agent._cleanup_cancelled_request("partitioned-turn")
+
+    operation = asyncio.create_task(cognition())
+    original_poll = store.poll_owner
+
+    async def unavailable_poll(*args, **kwargs):
+        raise RuntimeError("database partition")
+
+    try:
+        await entered.wait()
+        store.poll_owner = unavailable_poll
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, timeout=0.5)
+        assert replica_a._lease_lost is True
+        assert await replica_a.register(agent, "later-turn", 2) is False
+    finally:
+        store.poll_owner = original_poll
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
         await replica_a.close()
         await replica_b.close()
         await first_db.close()
