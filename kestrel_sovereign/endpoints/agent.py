@@ -69,9 +69,11 @@ from kestrel_sovereign.stop import (
     StopScope,
     UnavailableStopReceiptStore,
 )
-from kestrel_sovereign.stop.runtime_target import build_runtime_stop_target
+from kestrel_sovereign.stop.runtime_target import (
+    build_runtime_stop_target,
+    resolve_runtime_stop_identity,
+)
 from kestrel_sovereign.telemetry import current_trace_identity
-
 logger = logging.getLogger(__name__)
 
 # SSE connection tracking: maps (client_ip, agent_id) -> active connection count
@@ -1177,6 +1179,14 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
+        canonical_turn_id, target_trace_id, target_span_id = (
+            resolve_runtime_stop_identity(
+                agent,
+                explicit_request_id=request_id,
+                explicit_turn_id=turn_id,
+            )
+        )
+
         descendant_manager: list[object | None] = [None]
         descendant_query: list[object | None] = [None]
 
@@ -1312,7 +1322,6 @@ async def stop_agent_request(request: Request):
             descendant_resolver=resolve_descendants,
             unloaded_agent_stop=stop_unloaded_descendant,
         )
-        trace_id, span_id = current_trace_identity()
         stop_request = StopRequest(
             scope=(
                 StopScope.TURN
@@ -1331,9 +1340,9 @@ async def stop_agent_request(request: Request):
                 else None
             ),
             target_is_turn_id=turn_id is not None,
-            turn_id=turn_id,
-            trace_id=trace_id,
-            span_id=span_id,
+            turn_id=canonical_turn_id,
+            trace_id=target_trace_id,
+            span_id=target_span_id,
             **(
                 {"correlation_id": correlation_id}
                 if correlation_id is not None
@@ -1361,7 +1370,7 @@ async def stop_agent_request(request: Request):
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
-            "turn_id": turn_id,
+            "turn_id": canonical_turn_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel",
             "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }
