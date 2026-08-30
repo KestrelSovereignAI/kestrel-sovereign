@@ -770,6 +770,9 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
             self._agents = {"already-loaded": loaded_agent}
             self.shutdown_calls = 0
 
+        def set_created_agent_persistence_hook(self, _hook) -> None:
+            return None
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
