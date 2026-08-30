@@ -984,8 +984,8 @@ class ProcessManager:
         self._agents[name] = ap
         return ap
 
-    def stop_agent(self, name: str, timeout: float = 5.0) -> bool:
-        """Stop a single agent process.
+    def terminate_agent(self, name: str, timeout: float = 5.0) -> bool:
+        """Terminate a single agent process.
 
         Args:
             name: Agent name.
@@ -1115,7 +1115,7 @@ class ProcessManager:
         """
         still_running = []
         for name in list(self._agents):
-            if not self.stop_agent(name, timeout=timeout):
+            if not self.terminate_agent(name, timeout=timeout):
                 still_running.append(name)
         return still_running
 
