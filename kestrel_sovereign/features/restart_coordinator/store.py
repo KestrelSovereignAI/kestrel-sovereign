@@ -397,6 +397,21 @@ async def ensure_restart_requests_table(db) -> None:
         ON restart_authority_consumptions(request_id)
         """
     )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_retry_permissions (
+            lifecycle_generation TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            granted_at TEXT NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_restart_authority_retry_request
+        ON restart_authority_retry_permissions(request_id)
+        """
+    )
 
 
 async def insert_request(
@@ -924,6 +939,12 @@ async def claim_request_for_execution(
         if not isinstance(inserted_count, int) or inserted_count <= 0:
             return "consumed"
 
+        await db.execute(
+            "INSERT INTO restart_authority_retry_permissions "
+            "(lifecycle_generation, request_id, granted_at) VALUES (?, ?, ?)",
+            (generation, request.id, (await database_clock(db)).isoformat()),
+        )
+
         sql = (
             "UPDATE restart_requests SET status = ?, status_reason = ?"
             + (
@@ -949,6 +970,11 @@ async def claim_request_for_execution(
             # inserted this generation because our insert returned >0.
             await db.execute(
                 "DELETE FROM restart_authority_consumptions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (generation, request.id),
+            )
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
                 "WHERE lifecycle_generation = ? AND request_id = ?",
                 (generation, request.id),
             )
@@ -982,49 +1008,95 @@ async def update_status(
     """
     authority_evidence: Optional[str] = None
     authority_signature: Optional[str] = None
-    if status == "pending" and expected_current_status not in PENDING_STATES:
-        current = await get_request(db, request_id)
-        if current is not None and verify_restart_authority(current)[0]:
+    retry_generation: Optional[str] = None
+    retry_transition = (
+        status == "pending" and expected_current_status not in PENDING_STATES
+    )
+
+    # Retry authority is a capability outside the caller-editable request row.
+    # A legitimate execution claim grants it; the first active -> pending
+    # transition consumes it while rotating to a new lifecycle generation.
+    # Consequently, rewriting a terminal request row back to ``updating`` or
+    # ``executing`` cannot manufacture a retry after the terminal transition
+    # has revoked the separate permission.
+    async with db.transaction(immediate=True):
+        if retry_transition:
+            current = await get_request(db, request_id)
+            if current is None or not verify_restart_authority(current)[0]:
+                return False
+            if (
+                expected_current_status is not None
+                and current.status != expected_current_status
+            ):
+                return False
+            if (
+                expected_authority_signature is not None
+                and current.authority_signature != expected_authority_signature
+            ):
+                return False
+            try:
+                retry_generation = restart_authority_generation(current)
+            except RestartAuthorityError:
+                return False
+            permission = await db.fetchone(
+                "SELECT 1 FROM restart_authority_retry_permissions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (retry_generation, request_id),
+            )
+            if permission is None:
+                return False
             try:
                 authority_evidence, authority_signature = (
                     rotate_restart_authority_generation(current)
                 )
             except RestartAuthorityError:
-                authority_evidence = None
-                authority_signature = None
-            else:
-                # Bind the retry reseal to the exact generation just consumed,
-                # even when an older caller omitted the optional signature CAS.
-                if expected_authority_signature is None:
-                    expected_authority_signature = current.authority_signature
+                return False
+            # Bind the retry reseal to the exact generation just consumed,
+            # even when an older caller omitted the optional signature CAS.
+            if expected_authority_signature is None:
+                expected_authority_signature = current.authority_signature
 
-    sql = (
-        "UPDATE restart_requests SET status = ?, status_reason = ?"
-        + (", completed_at = ?" if completed_at is not None else "")
-        + (", executing_boot_id = ?" if executing_boot_id is not None else "")
-        + (
-            ", authority_evidence = ?, authority_signature = ?"
-            if authority_evidence is not None
-            else ""
+        sql = (
+            "UPDATE restart_requests SET status = ?, status_reason = ?"
+            + (", completed_at = ?" if completed_at is not None else "")
+            + (", executing_boot_id = ?" if executing_boot_id is not None else "")
+            + (
+                ", authority_evidence = ?, authority_signature = ?"
+                if authority_evidence is not None
+                else ""
+            )
+            + " WHERE id = ?"
         )
-        + " WHERE id = ?"
-    )
-    params_final: List[Any] = [status, status_reason]
-    if completed_at is not None:
-        params_final.append(completed_at)
-    if executing_boot_id is not None:
-        params_final.append(executing_boot_id)
-    if authority_evidence is not None:
-        params_final.extend([authority_evidence, authority_signature])
-    params_final.append(request_id)
-    if expected_current_status is not None:
-        sql += " AND status = ?"
-        params_final.append(expected_current_status)
-    if expected_authority_signature is not None:
-        sql += " AND authority_signature = ?"
-        params_final.append(expected_authority_signature)
-    result = await db.execute(sql, tuple(params_final))
-    # >0 = updated; 0 = expected-status mismatch, i.e. lost the race.
-    return await _write_landed(
-        db, result, request_id, lambda row: row.status == status,
-    )
+        params_final: List[Any] = [status, status_reason]
+        if completed_at is not None:
+            params_final.append(completed_at)
+        if executing_boot_id is not None:
+            params_final.append(executing_boot_id)
+        if authority_evidence is not None:
+            params_final.extend([authority_evidence, authority_signature])
+        params_final.append(request_id)
+        if expected_current_status is not None:
+            sql += " AND status = ?"
+            params_final.append(expected_current_status)
+        if expected_authority_signature is not None:
+            sql += " AND authority_signature = ?"
+            params_final.append(expected_authority_signature)
+        result = await db.execute(sql, tuple(params_final))
+        landed = await _write_landed(
+            db, result, request_id, lambda row: row.status == status,
+        )
+        if not landed:
+            return False
+        if retry_generation is not None:
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (retry_generation, request_id),
+            )
+        elif status in TERMINAL_STATES:
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+        return True

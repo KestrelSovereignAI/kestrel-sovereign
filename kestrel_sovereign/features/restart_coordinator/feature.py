@@ -2716,7 +2716,7 @@ class RestartCoordinatorFeature(Feature):
             self._db, status="updating", agent_id=str(agent_id),
         )
         for row in stuck:
-            await update_status(
+            moved = await update_status(
                 self._db, row.id,
                 status="pending",
                 status_reason=(
@@ -2725,6 +2725,40 @@ class RestartCoordinatorFeature(Feature):
                 ),
                 expected_current_status="updating",
             )
+            if moved:
+                continue
+            # The request row is not its own authority. A valid execution
+            # claim grants a separate, one-shot retry permission; terminal
+            # transitions revoke it. If only the caller-editable row says an
+            # update is in flight, reject that forged/replayed state rather
+            # than minting a fresh lifecycle generation from it.
+            fresh = await get_request(self._db, row.id)
+            if fresh is None or fresh.status != "updating":
+                continue
+            reason = (
+                "interrupted update has no durable retry authority; refusing "
+                "to revive a consumed host mutation"
+            )
+            rejected = await update_status(
+                self._db,
+                fresh.id,
+                status="rejected",
+                status_reason=reason,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                expected_current_status="updating",
+                expected_authority_signature=fresh.authority_signature,
+            )
+            if rejected:
+                logger.error(
+                    "restart_coordinator: rejected unauthorized interrupted "
+                    "update row %s",
+                    fresh.id,
+                )
+                await self._emit_status_event(
+                    fresh,
+                    state="rejected",
+                    status_reason=reason,
+                )
 
     async def _reap_post_restart_rows(self) -> List[asyncio.Task[Any]]:
         """Sweep ``executing`` rows this agent filed and wake the
