@@ -79,6 +79,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
         assert not await store.save_recipient_lifecycle(
             stale,
             recipient_agent_id=recipient,
+            expected_state=TaskState.SUBMITTED,
         )
         assert (await store.get(task_id)).status.state is TaskState.CANCELED
 
@@ -104,6 +105,7 @@ async def _exercise_authorized_cancel(store: TaskStore) -> None:
         assert await store.save_recipient_lifecycle(
             concurrent,
             recipient_agent_id=recipient,
+            expected_state=TaskState.SUBMITTED,
         )
 
         handler_payload = Task(

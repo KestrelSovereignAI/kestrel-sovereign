@@ -281,8 +281,9 @@ class TaskStore(UnifiedStoreBase):
                 CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence()
                 RETURNS trigger AS $a2a_fence_function$
                 BEGIN
-                    IF TG_OP = 'UPDATE' AND OLD.status = 'canceled' THEN
-                        RAISE EXCEPTION 'canceled A2A task is terminal'
+                    IF TG_OP = 'UPDATE'
+                       AND OLD.status IN ('completed', 'failed', 'canceled') THEN
+                        RAISE EXCEPTION 'terminal A2A task cannot be replaced'
                             USING ERRCODE = 'check_violation';
                     END IF;
                     IF NEW.status IN ('submitted', 'working', 'input-required')
@@ -308,12 +309,26 @@ class TaskStore(UnifiedStoreBase):
 
         await self._backend.execute_script("""
             DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_terminal_v2
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v2;
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_update_v3
             BEFORE UPDATE ON a2a_tasks
             FOR EACH ROW
-            WHEN OLD.status = 'canceled'
+            WHEN OLD.status IN ('completed', 'failed', 'canceled')
             BEGIN
-                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+                SELECT RAISE(ABORT, 'terminal A2A task cannot be replaced');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_replace_v3
+            BEFORE INSERT ON a2a_tasks
+            FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1
+                 FROM a2a_tasks
+                 WHERE id = NEW.id
+                   AND status IN ('completed', 'failed', 'canceled')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'terminal A2A task cannot be replaced');
             END;
 
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
@@ -369,8 +384,9 @@ class TaskStore(UnifiedStoreBase):
         task: Task,
         *,
         recipient_agent_id: str,
+        expected_state: TaskState,
     ) -> bool:
-        """Persist a worker result only for its durable task recipient."""
+        """CAS a worker result from one expected live recipient-owned state."""
 
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
             raise ValueError("Task lifecycle recipient must be a concrete identity")
@@ -379,6 +395,12 @@ class TaskStore(UnifiedStoreBase):
             raise ValueError(
                 "CANCELED is an authorized transition; use cancel_if_authorized"
             )
+        if expected_state in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.CANCELED,
+        }:
+            raise ValueError("A terminal A2A lifecycle cannot be replaced")
 
         message_json = task.status.message.model_dump_json() if task.status.message else None
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
@@ -398,7 +420,7 @@ class TaskStore(UnifiedStoreBase):
                 updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
-              AND status <> 'canceled'
+              AND status = ?
             """,
             (
                 task.status.state.value,
@@ -408,6 +430,7 @@ class TaskStore(UnifiedStoreBase):
                 metadata_json,
                 task.id,
                 recipient_agent_id,
+                expected_state.value,
             ),
         )
         return rows_affected == 1
@@ -570,6 +593,7 @@ class TaskStore(UnifiedStoreBase):
         status: TaskStatus,
         *,
         recipient_agent_id: str,
+        expected_state: TaskState,
     ) -> bool:
         """Update a live task only when the durable recipient matches."""
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
@@ -578,6 +602,12 @@ class TaskStore(UnifiedStoreBase):
             raise ValueError(
                 "CANCELED is an authorized transition; use cancel_if_authorized"
             )
+        if expected_state in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.CANCELED,
+        }:
+            raise ValueError("A terminal A2A lifecycle cannot be replaced")
         message_json = status.message.model_dump_json() if status.message else None
         rows_affected = await self._backend.execute(
             f"""
@@ -585,9 +615,15 @@ class TaskStore(UnifiedStoreBase):
             SET status = ?, message = ?, updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
-              AND status <> 'canceled'
+              AND status = ?
             """,
-            (status.state.value, message_json, task_id, recipient_agent_id),
+            (
+                status.state.value,
+                message_json,
+                task_id,
+                recipient_agent_id,
+                expected_state.value,
+            ),
         )
         return rows_affected == 1
 
