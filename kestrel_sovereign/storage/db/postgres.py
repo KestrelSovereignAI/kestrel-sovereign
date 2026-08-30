@@ -58,9 +58,27 @@ _CONCURRENT_WRITE_BACKOFF_S = 0.02
 _ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
 
 
-def _is_concurrent_update_error(exc: BaseException) -> bool:
+def is_concurrent_update_error(exc: BaseException) -> bool:
     """True for the transient 'tuple concurrently updated' race (#1805)."""
     return _CONCURRENT_UPDATE_MARKER in str(exc).lower()
+
+
+# Compatibility for existing internal callers/tests while new transactional
+# users consume the public policy helper below.
+_is_concurrent_update_error = is_concurrent_update_error
+
+
+def concurrent_write_retry_delay(
+    exc: BaseException,
+    retries_done: int,
+) -> Optional[float]:
+    """Return the shared backoff for a retryable PostgreSQL write conflict."""
+    if (
+        not is_concurrent_update_error(exc)
+        or retries_done >= _CONCURRENT_WRITE_RETRIES
+    ):
+        return None
+    return _CONCURRENT_WRITE_BACKOFF_S * (retries_done + 1)
 
 
 # asyncpg is optional - only required for PostgreSQL usage
@@ -533,17 +551,14 @@ class PostgresBackend(DatabaseBackend):
             except Exception as e:
                 # Retry the transient concurrent-upsert race on the autocommit
                 # path only (a poisoned txn can't be salvaged statement-wise).
-                if (
-                    txn is None
-                    and _is_concurrent_update_error(e)
-                    and attempt < _CONCURRENT_WRITE_RETRIES
-                ):
+                retry_delay = concurrent_write_retry_delay(e, attempt)
+                if txn is None and retry_delay is not None:
                     attempt += 1
                     logger.warning(
                         "Concurrent-update race on write (attempt %d/%d), retrying: %s",
                         attempt, _CONCURRENT_WRITE_RETRIES, e,
                     )
-                    await asyncio.sleep(_CONCURRENT_WRITE_BACKOFF_S * attempt)
+                    await asyncio.sleep(retry_delay)
                     continue
                 raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
     
