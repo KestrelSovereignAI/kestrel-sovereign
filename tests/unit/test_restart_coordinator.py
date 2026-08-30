@@ -1633,6 +1633,55 @@ async def test_canceled_restart_generation_cannot_be_replayed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancel_revokes_claimed_update_retry_permission(tmp_path):
+    """A canceled claimed row cannot borrow its former recovery grant."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="cancel claimed update")
+    request_id = created.data["request"]["id"]
+    current = await get_request(backend, request_id)
+    assert (
+        await claim_request_for_execution(
+            backend,
+            current,
+            status="updating",
+            status_reason="claimed before cancellation",
+        )
+        == "claimed"
+    )
+    permissions = await backend.fetchall(
+        "SELECT request_id FROM restart_authority_retry_permissions "
+        "WHERE request_id = ?",
+        (request_id,),
+    )
+    assert permissions == [(request_id,)]
+
+    # Reproduce the raw-row rollback from the review: cancellation must still
+    # revoke the independent grant even though the generation was consumed.
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending' WHERE id = ?",
+        (request_id,),
+    )
+    canceled = await feat.cancel_restart_request(request_id=request_id)
+    assert canceled.data["canceled"] is True
+    assert await backend.fetchall(
+        "SELECT request_id FROM restart_authority_retry_permissions "
+        "WHERE request_id = ?",
+        (request_id,),
+    ) == []
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'updating', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+    await feat._reset_interrupted_updates()
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "no durable retry authority" in replayed.status_reason
+
+
+@pytest.mark.asyncio
 async def test_malformed_signature_rejects_row_and_continues_scan(tmp_path):
     """Hostile signature bytes cannot wedge later coordinator candidates."""
 

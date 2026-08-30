@@ -562,6 +562,13 @@ def get_peer_api_key() -> str:
 
 _LOCAL_PEER_TRANSPORT_ROUTES = (
     ("GET", re.compile(r"^/api/agents$")),
+    # The process-host proxy strips ``/api/agents/{id}`` before forwarding to
+    # the child server.  The same credential therefore arrives at the second
+    # authentication hop on these canonical agent-local paths.
+    ("POST", re.compile(r"^/api/agent/invoke$")),
+    ("POST", re.compile(r"^/api/agent/tasks/send$")),
+    ("GET", re.compile(r"^/api/agent/tasks/[^/]+$")),
+    ("GET", re.compile(r"^/api/agent/tasks/[^/]+/subscribe$")),
     ("POST", re.compile(r"^/api/agents/[^/]+/api/agent/invoke$")),
     ("POST", re.compile(r"^/api/agents/[^/]+/api/agent/tasks/send$")),
     ("GET", re.compile(r"^/api/agents/[^/]+/api/agent/tasks/[^/]+$")),

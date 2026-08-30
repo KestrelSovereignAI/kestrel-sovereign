@@ -855,24 +855,42 @@ async def cancel_request_if_owned(
                     (await database_clock(db)).isoformat(),
                 ),
             )
+            # Cancellation is terminal even when the lifecycle generation was
+            # already consumed by an earlier claim.  The retry permission is
+            # a separate one-shot capability for recovering a legitimate
+            # interrupted update; leaving it behind would let a raw rewrite
+            # of this canceled row to ``updating`` mint fresh authority.
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
         return True
 
     # Invalid/legacy rows carry no executable authority to replay. Let their
     # owner dispose of them without manufacturing a valid lifecycle generation.
-    result = await db.execute(
-        "UPDATE restart_requests SET status = 'canceled', "
-        "status_reason = ?, completed_at = ? "
-        "WHERE id = ? AND requested_by_agent = ? "
-        "AND status IN ('pending', 'approved')",
-        (status_reason, completed_at, request_id, requested_by_agent),
-    )
-    return await _write_landed(
-        db,
-        result,
-        request_id,
-        lambda row: row.status == "canceled",
-        requested_by_agent=requested_by_agent,
-    )
+    async with db.transaction(immediate=True):
+        result = await db.execute(
+            "UPDATE restart_requests SET status = 'canceled', "
+            "status_reason = ?, completed_at = ? "
+            "WHERE id = ? AND requested_by_agent = ? "
+            "AND status IN ('pending', 'approved')",
+            (status_reason, completed_at, request_id, requested_by_agent),
+        )
+        landed = await _write_landed(
+            db,
+            result,
+            request_id,
+            lambda row: row.status == "canceled",
+            requested_by_agent=requested_by_agent,
+        )
+        if landed:
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+        return landed
 
 
 async def record_update_log(db, request_id: str, update_log: str) -> None:

@@ -148,6 +148,10 @@ def test_sovereign_bearer_is_not_downgraded_by_valid_peer_header(client):
     ("method", "path"),
     [
         ("GET", "/api/agents"),
+        ("POST", "/api/agent/invoke"),
+        ("POST", "/api/agent/tasks/send"),
+        ("GET", "/api/agent/tasks/task-1"),
+        ("GET", "/api/agent/tasks/task-1/subscribe"),
         ("POST", "/api/agents/Claw/api/agent/invoke"),
         ("POST", "/api/agents/Claw/api/agent/tasks/send"),
         ("GET", "/api/agents/Claw/api/agent/tasks/task-1"),
