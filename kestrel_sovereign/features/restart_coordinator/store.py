@@ -703,20 +703,74 @@ async def acknowledge_escalation(
     *,
     requested_by_agent: str,
 ) -> bool:
-    """Acknowledge a migrated row only for its durable requester."""
+    """Sovereign-authorize and acknowledge a row for its durable requester."""
+
+    current = await get_request_for_agent(db, request_id, requested_by_agent)
+    if current is None or current.status not in PENDING_STATES:
+        return False
+
+    current_evidence = current.authority_evidence or ""
+    current_signature = current.authority_signature or ""
+    if current_evidence or current_signature:
+        verified, _ = verify_restart_authority(current)
+        if not verified:
+            return False
+        authority_evidence = current_evidence
+        authority_signature = current_signature
+    else:
+        authority_evidence, authority_signature = issue_restart_authority(
+            request_id=current.id,
+            requested_by_agent=current.requested_by_agent,
+            reason=current.reason,
+            urgency=current.urgency,
+            policy=current.policy,
+            desired_window=current.desired_window,
+            operation=current.operation,
+            update_repo_path=current.update_repo_path,
+            update_target_ref=current.update_target_ref,
+            update_profile=current.update_profile,
+            update_allow_migrations=current.update_allow_migrations,
+            requester_request_id=current.requester_request_id,
+            origin_session_id=current.origin_session_id,
+            requested_at=current.requested_at,
+            first_blocked_at=current.first_blocked_at,
+        )
 
     result = await db.execute(
-        "UPDATE restart_requests SET escalation_acknowledged = 1 "
+        "UPDATE restart_requests SET escalation_acknowledged = 1, "
+        "authority_evidence = ?, authority_signature = ? "
         "WHERE id = ? AND requested_by_agent = ? "
-        "AND status IN ('pending', 'approved')",
-        (request_id, requested_by_agent),
+        "AND status IN ('pending', 'approved') "
+        "AND COALESCE(authority_evidence, '') = ? "
+        "AND COALESCE(authority_signature, '') = ?",
+        (
+            authority_evidence,
+            authority_signature,
+            request_id,
+            requested_by_agent,
+            current_evidence,
+            current_signature,
+        ),
     )
-    return await _write_landed(
+    landed = await _write_landed(
         db,
         result,
         request_id,
-        lambda row: row.escalation_acknowledged,
+        lambda row: (
+            row.escalation_acknowledged
+            and row.authority_signature == authority_signature
+        ),
         requested_by_agent=requested_by_agent,
+    )
+    if not landed:
+        return False
+    refreshed = await get_request_for_agent(db, request_id, requested_by_agent)
+    return bool(
+        refreshed is not None
+        and refreshed.escalation_acknowledged
+        and refreshed.authority_evidence == authority_evidence
+        and refreshed.authority_signature == authority_signature
+        and verify_restart_authority(refreshed)[0]
     )
 
 

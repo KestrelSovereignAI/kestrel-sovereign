@@ -924,6 +924,68 @@ async def test_agent_cannot_acknowledge_another_agents_escalation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sovereign_acknowledgement_seals_legacy_row_for_execution(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, "
+        "escalation_acknowledged) VALUES (?, ?, ?, ?, 'pending', 0)",
+        (
+            "legacy-to-authorize",
+            feat.agent.did,
+            "operator adopts legacy request",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    acknowledged = await feat.acknowledge_restart_escalation(
+        "legacy-to-authorize"
+    )
+    sealed = await get_request(backend, "legacy-to-authorize")
+
+    assert acknowledged.status is ToolResultStatus.OK
+    assert sealed.escalation_acknowledged is True
+    assert verify_restart_authority(sealed) == (
+        True,
+        "verified sovereign-key authority",
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+    assert mock_spawn.call_count == 1
+    assert result.data["executed"][0]["request_id"] == "legacy-to-authorize"
+
+
+@pytest.mark.asyncio
+async def test_nonsovereign_cannot_authorize_legacy_escalation(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, "
+        "escalation_acknowledged) VALUES (?, ?, ?, ?, 'pending', 0)",
+        (
+            "legacy-stays-unsigned",
+            feat.agent.did,
+            "legacy request",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    with caller_context_scope(CallerContext.authenticated("oauth@example.test")):
+        result = await feat.acknowledge_restart_escalation(
+            "legacy-stays-unsigned"
+        )
+    unchanged = await get_request(backend, "legacy-stays-unsigned")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["authority"] == "required"
+    assert unchanged.escalation_acknowledged is False
+    assert unchanged.authority_evidence == ""
+    assert unchanged.authority_signature == ""
+
+
+@pytest.mark.asyncio
 async def test_restart_request_list_is_scoped_to_requesting_agent(tmp_path):
     owner, backend = await _make_feature(tmp_path, did="did:test:owner")
     other = RestartCoordinatorFeature(_make_agent(backend, did="did:test:other"))
@@ -2398,6 +2460,34 @@ async def test_request_update_then_restart_creates_row(tmp_path):
     row = await get_request(backend, req["id"])
     assert row.operation == "update_then_restart"
     assert row.update_target_ref == "main"
+
+
+@pytest.mark.asyncio
+async def test_denied_update_request_never_inspects_checkout_paths(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    with (
+        caller_context_scope(CallerContext.authenticated("oauth@example.test")),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "default_sovereign_repo_path"
+        ) as default_path,
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "repo_is_git_checkout"
+        ) as inspect_checkout,
+    ):
+        result = await feat.request_restart(
+            reason="denied update",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["authority"] == "required"
+    default_path.assert_not_called()
+    inspect_checkout.assert_not_called()
+    assert await list_requests(backend) == []
 
 
 @pytest.mark.asyncio
