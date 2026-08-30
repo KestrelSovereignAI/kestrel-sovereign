@@ -12,6 +12,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sovereign.endpoints.restart_events import (
     get_restart_status_events,
@@ -24,10 +25,27 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 
+_test_databases: list[AsyncDatabase] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_test_databases():
+    """Close each test-owned worker before pytest tears down its event loop."""
+
+    _test_databases.clear()
+    try:
+        yield
+    finally:
+        for db in reversed(_test_databases):
+            await db.close()
+        _test_databases.clear()
+
+
 async def _backend(tmp_path):
     raw = SQLiteBackend(str(tmp_path / "restart-events.db"))
     await raw.connect()
     db = AsyncDatabase(raw)
+    _test_databases.append(db)
     await ensure_restart_status_events_table(db)
     return db
 
