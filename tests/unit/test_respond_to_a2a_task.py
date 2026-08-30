@@ -58,9 +58,24 @@ def _make_feature(initial_state: TaskState = TaskState.SUBMITTED):
         ]
         return state["task"]
 
+    async def cancel_task(task_id, reason=None, agent_name=None):
+        assert state["task"].id == task_id
+        prior = state["task"].status.state
+        state["task"].status = TaskStatus(
+            state=TaskState.CANCELED,
+            message=Message(
+                role="agent", parts=[TextPart(text=reason or "Task canceled")]
+            ),
+        )
+        state["transitions"] = state.get("transitions", []) + [
+            (prior.value, TaskState.CANCELED.value)
+        ]
+        return state["task"]
+
     task_manager = MagicMock()
     task_manager.get_task = AsyncMock(side_effect=get_task)
     task_manager.update_status = AsyncMock(side_effect=update_status)
+    task_manager.cancel_task = AsyncMock(side_effect=cancel_task)
 
     agent = SimpleNamespace(did="did:test:receiver")
     feature = TaskFeature(agent)
@@ -134,6 +149,11 @@ async def test_canceled_state_supported():
     )
     assert result.status is ToolResultStatus.OK
     assert state["task"].status.state == TaskState.CANCELED
+    feature.task_manager.cancel_task.assert_awaited_once_with(
+        "task-1",
+        reason="declining: out of scope",
+        agent_name="did:test:receiver",
+    )
 
 
 @pytest.mark.asyncio

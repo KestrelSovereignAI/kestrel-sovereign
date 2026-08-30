@@ -1793,6 +1793,36 @@ class SchedulerFeature(Feature):
             }
         return None
 
+    def _owned_watch_target_agent(self, requested_notify: Any = None) -> str:
+        """Return the durable identity of this scheduler's owning agent.
+
+        Watchers enqueue on this agent's dispatcher, so they can only wake this
+        agent.  A legacy ``notify`` argument is not a routing seam and must not
+        be allowed to stamp some peer into the signal/causation chain while the
+        local dispatcher still invokes its owner.
+        """
+
+        target = next(
+            (
+                candidate.strip()
+                for candidate in (
+                    getattr(self, "_agent_id", None),
+                    getattr(self.agent, "did", None),
+                    getattr(self.agent, "agent_id", None),
+                )
+                if isinstance(candidate, str) and candidate.strip()
+            ),
+            None,
+        )
+        if target is None:
+            raise RuntimeError("Scheduler watcher has no durable owning agent identity")
+        if requested_notify is not None and requested_notify != target:
+            logger.warning(
+                "Ignoring cross-agent watcher notify target; local scheduler "
+                "wakes only its owning agent"
+            )
+        return target
+
     async def _run_ecosystem_discovery_watch(self, args: dict) -> str:
         """Run stale-work/red-CI discovery and wake on actionable changes.
 
@@ -1801,7 +1831,8 @@ class SchedulerFeature(Feature):
             tool_args: kwargs passed to that tool. Any top-level args other
                 than watcher control keys are also forwarded for convenience.
             watch_key: optional dedupe key. Defaults to tool + repo/filter args.
-            notify: optional target agent DID (defaults to this agent).
+            notify: deprecated compatibility field; ignored. This local watcher
+                always wakes the scheduler's owning agent.
             max_findings: maximum findings included in the cognition payload.
         """
         from kestrel_sovereign.signals.sources.ecosystem_discovery import (
@@ -1879,7 +1910,7 @@ class SchedulerFeature(Feature):
                 "findings_count": len(decision.state.findings),
             })
 
-        target = args.get("notify") or getattr(self.agent, "did", "") or self._agent_id
+        target = self._owned_watch_target_agent(args.get("notify"))
         signal = build_signal_for_discovery_findings(
             watch_key=watch_key,
             tool_name=tool_name,
@@ -1938,7 +1969,8 @@ class SchedulerFeature(Feature):
             triggers: optional list of change categories that wake the
                 agent (default: state, merge, comments, checks). Pass
                 ``["any"]`` to wake on every fingerprint change.
-            notify: optional target agent DID (defaults to this agent).
+            notify: deprecated compatibility field; ignored. This local watcher
+                always wakes the scheduler's owning agent.
         """
         from kestrel_sovereign.features.strategic_memory.github_integration import (
             get_github_token,
@@ -2049,7 +2081,7 @@ class SchedulerFeature(Feature):
                 "changed": sorted(decision.changed),
             })
 
-        target = args.get("notify") or getattr(self.agent, "did", "") or self._agent_id
+        target = self._owned_watch_target_agent(args.get("notify"))
         signal = build_signal_for_pr_change(
             repo=repo,
             number=number_int,
