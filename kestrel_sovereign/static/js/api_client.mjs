@@ -628,6 +628,12 @@ export function createApiClient({
         // An older sovereign response must never overwrite a newer OAuth/JWT
         // response when /api/agents refreshes overlap across an auth change.
         hostLifecycleAuthorityGeneration: 0,
+        // Changes whenever the credential material attached by the auth
+        // provider changes. Lifecycle discovery records the generation used
+        // for its actual HTTP dispatch, so a response from one principal can
+        // never authorize controls after another principal takes over.
+        authIdentity: null,
+        authIdentityGeneration: 0,
         // Cached double-submit CSRF token for host-scoped state-changing
         // requests (#2293). Fetched lazily from GET /api/host/csrf (which also
         // sets the matching cookie) and reused for the page's lifetime. Only
@@ -636,6 +642,43 @@ export function createApiClient({
         csrfToken: null,
     };
     const hostAgentChangeListeners = new Set();
+
+    function invalidateHostLifecycleAuthority() {
+        state.hostLifecycleAuthority = {
+            classified: false,
+            create: false,
+            delete: false,
+        };
+    }
+
+    function authAddedHeaders(unsignedHeaders, signedHeaders) {
+        const before = new Map(
+            Object.entries(unsignedHeaders || {}).map(
+                ([key, value]) => [key.toLowerCase(), String(value)],
+            ),
+        );
+        return Object.entries(signedHeaders || {})
+            .map(([key, value]) => [key.toLowerCase(), String(value)])
+            .filter(([key, value]) => before.get(key) !== value)
+            .sort(([left], [right]) => left.localeCompare(right));
+    }
+
+    async function applyTrackedAuth(headers) {
+        const unsignedHeaders = { ...(headers || {}) };
+        const signedHeaders = await auth.applyAuth({ ...unsignedHeaders });
+        // Cookie-authenticated providers add no explicit header and therefore
+        // share one non-machine identity. Their definite expiry/change path is
+        // the 401 invalidation in recoverUnauthorized().
+        const identity = JSON.stringify(
+            authAddedHeaders(unsignedHeaders, signedHeaders),
+        );
+        if (state.authIdentity !== null && state.authIdentity !== identity) {
+            state.authIdentityGeneration += 1;
+            invalidateHostLifecycleAuthority();
+        }
+        state.authIdentity = identity;
+        return signedHeaders;
+    }
 
     // Fetch (once) and cache the host CSRF token. Returns null on failure so a
     // caller degrades to sending no header (the server then 403s a genuinely
@@ -674,6 +717,12 @@ export function createApiClient({
         // in progress even when the reader itself resolves normally; never
         // turn that cancellation into an auth refresh or typed 401.
         throwIfAborted(signal);
+        // The principal that produced the cached lifecycle classification has
+        // just been rejected. Fail closed before auth refresh mutates or clears
+        // its credentials, even if recovery itself throws or redirects.
+        state.authIdentityGeneration += 1;
+        state.authIdentity = null;
+        invalidateHostLifecycleAuthority();
         try {
             const recovery = await auth.onUnauthorized();
             // Cancellation can happen while a refresh/redirect callback is
@@ -699,7 +748,12 @@ export function createApiClient({
     // out, an explicit-agent call would either skip auth-refresh or
     // re-implement it (drift risk). The url passed in is FINAL — the
     // caller has already applied host-agent prefixing if needed.
-    async function performRequest(url, options = {}, retried = false) {
+    async function performRequest(
+        url,
+        options = {},
+        retried = false,
+        onAuthPrepared = null,
+    ) {
         let alreadyRetried = retried;
         let pendingUnauthorizedError = null;
 
@@ -707,6 +761,9 @@ export function createApiClient({
             let headers;
             try {
                 headers = await buildHeaders(options.headers);
+                if (typeof onAuthPrepared === 'function') {
+                    onAuthPrepared(state.authIdentityGeneration);
+                }
             } catch (error) {
                 throwIfAborted(options.signal);
                 if (pendingUnauthorizedError && !isAbortError(error)) {
@@ -804,13 +861,20 @@ export function createApiClient({
         getAgentInfo: () => client.request('/api/agent/info'),
         async getAgents() {
             const generation = ++state.hostLifecycleAuthorityGeneration;
-            state.hostLifecycleAuthority = {
-                classified: false,
-                create: false,
-                delete: false,
-            };
-            const data = await client.request('/api/agents');
-            if (generation === state.hostLifecycleAuthorityGeneration) {
+            invalidateHostLifecycleAuthority();
+            let responseAuthGeneration = null;
+            const data = await performRequest(
+                buildHostUrl('/api/agents'),
+                {},
+                false,
+                (authGeneration) => {
+                    responseAuthGeneration = authGeneration;
+                },
+            );
+            if (
+                generation === state.hostLifecycleAuthorityGeneration
+                && responseAuthGeneration === state.authIdentityGeneration
+            ) {
                 state.hostLifecycleAuthority = {
                     classified: true,
                     create: data.can_create_agents === true,
@@ -1248,7 +1312,7 @@ export function createApiClient({
         // anything that needs Content-Type control (FormData) or a non-JSON
         // protocol (EventSource preflight, etc.).
         async applyAuth(headers = {}) {
-            return await auth.applyAuth({ ...headers });
+            return await applyTrackedAuth(headers);
         },
         parseResponseError,
         setHostAgent(agentName) {
@@ -1347,7 +1411,7 @@ export function createApiClient({
             'Content-Type': 'application/json',
             ...extraHeaders,
         };
-        return await auth.applyAuth(headers);
+        return await applyTrackedAuth(headers);
     }
 
     return client;

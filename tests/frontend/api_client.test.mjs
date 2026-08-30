@@ -210,6 +210,61 @@ test('older lifecycle discovery cannot overwrite a newer principal classificatio
     assert.equal(client.canManageHostAgentLifecycle('delete'), false);
 });
 
+test('host lifecycle authority is invalidated when mutable auth credentials change', async () => {
+    let token = 'sovereign-machine-key';
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return { ...headers, Authorization: `Bearer ${token}` };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(200, { models: [] }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    token = 'ordinary-user-jwt';
+    await client.request('/api/models');
+
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
+test('a 401 invalidates cached host lifecycle authority before auth recovery', async () => {
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return { ...headers, Authorization: 'Bearer expired-sovereign-key' };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(401, { detail: 'expired' }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    await assert.rejects(() => client.request('/api/models'), /expired/i);
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
 test('renameConversation patches the conversation display name', async () => {
     const fetchFn = createFetchQueue(jsonResponse(200, {
         success: true,
