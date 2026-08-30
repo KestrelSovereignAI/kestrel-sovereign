@@ -2627,7 +2627,7 @@ function stopFailureRequiresFreshOperation(error) {
  * affordance — clicking "Stop A" while viewing B must reach A's
  * backend, not B's.
  */
-export async function stopAgent(agentName) {
+export async function stopAgentDetailed(agentName) {
     // #1257: Stop = stop everything. Clear any queued follow-up
     // SYNCHRONOUSLY, before the abort and before the awaited /stop
     // POST. This must precede every await: if `deps().api.stop()` is slow,
@@ -2674,15 +2674,17 @@ export async function stopAgent(agentName) {
         correlationId = newChatRequestId();
         retainedCorrelationIds.set(agentName, correlationId);
     }
+    let response = null;
+    let stopOutcomes = [];
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
-        const response = await deps().api.stop(
+        response = await deps().api.stop(
             requestId,
             agentName,
             correlationId,
         );
-        const stopOutcomes = Array.isArray(response?.stop_outcomes)
+        stopOutcomes = Array.isArray(response?.stop_outcomes)
             ? response.stop_outcomes
             : [];
         const confirmed = response?.success === true
@@ -2692,7 +2694,22 @@ export async function stopAgent(agentName) {
                     || outcome?.disposition === 'already_complete'
             );
         if (!confirmed) {
-            throw new Error('Cooperative Stop was not confirmed');
+            console.error(`Cooperative Stop was not confirmed on ${agentName}`);
+            refreshAgentThinkingDot(agentName);
+            if (agentName === deps().api.getHostAgent()) {
+                updateThinkingIndicator();
+            }
+            return {
+                confirmed: false,
+                outcomes: stopOutcomes.length > 0
+                    ? stopOutcomes
+                    : [{
+                        resolved_target: agentName,
+                        disposition: 'unreachable',
+                        detail: 'Cooperative Stop returned no target outcome',
+                    }],
+                response,
+            };
         }
     } catch (e) {
         console.error(`Error stopping request on ${agentName}:`, e);
@@ -2708,7 +2725,15 @@ export async function stopAgent(agentName) {
         if (agentName === deps().api.getHostAgent()) {
             updateThinkingIndicator();
         }
-        return false;
+        return {
+            confirmed: false,
+            outcomes: [{
+                resolved_target: agentName,
+                disposition: 'unreachable',
+                detail: e && e.message ? e.message : 'Cooperative Stop request failed',
+            }],
+            error: e,
+        };
     }
 
     unconfirmedStopAgents().delete(agentName);
@@ -2720,7 +2745,20 @@ export async function stopAgent(agentName) {
     if (agentName === deps().api.getHostAgent()) {
         updateThinkingIndicator();
     }
-    return true;
+    return {
+        confirmed: true,
+        outcomes: stopOutcomes,
+        response,
+    };
+}
+
+/**
+ * Backward-compatible boolean Stop result for chat interrupt/queue callers.
+ * Card surfaces use stopAgentDetailed() so typed partial outcomes stay visible.
+ */
+export async function stopAgent(agentName) {
+    const result = await stopAgentDetailed(agentName);
+    return result.confirmed;
 }
 
 function newChatRequestId() {

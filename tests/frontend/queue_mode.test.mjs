@@ -129,7 +129,13 @@ globalThis.CSS = { escape: (s) => String(s) };
 
 const { state, getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
 const chatModule = await import('../../kestrel_sovereign/static/js/chat.js');
-const { mountChatPane, wipeAgentChatPane, sendMessage, stopAgent } = chatModule;
+const {
+    mountChatPane,
+    wipeAgentChatPane,
+    sendMessage,
+    stopAgent,
+    stopAgentDetailed,
+} = chatModule;
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 chatModule.initChat();
@@ -399,6 +405,31 @@ test('Stop while queued = stop everything: queue cleared, nothing dispatches', a
 
     assert.deepEqual(dispatched, ['turn one'],
         'no second dispatch — the queued message was cancelled by Stop');
+});
+
+test('detailed Stop preserves a typed refusal while the boolean wrapper stays false', async () => {
+    const agent = 'q-typed-refusal';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    apiModule.default.getStreamAbortController = () => null;
+    apiModule.default.getCurrentStreamRequestId = () => 'exact-request';
+    apiModule.default.stop = async (requestId, target) => {
+        assert.equal(requestId, 'exact-request');
+        assert.equal(target, agent);
+        return {
+            success: false,
+            stop_outcomes: [{
+                resolved_target: agent,
+                disposition: 'refused',
+                detail: 'receipt persistence unavailable',
+            }],
+        };
+    };
+
+    const detailed = await stopAgentDetailed(agent);
+    assert.equal(detailed.confirmed, false);
+    assert.equal(detailed.outcomes[0].disposition, 'refused');
+    assert.equal(await stopAgent(agent), false);
 });
 
 

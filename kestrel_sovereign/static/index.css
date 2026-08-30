@@ -346,6 +346,24 @@ nav {
     transition: background-color 0.15s, color 0.15s, border-color 0.15s;
     flex-shrink: 0;
 }
+
+.agent-stop-outcome {
+    max-width: 9rem;
+    font-size: 0.68rem;
+    line-height: 1.15;
+    text-align: right;
+    color: var(--text-muted, #8b949e);
+}
+
+.agent-stop-outcome[data-disposition="stopped"] {
+    color: var(--success, #3fb950);
+}
+
+.agent-stop-outcome[data-disposition="refused"],
+.agent-stop-outcome[data-disposition="unreachable"],
+.agent-stop-outcome[data-disposition="indeterminate"] {
+    color: var(--warning, #d29922);
+}
 .agent-stop-btn:hover {
     background: var(--error, #dc2626);
     color: white;
