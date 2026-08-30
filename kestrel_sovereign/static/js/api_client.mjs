@@ -652,10 +652,12 @@ export function createApiClient({
     }
 
     function headerEntries(headers) {
-        if (headers && typeof headers.entries === 'function') {
-            return [...headers.entries()];
-        }
-        return Object.entries(headers || {});
+        // Fetch accepts every HeadersInit representation: Headers/Map-like
+        // iterables, sequences of pairs, and plain records.  Normalizing
+        // through Headers is the one browser-owned interpretation of all
+        // three; calling `.entries()` on a sequence instead yields numeric
+        // array indexes and mistakes the nested pair for a header value.
+        return [...new Headers(headers || {}).entries()];
     }
 
     function authAddedHeaders(unsignedHeaders, signedHeaders) {
@@ -673,12 +675,35 @@ export function createApiClient({
     async function applyTrackedAuth(headers) {
         const unsignedHeaders = { ...(headers || {}) };
         const signedHeaders = await auth.applyAuth({ ...unsignedHeaders });
-        // Cookie-authenticated providers add no explicit header and therefore
-        // share one non-machine identity. Their definite expiry/change path is
-        // the 401 invalidation in recoverUnauthorized().
-        const identity = JSON.stringify(
-            authAddedHeaders(unsignedHeaders, signedHeaders),
-        );
+        const addedHeaders = authAddedHeaders(unsignedHeaders, signedHeaders);
+        let identity;
+        if (typeof auth.getPrincipalIdentity === 'function') {
+            // Embedded hosts that use per-request signatures can expose the
+            // stable, host-owned principal identity explicitly.  This value is
+            // only a cache partition: the server response remains the sole
+            // source of lifecycle authority.
+            const principal = await auth.getPrincipalIdentity();
+            identity = `principal:${String(principal ?? '')}`;
+        } else {
+            // Ignore non-credential signing material (nonce, date, digest,
+            // request signature) so ordinary requests by the same principal
+            // do not revoke a freshly classified UI. Prefer the host API key
+            // when both it and a volatile Authorization signature are present;
+            // otherwise an exact bearer/API-key change fails closed.
+            const credentials = new Map(addedHeaders);
+            const apiKey = credentials.get('x-api-key');
+            const authorization = credentials.get('authorization');
+            const proxyAuthorization = credentials.get('proxy-authorization');
+            identity = JSON.stringify(
+                apiKey !== undefined
+                    ? [['x-api-key', apiKey]]
+                    : authorization !== undefined
+                        ? [['authorization', authorization]]
+                        : proxyAuthorization !== undefined
+                            ? [['proxy-authorization', proxyAuthorization]]
+                            : [],
+            );
+        }
         if (state.authIdentity !== null && state.authIdentity !== identity) {
             state.authIdentityGeneration += 1;
             invalidateHostLifecycleAuthority();
