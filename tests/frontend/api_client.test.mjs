@@ -262,10 +262,12 @@ test('streamInvoke posts canonical /agent/stream (#863)', async () => {
 });
 
 test('streamInvoke with API key refreshes bootstrap key once and retries the stream', async () => {
+    const logicalRequestId = 'retry-☃';
+    const wireRequestId = 'retry-%E2%98%83';
     const fetchFn = createFetchQueue(
         jsonResponse(401, { detail: 'expired stream key' }),
         jsonResponse(200, { key: 'fresh-key' }),
-        streamResponse(['hel', 'lo'], { 'X-Request-ID': 'stream-1' }),
+        streamResponse(['hel', 'lo'], { 'X-Request-ID': wireRequestId }),
     );
     const { client, sessionStorage } = createClient({
         fetchFn,
@@ -275,7 +277,9 @@ test('streamInvoke with API key refreshes bootstrap key once and retries the str
     await client.init();
 
     const chunks = [];
-    for await (const chunk of client.streamInvoke('hello')) {
+    for await (const chunk of client.streamInvoke(
+        'hello', null, null, null, false, undefined, null, logicalRequestId,
+    )) {
         chunks.push(chunk);
     }
 
@@ -288,6 +292,8 @@ test('streamInvoke with API key refreshes bootstrap key once and retries the str
     ]);
     assert.equal(fetchFn.calls[0].options.headers['X-API-Key'], 'stale-key');
     assert.equal(fetchFn.calls[2].options.headers['X-API-Key'], 'fresh-key');
+    assert.equal(fetchFn.calls[0].options.headers['X-Request-ID'], wireRequestId);
+    assert.equal(fetchFn.calls[2].options.headers['X-Request-ID'], wireRequestId);
 });
 
 test('applyHostAgentPrefix preserves host-level routes and prefixes per-agent routes in multi_agent mode', () => {
@@ -635,6 +641,94 @@ test('streamInvoke does not leak an abort controller when auth header build reje
     assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
     // And no fetch should have been issued — auth failed before URL build.
     assert.equal(fetchFn.calls.length, 0);
+});
+
+test('streamInvoke publishes and sends a client request id before response headers', async () => {
+    let releaseAuth;
+    const authReady = new Promise((resolve) => { releaseAuth = resolve; });
+    const provider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            await authReady;
+            return headers;
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const stream = pendingStreamResponse({ 'X-Request-ID': 'client-turn-id' });
+    const fetchFn = createFetchQueue(stream.response);
+    const { client } = createClient({ fetchFn, authProvider: provider });
+    client.setHostAgent('agent-A');
+
+    const iter = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, 'client-turn-id',
+    );
+    const firstChunk = iter.next();
+    await Promise.resolve();
+
+    assert.equal(
+        client.getCurrentStreamRequestId('agent-A'),
+        'client-turn-id',
+        'Stop must have a turn address while auth and headers are pending',
+    );
+    assert.equal(fetchFn.calls.length, 0, 'auth is still pending');
+
+    releaseAuth();
+    await firstChunk;
+    assert.equal(fetchFn.calls[0].options.headers['X-Request-ID'], 'client-turn-id');
+
+    stream.finish();
+    for await (const _ of iter) { /* drain */ }
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), null);
+});
+
+test('streamInvoke keeps opaque request ids logical while sending RFC 3986 wire form', async () => {
+    const logicalRequestId = "turn ☃ / 100% !'()*";
+    const wireRequestId = 'turn%20%E2%98%83%20%2F%20100%25%20%21%27%28%29%2A';
+    const stream = pendingStreamResponse({ 'X-Request-ID': wireRequestId });
+    const fetchFn = createFetchQueue(stream.response);
+    const { client } = createClient({ fetchFn });
+    client.setHostAgent('agent-A');
+
+    const iter = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, logicalRequestId,
+    );
+    await iter.next();
+
+    assert.equal(fetchFn.calls[0].options.headers['X-Request-ID'], wireRequestId);
+    assert.equal(client.getCurrentStreamRequestId('agent-A'), logicalRequestId);
+
+    stream.finish();
+    for await (const _ of iter) { /* drain */ }
+});
+
+test('streamInvoke measures request ids by Unicode code point', async () => {
+    const accepted = '🐢'.repeat(256);
+    const stream = pendingStreamResponse({
+        'X-Request-ID': encodeURIComponent(accepted),
+    });
+    const fetchFn = createFetchQueue(stream.response);
+    const { client } = createClient({ fetchFn });
+    client.setHostAgent('agent-A');
+
+    const allowed = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, accepted,
+    );
+    await allowed.next();
+    assert.equal(
+        fetchFn.calls[0].options.headers['X-Request-ID'],
+        encodeURIComponent(accepted),
+    );
+    stream.finish();
+    for await (const _ of allowed) { /* drain */ }
+
+    const rejected = client.streamInvoke(
+        'hello', null, null, null, false, 'agent-A', null, '🐢'.repeat(257),
+    );
+    await assert.rejects(
+        rejected.next(),
+        /stream request id must be 1-256 characters/,
+    );
+    assert.equal(fetchFn.calls.length, 1);
 });
 
 test('streamInvoke captures dispatch agent BEFORE awaiting auth headers (PR #874)', async () => {
