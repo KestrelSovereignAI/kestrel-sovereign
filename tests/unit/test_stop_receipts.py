@@ -807,6 +807,68 @@ async def test_cancelled_caller_cannot_split_effect_from_receipt(tmp_path):
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_cancelled_caller_cannot_split_claim_from_effect(tmp_path):
+    """Cancellation after claim commit cannot strand an in-progress operation."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-owned-claim.db"))
+    try:
+        durable_store = StopReceiptStore(db)
+        await durable_store.ensure_schema()
+        claim_committed = asyncio.Event()
+        release_claim = asyncio.Event()
+
+        class DelayedClaimStore:
+            load = durable_store.load
+            persist = durable_store.persist
+
+            async def claim(self, request):
+                claim = await durable_store.claim(request)
+                claim_committed.set()
+                await release_claim.wait()
+                return claim
+
+        request = _request(correlation_id="caller-cancelled-after-claim")
+        calls = 0
+
+        async def cancel(_request):
+            nonlocal calls
+            calls += 1
+            return StopDisposition.STOPPED
+
+        def authority():
+            return CancellationAuthority(
+                lambda: (
+                    CooperativeStopTarget(
+                        "agent-runtime-7",
+                        "did:test:agent",
+                        cancel,
+                        turn_ids=frozenset({request.target}),
+                    ),
+                ),
+                cleanup_registry=StopCleanupRegistry(),
+                receipt_store=DelayedClaimStore(),
+            )
+
+        operation = asyncio.create_task(authority().stop(request))
+        await claim_committed.wait()
+        operation.cancel()
+        release_claim.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+        receipt = await durable_store.load(request)
+        assert receipt is not None
+        assert receipt.outcomes[0].disposition is StopDisposition.STOPPED
+        assert (await authority().stop(request)) == receipt.outcomes
+        assert calls == 1
+    finally:
+        await db.close()
+
+
 def test_live_endpoint_without_receipt_store_refuses_before_cancellation():
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

@@ -152,6 +152,67 @@ async def test_closing_owned_iterator_interrupts_blocked_source():
 
 
 @pytest.mark.asyncio
+async def test_cancelling_unstarted_iterator_owner_interrupts_source():
+    """The exposed cancellation owner works before its coroutine first runs."""
+
+    entered = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def source():
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+            yield "unreachable"
+        finally:
+            finalized.set()
+
+    owned = OwnedAsyncIterator(
+        source,
+        operation="never-started watcher",
+        cleanup_requested=lambda: True,
+    )
+    # This is the endpoint race: registration exposes the watcher and Stop
+    # cancels it in the same event-loop turn, before its coroutine body runs.
+    assert owned.owner_task.cancel() is True
+
+    await asyncio.wait_for(entered.wait(), timeout=0.2)
+    for _attempt in range(20):
+        if finalized.is_set():
+            break
+        await asyncio.sleep(0)
+
+    assert finalized.is_set()
+    assert owned.interrupted_by_cleanup is True
+    await owned.aclose()
+
+
+@pytest.mark.asyncio
+async def test_natural_unwind_failure_is_cleanup_when_stop_was_requested():
+    """A Stop between the final item and terminal anext preserves cleanup failure."""
+
+    stop_requested = False
+
+    async def source():
+        try:
+            yield "last item"
+        finally:
+            raise RuntimeError("natural unwind cleanup failed")
+
+    owned = OwnedAsyncIterator(
+        source,
+        operation="naturally unwound source",
+        cleanup_requested=lambda: stop_requested,
+    )
+    assert await anext(owned) == "last item"
+    stop_requested = True
+
+    with pytest.raises(RuntimeError, match="natural unwind cleanup failed"):
+        await anext(owned)
+
+    assert isinstance(owned.cleanup_error, RuntimeError)
+
+
+@pytest.mark.asyncio
 async def test_natural_source_failure_is_not_cleanup_debt():
     """Only an initiated close, not ordinary iteration, owns cleanup debt."""
 
