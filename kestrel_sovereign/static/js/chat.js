@@ -2669,13 +2669,22 @@ export async function stopAgentDetailed(agentName) {
         if (agentName === deps().api.getHostAgent()) {
             updateThinkingIndicator();
         }
+        const typedErrorOutcomes = Array.isArray(e?.body?.error?.details)
+            ? e.body.error.details.filter((outcome) => (
+                outcome && typeof outcome === 'object'
+                && (outcome.disposition === 'refused'
+                    || outcome.disposition === 'unreachable')
+            ))
+            : [];
         return {
             confirmed: false,
-            outcomes: [{
-                resolved_target: agentName,
-                disposition: 'unreachable',
-                detail: e && e.message ? e.message : 'Cooperative Stop request failed',
-            }],
+            outcomes: typedErrorOutcomes.length > 0
+                ? typedErrorOutcomes
+                : [{
+                    resolved_target: agentName,
+                    disposition: 'unreachable',
+                    detail: e && e.message ? e.message : 'Cooperative Stop request failed',
+                }],
             error: e,
         };
     }

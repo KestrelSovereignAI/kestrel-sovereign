@@ -1031,7 +1031,10 @@ async def stop_agent_request(request: Request):
             turn_request_generations = {}
         if not isinstance(turn_request_ids, dict):
             raise TypeError("agent turn request inventory has an invalid type")
-        turn_addresses = active_request_ids.union(turn_request_ids)
+        # Private request IDs and public turn IDs are distinct address spaces.
+        # CancellationAuthority selects this inventory only for request-addressed
+        # Stop; public turn Stop resolves exclusively through the binding map.
+        turn_addresses = active_request_ids
 
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
             cancelled_request_ids: list[Optional[str]] = []

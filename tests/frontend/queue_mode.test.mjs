@@ -432,6 +432,37 @@ test('detailed Stop preserves a typed refusal while the boolean wrapper stays fa
     assert.equal(await stopAgent(agent), false);
 });
 
+test('detailed Stop preserves typed outcomes from an HTTP error envelope', async () => {
+    const agent = 'q-http-typed-refusal';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    apiModule.default.getStreamAbortController = () => null;
+    apiModule.default.getCurrentStreamRequestId = () => 'exact-request';
+    apiModule.default.stop = async () => {
+        const error = new Error('Cooperative Stop could not be confirmed');
+        error.body = {
+            error: {
+                details: [{
+                    requested_target: 'exact-request',
+                    resolved_target: agent,
+                    disposition: 'refused',
+                    detail: 'receipt persistence unavailable',
+                }],
+            },
+        };
+        throw error;
+    };
+
+    const detailed = await stopAgentDetailed(agent);
+    assert.equal(detailed.confirmed, false);
+    assert.deepEqual(detailed.outcomes, [{
+        requested_target: 'exact-request',
+        resolved_target: agent,
+        disposition: 'refused',
+        detail: 'receipt persistence unavailable',
+    }]);
+});
+
 
 test('conversation switch (wipeAgentChatPane) discards the queued message', async () => {
     const agent = 'q-wipe';
