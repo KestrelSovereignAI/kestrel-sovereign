@@ -1322,7 +1322,18 @@ def _bind_loaded_self_hold_readers(app: FastAPI) -> None:
         _bind_agent_self_hold_reader(app, agent)
     manager = getattr(app.state, "agent_manager", None)
     if manager is not None:
-        for managed in manager.list_agents().values():
+        loaded = manager.list_agents()
+        if isinstance(loaded, Mapping):
+            managed_agents = loaded.values()
+        else:
+            get_agent = getattr(manager, "get_agent", None)
+            managed_agents = (
+                get_agent(item) if isinstance(item, str) and callable(get_agent) else item
+                for item in loaded
+            )
+        for managed in managed_agents:
+            if managed is None:
+                continue
             if id(managed) in seen:
                 continue
             seen.add(id(managed))
