@@ -20,6 +20,24 @@ SAFE_SUBPROCESS_ENV_VARS = frozenset(
         "TZ",
         "PYTHONPATH",
         "VIRTUAL_ENV",
+        # Required by ordinary Windows process creation and runtime discovery.
+        # These describe the OS/user filesystem layout; they carry no Kestrel
+        # credentials and remain safe for sandboxed compute subprocesses.
+        "SYSTEMROOT",
+        "WINDIR",
+        "SYSTEMDRIVE",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "PATHEXT",
+        "COMSPEC",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
     }
 )
 
