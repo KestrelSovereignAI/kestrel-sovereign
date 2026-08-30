@@ -1768,6 +1768,39 @@ async def test_malformed_unicode_evidence_rejects_row_and_continues_scan(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_non_object_authority_evidence_rejects_row_and_continues_scan(tmp_path):
+    """Valid JSON of the wrong shape cannot wedge coordinator polling."""
+
+    feat, backend = await _make_feature(tmp_path)
+    malformed = await feat.request_restart(
+        reason="non-object first candidate",
+        urgency="critical",
+    )
+    later = await feat.request_restart(
+        reason="later candidate must still be inspected",
+        urgency="low",
+        policy="manual_only",
+    )
+    malformed_id = malformed.data["request"]["id"]
+    later_id = later.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ?, "
+        "authority_signature = ? WHERE id = ?",
+        ("[]", "0" * 64, malformed_id),
+    )
+
+    result = await feat.restart_coordinator()
+
+    rejected = await get_request(backend, malformed_id)
+    untouched = await get_request(backend, later_id)
+    assert rejected.status == "rejected"
+    assert "evidence is not an object" in rejected.status_reason
+    assert untouched.status == "pending"
+    assert result.status is ToolResultStatus.OK
+    assert [item["request_id"] for item in result.data["deferred"]] == [later_id]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("timestamp_field", ["requested_at", "first_blocked_at"])
 async def test_executor_rejects_tampered_safety_clock(
     tmp_path,
@@ -2144,6 +2177,34 @@ async def test_executor_recovers_on_spawn_failure(tmp_path):
     ):
         retried = await feat.restart_coordinator()
     assert retried.data["executed"] == [{"request_id": req_id}]
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_terminally_rejects_authority_revoked_in_flight(
+    tmp_path,
+    monkeypatch,
+):
+    """A revoked claimed request cannot remain permanently ``executing``."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="revoke during spawn")
+    req_id = created.data["request"]["id"]
+
+    def revoke_then_fail():
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-spawn")
+        raise OSError("kestrel binary missing")
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        side_effect=revoke_then_fail,
+    ):
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
+    assert "spawn failed" in row.status_reason
 
 
 # ---------------------------------------------------------------------------
@@ -4806,6 +4867,34 @@ async def test_dead_restart_child_returns_the_row_for_retry(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dead_restart_child_rejects_authority_revoked_in_flight(
+    tmp_path,
+    monkeypatch,
+):
+    """The watchdog terminalizes a dead dispatch whose seal was revoked."""
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="revoke before child dies")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=_dead_child(tmp_path),
+    ):
+        await feat.restart_coordinator()
+    monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-watchdog")
+    await agent.drain_background_tasks()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
+    assert "exited 1" in row.status_reason
+
+
+@pytest.mark.asyncio
 async def test_live_restart_child_leaves_the_row_executing(tmp_path):
     """The watchdog must RUN and decline to act on a restart still in flight.
 
@@ -4894,6 +4983,42 @@ async def test_stranded_executing_row_is_recovered_by_the_sweep(tmp_path):
     assert reset == [req.id]
     row = await get_request(backend, req.id)
     assert row.status == "pending"
+    assert "did not happen" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_stranded_row_rejects_authority_revoked_in_flight(
+    tmp_path,
+    monkeypatch,
+):
+    """The durable backstop terminalizes revoked in-flight authority."""
+
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        STALE_EXECUTING_SECONDS,
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, _agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend,
+        requested_by_agent="did:test:agent",
+        reason="revoked stranded dispatch",
+    )
+    assert await claim_request_for_execution(
+        backend,
+        req,
+        status="executing",
+        status_reason="dispatching restart",
+        executing_boot_id=_PROCESS_BOOT_ID,
+    ) == "claimed"
+    feat._instance_started_at -= STALE_EXECUTING_SECONDS + 1
+    monkeypatch.setenv("KESTREL_API_KEY", "rotated-before-recovery")
+
+    assert await feat._reconcile_stranded_executing_rows() == []
+    row = await get_request(backend, req.id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
     assert "did not happen" in row.status_reason
 
 
