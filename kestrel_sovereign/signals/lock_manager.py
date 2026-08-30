@@ -34,6 +34,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from contextvars import Context, ContextVar
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterable, Optional
 
@@ -75,6 +76,7 @@ class LockHolder:
     owner_task: Optional[asyncio.Task[object]] = field(
         default=None, repr=False, compare=False
     )
+    owner_token: object = field(default_factory=object, repr=False, compare=False)
 
     def held_seconds(self) -> float:
         return time.monotonic() - self.acquired_at
@@ -108,6 +110,15 @@ class OrderedLockManager:
         # count, and a holder cannot otherwise tell whether it is blocking
         # anyone — which is the difference between "slow" and "harmful".
         self._waiters: dict[ResourceLock, int] = {}
+        # Task isolation is explicit: normal ``create_task`` calls must not
+        # inherit lock authority, while the top-level invocation wrapper may
+        # hand the exact current hold generations to its owned child context.
+        self._inherited_ownership: ContextVar[
+            tuple[tuple[ResourceLock, object], ...]
+        ] = ContextVar(
+            f"kestrel_resource_lock_ownership_{id(self)}",
+            default=(),
+        )
 
     async def _get(self, name: ResourceLock) -> asyncio.Lock:
         # Lazy creation; protected so first-use races don't double-create.
@@ -307,11 +318,39 @@ class OrderedLockManager:
         different task currently holds the resource.
         """
         holder = self._holders.get(name)
-        return bool(
-            holder is not None
-            and holder.owner_task is not None
-            and holder.owner_task is asyncio.current_task()
+        if holder is None or holder.owner_task is None:
+            return False
+        if holder.owner_task is asyncio.current_task():
+            return True
+        return any(
+            inherited_name is name and inherited_token is holder.owner_token
+            for inherited_name, inherited_token in self._inherited_ownership.get()
         )
+
+    def bind_current_task_ownership_to_context(self, context: Context) -> None:
+        """Grant ``context`` only the lock generations this task now owns.
+
+        ``ContextVar`` values normally copy into every child task, which would
+        make accidental background work an owner. This explicit handoff is
+        called only by the request-lifecycle invocation task boundary. Tokens
+        are matched against the live holder, so a delayed child cannot reuse a
+        stale grant after release and reacquisition.
+        """
+
+        if not isinstance(context, Context):
+            raise TypeError("lock ownership handoff requires a Context")
+        current = asyncio.current_task()
+        inherited = self._inherited_ownership.get()
+        inherited_by_name = dict(inherited)
+        grants = tuple(
+            (name, holder.owner_token)
+            for name, holder in sorted(
+                self._holders.items(), key=lambda item: lock_sort_key(item[0])
+            )
+            if holder.owner_task is current
+            or inherited_by_name.get(name) is holder.owner_token
+        )
+        context.run(self._inherited_ownership.set, grants)
 
     def holder(self, name: ResourceLock) -> Optional[LockHolder]:
         """Who currently holds ``name``, for diagnostics and tests.

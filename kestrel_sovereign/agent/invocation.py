@@ -300,6 +300,21 @@ def bind_async_invocation(
                             None,
                         )
                         parent_context = copy_context()
+                        dispatcher = getattr(lifecycle_owner, "dispatcher", None)
+                        lock_manager = getattr(
+                            dispatcher, "lock_manager", None
+                        )
+                        handoff_lock_ownership = getattr(
+                            lock_manager,
+                            "bind_current_task_ownership_to_context",
+                            None,
+                        )
+                        if callable(handoff_lock_ownership):
+                            # Bind the captured comparison context before its
+                            # child copy. The invocation's ContextVar merge-back
+                            # then sees this private ownership grant as unchanged
+                            # and does not leak it into the long-lived caller.
+                            handoff_lock_ownership(parent_context)
                         operation_context = parent_context.copy()
                         caller = asyncio.current_task()
                         if caller is not None:

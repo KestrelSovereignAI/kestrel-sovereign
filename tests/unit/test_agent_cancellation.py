@@ -153,6 +153,38 @@ async def test_isolated_turn_preserves_context_outputs_for_caller_audit():
 
 
 @pytest.mark.asyncio
+async def test_isolated_turn_inherits_dispatcher_resource_lock_ownership():
+    """A resource-owning cognition dispatch must not deadlock its own tool."""
+
+    from types import SimpleNamespace
+
+    from kestrel_sdk.signals import ResourceLock
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+
+    lock_manager = OrderedLockManager()
+
+    class Owner:
+        dispatcher = SimpleNamespace(lock_manager=lock_manager)
+
+        def register_active_request(self, _request_id):
+            return None
+
+        def bind_request_operation(self, _request_id, _operation):
+            return None
+
+        def _cleanup_cancelled_request(self, _request_id):
+            return None
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            return lock_manager.is_owned_by_current_task(ResourceLock.MEMORY)
+
+    async with lock_manager.acquire({ResourceLock.MEMORY}):
+        assert await Owner().run(invocation_id="resource-owning-turn") is True
+
+
+@pytest.mark.asyncio
 async def test_stop_racing_with_isolated_completion_suppresses_normal_result():
     """A completed child cannot outrun Stop before its owner publishes output."""
 

@@ -6,6 +6,7 @@ must hold under contention.
 """
 
 import asyncio
+from contextvars import copy_context
 
 import pytest
 
@@ -70,6 +71,32 @@ async def test_task_ownership_does_not_confuse_a_different_task():
             return mgr.is_owned_by_current_task(ResourceLock.MEMORY)
 
         assert await asyncio.create_task(inspect_from_child()) is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_context_handoff_carries_only_live_hold_generation():
+    mgr = OrderedLockManager()
+    release_child = asyncio.Event()
+
+    async with mgr.acquire({ResourceLock.MEMORY}):
+        child_context = copy_context()
+        mgr.bind_current_task_ownership_to_context(child_context)
+
+        async def inspect_from_owned_child():
+            await release_child.wait()
+            return mgr.is_owned_by_current_task(ResourceLock.MEMORY)
+
+        child = asyncio.create_task(
+            inspect_from_owned_child(), context=child_context
+        )
+        release_child.set()
+        assert await child is True
+
+    stale_context = child_context.copy()
+    async with mgr.acquire({ResourceLock.MEMORY}):
+        assert await asyncio.create_task(
+            inspect_from_owned_child(), context=stale_context
+        ) is False
 
 
 @pytest.mark.asyncio
