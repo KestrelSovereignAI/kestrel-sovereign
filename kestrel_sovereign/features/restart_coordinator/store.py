@@ -449,7 +449,14 @@ async def list_requests_needing_wake(
     return [RestartRequest.from_row(r) for r in rows]
 
 
-async def _write_landed(db, result: Any, request_id: str, verify) -> bool:
+async def _write_landed(
+    db,
+    result: Any,
+    request_id: str,
+    verify,
+    *,
+    requested_by_agent: Optional[str] = None,
+) -> bool:
     """Did an ``UPDATE`` actually change a row?
 
     The single contract for this module. Extracted from ``update_status``,
@@ -463,7 +470,11 @@ async def _write_landed(db, result: Any, request_id: str, verify) -> bool:
     rowcount = getattr(result, "rowcount", None)
     if isinstance(rowcount, int):
         return rowcount > 0
-    row = await get_request(db, request_id)
+    row = (
+        await get_request_for_agent(db, request_id, requested_by_agent)
+        if requested_by_agent is not None
+        else await get_request(db, request_id)
+    )
     return row is not None and verify(row)
 
 
@@ -532,6 +543,23 @@ async def get_request(db, request_id: str) -> Optional[RestartRequest]:
     return RestartRequest.from_row(rows[0])
 
 
+async def get_request_for_agent(
+    db,
+    request_id: str,
+    requested_by_agent: str,
+) -> Optional[RestartRequest]:
+    """Read one row only within its durable requesting-agent principal."""
+
+    rows = await db.fetchall(
+        f"SELECT {_COLUMNS} FROM restart_requests "
+        "WHERE id = ? AND requested_by_agent = ?",
+        (request_id, requested_by_agent),
+    )
+    if not rows:
+        return None
+    return RestartRequest.from_row(rows[0])
+
+
 async def mark_deferral_started(
     db,
     request_id: str,
@@ -578,16 +606,52 @@ async def clear_deferral_started(
     )
 
 
-async def acknowledge_escalation(db, request_id: str) -> bool:
-    """Acknowledge bounded escalation for one migrated pending request."""
+async def acknowledge_escalation(
+    db,
+    request_id: str,
+    *,
+    requested_by_agent: str,
+) -> bool:
+    """Acknowledge a migrated row only for its durable requester."""
 
     result = await db.execute(
         "UPDATE restart_requests SET escalation_acknowledged = 1 "
-        "WHERE id = ? AND status IN ('pending', 'approved')",
-        (request_id,),
+        "WHERE id = ? AND requested_by_agent = ? "
+        "AND status IN ('pending', 'approved')",
+        (request_id, requested_by_agent),
     )
     return await _write_landed(
-        db, result, request_id, lambda row: row.escalation_acknowledged,
+        db,
+        result,
+        request_id,
+        lambda row: row.escalation_acknowledged,
+        requested_by_agent=requested_by_agent,
+    )
+
+
+async def cancel_request_if_owned(
+    db,
+    request_id: str,
+    *,
+    requested_by_agent: str,
+    status_reason: str,
+    completed_at: str,
+) -> bool:
+    """Atomically cancel a pending row owned by ``requested_by_agent``."""
+
+    result = await db.execute(
+        "UPDATE restart_requests SET status = 'canceled', "
+        "status_reason = ?, completed_at = ? "
+        "WHERE id = ? AND requested_by_agent = ? "
+        "AND status IN ('pending', 'approved')",
+        (status_reason, completed_at, request_id, requested_by_agent),
+    )
+    return await _write_landed(
+        db,
+        result,
+        request_id,
+        lambda row: row.status == "canceled",
+        requested_by_agent=requested_by_agent,
     )
 
 
