@@ -76,6 +76,7 @@ def _request(
         correlation_id=correlation_id or f"stop-{uuid4()}",
         span_id=span_id,
         trace_id=trace_id,
+        target_is_turn_id=True,
     )
 
 

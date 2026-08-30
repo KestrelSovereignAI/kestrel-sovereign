@@ -1397,6 +1397,9 @@ class KestrelAgent(
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
+        # Observable turn IDs resolve to the task-local invocation/request IDs
+        # that the cooperative Stop loop already understands (#3141).
+        self._turn_request_ids: dict[str, str] = {}
         self._cancelled_requests: set = set()
         self._cancelled_request_generations: set[tuple[str, int]] = set()
         # An exact Stop can race ahead of the matching HTTP request's lifecycle

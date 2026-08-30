@@ -32,7 +32,12 @@ from kestrel_sovereign.features.bridge.router import get_router
 API_KEY = "test-bridge-key"
 
 
-def _boot(process_input_streaming, *, cancel_on_check=None):
+def _boot(
+    process_input_streaming,
+    *,
+    cancel_on_check=None,
+    cancellation_after_stream=False,
+):
     """Boot the real app with a single agent exposing a BridgeFeature and the
     given ``process_input_streaming`` async generator. Returns ``(app, restore)``.
     """
@@ -65,7 +70,10 @@ def _boot(process_input_streaming, *, cancel_on_check=None):
     def _is_request_cancelled(_request_id):
         nonlocal cancellation_checks
         cancellation_checks += 1
-        return cancel_on_check is not None and cancellation_checks >= cancel_on_check
+        threshold = cancel_on_check
+        if threshold is None and cancellation_after_stream:
+            threshold = 2
+        return threshold is not None and cancellation_checks >= threshold
 
     agent.is_request_cancelled = MagicMock(side_effect=_is_request_cancelled)
 
@@ -83,9 +91,12 @@ def _boot(process_input_streaming, *, cancel_on_check=None):
     return app, restore
 
 
-def _post_stream(process_input_streaming):
+def _post_stream(process_input_streaming, *, cancellation_after_stream=False):
     os.environ["KESTREL_API_KEY"] = API_KEY
-    app, restore = _boot(process_input_streaming)
+    app, restore = _boot(
+        process_input_streaming,
+        cancellation_after_stream=cancellation_after_stream,
+    )
     try:
         with TestClient(app) as client:
             return client.post(
@@ -97,11 +108,20 @@ def _post_stream(process_input_streaming):
         restore()
 
 
-def _post_stream_with_agent(process_input_streaming, *, cancel_on_check=None):
+def _post_stream_with_agent(
+    process_input_streaming,
+    *,
+    cancel_on_check=None,
+    cancellation_after_stream=False,
+):
     """Drive the real bridge route and retain its test agent for assertions."""
 
     os.environ["KESTREL_API_KEY"] = API_KEY
-    app, restore = _boot(process_input_streaming, cancel_on_check=cancel_on_check)
+    app, restore = _boot(
+        process_input_streaming,
+        cancel_on_check=cancel_on_check,
+        cancellation_after_stream=cancellation_after_stream,
+    )
     agent = app.state.agent
     try:
         with TestClient(app) as client:
@@ -227,6 +247,24 @@ async def test_bridge_stop_interrupts_producer_blocked_before_first_event():
         agent.wait_for_request_completion("blocked-bridge"),
         timeout=1,
     )
+
+
+def test_bridge_stream_reports_stopped_command_instead_of_success():
+    """Clean command EOF still carries the live request cancellation marker."""
+
+    async def _stopped_command(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+
+    response = _post_stream(
+        _stopped_command,
+        cancellation_after_stream=True,
+    )
+
+    assert response.status_code == 200
+    events = _events(response.text)
+    assert [event["type"] for event in events] == ["stopped"]
+    assert events[0]["request_id"]
 
 
 def test_bridge_stream_withholds_queued_chunk_after_stop():

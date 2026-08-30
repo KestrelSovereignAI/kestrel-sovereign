@@ -998,6 +998,31 @@ async def stop_agent_request(request: Request):
             if body_has_request_id
             else request.query_params.get("request_id")
         )
+        explicit_turn_id = data.get("turn_id")
+        if explicit_turn_id is None:
+            explicit_turn_id = request.query_params.get("turn_id")
+        has_request_address = (
+            body_has_request_id
+            or query_has_request_id
+            or request.headers.get("X-Request-ID") is not None
+        )
+        if explicit_turn_id is not None and has_request_address:
+            raise ApiHTTPException(
+                status_code=400,
+                code="ambiguous_stop_target",
+                message="Pass either request_id or turn_id, not both.",
+            )
+        if explicit_turn_id is not None:
+            try:
+                turn_id = validate_invocation_id(explicit_turn_id)
+            except ValueError as error:
+                raise ApiHTTPException(
+                    status_code=400,
+                    code="invalid_turn_id",
+                    message=f"Invalid turn_id: {error}",
+                ) from error
+        else:
+            turn_id = None
         if body_has_request_id or query_has_request_id:
             try:
                 request_id = validate_invocation_id(explicit_request_id)
@@ -1051,8 +1076,8 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        def live_turn_ids() -> set[str]:
-            turn_ids = set(
+        def live_request_ids() -> set[str]:
+            request_ids = set(
                 getattr(agent, "_active_request_ids", set()) or set()
             )
             abandoned_turns = getattr(
@@ -1061,15 +1086,73 @@ async def stop_agent_request(request: Request):
                 None,
             )
             if isinstance(abandoned_turns, dict):
-                turn_ids.update(abandoned_turns)
+                request_ids.update(abandoned_turns)
             current_turn = getattr(agent, "_current_request_id", None)
             if isinstance(current_turn, str) and current_turn:
-                turn_ids.add(current_turn)
+                request_ids.add(current_turn)
             if request_id is not None:
-                turn_ids.add(request_id)
-            return turn_ids
+                request_ids.add(request_id)
+            return request_ids
 
-        active_turns = live_turn_ids()
+        active_request_ids = live_request_ids()
+        instance_binding_accessor = vars(agent).get(
+            "active_turn_request_bindings"
+        )
+        if callable(instance_binding_accessor):
+            has_binding_accessor = True
+            raw_turn_bindings = instance_binding_accessor()
+        else:
+            class_binding_accessor = getattr(
+                type(agent),
+                "active_turn_request_bindings",
+                None,
+            )
+            has_binding_accessor = callable(class_binding_accessor)
+            raw_turn_bindings = (
+                class_binding_accessor(agent) if has_binding_accessor else None
+            )
+        if has_binding_accessor:
+            if not isinstance(raw_turn_bindings, dict):
+                raise TypeError("agent turn binding inventory has an invalid type")
+            turn_request_ids = {}
+            turn_request_generations = {}
+            for indexed_turn_id, binding in raw_turn_bindings.items():
+                if (
+                    not isinstance(indexed_turn_id, str)
+                    or not indexed_turn_id.strip()
+                    or not isinstance(binding, tuple)
+                    or len(binding) != 2
+                    or not isinstance(binding[0], str)
+                    or not binding[0].strip()
+                ):
+                    raise TypeError("agent turn binding inventory is malformed")
+                turn_request_ids[indexed_turn_id] = binding[0]
+                if binding[1] is not None:
+                    if (
+                        not isinstance(binding[1], int)
+                        or isinstance(binding[1], bool)
+                        or binding[1] <= 0
+                    ):
+                        raise TypeError("agent turn generation is malformed")
+                    turn_request_generations[indexed_turn_id] = binding[1]
+        else:
+            turn_index_accessor = vars(agent).get("active_turn_request_ids")
+            if not callable(turn_index_accessor):
+                turn_index_accessor = getattr(
+                    type(agent),
+                    "active_turn_request_ids",
+                    None,
+                )
+                if callable(turn_index_accessor):
+                    turn_request_ids = turn_index_accessor(agent)
+                else:
+                    turn_request_ids = {}
+            else:
+                turn_request_ids = turn_index_accessor()
+            turn_request_generations = {}
+        if not isinstance(turn_request_ids, dict):
+            raise TypeError("agent turn request inventory has an invalid type")
+        turn_addresses = active_request_ids.union(turn_request_ids)
 
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
             distributed_stop = getattr(
@@ -1090,9 +1173,10 @@ async def stop_agent_request(request: Request):
                     )
             cancelled_request_ids: list[Optional[str]] = []
             if stop_request.scope is StopScope.TURN:
-                canceled = agent.cancel_current_request(
-                    request_id=stop_request.target
-                )
+                cancel_kwargs = {"request_id": stop_request.target}
+                if stop_request.request_generation is not None:
+                    cancel_kwargs["generation"] = stop_request.request_generation
+                canceled = agent.cancel_current_request(**cancel_kwargs)
                 if canceled:
                     cancelled_request_ids.append(stop_request.target)
                 else:
@@ -1106,14 +1190,17 @@ async def stop_agent_request(request: Request):
                         "reserve_request_cancellation",
                         None,
                     )
-                    if callable(reserve):
+                    if (
+                        stop_request.request_generation is None
+                        and callable(reserve)
+                    ):
                         reserve(agent, stop_request.target)
             else:
                 # Receipt load/claim may await after the endpoint's inventory
                 # snapshot. Re-read at the cancellation linearization point so
                 # a turn registered during those awaits cannot outlive an
                 # agent-wide STOPPED receipt.
-                turns_to_cancel = active_turns | live_turn_ids()
+                turns_to_cancel = active_request_ids | live_request_ids()
                 canceled = False
                 for active_request_id in sorted(turns_to_cancel):
                     request_cancelled = agent.cancel_current_request(
@@ -1142,8 +1229,17 @@ async def stop_agent_request(request: Request):
                 # endpoint cleanup; CancellationAuthority bounds this wait.
                 abandoned = False
                 for cancelled_request_id in cancelled_request_ids:
+                    wait_kwargs = {}
+                    if (
+                        stop_request.scope is StopScope.TURN
+                        and stop_request.request_generation is not None
+                    ):
+                        wait_kwargs["generation"] = (
+                            stop_request.request_generation
+                        )
                     completion_disposition = await wait_for_completion(
-                        cancelled_request_id
+                        cancelled_request_id,
+                        **wait_kwargs,
                     )
                     abandoned = abandoned or (
                         completion_disposition
@@ -1184,7 +1280,9 @@ async def stop_agent_request(request: Request):
                     target_id=agent_id,
                     agent_id=agent_id,
                     cancel=cancel_request,
-                    turn_ids=frozenset(active_turns),
+                    turn_ids=frozenset(turn_addresses),
+                    turn_request_ids=turn_request_ids,
+                    turn_request_generations=turn_request_generations,
                 ),
             ),
             cleanup_registry=cleanup_registry,
@@ -1195,10 +1293,24 @@ async def stop_agent_request(request: Request):
         )
         trace_id, span_id = current_trace_identity()
         stop_request = StopRequest(
-            scope=StopScope.TURN if request_id is not None else StopScope.AGENT,
+            scope=(
+                StopScope.TURN
+                if request_id is not None or turn_id is not None
+                else StopScope.AGENT
+            ),
             actor_id=actor_id,
-            target=request_id if request_id is not None else agent_id,
-            target_agent_id=agent_id if request_id is not None else None,
+            target=(
+                turn_id
+                if turn_id is not None
+                else request_id if request_id is not None else agent_id
+            ),
+            target_agent_id=(
+                agent_id
+                if request_id is not None or turn_id is not None
+                else None
+            ),
+            target_is_turn_id=turn_id is not None,
+            turn_id=turn_id,
             trace_id=trace_id,
             span_id=span_id,
             **(
@@ -1228,6 +1340,7 @@ async def stop_agent_request(request: Request):
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
+            "turn_id": turn_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel",
             "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }

@@ -405,6 +405,11 @@ def get_router() -> APIRouter:
                     event_data = json.dumps({"type": "chunk", "content": chunk})
                     yield f"data: {event_data}\n\n"
 
+                # Command streaming delegates to an isolated process_input
+                # child. Cooperative Stop unwinds that child as clean iterator
+                # exhaustion so a persistent gateway task survives. Re-read
+                # the exact request marker before publishing success: normal
+                # EOF and stopped command EOF are intentionally distinct here.
                 if (
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True

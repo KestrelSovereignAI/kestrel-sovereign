@@ -333,7 +333,12 @@ class RequestLifecycleMixin:
         generations = tombstones.get(request_id)
         return set(generations) if isinstance(generations, set) else set()
 
-    def cancel_current_request(self, request_id: Optional[str] = None) -> bool:
+    def cancel_current_request(
+        self,
+        request_id: Optional[str] = None,
+        *,
+        generation: int | None = None,
+    ) -> bool:
         """
         Cancel the current streaming request.
 
@@ -347,15 +352,45 @@ class RequestLifecycleMixin:
         target_request_id = request_id or self._current_request_id
         if not target_request_id:
             return False
-        # Install the exact-ID fence even for a currently active generation.
-        # Same-ID transport redeliveries must not resume after Stop returns.
-        self.reserve_request_cancellation(target_request_id)
+        if generation is not None and (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+        ):
+            raise ValueError("request generation must be a positive integer")
 
-        generations: set[int] = self._abandoned_generations(target_request_id)
-        if (
+        if generation is None:
+            # A request-ID Stop intentionally fences immediate same-ID
+            # redelivery. A public turn address carries its exact generation
+            # and must never install this broader fence: doing so could poison
+            # a newer generation that reused the transport request ID.
+            self.reserve_request_cancellation(target_request_id)
+            generations: set[int] = self._abandoned_generations(
+                target_request_id
+            )
+        else:
+            generations = set()
+
+        request_is_active = (
             target_request_id in active_request_ids
             or target_request_id == self._current_request_id
-        ):
+        )
+        active_generations = getattr(
+            self,
+            "_active_request_generations",
+            None,
+        )
+        indexed_active_generation = (
+            active_generations.get(target_request_id)
+            if isinstance(active_generations, dict)
+            else None
+        )
+        if generation is not None:
+            if (
+                request_is_active and indexed_active_generation == generation
+            ) or generation in self._abandoned_generations(target_request_id):
+                generations.add(generation)
+        elif request_is_active:
             active_generation = self._request_generation_for_current_task(
                 target_request_id
             )
@@ -429,6 +464,8 @@ class RequestLifecycleMixin:
     async def wait_for_request_completion(
         self,
         request_id: Optional[str] = None,
+        *,
+        generation: int | None = None,
     ) -> RequestCompletionDisposition:
         """Wait until every cancelled generation has left the live lifecycle.
 
@@ -443,19 +480,30 @@ class RequestLifecycleMixin:
         target_request_id = request_id or self._current_request_id
         if target_request_id is None:
             return RequestCompletionDisposition.COMPLETED
+        if generation is not None and (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+        ):
+            raise ValueError("request generation must be a positive integer")
         cancelled = getattr(self, "_cancelled_request_generations", None)
         generations = {
-            generation
-            for rid, generation in (
+            candidate_generation
+            for rid, candidate_generation in (
                 cancelled if isinstance(cancelled, set) else set()
             )
             if rid == target_request_id
+            and (generation is None or candidate_generation == generation)
         }
         abandoned = self._abandoned_generations(target_request_id)
         if not generations:
             return (
                 RequestCompletionDisposition.ABANDONED
-                if abandoned
+                if (
+                    generation in abandoned
+                    if generation is not None
+                    else bool(abandoned)
+                )
                 else RequestCompletionDisposition.COMPLETED
             )
 

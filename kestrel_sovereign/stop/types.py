@@ -46,6 +46,8 @@ class StopRequest:
     turn_id: str | None = None
     span_id: str | None = None
     trace_id: str | None = None
+    target_is_turn_id: bool = False
+    request_generation: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, StopScope):
@@ -78,6 +80,21 @@ class StopRequest:
             raise ValueError("reason must be a non-empty string when supplied")
         if not isinstance(self.cascade, bool):
             raise TypeError("cascade must be boolean")
+        if not isinstance(self.target_is_turn_id, bool):
+            raise TypeError("target_is_turn_id must be boolean")
+        if self.target_is_turn_id and self.scope is not StopScope.TURN:
+            raise ValueError("only turn Stop may carry a public turn address")
+        if self.request_generation is not None and (
+            self.scope is not StopScope.TURN
+            or self.target_is_turn_id
+            or not isinstance(self.request_generation, int)
+            or isinstance(self.request_generation, bool)
+            or self.request_generation <= 0
+        ):
+            raise ValueError(
+                "request_generation requires a resolved turn request and a "
+                "positive integer"
+            )
         if (
             not isinstance(self.correlation_id, str)
             or not self.correlation_id.strip()
@@ -91,11 +108,13 @@ class StopRequest:
             raise ValueError(
                 "correlation_id must be no longer than 256 UTF-8 bytes"
             )
-        if self.scope is StopScope.TURN:
+        if self.scope is StopScope.TURN and self.target_is_turn_id:
             if self.turn_id is None:
                 object.__setattr__(self, "turn_id", self.target)
             elif self.turn_id != self.target:
-                raise ValueError("turn Stop identity must match its target")
+                raise ValueError("public turn Stop identity must match its target")
+        elif self.scope is not StopScope.TURN and self.turn_id is not None:
+            raise ValueError("only turn Stop may carry a turn_id")
         if self.turn_id is not None and (
             not isinstance(self.turn_id, str) or not self.turn_id
         ):
@@ -123,6 +142,8 @@ class StopRequest:
             "turn_id": self.turn_id,
             "span_id": self.span_id,
             "trace_id": self.trace_id,
+            "target_is_turn_id": self.target_is_turn_id,
+            "request_generation": self.request_generation,
         }
 
     @classmethod
@@ -138,6 +159,8 @@ class StopRequest:
             turn_id=value.get("turn_id"),
             span_id=value.get("span_id"),
             trace_id=value.get("trace_id"),
+            target_is_turn_id=value.get("target_is_turn_id", False),
+            request_generation=value.get("request_generation"),
         )
 
 
