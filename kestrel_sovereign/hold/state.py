@@ -459,6 +459,15 @@ class HoldStore:
                 await self._assert_completed_witness_migration_intact()
                 return
 
+            duplicate_operation = await self._db.fetchone(
+                "SELECT operation_id FROM hold_receipts "
+                "GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1"
+            )
+            if duplicate_operation is not None:
+                raise HoldCorruptStateError(
+                    "Hold receipt history has a duplicate operation identity"
+                )
+
             # Seed the witness exactly once for upgraded databases. Future
             # schema checks never derive missing witnesses from mutable receipt
             # rows after the durable migration marker exists. Without that
@@ -517,6 +526,10 @@ class HoldStore:
                 "WHERE scope <> 'host' OR target_id = 'host' "
                 "ON CONFLICT (scope, target_id) DO NOTHING"
             )
+            # A partially attempted legacy migration may already contain an
+            # operation witness. Verify its receipt binding before making the
+            # one-way completion marker.
+            await self._assert_operation_witness_bindings_intact()
             await self._db.execute(
                 "INSERT INTO hold_schema_migrations (name) VALUES (?) "
                 "ON CONFLICT (name) DO NOTHING",
@@ -548,6 +561,8 @@ class HoldStore:
                 "completed Hold witness migration is missing an operation witness"
             )
 
+        await self._assert_operation_witness_bindings_intact()
+
         missing_count = await self._db.fetchone(
             "SELECT source.scope, source.target_id FROM ("
             "SELECT scope, target_id FROM hold_receipts "
@@ -559,6 +574,20 @@ class HoldStore:
         if missing_count is not None:
             raise HoldCorruptStateError(
                 "completed Hold witness migration is missing a receipt-count witness"
+            )
+
+    async def _assert_operation_witness_bindings_intact(self) -> None:
+        """Require every global operation witness to name its exact receipt."""
+
+        mismatched_operation = await self._db.fetchone(
+            "SELECT r.operation_id FROM hold_receipts AS r "
+            "JOIN hold_operation_witnesses AS w "
+            "ON w.operation_id = r.operation_id "
+            "WHERE w.receipt_id <> r.receipt_id LIMIT 1"
+        )
+        if mismatched_operation is not None:
+            raise HoldCorruptStateError(
+                "completed Hold operation witness does not match receipt identity"
             )
 
     async def _lock_operation_and_target(

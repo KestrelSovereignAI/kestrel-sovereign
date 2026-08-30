@@ -965,6 +965,31 @@ async def test_legacy_duplicate_operation_ids_fail_closed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_duplicate_operations_block_witness_migration(tmp_path):
+    """Backfill cannot bless one receipt while hiding its duplicate peer."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-duplicate-backfill.db"))
+    await _create_legacy_hold_tables(db)
+    for suffix in ("one", "two"):
+        receipt_id = f"preexisting-duplicate-{suffix}"
+        await db.execute(
+            "INSERT INTO hold_receipts ("
+            "receipt_id, operation_id, action, disposition, scope, target_id, "
+            "reason, actor_id, occurred_at, resulting_hold_receipt_id"
+            ") VALUES (?, 'duplicate-before-backfill', 'hold', 'applied', "
+            "'agent', ?, 'legacy import', 'did:sovereign:operator', "
+            "'2026-08-28T00:00:00+00:00', ?)",
+            (receipt_id, f"did:agent:{suffix}", receipt_id),
+        )
+    store = HoldStore(db)
+    try:
+        with pytest.raises(HoldCorruptStateError, match="duplicate operation"):
+            await store.ensure_schema()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_fractional_latch_revision_fails_closed(hold_db):
     """SQLite integer affinity cannot turn 1.9 into a valid revision one."""
 
