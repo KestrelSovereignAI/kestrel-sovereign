@@ -53,6 +53,11 @@ async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
         except asyncio.CancelledError:
             cancelled = True
             continue
+        except Exception:  # noqa: BLE001 - inspect and log below
+            # The task is now complete with an error.  Do not let a secondary
+            # close failure replace the schema-initialization failure whose
+            # cleanup brought us here; the final await below records it.
+            continue
     try:
         await cleanup
     except asyncio.CancelledError:

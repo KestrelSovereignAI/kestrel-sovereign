@@ -20,8 +20,9 @@ from kestrel_sovereign.hold import (
 )
 from kestrel_sovereign.hold.state import (
     HoldCorruptStateError,
-    _terminal_authority_ids,
+    _latch_from_row,
     _receipt_from_row,
+    _terminal_authority_ids,
 )
 from kestrel_sovereign.host_features.context import build_host_context
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -137,6 +138,15 @@ async def test_receipt_primary_key_is_explicitly_not_null(hold_db):
     assert receipt_id[3] == 1
 
 
+@pytest.mark.asyncio
+async def test_content_witness_lookup_has_target_index(hold_db):
+    db, _store = hold_db
+    columns = await db.fetchall(
+        "PRAGMA index_info(idx_hold_receipt_content_witnesses_target)"
+    )
+    assert [row[2] for row in columns] == ["scope", "target_id"]
+
+
 def test_existing_null_receipt_identity_fails_closed_on_read() -> None:
     with pytest.raises(HoldCorruptStateError, match="missing required evidence"):
         _receipt_from_row(
@@ -153,6 +163,44 @@ def test_existing_null_receipt_identity_fails_closed_on_read() -> None:
                 "expected-receipt",
                 "",
                 "",
+            )
+        )
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-timestamp", "2026-08-28T00:00:00"])
+def test_malformed_or_naive_receipt_timestamp_fails_closed(timestamp) -> None:
+    with pytest.raises(HoldCorruptStateError, match="receipt timestamp"):
+        _receipt_from_row(
+            (
+                "receipt-id",
+                "legacy-operation",
+                "hold",
+                "applied",
+                "agent",
+                "did:agent:kite",
+                "legacy import",
+                "did:sovereign:operator",
+                timestamp,
+                "",
+                "",
+                "receipt-id",
+            )
+        )
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-timestamp", "2026-08-28T00:00:00"])
+def test_malformed_or_naive_latch_timestamp_fails_closed(timestamp) -> None:
+    with pytest.raises(HoldCorruptStateError, match="latch timestamp"):
+        _latch_from_row(
+            (
+                "agent",
+                "did:agent:kite",
+                1,
+                "receipt-id",
+                "legacy import",
+                "did:sovereign:operator",
+                timestamp,
+                1,
             )
         )
 
@@ -522,6 +570,38 @@ async def test_postgres_factory_closes_pool_when_core_schema_init_fails(
         await database_module.AsyncDatabase.postgres("postgresql://durable/host")
 
     assert events == ["connect", "schema", "close"]
+
+
+@pytest.mark.asyncio
+async def test_database_factory_preserves_schema_error_when_cleanup_also_fails(
+    monkeypatch,
+    caplog,
+):
+    """A secondary close failure cannot replace the initialization defect."""
+
+    from kestrel_sovereign.storage import async_database as database_module
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    class _Backend:
+        backend_type = "postgres"
+
+        async def connect(self):
+            return None
+
+        async def close(self):
+            raise RuntimeError("cleanup failed")
+
+    async def _fail_schema(_self):
+        raise RuntimeError("primary schema failure")
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", lambda dsn: _Backend())
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
+
+    with pytest.raises(RuntimeError, match="primary schema failure"):
+        await database_module.AsyncDatabase.postgres("postgresql://durable/host")
+
+    assert "cleanup failed" in caplog.text
 
 
 @pytest.mark.asyncio
