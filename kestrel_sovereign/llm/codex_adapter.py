@@ -529,17 +529,44 @@ def _turn_input_text_for_estimate(turn_input: CodexTurnInput) -> str:
 
 
 def _usage_from(tu: dict) -> Dict[str, Optional[int]]:
-    total = (tu or {}).get("total", {}) or {}
-    inp = total.get("inputTokens")
-    out = total.get("outputTokens")
-    tot = total.get("totalTokens")
+    # ``total`` is cumulative for the whole reused Codex thread.  Durable
+    # usage accounting is per invocation, so prefer the latest-turn bucket;
+    # retain ``total`` as a compatibility fallback for older app servers.
+    # The app-server already emits all three latest-turn spellings below in
+    # supported versions (and pairs snake-case blocks with snake-case fields),
+    # so usage accounting must mirror the occupancy parser's wire tolerance.
+    source = tu or {}
+    usage = (
+        source.get("last")
+        or source.get("lastTokenUsage")
+        or source.get("last_token_usage")
+        or source.get("total")
+        or {}
+    )
+
+    def token_field(*names: str) -> Optional[int]:
+        for name in names:
+            value = usage.get(name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
+
+    inp = token_field("inputTokens", "input_tokens")
+    out = token_field("outputTokens", "output_tokens")
+    tot = token_field("totalTokens", "total_tokens")
+    cached = token_field("cachedInputTokens", "cached_input_tokens")
+    if cached is not None:
+        if inp is not None:
+            inp = max(0, inp - cached)
+        if tot is not None:
+            tot = max(0, tot - cached)
     if tot is None and (inp is not None or out is not None):
         tot = (inp or 0) + (out or 0)
     return {
         "input_tokens": inp,
         "output_tokens": out,
         "total_tokens": tot,
-        "cache_read_input_tokens": total.get("cachedInputTokens"),
+        "cache_read_input_tokens": cached,
     }
 
 
@@ -3119,8 +3146,10 @@ class CodexAdapter(LLMAdapter):
                             if pre_tool_prose_snapshot is None:
                                 pre_tool_prose_snapshot = "".join(text_parts)
                             yield {"tool_call": tc}
-                elif method == "thread/tokenUsage/updated":
-                    usage = _usage_from(p.get("tokenUsage") or {})
+                elif method in self._DISCOVERED_CAP_EVENT_METHODS:
+                    usage = _usage_from(
+                        p.get("tokenUsage") or p.get("token_usage") or {}
+                    )
                 elif method == "turn/failed":
                     err = p.get("error") or p.get("turn", {}).get("error") or {}
                     raise CodexAppServerError(
