@@ -45,6 +45,7 @@ from kestrel_sovereign.features.restart_coordinator.feature import (
     _describe_background_tasks,
 )
 from kestrel_sovereign.features.restart_coordinator.store import (
+    claim_request_for_execution,
     clear_deferral_started,
     ensure_restart_requests_table,
     get_request,
@@ -1563,6 +1564,50 @@ async def test_consumed_restart_generation_cannot_be_replayed_from_terminal_stat
 
 
 @pytest.mark.asyncio
+async def test_interrupted_update_reset_cannot_reseal_consumed_terminal_authority(
+    tmp_path,
+):
+    """Bootstrap recovery trusts its retry ledger, never a rewritten row."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="terminal reset replay")
+    request_id = created.data["request"]["id"]
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=MagicMock(),
+    ):
+        first = await feat.restart_coordinator()
+    assert first.data["executed"] == [{"request_id": request_id}]
+    assert await update_status(
+        backend,
+        request_id,
+        status="completed",
+        status_reason="completed before forged interrupted update",
+        completed_at=datetime.now(timezone.utc).isoformat(),
+        expected_current_status="executing",
+    )
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'updating', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+    await feat._reset_interrupted_updates()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed is not None
+    assert replayed.status == "rejected"
+    assert "no durable retry authority" in replayed.status_reason
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_canceled_restart_generation_cannot_be_replayed(tmp_path):
     feat, backend = await _make_feature(tmp_path)
     created = await feat.request_restart(reason="cancel consumes authority")
@@ -2985,10 +3030,12 @@ async def test_boot_resets_interrupted_updating_row(tmp_path):
         update_target_ref="main",
         update_repo_path=str(tmp_path),
     )
-    await update_status(
-        backend, req.id, status="updating",
-        expected_current_status="pending",
-    )
+    assert await claim_request_for_execution(
+        backend,
+        req,
+        status="updating",
+        status_reason="running update profile before restart",
+    ) == "claimed"
 
     dispatcher = _CapturingDispatcher()
     agent = _make_agent(backend, dispatcher=dispatcher)
@@ -4758,11 +4805,13 @@ async def test_stranded_executing_row_is_recovered_by_the_sweep(tmp_path):
     req = await insert_request(
         backend, requested_by_agent="did:test:agent", reason="stranded",
     )
-    await update_status(
-        backend, req.id, status="executing",
-        expected_current_status="pending",
+    assert await claim_request_for_execution(
+        backend,
+        req,
+        status="executing",
+        status_reason="dispatching restart",
         executing_boot_id=_PROCESS_BOOT_ID,
-    )
+    ) == "claimed"
     # Stamped by this process but with no dispatch in flight — nothing is
     # waiting on it and nothing else will ever move it.
     assert req.id not in feat._executing_since

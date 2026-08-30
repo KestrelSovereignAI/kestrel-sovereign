@@ -15,6 +15,7 @@ import secrets
 from collections.abc import MutableMapping
 
 from kestrel_sovereign.security.sovereign_key import (
+    is_ephemeral_sovereign_key,
     normalize_sovereign_api_key,
 )
 
@@ -69,7 +70,13 @@ def ensure_peer_api_key(
             _automatic_peer_key_provenance(normalized_existing),
         )
 
-    if not raw_peer_key or (peer_was_automatic and raw_sovereign_key):
+    sovereign_is_durable = bool(
+        raw_sovereign_key
+        and not is_ephemeral_sovereign_key(
+            normalize_sovereign_api_key(raw_sovereign_key)
+        )
+    )
+    if not raw_peer_key or (peer_was_automatic and sovereign_is_durable):
         raw_peer_key = (
             derive_peer_api_key(raw_sovereign_key)
             if raw_sovereign_key

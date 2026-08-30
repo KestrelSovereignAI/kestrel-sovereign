@@ -221,6 +221,26 @@ def test_generated_peer_key_is_stable_and_distinct(monkeypatch):
     assert first != "sovereign-key"
 
 
+def test_random_peer_key_survives_ephemeral_sovereign_bootstrap(monkeypatch):
+    """A late temporary API key cannot invalidate already-issued peer keys."""
+
+    from kestrel_sovereign.security.peer_key import ensure_peer_api_key
+
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    monkeypatch.delenv("KESTREL_PEER_API_KEY", raising=False)
+    monkeypatch.delenv(
+        "KESTREL_INTERNAL_PEER_API_KEY_PROVENANCE",
+        raising=False,
+    )
+    first = ensure_peer_api_key()
+
+    temporary_sovereign = server_module.get_api_key()
+    second = server_module.get_peer_api_key()
+
+    assert temporary_sovereign != first
+    assert second == first == os.environ["KESTREL_PEER_API_KEY"]
+
+
 def test_explicit_peer_key_survives_sovereign_rotation(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", "old-sovereign-key")
     monkeypatch.setenv("KESTREL_PEER_API_KEY", "operator-peer-key")
