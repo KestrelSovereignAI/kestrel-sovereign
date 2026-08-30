@@ -88,6 +88,8 @@ async def test_owner_lease_expiry_has_sqlite_postgres_parity(db_backend):
 
     assert poll.live_generation_ids == ()
     assert reaped == (generation_id,)
+    assert len(await store.remaining((generation_id,))) == 1
+    await store.complete(generation_id, owner_id)
     assert await store.remaining((generation_id,)) == ()
 
 
@@ -228,7 +230,7 @@ async def test_unjoined_remote_owner_is_unreachable_not_already_complete(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_expired_crashed_owner_is_cas_reaped_and_stop_confirms(tmp_path):
+async def test_expired_crashed_owner_stays_unreachable_until_owner_cleanup(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
     path = tmp_path / "expired-owner.db"
@@ -261,9 +263,25 @@ async def test_expired_crashed_owner_is_cas_reaped_and_stop_confirms(tmp_path):
 
         assert (
             await waiter.wait_for_stop(ticket, timeout_seconds=0.2)
+            is StopDisposition.UNREACHABLE
+        )
+        assert len(await store.remaining((generation_id,))) == 1
+
+        repeated = await waiter.request_turn(
+            "did:test:crashed-agent", "crashed-turn"
+        )
+        assert repeated.generation_ids == (generation_id,)
+        repeated_agent = await waiter.request_agent("did:test:crashed-agent")
+        assert repeated_agent.generation_ids == (generation_id,)
+
+        await store.complete(generation_id, "wrong-owner")
+        assert len(await store.remaining((generation_id,))) == 1
+        await store.complete(generation_id, "crashed-owner")
+        assert await store.remaining((generation_id,)) == ()
+        assert (
+            await waiter.wait_for_stop(ticket, timeout_seconds=0.2)
             is StopDisposition.STOPPED
         )
-        assert await store.remaining((generation_id,)) == ()
     finally:
         await first_db.close()
         await second_db.close()
