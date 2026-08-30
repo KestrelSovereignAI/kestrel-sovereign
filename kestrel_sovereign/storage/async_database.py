@@ -39,6 +39,38 @@ logger = logging.getLogger(__name__)
 
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
 
+
+async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
+    """Finish closing an owned backend even if its caller is cancelled again."""
+
+    cleanup = asyncio.create_task(
+        db.close(), name="failed-database-initialization-cleanup"
+    )
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+        except Exception:  # noqa: BLE001 - inspect and log below
+            # The task is now complete with an error.  Do not let a secondary
+            # close failure replace the schema-initialization failure whose
+            # cleanup brought us here; the final await below records it.
+            continue
+    try:
+        await cleanup
+    except asyncio.CancelledError:
+        cancelled = True
+    except Exception as close_exc:  # noqa: BLE001 - preserve initialization error
+        logger.warning(
+            "Could not close backend after database initialization failed: %s",
+            close_exc,
+        )
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
 #: ``(name, table, columns)`` of the index that makes the #2959 projection worth
 #: having — Phase C lists an agent's sessions newest-activity-first.
 #:
@@ -968,7 +1000,11 @@ class AsyncDatabase:
         """
         backend = await get_backend(config)
         db = cls(backend)
-        await db._init_schema()
+        try:
+            await db._init_schema()
+        except BaseException:
+            await _close_failed_database_initialization(db)
+            raise
         db._initialized = True
         return db
     
@@ -978,7 +1014,11 @@ class AsyncDatabase:
         backend = SQLiteBackend(db_path)
         await backend.connect()
         db = cls(backend)
-        await db._init_schema()
+        try:
+            await db._init_schema()
+        except BaseException:
+            await _close_failed_database_initialization(db)
+            raise
         db._initialized = True
         logger.info(f"SQLite database connected: {db_path}")
         return db
@@ -990,7 +1030,11 @@ class AsyncDatabase:
         backend = PostgresBackend(dsn=dsn)
         await backend.connect()
         db = cls(backend)
-        await db._init_schema()
+        try:
+            await db._init_schema()
+        except BaseException:
+            await _close_failed_database_initialization(db)
+            raise
         db._initialized = True
         logger.info("PostgreSQL database connected")
         return db
