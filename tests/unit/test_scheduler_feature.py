@@ -477,6 +477,33 @@ class TestRetiredCronCleanup:
         assert "request_restart" not in readded
 
     @pytest.mark.asyncio
+    async def test_post_load_fails_closed_when_authority_schedule_removal_fails(self):
+        """An obsolete request_restart row must not survive a successful boot."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [{
+                "task_name": "request_restart",
+                "id": "legacy-still-durable",
+                "enabled": True,
+            }]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.failed(error="delete transaction failed")
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="Failed to remove authority-bound schedule.*delete transaction failed",
+        ):
+            await f.post_all_features_loaded(agent)
+
+    @pytest.mark.asyncio
     async def test_post_load_removes_retired_builtin_schedules(self):
         """Persisted rows for removed core sources must be deleted on upgrade."""
         from kestrel_sdk.tools.result import ToolResult

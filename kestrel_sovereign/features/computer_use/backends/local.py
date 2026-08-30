@@ -16,6 +16,8 @@ import shutil
 import time
 from pathlib import Path
 
+from kestrel_sovereign.security.subprocess_env import sanitized_subprocess_env
+
 from .base import (
     CapabilityBlocked,
     CompletedRun,
@@ -85,7 +87,7 @@ class LocalSandboxBackend(SandboxBackend):
             proc = await asyncio.create_subprocess_exec(
                 *full_argv,
                 cwd=str(cwd) if cwd else None,
-                env=env,
+                env=sanitized_subprocess_env(env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

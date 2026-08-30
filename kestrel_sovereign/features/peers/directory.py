@@ -224,25 +224,22 @@ class LocalHostPeerDirectory:
         self,
         host_url: str,
         *,
-        api_key: str = "",
+        peer_api_key: str = "",
         client_factory: Callable[..., Any] = httpx.AsyncClient,
     ) -> None:
         self._host_url = host_url.rstrip("/")
-        self._api_key = api_key
+        self._peer_api_key = peer_api_key
         self._client_factory = client_factory
 
     def _headers(self) -> dict[str, str]:
-        from kestrel_sovereign.auth import (
-            LOCAL_PEER_TRANSPORT_HEADER,
-            LOCAL_PEER_TRANSPORT_VALUE,
-        )
+        from kestrel_sovereign.auth import LOCAL_PEER_API_KEY_HEADER
 
         headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["X-API-Key"] = self._api_key
-            # The shared key authenticates this host-local transport; it does
-            # not turn the sending agent into the sovereign operator.
-            headers[LOCAL_PEER_TRANSPORT_HEADER] = LOCAL_PEER_TRANSPORT_VALUE
+        if self._peer_api_key:
+            # A peer transport never receives the sovereign API key. The
+            # dedicated credential resolves only to authenticated peer
+            # authority at the host middleware boundary.
+            headers[LOCAL_PEER_API_KEY_HEADER] = self._peer_api_key
         return headers
 
     @staticmethod

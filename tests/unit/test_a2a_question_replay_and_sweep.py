@@ -90,7 +90,7 @@ def _make_feature_for_replay(*, run_tracked_tasks: bool = False):
     """
     feature = PeersFeature.__new__(PeersFeature)
     feature._host_url = "http://host:8888"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "Sender"
 
     agent = MagicMock()

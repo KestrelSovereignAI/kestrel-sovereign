@@ -42,13 +42,16 @@ def _local_peers_feature(agent, router, requester):
 
 
 @pytest.mark.asyncio
-async def test_hosted_policy_refreshes_local_router_with_generated_api_key(monkeypatch):
-    """Registration sees a key generated after PeersFeature initialized."""
+async def test_hosted_policy_refreshes_local_router_with_generated_peer_key(monkeypatch):
+    """Registration sees a peer key generated after feature initialization."""
 
     monkeypatch.delenv("KESTREL_HOST_URL", raising=False)
     generated_key = "generated-after-feature-startup"
-    monkeypatch.setattr(server, "get_api_key", lambda: generated_key)
-    stale_router = LocalHostPeerDirectory("http://localhost:8888", api_key="")
+    monkeypatch.setattr(server, "get_peer_api_key", lambda: generated_key)
+    stale_router = LocalHostPeerDirectory(
+        "http://localhost:8888",
+        peer_api_key="",
+    )
     agent = _local_peer_agent()
     peers = _local_peers_feature(
         agent,
@@ -67,7 +70,7 @@ async def test_hosted_policy_refreshes_local_router_with_generated_api_key(monke
     assert isinstance(router, LocalHostPeerDirectory)
     assert router is not stale_router
     assert router._host_url == "http://localhost:9123"
-    assert router._headers()["X-API-Key"] == generated_key
+    assert router._headers()["X-Kestrel-Peer-Key"] == generated_key
     assert requester.identity == agent_id
     assert peers._peer_router is router
     assert peers._peer_requester is requester
@@ -77,7 +80,7 @@ def test_hosted_policy_uses_explicit_multi_agent_config_port(monkeypatch, tmp_pa
     """An explicit config outside default discovery still drives local A2A."""
 
     monkeypatch.delenv("KESTREL_HOST_URL", raising=False)
-    monkeypatch.setattr(server, "get_api_key", lambda: "host-key")
+    monkeypatch.setattr(server, "get_peer_api_key", lambda: "peer-key")
     agent = _local_peer_agent()
     _local_peers_feature(
         agent,
@@ -95,7 +98,7 @@ def test_hosted_policy_uses_platform_port_override(monkeypatch):
     """The local policy follows PORT-adjusted config, not a stale env URL."""
 
     monkeypatch.setenv("KESTREL_HOST_URL", "http://stale-host:8888")
-    monkeypatch.setattr(server, "get_api_key", lambda: "host-key")
+    monkeypatch.setattr(server, "get_peer_api_key", lambda: "peer-key")
     app = _host_app(port=8888)
     server._apply_platform_host_port(
         app.state.multi_agent_config,
@@ -116,7 +119,7 @@ def test_hosted_policy_uses_platform_port_override(monkeypatch):
 def test_hosted_policy_keeps_injected_scoped_router(monkeypatch):
     """A user-scoped router is never replaced with global local discovery."""
 
-    monkeypatch.setattr(server, "get_api_key", lambda: "host-key")
+    monkeypatch.setattr(server, "get_peer_api_key", lambda: "peer-key")
     scoped_router = SimpleNamespace(authorize_inbound_sender=object())
     scoped_requester = PeerRequester("did:test:hosted-peer", object())
     agent = _local_peer_agent()

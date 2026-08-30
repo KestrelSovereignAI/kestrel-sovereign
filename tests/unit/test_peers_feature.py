@@ -24,7 +24,7 @@ async def test_list_peers_filters_out_self():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "emma"
 
     response = MagicMock()
@@ -57,7 +57,7 @@ async def test_ask_agent_rejects_self_target():
     agent = SimpleNamespace(_agent_name="emma", did="did:test:emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "emma"
 
     client = AsyncMock()
@@ -81,7 +81,7 @@ async def test_ask_agent_reports_offline_peer():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "emma"
 
     response = MagicMock(status_code=503)
@@ -105,7 +105,7 @@ async def test_ask_agent_returns_peer_response():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = "key"
+    feature._peer_api_key = "key"
     feature._own_name = "emma"
 
     response = MagicMock(status_code=200)
@@ -131,7 +131,7 @@ async def test_local_host_routes_resolved_routing_name_not_display_name():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "emma"
 
     directory = MagicMock(status_code=200)
@@ -200,7 +200,7 @@ def _make_a2a_feature(name="emma"):
 
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = name
     return feature
 
@@ -1026,7 +1026,7 @@ async def test_replay_supervisor_is_feature_owned_and_cancelled_on_shutdown():
     agent = _TrackingAgent()
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "emma"
 
     # Replace the real SSE supervisor with one that blocks forever, so the
@@ -1075,7 +1075,7 @@ async def test_replay_past_deadline_row_spawns_no_supervisor():
     agent = _TrackingAgent()
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "emma"
     feature._handle_expired_row = AsyncMock(return_value=None)
 
@@ -1184,7 +1184,7 @@ async def test_question_answered_retry_is_feature_owned_and_cancelled_on_shutdow
     agent = _TrackingAgent()
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._peer_api_key = ""
     feature._own_name = "emma"
 
     # Block the retry loop forever so the spawned task stays PENDING and teardown

@@ -6,8 +6,7 @@ from enum import Enum
 from typing import Optional
 
 
-LOCAL_PEER_TRANSPORT_HEADER = "X-Kestrel-Peer-Transport"
-LOCAL_PEER_TRANSPORT_VALUE = "local-host-v1"
+LOCAL_PEER_API_KEY_HEADER = "X-Kestrel-Peer-Key"
 
 
 class AuthMethod(str, Enum):

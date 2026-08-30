@@ -553,6 +553,22 @@ def get_api_key():
     return normalize_sovereign_api_key(api_key)
 
 
+def get_peer_api_key() -> str:
+    """Get a process-local credential that grants peer, never sovereign, auth."""
+
+    raw_key = os.environ.get("KESTREL_PEER_API_KEY")
+    if not raw_key:
+        raw_key = secrets.token_urlsafe(32)
+        os.environ["KESTREL_PEER_API_KEY"] = raw_key
+    peer_key = normalize_sovereign_api_key(raw_key)
+    sovereign_key = get_api_key()
+    if secrets.compare_digest(peer_key, sovereign_key):
+        raise RuntimeError(
+            "KESTREL_PEER_API_KEY must be distinct from KESTREL_API_KEY"
+        )
+    return peer_key
+
+
 async def verify_api_key(
     request: Request,
     api_key_header: Optional[str] = Security(api_key_header),
@@ -1288,7 +1304,10 @@ def _hosted_peer_directory_context(app: FastAPI, agent) -> tuple[object, object]
         refresh = getattr(peer_feature, "refresh_local_host_peer_directory", None)
         if not callable(refresh):
             return None, None
-        refreshed = refresh(host_url=host_url, api_key=get_api_key())
+        refreshed = refresh(
+            host_url=host_url,
+            peer_api_key=get_peer_api_key(),
+        )
         return refreshed if refreshed is not None else (None, None)
     return (
         getattr(agent, "peer_directory_router", None),
@@ -3018,8 +3037,7 @@ async def auth_middleware(request: Request, call_next):
     # it, so an unhandled downstream application fault keeps FastAPI's
     # 500 semantics instead of masquerading as a 401 (#2490).
     from kestrel_sovereign.auth import (
-        LOCAL_PEER_TRANSPORT_HEADER,
-        LOCAL_PEER_TRANSPORT_VALUE,
+        LOCAL_PEER_API_KEY_HEADER,
         AuthMethod,
         CallerContext,
     )
@@ -3028,17 +3046,19 @@ async def auth_middleware(request: Request, call_next):
     unauthenticated_root_dispatch = False
     try:
         expected_key = get_api_key()
+        expected_peer_key = get_peer_api_key()
+
+        peer_key_header = request.headers.get(LOCAL_PEER_API_KEY_HEADER)
+        if peer_key_header and secrets.compare_digest(
+            peer_key_header,
+            expected_peer_key,
+        ):
+            caller = CallerContext.local_peer_transport()
 
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
-            if (
-                request.headers.get(LOCAL_PEER_TRANSPORT_HEADER)
-                == LOCAL_PEER_TRANSPORT_VALUE
-            ):
-                caller = CallerContext.local_peer_transport()
-            else:
-                caller = CallerContext.sovereign(AuthMethod.API_KEY)
+            caller = CallerContext.sovereign(AuthMethod.API_KEY)
 
         # Check Bearer token (API key OR JWT)
         if caller is None:

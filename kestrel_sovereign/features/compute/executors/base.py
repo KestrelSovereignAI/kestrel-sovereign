@@ -18,6 +18,7 @@ from typing import Optional, TypeVar, cast
 from uuid import uuid4
 
 from ..models import ComputeScript, ExecutionRecord
+from kestrel_sovereign.security.subprocess_env import SAFE_SUBPROCESS_ENV_VARS
 
 logger = logging.getLogger(__name__)
 
@@ -33,20 +34,7 @@ _T = TypeVar("_T")
 # Never pass API keys, tokens, encryption keys (e.g. KESTREL_DATA_KEY), or
 # other secrets. Shared by every executor that builds a subprocess env so the
 # host environment is never leaked into script code (F129).
-_SAFE_ENV_VARS = {
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TMPDIR",
-    "TERM",
-    "TZ",
-    "PYTHONPATH",
-    "VIRTUAL_ENV",
-}
+_SAFE_ENV_VARS = SAFE_SUBPROCESS_ENV_VARS
 
 
 @dataclass(frozen=True, slots=True)

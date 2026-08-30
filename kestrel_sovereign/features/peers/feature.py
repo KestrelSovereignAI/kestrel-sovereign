@@ -271,7 +271,7 @@ class PeersFeature(Feature):
 
     async def initialize(self):
         self._host_url = _discover_host_url()
-        self._api_key = os.environ.get("KESTREL_API_KEY", "")
+        self._peer_api_key = os.environ.get("KESTREL_PEER_API_KEY", "")
         self._own_name = self._get_own_name()
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and
@@ -384,7 +384,7 @@ class PeersFeature(Feature):
         # the first operation that installed this adapter.
         self._peer_router = LocalHostPeerDirectory(
             host_url,
-            api_key=getattr(self, "_api_key", ""),
+            peer_api_key=getattr(self, "_peer_api_key", ""),
             client_factory=lambda *args, **kwargs: httpx.AsyncClient(
                 *args, **kwargs,
             ),
@@ -439,7 +439,7 @@ class PeersFeature(Feature):
         self,
         *,
         host_url: str,
-        api_key: str,
+        peer_api_key: str,
     ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
         """Refresh only the local compatibility adapter for hosted policy.
 
@@ -459,7 +459,7 @@ class PeersFeature(Feature):
         if router is not None and not isinstance(router, LocalHostPeerDirectory):
             return self._peer_directory_context()
         self._host_url = host_url.rstrip("/")
-        self._api_key = api_key
+        self._peer_api_key = peer_api_key
         self._peer_router = None
         self._peer_requester = None
         self._install_local_host_router()
