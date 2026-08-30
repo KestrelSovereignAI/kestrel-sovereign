@@ -3406,8 +3406,8 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
     manager._child_mandates[child_name] = mandate
     # This lifecycle-ownership fixture intentionally uses object sentinels,
     # not signed authority receipts. Keep it focused on quarantine tracking.
-    manager.get_authoritative_children = AsyncMock(
-        side_effect=manager.get_children
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child.agent_id: (parent_did, child_name)}
     )
     refund_started = asyncio.Event()
     allow_refund = asyncio.Event()
@@ -3416,9 +3416,11 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
         name: str,
         *,
         offboard_runtime: bool = False,
+        _lifecycle_cleanup_expected_agent_id: str | None = None,
     ) -> bool:
         assert offboard_runtime is False
         assert name == child_name
+        assert _lifecycle_cleanup_expected_agent_id == child.agent_id
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
         assert manager._child_budgets.pop(name) is entry
@@ -3463,8 +3465,8 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
     manager._child_mandates[child_name] = mandate
     # This lifecycle-ownership fixture intentionally uses object sentinels,
     # not signed authority receipts. Keep it focused on quarantine tracking.
-    manager.get_authoritative_children = AsyncMock(
-        side_effect=manager.get_children
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child.agent_id: (parent_did, child_name)}
     )
     refund_started = asyncio.Event()
     allow_failure = asyncio.Event()
@@ -3473,9 +3475,11 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
         name: str,
         *,
         offboard_runtime: bool = False,
+        _lifecycle_cleanup_expected_agent_id: str | None = None,
     ) -> bool:
         assert offboard_runtime is False
         assert name == child_name
+        assert _lifecycle_cleanup_expected_agent_id == child.agent_id
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
         assert manager._child_budgets.pop(name) is entry
