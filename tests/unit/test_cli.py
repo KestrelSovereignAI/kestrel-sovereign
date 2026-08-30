@@ -16,6 +16,7 @@ from kestrel_sovereign.cli import (
     main,
     cmd_start,
     cmd_stop,
+    cmd_shutdown,
     cmd_status,
     cmd_logs,
     cmd_list,
@@ -561,19 +562,19 @@ class TestCmdStorage:
 
 
 # -----------------------------------------------------------------------
-# cmd_stop tests
+# cmd_shutdown tests
 # -----------------------------------------------------------------------
 
-class TestCmdStop:
+class TestCmdShutdown:
     """Tests for the 'stop' command."""
 
     def test_stop_single_agent_not_found(self, multi_agent_env, capsys):
         """Stop should return 1 if agent name not found."""
         parser = build_parser()
-        args = parser.parse_args(["stop", "nonexistent"])
+        args = parser.parse_args(["shutdown", "nonexistent"])
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_shutdown(args)
 
         assert rc == 1
         output = capsys.readouterr().out
@@ -582,28 +583,28 @@ class TestCmdStop:
     def test_stop_single_not_running(self, multi_agent_env, capsys):
         """Stop should succeed even if agent is not running."""
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["shutdown", "claw"])
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_shutdown(args)
 
         assert rc == 0
 
     def test_stop_all(self, multi_agent_env, capsys):
         """Stop all should stop agents and host."""
         parser = build_parser()
-        args = parser.parse_args(["stop"])
+        args = parser.parse_args(["shutdown"])
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_shutdown(args)
 
         assert rc == 0
         output = capsys.readouterr().out
-        assert "MultiAgent stopped" in output
+        assert "MultiAgent shut down" in output
 
 
 # -----------------------------------------------------------------------
-# cmd_stop postcondition tests (#2990)
+# cmd_shutdown postcondition tests (#2990)
 #
 # The verdict in every test below is decided by a REAL listening socket, so
 # ``is_port_in_use`` does the same connect() it does in production. Only the
@@ -684,7 +685,7 @@ def _repoint_ports(env, **ports: int) -> None:
 
 
 class TestCmdStopReportsOnlyVerifiedStops:
-    """`stop` may report stopped only when the port was actually released."""
+    """`shutdown` may report stopped only when the port was actually released."""
 
     def test_a_held_port_reads_as_held_however_full_its_backlog(self):
         """The probe must answer "can this be bound", not "is it accepting".
@@ -692,7 +693,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
         A listener with a full accept backlog refuses new connections while
         still owning the port. The old ``connect_ex`` probe therefore reported
         a held port as free after a single unaccepted connection — which let
-        `stop` report success over exactly the listener it was checking for.
+        `shutdown` report success over exactly the listener it was checking for.
         """
         with _listener_on() as port:
             assert [
@@ -822,7 +823,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
     def test_an_unresolvable_bind_address_is_not_called_occupied(self):
         """A typo is a configuration fault, not another process holding a port.
 
-        Claiming occupancy would wedge `stop` into permanent failure; the bind
+        Claiming occupancy would wedge `shutdown` into permanent failure; the bind
         error surfaces at `start`, where it names the address.
         """
         assert ProcessManager.is_port_in_use(
@@ -864,19 +865,19 @@ class TestCmdStopReportsOnlyVerifiedStops:
     def test_stop_all_fails_when_host_port_stays_held(self, multi_agent_env, capsys):
         """A host port nobody could free must not read as a clean shutdown."""
         parser = build_parser()
-        args = parser.parse_args(["stop"])
+        args = parser.parse_args(["shutdown"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
                            testbot=_free_port())
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env):
-                rc = cmd_stop(args)
+                rc = cmd_shutdown(args)
 
         output = capsys.readouterr().out
         assert rc == 1
-        assert "MultiAgent stopped" not in output
-        assert "stop incomplete" in output
+        assert "MultiAgent shut down" not in output
+        assert "shutdown incomplete" in output
         assert "host" in output
         assert f"port :{port}" in output
 
@@ -884,13 +885,13 @@ class TestCmdStopReportsOnlyVerifiedStops:
         self, multi_agent_env, capsys
     ):
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["shutdown", "claw"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, claw=port)
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env):
-                rc = cmd_stop(args)
+                rc = cmd_shutdown(args)
 
         output = capsys.readouterr().out
         assert rc == 1
@@ -902,12 +903,12 @@ class TestCmdStopReportsOnlyVerifiedStops:
     ):
         """The success path still succeeds — nothing is bound to claw's port."""
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["shutdown", "claw"])
         _repoint_ports(multi_agent_env, claw=_free_port())
 
         with _unkillable_orphan(), \
              patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_shutdown(args)
 
         output = capsys.readouterr().out
         assert rc == 0
@@ -922,7 +923,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
         `kestrel start` fails on a port this command called free.
         """
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["shutdown", "claw"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, claw=port)
@@ -931,7 +932,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
                  patch.object(ProcessManager, "stop_agent", return_value=True), \
                  patch.object(ProcessManager, "read_pid", return_value=4242), \
                  patch.object(ProcessManager, "is_process_running", return_value=True):
-                rc = cmd_stop(args)
+                rc = cmd_shutdown(args)
 
         output = capsys.readouterr().out
         assert rc == 1, output
@@ -964,18 +965,18 @@ class TestCmdStopReportsOnlyVerifiedStops:
         assert ProcessManager.read_pid_record(pid_file).status is PidStatus.STALE
 
         parser = build_parser()
-        args = parser.parse_args(["stop"])
+        args = parser.parse_args(["shutdown"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
                            testbot=_free_port())
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env):
-                rc = cmd_stop(args)
+                rc = cmd_shutdown(args)
 
         output = capsys.readouterr().out
         assert rc == 1, output
-        assert "stop incomplete" in output
+        assert "shutdown incomplete" in output
         assert not pid_file.exists(), (
             "a dead host's PID file was kept because the port was still held; "
             "the number can be reused and signalled by the next command"

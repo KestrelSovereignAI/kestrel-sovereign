@@ -14,7 +14,7 @@ Operator workflow:
     kestrel migrate-encryption --data-dir agent_data/meridian --dry-run
 
     # 2) Stop the agent host (or shut down only the affected agent).
-    kestrel stop
+    kestrel shutdown
 
     # 3) Backfill.
     kestrel migrate-encryption --data-dir agent_data/meridian
@@ -527,7 +527,7 @@ def cli_run(args, *, stdout=None, stderr=None) -> int:
                 print(
                     f"Refusing to mutate: {label} is running (pid "
                     f"{pid}, pid file {pid_file}). Stop the host "
-                    f"first (kestrel stop), then re-run. Use "
+                    f"first (kestrel shutdown), then re-run. Use "
                     f"--dry-run to audit without writing.",
                     file=err,
                 )

@@ -249,7 +249,7 @@ class ProcessManager:
     def find_pids_on_port(port: int) -> list[int]:
         """Return PIDs of processes currently listening on `port`.
 
-        Used by `kestrel stop` to reap orphans — servers whose PID file was
+        Used by `kestrel shutdown` to reap orphans — servers whose PID file was
         lost or never written, which would otherwise block a subsequent start.
         Returns an empty list on any failure (tool missing, parse error).
         """

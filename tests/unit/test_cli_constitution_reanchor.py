@@ -167,7 +167,7 @@ def test_reanchor_refuses_when_agent_appears_running(reanchor_env, capsys):
     assert rc == 2
     err = capsys.readouterr().err.lower()
     assert "appears to be running" in err
-    assert "kestrel stop test" in err
+    assert "kestrel shutdown test" in err
     mock_reanchor.assert_not_called()
 
 
@@ -914,9 +914,9 @@ def test_the_guard_sees_an_agent_served_by_the_in_process_host(tmp_path, monkeyp
     assert not (agent_dir / "agent.pid").exists()
 
     holder = _agent_holder(tmp_path, "Claw", cfg)
-    assert holder == "kestrel stop", (
+    assert holder == "kestrel shutdown", (
         "the guard must see the shared host, and must prescribe a command "
-        "that can actually stop it — `kestrel stop Claw` cannot stop an "
+        "that can actually stop it — `kestrel shutdown Claw` cannot stop an "
         "agent with no process of its own, so every retry would refuse again"
     )
 
@@ -935,4 +935,4 @@ def test_the_guard_prescribes_the_per_agent_stop_in_subprocess_mode(tmp_path):
     ProcessManager.write_pid(
         ProcessManager.agent_pid_file(agent_dir), os.getpid(), port=8801
     )
-    assert _agent_holder(tmp_path, "Claw", cfg) == "kestrel stop Claw"
+    assert _agent_holder(tmp_path, "Claw", cfg) == "kestrel shutdown Claw"

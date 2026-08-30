@@ -1,6 +1,6 @@
 """Kestrel CLI — host/agent lifecycle commands.
 
-``start``, ``stop``, ``restart``, ``update``, ``status``, ``logs``. Extracted
+``start``, ``shutdown``, ``restart``, ``update``, ``status``, ``logs``. Extracted
 from ``cli.py`` (#1678) following the ``cli_<group>.py`` convention. Shared,
 test-patched helpers (``_get_project_dir``, ``MultiAgentConfig``, and the
 ``update`` git/uv helpers patched via ``cli.<name>``) are reached through the
@@ -330,7 +330,7 @@ def _start_inprocess_mode(
         orphans = pm.find_pids_on_port(multi_agent.host.port)
         print(f"   Port {multi_agent.host.port} already in use"
               + (f" by PID(s) {orphans}" if orphans else ""))
-        print(f"   Run: kestrel stop   (add --force if it doesn't die)")
+        print(f"   Run: kestrel shutdown   (add --force if it doesn't die)")
         return 1
 
     env = pm._load_env()
@@ -452,8 +452,8 @@ def _report_port_still_held(label: str, port: int) -> None:
         print(f"   Identify the owner with: lsof -nP -iTCP:{port} -sTCP:LISTEN")
 
 
-def cmd_stop(args) -> int:
-    """Stop host and/or agents."""
+def cmd_shutdown(args) -> int:
+    """Shut down host and/or agent processes."""
     project_dir = cli._get_project_dir()
     multi_agent = cli.MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
@@ -499,7 +499,7 @@ def cmd_stop(args) -> int:
         return 0
 
     # Stop everything: agents first, then host
-    print("\U0001F6D1 Stopping Kestrel MultiAgent...")
+    print("\U0001F6D1 Shutting down Kestrel MultiAgent processes...")
 
     # Anything that outlived the stop, named so the summary cannot claim a
     # clean shutdown over the top of it.
@@ -591,19 +591,19 @@ def cmd_stop(args) -> int:
 
     if unstopped:
         print(
-            "\u274c MultiAgent stop incomplete — still running: "
+            "\u274c MultiAgent shutdown incomplete — still running: "
             + ", ".join(unstopped)
         )
         return 1
 
-    print("\u2705 MultiAgent stopped")
+    print("\u2705 MultiAgent shut down")
     return 0
 
 
 def cmd_restart(args) -> int:
-    """Restart host and/or agents (stop then start)."""
-    # Through ``cli.`` so test patches of cli.cmd_stop / cli.cmd_start apply.
-    rc = cli.cmd_stop(args)
+    """Restart host and/or agents (shutdown then start)."""
+    # Through ``cli.`` so test patches of cli.cmd_shutdown / cli.cmd_start apply.
+    rc = cli.cmd_shutdown(args)
     if rc != 0:
         return rc
     print()
@@ -1674,16 +1674,18 @@ def cmd_logs(args) -> int:
 
 
 def add_lifecycle_subparsers(subparsers) -> None:
-    """Register start/stop/restart/update/status/logs on ``subparsers``."""
+    """Register start/shutdown/restart/update/status/logs on ``subparsers``."""
     # kestrel start [name]
     start_p = subparsers.add_parser("start", help="Start host and/or agents")
     start_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
     _add_startup_timeout_argument(start_p)
 
-    # kestrel stop [name] [--force]
-    stop_p = subparsers.add_parser("stop", help="Stop host and/or agents")
-    stop_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
-    stop_p.add_argument(
+    # kestrel shutdown [name] [--force]
+    shutdown_p = subparsers.add_parser(
+        "shutdown", help="Shut down host and/or agent processes"
+    )
+    shutdown_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
+    shutdown_p.add_argument(
         "--force", action="store_true",
         help="Send SIGKILL instead of SIGTERM (also used when reaping orphans)",
     )
