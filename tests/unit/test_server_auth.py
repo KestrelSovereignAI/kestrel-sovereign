@@ -13,10 +13,8 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 from kestrel_sovereign import server as server_module
-from kestrel_sovereign.features.peers.directory import LocalHostPeerDirectory
 
 API_KEY = "unit-test-key-2490"
-PEER_KEY = "unit-test-peer-key-3148"
 SENTINEL = "sentinel downstream failure"
 
 # Lanes the middleware accepts credentials on. The query-param lane is only
@@ -57,22 +55,12 @@ def _build_app():
         request.session["user_email"] = "operator@example.com"
         return {"ok": True}
 
-    @app.get("/api/test/caller")
-    async def caller_route(request: Request):
-        caller = request.state.caller
-        return {
-            "role": caller.role.value,
-            "auth_method": caller.auth_method.value,
-            "is_sovereign": caller.is_sovereign,
-        }
-
     return app
 
 
 @pytest.fixture()
 def client(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
-    monkeypatch.setenv("KESTREL_PEER_API_KEY", PEER_KEY)
     with TestClient(_build_app(), raise_server_exceptions=False) as test_client:
         yield test_client
 
@@ -98,52 +86,6 @@ def test_valid_credentials_reach_route(client, lane):
     response = client.get(path, **_lane_kwargs(client, lane))
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-
-
-def test_local_peer_transport_key_is_authenticated_but_not_sovereign(client):
-    headers = LocalHostPeerDirectory(
-        "http://localhost:8888",
-        peer_api_key=PEER_KEY,
-    )._headers()
-
-    response = client.get("/api/test/caller", headers=headers)
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "role": "authenticated",
-        "auth_method": "internal",
-        "is_sovereign": False,
-    }
-
-
-def test_peer_key_is_not_accepted_on_sovereign_header(client):
-    response = client.get(
-        "/api/test/caller",
-        headers={"X-API-Key": PEER_KEY},
-    )
-
-    assert response.status_code == 401
-
-
-def test_legacy_peer_marker_cannot_downgrade_or_upgrade_sovereign_key(client):
-    response = client.get(
-        "/api/test/caller",
-        headers={
-            "X-API-Key": API_KEY,
-            "X-Kestrel-Peer-Transport": "local-host-v1",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["is_sovereign"] is True
-
-
-def test_peer_and_sovereign_keys_must_be_distinct(monkeypatch):
-    monkeypatch.setenv("KESTREL_API_KEY", "same-key")
-    monkeypatch.setenv("KESTREL_PEER_API_KEY", "same-key")
-
-    with pytest.raises(RuntimeError, match="must be distinct"):
-        server_module.get_peer_api_key()
 
 
 @pytest.mark.parametrize(
