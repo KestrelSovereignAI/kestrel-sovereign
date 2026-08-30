@@ -147,14 +147,7 @@ class StopOutcome:
                 raise ValueError(
                     "requested_target must be a non-empty string when supplied"
                 )
-        if self.scope in {StopScope.TURN, StopScope.TOOL_CALL}:
-            try:
-                validate_invocation_id(self.resolved_target)
-            except ValueError as error:
-                raise ValueError(
-                    "resolved_target must be a valid opaque work address"
-                ) from error
-        elif (
+        if (
             not isinstance(self.resolved_target, str)
             or not self.resolved_target.strip()
         ):

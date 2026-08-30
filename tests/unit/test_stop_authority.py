@@ -434,6 +434,37 @@ async def test_authority_resolves_turn_and_tool_addresses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_work_stop_outcome_preserves_long_agent_target_identity() -> None:
+    """Invocation ID bounds never constrain the resolved agent DID."""
+
+    long_agent_id = "did:web:example.test:" + ("agent-" * 50)
+    cancel = AsyncMock(return_value=StopDisposition.STOPPED)
+    authority = _authority(
+        lambda: (
+            CooperativeStopTarget(
+                long_agent_id,
+                long_agent_id,
+                cancel,
+                turn_ids=frozenset({"turn-long-owner"}),
+            ),
+        )
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(
+            StopScope.TURN,
+            "did:test:operator",
+            "turn-long-owner",
+            target_agent_id=long_agent_id,
+        )
+    )
+
+    assert outcomes[0].resolved_target == long_agent_id
+    assert outcomes[0].disposition is StopDisposition.STOPPED
+    cancel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_turn_address_includes_owner_when_ids_collide() -> None:
     calls: list[str] = []
 

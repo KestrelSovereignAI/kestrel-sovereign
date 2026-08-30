@@ -115,7 +115,12 @@ class CancellationAuthority:
                 StopOutcome(
                     scope=request.scope,
                     requested_target=request.target,
-                    resolved_target=request.target or StopScope.HOST.value,
+                    resolved_target=(
+                        request.target_agent_id
+                        if request.scope in {StopScope.TURN, StopScope.TOOL_CALL}
+                        else request.target
+                    )
+                    or StopScope.HOST.value,
                     agent_id=request.target_agent_id or request.target or "unresolved",
                     disposition=StopDisposition.UNREACHABLE,
                     correlation_id=request.correlation_id,
