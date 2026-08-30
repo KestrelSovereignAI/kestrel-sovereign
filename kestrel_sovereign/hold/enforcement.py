@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # reuse the exact snapshot it already observed; a different agent, task, or
 # later top-level call still performs its own durable read.
 _turn_admission_snapshot: ContextVar[
-    tuple[Any, EffectiveHoldState | None] | None
+    tuple[Any, asyncio.Task[Any], EffectiveHoldState | None] | None
 ] = ContextVar("kestrel_hold_turn_admission_snapshot", default=None)
 
 
@@ -36,7 +36,10 @@ def _reuse_turn_admission_snapshot(
     agent: Any,
     effective_state: EffectiveHoldState | None,
 ):
-    token = _turn_admission_snapshot.set((agent, effective_state))
+    owner_task = asyncio.current_task()
+    if owner_task is None:
+        raise RuntimeError("Hold admission reuse requires a running asyncio task")
+    token = _turn_admission_snapshot.set((agent, owner_task, effective_state))
     try:
         yield
     finally:
@@ -248,8 +251,12 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     """
 
     reused = _turn_admission_snapshot.get()
-    if reused is not None and reused[0] is agent:
-        return reused[1]
+    if (
+        reused is not None
+        and reused[0] is agent
+        and reused[1] is asyncio.current_task()
+    ):
+        return reused[2]
 
     # Hold enforcement is enabled only by the explicit factory binding above.
     # Dynamic proxy objects (notably MagicMock-backed library consumers) may

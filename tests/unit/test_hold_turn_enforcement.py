@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from kestrel_sovereign.hold import (
     require_turn_start_allowed,
 )
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.hold.enforcement import _reuse_turn_admission_snapshot
 
 
 def _latch(scope: HoldScope, receipt_id: str, *, target: str) -> HoldState:
@@ -308,6 +310,29 @@ async def test_streamed_command_reuses_its_first_hold_admission_snapshot() -> No
     chunks = [chunk async for chunk in agent.process_input_streaming("!status")]
 
     assert chunks == ["command complete"]
+    assert store.calls == ["did:test:held"]
+
+
+@pytest.mark.asyncio
+async def test_child_task_cannot_inherit_streamed_command_hold_snapshot() -> None:
+    """A new task is a new turn even when its ContextVars were copied."""
+
+    admitted = EffectiveHoldState(host=None, agent=None)
+    committed_hold = _latch(
+        HoldScope.AGENT,
+        "hold:committed-before-child-turn",
+        target="did:test:held",
+    )
+    store = _Store(EffectiveHoldState(host=None, agent=committed_hold))
+    agent = _bare_agent(store)
+
+    with _reuse_turn_admission_snapshot(agent, admitted):
+        child_turn = asyncio.create_task(require_turn_start_allowed(agent))
+
+    with pytest.raises(HoldTurnRefusal) as caught:
+        await child_turn
+
+    assert caught.value.agent_hold is committed_hold
     assert store.calls == ["did:test:held"]
 
 
