@@ -209,15 +209,15 @@ async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
                 recipient_agent_id=recipient,
             )
 
-        rows = await backend.execute(
-            """
-            INSERT OR REPLACE INTO a2a_tasks
-                (id, task_type, status, creator_agent_id, recipient_agent_id)
-            VALUES (?, 'generic', 'completed', ?, ?)
-            """,
-            (task_id, creator, recipient),
-        )
-        assert rows == 0
+        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+            await backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks
+                    (id, task_type, status, creator_agent_id, recipient_agent_id)
+                VALUES (?, 'generic', 'completed', ?, ?)
+                """,
+                (task_id, creator, recipient),
+            )
 
         persisted = await store._get_unscoped(task_id)
         assert persisted.status.state is TaskState.CANCELED

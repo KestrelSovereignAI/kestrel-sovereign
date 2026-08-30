@@ -986,7 +986,7 @@ class TaskManager:
         # SUBMITTED snapshot after a terminal transition already committed.
         canonical_read_succeeded = False
         try:
-            canonical = await self.task_store.get(task.id)
+            canonical = await self.task_store._get_unscoped(task.id)
             canonical_read_succeeded = canonical is not None
         except (Exception, asyncio.CancelledError):
             canonical = None

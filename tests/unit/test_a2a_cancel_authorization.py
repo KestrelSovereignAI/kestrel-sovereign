@@ -283,7 +283,7 @@ async def test_cancel_readback_is_atomic_with_authorized_transition(
             agent_name="did:test:recipient",
             creator_agent_id="did:test:creator",
         )
-        canonical_get = manager.task_store.get
+        canonical_get = manager.task_store._get_unscoped
         current = await canonical_get("cancel-readback")
         task_payload = (
             current.model_copy(
@@ -294,7 +294,7 @@ async def test_cancel_readback_is_atomic_with_authorized_transition(
         )
         canceled_callbacks: list[str] = []
         manager._on_task_cancelled = lambda task: canceled_callbacks.append(task.id)
-        manager.task_store.get = AsyncMock(
+        manager.task_store._get_unscoped = AsyncMock(
             side_effect=RuntimeError("injected post-update public read failure")
         )
 
@@ -353,7 +353,9 @@ async def test_ambiguous_cancel_commit_reconciles_projections_before_rethrow(
                 recipient_agent_id="did:test:recipient",
             )
 
-        persisted = await manager.get_task("ambiguous-commit")
+        persisted = await manager.get_task_for_creator(
+            "ambiguous-commit", "did:test:creator"
+        )
         assert persisted.status.state is TaskState.CANCELED
         assert canceled_callbacks == ["ambiguous-commit"]
         assert completions == ["ambiguous-commit"]
@@ -464,8 +466,8 @@ async def test_create_task_returns_accepted_snapshot_when_final_readback_fails(
         accepted: list[str] = []
         manager._on_task_submitted = lambda task: accepted.append(task.id)
         manager._notify_status_update = AsyncMock()
-        original_get = manager.task_store.get
-        manager.task_store.get = AsyncMock(side_effect=read_error)
+        original_get = manager.task_store._get_unscoped
+        manager.task_store._get_unscoped = AsyncMock(side_effect=read_error)
 
         created = await manager.create_task(
             _params("accepted-before-readback-failure"),
@@ -477,8 +479,10 @@ async def test_create_task_returns_accepted_snapshot_when_final_readback_fails(
         assert created.status.state is TaskState.SUBMITTED
         assert accepted == ["accepted-before-readback-failure"]
         manager._notify_status_update.assert_not_awaited()
-        manager.task_store.get = original_get
-        persisted = await manager.get_task(created.id)
+        manager.task_store._get_unscoped = original_get
+        persisted = await manager.get_task_for_creator(
+            created.id, "did:test:creator"
+        )
         assert persisted is not None
         assert persisted.status.state is TaskState.SUBMITTED
     finally:
@@ -510,8 +514,8 @@ async def test_cancel_commit_does_not_depend_on_a_post_commit_read(
                 Artifact(name="partial", parts=[TextPart(text="preserved")])
             ]
 
-        original_get = manager.task_store.get
-        manager.task_store.get = AsyncMock(
+        original_get = manager.task_store._get_unscoped
+        manager.task_store._get_unscoped = AsyncMock(
             side_effect=RuntimeError("post-commit reads unavailable")
         )
         canceled = await manager.cancel_task(
@@ -525,8 +529,10 @@ async def test_cancel_commit_does_not_depend_on_a_post_commit_read(
         assert canceled.status.state is TaskState.CANCELED
         assert cancellations == [submitted.id]
         assert completions == [submitted.id]
-        manager.task_store.get = original_get
-        persisted = await manager.get_task(submitted.id)
+        manager.task_store._get_unscoped = original_get
+        persisted = await manager.get_task_for_creator(
+            submitted.id, "did:test:creator"
+        )
         assert persisted.status.state is TaskState.CANCELED
         if with_payload:
             assert persisted.artifacts[0].name == "partial"
@@ -589,7 +595,7 @@ async def test_cancel_task_unauthorized_peer_lineage_and_causation_is_refused(
         result = await _feature(manager, caller).cancel_task("protected")
 
         assert result.status is ToolResultStatus.ERROR
-        assert "not authorized" in result.error
+        assert result.error == "Task protected not found"
         unchanged = await manager.task_store._get_unscoped("protected")
         assert unchanged.status.state is TaskState.SUBMITTED
         assert "cancellation_receipt" not in (unchanged.metadata or {})
@@ -2770,7 +2776,9 @@ async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
             )
 
         assert (
-            await manager.get_task("terminal-cancel")
+            await manager.get_task_for_creator(
+                "terminal-cancel", "did:test:creator"
+            )
         ).status.state is TaskState.CANCELED
     finally:
         await manager.close()
@@ -2840,7 +2848,12 @@ async def test_database_fence_blocks_all_mutation_of_canceled_task(tmp_path):
             )
 
         assert "legacy" not in (
-            (await manager.get_task("immutable-cancel")).metadata or {}
+            (
+                await manager.get_task_for_creator(
+                    "immutable-cancel", "did:test:creator"
+                )
+            ).metadata
+            or {}
         )
     finally:
         await manager.close()
@@ -2863,7 +2876,12 @@ async def test_database_fence_rejects_legacy_live_insert_without_authority(
                 ("late-legacy-live", "generic"),
             )
 
-        assert await manager.get_task("late-legacy-live") is None
+        assert (
+            await manager.get_task_for_creator(
+                "late-legacy-live", "did:test:creator"
+            )
+            is None
+        )
     finally:
         await manager.close()
 
@@ -2974,7 +2992,7 @@ async def test_database_fence_blocks_legacy_writer_on_available_backends(db_back
                 (task_id,),
             )
 
-        assert (await store.get(task_id)).status.state is TaskState.CANCELED
+        assert (await store._get_unscoped(task_id)).status.state is TaskState.CANCELED
     finally:
         await db_backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task_id,))
 
@@ -3023,7 +3041,7 @@ async def test_cancel_readback_failure_rolls_back_transition_on_available_backen
             )
         monkeypatch.setattr(db_backend, "fetch_one", fetch_one)
 
-        persisted = await store.get(task_id)
+        persisted = await store._get_unscoped(task_id)
         assert persisted is not None
         assert persisted.status.state is TaskState.SUBMITTED
     finally:

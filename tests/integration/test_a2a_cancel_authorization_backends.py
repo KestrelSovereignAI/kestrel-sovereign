@@ -223,7 +223,7 @@ async def test_sqlite_legacy_insert_or_replace_cannot_overwrite_cancellation(tmp
                 (task_id,),
             )
 
-        canceled = await store.get(task_id)
+        canceled = await store._get_unscoped(task_id)
         assert canceled is not None
         assert canceled.status.state is TaskState.CANCELED
         assert canceled.metadata["cancellation_receipt"] == {
