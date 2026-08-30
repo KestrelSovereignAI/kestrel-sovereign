@@ -1186,6 +1186,27 @@ async def test_completed_witness_migration_never_reblesses_missing_evidence(
 
 
 @pytest.mark.asyncio
+async def test_every_target_read_validates_operation_witness_binding(hold_db):
+    """Operation tombstones are load-bearing outside direct receipt lookup."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:operation-witness",
+        actor_id="did:sovereign:operator",
+        reason="witness every state path",
+        operation_id="operation-witness-everywhere",
+    )
+    await db.execute(
+        "DELETE FROM hold_operation_witnesses WHERE operation_id = ?",
+        (held.receipt.operation_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="operation witness"):
+        await store.get_effective("did:agent:operation-witness")
+
+
+@pytest.mark.asyncio
 async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
@@ -1522,6 +1543,38 @@ async def test_postgres_read_targets_take_shared_locks_in_global_order():
             ("kestrel:hold:target:host:host",),
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_receipt_read_locks_operation_before_witness_lookup(
+    monkeypatch,
+):
+    events: list[str] = []
+
+    class _Database:
+        backend_type = "postgres"
+
+        @asynccontextmanager
+        async def transaction(self):
+            events.append("transaction")
+            yield
+
+        async def execute(self, sql, params=()):
+            assert "pg_advisory_xact_lock_shared" in sql
+            assert params == ("kestrel:hold:operation:concurrent-operation",)
+            events.append("operation-lock")
+
+    store = HoldStore(_Database())
+
+    async def validate(_operation):
+        assert events == ["transaction", "operation-lock"]
+        events.append("witness-read")
+        return None
+
+    monkeypatch.setattr(store, "_validate_operation_witness", validate)
+
+    assert await store.get_receipt("concurrent-operation") is None
+    assert events == ["transaction", "operation-lock", "witness-read"]
 
 
 def test_authority_graph_walk_is_linear_in_number_of_receipts():

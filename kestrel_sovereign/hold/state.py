@@ -626,6 +626,16 @@ class HoldStore:
                 (key,),
             )
 
+    async def _lock_read_operation(self, operation_id: str) -> None:
+        """Serialize a PostgreSQL receipt lookup with the operation writer."""
+
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        await self._db.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+            (f"kestrel:hold:operation:{operation_id}",),
+        )
+
     async def _ensure_latch_row(self, scope: HoldScope, target_id: str) -> None:
         await self._db.execute(
             "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?) "
@@ -776,6 +786,25 @@ class HoldStore:
         for row, receipt in zip(rows, receipts):
             if content_witnesses.get(receipt.receipt_id) != _receipt_content_digest(row):
                 content_witness_valid = False
+        operation_witness_rows = await self._db.fetchall(
+            "SELECT r.operation_id, r.receipt_id, w.receipt_id "
+            "FROM hold_receipts AS r "
+            "LEFT JOIN hold_operation_witnesses AS w "
+            "ON w.operation_id = r.operation_id "
+            "WHERE r.scope = ? AND r.target_id = ?",
+            (scope.value, target_id),
+        )
+        operation_witness_valid = len(operation_witness_rows) == len(receipts)
+        for witness in operation_witness_rows:
+            if (
+                len(witness) != 3
+                or not isinstance(witness[0], str)
+                or not witness[0]
+                or not isinstance(witness[1], str)
+                or not witness[1]
+                or witness[2] != witness[1]
+            ):
+                operation_witness_valid = False
         projection_row = await self._read_latch_row(scope, target_id)
         projection_revision = 0
         if projection_row is not None:
@@ -862,6 +891,10 @@ class HoldStore:
                     raise HoldCorruptStateError(
                         "Hold receipt content witness does not match receipt history"
                     )
+                if not operation_witness_valid:
+                    raise HoldCorruptStateError(
+                        "Hold operation witness does not match receipt identity"
+                    )
                 return
             raise HoldCorruptStateError(
                 "unheld projection retains active Hold authority"
@@ -903,6 +936,10 @@ class HoldStore:
         if not content_witness_valid:
             raise HoldCorruptStateError(
                 "Hold receipt content witness does not match receipt history"
+            )
+        if not operation_witness_valid:
+            raise HoldCorruptStateError(
+                "Hold operation witness does not match receipt identity"
             )
 
     async def _validate_latch_projection(
@@ -1342,6 +1379,7 @@ class HoldStore:
 
         operation = _required_text(operation_id, "operation_id")
         async with self._db.transaction():
+            await self._lock_read_operation(operation)
             row = await self._validate_operation_witness(operation)
             if row is None:
                 return None
