@@ -1657,6 +1657,43 @@ async def test_canceled_restart_generation_cannot_be_replayed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_terminalization_revokes_issued_generation_after_evidence_swap(tmp_path):
+    """Terminal state consumes the issued generation, never mutable evidence."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="swap generation before cancel")
+    request_id = created.data["request"]["id"]
+    original = await get_request(backend, request_id)
+    assert original is not None
+
+    tampered = json.loads(original.authority_evidence)
+    tampered["lifecycle_generation"] = "f" * 32
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ? WHERE id = ?",
+        (json.dumps(tampered), request_id),
+    )
+    canceled = await feat.cancel_restart_request(request_id=request_id)
+    assert canceled.data["canceled"] is True
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending', completed_at = NULL, "
+        "authority_evidence = ?, authority_signature = ? WHERE id = ?",
+        (original.authority_evidence, original.authority_signature, request_id),
+    )
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed is not None
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_cancel_revokes_claimed_update_retry_permission(tmp_path):
     """A canceled claimed row cannot borrow its former recovery grant."""
 

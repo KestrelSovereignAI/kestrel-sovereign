@@ -187,10 +187,9 @@ def issue_restart_authority(
     return evidence, _signature(document)
 
 
-def restart_authority_generation(request: Any) -> str:
-    """Return the structurally valid lifecycle generation in one seal."""
+def restart_authority_evidence_generation(evidence: Any) -> str:
+    """Return the structurally valid lifecycle generation in evidence bytes."""
 
-    evidence = getattr(request, "authority_evidence", "")
     try:
         document = json.loads(evidence)
     except (TypeError, ValueError) as error:
@@ -207,6 +206,14 @@ def restart_authority_generation(request: Any) -> str:
             "restart authority lifecycle generation is absent or malformed"
         )
     return generation
+
+
+def restart_authority_generation(request: Any) -> str:
+    """Return the structurally valid lifecycle generation in one request."""
+
+    return restart_authority_evidence_generation(
+        getattr(request, "authority_evidence", "")
+    )
 
 
 def rotate_restart_authority_generation(request: Any) -> tuple[str, str]:
