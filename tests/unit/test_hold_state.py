@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from kestrel_sovereign.hold.state import (
     _latch_from_row,
     _receipt_from_row,
     _terminal_authority_ids,
+    hold_initialization_witness_path,
 )
 from kestrel_sovereign.host_features.context import build_host_context
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -582,12 +584,103 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     assert ctx.db is fake_host_db
     assert ctx.hold_db is fake_hold_db
     assert ctx.hold_store._db is fake_hold_db
+    assert ctx.hold_store._initialization_witness_path is None
     assert events[:4] == [
         ("sqlite", str(host_path)),
         ("postgres", "postgresql://durable/host"),
         ("hold-schema", fake_hold_db),
         ("hold-boot-read", fake_hold_db),
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_without_dsn_uses_runtime_sqlite_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    """Hold selects the same effective backend as the agent runtime."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[object] = []
+
+    class _DB:
+        backend_type = "sqlite"
+
+        async def close(self):
+            events.append("db-close")
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close")
+
+    fake_db = _DB()
+
+    async def _sqlite(_cls, path):
+        events.append(("sqlite", path))
+        return fake_db
+
+    async def _postgres(_cls, _dsn):
+        raise AssertionError("runtime fallback must not open PostgreSQL")
+
+    async def _ensure_schema(self):
+        events.append(("hold-schema", self._db))
+
+    async def _read_boot_state(self):
+        return ()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module, "make_session_factory", lambda _db: _InnerFactory()
+    )
+    monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
+    monkeypatch.setattr(HoldStore, "read_boot_state", _read_boot_state)
+
+    path = tmp_path / "sqlite-fallback.db"
+    ctx = await build_host_context(db_path=str(path))
+
+    assert ctx.db is fake_db
+    assert ctx.hold_db is fake_db
+    assert ctx.hold_store is not None
+    assert events == [
+        ("sqlite", str(path)),
+        ("hold-schema", fake_db),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_initialization_witness_uses_durable_runtime_metadata(
+    tmp_path,
+):
+    """A fresh Cloud Run instance reads the witness from PostgreSQL state."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "postgres-witness-facade.db"))
+
+    class _PostgresWitnessFacade:
+        backend_type = "postgres"
+
+        async def fetchall(self, query, params=()):
+            return await db.fetchall(query, params)
+
+        async def execute(self, query, params=()):
+            return await db.execute(query, params)
+
+    try:
+        first = HoldStore(_PostgresWitnessFacade())
+        assert first._initialization_witness_path is None
+        assert await first._read_initialization_witness() is False
+        await first._write_initialization_witness()
+
+        restarted = HoldStore(_PostgresWitnessFacade())
+        assert await restarted._read_initialization_witness() is True
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -969,6 +1062,35 @@ async def test_legacy_receipts_gain_witnesses_once_before_marker(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_duplicate_operation_ids_are_rejected_during_backfill(
+    tmp_path,
+):
+    """Migration cannot bind one operation witness to two legacy receipts."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "duplicate-backfill.db"))
+    await _create_legacy_hold_tables(db)
+    for suffix in ("one", "two"):
+        await db.execute(
+            "INSERT INTO hold_receipts ("
+            "receipt_id, operation_id, action, disposition, scope, target_id, "
+            "reason, actor_id, occurred_at, resulting_hold_receipt_id"
+            ") VALUES (?, 'duplicate-before-backfill', 'hold', 'applied', "
+            "'agent', ?, 'legacy', 'did:sovereign:operator', "
+            "'2026-08-28T00:00:00+00:00', ?)",
+            (
+                f"legacy-duplicate-{suffix}",
+                f"did:agent:legacy-{suffix}",
+                f"legacy-duplicate-{suffix}",
+            ),
+        )
+    try:
+        with pytest.raises(HoldCorruptStateError, match="duplicate operation"):
+            await HoldStore(db).ensure_schema()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_duplicate_operation_ids_fail_closed(tmp_path):
     """Runtime reads cannot trust a UNIQUE constraint an old table may lack."""
 
@@ -1199,6 +1321,37 @@ async def test_orphaned_operation_witness_fails_closed_on_read_and_restart(hold_
         await store.get_hold("agent", held.receipt.target_id)
     with pytest.raises(HoldCorruptStateError, match="missing receipt"):
         await store.ensure_schema()
+
+
+@pytest.mark.asyncio
+async def test_boot_discovers_target_retained_only_by_content_and_count_witnesses(
+    hold_db,
+):
+    """Surviving target-bearing evidence cannot vanish from the boot scan."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:witness-only-target",
+        actor_id="did:sovereign:operator",
+        reason="evidence must remain visible",
+        operation_id="witness-only-target-hold",
+    )
+    await db.execute(
+        "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
+        (held.receipt.scope.value, held.receipt.target_id),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+    await db.execute(
+        "DELETE FROM hold_operation_witnesses WHERE operation_id = ?",
+        (held.receipt.operation_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="witness|receipt-count"):
+        await store.read_boot_state()
 
 
 @pytest.mark.asyncio
@@ -1703,6 +1856,35 @@ async def test_external_initialization_witness_rejects_total_hold_schema_loss(
 
 
 @pytest.mark.asyncio
+async def test_initialization_witness_is_not_visible_until_payload_is_complete(
+    tmp_path,
+    monkeypatch,
+):
+    """Concurrent boot can observe only absence or a complete witness."""
+
+    from kestrel_sovereign.hold import state as hold_state_module
+
+    database_path = tmp_path / "atomic-witness.db"
+    witness_path = hold_initialization_witness_path(database_path)
+    db = await AsyncDatabase.sqlite(str(database_path))
+    observed_final_path: list[bool] = []
+    real_write = os.write
+
+    def observe_before_write(descriptor, payload):
+        observed_final_path.append(witness_path.exists())
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(hold_state_module.os, "write", observe_before_write)
+    try:
+        await HoldStore(db).ensure_schema()
+    finally:
+        await db.close()
+
+    assert observed_final_path
+    assert not any(observed_final_path)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["get", "set", "release"])
 async def test_imported_duplicate_latch_fails_closed_on_single_target_paths(
     tmp_path,
@@ -1971,7 +2153,11 @@ async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
     db = AsyncDatabase(db_backend)
     store = HoldStore(
         db,
-        initialization_witness_path=tmp_path / "backend-parity.hold-initialized-v1",
+        initialization_witness_path=(
+            None
+            if getattr(db, "backend_type", "") == "postgres"
+            else tmp_path / "backend-parity.hold-initialized-v1"
+        ),
     )
     await store.ensure_schema()
     suffix = uuid4().hex

@@ -30,6 +30,8 @@ HOST_HOLD_TARGET = "host"
 _SCHEMA_LOCK = "hold_state_v1"
 _WITNESS_BACKFILL = "hold_state_witness_ledgers_v1"
 _INITIALIZATION_WITNESS_PAYLOAD = b"kestrel-hold-state-initialized-v1\n"
+_POSTGRES_WITNESS_AGENT_ID = "__kestrel_host_control__"
+_POSTGRES_WITNESS_KEY = "hold_schema_initialized_v1"
 _HOLD_SCHEMA_TABLES = frozenset(
     {
         "hold_latches",
@@ -410,14 +412,11 @@ class HoldStore:
         else:
             self._initialization_witness_path = None
 
-    def _read_initialization_witness(self) -> bool:
+    def _read_file_initialization_witness(self) -> bool:
         """Return whether the external initialized marker is present and valid."""
 
         path = self._initialization_witness_path
-        if path is None:
-            raise HoldStateError(
-                "durable Hold requires an external initialization witness path"
-            )
+        assert path is not None
         if not path_exists(path):
             return False
         try:
@@ -440,23 +439,52 @@ class HoldStore:
             )
         return True
 
-    def _write_initialization_witness(self) -> None:
-        """Create the external initialized marker after the schema commits."""
+    async def _read_initialization_witness(self) -> bool:
+        """Read initialization evidence from restart-surviving custody."""
+
+        if self._initialization_witness_path is not None:
+            return self._read_file_initialization_witness()
+        if getattr(self._db, "backend_type", "") != "postgres":
+            raise HoldStateError(
+                "durable Hold requires an external initialization witness"
+            )
+        rows = await self._db.fetchall(
+            "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+            (_POSTGRES_WITNESS_AGENT_ID, _POSTGRES_WITNESS_KEY),
+        )
+        if not rows:
+            return False
+        expected = _INITIALIZATION_WITNESS_PAYLOAD.decode("ascii")
+        if len(rows) != 1 or len(rows[0]) != 1 or rows[0][0] != expected:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold initialization witness has invalid durable evidence"
+            )
+        return True
+
+    @staticmethod
+    def _fsync_witness_directory(path: Path) -> None:
+        if os.name == "nt":  # pragma: no cover - directory fsync is POSIX-only
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path.parent, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _write_file_initialization_witness(self) -> None:
+        """Atomically publish a complete local initialized marker."""
 
         path = self._initialization_witness_path
         assert path is not None
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         try:
             descriptor = open_private_file(
-                path,
+                temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 label="Hold initialization witness",
             )
         except PrivateStorageError as exc:
-            # A concurrent schema initializer may have published the same
-            # marker after our transaction committed. Trust it only after an
-            # exact read through the private-file custody checks.
-            if path_exists(path) and self._read_initialization_witness():
-                return
             raise HoldStateError(
                 f"could not persist Hold initialization witness: {exc}"
             ) from exc
@@ -468,12 +496,55 @@ class HoldStore:
                     raise OSError("short write while persisting Hold witness")
                 view = view[written:]
             os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+
+            # A concurrent initializer may already have published an exact
+            # complete marker. Otherwise replace from the same private
+            # directory: readers can observe only absence or the fsynced
+            # payload, never the temporary inode while it is being written.
+            if path_exists(path) and self._read_file_initialization_witness():
+                os.unlink(temporary)
+                self._fsync_witness_directory(path)
+                return
+            os.replace(temporary, path)
+            self._fsync_witness_directory(path)
         except OSError as exc:
             raise HoldStateError(
                 f"could not persist Hold initialization witness: {exc}"
             ) from exc
         finally:
-            os.close(descriptor)
+            if descriptor >= 0:
+                os.close(descriptor)
+            if path_exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    async def _write_initialization_witness(self) -> None:
+        """Publish initialized evidence after the Hold schema commits."""
+
+        if self._initialization_witness_path is not None:
+            self._write_file_initialization_witness()
+            return
+        if getattr(self._db, "backend_type", "") != "postgres":
+            raise HoldStateError(
+                "durable Hold requires an external initialization witness"
+            )
+        await self._db.execute(
+            "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT (agent_id, key) DO NOTHING",
+            (
+                _POSTGRES_WITNESS_AGENT_ID,
+                _POSTGRES_WITNESS_KEY,
+                _INITIALIZATION_WITNESS_PAYLOAD.decode("ascii"),
+            ),
+        )
+        if not await self._read_initialization_witness():
+            raise HoldStateError(
+                "could not persist PostgreSQL Hold initialization witness"
+            )
 
     async def _existing_schema_tables(self) -> set[str]:
         placeholders = ", ".join("?" for _ in _HOLD_SCHEMA_TABLES)
@@ -497,10 +568,10 @@ class HoldStore:
         """Create the Hold schema while preserving typed integrity failures."""
 
         try:
-            initialized = self._read_initialization_witness()
+            initialized = await self._read_initialization_witness()
             await self._ensure_schema_transaction(initialized=initialized)
             if not initialized:
-                self._write_initialization_witness()
+                await self._write_initialization_witness()
         except BaseException as exc:
             domain_error = _domain_error_from_chain(exc)
             if domain_error is not None:
@@ -596,6 +667,14 @@ class HoldStore:
                 "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
                 (_WITNESS_BACKFILL,),
             )
+            duplicate_operation = await self._db.fetchone(
+                "SELECT operation_id FROM hold_receipts "
+                "GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1"
+            )
+            if duplicate_operation is not None:
+                raise HoldCorruptStateError(
+                    "Hold receipt history contains a duplicate operation id"
+                )
             if migration_complete is not None:
                 await self._assert_completed_witness_migration_intact()
                 return
@@ -723,7 +802,9 @@ class HoldStore:
 
         rows = await self._db.fetchall(
             "SELECT scope, target_id FROM hold_latches "
-            "UNION SELECT scope, target_id FROM hold_receipts"
+            "UNION SELECT scope, target_id FROM hold_receipts "
+            "UNION SELECT scope, target_id FROM hold_receipt_witnesses "
+            "UNION SELECT scope, target_id FROM hold_receipt_content_witnesses"
         )
         targets: set[tuple[HoldScope, str]] = {(HoldScope.HOST, HOST_HOLD_TARGET)}
         for row in rows:
