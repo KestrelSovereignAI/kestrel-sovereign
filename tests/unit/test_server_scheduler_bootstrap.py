@@ -304,6 +304,13 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
             )
         )
         await asyncio.wait_for(removal_resolution_started.wait(), timeout=1)
+        external_config = ma_config.LocalAgentConfig(
+            data_dir=tmp_path / "external-child",
+            port=8901,
+        )
+        externally_edited = ma_config.MultiAgentConfig.from_file(config_path)
+        externally_edited.agents["ExternalChild"] = external_config
+        externally_edited.save(config_path)
         concurrent_config = ma_config.LocalAgentConfig(
             data_dir=tmp_path / "concurrent-child",
             port=8900,
@@ -325,10 +332,14 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert ma_config.MultiAgentConfig.from_file(config_path).agents[
             "ConcurrentChild"
         ] == concurrent_config
+        assert ma_config.MultiAgentConfig.from_file(config_path).agents[
+            "ExternalChild"
+        ] == external_config
         await rollback()
         restored = ma_config.MultiAgentConfig.from_file(config_path).agents
         assert restored["PersistentChild"] == child_config
         assert restored["ConcurrentChild"] == concurrent_config
+        assert restored["ExternalChild"] == external_config
 
     assert events == ["preflight", "load", "host-start"]
     assert callable(manager.created_agent_persistence_hook)

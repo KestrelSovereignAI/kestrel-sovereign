@@ -3876,6 +3876,15 @@ class AgentManager:
                                 "child agents. Use terminate_child, which cascades "
                                 "and releases nested budgets leaf-first (#2113)."
                             )
+                        if self._has_authoritative_descendants(
+                            name,
+                            known_agent_id=agent_id,
+                        ):
+                            raise ValueError(
+                                f"Cannot remove '{name}' directly: it has signed "
+                                "child agents. Use terminate_child, which removes "
+                                "durable descendants before their authority parent."
+                            )
                         identity_config = (
                             known_agent_config or self._created_configs.get(name)
                         )
@@ -4978,6 +4987,12 @@ class AgentManager:
                 f"Use terminate_child, which cascades and releases nested budgets "
                 f"leaf-first (#2113)."
             )
+        if self._has_authoritative_descendants(name):
+            raise ValueError(
+                f"Cannot remove '{name}' directly: it has signed child agents. "
+                "Use terminate_child, which removes durable descendants before "
+                "their authority parent."
+            )
 
         # A spawn can reserve a delegated hold before its agent is published.
         # There is no process to stop in that state, but a DELETE/shutdown must
@@ -5691,6 +5706,24 @@ class AgentManager:
             return False
 
         return visit(name, known_agent_id)
+
+    def _has_authoritative_descendants(
+        self,
+        name: str,
+        *,
+        known_agent_id: Optional[str] = None,
+    ) -> bool:
+        """Whether removing ``name`` would orphan a signed descendant edge."""
+
+        agent_id = known_agent_id
+        if not agent_id:
+            _published_name, current = self._published_agent_binding(name)
+            agent_id = _loaded_agent_did(current) if current is not None else None
+        if not agent_id:
+            _authority_name, agent_id = self._scheduler_authority_binding_by_name(
+                name
+            )
+        return bool(agent_id and self._parent_children.get(agent_id))
 
     async def _release_child_budget(self, child_name: str) -> None:
         """Credit a terminated child's unspent budget back to its parent (#2113).

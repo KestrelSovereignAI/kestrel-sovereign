@@ -1075,10 +1075,10 @@ async def test_registration_rehydrates_parent_authority_after_restart(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_retained_child_does_not_block_unrelated_registration_after_parent_stop(
+async def test_signed_child_blocks_direct_parent_removal_without_cascade(
     tmp_path,
 ):
-    """A verified projection remains usable after non-cascading withdrawal."""
+    """A durable child must not lose its parent authority through direct DELETE."""
 
     parent_did = "did:pkh:eip155:1:0xStoppedParent"
     child_did = "did:pkh:eip155:1:0xRetainedChild"
@@ -1089,7 +1089,9 @@ async def test_retained_child_does_not_block_unrelated_registration_after_parent
     manager._register_agent("StoppedParent", parent)
     manager._register_agent("RetainedChild", child)
 
-    assert await manager.remove_agent("StoppedParent") is True
+    with pytest.raises(ValueError, match="signed child agents"):
+        await manager.remove_agent("StoppedParent", offboard_runtime=True)
+    assert manager.get_agent("StoppedParent") is parent
     assert manager.get_agent("RetainedChild") is child
     assert manager.get_mandate("RetainedChild") is mandate
 

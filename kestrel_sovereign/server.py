@@ -2386,6 +2386,33 @@ async def _lifespan_startup(app: FastAPI):
                                 "Persistent spawned child identity changed before "
                                 "startup-registration removal"
                             )
+                        # DID resolution performs storage I/O. The in-process
+                        # lock excludes our own hooks but cannot exclude an
+                        # operator or another process editing multi_agent.toml.
+                        # Re-read and CAS the exact registration we witnessed;
+                        # saving the pre-await object would erase unrelated
+                        # concurrent edits.
+                        fresh = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        fresh_matches = [
+                            existing
+                            for existing in fresh.agents
+                            if existing.casefold() == persisted_name.casefold()
+                        ]
+                        if len(fresh_matches) != 1:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration "
+                                "changed during identity resolution"
+                            )
+                        fresh_name = fresh_matches[0]
+                        if fresh.agents[fresh_name] != registered_config:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration "
+                                "changed during identity resolution"
+                            )
+                        current = fresh
+                        persisted_name = fresh_name
                         removed_config = current.agents.pop(persisted_name)
                         type(current).model_validate(current.model_dump())
                         current.save(app.state.multi_agent_config_path)
