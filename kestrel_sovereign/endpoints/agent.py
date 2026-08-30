@@ -1017,6 +1017,8 @@ async def get_stop_capabilities():
         "version": 1,
         "scopes": ["agent", "turn"],
         "turn_address": "turn_id",
+        "accepted_turn_addresses": ["turn_id", "request_id"],
+        "invocation_address_header": "X-Request-ID",
         "typed_outcomes": True,
         "durable_receipts": True,
     }

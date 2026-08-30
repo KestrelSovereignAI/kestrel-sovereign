@@ -1149,6 +1149,8 @@ def test_turn_stop_capability_endpoint_is_explicit_and_versioned() -> None:
         "version": 1,
         "scopes": ["agent", "turn"],
         "turn_address": "turn_id",
+        "accepted_turn_addresses": ["turn_id", "request_id"],
+        "invocation_address_header": "X-Request-ID",
         "typed_outcomes": True,
         "durable_receipts": True,
     }
