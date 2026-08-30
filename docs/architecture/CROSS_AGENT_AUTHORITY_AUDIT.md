@@ -70,7 +70,7 @@ narrow, revocable, signed delegation.
 | File/execute whole-host restart or update | `request_restart`, `restart_coordinator` | Every co-hosted agent and possibly their code checkout | Sovereign/delegated | The current feature admits an ordinary agent tool call; generic ASK can be auto-promoted. Defect: [#3148](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3148). |
 | Read/cancel/ack restart request | `list_restart_requests`, `list_restart_status_events`, `cancel_restart_request`, `acknowledge_restart_escalation`; restart status endpoint | A durable restart request/event | Self for requester detail/mutation; explicitly public host-coordination fields may be universal read-only | Enforced by [#3146](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3146): list/event reads bind the requesting agent, and cancel/ack mutations include `requested_by_agent` in the durable predicate. |
 | Scheduler watcher wake | `github_pr_watch`/`ecosystem_discovery_watch` arguments executed through schedules | Owning agent only | Self | Enforced by [#3147](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3147): the runtime binds the scheduler owner's DID and ignores legacy caller-provided `notify` as a routing or causation identity. |
-| Host agent create/withdraw/offboard | `POST /api/agents`, `DELETE /api/agents/{agent_name}` | Host registry, peer runtime, hosted namespace | Sovereign/delegated | Enforced by [#3149](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3149): create and withdraw/offboard require a live sovereign caller context at the handler boundary; ordinary OAuth/JWT authentication is insufficient. |
+| Host agent create/withdraw/offboard | `POST /api/agents`, `DELETE /api/agents/{agent_name}`, `!create-agent` | Host registry, peer runtime, hosted namespace, trusted identity directory | Sovereign/delegated | Enforced by [#3149](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3149): every host lifecycle/provisioning door requires a live sovereign caller context at the handler boundary; ordinary OAuth/JWT authentication is insufficient. |
 | Talon coding/repository orchestration | External `kestrel-feature-talon`/`kestrel-talon` process | Repository work, issues, PRs | Outside agent hierarchy | Talon is an operator-enabled external feature/process. Its coordinator state, reviewer state, and worktree lineage are not Kestrel agent authority or causation relations. |
 
 `OrchestrationStore` is currently a backend library with no core agent-facing
@@ -115,6 +115,18 @@ cannot silently appear.
 | `kestrel_sovereign/features/tasks/feature.py::list_my_tasks` | Recipient inbox read; #3145. |
 | `kestrel_sovereign/features/tasks/feature.py::respond_to_a2a_task` | Recipient-owned mutation; #3144. |
 | `kestrel_sovereign/features/todo/feature.py::todo_link_task` | Self-owned todo metadata link; not an A2A task control. |
+
+## Machine-checked built-in command inventory
+
+Built-in commands do not carry feature `@tool` decorators. The contract test
+therefore discovers command names containing the same cross-agent terms
+directly from `BUILTIN_COMMAND_SPECS`, so a command-handler mutation cannot add
+a host-control door behind the feature-tool inventory.
+
+| Surface ID | Classification |
+|---|---|
+| `kestrel_sovereign/command_handler.py::!create-agent` | Sovereign/delegated host identity provisioning; #3149. |
+| `kestrel_sovereign/command_handler.py::!tasks` | Self-only process-local background-task inspection. |
 
 ## Machine-checked HTTP inventory
 

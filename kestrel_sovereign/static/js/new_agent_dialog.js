@@ -27,6 +27,8 @@ const SPAWN_LINK_ID = 'create-agent-spawn-link';
  * @param {object}   deps
  * @param {object}   deps.modal          - shared Modal helper (`show`).
  * @param {object}   deps.api            - API client exposing `createAgent(name)`.
+ * @param {Function} deps.canCreate      - live caller-authority predicate,
+ *                                          rechecked at submission time.
  * @param {Function} deps.onCreated      - async cb(name) run after a successful
  *                                          create (refresh the list + select).
  * @param {boolean} [deps.spawnAvailable] - when true, render the secondary
@@ -34,9 +36,9 @@ const SPAWN_LINK_ID = 'create-agent-spawn-link';
  * @param {Function} [deps.onSpawn]      - cb() invoked when the spawn link is
  *                                          clicked (routes to the Spawn tab).
  */
-export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = false, onSpawn, toast = null } = {}) {
-    if (!modal || !api) {
-        throw new Error('openCreateAgentDialog requires { modal, api }');
+export function openCreateAgentDialog({ modal, api, canCreate, onCreated, spawnAvailable = false, onSpawn, toast = null } = {}) {
+    if (!modal || !api || typeof canCreate !== 'function') {
+        throw new Error('openCreateAgentDialog requires { modal, api, canCreate }');
     }
 
     const inputStyle = `
@@ -102,6 +104,13 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         }
         if (!AGENT_NAME_RE.test(name)) {
             showError('Agent name must start with a letter and contain only letters, numbers, hyphens, or underscores.');
+            return;
+        }
+        // Caller-scoped host authority can be revoked while this modal remains
+        // open. The open-time affordance check is presentation only; re-check
+        // at the irreversible POST boundary and fail closed.
+        if (!canCreate()) {
+            showError('Create-agent authority is no longer available. Refresh and try again.');
             return;
         }
         submitting = true;
