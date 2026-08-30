@@ -531,6 +531,39 @@ def test_live_stop_endpoint_routes_request_through_typed_authority() -> None:
     agent.cancel_current_request.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "request_kwargs",
+    (
+        {"json": {"request_id": None}},
+        {"json": {"request_id": ""}},
+        {"json": {"request_id": 0}},
+        {"json": {"request_id": False}},
+        {"params": {"request_id": ""}},
+    ),
+)
+def test_explicit_invalid_stop_id_is_rejected_without_widening_scope(
+    request_kwargs,
+) -> None:
+    """A present invalid turn ID must never collapse into agent-wide Stop."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:invalid-stop-id"
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+
+    response = TestClient(app).post("/api/agent/stop", **request_kwargs)
+
+    assert response.status_code == 400
+    assert "request_id must be a non-empty valid Unicode string" in (
+        response.json()["detail"]
+    )
+    agent.cancel_current_request.assert_not_called()
+
+
 def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     from kestrel_sovereign.endpoints.agent import router
 

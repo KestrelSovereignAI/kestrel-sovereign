@@ -178,6 +178,97 @@ async def test_cancelled_isolated_turn_cleanup_failure_is_abandoned():
 
 
 @pytest.mark.asyncio
+async def test_isolated_stop_uses_caller_cancellation_entry_baseline():
+    """An old caught cancellation must not turn a later Stop into disconnect."""
+
+    from kestrel_sovereign.agent.invocation import (
+        InvocationCancelledError,
+        bind_async_invocation,
+    )
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    started = asyncio.Event()
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            started.set()
+            await asyncio.Event().wait()
+
+    owner = Owner()
+
+    async def persistent_caller():
+        caller = asyncio.current_task()
+        assert caller is not None
+        caller.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        assert caller.cancelling() == 1
+        with pytest.raises(InvocationCancelledError):
+            await owner.run(invocation_id="after-old-cancel")
+
+    turn = asyncio.create_task(persistent_caller())
+    await started.wait()
+    assert owner.cancel_current_request("after-old-cancel") is True
+    await turn
+
+
+@pytest.mark.asyncio
+async def test_disconnect_after_terminal_stopped_child_is_not_abandoned():
+    """A client cancel cannot convert already-terminal Stop cleanup to 503."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        def bind_request_operation(self, request_id, operation):
+            super().bind_request_operation(request_id, operation)
+            caller = asyncio.current_task()
+            assert caller is not None
+
+            def stop_then_disconnect(_completed):
+                assert self.cancel_current_request(request_id) is True
+                caller.cancel()
+
+            operation.add_done_callback(stop_then_disconnect)
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            return "terminal"
+
+    owner = Owner()
+    turn = asyncio.create_task(owner.run(invocation_id="terminal-disconnect"))
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert (
+        await owner.wait_for_request_completion("terminal-disconnect")
+        is RequestCompletionDisposition.COMPLETED
+    )
+
+
+@pytest.mark.asyncio
 async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
     from kestrel_sovereign.agent.invocation import bind_async_invocation
     from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
@@ -1144,6 +1235,92 @@ class TestAgentCancellation:
         with pytest.raises(StopAsyncIteration):
             await anext(stream)
         assert bridge.log_invocation.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bridge_stop_at_clean_eof_emits_stopped_instead_of_done(
+        self,
+        monkeypatch,
+    ):
+        """Cancellation at iterator exhaustion still wins over SSE completion."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+        from kestrel_sovereign.features.bridge import router as bridge_router
+        from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+
+        request_id = "bridge-clean-eof-stop"
+
+        class LiveAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+
+            async def process_input_streaming(self, *_args, **_kwargs):
+                yield "source-is-replaced"
+
+        agent = LiveAgent()
+
+        class StopAtEof:
+            def __init__(self, *_args, **_kwargs):
+                self.cleanup_error = None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                assert agent.cancel_current_request(request_id) is True
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(bridge_router, "OwnedAsyncIterator", StopAtEof)
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent.features = {"BridgeFeature": bridge}
+        app = FastAPI()
+        app.state.agent = agent
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/bridge/stream",
+                "raw_path": b"/api/bridge/stream",
+                "query_string": b"",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            }
+        )
+        route = next(
+            route
+            for route in bridge_router.get_router().routes
+            if route.path == "/api/bridge/stream"
+        )
+        endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+        response = await endpoint(
+            request,
+            BridgeRequest(message="work", request_id=request_id),
+        )
+        stream = response.body_iterator
+
+        event = await anext(stream)
+        assert '"type": "stopped"' in event
+        assert '"type": "done"' not in event
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
 
     @pytest.mark.asyncio
     async def test_bridge_cleanup_failure_releases_stop_as_abandoned(self):

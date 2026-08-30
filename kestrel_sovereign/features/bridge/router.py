@@ -291,6 +291,23 @@ def get_router() -> APIRouter:
                     event_data = json.dumps({"type": "chunk", "content": chunk})
                     yield f"data: {event_data}\n\n"
 
+                # Stop can linearize as the owned iterator reaches clean EOF,
+                # including a strict buffer that yields no chunks. Recheck
+                # before publishing the completion event; the in-loop check
+                # has no opportunity to run in that boundary case.
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    stopped_data = json.dumps(
+                        {
+                            "type": "stopped",
+                            "request_id": request_id,
+                        }
+                    )
+                    yield f"data: {stopped_data}\n\n"
+                    return
+
                 # Send completion event with metadata
                 elapsed_ms = int((time.monotonic() - start_ms) * 1000)
                 complete_data = json.dumps({

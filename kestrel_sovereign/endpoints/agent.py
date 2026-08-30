@@ -24,6 +24,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    validate_request_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.agent.invocation import (
@@ -902,20 +903,22 @@ async def stop_agent_request(request: Request):
         # remain literal values.  Only X-Request-ID is a percent-encoded wire
         # form, so a client can copy an invoke/stream response header here
         # verbatim without forking the cancellation key.
+        body_has_request_id = "request_id" in data
+        query_has_request_id = "request_id" in request.query_params
         explicit_request_id = (
-            data.get("request_id") or request.query_params.get("request_id")
+            data["request_id"]
+            if body_has_request_id
+            else request.query_params.get("request_id")
         )
-        request_id = (
-            resolve_request_invocation_id(
-                request,
-                {"request_id": explicit_request_id}
-                if explicit_request_id is not None
-                else {},
-            )
-            if explicit_request_id is not None
-            or request.headers.get("X-Request-ID") is not None
-            else None
+        explicit_request_id_present = (
+            body_has_request_id or query_has_request_id
         )
+        if explicit_request_id_present:
+            request_id = validate_request_invocation_id(explicit_request_id)
+        elif request.headers.get("X-Request-ID") is not None:
+            request_id = resolve_request_invocation_id(request, {})
+        else:
+            request_id = None
         agent = get_agent(request)
         agent_id = getattr(agent, "agent_id", None)
         if not isinstance(agent_id, str) or not agent_id.strip():

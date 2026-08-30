@@ -9,6 +9,7 @@ from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
     request_provenance,
     resolve_transport_invocation_id,
+    validate_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
 
@@ -41,14 +42,27 @@ def resolve_request_invocation_id(
             request.headers.get("X-Request-ID"),
         )
     except ValueError as error:
-        raise ApiHTTPException(
-            status_code=400,
-            code="invalid_request_id",
-            message=(
-                "request_id must be a non-empty valid Unicode string no "
-                f"longer than 256 characters: {error}"
-            ),
-        ) from error
+        raise _invalid_request_id(error) from error
+
+
+def validate_request_invocation_id(value: object) -> str:
+    """Validate a present literal body/query request identity."""
+
+    try:
+        return validate_invocation_id(value)
+    except ValueError as error:
+        raise _invalid_request_id(error) from error
+
+
+def _invalid_request_id(error: ValueError) -> ApiHTTPException:
+    return ApiHTTPException(
+        status_code=400,
+        code="invalid_request_id",
+        message=(
+            "request_id must be a non-empty valid Unicode string no "
+            f"longer than 256 characters: {error}"
+        ),
+    )
 
 
 def request_invocation_provenance(

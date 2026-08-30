@@ -282,6 +282,11 @@ def bind_async_invocation(
                 lifecycle_owner = args[0] if args else None
                 registered = False
                 cleanup_abandoned = False
+                isolated_operation: asyncio.Task[Any] | None = None
+                caller_task = asyncio.current_task()
+                caller_cancellation_baseline = (
+                    caller_task.cancelling() if caller_task is not None else 0
+                )
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
                         type(lifecycle_owner),
@@ -300,7 +305,16 @@ def bind_async_invocation(
                         )
                         parent_context = copy_context()
                         operation_context = parent_context.copy()
-                        operation = asyncio.create_task(
+                        dispatcher = getattr(lifecycle_owner, "dispatcher", None)
+                        lock_manager = getattr(dispatcher, "lock_manager", None)
+                        delegate_lock_ownership = getattr(
+                            lock_manager,
+                            "delegate_current_task_ownership",
+                            None,
+                        )
+                        if callable(delegate_lock_ownership):
+                            delegate_lock_ownership(operation_context)
+                        isolated_operation = asyncio.create_task(
                             function(*bound.args, **bound.kwargs),
                             name=(
                                 "invocation-turn:"
@@ -312,10 +326,10 @@ def bind_async_invocation(
                             bind_operation(
                                 lifecycle_owner,
                                 invocation_id,
-                                operation,
+                                isolated_operation,
                             )
                         try:
-                            result = await operation
+                            result = await isolated_operation
                             # ``Task.cancel()`` is a no-op once the isolated
                             # child has produced a result.  Stop can linearize
                             # in the narrow window between that completion and
@@ -338,8 +352,11 @@ def bind_async_invocation(
                                 )
                             return result
                         except asyncio.CancelledError as error:
-                            caller = asyncio.current_task()
-                            if caller is not None and caller.cancelling():
+                            if (
+                                caller_task is not None
+                                and caller_task.cancelling()
+                                > caller_cancellation_baseline
+                            ):
                                 raise
                             raise InvocationCancelledError(
                                 "isolated invocation was cancelled "
@@ -370,7 +387,7 @@ def bind_async_invocation(
                     # cancellation is a successful lifecycle completion, not a
                     # cleanup failure.
                     raise
-                except BaseException:
+                except BaseException as error:
                     if registered:
                         request_cancelled = getattr(
                             type(lifecycle_owner),
@@ -378,12 +395,24 @@ def bind_async_invocation(
                             None,
                         )
                         try:
-                            cleanup_abandoned = bool(
-                                callable(request_cancelled)
-                                and request_cancelled(
-                                    lifecycle_owner, invocation_id
+                            if (
+                                isinstance(error, asyncio.CancelledError)
+                                and isolated_operation is not None
+                                and isolated_operation.done()
+                            ):
+                                # A disconnect which races a Stop can cancel
+                                # this long-lived owner after the isolated turn
+                                # has already reached a terminal state. The
+                                # request marker says Stop happened; the child
+                                # task says whether cleanup was abandoned.
+                                cleanup_abandoned = False
+                            else:
+                                cleanup_abandoned = bool(
+                                    callable(request_cancelled)
+                                    and request_cancelled(
+                                        lifecycle_owner, invocation_id
+                                    )
                                 )
-                            )
                         except Exception:
                             # Never hide the turn's original failure. A broken
                             # cancellation predicate is conservatively treated
