@@ -98,7 +98,16 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     initialization, and fail closed through :func:`require_context_hold_store`.
     """
 
-    store = getattr(agent, "_hold_store", None)
+    # Hold enforcement is enabled only by the explicit factory binding above.
+    # Dynamic proxy objects (notably MagicMock-backed library consumers) may
+    # fabricate any missing attribute on access; treating that fabricated value
+    # as a store both breaks the pre-Hold unbound-object contract and attempts to
+    # await a non-store. Read the instance namespace so only an actual binding
+    # activates this load-bearing seam.
+    try:
+        store = vars(agent).get("_hold_store")
+    except TypeError:
+        store = None
     if store is None:
         return None
     agent_id = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
