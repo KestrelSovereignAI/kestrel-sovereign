@@ -456,6 +456,9 @@ class TestCoreGeneration:
             cache_creation_input_tokens=0,
             cache_read_input_tokens=66482,
         ))
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
 
         with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
             await llm_service.get_response(
@@ -470,6 +473,14 @@ class TestCoreGeneration:
         assert payload["output_tokens"] == 42
         assert payload["cache_creation_input_tokens"] == 0
         assert payload["cache_read_input_tokens"] == 66482
+        llm_service._track_model_usage.assert_awaited_once_with(
+            "gpt-5-mini",
+            "openai:api",
+            tokens=2145,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=66482,
+        )
+        assert store.log_llm_call.await_args.kwargs["input_tokens"] == 68585
         assert "duration_ms" in payload
         assert "model" in payload
         assert payload["tools"] is False
@@ -881,6 +892,195 @@ class TestMeteringAndCost:
         assert seen == [0.0042]
 
     @pytest.mark.asyncio
+    async def test_cache_breakdown_forwarded_to_opted_in_callback(
+        self, llm_service, mock_adapter
+    ):
+        """Uncached input and discounted cache buckets both reach billing."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=40,
+            output_tokens=5,
+            total_tokens=45,
+            cache_creation_input_tokens=7,
+            cache_read_input_tokens=80,
+        ))
+        seen = []
+
+        async def _cb(
+            *,
+            companion_id,
+            user_id,
+            provider,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            cache_creation_input_tokens=None,
+            cache_read_input_tokens=None,
+        ):
+            seen.append(
+                (
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                )
+            )
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(40, 5, 7, 80)]
+
+    @pytest.mark.asyncio
+    async def test_legacy_observability_store_keeps_inclusive_prompt_total(
+        self, llm_service
+    ):
+        """The legacy per-call row has no cache columns, so it must retain
+        its historical inclusive input-token total after cache separation."""
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+
+        await llm_service._log_llm_call(
+            provider="openai:api",
+            model="gpt-5-mini",
+            duration_ms=1,
+            success=True,
+            input_tokens=40,
+            output_tokens=5,
+            cache_creation_input_tokens=7,
+            cache_read_input_tokens=80,
+        )
+
+        assert store.log_llm_call.await_args.kwargs["input_tokens"] == 127
+
+    @pytest.mark.asyncio
+    async def test_legacy_prometheus_counter_keeps_inclusive_prompt_total(
+        self, llm_service
+    ):
+        increments = []
+
+        class _Metric:
+            def labels(self, **labels):
+                class _Child:
+                    def inc(self, value=1):
+                        increments.append((labels, value))
+
+                    def observe(self, value):
+                        increments.append((labels, value))
+
+                return _Child()
+
+        metric = _Metric()
+        with (
+            patch("kestrel_sdk.metrics.PROMETHEUS_AVAILABLE", True),
+            patch("kestrel_sdk.metrics.LLM_CALLS", metric),
+            patch("kestrel_sdk.metrics.LLM_DURATION", metric),
+            patch("kestrel_sdk.metrics.LLM_TOKENS", metric),
+        ):
+            await llm_service._log_llm_call(
+                provider="openai:api",
+                model="gpt-5-mini",
+                duration_ms=1,
+                success=True,
+                input_tokens=40,
+                output_tokens=5,
+                cache_creation_input_tokens=7,
+                cache_read_input_tokens=80,
+            )
+
+        assert ({"model": "gpt-5-mini", "direction": "input"}, 127) in increments
+
+    @pytest.mark.asyncio
+    async def test_cache_read_folded_into_prompt_for_cost_only_callback(
+        self, llm_service, mock_adapter
+    ):
+        """Existing Frinz-shaped callbacks retain the inclusive token count."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=40,
+            output_tokens=5,
+            total_tokens=45,
+            cache_read_input_tokens=80,
+        ))
+        seen = []
+
+        async def _cb(
+            *, companion_id, user_id, provider, model,
+            prompt_tokens, completion_tokens, cost=None,
+        ):
+            seen.append((prompt_tokens, completion_tokens, cost))
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(120, 5, None)]
+
+    @pytest.mark.asyncio
+    async def test_kwargs_callback_does_not_implicitly_opt_into_cache_split(
+        self, llm_service, mock_adapter
+    ):
+        """A legacy extensible callback must keep inclusive prompt billing."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=40,
+            output_tokens=5,
+            total_tokens=45,
+            cache_read_input_tokens=80,
+        ))
+        seen = []
+
+        async def _cb(
+            *, companion_id, user_id, provider, model,
+            prompt_tokens, completion_tokens, **kwargs,
+        ):
+            seen.append((prompt_tokens, completion_tokens, kwargs))
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(120, 5, {"cost": None})]
+
+    @pytest.mark.asyncio
+    async def test_required_cache_parameter_receives_unknown_as_none(
+        self, llm_service, mock_adapter
+    ):
+        """Explicit cache opt-in remains callable when telemetry is absent."""
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi",
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+        ))
+        seen = []
+
+        async def _cb(
+            *, companion_id, user_id, provider, model,
+            prompt_tokens, completion_tokens, cache_read_input_tokens,
+        ):
+            seen.append((prompt_tokens, completion_tokens, cache_read_input_tokens))
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [(10, 5, None)]
+
+    @pytest.mark.asyncio
     async def test_legacy_callback_without_cost_still_called(self, llm_service):
         """A callback written against the original signature (no cost kwarg)
         is not handed an unexpected kwarg — backward compatible (#1806)."""
@@ -892,6 +1092,7 @@ class TestMeteringAndCost:
 
         llm_service.set_metering_callback(_legacy)
         assert llm_service._metering_callback_accepts_cost is False
+        assert llm_service._metering_callback_optional_kwargs == frozenset()
         llm_service.set_observability_context(companion_id="c1", user_id="u1")
 
         await llm_service.generate_with_messages(
