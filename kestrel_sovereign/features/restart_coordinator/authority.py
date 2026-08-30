@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -27,9 +28,10 @@ from kestrel_sovereign.security.sovereign_key import (
 )
 
 
-AUTHORITY_KIND = "sovereign_api_key_hmac_v1"
-AUTHORITY_VERSION = 1
-_DOMAIN = b"kestrel/restart-authority/v1\x00"
+AUTHORITY_KIND = "sovereign_api_key_hmac_v2"
+AUTHORITY_VERSION = 2
+_DOMAIN = b"kestrel/restart-authority/v2\x00"
+_GENERATION_RE = re.compile(r"[0-9a-f]{32}")
 
 
 class RestartAuthorityError(ValueError):
@@ -158,6 +160,11 @@ def issue_restart_authority(
         "kind": AUTHORITY_KIND,
         "actor": actor,
         "issued_at": datetime.now(timezone.utc).isoformat(),
+        # A seal authorizes exactly one lifecycle attempt. The store consumes
+        # this unpredictable generation in a separate durable ledger before a
+        # host mutation can begin; status edits to restart_requests cannot make
+        # a consumed authorization executable again.
+        "lifecycle_generation": secrets.token_hex(16),
         "request": _request_claims(
             request_id=request_id,
             requested_by_agent=requested_by_agent,
@@ -176,6 +183,37 @@ def issue_restart_authority(
             first_blocked_at=first_blocked_at,
         ),
     }
+    evidence = _canonical(document).decode("utf-8")
+    return evidence, _signature(document)
+
+
+def restart_authority_generation(request: Any) -> str:
+    """Return the structurally valid lifecycle generation in one seal."""
+
+    evidence = getattr(request, "authority_evidence", "")
+    try:
+        document = json.loads(evidence)
+    except (TypeError, ValueError) as error:
+        raise RestartAuthorityError(
+            "restart authority evidence is malformed"
+        ) from error
+    generation = document.get("lifecycle_generation")
+    if not isinstance(generation, str) or _GENERATION_RE.fullmatch(generation) is None:
+        raise RestartAuthorityError(
+            "restart authority lifecycle generation is absent or malformed"
+        )
+    return generation
+
+
+def rotate_restart_authority_generation(request: Any) -> tuple[str, str]:
+    """Reseal an authenticated retry onto a fresh single-use generation."""
+
+    verified, reason = verify_restart_authority(request)
+    if not verified:
+        raise RestartAuthorityError(reason)
+    document = json.loads(getattr(request, "authority_evidence"))
+    document["lifecycle_generation"] = secrets.token_hex(16)
+    document["lifecycle_reissued_at"] = datetime.now(timezone.utc).isoformat()
     evidence = _canonical(document).decode("utf-8")
     return evidence, _signature(document)
 
@@ -242,6 +280,9 @@ def verify_restart_authority(request: Any) -> tuple[bool, str]:
         return False, "restart authority evidence version is unsupported"
     if document.get("kind") != AUTHORITY_KIND:
         return False, "restart authority kind is not sovereign-key authority"
+    generation = document.get("lifecycle_generation")
+    if not isinstance(generation, str) or _GENERATION_RE.fullmatch(generation) is None:
+        return False, "restart authority lifecycle generation is absent or malformed"
     actor = document.get("actor")
     if not isinstance(actor, str) or not actor:
         return False, "restart authority actor is absent"
