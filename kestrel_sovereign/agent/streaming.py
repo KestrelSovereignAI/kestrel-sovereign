@@ -1124,6 +1124,11 @@ class StreamingMixin:
             # directions (the AB-BA wedge this replaces, where streaming took the
             # transition lock first and then blocked on CONVERSATION).
             async with self._turn_lifecycle():
+                # `start_span` precedes lifecycle acquisition so setup failures
+                # remain observable. Bind its concrete identity only once the
+                # canonical turn address exists; a feature-owned turn root may
+                # supersede this optional correlation at USER_PROMPT_SUBMIT.
+                self.bind_current_turn_span(_otel_span)
                 transition_lock = self._get_privacy_transition_lock()
                 async with transition_lock:
                     # #1914: bind a per-turn part buffer so tools/features can

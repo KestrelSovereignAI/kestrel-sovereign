@@ -159,7 +159,9 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     optional_transition_lock,
 )
 from kestrel_sovereign.telemetry import (
+    capture_turn_ids,
     KESTREL_AGENT_NAME,
+    KESTREL_TURN_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
     optional_span,
@@ -3956,6 +3958,12 @@ class SignalDispatcher:
                     span.set_attribute(
                         "kestrel.signal.status", result.status.value
                     )
+                    if result.turn_id:
+                        # The dispatch span opens before process_input enters a
+                        # turn, so task-local auto-stamping cannot know this
+                        # address yet. Bind the returned canonical turn rather
+                        # than a causation/display projection.
+                        span.set_attribute(KESTREL_TURN_ID, result.turn_id)
                 return result
         except InvocationCancelledError as error:
             # Cooperative Stop is neither a provider failure nor retry
@@ -4356,24 +4364,25 @@ class SignalDispatcher:
                 "mode": signal.mode.value,
             }
 
-        try:
-            if process_input_kwargs:
-                result = await self._agent.process_input(
-                    prompt, **process_input_kwargs
-                )
-            else:
-                result = await self._agent.process_input(prompt)
-        except Exception:
-            if receipt_tool_registered:
-                clear_receipt = getattr(
-                    self._agent, "clear_constitution_receipt_tool", None
-                )
-                if callable(clear_receipt):
-                    clear_receipt()
-            raise
-        finally:
-            if clear_chain is not None:
-                clear_chain(token)
+        with capture_turn_ids() as cognition_turn_ids:
+            try:
+                if process_input_kwargs:
+                    result = await self._agent.process_input(
+                        prompt, **process_input_kwargs
+                    )
+                else:
+                    result = await self._agent.process_input(prompt)
+            except Exception:
+                if receipt_tool_registered:
+                    clear_receipt = getattr(
+                        self._agent, "clear_constitution_receipt_tool", None
+                    )
+                    if callable(clear_receipt):
+                        clear_receipt()
+                raise
+            finally:
+                if clear_chain is not None:
+                    clear_chain(token)
 
         # Codex round-13/14 P2: surface the agent's actual
         # injected/dropped clause tracking from the budget-aware
@@ -4446,6 +4455,11 @@ class SignalDispatcher:
             registration,
             audit=audit,
             cognition_result=result,
+            turn_id=(
+                cognition_turn_ids[0]
+                if len(cognition_turn_ids) == 1
+                else None
+            ),
         )
 
     async def _ensure_doctrine_bundle_anchored(self) -> None:
@@ -4715,6 +4729,7 @@ class SignalDispatcher:
         artifact: Any = None,
         action_result: Any = None,
         cognition_result: Any = None,
+        turn_id: Optional[str] = None,
         audit: Optional[_ConstitutionAudit] = None,
     ) -> SignalResult:
         # SignalResult has separate fields for side-effect action results and
@@ -4726,6 +4741,7 @@ class SignalDispatcher:
             status=Status.OK,
             mode=signal.mode,
             duration_ms=int((time.monotonic() - start) * 1000),
+            turn_id=turn_id,
             artifact=artifact if artifact is not None else cognition_result,
             action_result=action_result,
         )

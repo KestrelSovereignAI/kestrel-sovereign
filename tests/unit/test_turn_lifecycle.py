@@ -192,6 +192,25 @@ async def test_turn_index_carries_the_exact_request_generation():
 
 
 @pytest.mark.asyncio
+async def test_live_turn_trace_identity_is_optional_evidence_and_cleans_up():
+    agent = _RequestTurnAgent()
+    trace_id = "0123456789abcdef0123456789abcdef"
+    span_id = "0123456789abcdef"
+
+    with invocation_scope("observable-request"):
+        agent.register_active_request("observable-request")
+        async with agent._turn_lifecycle() as turn_id:
+            assert agent.get_current_turn_id() == turn_id
+            assert agent.bind_current_turn_trace_identity(trace_id, span_id)
+            assert agent.active_turn_trace_identities() == {
+                turn_id: (trace_id, span_id)
+            }
+
+    assert agent.active_turn_trace_identities() == {}
+    assert agent.get_current_turn_id() is None
+
+
+@pytest.mark.asyncio
 async def test_turn_request_index_cleanup_survives_turn_failure():
     agent = _StubAgent()
     turn_id = None

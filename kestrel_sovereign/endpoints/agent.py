@@ -55,8 +55,6 @@ from kestrel_sovereign.stop import (
     StopScope,
     UnavailableStopReceiptStore,
 )
-from kestrel_sovereign.telemetry import current_trace_identity
-
 logger = logging.getLogger(__name__)
 
 # SSE connection tracking: maps (client_ip, agent_id) -> active connection count
@@ -1154,6 +1152,51 @@ async def stop_agent_request(request: Request):
             raise TypeError("agent turn request inventory has an invalid type")
         turn_addresses = active_request_ids.union(turn_request_ids)
 
+        trace_accessor = vars(agent).get("active_turn_trace_identities")
+        if not callable(trace_accessor):
+            trace_accessor = getattr(
+                type(agent),
+                "active_turn_trace_identities",
+                None,
+            )
+            raw_trace_identities = (
+                trace_accessor(agent) if callable(trace_accessor) else {}
+            )
+        else:
+            raw_trace_identities = trace_accessor()
+        if not isinstance(raw_trace_identities, dict):
+            raise TypeError("agent turn trace inventory has an invalid type")
+        turn_trace_identities: dict[str, tuple[str, str]] = {}
+        for indexed_turn_id, identity in raw_trace_identities.items():
+            if (
+                indexed_turn_id not in turn_request_ids
+                or not isinstance(identity, tuple)
+                or len(identity) != 2
+                or not isinstance(identity[0], str)
+                or re.fullmatch(r"[0-9a-f]{32}", identity[0]) is None
+                or not isinstance(identity[1], str)
+                or re.fullmatch(r"[0-9a-f]{16}", identity[1]) is None
+            ):
+                raise TypeError("agent turn trace inventory is malformed")
+            turn_trace_identities[indexed_turn_id] = identity
+
+        canonical_turn_id = turn_id
+        if canonical_turn_id is None and request_id is not None:
+            matching_turn_ids = [
+                indexed_turn_id
+                for indexed_turn_id, indexed_request_id in turn_request_ids.items()
+                if indexed_request_id == request_id
+            ]
+            if len(matching_turn_ids) == 1:
+                canonical_turn_id = matching_turn_ids[0]
+        trace_identity = (
+            turn_trace_identities.get(canonical_turn_id)
+            if canonical_turn_id is not None
+            else None
+        )
+        target_trace_id = trace_identity[0] if trace_identity is not None else None
+        target_span_id = trace_identity[1] if trace_identity is not None else None
+
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
             distributed_stop = getattr(
                 request.app.state,
@@ -1291,7 +1334,6 @@ async def stop_agent_request(request: Request):
                 or UnavailableStopReceiptStore()
             ),
         )
-        trace_id, span_id = current_trace_identity()
         stop_request = StopRequest(
             scope=(
                 StopScope.TURN
@@ -1310,9 +1352,9 @@ async def stop_agent_request(request: Request):
                 else None
             ),
             target_is_turn_id=turn_id is not None,
-            turn_id=turn_id,
-            trace_id=trace_id,
-            span_id=span_id,
+            turn_id=canonical_turn_id,
+            trace_id=target_trace_id,
+            span_id=target_span_id,
             **(
                 {"correlation_id": correlation_id}
                 if correlation_id is not None
@@ -1340,7 +1382,7 @@ async def stop_agent_request(request: Request):
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
-            "turn_id": turn_id,
+            "turn_id": canonical_turn_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel",
             "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }

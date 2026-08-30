@@ -155,7 +155,11 @@ class _FakeAgent:
         return self._did
 
     async def process_input(self, prompt: str):
-        return "ok"
+        from kestrel_sovereign.telemetry import turn_span_scope
+
+        with turn_span_scope("turn_signal_cognition"):
+            await asyncio.sleep(0)
+            return "ok"
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
@@ -207,11 +211,13 @@ async def test_signal_dispatch_cognition_span_carries_kind_and_agent_name(
     try:
         result = await dispatcher.dispatch_signal(signal)
         assert result.status == Status.OK
+        assert result.turn_id == "turn_signal_cognition"
 
         span = _one(otel_exporter, "signal.dispatch.cognition")
         attrs = dict(span.attributes)
         assert attrs[OI_KIND] == "CHAIN"
         assert attrs[KESTREL_AGENT_NAME] == "Nellie"
+        assert attrs["kestrel.turn_id"] == "turn_signal_cognition"
         # Sanity: the existing constitution-injection attrs still ride along.
         assert attrs["kestrel.signal.source"] == "cog_src"
     finally:

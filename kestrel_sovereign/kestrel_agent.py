@@ -5607,6 +5607,10 @@ Expected Duration: {expected_duration}
                 KESTREL_SESSION_ID: session_id or None,
                 "agent.input_length": len(user_input),
             }) as _otel_span:
+                # Correlation is optional evidence, never cancellation
+                # authority. The observability feature may replace this with
+                # its dedicated turn-root span later in USER_PROMPT_SUBMIT.
+                self.bind_current_turn_span(_otel_span)
                 # Lifecycle is already entered; call the locked body directly.
                 return await self._process_input_traced_locked(
                     user_input, model_override, session_id, _otel_span, include_memories,

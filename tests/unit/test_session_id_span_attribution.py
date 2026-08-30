@@ -59,6 +59,7 @@ from kestrel_sovereign.agent.orchestrator_engine import (
 from kestrel_sovereign.agent.context_manager import ContextManager
 from kestrel_sovereign.agent.memory_manager import MemoryManager
 from kestrel_sovereign.agent.streaming import StreamingMixin
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.context.feature import ContextFeature
 from kestrel_sovereign.features.memory.feature import MemoryFeature
@@ -121,6 +122,37 @@ def _turn_host(**overrides):
     host.bootstrap_service = None
     for key, value in overrides.items():
         setattr(host, key, value)
+    return host
+
+
+def _correlated_turn_host(turn_id: str, **overrides):
+    """Minimal host with the real canonical turn/span evidence methods."""
+
+    host = _turn_host(**overrides)
+    host._turn_trace_identities = {}
+    host._turn_trace_index = TurnLifecycleMixin._turn_trace_index.__get__(host)
+    host.get_current_turn_id = TurnLifecycleMixin.get_current_turn_id.__get__(host)
+    host.bind_current_turn_trace_identity = (
+        TurnLifecycleMixin.bind_current_turn_trace_identity.__get__(host)
+    )
+    host.bind_current_turn_span = TurnLifecycleMixin.bind_current_turn_span.__get__(
+        host
+    )
+    host.active_turn_trace_identities = (
+        TurnLifecycleMixin.active_turn_trace_identities.__get__(host)
+    )
+
+    @asynccontextmanager
+    async def lifecycle():
+        with telemetry.turn_span_scope(turn_id):
+            host._live_turn_id = turn_id
+            try:
+                yield turn_id
+            finally:
+                host._turn_trace_identities.pop(turn_id, None)
+                host._live_turn_id = None
+
+    host._turn_lifecycle = lifecycle
     return host
 
 
@@ -235,6 +267,54 @@ class TestTurnSpansCarryTimelineSessionKey:
         assert len(roots) == 2
         for span in roots:
             assert KESTREL_SESSION_ID not in dict(span.attributes)
+
+
+class TestTurnSpansCarryCanonicalStopCorrelation:
+    @pytest.mark.asyncio
+    async def test_process_input_binds_root_span_to_live_turn(self, span_exporter):
+        observed = {}
+        host = _correlated_turn_host("turn_invoke")
+
+        async def traced_locked(*_args, **_kwargs):
+            observed.update(host.active_turn_trace_identities())
+            return "42"
+
+        host._process_input_traced_locked = traced_locked
+
+        assert await _run_process_input(host, SESSION) == "42"
+        assert set(observed) == {"turn_invoke"}
+        assert len(observed["turn_invoke"][0]) == 32
+        assert len(observed["turn_invoke"][1]) == 16
+        assert host.active_turn_trace_identities() == {}
+
+    @pytest.mark.asyncio
+    async def test_streaming_binds_root_span_to_live_turn(self, span_exporter):
+        observed = {}
+        host = _correlated_turn_host("turn_stream")
+
+        async def traced_locked(*_args, **_kwargs):
+            observed.update(host.active_turn_trace_identities())
+            yield "42"
+
+        host._process_input_streaming_traced_locked = traced_locked
+        host._get_privacy_transition_lock = lambda: asyncio.Lock()
+        host.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
+            host
+        )
+
+        chunks = [
+            chunk
+            async for chunk in host.process_input_streaming(
+                "what is 6*7?",
+                session_id=SESSION,
+            )
+        ]
+
+        assert chunks == ["42"]
+        assert set(observed) == {"turn_stream"}
+        assert len(observed["turn_stream"][0]) == 32
+        assert len(observed["turn_stream"][1]) == 16
+        assert host.active_turn_trace_identities() == {}
 
 
 class _AllowAllHooks:

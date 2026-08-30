@@ -30,6 +30,11 @@ from kestrel_sdk.signals import CausationFrame, ResourceLock
 
 from kestrel_sovereign.agent.invocation import current_invocation_id
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.telemetry import (
+    current_turn_id as telemetry_current_turn_id,
+    span_trace_identity,
+    turn_span_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +56,6 @@ logger = logging.getLogger(__name__)
 _CURRENT_CHAIN: contextvars.ContextVar[list[CausationFrame]] = (
     contextvars.ContextVar("kestrel_signals_current_chain", default=[])
 )
-_CURRENT_TURN_ID: contextvars.ContextVar[Optional[str]] = (
-    contextvars.ContextVar("kestrel_agent_current_turn_id", default=None)
-)
-
-
 @dataclass(frozen=True)
 class _TurnSessionBinding:
     """A turn/session pair explicitly carried across a task boundary."""
@@ -102,7 +102,7 @@ def capture_turn_session_binding(agent: object) -> _TurnSessionBinding:
             return propagated
         return _TurnSessionBinding(agent, None, None)
 
-    turn_id = _CURRENT_TURN_ID.get()
+    turn_id = telemetry_current_turn_id()
     if turn_id and turn_id == live_turn_id:
         resolve = getattr(agent, "get_turn_bound_session_id", None)
         if not callable(resolve):
@@ -177,9 +177,15 @@ class TurnLifecycleMixin:
         chain = _CURRENT_CHAIN.get()
         return chain if chain else None
 
+    def get_current_turn_id(self) -> Optional[str]:
+        """Return the canonical cooperative-Stop address of this task's turn."""
+
+        return telemetry_current_turn_id()
+
     def _get_current_turn_id(self) -> Optional[str]:
-        """Return the current agent turn id for per-turn observability."""
-        return _CURRENT_TURN_ID.get()
+        """Compatibility alias for callers predating the public accessor."""
+
+        return self.get_current_turn_id()
 
     def _turn_request_index(self) -> dict[str, tuple[str, int | None]]:
         """Return the live turn-to-request index, creating it for test doubles."""
@@ -246,6 +252,57 @@ class TurnLifecycleMixin:
             for turn_id, binding in self.active_turn_request_bindings().items()
         }
 
+    def _turn_trace_index(self) -> dict[str, tuple[str, str]]:
+        """Return live turn-to-span correlations, creating it for test doubles."""
+
+        index = getattr(self, "_turn_trace_identities", None)
+        if index is None:
+            index = {}
+            self._turn_trace_identities = index
+        if not isinstance(index, dict):
+            raise TypeError("turn trace identity index has an invalid type")
+        return index
+
+    def bind_current_turn_trace_identity(
+        self,
+        trace_id: str,
+        span_id: str,
+    ) -> bool:
+        """Correlate the live canonical turn with one observable turn span.
+
+        The mapping is evidence only. Cancellation still resolves exclusively
+        through the lifecycle-owned turn-to-request index.
+        """
+
+        turn_id = self.get_current_turn_id()
+        if turn_id is None or turn_id != getattr(self, "_live_turn_id", None):
+            return False
+        for field_name, value, length in (
+            ("trace_id", trace_id, 32),
+            ("span_id", span_id, 16),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != length
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{field_name} must be a lowercase W3C hex identity")
+        self._turn_trace_index()[turn_id] = (trace_id, span_id)
+        return True
+
+    def bind_current_turn_span(self, span: object) -> bool:
+        """Bind a concrete OTel span to the live turn when it is valid."""
+
+        trace_id, span_id = span_trace_identity(span)
+        if trace_id is None or span_id is None:
+            return False
+        return self.bind_current_turn_trace_identity(trace_id, span_id)
+
+    def active_turn_trace_identities(self) -> dict[str, tuple[str, str]]:
+        """Snapshot optional observability correlations for live turns."""
+
+        return dict(self._turn_trace_index())
+
     def _unregister_turn_request_id(
         self,
         turn_id: str,
@@ -305,7 +362,7 @@ class TurnLifecycleMixin:
                 return _normalize_session_id(propagated.session_id)
             return None
 
-        turn_id = _CURRENT_TURN_ID.get()
+        turn_id = telemetry_current_turn_id()
         if turn_id and turn_id == live_turn_id:
             return _normalize_session_id(
                 getattr(self, "_active_session_id", None)
@@ -386,7 +443,8 @@ class TurnLifecycleMixin:
         started = time.monotonic()
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
             logger.info("turn_lifecycle: %s begin", label)
-            token = _CURRENT_TURN_ID.set(turn_id)
+            turn_scope = turn_span_scope(turn_id)
+            turn_scope.__enter__()
             # Agent-scoped mirror of "which turn is LIVE" — i.e. which one
             # holds the CONVERSATION lock and therefore owns the value of
             # `_active_session_id`. Set and cleared inside the lock, so at most
@@ -431,7 +489,8 @@ class TurnLifecycleMixin:
                         )
                 finally:
                     _BOUND_TURN_SESSION.reset(bound_token)
-                    _CURRENT_TURN_ID.reset(token)
+                    self._turn_trace_index().pop(turn_id, None)
+                    turn_scope.__exit__(None, None, None)
                     self._live_turn_id = None
                     # Clear the per-turn active session on exit so an out-of-turn
                     # caller (e.g. a CLI/system-filed request_restart after a chat

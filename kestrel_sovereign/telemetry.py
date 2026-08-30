@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,19 @@ _tracer = None
 # kestrel_sdk.tracing.configure(), so the whole process shares ONE
 # TracerProvider rather than standing up a second competing exporter pipeline.
 _kestrel_tracer = None
+
+# The canonical cooperative-Stop address for the task's live cognition turn.
+# It lives in telemetry rather than an agent module so every span builder can
+# stamp one source of truth without importing the agent package (and creating a
+# cycle). TurnLifecycleMixin owns the scope; child tasks inherit it naturally.
+_CURRENT_TURN_ID: ContextVar[Optional[str]] = ContextVar(
+    "kestrel_telemetry_current_turn_id",
+    default=None,
+)
+_TURN_ID_CAPTURE: ContextVar[Optional[list[str]]] = ContextVar(
+    "kestrel_telemetry_turn_id_capture",
+    default=None,
+)
 
 try:
     from opentelemetry import trace
@@ -147,8 +161,10 @@ def optional_span(name: str, attributes: Optional[Dict[str, Any]] = None):
         return
 
     with tracer.start_as_current_span(name) as span:
-        if attributes:
-            for key, value in attributes.items():
+        effective_attributes = dict(attributes or {})
+        effective_attributes.update(current_turn_span_attributes())
+        if effective_attributes:
+            for key, value in effective_attributes.items():
                 if value is not None:
                     span.set_attribute(key, value)
         try:
@@ -170,8 +186,10 @@ def start_span(name: str, attributes: Optional[Dict[str, Any]] = None):
         return None
 
     span = tracer.start_span(name)
-    if attributes:
-        for key, value in attributes.items():
+    effective_attributes = dict(attributes or {})
+    effective_attributes.update(current_turn_span_attributes())
+    if effective_attributes:
+        for key, value in effective_attributes.items():
             if value is not None:
                 span.set_attribute(key, value)
     return span
@@ -246,6 +264,11 @@ KESTREL_AGENT_NAME = "kestrel.agent_name"
 # the same to the consumer but only one of them is noise.
 KESTREL_SESSION_ID = "kestrel.session_id"
 
+# Canonical cooperative-Stop address. Unlike request_id (transport-local) and
+# turn_index/session display labels, this exact value resolves through the
+# live turn index and is therefore safe for Timeline/Navigator Stop controls.
+KESTREL_TURN_ID = "kestrel.turn_id"
+
 # A ``session_id`` in flight doubles as a source tag: callers with no
 # conversation session pass a sentinel ("orchestrator" is the dispatch
 # parameter's own default, "original" comes from the re-entrant chat path)
@@ -283,6 +306,48 @@ def session_span_attributes(session_id: Optional[str]) -> Dict[str, str]:
         return {}
     resolved = resolved.strip()
     return {KESTREL_SESSION_ID: resolved, OI_SESSION_ID: resolved}
+
+
+def current_turn_id() -> Optional[str]:
+    """Return the task-local canonical Stop turn address, when live."""
+
+    value = _CURRENT_TURN_ID.get()
+    return value if isinstance(value, str) and value.strip() else None
+
+
+@contextmanager
+def turn_span_scope(turn_id: str):
+    """Bind one lifecycle-owned turn address for all nested span builders."""
+
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("turn_id must be a concrete string")
+    capture = _TURN_ID_CAPTURE.get()
+    if capture is not None:
+        capture.append(turn_id)
+    token = _CURRENT_TURN_ID.set(turn_id)
+    try:
+        yield turn_id
+    finally:
+        _CURRENT_TURN_ID.reset(token)
+
+
+@contextmanager
+def capture_turn_ids():
+    """Capture lifecycle-created turn addresses in this task subtree."""
+
+    captured: list[str] = []
+    token = _TURN_ID_CAPTURE.set(captured)
+    try:
+        yield captured
+    finally:
+        _TURN_ID_CAPTURE.reset(token)
+
+
+def current_turn_span_attributes() -> Dict[str, str]:
+    """Return the canonical Stop address attribute, or an empty mapping."""
+
+    turn_id = current_turn_id()
+    return {KESTREL_TURN_ID: turn_id} if turn_id is not None else {}
 
 
 def _resolved_otlp_endpoint() -> Optional[str]:
@@ -471,12 +536,14 @@ def llm_span(
     cap (issue #2573; talon#71 convention).
     """
     tracer = get_kestrel_tracer()
+    effective_attributes = dict(attributes or {})
+    effective_attributes.update(current_turn_span_attributes())
     with tracer.llm_span(
         name,
         input_value=truncate_for_span(input_value),
         model_name=model_name,
         agent_name=agent_name,
-        attributes=attributes,
+        attributes=effective_attributes,
     ) as span:
         yield span
 
@@ -569,4 +636,19 @@ def current_trace_identity() -> tuple[Optional[str], Optional[str]]:
         return f"{context.trace_id:032x}", f"{context.span_id:016x}"
     except Exception:  # pragma: no cover - correlation is best-effort
         logger.debug("Failed to read current trace identity", exc_info=True)
+        return None, None
+
+
+def span_trace_identity(span: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return one concrete span's W3C identities without requiring it current."""
+
+    if span is None:
+        return None, None
+    try:
+        context = span.get_span_context()
+        if context is None or not context.is_valid:
+            return None, None
+        return f"{context.trace_id:032x}", f"{context.span_id:016x}"
+    except Exception:  # pragma: no cover - correlation is best-effort
+        logger.debug("Failed to read span trace identity", exc_info=True)
         return None, None
