@@ -418,11 +418,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
         ]
 
     assert events[-5:] == [
+        "agents-stop",
         "host-stop",
         "host-unmount",
         "session-close",
         "db-close",
-        "agents-stop",
     ]
 
 
