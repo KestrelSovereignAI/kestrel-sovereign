@@ -974,6 +974,14 @@ async def create_kestrel_identity_async(
     #      indexing, the spawned_by edge, the genesis-audit event and key
     #      provisioning are all recoverable by re-running and stay OUTSIDE it.
     async with db.transaction():
+        # Birth-record replication can touch the same deterministic DID and
+        # constitution hash in one composed transaction. Reserve inception's
+        # complete graph write set first so both writers acquire PostgreSQL's
+        # advisory/row locks in the same global order rather than one taking
+        # constitution→agent while the other takes agent→constitution.
+        await graph.lock_nodes_for_update(
+            [constitution_node.node_id, agent_node.node_id]
+        )
         await graph.add_node(constitution_node)
         await graph.add_node(agent_node)
         # 6. Link the agent to its constitution.
