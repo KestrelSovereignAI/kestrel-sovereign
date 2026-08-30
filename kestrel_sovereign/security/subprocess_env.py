@@ -6,8 +6,7 @@ import os
 from collections.abc import Mapping
 
 
-SAFE_SUBPROCESS_ENV_VARS = frozenset(
-    {
+SAFE_SUBPROCESS_ENV_VARS = {
         "PATH",
         "HOME",
         "USER",
@@ -38,8 +37,7 @@ SAFE_SUBPROCESS_ENV_VARS = frozenset(
         "PROGRAMDATA",
         "PROGRAMFILES",
         "PROGRAMFILES(X86)",
-    }
-)
+}
 
 
 def sanitized_subprocess_env(

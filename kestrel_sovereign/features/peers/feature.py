@@ -49,6 +49,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerUnavailableError,
     iter_sse_events,
 )
+from kestrel_sovereign.security.peer_key import ensure_peer_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +272,14 @@ class PeersFeature(Feature):
 
     async def initialize(self):
         self._host_url = _discover_host_url()
-        self._peer_api_key = os.environ.get("KESTREL_PEER_API_KEY", "")
+        # Direct-host agents do not pass through ProcessManager's child-env
+        # construction.  Provision the same domain-separated transport key at
+        # this boundary so the documented KESTREL_HOST_URL + KESTREL_API_KEY
+        # configuration authenticates to the host without requiring an
+        # operator to discover and duplicate an internal credential.
+        self._peer_api_key = (
+            ensure_peer_api_key() if self._host_url else ""
+        )
         self._own_name = self._get_own_name()
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and

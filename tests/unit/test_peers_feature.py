@@ -1,5 +1,6 @@
 """Direct contracts for the Peers feature."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,12 +12,30 @@ from kestrel_sovereign.features.peers.feature import (
     PeersFeature,
     _discover_host_url,
 )
+from kestrel_sovereign.security.peer_key import derive_peer_api_key
 
 
 def test_discover_host_url_from_env(monkeypatch):
     monkeypatch.setenv("KESTREL_HOST_URL", "http://localhost:9999/")
 
     assert _discover_host_url() == "http://localhost:9999"
+
+
+@pytest.mark.asyncio
+async def test_initialize_direct_host_derives_shared_peer_transport_key(monkeypatch):
+    monkeypatch.setenv("KESTREL_HOST_URL", "http://localhost:9999")
+    monkeypatch.setenv("KESTREL_API_KEY", "direct-host-sovereign")
+    monkeypatch.delenv("KESTREL_PEER_API_KEY", raising=False)
+    agent = SimpleNamespace(_agent_name="emma")
+    feature = PeersFeature(agent)
+
+    with patch.object(feature, "_install_local_host_router") as install:
+        await feature.initialize()
+
+    expected = derive_peer_api_key("direct-host-sovereign")
+    assert feature._peer_api_key == expected
+    assert os.environ["KESTREL_PEER_API_KEY"] == expected
+    install.assert_called_once_with()
 
 
 @pytest.mark.asyncio
