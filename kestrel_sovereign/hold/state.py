@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping, Optional
 from uuid import uuid4
@@ -204,6 +205,25 @@ def _exact_active_flag(value: object) -> int:
     return value
 
 
+def _aware_timestamp(value: object, field: str) -> str:
+    """Validate persisted Hold time evidence without rewriting its digest."""
+
+    if not isinstance(value, str) or not value:
+        raise HoldCorruptStateError(f"hold {field} timestamp is invalid")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise HoldCorruptStateError(
+            f"hold {field} timestamp is invalid"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HoldCorruptStateError(
+            f"hold {field} timestamp must be timezone-aware"
+        )
+    return value
+
+
 def _latch_from_row(row: Any) -> Optional[HoldState]:
     if row is None:
         return None
@@ -233,6 +253,7 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
         return None
     if not all(evidence):
         raise HoldCorruptStateError("active hold latch is missing required evidence")
+    _aware_timestamp(set_at, "latch")
     return HoldState(
         scope=scope,
         target_id=target_id,
@@ -281,6 +302,7 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
     )
     if not all(common_evidence):
         raise HoldCorruptStateError("hold receipt invariant is invalid")
+    _aware_timestamp(receipt.occurred_at, "receipt")
     if receipt.scope is HoldScope.HOST and receipt.target_id != HOST_HOLD_TARGET:
         raise HoldCorruptStateError("hold receipt invariant is invalid")
 
@@ -414,6 +436,11 @@ class HoldStore:
                 "receipt_digest TEXT NOT NULL, "
                 "CHECK (scope IN ('host', 'agent')), "
                 "CHECK (scope <> 'host' OR target_id = 'host'))"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_hold_receipt_content_witnesses_target "
+                "ON hold_receipt_content_witnesses(scope, target_id)"
             )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS hold_operation_witnesses ("
