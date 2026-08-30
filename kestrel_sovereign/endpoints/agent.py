@@ -4,7 +4,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
 from typing import Any, Dict, List, Optional
 import asyncio
 import inspect
@@ -42,6 +41,9 @@ from kestrel_sovereign.agent.request_lifecycle import (
     bind_request_operation_if_supported,
 )
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.endpoints.closing_streaming_response import (
+    ClosingStreamingResponse,
+)
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
@@ -1000,11 +1002,10 @@ async def stream_agent_response(request: Request):
         }
         if effective_session_id:
             headers["X-Session-Id"] = effective_session_id
-        return StreamingResponse(
+        return ClosingStreamingResponse(
             _CloseAwareStreamBody(generate(), cleanup_unstarted_stream),
             media_type="text/plain",
             headers=headers,
-            background=BackgroundTask(cleanup_unstarted_stream),
         )
     except asyncio.CancelledError:
         cleanup_unstarted_stream()
