@@ -99,7 +99,9 @@ _RETIRED_BUILTIN_CRON_TASKS = frozenset({
 # executed by an unattended scheduler tick. Their separate background
 # coordinators remain valid built-in cron sources; only the authority-bearing
 # request surface is excluded here.
-_AUTHORITY_BOUND_TASKS = frozenset({"request_restart"})
+_AUTHORITY_BOUND_TASKS = frozenset(
+    {"request_restart", "acknowledge_restart_escalation"}
+)
 
 # Stable namespace used to distinguish core-owned schedule rows from user rows.
 _BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX = "scheduler:builtin:v1:"
