@@ -359,10 +359,12 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
 
     cancelled, failure = await server._shutdown_server_resources(app)
 
-    assert phases == ["host", "agents", "phoenix"]
+    # Agents still execute turns and feature cleanup against the shared Hold
+    # store. They must stop before host features close that database.
+    assert phases == ["agents", "host", "phoenix"]
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
-    assert str(failure) == "host failure"
+    assert str(failure) == "agent failure"
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -49,6 +50,70 @@ def _bare_agent(store: _Store) -> KestrelAgent:
     agent.did = "did:test:held"
     agent._hold_store = store
     return agent
+
+
+@pytest.mark.asyncio
+async def test_agent_closes_legacy_owned_hold_context_after_shutdown_work() -> None:
+    events: list[str] = []
+
+    class _Resource:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        async def close(self) -> None:
+            events.append(self.label)
+
+    agent = KestrelAgent.__new__(KestrelAgent)
+    agent._standalone_hold_context = SimpleNamespace(
+        session_factory=_Resource("factory"),
+        db=_Resource("database"),
+    )
+
+    cancelled, failure = await agent._close_standalone_hold_context()
+
+    assert cancelled is False
+    assert failure is None
+    assert events == ["factory", "database"]
+    assert agent._standalone_hold_context is None
+    assert "await self._close_standalone_hold_context()" in inspect.getsource(
+        KestrelAgent.shutdown
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_agent_by_did_closes_hold_context_when_initialize_fails(
+    monkeypatch,
+) -> None:
+    import kestrel_sovereign.hold as hold_module
+    import kestrel_sovereign.main as main_module
+
+    events: list[str] = []
+    context = SimpleNamespace()
+
+    class _Agent:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            raise RuntimeError("initialize failed")
+
+    async def build_context(_agent):
+        events.append("built")
+        return context
+
+    async def close_context(value):
+        assert value is context
+        events.append("closed")
+
+    monkeypatch.setattr(main_module, "KestrelAgent", _Agent)
+    monkeypatch.setattr(main_module, "LLMService", lambda: object())
+    monkeypatch.setattr(hold_module, "build_bound_host_context", build_context)
+    monkeypatch.setattr(hold_module, "close_bound_host_context", close_context)
+
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        await main_module.get_agent_by_did("did:test:legacy")
+
+    assert events == ["built", "closed"]
 
 
 @pytest.mark.asyncio

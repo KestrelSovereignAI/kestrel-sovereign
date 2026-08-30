@@ -11,6 +11,7 @@ from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     await_agent_shutdown_completion,
+    await_lifecycle_task_completion,
 )
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.paths import load_project_env, project_dir
@@ -151,12 +152,41 @@ async def get_agent_by_did(did: str) -> KestrelAgent:
     storage_path = os.environ.get("KESTREL_DB_PATH", os.getcwd())
     llm_service = LLMService()
     agent = KestrelAgent(did=did, storage_path=storage_path, llm_service=llm_service)
-    from kestrel_sovereign.hold import build_bound_host_context
+    from kestrel_sovereign.hold import (
+        build_bound_host_context,
+        close_bound_host_context,
+    )
 
-    # This legacy helper transfers both agent and context lifetime to its
-    # caller.  Main process paths below close their context explicitly.
+    # This legacy helper binds a standalone context whose lifetime transfers to
+    # the returned agent; KestrelAgent.shutdown owns its terminal close.
     agent._standalone_hold_context = await build_bound_host_context(agent)
-    await agent.initialize()
+    try:
+        await agent.initialize()
+    except BaseException as startup_failure:
+        close_task = asyncio.create_task(
+            close_bound_host_context(agent._standalone_hold_context),
+            name="get_agent_by_did:close_hold_context",
+        )
+        cleanup_cancelled, cleanup_failure = (
+            await await_lifecycle_task_completion(close_task)
+        )
+        if cleanup_failure is None:
+            agent._standalone_hold_context = None
+        else:
+            logger.warning(
+                "Hold context cleanup failed after agent initialization: %s",
+                cleanup_failure,
+                exc_info=(
+                    type(cleanup_failure),
+                    cleanup_failure,
+                    cleanup_failure.__traceback__,
+                ),
+            )
+        if cleanup_cancelled and not isinstance(
+            startup_failure, asyncio.CancelledError
+        ):
+            raise asyncio.CancelledError() from startup_failure
+        raise
     return agent
 
 async def main():

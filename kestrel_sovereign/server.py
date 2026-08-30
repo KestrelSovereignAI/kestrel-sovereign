@@ -2128,8 +2128,11 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # registration/onboarding path while stop() drains owned work. Drain
         # it before unmounting host and feature surfaces, otherwise that late
         # onboarding can remount routes or UI after their only teardown pass.
-        ("host-features", lambda: _shutdown_host_features(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        # HostContext owns the fleet Hold store. Agent heartbeats, signals and
+        # feature cleanup can still start/check turns until agent shutdown is
+        # terminal, so the context must remain live through that phase.
+        ("host-features", lambda: _shutdown_host_features(app)),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
         phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
