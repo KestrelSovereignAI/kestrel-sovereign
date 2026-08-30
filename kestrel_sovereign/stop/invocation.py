@@ -116,12 +116,28 @@ class DistributedInvocationStore:
                 "PRIMARY KEY (agent_id, turn_digest))"
             )
             await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS stop_unresolved_invocations ("
+                "generation_id TEXT NOT NULL PRIMARY KEY, "
+                "agent_id TEXT NOT NULL, "
+                "turn_digest TEXT NOT NULL, "
+                "owner_id TEXT NOT NULL, "
+                "expired_at TEXT NOT NULL)"
+            )
+            await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stop_active_agent_turn "
                 "ON stop_active_invocations(agent_id, turn_digest)"
             )
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stop_active_owner "
                 "ON stop_active_invocations(owner_id, stop_requested)"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stop_unresolved_agent_turn "
+                "ON stop_unresolved_invocations(agent_id, turn_digest)"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stop_unresolved_owner "
+                "ON stop_unresolved_invocations(owner_id)"
             )
 
     async def _lock_agent(self, agent_id: str) -> None:
@@ -185,19 +201,27 @@ class DistributedInvocationStore:
         async with self._db.transaction(immediate=True):
             row = await self._db.fetchone(
                 "SELECT agent_id FROM stop_active_invocations "
+                "WHERE generation_id = ? AND owner_id = ? "
+                "UNION ALL "
+                "SELECT agent_id FROM stop_unresolved_invocations "
                 "WHERE generation_id = ? AND owner_id = ?",
-                (generation_id, owner_id),
+                (generation_id, owner_id, generation_id, owner_id),
             )
             if row is None:
                 return
             agent_id = _required_identity(row[0], "stored agent identity")
             await self._lock_agent(agent_id)
-            deleted = await self._db.execute(
+            deleted_active = await self._db.execute(
                 "DELETE FROM stop_active_invocations "
                 "WHERE generation_id = ? AND owner_id = ?",
                 (generation_id, owner_id),
             )
-            if deleted != 1:
+            deleted_unresolved = await self._db.execute(
+                "DELETE FROM stop_unresolved_invocations "
+                "WHERE generation_id = ? AND owner_id = ?",
+                (generation_id, owner_id),
+            )
+            if deleted_active + deleted_unresolved != 1:
                 raise RuntimeError(
                     "distributed Stop completion changed inside its agent lock"
                 )
@@ -222,8 +246,11 @@ class DistributedInvocationStore:
             rows = await self._db.fetchall(
                 "SELECT generation_id FROM stop_active_invocations "
                 "WHERE agent_id = ? AND turn_digest = ? "
+                "UNION ALL "
+                "SELECT generation_id FROM stop_unresolved_invocations "
+                "WHERE agent_id = ? AND turn_digest = ? "
                 "ORDER BY generation_id",
-                (agent_id, digest),
+                (agent_id, digest, agent_id, digest),
             )
             generation_ids = tuple(str(row[0]) for row in rows)
             if generation_ids:
@@ -232,7 +259,13 @@ class DistributedInvocationStore:
                     "WHERE agent_id = ? AND turn_digest = ?",
                     (agent_id, digest),
                 )
-                if changed != len(generation_ids):
+                active_count = await self._db.fetchone(
+                    "SELECT COUNT(*) FROM stop_active_invocations "
+                    "WHERE agent_id = ? AND turn_digest = ?",
+                    (agent_id, digest),
+                )
+                expected_changed = int(active_count[0]) if active_count else 0
+                if changed != expected_changed:
                     raise RuntimeError(
                         "distributed Stop turn inventory changed inside its lock"
                     )
@@ -246,8 +279,11 @@ class DistributedInvocationStore:
             await self._lock_agent(agent_id)
             rows = await self._db.fetchall(
                 "SELECT generation_id FROM stop_active_invocations "
+                "WHERE agent_id = ? "
+                "UNION ALL "
+                "SELECT generation_id FROM stop_unresolved_invocations "
                 "WHERE agent_id = ? ORDER BY generation_id",
-                (agent_id,),
+                (agent_id, agent_id),
             )
             generation_ids = tuple(str(row[0]) for row in rows)
             if generation_ids:
@@ -256,7 +292,13 @@ class DistributedInvocationStore:
                     "WHERE agent_id = ?",
                     (agent_id,),
                 )
-                if changed != len(generation_ids):
+                active_count = await self._db.fetchone(
+                    "SELECT COUNT(*) FROM stop_active_invocations "
+                    "WHERE agent_id = ?",
+                    (agent_id,),
+                )
+                expected_changed = int(active_count[0]) if active_count else 0
+                if changed != expected_changed:
                     raise RuntimeError(
                         "distributed Stop agent inventory changed inside its lock"
                     )
@@ -310,7 +352,7 @@ class DistributedInvocationStore:
         *,
         lease_seconds: float,
     ) -> tuple[str, ...]:
-        """CAS-delete selected generations whose owner lease has expired."""
+        """CAS-retire expired owners while preserving indeterminate work."""
 
         if not generation_ids:
             return ()
@@ -334,19 +376,39 @@ class DistributedInvocationStore:
                     _required_identity(agent_id, "stored agent identity")
                 )
             for generation_id, _agent_id, observed_heartbeat in rows:
-                # heartbeat_at is part of the delete predicate: a renewal that
-                # won the race makes this a no-op instead of reaping a live
-                # owner from a stale read.
+                # heartbeat_at is part of the retirement predicate: a renewal
+                # that won the race makes this a no-op instead of retiring a
+                # live owner from a stale read.
                 cutoff_sql, cutoff_args = _lease_cutoff_sql(
                     self._db, float(lease_seconds)
                 )
+                now_sql = database_now_sql(self._db)
                 changed = await self._db.execute(
-                    "DELETE FROM stop_active_invocations "
+                    "INSERT INTO stop_unresolved_invocations ("
+                    "generation_id, agent_id, turn_digest, owner_id, expired_at) "
+                    "SELECT generation_id, agent_id, turn_digest, owner_id, "
+                    f"{now_sql} FROM stop_active_invocations "
                     "WHERE generation_id = ? AND heartbeat_at = ? "
-                    f"AND heartbeat_at <= {cutoff_sql}",
-                    (str(generation_id), observed_heartbeat, *cutoff_args),
+                    f"AND heartbeat_at <= {cutoff_sql} "
+                    "AND NOT EXISTS (SELECT 1 FROM stop_unresolved_invocations "
+                    "WHERE generation_id = ?)",
+                    (
+                        str(generation_id),
+                        observed_heartbeat,
+                        *cutoff_args,
+                        str(generation_id),
+                    ),
                 )
                 if changed == 1:
+                    deleted = await self._db.execute(
+                        "DELETE FROM stop_active_invocations "
+                        "WHERE generation_id = ? AND heartbeat_at = ?",
+                        (str(generation_id), observed_heartbeat),
+                    )
+                    if deleted != 1:
+                        raise RuntimeError(
+                            "distributed Stop expired-owner retirement lost its row"
+                        )
                     reaped.append(str(generation_id))
                 elif changed != 0:
                     raise RuntimeError(
@@ -358,15 +420,18 @@ class DistributedInvocationStore:
         self,
         generation_ids: tuple[str, ...],
     ) -> tuple[tuple[str, str], ...]:
-        """Return selected generations still live and their heartbeat stamps."""
+        """Return selected live or unresolved generations and their timestamps."""
 
         if not generation_ids:
             return ()
         placeholders = ", ".join("?" for _ in generation_ids)
         rows = await self._db.fetchall(
             "SELECT generation_id, heartbeat_at FROM stop_active_invocations "
+            f"WHERE generation_id IN ({placeholders}) "
+            "UNION ALL "
+            "SELECT generation_id, expired_at FROM stop_unresolved_invocations "
             f"WHERE generation_id IN ({placeholders}) ORDER BY generation_id",
-            generation_ids,
+            (*generation_ids, *generation_ids),
         )
         return tuple((str(row[0]), str(row[1])) for row in rows)
 
@@ -374,9 +439,12 @@ class DistributedInvocationStore:
         owner_id = _required_identity(owner_id, "owner identity")
         async with self._db.transaction(immediate=True):
             rows = await self._db.fetchall(
-                "SELECT DISTINCT agent_id FROM stop_active_invocations "
+                "SELECT agent_id FROM stop_active_invocations "
+                "WHERE owner_id = ? "
+                "UNION "
+                "SELECT agent_id FROM stop_unresolved_invocations "
                 "WHERE owner_id = ? ORDER BY agent_id",
-                (owner_id,),
+                (owner_id, owner_id),
             )
             for row in rows:
                 await self._lock_agent(
@@ -384,6 +452,10 @@ class DistributedInvocationStore:
                 )
             await self._db.execute(
                 "DELETE FROM stop_active_invocations WHERE owner_id = ?",
+                (owner_id,),
+            )
+            await self._db.execute(
+                "DELETE FROM stop_unresolved_invocations WHERE owner_id = ?",
                 (owner_id,),
             )
 
