@@ -22,6 +22,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 import kestrel_sovereign.endpoints.agent as agent_endpoint
+from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.a2a.types import (
     Task,
     TaskState,
@@ -56,7 +57,9 @@ def _stub_agent():
     agent._a2a_host_manager = None
     agent.task_manager = MagicMock()
 
-    async def fake_create_task(*, params, agent_name, artifacts=None):
+    async def fake_create_task(
+        *, params, agent_name, artifacts=None, creator_agent_id=None
+    ):
         return Task(
             id=params.id,
             sessionId=params.sessionId,
@@ -144,6 +147,20 @@ def test_send_task_without_artifacts_passes_none(app_with_send):
 
     assert resp.status_code == 200
     assert agent.task_manager.create_task.await_args.kwargs["artifacts"] is None
+
+
+def test_send_task_reports_caller_supplied_duplicate_id_as_conflict(app_with_send):
+    agent = _stub_agent()
+    agent.task_manager.create_task = AsyncMock(
+        side_effect=TaskAlreadyExistsError("Task already exists: task-1")
+    )
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=_body())
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "Task already exists: task-1"
 
 
 def test_send_task_rejects_non_list_artifacts(app_with_send):
@@ -273,6 +290,8 @@ def _install_hosted_a2a_manager(agent, document, authorize_inbound_sender):
         did="did:pkh:hosted:sender",
         identity=SimpleNamespace(
             is_hybrid=True,
+            legacy_did="did:pkh:hosted:sender",
+            new_did=_SENDER_DID,
             signing_did=_SENDER_DID,
             new_verification_methods=list(document["verificationMethod"]),
         ),
@@ -353,6 +372,7 @@ def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send):
     assert resp.status_code == 200
     # Verdict recorded for downstream governance.
     assert agent.task_manager.create_task.await_args.kwargs["params"].metadata["sender_verified"] is False
+    assert agent.task_manager.create_task.await_args.kwargs["creator_agent_id"] is None
 
 
 def test_installed_standalone_authorizer_keeps_unsigned_compatibility(
@@ -390,6 +410,239 @@ def test_valid_signed_envelope_verifies(app_with_send):
 
     assert resp.status_code == 200
     assert agent.task_manager.create_task.await_args.kwargs["params"].metadata["sender_verified"] is True
+    assert (
+        agent.task_manager.create_task.await_args.kwargs["creator_agent_id"]
+        == _SENDER_DID
+    )
+
+
+def test_signed_creator_cancellation_is_verified_and_committed(app_with_send):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    reason = "assignment withdrawn"
+    session_id = "a2a-cancel:task-1"
+    metadata = {"sender": _SENDER_DID, "a2a_verb": "cancel_task"}
+
+    async def cancel_task(
+        task_id, reason=None, agent_name=None, recipient_agent_id=None
+    ):
+        assert agent_name == _SENDER_DID
+        assert recipient_agent_id == agent.did
+        return Task(
+            id=task_id,
+            status=TaskStatus(state=TaskState.CANCELED),
+            metadata={
+                "cancellation_receipt": {
+                    "actor_agent_id": agent_name,
+                    "reason": reason,
+                    "status_before": "submitted",
+                }
+            },
+        )
+
+    agent.task_manager.cancel_task = AsyncMock(side_effect=cancel_task)
+    _attach(app_with_send, agent)
+    body = {
+        "reason": reason,
+        "sessionId": session_id,
+        "metadata": {
+            **metadata,
+            "signature": sign(
+                [reason],
+                task_id="task-1",
+                session_id=session_id,
+                metadata=metadata,
+            ),
+        },
+    }
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/tasks/task-1/cancel", json=body)
+
+    assert response.status_code == 200
+    assert response.json()["cancellation_receipt"] == {
+        "actor_agent_id": _SENDER_DID,
+        "reason": reason,
+        "status_before": "submitted",
+    }
+    agent.task_manager.cancel_task.assert_awaited_once_with(
+        "task-1",
+        reason=reason,
+        agent_name=_SENDER_DID,
+        recipient_agent_id=agent.did,
+    )
+
+
+def test_signed_creator_cancellation_accepts_slash_bearing_task_id(app_with_send):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    task_id = "task/with slash"
+    reason = "assignment withdrawn"
+    session_id = f"a2a-cancel:{task_id}"
+    metadata = {"sender": _SENDER_DID, "a2a_verb": "cancel_task"}
+    agent.task_manager.cancel_task = AsyncMock(
+        return_value=Task(
+            id=task_id,
+            status=TaskStatus(state=TaskState.CANCELED),
+            metadata={
+                "cancellation_receipt": {
+                    "actor_agent_id": _SENDER_DID,
+                    "reason": reason,
+                    "status_before": "submitted",
+                }
+            },
+        )
+    )
+    _attach(app_with_send, agent)
+    body = {
+        "reason": reason,
+        "sessionId": session_id,
+        "metadata": {
+            **metadata,
+            "signature": sign(
+                [reason],
+                task_id=task_id,
+                session_id=session_id,
+                metadata=metadata,
+            ),
+        },
+    }
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/task%2Fwith%20slash/cancel",
+            json=body,
+        )
+
+    assert response.status_code == 200, response.text
+    agent.task_manager.cancel_task.assert_awaited_once_with(
+        task_id,
+        reason=reason,
+        agent_name=_SENDER_DID,
+        recipient_agent_id=agent.did,
+    )
+
+
+def test_hosted_rotated_creator_cancellation_uses_stable_principal(
+    app_with_send,
+):
+    """A successor signature retains the pre-ceremony task owner identity."""
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    _manager, sender = _install_hosted_a2a_manager(
+        agent,
+        doc,
+        AsyncMock(return_value=True),
+    )
+    reason = "assignment withdrawn after ceremony"
+    session_id = "a2a-cancel:task-before-ceremony"
+    metadata = {"sender": _SENDER_DID, "a2a_verb": "cancel_task"}
+
+    async def cancel_task(
+        task_id, reason=None, agent_name=None, recipient_agent_id=None
+    ):
+        assert agent_name == sender.did
+        assert recipient_agent_id == agent.did
+        return Task(
+            id=task_id,
+            status=TaskStatus(state=TaskState.CANCELED),
+            metadata={
+                "cancellation_receipt": {
+                    "actor_agent_id": agent_name,
+                    "reason": reason,
+                    "status_before": "working",
+                }
+            },
+        )
+
+    agent.task_manager.cancel_task = AsyncMock(side_effect=cancel_task)
+    _attach(app_with_send, agent)
+    body = {
+        "reason": reason,
+        "sessionId": session_id,
+        "metadata": {
+            **metadata,
+            "signature": sign(
+                [reason],
+                task_id="task-before-ceremony",
+                session_id=session_id,
+                metadata=metadata,
+            ),
+        },
+    }
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/task-before-ceremony/cancel",
+            json=body,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["cancellation_receipt"]["actor_agent_id"] == sender.did
+    agent.task_manager.cancel_task.assert_awaited_once_with(
+        "task-before-ceremony",
+        reason=reason,
+        agent_name=sender.did,
+        recipient_agent_id=agent.did,
+    )
+
+
+def test_creator_cancellation_rejects_unsigned_actor(app_with_send):
+    agent = _stub_agent()
+    agent.a2a_did_resolver = None
+    agent.task_manager.cancel_task = AsyncMock()
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/task-1/cancel",
+            json={
+                "reason": "withdrawn",
+                "sessionId": "a2a-cancel:task-1",
+                "metadata": {"sender": "forged", "a2a_verb": "cancel_task"},
+            },
+        )
+
+    assert response.status_code == 403
+    agent.task_manager.cancel_task.assert_not_awaited()
+
+
+def test_hosted_legacy_unsigned_peer_cannot_impersonate_cancellation_actor(
+    app_with_send,
+):
+    """Task-creation compatibility never grants destructive peer authority."""
+    agent = _stub_agent()
+    _manager, victim = _install_hosted_legacy_unsigned_manager(
+        agent,
+        AsyncMock(return_value=True),
+        sender_name="victim",
+        sender_display_name="Victim",
+    )
+    agent.task_manager.cancel_task = AsyncMock()
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/preexisting/cancel",
+            json={
+                "reason": "forged",
+                "sessionId": "a2a-cancel:preexisting",
+                "metadata": {
+                    "sender": "Victim",
+                    "a2a_verb": "cancel_task",
+                },
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "A2A cancellation requires a verified sender signature"
+    )
+    assert victim.did == "did:pkh:hosted:victim"
+    agent.task_manager.cancel_task.assert_not_awaited()
 
 
 def test_scoped_valid_signed_sender_is_authorized_after_verification(
@@ -473,6 +726,10 @@ def test_hosted_exact_non_hybrid_local_sender_keeps_unsigned_compatibility(
         agent.task_manager.create_task.await_args.kwargs["params"]
         .metadata["sender_verified"]
         is False
+    )
+    assert (
+        agent.task_manager.create_task.await_args.kwargs["creator_agent_id"]
+        == sender.agent_id
     )
     directory.assert_awaited_once_with(agent.peer_requester, sender.agent_id)
 
