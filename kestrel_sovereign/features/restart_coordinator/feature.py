@@ -59,6 +59,7 @@ from .store import (
     PENDING_STATES,
     acknowledge_escalation,
     cancel_request_if_owned,
+    claim_request_for_execution,
     clear_deferral_started,
     ensure_restart_requests_table,
     get_request,
@@ -1042,16 +1043,15 @@ class RestartCoordinatorFeature(Feature):
                 # very much alive. Popped again below if the transition loses
                 # its race.
                 self._executing_since[req.id] = time.monotonic()
-            moved = await update_status(
-                self._db, req.id,
+            claim_result = await claim_request_for_execution(
+                self._db,
+                req,
                 status=initial_state,
                 status_reason=(
                     "running update profile before restart"
                     if initial_state == "updating"
                     else "dispatched to detached restart subprocess"
                 ),
-                expected_current_status=req.status,
-                expected_authority_signature=req.authority_signature,
                 # Stamp the live process only when crossing straight to
                 # ``executing`` (#1796); an ``updating`` row has not yet
                 # reached the restart, so it carries no boot stamp.
@@ -1059,12 +1059,38 @@ class RestartCoordinatorFeature(Feature):
                     _PROCESS_BOOT_ID if initial_state == "executing" else None
                 ),
             )
-            if not moved:
+            if claim_result != "claimed":
                 if initial_state == "executing":
                     self._executing_since.pop(req.id, None)
+                if claim_result == "consumed":
+                    replay_reason = (
+                        "restart authority lifecycle generation was already "
+                        "consumed; refusing replay"
+                    )
+                    rejected = await update_status(
+                        self._db,
+                        req.id,
+                        status="rejected",
+                        status_reason=replay_reason,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                        expected_current_status=req.status,
+                        expected_authority_signature=req.authority_signature,
+                    )
+                    if rejected:
+                        req.status = "rejected"
+                        await self._emit_status_event(
+                            req,
+                            state="rejected",
+                            status_reason=replay_reason,
+                        )
+                    continue
                 deferred.append({
                     "request_id": req.id,
-                    "reason": "lost race against another transition",
+                    "reason": (
+                        "invalid restart authority"
+                        if claim_result == "invalid"
+                        else "lost race against another transition"
+                    ),
                 })
                 continue
             req.status = initial_state

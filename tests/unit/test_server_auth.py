@@ -221,6 +221,15 @@ def test_generated_peer_key_is_stable_and_distinct(monkeypatch):
     assert first != "sovereign-key"
 
 
+def test_explicit_peer_key_survives_sovereign_rotation(monkeypatch):
+    monkeypatch.setenv("KESTREL_API_KEY", "old-sovereign-key")
+    monkeypatch.setenv("KESTREL_PEER_API_KEY", "operator-peer-key")
+
+    assert server_module.get_peer_api_key() == "operator-peer-key"
+    monkeypatch.setenv("KESTREL_API_KEY", "new-sovereign-key")
+    assert server_module.get_peer_api_key() == "operator-peer-key"
+
+
 @pytest.mark.parametrize(
     ("lane", "path"),
     [

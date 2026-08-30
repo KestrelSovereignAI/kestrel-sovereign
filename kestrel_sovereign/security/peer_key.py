@@ -20,6 +20,15 @@ from kestrel_sovereign.security.sovereign_key import (
 
 
 _PEER_KEY_DERIVATION_CONTEXT = b"kestrel-local-peer-transport-v1"
+_PEER_KEY_PROVENANCE_ENV = "KESTREL_INTERNAL_PEER_API_KEY_PROVENANCE"
+_PEER_KEY_PROVENANCE_PREFIX = "auto-v1:"
+
+
+def _automatic_peer_key_provenance(peer_key: str) -> str:
+    """Return a non-secret marker that identifies one host-generated key."""
+
+    digest = hashlib.sha256(peer_key.encode("utf-8")).hexdigest()
+    return f"{_PEER_KEY_PROVENANCE_PREFIX}{digest}"
 
 
 def derive_peer_api_key(sovereign_key: str) -> str:
@@ -50,7 +59,17 @@ def ensure_peer_api_key(
     target = os.environ if environment is None else environment
     raw_sovereign_key = sovereign_key or target.get("KESTREL_API_KEY")
     raw_peer_key = target.get("KESTREL_PEER_API_KEY")
-    if not raw_peer_key:
+    had_peer_key = bool(raw_peer_key)
+    provenance = target.get(_PEER_KEY_PROVENANCE_ENV, "")
+    peer_was_automatic = False
+    if raw_peer_key:
+        normalized_existing = normalize_sovereign_api_key(raw_peer_key)
+        peer_was_automatic = secrets.compare_digest(
+            provenance,
+            _automatic_peer_key_provenance(normalized_existing),
+        )
+
+    if not raw_peer_key or (peer_was_automatic and raw_sovereign_key):
         raw_peer_key = (
             derive_peer_api_key(raw_sovereign_key)
             if raw_sovereign_key
@@ -69,4 +88,14 @@ def ensure_peer_api_key(
 
     target["KESTREL_PEER_API_KEY"] = peer_key
     os.environ["KESTREL_PEER_API_KEY"] = peer_key
+    if not had_peer_key or peer_was_automatic:
+        marker = _automatic_peer_key_provenance(peer_key)
+        target[_PEER_KEY_PROVENANCE_ENV] = marker
+        os.environ[_PEER_KEY_PROVENANCE_ENV] = marker
+    else:
+        # A project ``.env`` may replace an inherited automatic peer key. Its
+        # differing value is explicit operator configuration, so do not let the
+        # inherited marker make a later sovereign rotation overwrite it.
+        target.pop(_PEER_KEY_PROVENANCE_ENV, None)
+        os.environ.pop(_PEER_KEY_PROVENANCE_ENV, None)
     return peer_key

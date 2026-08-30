@@ -1149,10 +1149,11 @@ async def test_escalation_event_is_not_emitted_before_lifecycle_cas(tmp_path):
     captured = _attach_emit_capture(feat)
 
     async def lose_transition(*args, **kwargs):
-        return False
+        return "lost_race"
 
     with patch(
-        "kestrel_sovereign.features.restart_coordinator.feature.update_status",
+        "kestrel_sovereign.features.restart_coordinator.feature."
+        "claim_request_for_execution",
         side_effect=lose_transition,
     ), patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
@@ -1511,6 +1512,79 @@ async def test_executor_rejects_tampered_signed_request_bounds(tmp_path):
     assert row.status == "rejected"
     assert "do not match signed authority bounds" in row.status_reason
     mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["completed", "rejected"])
+async def test_consumed_restart_generation_cannot_be_replayed_from_terminal_status(
+    tmp_path,
+    terminal_status,
+):
+    """Editing restart_requests cannot reactivate a consumed host mutation."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="single-use restart authority")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=MagicMock(),
+    ):
+        first = await feat.restart_coordinator()
+    assert first.data["executed"] == [{"request_id": request_id}]
+    assert await update_status(
+        backend,
+        request_id,
+        status=terminal_status,
+        status_reason="terminal for replay test",
+        completed_at=datetime.now(timezone.utc).isoformat(),
+        expected_current_status="executing",
+    )
+
+    # This is the review's raw-store attack: only the request row is writable;
+    # the separate lifecycle-consumption ledger remains authoritative.
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_canceled_restart_generation_cannot_be_replayed(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="cancel consumes authority")
+    request_id = created.data["request"]["id"]
+    canceled = await feat.cancel_restart_request(request_id=request_id)
+    assert canceled.data["canceled"] is True
+
+    await backend.execute(
+        "UPDATE restart_requests SET status = 'pending', completed_at = NULL "
+        "WHERE id = ?",
+        (request_id,),
+    )
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1931,6 +2005,10 @@ async def test_executor_recovers_on_spawn_failure(tmp_path):
     feat, backend = await _make_feature(tmp_path)
     created = await feat.request_restart(reason="r")
     req_id = created.data["request"]["id"]
+    original = await get_request(backend, req_id)
+    original_generation = json.loads(original.authority_evidence)[
+        "lifecycle_generation"
+    ]
 
     with patch.object(
         RestartCoordinatorFeature,
@@ -1942,6 +2020,18 @@ async def test_executor_recovers_on_spawn_failure(tmp_path):
     row = await get_request(backend, req_id)
     assert row.status == "pending"
     assert "spawn failed" in row.status_reason
+    assert (
+        json.loads(row.authority_evidence)["lifecycle_generation"]
+        != original_generation
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+        return_value=MagicMock(),
+    ):
+        retried = await feat.restart_coordinator()
+    assert retried.data["executed"] == [{"request_id": req_id}]
 
 
 # ---------------------------------------------------------------------------
@@ -4818,13 +4908,13 @@ async def test_boot_sweeps_stderr_files_orphaned_by_successful_restarts(
 async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
     """TOCTOU guard, probing the actual window.
 
-    ``update_status`` awaits. If the in-flight record is written AFTER it
+    The durable execution claim awaits. If the in-flight record is written AFTER it
     returns, there is a window where the row is durably ``executing`` under
     this boot id with NO entry in ``_executing_since`` — and the reconciler
     treats exactly that as an orphan. A cron tick landing there resets a
     dispatch that is very much alive.
 
-    This runs the reconciler INSIDE that window (from within update_status,
+    This runs the reconciler INSIDE that window (from within the execution claim,
     immediately after the executing row commits) rather than after the fact,
     which is the only placement that can tell the two orderings apart.
     """
@@ -4836,18 +4926,18 @@ async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
     created = await feat.request_restart(reason="ship")
     req_id = created.data["request"]["id"]
 
-    real_update_status = fm.update_status
+    real_claim = fm.claim_request_for_execution
     fired = {"count": 0}
 
-    async def _reconcile_inside_the_window(db, request_id, **kwargs):
-        landed = await real_update_status(db, request_id, **kwargs)
-        if kwargs.get("status") == "executing" and landed:
+    async def _reconcile_inside_the_window(db, request, **kwargs):
+        result = await real_claim(db, request, **kwargs)
+        if kwargs.get("status") == "executing" and result == "claimed":
             # A concurrent cron tick, arriving at the worst possible moment.
             fired["count"] += 1
             await feat._reconcile_stranded_executing_rows()
-        return landed
+        return result
 
-    fm.update_status = _reconcile_inside_the_window
+    fm.claim_request_for_execution = _reconcile_inside_the_window
     try:
         with patch.object(
             RestartCoordinatorFeature, "_spawn_restart_subprocess",
@@ -4856,7 +4946,7 @@ async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
             await feat.restart_coordinator()
         await agent.drain_background_tasks()
     finally:
-        fm.update_status = real_update_status
+        fm.claim_request_for_execution = real_claim
 
     assert fired["count"] == 1, "the window was never exercised"
     row = await get_request(backend, req_id)

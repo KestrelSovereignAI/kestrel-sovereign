@@ -494,6 +494,33 @@ class TestStartAgent:
         )
         assert first_env["KESTREL_PEER_API_KEY"] != first_env["KESTREL_API_KEY"]
 
+    def test_start_agent_rederives_inherited_peer_after_sovereign_rotation(
+        self, pm, monkeypatch,
+    ):
+        """A launcher must not mistake an old derived key for an explicit pin."""
+
+        from kestrel_sovereign.security.peer_key import (
+            derive_peer_api_key,
+            ensure_peer_api_key,
+        )
+
+        monkeypatch.setenv("KESTREL_API_KEY", "old-sovereign-key")
+        monkeypatch.delenv("KESTREL_PEER_API_KEY", raising=False)
+        old_peer = ensure_peer_api_key()
+        assert old_peer == derive_peer_api_key("old-sovereign-key")
+
+        # The project fixture's .env wins in spawned_agent_env and contains
+        # KESTREL_API_KEY=test-key, while the old automatic peer + provenance
+        # marker arrive through the inherited process environment.
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        with patch("subprocess.Popen", return_value=MagicMock(pid=12345)) as popen:
+            pm.start_agent("claw", cfg)
+
+        child_env = popen.call_args.kwargs["env"]
+        assert child_env["KESTREL_API_KEY"] == "test-key"
+        assert child_env["KESTREL_PEER_API_KEY"] == derive_peer_api_key("test-key")
+        assert child_env["KESTREL_PEER_API_KEY"] != old_peer
+
     def test_start_agent_passes_per_agent_semantic_inference_profile(
         self,
         pm,

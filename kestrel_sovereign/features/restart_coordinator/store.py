@@ -24,7 +24,9 @@ from kestrel_sovereign.storage.database_clock import database_clock
 from .authority import (
     RestartAuthorityError,
     issue_restart_authority,
+    restart_authority_generation,
     reseal_restart_safety_state,
+    rotate_restart_authority_generation,
     verify_restart_authority,
 )
 
@@ -378,6 +380,21 @@ async def ensure_restart_requests_table(db) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_restart_requests_agent
         ON restart_requests(requested_by_agent, status)
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_consumptions (
+            lifecycle_generation TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            consumed_at TEXT NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_restart_authority_consumptions_request
+        ON restart_authority_consumptions(request_id)
         """
     )
 
@@ -784,6 +801,49 @@ async def cancel_request_if_owned(
 ) -> bool:
     """Atomically cancel a pending row owned by ``requested_by_agent``."""
 
+    current = await get_request_for_agent(db, request_id, requested_by_agent)
+    if current is None or current.status not in PENDING_STATES:
+        return False
+    verified, _ = verify_restart_authority(current)
+    if verified:
+        generation = restart_authority_generation(current)
+        async with db.transaction(immediate=True):
+            result = await db.execute(
+                "UPDATE restart_requests SET status = 'canceled', "
+                "status_reason = ?, completed_at = ? "
+                "WHERE id = ? AND requested_by_agent = ? "
+                "AND status IN ('pending', 'approved') "
+                "AND authority_signature = ?",
+                (
+                    status_reason,
+                    completed_at,
+                    request_id,
+                    requested_by_agent,
+                    current.authority_signature,
+                ),
+            )
+            changed = (
+                result
+                if isinstance(result, int)
+                else getattr(result, "rowcount", 0)
+            )
+            if not isinstance(changed, int) or changed <= 0:
+                return False
+            await db.execute(
+                "INSERT INTO restart_authority_consumptions "
+                "(lifecycle_generation, request_id, consumed_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(lifecycle_generation) DO NOTHING",
+                (
+                    generation,
+                    request_id,
+                    (await database_clock(db)).isoformat(),
+                ),
+            )
+        return True
+
+    # Invalid/legacy rows carry no executable authority to replay. Let their
+    # owner dispose of them without manufacturing a valid lifecycle generation.
     result = await db.execute(
         "UPDATE restart_requests SET status = 'canceled', "
         "status_reason = ?, completed_at = ? "
@@ -813,6 +873,89 @@ async def record_update_log(db, request_id: str, update_log: str) -> None:
     )
 
 
+async def claim_request_for_execution(
+    db,
+    request: RestartRequest,
+    *,
+    status: str,
+    status_reason: str,
+    executing_boot_id: Optional[str] = None,
+) -> str:
+    """Consume one signed lifecycle generation and cross into host mutation.
+
+    Returns ``claimed``, ``consumed``, ``invalid``, or ``lost_race``. The
+    consumption row lives outside ``restart_requests`` deliberately: a caller
+    that can edit a request row cannot reactivate a completed/canceled/rejected
+    request by changing its status back to pending.
+    """
+
+    if status not in {"updating", "executing"}:
+        raise ValueError("an execution claim must enter updating or executing")
+    try:
+        generation = restart_authority_generation(request)
+    except RestartAuthorityError:
+        return "invalid"
+
+    async with db.transaction(immediate=True):
+        fresh = await get_request(db, request.id)
+        if (
+            fresh is None
+            or fresh.status != request.status
+            or fresh.authority_signature != request.authority_signature
+        ):
+            return "lost_race"
+        verified, _ = verify_restart_authority(fresh)
+        if not verified:
+            return "invalid"
+        if restart_authority_generation(fresh) != generation:
+            return "lost_race"
+
+        inserted = await db.execute(
+            "INSERT INTO restart_authority_consumptions "
+            "(lifecycle_generation, request_id, consumed_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(lifecycle_generation) DO NOTHING",
+            (generation, request.id, (await database_clock(db)).isoformat()),
+        )
+        inserted_count = (
+            inserted
+            if isinstance(inserted, int)
+            else getattr(inserted, "rowcount", 0)
+        )
+        if not isinstance(inserted_count, int) or inserted_count <= 0:
+            return "consumed"
+
+        sql = (
+            "UPDATE restart_requests SET status = ?, status_reason = ?"
+            + (
+                ", executing_boot_id = ?"
+                if executing_boot_id is not None
+                else ""
+            )
+            + " WHERE id = ? AND status = ? AND authority_signature = ?"
+        )
+        params: List[Any] = [status, status_reason]
+        if executing_boot_id is not None:
+            params.append(executing_boot_id)
+        params.extend([request.id, request.status, request.authority_signature])
+        updated = await db.execute(sql, tuple(params))
+        updated_count = (
+            updated
+            if isinstance(updated, int)
+            else getattr(updated, "rowcount", 0)
+        )
+        if not isinstance(updated_count, int) or updated_count <= 0:
+            # Undo the just-inserted consumption inside the same transaction
+            # when the lifecycle CAS loses. No other claimant could have
+            # inserted this generation because our insert returned >0.
+            await db.execute(
+                "DELETE FROM restart_authority_consumptions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (generation, request.id),
+            )
+            return "lost_race"
+    return "claimed"
+
+
 async def update_status(
     db,
     request_id: str,
@@ -837,10 +980,33 @@ async def update_status(
     post-restart sweep can tell a prior-process restart (real) from a
     live-process one (still in flight / failed).
     """
+    authority_evidence: Optional[str] = None
+    authority_signature: Optional[str] = None
+    if status == "pending" and expected_current_status not in PENDING_STATES:
+        current = await get_request(db, request_id)
+        if current is not None and verify_restart_authority(current)[0]:
+            try:
+                authority_evidence, authority_signature = (
+                    rotate_restart_authority_generation(current)
+                )
+            except RestartAuthorityError:
+                authority_evidence = None
+                authority_signature = None
+            else:
+                # Bind the retry reseal to the exact generation just consumed,
+                # even when an older caller omitted the optional signature CAS.
+                if expected_authority_signature is None:
+                    expected_authority_signature = current.authority_signature
+
     sql = (
         "UPDATE restart_requests SET status = ?, status_reason = ?"
         + (", completed_at = ?" if completed_at is not None else "")
         + (", executing_boot_id = ?" if executing_boot_id is not None else "")
+        + (
+            ", authority_evidence = ?, authority_signature = ?"
+            if authority_evidence is not None
+            else ""
+        )
         + " WHERE id = ?"
     )
     params_final: List[Any] = [status, status_reason]
@@ -848,6 +1014,8 @@ async def update_status(
         params_final.append(completed_at)
     if executing_boot_id is not None:
         params_final.append(executing_boot_id)
+    if authority_evidence is not None:
+        params_final.extend([authority_evidence, authority_signature])
     params_final.append(request_id)
     if expected_current_status is not None:
         sql += " AND status = ?"
