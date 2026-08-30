@@ -356,6 +356,31 @@ nav {
     align-items: center;
     justify-content: center;
 }
+.agent-card.agent-thinking .agent-stop-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.agent-card.agent-held .agent-resume-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: auto;
+    font-size: 0.75rem;
+    padding: 0.3rem 0.55rem;
+    color: var(--accent-color);
+}
+.agent-card.agent-held .agent-resume-btn:hover {
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+    color: white;
+}
+.agent-card.agent-lifecycle-pending {
+    opacity: 0.72;
+}
+.agent-card.agent-lifecycle-pending button {
+    cursor: wait;
+}
 .agent-item.selected .agent-stop-btn {
     border-color: rgba(255, 255, 255, 0.4);
     color: rgba(255, 255, 255, 0.85);
@@ -371,9 +396,37 @@ nav {
 .agent-list-component .agent-card-actions:not(:empty) {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 0.35rem;
     min-height: 1.75rem;
     margin-top: 0.25rem;
+}
+.agent-hold-badge,
+.agent-hold-unavailable {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border-radius: 999px;
+    padding: 0.2rem 0.45rem;
+    font-size: 0.68rem;
+    line-height: 1.25;
+}
+.agent-hold-badge {
+    color: #92400e;
+    background: #fef3c7;
+    border: 1px solid #f59e0b;
+}
+.agent-hold-unavailable {
+    color: var(--error, #dc2626);
+    background: color-mix(in srgb, var(--error, #dc2626) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--error, #dc2626) 45%, transparent);
+}
+.agent-card-kebab {
+    flex: 0 0 auto;
+}
+.agent-item.selected .agent-hold-badge {
+    color: #78350f;
 }
 
 /* Per-agent chat pane element. Each agent owns one of these

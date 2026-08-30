@@ -790,6 +790,40 @@ export function createApiClient({
         health: () => client.request('/health'),
         getAgentInfo: () => client.request('/api/agent/info'),
         getAgents: () => client.request('/api/agents'),
+        // Durable agent-scoped Hold lives in the host control database, so both
+        // mutations target the host root and bind the routing name to the DID
+        // observed on the card. Resume additionally carries the exact latch
+        // receipt; a stale card can therefore never release a replacement Hold.
+        holdAgent: (agentName, targetAgentId, reason, operationId) =>
+            client.requestHost(
+                `/api/host/holds/agents/${encodeURIComponent(agentName)}`,
+                {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        target_agent_id: targetAgentId,
+                        reason,
+                        operation_id: operationId,
+                    }),
+                },
+            ),
+        resumeAgentHold: (
+            agentName,
+            targetAgentId,
+            expectedHoldReceiptId,
+            reason,
+            operationId,
+        ) => client.requestHost(
+            `/api/host/holds/agents/${encodeURIComponent(agentName)}/release`,
+            {
+                method: 'POST',
+                body: JSON.stringify({
+                    target_agent_id: targetAgentId,
+                    expected_hold_receipt_id: expectedHoldReceiptId,
+                    reason,
+                    operation_id: operationId,
+                }),
+            },
+        ),
         // Create a fresh top-level (parentless) agent (#2351) — the
         // multi-agent manager's ``POST /api/agents`` (see
         // endpoints/models.py::create_agent). Runs inception + load and returns

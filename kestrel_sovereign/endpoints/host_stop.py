@@ -8,7 +8,6 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kestrel_sovereign.api_errors import ApiHTTPException
-from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     MAX_STOP_CORRELATION_ID_BYTES,
@@ -20,6 +19,8 @@ from kestrel_sovereign.stop import (
 )
 from kestrel_sovereign.stop.runtime_target import build_runtime_stop_target
 from kestrel_sovereign.telemetry import current_trace_identity
+
+from .host_authority import require_sovereign_actor
 
 
 router = APIRouter(prefix="/api/host", tags=["host"])
@@ -59,18 +60,6 @@ class HostStopBody(BaseModel):
         return value
 
 
-def _sovereign_actor(request: Request) -> str:
-    caller = getattr(request.state, "caller", None)
-    if not isinstance(caller, CallerContext) or not caller.is_sovereign:
-        raise ApiHTTPException(
-            status_code=403,
-            code="sovereign_authority_required",
-            message="Host Stop requires sovereign authority.",
-        )
-    identity = caller.identity
-    return identity if isinstance(identity, str) and identity.strip() else "api_key"
-
-
 def _host_agents(request: Request) -> tuple[tuple[str, object], ...]:
     manager = getattr(request.app.state, "agent_manager", None)
     if manager is not None:
@@ -103,7 +92,7 @@ async def stop_host(
 ):
     """Cooperatively stop every currently loaded agent; never stop a process."""
 
-    actor_id = _sovereign_actor(request)
+    actor_id = require_sovereign_actor(request, action="Host Stop")
     distributed_registry = getattr(
         request.app.state,
         "distributed_invocation_registry",

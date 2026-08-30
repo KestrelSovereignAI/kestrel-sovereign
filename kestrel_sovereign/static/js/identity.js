@@ -49,6 +49,14 @@ import { uiStateGet, uiStateSet, storeGet, storeSet, storeRemove, UI_STATE_PREFI
 // Local reference to current agent ID (for use in loadIdentity title update)
 let currentAgentId = null;
 
+function newAgentHoldOperationId(action) {
+    const randomUuid = globalThis.crypto?.randomUUID;
+    const unique = typeof randomUuid === 'function'
+        ? randomUuid.call(globalThis.crypto)
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    return `agent-${action}-${unique}`;
+}
+
 // #2298: persist the multi-agent selection across a hard refresh. The value is
 // a validated soft preference — restored only when the agent still exists and
 // is online in the freshly-fetched /api/agents list (see handleAgentsLoaded);
@@ -1040,6 +1048,40 @@ export async function loadAgents() {
             isThinking: (name) => state.waitingAgents.has(name)
                 || state.unconfirmedStopAgents.has(name),
             onStop: (name) => stopAgent(name),
+            // Hold state and receipts come from the host control database in
+            // the same /api/agents snapshot. The component owns presentation;
+            // this host wiring owns sovereign API calls and operator feedback.
+            requestHoldReason: (item) => Modal.prompt(
+                `Hold ${item.displayName || item.name}`,
+                'Reason for Hold',
+            ),
+            onHold: (item, reason) => API.holdAgent(
+                item.name,
+                item.id,
+                reason,
+                newAgentHoldOperationId('hold'),
+            ),
+            onResume: (item, receiptId) => API.resumeAgentHold(
+                item.name,
+                item.id,
+                receiptId,
+                'Resumed from agent card',
+                newAgentHoldOperationId('resume'),
+            ),
+            onLifecycleResult: (result, item, action) => {
+                const name = item.displayName || item.name;
+                if (action === 'resume' && result?.success === false) {
+                    Toast.warning(`${name}'s Hold changed; the card was refreshed.`);
+                } else if (action === 'stop-and-hold' && result?.stop !== true) {
+                    Toast.warning(`${name} is held, but Stop was not confirmed.`);
+                } else {
+                    Toast.success(action === 'resume' ? `${name} resumed.` : `${name} held.`);
+                }
+            },
+            onLifecycleError: (error, item, action) => {
+                const verb = action === 'resume' ? 'resume' : 'hold';
+                Toast.error(`Failed to ${verb} ${item.displayName || item.name}: ${error?.message || 'request failed'}`);
+            },
             // Selecting a card runs the full product wiring (capability refresh,
             // chat mount, agent:switch bus emit); the component already pinned
             // routing via setHostAgent before this fires.

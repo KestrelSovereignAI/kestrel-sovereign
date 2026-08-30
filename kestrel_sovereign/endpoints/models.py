@@ -25,6 +25,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     resolve_request_invocation_id,
     stopped_invocation_http_error,
 )
+from kestrel_sovereign.endpoints.agent_hold import effective_hold_for_agent
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     invocation_id_response_header,
@@ -220,6 +221,9 @@ async def get_agents(request: Request):
                     card_dict["name"] = name
                 card_dict["status"] = "online"
                 card_dict["is_demo"] = _is_demo(agent)
+                card_dict["hold"] = await effective_hold_for_agent(
+                    request, agent.agent_id
+                )
                 agents_list.append(card_dict)
             except Exception as e:
                 logger.warning(f"Error getting agent card for '{name}': {e}")
@@ -229,6 +233,9 @@ async def get_agents(request: Request):
                     "routing_name": name,
                     "status": "error",
                     "is_demo": _is_demo(agent),
+                    "hold": await effective_hold_for_agent(
+                        request, agent.agent_id
+                    ),
                 })
         return {
             "agents": agents_list,
@@ -248,6 +255,9 @@ async def get_agents(request: Request):
         card_dict["id"] = agent.agent_id
         card_dict["status"] = "online"
         card_dict["is_demo"] = _is_demo(agent)
+        card_dict["hold"] = await effective_hold_for_agent(
+            request, agent.agent_id
+        )
         return {
             "agents": [card_dict],
             "mode": "standalone",

@@ -27,6 +27,7 @@ import API from './api.js';
 import { escapeHtml as sharedEscapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import { storeGet, storeSet } from './ui_state.mjs';
+import { createKebabButton, openMenuAt, positionFromEvent } from './kebab_menu.js';
 
 // ============================================================================
 // Default adapter — the standalone console's `/api/agents` data source
@@ -81,6 +82,7 @@ export function createDefaultAgentAdapter(api = API) {
                     avatarUrl: a.avatar_hash ? `/api/files/${a.avatar_hash}` : undefined,
                     status: a.status,
                     isDemo: a.is_demo === true,
+                    hold: a.hold || null,
                     raw: a,
                 };
             });
@@ -100,7 +102,7 @@ export function createDefaultAgentAdapter(api = API) {
 // div would break the row layout), letting the component prepend the
 // component-owned status dot and append the actions anchor around it. The
 // status dot is component-owned (§3.2), so this renderer does NOT draw it.
-function makeConsoleRenderer({ onStop }) {
+function makeConsoleRenderer() {
     return (item) => {
         const doc = typeof document !== 'undefined' ? document : null;
         const frag = doc.createDocumentFragment();
@@ -124,23 +126,6 @@ function makeConsoleRenderer({ onStop }) {
         info.appendChild(nameEl);
         info.appendChild(desc);
         frag.appendChild(info);
-
-        // Per-agent stop control. Rendered always but only VISIBLE while the
-        // row carries `.agent-thinking` (CSS gate); a click aborts that exact
-        // agent's stream via the host `onStop` hook. stopPropagation so it does
-        // not also fire the row's selection handler.
-        const stopBtn = doc.createElement('button');
-        stopBtn.className = 'agent-stop-btn';
-        // Label with the live display name; but stop ROUTES by item.name (the
-        // manager routing key) so the abort reaches the right agent (#2672 P2).
-        stopBtn.title = `Stop ${name}`;
-        stopBtn.setAttribute('aria-label', `Stop ${name}`);
-        stopBtn.innerHTML = '&times;';
-        stopBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            if (typeof onStop === 'function') onStop(item.name);
-        });
-        frag.appendChild(stopBtn);
 
         return frag;
     };
@@ -176,14 +161,26 @@ export function mountAgentList(containerEl, config = {}) {
     const showStatusDot = config.showStatusDot !== false; // default true = console behavior
     const isThinking = typeof config.isThinking === 'function' ? config.isThinking : () => false;
     const onStop = typeof config.onStop === 'function' ? config.onStop : null;
+    const onHold = typeof config.onHold === 'function' ? config.onHold : null;
+    const onResume = typeof config.onResume === 'function' ? config.onResume : null;
+    const requestHoldReason = typeof config.requestHoldReason === 'function'
+        ? config.requestHoldReason
+        : null;
+    const onLifecycleResult = typeof config.onLifecycleResult === 'function'
+        ? config.onLifecycleResult
+        : null;
+    const onLifecycleError = typeof config.onLifecycleError === 'function'
+        ? config.onLifecycleError
+        : null;
     const onSelect = typeof config.onSelect === 'function'
         ? config.onSelect
         : (adapter && typeof adapter.onSelect === 'function' ? adapter.onSelect : null);
-    const renderCard = hostRenderCard || makeConsoleRenderer({ onStop });
+    const renderCard = hostRenderCard || makeConsoleRenderer();
 
     let items = [];
     let activeName = config.selectedName || null;
     let refreshSeq = 0;
+    const pendingLifecycleActions = new Set();
 
     if (containerEl.classList) containerEl.classList.add('agent-list-component');
     const root = doc.createElement('div');
@@ -194,6 +191,165 @@ export function mountAgentList(containerEl, config = {}) {
     function mode() { return (adapter && adapter.mode) || 'multi_agent'; }
     function isStandalone() { return mode() === 'standalone'; }
     function findItem(name) { return items.find((i) => i && i.name === name) || null; }
+
+    function lifecycleKey(item) {
+        return String((item && (item.id || item.name)) || '');
+    }
+
+    function holdModel(item) {
+        const hold = item && item.hold && typeof item.hold === 'object'
+            ? item.hold
+            : null;
+        return {
+            supplied: hold !== null,
+            available: hold === null ? null : hold.available === true,
+            held: hold !== null && hold.held === true,
+            agent: hold && hold.agent && typeof hold.agent === 'object'
+                ? hold.agent
+                : null,
+            host: hold && hold.host && typeof hold.host === 'object'
+                ? hold.host
+                : null,
+        };
+    }
+
+    function reportLifecycleError(error, item, action) {
+        if (onLifecycleError) {
+            try { onLifecycleError(error, item, action); } catch (_) { /* host-owned */ }
+            return;
+        }
+        if (typeof console !== 'undefined' && typeof console.error === 'function') {
+            console.error(`Agent ${action} failed`, error);
+        }
+    }
+
+    async function holdReason(item) {
+        if (!requestHoldReason) return null;
+        const value = await requestHoldReason(item);
+        if (value === null || value === undefined) return null;
+        const reason = String(value).trim();
+        return reason || null;
+    }
+
+    async function runLifecycleAction(item, action) {
+        const key = lifecycleKey(item);
+        if (!key || pendingLifecycleActions.has(key)) return;
+        pendingLifecycleActions.add(key);
+        renderList();
+        let leaveRefreshErrorVisible = false;
+        try {
+            let result;
+            if (action === 'resume') {
+                const receiptId = holdModel(item).agent?.hold_receipt_id;
+                if (!onResume || !receiptId) return;
+                result = await onResume(item, receiptId);
+            } else {
+                const reason = await holdReason(item);
+                if (!reason || !onHold) return;
+                if (action === 'stop-and-hold') {
+                    let stopResult;
+                    let stopError = null;
+                    try {
+                        stopResult = onStop ? await onStop(item.name) : null;
+                    } catch (error) {
+                        stopError = error;
+                    }
+                    // Hold still runs when Stop is unconfirmed: it closes the
+                    // admission door while preserving Stop's separate receipt.
+                    const holdResult = await onHold(item, reason);
+                    result = { stop: stopResult, hold: holdResult };
+                    if (stopError) throw stopError;
+                } else {
+                    result = await onHold(item, reason);
+                }
+            }
+            if (onLifecycleResult) onLifecycleResult(result, item, action);
+            leaveRefreshErrorVisible = await refresh() === false;
+        } catch (error) {
+            reportLifecycleError(error, item, action);
+            // Even a stale release or ambiguous transport may have changed
+            // durable state. Re-read it before allowing another action.
+            try {
+                leaveRefreshErrorVisible = await refresh() === false;
+            } catch (_) {
+                leaveRefreshErrorVisible = true;
+            }
+        } finally {
+            pendingLifecycleActions.delete(key);
+            if (!leaveRefreshErrorVisible) renderList();
+        }
+    }
+
+    function lifecycleMenuItems(item) {
+        const hold = holdModel(item);
+        if (!hold.supplied || !hold.available || pendingLifecycleActions.has(lifecycleKey(item))) {
+            return [];
+        }
+        if (hold.agent) {
+            return onResume ? [{
+                label: 'Resume',
+                action: 'resume',
+                onSelect: () => { void runLifecycleAction(item, 'resume'); },
+            }] : [];
+        }
+        if (!onHold || !requestHoldReason) return [];
+        const stopFirst = !!isThinking(item.name) && !!onStop;
+        return [{
+            label: stopFirst ? 'Stop and hold' : 'Hold',
+            action: stopFirst ? 'stop-and-hold' : 'hold',
+            onSelect: () => {
+                void runLifecycleAction(item, stopFirst ? 'stop-and-hold' : 'hold');
+            },
+        }];
+    }
+
+    function appendHoldEvidence(actionsAnchor, item, hold) {
+        if (!hold.supplied) return;
+        if (!hold.available) {
+            const unavailable = doc.createElement('span');
+            unavailable.className = 'agent-hold-unavailable';
+            unavailable.textContent = 'Hold state unavailable';
+            actionsAnchor.appendChild(unavailable);
+            return;
+        }
+        if (!hold.held) return;
+        const evidence = hold.agent || hold.host;
+        if (!evidence) return;
+        const badge = doc.createElement('span');
+        badge.className = 'agent-hold-badge';
+        const source = evidence.scope === 'host' ? 'Host held' : 'Held';
+        badge.textContent = `${source} · ${evidence.reason} · ${evidence.actor_id} · ${evidence.set_at}`;
+        badge.title = badge.textContent;
+        actionsAnchor.appendChild(badge);
+    }
+
+    function lifecyclePrimaryButton(item, thinking, hold) {
+        const name = item.displayName || item.name || 'Unnamed Agent';
+        const button = doc.createElement('button');
+        button.type = 'button';
+        if (hold.agent) {
+            button.className = 'agent-stop-btn agent-resume-btn';
+            button.textContent = 'Resume';
+            button.title = `Resume ${name}`;
+            button.setAttribute('aria-label', `Resume ${name}`);
+            button.disabled = !onResume || pendingLifecycleActions.has(lifecycleKey(item));
+            button.addEventListener('click', (event) => {
+                event.stopPropagation();
+                void runLifecycleAction(item, 'resume');
+            });
+            return button;
+        }
+        button.className = 'agent-stop-btn';
+        button.title = `Stop ${name}`;
+        button.setAttribute('aria-label', `Stop ${name}`);
+        button.innerHTML = '&times;';
+        button.disabled = !onStop || pendingLifecycleActions.has(lifecycleKey(item));
+        button.addEventListener('click', (event) => {
+            event.stopPropagation();
+            if (thinking && onStop) void onStop(item.name);
+        });
+        return button;
+    }
 
     // Portrait/signed-URL hosts can mint the avatar URL per render via an adapter
     // `avatarUrl(item)` override; otherwise the adapter precomputed it in
@@ -209,6 +365,7 @@ export function mountAgentList(containerEl, config = {}) {
         const selected = item.name != null && item.name === activeName;
         const offline = item.status === 'offline';
         const thinking = !!isThinking(item.name);
+        const hold = holdModel(item);
 
         const shell = doc.createElement('div');
         const classes = [];
@@ -221,6 +378,8 @@ export function mountAgentList(containerEl, config = {}) {
         if (selected) classes.push('selected');
         if (offline) classes.push('offline');
         if (thinking) classes.push('agent-thinking');
+        if (hold.held) classes.push('agent-held');
+        if (pendingLifecycleActions.has(lifecycleKey(item))) classes.push('agent-lifecycle-pending');
         shell.className = classes.join(' ');
         // Always carry the real agent name — thinking-dot / stop lookups depend
         // on it in every mode (see chat.js refreshAgentThinkingDot).
@@ -261,12 +420,34 @@ export function mountAgentList(containerEl, config = {}) {
         };
         const body = renderCard(item, ctx);
 
+        appendHoldEvidence(actionsAnchor, item, hold);
+        const menuItems = lifecycleMenuItems(item);
+        if (menuItems.length) {
+            const kebab = createKebabButton(
+                () => lifecycleMenuItems(item),
+                {
+                    className: 'agent-card-kebab',
+                    ariaLabel: `Actions for ${item.displayName || item.name}`,
+                    title: `Actions for ${item.displayName || item.name}`,
+                },
+            );
+            actionsAnchor.appendChild(kebab);
+            shell.addEventListener('contextmenu', (event) => {
+                const currentItems = lifecycleMenuItems(item);
+                if (!currentItems.length) return;
+                event.preventDefault();
+                event.stopPropagation();
+                openMenuAt(currentItems, positionFromEvent(event));
+            });
+        }
+
         // Component owns the shell layout: status dot first, then the renderer's
         // body, then the actions anchor — UNLESS a host renderer already placed
         // the anchor inside its own layout (portrait cards position it under the
         // portrait), in which case the component leaves it where the host put it.
         if (statusDot) shell.appendChild(statusDot);
         if (body) shell.appendChild(body);
+        shell.appendChild(lifecyclePrimaryButton(item, thinking, hold));
         if (!actionsAnchor.parentNode) shell.appendChild(actionsAnchor);
 
         // NOTE: the `agent-card-actions` slot is rendered by `renderList` AFTER
@@ -355,7 +536,9 @@ export function mountAgentList(containerEl, config = {}) {
             err.textContent = config.errorText || 'Failed to load agents';
             root.appendChild(err);
             if (typeof config.onError === 'function') config.onError(e);
+            return false;
         }
+        return true;
     }
 
     // Drive the shared host-agent selection path: pin routing
@@ -541,6 +724,11 @@ export function mountAgentListPane(containerEl, config = {}) {
         showStatusDot: config.showStatusDot,
         isThinking: config.isThinking,
         onStop: config.onStop,
+        onHold: config.onHold,
+        onResume: config.onResume,
+        requestHoldReason: config.requestHoldReason,
+        onLifecycleResult: config.onLifecycleResult,
+        onLifecycleError: config.onLifecycleError,
         onSelect: config.onSelect,
         onLoaded: config.onLoaded,
         onError: config.onError,

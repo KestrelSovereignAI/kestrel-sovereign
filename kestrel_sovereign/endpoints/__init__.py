@@ -18,6 +18,7 @@ from .features import router as features_router
 from .ui import router as ui_router
 from .github import router as github_router
 from .host_stop import router as host_stop_router
+from .agent_hold import router as agent_hold_router
 
 # Feature-contributed routers (voice, spawn) are no longer
 # imported here. They are mounted dynamically via Feature.get_router()
@@ -40,4 +41,5 @@ __all__ = [
     "ui_router",
     "github_router",
     "host_stop_router",
+    "agent_hold_router",
 ]
