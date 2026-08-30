@@ -240,7 +240,7 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
     reason = str(row[4] or "")
     actor_id = str(row[5] or "")
     set_at = str(row[6] or "")
-    if not target_id:
+    if not target_id.strip():
         raise HoldCorruptStateError("hold latch is missing its target identity")
     if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
         raise HoldCorruptStateError("host hold latch has a foreign target")
@@ -251,7 +251,7 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
                 "inactive latch retains active hold evidence"
             )
         return None
-    if not all(evidence):
+    if any(not value.strip() for value in evidence):
         raise HoldCorruptStateError("active hold latch is missing required evidence")
     _aware_timestamp(set_at, "latch")
     return HoldState(
@@ -300,7 +300,7 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
         receipt.actor_id,
         receipt.occurred_at,
     )
-    if not all(common_evidence):
+    if any(not value.strip() for value in common_evidence):
         raise HoldCorruptStateError("hold receipt invariant is invalid")
     _aware_timestamp(receipt.occurred_at, "receipt")
     if receipt.scope is HoldScope.HOST and receipt.target_id != HOST_HOLD_TARGET:
@@ -309,6 +309,8 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
     prior = receipt.prior_hold_receipt_id
     resulting = receipt.resulting_hold_receipt_id
     expected = receipt.expected_hold_receipt_id
+    if any(value and not value.strip() for value in (prior, resulting, expected)):
+        raise HoldCorruptStateError("hold receipt invariant is invalid")
     if receipt.action is HoldAction.HOLD:
         valid = expected == "" and (
             (
@@ -548,6 +550,8 @@ class HoldStore:
                 "completed Hold witness migration is missing an operation witness"
             )
 
+        await self._assert_no_orphaned_operation_witnesses()
+
         missing_count = await self._db.fetchone(
             "SELECT source.scope, source.target_id FROM ("
             "SELECT scope, target_id FROM hold_receipts "
@@ -559,6 +563,20 @@ class HoldStore:
         if missing_count is not None:
             raise HoldCorruptStateError(
                 "completed Hold witness migration is missing a receipt-count witness"
+            )
+
+    async def _assert_no_orphaned_operation_witnesses(self) -> None:
+        """Reject append-only operation evidence without its immutable receipt."""
+
+        orphaned = await self._db.fetchone(
+            "SELECT w.operation_id FROM hold_operation_witnesses AS w "
+            "LEFT JOIN hold_receipts AS r "
+            "ON r.operation_id = w.operation_id AND r.receipt_id = w.receipt_id "
+            "WHERE r.operation_id IS NULL LIMIT 1"
+        )
+        if orphaned is not None:
+            raise HoldCorruptStateError(
+                "Hold operation witness refers to a missing receipt"
             )
 
     async def _lock_operation_and_target(
@@ -833,6 +851,11 @@ class HoldStore:
                     raise HoldCorruptStateError(
                         "Hold receipt content witness does not match receipt history"
                     )
+                # Operation witnesses are global tombstones. Without target
+                # metadata an orphan cannot safely be attributed to this target
+                # or ruled out, so a successful read must fail closed until the
+                # database is repaired.
+                await self._assert_no_orphaned_operation_witnesses()
                 return
             raise HoldCorruptStateError(
                 "unheld projection retains active Hold authority"
@@ -875,6 +898,7 @@ class HoldStore:
             raise HoldCorruptStateError(
                 "Hold receipt content witness does not match receipt history"
             )
+        await self._assert_no_orphaned_operation_witnesses()
 
     async def _validate_latch_projection(
         self,
