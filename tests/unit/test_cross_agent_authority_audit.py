@@ -6,6 +6,8 @@ import ast
 import re
 from pathlib import Path
 
+from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = REPO_ROOT / "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md"
 TOOL_KEYWORDS = ("agent", "peer", "a2a", "child", "restart", "task")
@@ -22,6 +24,9 @@ HTTP_SEGMENTS = {
 HTTP_EXACT_ROUTES = {"/api/agent/invoke"}
 SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/(?:features|endpoints)/[^`]+)`\s*\|"
+)
+COMMAND_SURFACE_ID = re.compile(
+    r"\|\s*`(kestrel_sovereign/command_handler\.py::![^`]+)`\s*\|"
 )
 
 
@@ -62,6 +67,24 @@ def _discovered_tool_surfaces() -> set[str]:
                 if any(term in public_name.casefold() for term in TOOL_KEYWORDS):
                     relative = path.relative_to(REPO_ROOT).as_posix()
                     surfaces.add(f"{relative}::{public_name}")
+    return surfaces
+
+
+def _discovered_builtin_command_surfaces() -> set[str]:
+    """Return built-ins whose public names indicate cross-agent reach.
+
+    Built-in commands bypass feature ``@tool`` discovery.  They therefore need
+    their own inventory source or a host-control door such as ``!create-agent``
+    can remain invisible while the feature-tool completeness gate stays green.
+    """
+
+    surfaces: set[str] = set()
+    for spec in BUILTIN_COMMAND_SPECS:
+        command = spec.get("cmd")
+        if not isinstance(command, str):
+            continue
+        if any(term in command.casefold() for term in TOOL_KEYWORDS):
+            surfaces.add(f"kestrel_sovereign/command_handler.py::{command}")
     return surfaces
 
 
@@ -148,9 +171,30 @@ def _documented_surfaces(section: str) -> set[str]:
     return set(SURFACE_ID.findall(body))
 
 
+def _documented_command_surfaces(section: str) -> set[str]:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    start = audit.index(section)
+    next_section = audit.find("\n## ", start + len(section))
+    body = audit[start:] if next_section < 0 else audit[start:next_section]
+    return set(COMMAND_SURFACE_ID.findall(body))
+
+
 def test_every_cross_agent_named_tool_is_classified() -> None:
     assert _discovered_tool_surfaces() == _documented_surfaces(
         "## Machine-checked tool inventory"
+    )
+
+
+def test_every_cross_agent_named_builtin_command_is_classified() -> None:
+    assert _discovered_builtin_command_surfaces() == _documented_command_surfaces(
+        "## Machine-checked built-in command inventory"
+    )
+
+
+def test_builtin_agent_creation_command_is_discovered() -> None:
+    assert (
+        "kestrel_sovereign/command_handler.py::!create-agent"
+        in _discovered_builtin_command_surfaces()
     )
 
 
