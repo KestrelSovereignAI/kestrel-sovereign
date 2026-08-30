@@ -968,16 +968,18 @@ class RestartCoordinatorFeature(Feature):
                     )
                     continue
                 # Hard reject.
-                await update_status(
+                rejected = await update_status(
                     self._db, req.id,
                     status="rejected",
                     status_reason=decision["reason"],
                     completed_at=datetime.now(timezone.utc).isoformat(),
                     expected_current_status=req.status,
+                    expected_authority_signature=req.authority_signature,
                 )
-                await self._emit_status_event(
-                    req, state="rejected", status_reason=decision["reason"],
-                )
+                if rejected:
+                    await self._emit_status_event(
+                        req, state="rejected", status_reason=decision["reason"],
+                    )
                 continue
 
             # Safety checks can await fleet state. Re-verify immediately before
@@ -1021,6 +1023,7 @@ class RestartCoordinatorFeature(Feature):
                     else "dispatched to detached restart subprocess"
                 ),
                 expected_current_status=req.status,
+                expected_authority_signature=req.authority_signature,
                 # Stamp the live process only when crossing straight to
                 # ``executing`` (#1796); an ``updating`` row has not yet
                 # reached the restart, so it carries no boot stamp.
@@ -1106,7 +1109,7 @@ class RestartCoordinatorFeature(Feature):
                             "reason": decision["reason"],
                         })
                         continue
-                    await update_status(
+                    moved = await update_status(
                         self._db, req.id,
                         status="pending",
                         status_reason=(
@@ -1114,7 +1117,14 @@ class RestartCoordinatorFeature(Feature):
                             f"restart: {decision['reason']}"
                         ),
                         expected_current_status="updating",
+                        expected_authority_signature=req.authority_signature,
                     )
+                    if not moved:
+                        deferred.append({
+                            "request_id": req.id,
+                            "reason": "lost race after update safety check",
+                        })
+                        continue
                     deferred.append({
                         "request_id": req.id,
                         "reason": (
@@ -1147,6 +1157,7 @@ class RestartCoordinatorFeature(Feature):
                     status="executing",
                     status_reason="update complete; dispatching restart",
                     expected_current_status="updating",
+                    expected_authority_signature=req.authority_signature,
                     executing_boot_id=_PROCESS_BOOT_ID,
                 )
                 if not moved:
@@ -1191,6 +1202,7 @@ class RestartCoordinatorFeature(Feature):
                     status="pending",
                     status_reason=f"spawn failed: {e}",
                     expected_current_status="executing",
+                    expected_authority_signature=req.authority_signature,
                 )
                 await self._emit_status_event(
                     req, state="pending",
@@ -1234,23 +1246,60 @@ class RestartCoordinatorFeature(Feature):
         *,
         expected_current_status: str,
     ) -> bool:
-        """Reject a row unless its exact sovereign seal verifies right now."""
+        """Stop processing unless the exact durable sovereign seal is current.
 
-        verified, reason = verify_restart_authority(req)
+        Safety-state writes reseal a row without changing its lifecycle status.
+        Re-reading only to verify the stale caller object therefore leaves a
+        check/use gap: another coordinator can clear or start a deferral clock
+        after safety evaluation and before execution.  A changed, valid seal is
+        not rejected; pending work is deferred for a fresh evaluation, while a
+        row already crossed into a mutation state is returned to ``pending``.
+        """
+
+        fresh = await get_request(self._db, req.id)
+        if fresh is None or fresh.status != expected_current_status:
+            return True
+
+        verified, reason = verify_restart_authority(fresh)
         if verified:
-            return False
+            if fresh.authority_signature == req.authority_signature:
+                return False
+            if expected_current_status not in PENDING_STATES:
+                recovered = await update_status(
+                    self._db,
+                    fresh.id,
+                    status="pending",
+                    status_reason=(
+                        "signed safety state changed during restart dispatch; "
+                        "returned to pending for reevaluation"
+                    ),
+                    expected_current_status=expected_current_status,
+                    expected_authority_signature=fresh.authority_signature,
+                )
+                if recovered:
+                    fresh.status = "pending"
+                    await self._emit_status_event(
+                        fresh,
+                        state="pending",
+                        deferral_reason=(
+                            "signed safety state changed during restart dispatch; "
+                            "reevaluating"
+                        ),
+                    )
+            return True
         landed = await update_status(
             self._db,
-            req.id,
+            fresh.id,
             status="rejected",
             status_reason=f"authority denied: {reason}",
             completed_at=datetime.now(timezone.utc).isoformat(),
             expected_current_status=expected_current_status,
+            expected_authority_signature=fresh.authority_signature,
         )
         if landed:
-            fresh = await get_request(self._db, req.id)
+            rejected = await get_request(self._db, fresh.id)
             await self._emit_status_event(
-                fresh or req,
+                rejected or fresh,
                 state="rejected",
                 status_reason=f"authority denied: {reason}",
             )
@@ -1977,6 +2026,7 @@ class RestartCoordinatorFeature(Feature):
                 ),
                 completed_at=now(),
                 expected_current_status="updating",
+                expected_authority_signature=req.authority_signature,
             )
             return {
                 "request_id": req.id,
@@ -1995,6 +2045,7 @@ class RestartCoordinatorFeature(Feature):
                 ),
                 completed_at=now(),
                 expected_current_status="updating",
+                expected_authority_signature=req.authority_signature,
             )
             return {
                 "request_id": req.id,
@@ -2024,6 +2075,7 @@ class RestartCoordinatorFeature(Feature):
                     "left retryable (see update_log)"
                 ),
                 expected_current_status="updating",
+                expected_authority_signature=req.authority_signature,
             )
             return {
                 "request_id": req.id,

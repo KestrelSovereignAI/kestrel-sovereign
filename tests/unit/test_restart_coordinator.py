@@ -552,6 +552,33 @@ async def test_update_status_gated_on_expected_current(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_update_status_gated_on_exact_authority_signature(tmp_path):
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="a", reason="signed transition",
+    )
+
+    stale = await update_status(
+        backend,
+        req.id,
+        status="executing",
+        expected_current_status="pending",
+        expected_authority_signature="0" * 64,
+    )
+    assert stale is False
+    assert (await get_request(backend, req.id)).status == "pending"
+
+    current = await update_status(
+        backend,
+        req.id,
+        status="executing",
+        expected_current_status="pending",
+        expected_authority_signature=req.authority_signature,
+    )
+    assert current is True
+
+
+@pytest.mark.asyncio
 async def test_list_requests_filters_by_status_and_agent(tmp_path):
     backend = await _backend(tmp_path)
     await insert_request(backend, requested_by_agent="a", reason="r1")
@@ -1597,6 +1624,106 @@ async def test_executor_reverifies_after_awaited_safety_check(
         for event in events.data["events"]
         if event["request_id"] == request_id
     )
+
+
+@pytest.mark.asyncio
+async def test_executor_defers_when_safety_state_is_resealed_during_check(
+    tmp_path,
+):
+    """A valid newer seal invalidates the stale safety observation."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="reseal during safety")
+    request_id = created.data["request"]["id"]
+
+    async def reseal_during_safety(req):
+        refreshed = await mark_deferral_started(
+            backend,
+            req.id,
+            expected_current_status=req.status,
+            blocked_at="2026-08-30T00:00:00+00:00",
+        )
+        assert refreshed is not None
+        assert refreshed.authority_signature != req.authority_signature
+        return req, {"safe": True, "reason": "stale fleet-idle observation"}
+
+    feat._evaluate_and_track_safety = reseal_during_safety
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert row.first_blocked_at == "2026-08-30T00:00:00+00:00"
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_authority_recheck_rejects_a_valid_but_stale_seal(tmp_path):
+    """The verifier compares the caller snapshot with the durable version."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="direct stale-seal check")
+    stale = await get_request(backend, created.data["request"]["id"])
+    refreshed = await mark_deferral_started(
+        backend,
+        stale.id,
+        expected_current_status="pending",
+        blocked_at="2026-08-30T00:00:00+00:00",
+    )
+    assert refreshed.authority_signature != stale.authority_signature
+
+    stop = await feat._reject_invalid_authority(
+        stale,
+        expected_current_status="pending",
+    )
+
+    assert stop is True
+    assert (await get_request(backend, stale.id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_execution_transition_is_bound_to_reverified_safety_seal(
+    tmp_path,
+):
+    """A reseal after re-verification still loses the execution CAS."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="reseal after verification")
+    request_id = created.data["request"]["id"]
+    original_reject = feat._reject_invalid_authority
+    successful_checks = 0
+
+    async def reseal_after_second_check(req, *, expected_current_status):
+        nonlocal successful_checks
+        stop = await original_reject(
+            req,
+            expected_current_status=expected_current_status,
+        )
+        if not stop:
+            successful_checks += 1
+            if successful_checks == 2:
+                refreshed = await mark_deferral_started(
+                    backend,
+                    req.id,
+                    expected_current_status=expected_current_status,
+                    blocked_at="2026-08-30T00:00:01+00:00",
+                )
+                assert refreshed is not None
+                assert refreshed.authority_signature != req.authority_signature
+        return stop
+
+    feat._reject_invalid_authority = reseal_after_second_check
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert row.first_blocked_at == "2026-08-30T00:00:01+00:00"
+    mock_spawn.assert_not_called()
 
 
 @pytest.mark.asyncio

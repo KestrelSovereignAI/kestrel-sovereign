@@ -889,6 +889,15 @@ class ProcessManager:
 
         # Build env
         env = self._load_env()
+        # Every separately hosted agent must share the host's peer transport
+        # credential.  Generating independently inside each server process
+        # leaves the fleet unable to authenticate to its siblings.
+        from kestrel_sovereign.security.peer_key import ensure_peer_api_key
+
+        ensure_peer_api_key(
+            env,
+            sovereign_key=env.get("KESTREL_API_KEY"),
+        )
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
         # the resolved custody root in a dedicated child-only variable so

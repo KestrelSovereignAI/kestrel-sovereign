@@ -464,6 +464,32 @@ class TestStartAgent:
         assert env["PORT"] == "8801"
         assert env["KESTREL_SERVE_UI"] == "false"
 
+    def test_start_agent_shares_one_distinct_peer_key_across_children(
+        self, pm, monkeypatch,
+    ):
+        """Separately hosted peers authenticate with one host credential."""
+
+        monkeypatch.delenv("KESTREL_PEER_API_KEY", raising=False)
+        claw = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        testbot = LocalAgentConfig(
+            data_dir=Path("agent_data/testbot"), port=8802,
+        )
+        processes = [MagicMock(pid=12345), MagicMock(pid=12346)]
+
+        with patch("subprocess.Popen", side_effect=processes) as mock_popen:
+            pm.start_agent("claw", claw)
+            pm.start_agent("testbot", testbot)
+
+        first_env = mock_popen.call_args_list[0].kwargs["env"]
+        second_env = mock_popen.call_args_list[1].kwargs["env"]
+        assert first_env["KESTREL_PEER_API_KEY"]
+        assert (
+            first_env["KESTREL_PEER_API_KEY"]
+            == second_env["KESTREL_PEER_API_KEY"]
+            == os.environ["KESTREL_PEER_API_KEY"]
+        )
+        assert first_env["KESTREL_PEER_API_KEY"] != first_env["KESTREL_API_KEY"]
+
     def test_start_agent_passes_per_agent_semantic_inference_profile(
         self,
         pm,

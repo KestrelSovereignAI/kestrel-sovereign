@@ -41,6 +41,7 @@ from kestrel_sovereign.security.sovereign_key import (
     mark_ephemeral_sovereign_key,
     normalize_sovereign_api_key,
 )
+from kestrel_sovereign.security.peer_key import ensure_peer_api_key
 from kestrel_sovereign.api_errors import (
     api_error_response,
     api_unhandled_exception_handler,
@@ -554,19 +555,9 @@ def get_api_key():
 
 
 def get_peer_api_key() -> str:
-    """Get a process-local credential that grants peer, never sovereign, auth."""
+    """Get the shared credential that grants peer, never sovereign, auth."""
 
-    raw_key = os.environ.get("KESTREL_PEER_API_KEY")
-    if not raw_key:
-        raw_key = secrets.token_urlsafe(32)
-        os.environ["KESTREL_PEER_API_KEY"] = raw_key
-    peer_key = normalize_sovereign_api_key(raw_key)
-    sovereign_key = get_api_key()
-    if secrets.compare_digest(peer_key, sovereign_key):
-        raise RuntimeError(
-            "KESTREL_PEER_API_KEY must be distinct from KESTREL_API_KEY"
-        )
-    return peer_key
+    return ensure_peer_api_key(sovereign_key=get_api_key())
 
 
 async def verify_api_key(

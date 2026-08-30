@@ -767,14 +767,15 @@ async def update_status(
     status_reason: str = "",
     completed_at: Optional[str] = None,
     expected_current_status: Optional[str] = None,
+    expected_authority_signature: Optional[str] = None,
     executing_boot_id: Optional[str] = None,
 ) -> bool:
     """Atomic status transition. Returns True if a row was updated.
 
-    When ``expected_current_status`` is provided, the update is gated
-    on the row currently having that status — protects against
-    racing coordinators (or a concurrent cancel) overwriting an
-    in-flight ``executing`` row.
+    ``expected_current_status`` protects against lifecycle races.
+    ``expected_authority_signature`` additionally binds a transition to the
+    exact signed safety-state version the caller evaluated, so a concurrent
+    deferral-clock reseal cannot turn a stale safe observation into execution.
 
     When ``executing_boot_id`` is provided, it is stamped onto the row
     alongside the status (#1796) — the caller passes the current host
@@ -797,6 +798,9 @@ async def update_status(
     if expected_current_status is not None:
         sql += " AND status = ?"
         params_final.append(expected_current_status)
+    if expected_authority_signature is not None:
+        sql += " AND authority_signature = ?"
+        params_final.append(expected_authority_signature)
     result = await db.execute(sql, tuple(params_final))
     # >0 = updated; 0 = expected-status mismatch, i.e. lost the race.
     return await _write_landed(

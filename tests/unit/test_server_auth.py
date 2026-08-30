@@ -7,6 +7,8 @@ secret-bearing traceback body) and controlled ``HTTPException`` statuses
 pass through intact.
 """
 
+import os
+
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
@@ -144,6 +146,17 @@ def test_peer_and_sovereign_keys_must_be_distinct(monkeypatch):
 
     with pytest.raises(RuntimeError, match="must be distinct"):
         server_module.get_peer_api_key()
+
+
+def test_generated_peer_key_is_stable_and_distinct(monkeypatch):
+    monkeypatch.setenv("KESTREL_API_KEY", "sovereign-key")
+    monkeypatch.delenv("KESTREL_PEER_API_KEY", raising=False)
+
+    first = server_module.get_peer_api_key()
+    second = server_module.get_peer_api_key()
+
+    assert first == second == os.environ["KESTREL_PEER_API_KEY"]
+    assert first != "sovereign-key"
 
 
 @pytest.mark.parametrize(
