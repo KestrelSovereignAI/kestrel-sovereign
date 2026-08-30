@@ -10,12 +10,37 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from .state import EffectiveHoldState, HoldState, HoldStateError
 
 
 logger = logging.getLogger(__name__)
+
+
+# A streamed ``!command`` enters through both public turn seams: streaming
+# first, then the non-streaming command implementation.  Both seams must stay
+# independently load-bearing, but they must linearize the *same turn* at one
+# latch snapshot.  This task-local binding lets only the streaming delegate
+# reuse the exact snapshot it already observed; a different agent, task, or
+# later top-level call still performs its own durable read.
+_turn_admission_snapshot: ContextVar[
+    tuple[Any, EffectiveHoldState | None] | None
+] = ContextVar("kestrel_hold_turn_admission_snapshot", default=None)
+
+
+@contextmanager
+def _reuse_turn_admission_snapshot(
+    agent: Any,
+    effective_state: EffectiveHoldState | None,
+):
+    token = _turn_admission_snapshot.set((agent, effective_state))
+    try:
+        yield
+    finally:
+        _turn_admission_snapshot.reset(token)
 
 
 class HoldEnforcementUnavailableError(HoldStateError):
@@ -118,7 +143,16 @@ async def build_bound_host_context(agent: Any, *, config: Any = None) -> Any:
     from kestrel_sovereign.host_features.context import build_host_context
 
     context = await build_host_context(config=config)
-    agent._hold_store = require_context_hold_store(context)
+    try:
+        store = require_context_hold_store(context)
+    except BaseException as binding_failure:
+        await _close_context_after_startup_failure(
+            context,
+            binding_failure,
+            phase="Hold binding",
+        )
+        raise
+    agent._hold_store = store
     return context
 
 
@@ -146,6 +180,40 @@ async def close_bound_host_context(context: Any) -> None:
                 await db.close()
 
 
+async def _close_context_after_startup_failure(
+    context: Any,
+    startup_failure: BaseException,
+    *,
+    phase: str,
+) -> None:
+    """Join context cleanup before propagating a failed startup phase."""
+
+    from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
+
+    close_task = asyncio.create_task(
+        close_bound_host_context(context),
+        name=f"hold_context:{phase}:close",
+    )
+    cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
+        close_task
+    )
+    if cleanup_failure is not None:
+        logger.warning(
+            "Hold context cleanup failed after %s: %s",
+            phase,
+            cleanup_failure,
+            exc_info=(
+                type(cleanup_failure),
+                cleanup_failure,
+                cleanup_failure.__traceback__,
+            ),
+        )
+    if cleanup_cancelled and not isinstance(
+        startup_failure, asyncio.CancelledError
+    ):
+        raise asyncio.CancelledError() from startup_failure
+
+
 async def initialize_with_bound_hold_context(
     agent: Any,
     *,
@@ -157,32 +225,11 @@ async def initialize_with_bound_hold_context(
     try:
         await agent.initialize()
     except BaseException as startup_failure:
-        # Initialization may be cancelled repeatedly. Give resource cleanup its
-        # own task and use the repository's cancellation-resilient join before
-        # propagating the original startup outcome.
-        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
-
-        close_task = asyncio.create_task(
-            close_bound_host_context(context),
-            name="initialize_with_bound_hold_context:close",
+        await _close_context_after_startup_failure(
+            context,
+            startup_failure,
+            phase="agent initialization",
         )
-        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
-            close_task
-        )
-        if cleanup_failure is not None:
-            logger.warning(
-                "Hold context cleanup failed after agent initialization: %s",
-                cleanup_failure,
-                exc_info=(
-                    type(cleanup_failure),
-                    cleanup_failure,
-                    cleanup_failure.__traceback__,
-                ),
-            )
-        if cleanup_cancelled and not isinstance(
-            startup_failure, asyncio.CancelledError
-        ):
-            raise asyncio.CancelledError() from startup_failure
         raise
     return context
 
@@ -199,6 +246,10 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     Hold.  Production factories are responsible for binding the store before
     initialization, and fail closed through :func:`require_context_hold_store`.
     """
+
+    reused = _turn_admission_snapshot.get()
+    if reused is not None and reused[0] is agent:
+        return reused[1]
 
     # Hold enforcement is enabled only by the explicit factory binding above.
     # Dynamic proxy objects (notably MagicMock-backed library consumers) may

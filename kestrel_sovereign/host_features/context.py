@@ -18,6 +18,7 @@ sessions against the host backend (SQLite default), so Phase 1 works standalone.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -29,6 +30,58 @@ logger = logging.getLogger(__name__)
 #: tenant id (agents scope by DID / agent id), so a host feature's entities
 #: never collide with per-agent rows.
 FLEET_TENANT_ID = "__fleet__"
+
+
+async def _close_open_host_resources(
+    *,
+    session_factory: Any,
+    hold_database: Any,
+    db: Any,
+) -> None:
+    """Close every resource acquired by an interrupted context build."""
+
+    failures: list[BaseException] = []
+    resources = [session_factory]
+    if hold_database is not None and hold_database is not db:
+        resources.append(hold_database)
+    resources.append(db)
+    for resource in resources:
+        closer = getattr(resource, "close", None)
+        if not callable(closer):
+            continue
+        try:
+            await closer()
+        except BaseException as exc:  # close every later owner before reporting
+            failures.append(exc)
+    if failures:
+        raise BaseExceptionGroup("host context startup cleanup failed", failures)
+
+
+async def _close_after_startup_cancellation(
+    cancellation: asyncio.CancelledError,
+    *,
+    session_factory: Any,
+    hold_database: Any,
+    db: Any,
+) -> None:
+    """Join cleanup despite repeated cancellation of the startup owner."""
+
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    cleanup = asyncio.create_task(
+        _close_open_host_resources(
+            session_factory=session_factory,
+            hold_database=hold_database,
+            db=db,
+        ),
+        name="build_host_context:cancelled:close",
+    )
+    outcome = await await_owned_task(cleanup, pending_cancellation=cancellation)
+    if outcome.error is not None:
+        cancellation.add_note(
+            f"host context cleanup also failed: {outcome.error}"
+        )
+        raise cancellation from outcome.error
 
 
 class FleetSessionFactory:
@@ -229,6 +282,14 @@ async def build_host_context(
             resolved,
             FLEET_TENANT_ID,
         )
+    except asyncio.CancelledError as cancellation:
+        await _close_after_startup_cancellation(
+            cancellation,
+            session_factory=session_factory,
+            hold_database=hold_database,
+            db=db,
+        )
+        raise
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
         if session_factory is not None:
             try:
@@ -272,6 +333,14 @@ async def build_host_context(
             hold_store = HoldStore(hold_database)
             await hold_store.ensure_schema()
             logger.info("Hold backend opened at %s", hold_label)
+        except asyncio.CancelledError as cancellation:
+            await _close_after_startup_cancellation(
+                cancellation,
+                session_factory=session_factory,
+                hold_database=hold_database,
+                db=db,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 - named gap; admission fails closed
             if hold_database is not None and hold_database is not db:
                 try:

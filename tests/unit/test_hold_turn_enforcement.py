@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from types import SimpleNamespace
+from types import MethodType
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -143,6 +144,49 @@ async def test_bound_hold_initialization_closes_context_on_failure(monkeypatch) 
     close_context.assert_awaited_once_with(context)
 
 
+@pytest.mark.asyncio
+async def test_hold_binding_failure_closes_context_before_refusing_startup(
+    monkeypatch,
+) -> None:
+    """A degraded context never escapes without releasing its live backend."""
+    import kestrel_sovereign.host_features.context as context_module
+    import kestrel_sovereign.hold.enforcement as enforcement
+
+    closed: list[str] = []
+
+    class _Resource:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        async def close(self) -> None:
+            closed.append(self.label)
+
+    context = SimpleNamespace(
+        hold_store=None,
+        backend_error="Hold schema unavailable",
+        session_factory=_Resource("factory"),
+        hold_database=None,
+        db=_Resource("database"),
+    )
+
+    async def build_context(*, config=None):
+        assert config == {"mode": "test"}
+        return context
+
+    monkeypatch.setattr(context_module, "build_host_context", build_context)
+
+    with pytest.raises(
+        HoldEnforcementUnavailableError,
+        match="Hold schema unavailable",
+    ):
+        await enforcement.build_bound_host_context(
+            SimpleNamespace(),
+            config={"mode": "test"},
+        )
+
+    assert closed == ["factory", "database"]
+
+
 def test_standalone_entrypoints_use_atomic_hold_initialization_wiring() -> None:
     import kestrel_sovereign.cli as cli_module
     import kestrel_sovereign.main as main_module
@@ -226,6 +270,44 @@ async def test_unheld_snapshot_admits_turn_at_the_same_boundary() -> None:
     effective = await require_turn_start_allowed(agent)
 
     assert effective == EffectiveHoldState(host=None, agent=None)
+    assert store.calls == ["did:test:held"]
+
+
+@pytest.mark.asyncio
+async def test_streamed_command_reuses_its_first_hold_admission_snapshot() -> None:
+    """A command has one Hold linearization point, not two conflicting reads."""
+    admitted = EffectiveHoldState(host=None, agent=None)
+    later_hold = _latch(
+        HoldScope.AGENT,
+        "hold:after-admission",
+        target="did:test:held",
+    )
+
+    class _ChangingStore(_Store):
+        async def get_effective(self, agent_id: str) -> EffectiveHoldState:
+            effective = await super().get_effective(agent_id)
+            self.effective = EffectiveHoldState(host=None, agent=later_hold)
+            return effective
+
+    store = _ChangingStore(admitted)
+    agent = _bare_agent(store)
+    agent.storage = object()
+    agent._safe_mode = False
+    agent._constitution_audit_pending = False
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent._maybe_audit = AsyncMock()
+
+    async def delegated_process_input(self, *_args, **_kwargs):
+        # This is the universal check at the real process_input entrypoint. The
+        # streaming wrapper must bind its already-observed snapshot around it.
+        await require_turn_start_allowed(self)
+        return "command complete"
+
+    agent.process_input = MethodType(delegated_process_input, agent)
+
+    chunks = [chunk async for chunk in agent.process_input_streaming("!status")]
+
+    assert chunks == ["command complete"]
     assert store.calls == ["did:test:held"]
 
 

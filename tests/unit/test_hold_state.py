@@ -393,6 +393,63 @@ async def test_postgres_hold_backend_does_not_replace_host_feature_store(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_hold_startup_closes_open_host_resources(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancellation after the host DB opens cannot orphan its pool or DB."""
+    import kestrel_sovereign.hold as hold_module
+    import kestrel_sovereign.host_features.storage as host_storage
+    import kestrel_sovereign.storage.async_database as database_module
+    import kestrel_sovereign.storage.sqla.session as session_module
+
+    events: list[str] = []
+
+    class _FakeDatabase:
+        async def close(self):
+            events.append("database")
+
+    class _FakeFactory:
+        async def close(self):
+            events.append("factory")
+
+    class _CancelledHoldStore:
+        def __init__(self, _db):
+            pass
+
+        async def ensure_schema(self):
+            raise asyncio.CancelledError()
+
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.setattr(
+        database_module.AsyncDatabase,
+        "sqlite",
+        AsyncMock(return_value=_FakeDatabase()),
+    )
+    monkeypatch.setattr(
+        host_storage,
+        "prepare_host_database",
+        lambda _path=None: tmp_path / "host-features.db",
+    )
+    monkeypatch.setattr(
+        host_storage,
+        "validate_sqlite_family_private",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        session_module,
+        "make_session_factory",
+        lambda _db: _FakeFactory(),
+    )
+    monkeypatch.setattr(hold_module, "HoldStore", _CancelledHoldStore)
+
+    with pytest.raises(asyncio.CancelledError):
+        await build_host_context(db_path=str(tmp_path / "configured-host.db"))
+
+    assert events == ["factory", "database"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("surviving_disposition", ["already", "stale"])
 async def test_non_applied_receipt_cannot_outlive_referenced_authority(
     hold_db,
