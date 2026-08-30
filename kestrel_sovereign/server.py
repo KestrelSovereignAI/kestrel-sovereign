@@ -3063,16 +3063,14 @@ async def auth_middleware(request: Request, call_next):
         expected_peer_key = get_peer_api_key()
 
         peer_key_header = request.headers.get(LOCAL_PEER_API_KEY_HEADER)
-        if (
+        valid_peer_transport = bool(
             peer_key_header
             and secrets.compare_digest(peer_key_header, expected_peer_key)
             and _is_local_peer_transport_route(
                 request.method,
                 request.scope.get("path", request.url.path),
             )
-        ):
-            caller = CallerContext.local_peer_transport()
-
+        )
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
@@ -3134,6 +3132,12 @@ async def auth_middleware(request: Request, call_next):
                     identity=user_email,
                     auth_method=AuthMethod.OAUTH_SESSION,
                 )
+
+        # Peer transport is weaker than every sovereign or named-user lane.
+        # Its presence must not downgrade a valid bearer/header/query/session
+        # credential; use it only when no stronger credential authenticated.
+        if caller is None and valid_peer_transport:
+            caller = CallerContext.local_peer_transport()
 
         # No valid auth — for the root page in a browser:
         if caller is None and request.url.path == "/" and SERVE_UI:

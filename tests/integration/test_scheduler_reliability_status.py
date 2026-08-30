@@ -2154,7 +2154,12 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(
         )
         assert needs_ack["safe"] is False
         assert "acknowledgement required" in needs_ack["reason"]
-        acknowledged = await feature.acknowledge_restart_escalation(legacy.id)
+        with caller_context_scope(
+            CallerContext.sovereign(identity="scheduler-reliability-test")
+        ):
+            acknowledged = await feature.acknowledge_restart_escalation(
+                legacy.id
+            )
         assert acknowledged.data["acknowledged"] is True
         legacy = await get_request(db, legacy.id)
         assert feature._evaluate_safety(

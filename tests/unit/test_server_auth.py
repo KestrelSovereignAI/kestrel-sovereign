@@ -127,6 +127,23 @@ def test_local_peer_transport_key_is_authenticated_but_not_sovereign(client):
     }
 
 
+def test_sovereign_bearer_is_not_downgraded_by_valid_peer_header(client):
+    response = client.get(
+        "/api/agents",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "X-Kestrel-Peer-Key": PEER_KEY,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "role": "sovereign",
+        "auth_method": "api_key",
+        "is_sovereign": True,
+    }
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
