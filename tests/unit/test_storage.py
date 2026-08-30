@@ -9,7 +9,8 @@ import tempfile
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from kestrel_sovereign.storage import AsyncStorage, GraphNode
+from kestrel_sovereign.storage import AsyncGraphStore, AsyncStorage, GraphNode
+from kestrel_sovereign.storage.db import TransactionError
 
 @pytest_asyncio.fixture
 async def storage(temp_dir):
@@ -119,3 +120,82 @@ async def test_backup_local_only(storage):
     node = await storage.get_node(ch)
     assert node is not None
     assert node.node_type == "backup_artifact"
+
+
+@pytest.mark.asyncio
+async def test_backup_rejects_foreign_node_at_provisional_agent_id(storage):
+    """Backup bootstrap cannot claim a graph id controlled by another tenant."""
+
+    agent_id = "did:test:backup-victim"
+    attacker_id = "did:test:backup-attacker"
+    await storage.db.execute_commit(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+        "VALUES (?, 'skill', 'Squat', ?)",
+        (agent_id, '{"agent_id":"did:test:backup-attacker"}'),
+    )
+    await storage.db.execute_commit(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+        (agent_id, attacker_id),
+    )
+
+    class _FakeResult:
+        content_hash = "f" * 64
+        storage_tier = type("T", (), {"value": "local"})()
+        ipfs_cid = None
+        filecoin_deal_id = None
+        encrypted = False
+        encryption_key_hash = None
+
+    with pytest.raises(TransactionError, match="collides"):
+        await storage.record_backup_artifact(agent_id, _FakeResult())
+
+    assert await storage.db.fetchall(
+        "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+        (agent_id,),
+    ) == [(attacker_id,)]
+    assert await storage.db.fetchone(
+        "SELECT 1 FROM graph_nodes WHERE node_id = ?", (_FakeResult.content_hash,)
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_bound_storage_rejects_backup_for_another_agent(temp_dir):
+    """A per-call backup id cannot replace the facade's tenant capability."""
+
+    bound_agent = "did:test:backup-bound"
+    requested_agent = "did:test:backup-foreign"
+    bound = AsyncStorage(
+        db_path=str(temp_dir / "bound-backup.db"),
+        agent_id=bound_agent,
+    )
+    await bound.initialize()
+
+    class _FakeResult:
+        content_hash = "e" * 64
+        storage_tier = type("T", (), {"value": "local"})()
+        ipfs_cid = None
+        filecoin_deal_id = None
+        encrypted = False
+        encryption_key_hash = None
+
+    try:
+        foreign = AsyncGraphStore(bound.db, agent_id=requested_agent)
+        await foreign.add_node(
+            GraphNode(
+                node_id=requested_agent,
+                node_type="agent",
+                label="Foreign agent",
+                properties={"agent_id": requested_agent},
+            )
+        )
+
+        with pytest.raises(ValueError, match="bound storage"):
+            await bound.record_backup_artifact(requested_agent, _FakeResult())
+
+        assert await foreign.get_node(_FakeResult.content_hash) is None
+        assert await bound.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE source_id = ? AND target_id = ?",
+            (requested_agent, _FakeResult.content_hash),
+        ) is None
+    finally:
+        await bound.close()
