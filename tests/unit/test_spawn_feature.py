@@ -364,7 +364,9 @@ class TestSpawnFeatureWithManager:
         manager.persist_created_agent_registration = AsyncMock(
             side_effect=OSError("registry unavailable")
         )
-        manager.terminate_child = AsyncMock(return_value=True)
+        manager.rollback_unregistered_persistent_spawn = AsyncMock(
+            return_value=True
+        )
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
         envelope = await feature.spawn_agent(
@@ -375,10 +377,10 @@ class TestSpawnFeatureWithManager:
 
         assert envelope.status is ToolResultStatus.ERROR
         assert "registry unavailable" in envelope.error
-        manager.terminate_child.assert_awaited_once_with(
+        manager.rollback_unregistered_persistent_spawn.assert_awaited_once_with(
             parent.agent_id,
             "durable-helper",
-            offboard_runtime=True,
+            expected_child_did=child.agent_id,
         )
 
     @pytest.mark.asyncio
@@ -390,7 +392,7 @@ class TestSpawnFeatureWithManager:
         manager.persist_created_agent_registration = AsyncMock(
             side_effect=OSError("registry unavailable")
         )
-        manager.terminate_child = AsyncMock(
+        manager.rollback_unregistered_persistent_spawn = AsyncMock(
             side_effect=RuntimeError("child shutdown refused")
         )
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
@@ -2575,6 +2577,45 @@ class TestAgentManagerSpawn:
             offboard_runtime=True,
         ) is True
         rollback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_persistence_rollback_discards_exact_unregistered_child(
+        self,
+    ):
+        manager = AgentManager()
+        child = _make_mock_agent("did:child:never-registered")
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+        manager._child_mandates["helper"] = SpawnMandate(
+            parent_did="did:parent",
+            child_did=child.agent_id,
+            ttl_seconds=0,
+        )
+        _use_runtime_projection_as_authority_test_double(manager)
+        registration_removal = AsyncMock(
+            side_effect=AssertionError("no registration exists to remove")
+        )
+        manager.set_created_agent_registration_removal_hook(
+            registration_removal
+        )
+
+        async def remove_agent(name: str, **kwargs) -> bool:
+            assert name == "helper"
+            assert kwargs["offboard_runtime"] is True
+            assert kwargs["_lifecycle_cleanup_expected_agent_id"] == child.agent_id
+            manager._agents.pop(name, None)
+            manager._agent_names.pop(child.agent_id, None)
+            return True
+
+        manager.remove_agent = AsyncMock(side_effect=remove_agent)
+
+        assert await manager.rollback_unregistered_persistent_spawn(
+            "did:parent",
+            "helper",
+            expected_child_did=child.agent_id,
+        ) is True
+        registration_removal.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_persistent_child_offboard_restores_registration_if_not_admitted(

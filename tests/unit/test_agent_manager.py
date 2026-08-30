@@ -228,6 +228,50 @@ async def test_spawn_refuses_prebound_child_identity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_spawn_revalidates_spawned_parent_before_child_inception(tmp_path):
+    """A revoked parent cannot start child identity or feature initialization."""
+
+    root_did = "did:test:preinit-root"
+    parent_did = "did:test:preinit-parent"
+    root, parent_receipt = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=0,
+        max_child_depth=1,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent._persisted_spawn_mandate = parent_receipt
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("SpawnedParent", parent)
+
+    # Another replica withdrew the durable edge; the local projection has not
+    # reconciled yet. The pre-inception read must still see the revocation.
+    parent.storage.get_edges_from = AsyncMock(return_value=[])
+    inception = AsyncMock()
+    manager._initialize_agent = AsyncMock(
+        side_effect=AssertionError("child initialization must not start")
+    )
+
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+        inception,
+    ):
+        with pytest.raises(RuntimeError, match="revoked or expired"):
+            await manager.spawn_agent(
+                "DeniedGrandchild",
+                parent,
+                SpawnMandate(parent_did=parent_did),
+            )
+
+    inception.assert_not_awaited()
+    manager._initialize_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_load_awaits_spawn_receipt_before_routing_publication(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
     child = _make_mock_agent("did:test:prepublication-child")

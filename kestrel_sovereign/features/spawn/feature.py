@@ -857,11 +857,21 @@ class SpawnFeature(Feature):
                     # this boundary, so own the inverse explicitly rather than
                     # returning an error with an authoritative orphan still
                     # routable until restart.
+                    rollback_unregistered = getattr(
+                        manager,
+                        "rollback_unregistered_persistent_spawn",
+                        None,
+                    )
+                    if not callable(rollback_unregistered):
+                        raise RuntimeError(
+                            "Persistent spawn registration failed and the manager "
+                            "has no unregistered-child cleanup seam"
+                        ) from persistence_error
                     rollback_task = asyncio.create_task(
-                        manager.terminate_child(
+                        rollback_unregistered(
                             self.agent.agent_id,
                             name,
-                            offboard_runtime=True,
+                            expected_child_did=child.agent_id,
                         ),
                         name=f"rollback_persistent_spawn:{name}",
                     )

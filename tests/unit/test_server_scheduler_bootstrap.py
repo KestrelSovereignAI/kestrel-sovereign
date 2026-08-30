@@ -220,6 +220,8 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
     )
     events: list[str] = []
+    removal_resolution_started = asyncio.Event()
+    allow_removal_resolution = asyncio.Event()
 
     class _Manager:
         init_failures = []
@@ -245,6 +247,8 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         async def resolve_registered_agent_id(self, name, agent_config) -> str:
             assert name == "PersistentChild"
             assert agent_config.port == 8899
+            removal_resolution_started.set()
+            await allow_removal_resolution.wait()
             return "did:test:persistent-child"
 
         def list_agents(self):
@@ -293,17 +297,38 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
             "PersistentChild",
             child_config,
         )
-        rollback = await manager.created_agent_registration_removal_hook(
-            "PersistentChild",
-            "did:test:persistent-child",
+        removal_task = asyncio.create_task(
+            manager.created_agent_registration_removal_hook(
+                "PersistentChild",
+                "did:test:persistent-child",
+            )
         )
+        await asyncio.wait_for(removal_resolution_started.wait(), timeout=1)
+        concurrent_config = ma_config.LocalAgentConfig(
+            data_dir=tmp_path / "concurrent-child",
+            port=8900,
+        )
+        concurrent_persist = asyncio.create_task(
+            manager.created_agent_persistence_hook(
+                "ConcurrentChild",
+                concurrent_config,
+            )
+        )
+        await asyncio.sleep(0)
+        assert concurrent_persist.done() is False
+        allow_removal_resolution.set()
+        rollback = await removal_task
+        await concurrent_persist
         assert "PersistentChild" not in ma_config.MultiAgentConfig.from_file(
             config_path
         ).agents
-        await rollback()
         assert ma_config.MultiAgentConfig.from_file(config_path).agents[
-            "PersistentChild"
-        ] == child_config
+            "ConcurrentChild"
+        ] == concurrent_config
+        await rollback()
+        restored = ma_config.MultiAgentConfig.from_file(config_path).agents
+        assert restored["PersistentChild"] == child_config
+        assert restored["ConcurrentChild"] == concurrent_config
 
     assert events == ["preflight", "load", "host-start"]
     assert callable(manager.created_agent_persistence_hook)

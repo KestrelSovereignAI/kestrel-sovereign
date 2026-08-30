@@ -944,6 +944,38 @@ class AgentManager:
         if hook is not None:
             await hook(name, config)
 
+    async def rollback_unregistered_persistent_spawn(
+        self,
+        parent_did: str,
+        child_name: str,
+        *,
+        expected_child_did: str,
+    ) -> bool:
+        """Destroy a persistent child whose startup registration never committed.
+
+        This is deliberately narrower than ordinary destructive termination.  It
+        exists only for the failure edge immediately after
+        :meth:`persist_created_agent_registration` raises, where requiring the
+        startup-registration removal hook would make the inverse impossible: no
+        registration exists to remove.  The exact child DID prevents a stale
+        persistence failure from deleting a same-name replacement.
+
+        Persistence hooks must be transactional: returning means the registry
+        commit happened; raising means it did not.  The server-owned hook uses an
+        atomic ``os.replace`` save under a registry mutation lock.
+        """
+
+        if not isinstance(expected_child_did, str) or not expected_child_did:
+            raise ValueError("expected_child_did must be a non-empty string")
+        return await self.terminate_child(
+            parent_did,
+            child_name,
+            offboard_runtime=True,
+            _unregistered_persistent_spawn_expected_agent_id=(
+                expected_child_did
+            ),
+        )
+
     def set_created_agent_registration_removal_hook(
         self,
         hook: Optional[
@@ -2925,6 +2957,13 @@ class AgentManager:
             name, kind="load"
         )
         try:
+            # Live descendant spawns borrow the outer spawn admission.  Re-read
+            # the spawned parent's durable authority immediately before any
+            # child object, feature initializer, or worker can start.  The
+            # governance-commit check in ``_do_spawn`` remains necessary after
+            # inception/provider I/O; this earlier gate prevents already-revoked
+            # authority from getting a side-effecting initialization window.
+            await self._verify_live_spawn_parent_before_child_start(admission)
             agent = await self._initialize_agent(
                 name,
                 config,
@@ -6046,6 +6085,11 @@ class AgentManager:
                     raise asyncio.CancelledError()
 
         assert admission is not None
+        # Refuse authority that was already withdrawn before inception, then
+        # re-run the same durable check from ``load_agent`` immediately before
+        # hosted child initialization.  The two gates keep both identity
+        # creation and wake-capable feature startup behind live parent authority.
+        await self._verify_live_spawn_parent_before_child_start(admission)
         # Resolve the parent's signing material now. The final signature is
         # created only after inception returns the child's DID; signing before
         # that point would bind ``child_did=None`` and cannot authorize the
@@ -6419,6 +6463,37 @@ class AgentManager:
             and self._child_mandates.get(parent_name)
             is admission.spawn_parent_mandate
         )
+
+    async def _verify_live_spawn_parent_before_child_start(
+        self,
+        admission: AgentOperationAdmission,
+    ) -> None:
+        """Re-prove a spawned parent's durable relation before child startup."""
+
+        if (
+            admission.kind not in {"spawn", "direct-spawn-test"}
+            or admission.spawn_parent_mandate is None
+        ):
+            return
+        parent = admission.spawn_parent_agent
+        parent_name = admission.spawn_parent_name
+        parent_did = _loaded_agent_did(parent) if parent is not None else None
+        if not isinstance(parent_did, str) or not isinstance(parent_name, str):
+            raise RuntimeError(
+                "Spawned parent authority is unavailable before child initialization"
+            )
+        async with self.a2a_execution_lease():
+            if not self._spawn_parent_authority_is_admitted(admission):
+                raise RuntimeError(
+                    "Spawned parent authority changed before child initialization"
+                )
+            relations = await self._verified_spawn_relations_under_lease()
+            relation = relations.get(parent_did)
+            if relation is None or relation[1] != parent_name:
+                raise RuntimeError(
+                    "Spawned parent durable authority was revoked or expired before "
+                    "child initialization"
+                )
 
     async def _ensure_spawn_operation_admitted(
         self, admission: AgentOperationAdmission, child: KestrelAgent
@@ -7194,6 +7269,7 @@ class AgentManager:
         child_name: str,
         *,
         offboard_runtime: bool = False,
+        _unregistered_persistent_spawn_expected_agent_id: Optional[str] = None,
     ) -> bool:
         """Terminate a specific child agent and its descendants.
 
@@ -7236,6 +7312,15 @@ class AgentManager:
         # siblings or the now-stopped parent. Preserve it for the caller after
         # every reachable lifecycle target has received its teardown attempt.
         child_agent = self.get_agent(child_name)
+        if _unregistered_persistent_spawn_expected_agent_id is not None:
+            actual_child_did = (
+                _loaded_agent_did(child_agent) if child_agent is not None else None
+            )
+            if actual_child_did != _unregistered_persistent_spawn_expected_agent_id:
+                raise RuntimeError(
+                    "Unregistered persistent spawn rollback no longer names the "
+                    "exact live child"
+                )
         if child_agent is not None:
             try:
                 if offboard_runtime:
@@ -7256,7 +7341,17 @@ class AgentManager:
         persistent_spawn = (
             isinstance(mandate, SpawnMandate) and mandate.ttl_seconds <= 0
         )
-        if offboard_runtime and persistent_spawn:
+        unregistered_persistent_rollback = (
+            _unregistered_persistent_spawn_expected_agent_id is not None
+        )
+        if unregistered_persistent_rollback and (
+            not offboard_runtime or not persistent_spawn
+        ):
+            raise RuntimeError(
+                "Unregistered spawn rollback requires an exact persistent child "
+                "and destructive offboarding"
+            )
+        if offboard_runtime and persistent_spawn and not unregistered_persistent_rollback:
             removal_hook = self._created_agent_registration_removal_hook
             if removal_hook is None:
                 raise RuntimeError(
@@ -7318,12 +7413,16 @@ class AgentManager:
             }
             if offboarding_admission is not None:
                 removal_kwargs["offboarding_admission"] = offboarding_admission
-            if cleanup_child_did is not None:
+            exact_cleanup_child_did = (
+                cleanup_child_did
+                or _unregistered_persistent_spawn_expected_agent_id
+            )
+            if exact_cleanup_child_did is not None:
                 # Bind cleanup-only custody to the exact tracked child so a
                 # same-name replacement cannot be removed after the authority
                 # snapshot. Governance callers retain their existing API.
                 removal_kwargs["_lifecycle_cleanup_expected_agent_id"] = (
-                    cleanup_child_did
+                    exact_cleanup_child_did
                 )
             try:
                 removed = await self.remove_agent(child_name, **removal_kwargs)

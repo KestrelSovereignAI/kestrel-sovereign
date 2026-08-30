@@ -2321,25 +2321,33 @@ async def _lifespan_startup(app: FastAPI):
                 multi_agent_path if multi_agent_path.exists() else None
             )
             if app.state.multi_agent_config_path is not None:
+                # Every read-modify-write of multi_agent.toml shares one async
+                # mutation boundary.  In particular, removal resolves the
+                # registered DID asynchronously; without this lock a concurrent
+                # spawn could commit while removal later saved its stale
+                # pre-await snapshot and silently erased the new registration.
+                created_agent_registry_lock = asyncio.Lock()
+
                 async def persist_created_agent_registration(name, agent_config):
                     """Merge a persistent runtime child into fresh disk state."""
 
-                    current = MultiAgentConfig.from_file(
-                        app.state.multi_agent_config_path
-                    )
-                    collisions = {
-                        existing.casefold()
-                        for existing in current.agents
-                        if existing != name
-                    }
-                    if name.casefold() in collisions or name in current.agents:
-                        raise RuntimeError(
-                            f"Agent {name!r} is already present in the startup registry"
+                    async with created_agent_registry_lock:
+                        current = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
                         )
-                    current.agents[name] = agent_config
-                    type(current).model_validate(current.model_dump())
-                    current.save(app.state.multi_agent_config_path)
-                    app.state.multi_agent_config = current
+                        collisions = {
+                            existing.casefold()
+                            for existing in current.agents
+                            if existing != name
+                        }
+                        if name.casefold() in collisions or name in current.agents:
+                            raise RuntimeError(
+                                f"Agent {name!r} is already present in the startup registry"
+                            )
+                        current.agents[name] = agent_config
+                        type(current).model_validate(current.model_dump())
+                        current.save(app.state.multi_agent_config_path)
+                        app.state.multi_agent_config = current
 
                 async def remove_created_agent_registration(
                     name,
@@ -2347,57 +2355,59 @@ async def _lifespan_startup(app: FastAPI):
                 ):
                     """CAS-remove one persistent child and return compensation."""
 
-                    current = MultiAgentConfig.from_file(
-                        app.state.multi_agent_config_path
-                    )
-                    matches = [
-                        existing
-                        for existing in current.agents
-                        if existing.casefold() == name.casefold()
-                    ]
-                    if len(matches) != 1:
-                        raise RuntimeError(
-                            "Persistent spawned child startup registration is "
-                            "missing or ambiguous; destructive offboarding refused"
-                        )
-                    persisted_name = matches[0]
-                    registered_config = current.agents[persisted_name]
-                    from kestrel_sovereign.multi_agent.config import LocalAgentConfig
-
-                    if not isinstance(registered_config, LocalAgentConfig):
-                        raise RuntimeError(
-                            "Persistent spawned child is not a local hosted registration"
-                        )
-                    registered_agent_id = await manager.resolve_registered_agent_id(
-                        persisted_name,
-                        registered_config,
-                    )
-                    if registered_agent_id != expected_agent_id:
-                        raise RuntimeError(
-                            "Persistent spawned child identity changed before "
-                            "startup-registration removal"
-                        )
-                    removed_config = current.agents.pop(persisted_name)
-                    type(current).model_validate(current.model_dump())
-                    current.save(app.state.multi_agent_config_path)
-                    app.state.multi_agent_config = current
-
-                    async def restore_registration() -> None:
-                        fresh = MultiAgentConfig.from_file(
+                    async with created_agent_registry_lock:
+                        current = MultiAgentConfig.from_file(
                             app.state.multi_agent_config_path
                         )
-                        if any(
-                            existing.casefold() == persisted_name.casefold()
-                            for existing in fresh.agents
-                        ):
+                        matches = [
+                            existing
+                            for existing in current.agents
+                            if existing.casefold() == name.casefold()
+                        ]
+                        if len(matches) != 1:
                             raise RuntimeError(
-                                "Persistent child registration changed concurrently; "
-                                "refusing compensation overwrite"
+                                "Persistent spawned child startup registration is "
+                                "missing or ambiguous; destructive offboarding refused"
                             )
-                        fresh.agents[persisted_name] = removed_config
-                        type(fresh).model_validate(fresh.model_dump())
-                        fresh.save(app.state.multi_agent_config_path)
-                        app.state.multi_agent_config = fresh
+                        persisted_name = matches[0]
+                        registered_config = current.agents[persisted_name]
+                        from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+
+                        if not isinstance(registered_config, LocalAgentConfig):
+                            raise RuntimeError(
+                                "Persistent spawned child is not a local hosted registration"
+                            )
+                        registered_agent_id = await manager.resolve_registered_agent_id(
+                            persisted_name,
+                            registered_config,
+                        )
+                        if registered_agent_id != expected_agent_id:
+                            raise RuntimeError(
+                                "Persistent spawned child identity changed before "
+                                "startup-registration removal"
+                            )
+                        removed_config = current.agents.pop(persisted_name)
+                        type(current).model_validate(current.model_dump())
+                        current.save(app.state.multi_agent_config_path)
+                        app.state.multi_agent_config = current
+
+                    async def restore_registration() -> None:
+                        async with created_agent_registry_lock:
+                            fresh = MultiAgentConfig.from_file(
+                                app.state.multi_agent_config_path
+                            )
+                            if any(
+                                existing.casefold() == persisted_name.casefold()
+                                for existing in fresh.agents
+                            ):
+                                raise RuntimeError(
+                                    "Persistent child registration changed concurrently; "
+                                    "refusing compensation overwrite"
+                                )
+                            fresh.agents[persisted_name] = removed_config
+                            type(fresh).model_validate(fresh.model_dump())
+                            fresh.save(app.state.multi_agent_config_path)
+                            app.state.multi_agent_config = fresh
 
                     return restore_registration
 
