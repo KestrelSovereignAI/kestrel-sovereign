@@ -74,7 +74,16 @@ def test_text_only_stream_emits_terminal_llmresponse_with_usage():
     from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 
     events = [
-        _ev("message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=12))),
+        _ev(
+            "message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=12,
+                    cache_creation_input_tokens=101,
+                    cache_read_input_tokens=202,
+                )
+            ),
+        ),
         _ev("content_block_start", index=0, content_block=SimpleNamespace(type="text")),
         _ev("content_block_delta", index=0,
             delta=SimpleNamespace(type="text_delta", text="hello world")),
@@ -93,6 +102,8 @@ def test_text_only_stream_emits_terminal_llmresponse_with_usage():
     resp = terminals[0]
     assert resp.input_tokens == 12
     assert resp.output_tokens == 7
+    assert resp.cache_creation_input_tokens == 101
+    assert resp.cache_read_input_tokens == 202
     assert not resp.tool_calls  # text-only: no tool calls
 
 
@@ -120,8 +131,16 @@ class _FakeService(StreamingMixin):
 
 def test_record_streamed_usage_meters_terminal_response():
     svc = _FakeService()
-    resp = LLMResponse(content="hi", tool_calls=None, raw=None,
-                       input_tokens=10, output_tokens=20, total_tokens=30)
+    resp = LLMResponse(
+        content="hi",
+        tool_calls=None,
+        raw=None,
+        input_tokens=10,
+        output_tokens=20,
+        total_tokens=30,
+        cache_creation_input_tokens=40,
+        cache_read_input_tokens=50,
+    )
 
     asyncio.run(svc._record_streamed_usage(resp, "claude-x", "anthropic", duration_ms=42))
 
@@ -129,6 +148,8 @@ def test_record_streamed_usage_meters_terminal_response():
     args, kwargs = svc._track_model_usage.await_args
     assert args[0] == "claude-x" and args[1] == "anthropic"
     assert kwargs.get("tokens") == 30  # input + output
+    assert kwargs["cache_creation_input_tokens"] == 40
+    assert kwargs["cache_read_input_tokens"] == 50
 
     svc._log_llm_call.assert_awaited_once()
     _, lk = svc._log_llm_call.await_args
@@ -435,7 +456,15 @@ def test_openai_text_only_stream_emits_terminal_llmresponse_with_usage(monkeypat
         )],
     )
     usage_chunk = SimpleNamespace(
-        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=7, total_tokens=19),
+        usage=SimpleNamespace(
+            prompt_tokens=12,
+            completion_tokens=7,
+            total_tokens=19,
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=8,
+                cache_write_tokens=2,
+            ),
+        ),
         choices=[],
     )
 
@@ -459,8 +488,11 @@ def test_openai_text_only_stream_emits_terminal_llmresponse_with_usage(monkeypat
     assert "".join(i for i in items if isinstance(i, str)) == "hello world"
     terminals = [i for i in items if isinstance(i, LLMResponse)]
     assert len(terminals) == 1, items
-    assert terminals[0].input_tokens == 12
+    assert terminals[0].input_tokens == 2
     assert terminals[0].output_tokens == 7
+    assert terminals[0].total_tokens == 9
+    assert terminals[0].cache_creation_input_tokens == 2
+    assert terminals[0].cache_read_input_tokens == 8
     assert not terminals[0].tool_calls
 
 
@@ -472,7 +504,11 @@ def test_vertex_text_stream_emits_terminal_llmresponse_with_usage(monkeypatch):
         SimpleNamespace(text="hello ", usage_metadata=None),
         SimpleNamespace(text="world", usage_metadata=None),
         SimpleNamespace(text="", usage_metadata=SimpleNamespace(
-            prompt_token_count=5, candidates_token_count=3, total_token_count=8)),
+            prompt_token_count=5,
+            candidates_token_count=3,
+            total_token_count=8,
+            cached_content_token_count=3,
+        )),
     ]
 
     async def fake_with_retry(fn, **kwargs):
@@ -498,8 +534,10 @@ def test_vertex_text_stream_emits_terminal_llmresponse_with_usage(monkeypatch):
     assert "".join(i for i in items if isinstance(i, str)) == "hello world"
     terminals = [i for i in items if isinstance(i, LLMResponse)]
     assert len(terminals) == 1, items
-    assert terminals[0].input_tokens == 5
+    assert terminals[0].input_tokens == 2
     assert terminals[0].output_tokens == 3
+    assert terminals[0].total_tokens == 5
+    assert terminals[0].cache_read_input_tokens == 3
 
     # And the public text-only contract still drops the terminal response.
     text_items = _collect(VertexAIAdapter().get_streaming_response(
@@ -509,6 +547,129 @@ def test_vertex_text_stream_emits_terminal_llmresponse_with_usage(monkeypatch):
     ))
     assert all(isinstance(i, str) for i in text_items)
     assert "".join(text_items) == "hello world"
+
+
+def test_vertex_nonstream_normalizes_cached_prompt_usage(monkeypatch):
+    from kestrel_sovereign.llm import vertex_adapter as vx_mod
+    from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
+
+    raw_response = SimpleNamespace(
+        candidates=[],
+        text="hello",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=11,
+            candidates_token_count=4,
+            total_token_count=15,
+            cached_content_token_count=7,
+        ),
+    )
+
+    async def fake_with_retry(fn, **kwargs):
+        return raw_response
+
+    monkeypatch.setattr(vx_mod, "with_retry", fake_with_retry)
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(generate_content=lambda **k: None))
+    )
+
+    response = asyncio.run(VertexAIAdapter().get_response(
+        client=fake_client,
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+    ))
+
+    assert response.input_tokens == 4
+    assert response.output_tokens == 4
+    assert response.total_tokens == 8
+    assert response.cache_read_input_tokens == 7
+
+
+def test_vertex_usage_without_cache_telemetry_stays_inclusive():
+    from kestrel_sovereign.llm.google_adapter import _normalized_google_genai_usage
+
+    assert _normalized_google_genai_usage(SimpleNamespace(
+        prompt_token_count=5,
+        candidates_token_count=3,
+        total_token_count=8,
+    )) == (5, 3, 8, None)
+
+
+def test_google_text_stream_emits_terminal_cache_usage():
+    from kestrel_sovereign.llm.google_adapter import GoogleAdapter
+
+    chunks = [
+        SimpleNamespace(text="hello ", usage_metadata=None),
+        SimpleNamespace(text="world", usage_metadata=None),
+        SimpleNamespace(
+            text="",
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=11,
+                candidates_token_count=4,
+                total_token_count=15,
+                cached_content_token_count=7,
+            ),
+        ),
+    ]
+
+    async def generate_content_stream(**kwargs):
+        return _FakeAsyncIter(chunks)
+
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content_stream=generate_content_stream,
+            )
+        )
+    )
+    adapter = GoogleAdapter()
+
+    items = _collect(adapter.get_streaming_response_with_tools(
+        client=fake_client,
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+        tools=None,
+    ))
+
+    assert "".join(i for i in items if isinstance(i, str)) == "hello world"
+    terminals = [i for i in items if isinstance(i, LLMResponse)]
+    assert len(terminals) == 1
+    assert terminals[0].input_tokens == 4
+    assert terminals[0].output_tokens == 4
+    assert terminals[0].total_tokens == 8
+    assert terminals[0].cache_read_input_tokens == 7
+
+    text_items = _collect(adapter.get_streaming_response(
+        client=fake_client,
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+    ))
+    assert all(isinstance(item, str) for item in text_items)
+    assert "".join(text_items) == "hello world"
+
+
+def test_google_tool_fallback_forwards_probe_cache_usage():
+    from kestrel_sovereign.llm.google_adapter import GoogleAdapter
+
+    adapter = GoogleAdapter()
+    adapter.get_response = AsyncMock(return_value=LLMResponse(
+        content="text after probe",
+        input_tokens=4,
+        output_tokens=4,
+        total_tokens=8,
+        cache_read_input_tokens=7,
+    ))
+
+    items = _collect(adapter.get_streaming_response_with_tools(
+        client=SimpleNamespace(),
+        model="gemini-x",
+        messages=[{"role": "user", "parts": [{"text": "hi"}]}],
+        tools=[{"type": "function", "function": {"name": "x"}}],
+    ))
+
+    assert "text after probe" in [item for item in items if isinstance(item, str)]
+    terminals = [item for item in items if isinstance(item, LLMResponse)]
+    assert len(terminals) == 1
+    assert terminals[0].cache_read_input_tokens == 7
 
 
 def test_vertex_text_with_tools_path_emits_terminal_response(monkeypatch):
@@ -597,7 +758,16 @@ def test_anthropic_populates_usage_sink_as_events_arrive():
     assert AnthropicAdapter.supports_partial_usage_flush is True
 
     events = [
-        _ev("message_start", message=SimpleNamespace(usage=SimpleNamespace(input_tokens=42))),
+        _ev(
+            "message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=42,
+                    cache_creation_input_tokens=88,
+                    cache_read_input_tokens=99,
+                )
+            ),
+        ),
         _ev("message_delta", usage=SimpleNamespace(output_tokens=8)),
     ]
     sink: dict = {}
@@ -616,7 +786,12 @@ def test_anthropic_populates_usage_sink_as_events_arrive():
             pass
 
     asyncio.run(_run())
-    assert sink == {"input_tokens": 42, "output_tokens": 8}
+    assert sink == {
+        "input_tokens": 42,
+        "output_tokens": 8,
+        "cache_creation_input_tokens": 88,
+        "cache_read_input_tokens": 99,
+    }
 
 
 class _AbortingAdapter:
@@ -632,6 +807,8 @@ class _AbortingAdapter:
         if sink is not None:
             sink["input_tokens"] = 100
             sink["output_tokens"] = 3
+            sink["cache_creation_input_tokens"] = 17
+            sink["cache_read_input_tokens"] = 83
         raise asyncio.CancelledError()
 
 
@@ -652,10 +829,18 @@ def test_stream_with_tool_detection_flushes_partial_on_abort(monkeypatch):
     asyncio.run(_run())
 
     # The aborted stream still recorded the partial usage the provider billed.
-    svc._track_model_usage.assert_awaited_once()
+    svc._track_model_usage.assert_awaited_once_with(
+        "claude-x",
+        "anthropic",
+        tokens=103,
+        cache_creation_input_tokens=17,
+        cache_read_input_tokens=83,
+    )
     svc._log_llm_call.assert_awaited_once()
     _, lk = svc._log_llm_call.await_args
     assert lk["input_tokens"] == 100 and lk["output_tokens"] == 3
+    assert lk["cache_creation_input_tokens"] == 17
+    assert lk["cache_read_input_tokens"] == 83
     assert lk["metadata"] == {
         "streamed": True,
         "path": "stream_with_tool_detection",
