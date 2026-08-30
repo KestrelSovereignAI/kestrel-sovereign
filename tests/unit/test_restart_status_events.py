@@ -52,7 +52,10 @@ async def _sovereign_restart_authority(monkeypatch):
 
     monkeypatch.setenv("KESTREL_API_KEY", "restart-status-event-test-key")
     with caller_context_scope(
-        CallerContext.sovereign(identity="restart-status-event-test")
+        CallerContext.sovereign(
+            identity="restart-status-event-test",
+            credential="restart-status-event-test-key",
+        )
     ):
         yield
 

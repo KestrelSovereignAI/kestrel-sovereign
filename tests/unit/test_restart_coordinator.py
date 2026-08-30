@@ -157,7 +157,10 @@ async def _close_test_owned_resources(monkeypatch):
     _real_dispatch_lifecycles.clear()
     monkeypatch.setenv("KESTREL_API_KEY", "restart-authority-test-key")
     with caller_context_scope(
-        CallerContext.sovereign(identity="test-sovereign")
+        CallerContext.sovereign(
+            identity="test-sovereign",
+            credential="restart-authority-test-key",
+        )
     ):
         try:
             yield
@@ -956,6 +959,38 @@ async def test_sovereign_acknowledgement_seals_legacy_row_for_execution(tmp_path
         result = await feat.restart_coordinator()
     assert mock_spawn.call_count == 1
     assert result.data["executed"][0]["request_id"] == "legacy-to-authorize"
+
+
+@pytest.mark.asyncio
+async def test_acknowledgement_rolls_back_when_issuance_conflicts(tmp_path):
+    """The signed row and its independent issuance are one atomic fact."""
+
+    feat, backend = await _make_feature(tmp_path)
+    request_id = "legacy-issuance-conflict"
+    await backend.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, "
+        "escalation_acknowledged) VALUES (?, ?, ?, ?, 'pending', 0)",
+        (
+            request_id,
+            feat.agent.did,
+            "conflicting issuance",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    await backend.execute(
+        "INSERT INTO restart_authority_issuances "
+        "(request_id, lifecycle_generation, issued_at) VALUES (?, ?, ?)",
+        (request_id, "f" * 32, datetime.now(timezone.utc).isoformat()),
+    )
+
+    result = await feat.acknowledge_restart_escalation(request_id)
+    row = await get_request(backend, request_id)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert row.escalation_acknowledged is False
+    assert row.authority_evidence == ""
+    assert row.authority_signature == ""
 
 
 @pytest.mark.asyncio
@@ -1891,6 +1926,30 @@ async def test_executor_rejects_authority_revoked_by_sovereign_key_rotation(
     row = await get_request(backend, request_id)
     assert row.status == "rejected"
     assert "signature verification failed" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_terminalizes_a_missing_authority_issuance(tmp_path):
+    """A valid seal without its independent issuance must not retry forever."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="lose issuance before poll")
+    request_id = created.data["request"]["id"]
+    await backend.execute(
+        "DELETE FROM restart_authority_issuances WHERE request_id = ?",
+        (request_id,),
+    )
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "issuance" in row.status_reason
+    assert result.data["deferred"] == []
     mock_spawn.assert_not_called()
 
 

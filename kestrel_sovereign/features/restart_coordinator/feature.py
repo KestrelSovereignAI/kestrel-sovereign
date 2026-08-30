@@ -39,6 +39,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.storage.database_clock import database_clock
+from kestrel_sovereign.storage.db.interface import TransactionError
 
 from .authority import (
     RestartAuthorityError,
@@ -808,6 +809,14 @@ class RestartCoordinatorFeature(Feature):
                     "authority": "required",
                 },
             )
+        except TransactionError:
+            return ToolResult.failed(
+                "Restart authority acknowledgement did not commit atomically",
+                data={
+                    "acknowledged": False,
+                    "request_id": normalized,
+                },
+            )
         if not acknowledged:
             row = await get_request_for_agent(self._db, normalized, requester)
             if row is not None and row.status not in PENDING_STATES:
@@ -1062,10 +1071,13 @@ class RestartCoordinatorFeature(Feature):
             if claim_result != "claimed":
                 if initial_state == "executing":
                     self._executing_since.pop(req.id, None)
-                if claim_result == "consumed":
+                if claim_result in {"consumed", "invalid"}:
                     replay_reason = (
                         "restart authority lifecycle generation was already "
                         "consumed; refusing replay"
+                        if claim_result == "consumed"
+                        else "restart authority issuance is absent or does not "
+                        "match the signed lifecycle generation; refusing execution"
                     )
                     rejected = await update_status(
                         self._db,

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from kestrel_sovereign.security.sovereign_key import sovereign_key_fingerprint
+
 
 LOCAL_PEER_API_KEY_HEADER = "X-Kestrel-Peer-Key"
 
@@ -33,10 +35,28 @@ class CallerContext:
     role: CallerRole = CallerRole.ANONYMOUS
     auth_method: AuthMethod = AuthMethod.INTERNAL
     identity: Optional[str] = None  # email, "api_key", or None
+    # Present only when the endpoint authenticated an actual sovereign API-key
+    # credential. It binds later mutation authority to that entry credential
+    # without retaining the secret itself.
+    credential_fingerprint: Optional[str] = None
 
     @staticmethod
-    def sovereign(auth_method: AuthMethod = AuthMethod.API_KEY, identity: str = None) -> "CallerContext":
-        return CallerContext(role=CallerRole.SOVEREIGN, auth_method=auth_method, identity=identity or "api_key")
+    def sovereign(
+        auth_method: AuthMethod = AuthMethod.API_KEY,
+        identity: str = None,
+        *,
+        credential: str | None = None,
+    ) -> "CallerContext":
+        return CallerContext(
+            role=CallerRole.SOVEREIGN,
+            auth_method=auth_method,
+            identity=identity or "api_key",
+            credential_fingerprint=(
+                sovereign_key_fingerprint(credential)
+                if credential is not None
+                else None
+            ),
+        )
 
     @staticmethod
     def authenticated(identity: str, auth_method: AuthMethod = AuthMethod.OAUTH_SESSION) -> "CallerContext":

@@ -8,6 +8,8 @@ pass through intact.
 """
 
 import os
+import subprocess
+import sys
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -67,6 +69,22 @@ def _build_app():
             "auth_method": caller.auth_method.value,
             "is_sovereign": caller.is_sovereign,
         }
+
+    @app.get("/api/test/restart-authority-after-rotation")
+    async def restart_authority_after_rotation(request: Request):
+        from kestrel_sovereign.auth import caller_context_scope
+        from kestrel_sovereign.features.restart_coordinator.authority import (
+            RestartAuthorityError,
+            require_restart_request_authority,
+        )
+
+        os.environ["KESTREL_API_KEY"] = "rotated-after-authentication"
+        try:
+            with caller_context_scope(request.state.caller):
+                require_restart_request_authority()
+        except RestartAuthorityError as error:
+            return {"accepted": False, "error": str(error)}
+        return {"accepted": True}
 
     @app.get("/api/agents")
     async def peer_directory_route(request: Request):
@@ -243,6 +261,43 @@ def test_random_peer_key_survives_ephemeral_sovereign_bootstrap(monkeypatch):
 
     assert temporary_sovereign != first
     assert second == first == os.environ["KESTREL_PEER_API_KEY"]
+
+
+def test_temporary_sovereign_key_provenance_survives_a_child_process(monkeypatch):
+    """A host child must not reinterpret its inherited bootstrap key as stable."""
+
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    temporary = server_module.get_api_key()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from kestrel_sovereign.security.sovereign_key import "
+                "is_ephemeral_sovereign_key; "
+                "import os; "
+                "print(is_ephemeral_sovereign_key(os.environ['KESTREL_API_KEY']))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+    )
+
+    assert temporary == os.environ["KESTREL_API_KEY"]
+    assert proc.stdout.strip() == "True"
+
+
+def test_restart_authority_is_bound_to_the_key_authenticated_at_entry(client):
+    response = client.get(
+        "/api/test/restart-authority-after-rotation",
+        headers={"X-API-Key": API_KEY},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is False
+    assert "authenticated credential" in response.json()["error"]
 
 
 def test_explicit_peer_key_survives_sovereign_rotation(monkeypatch):

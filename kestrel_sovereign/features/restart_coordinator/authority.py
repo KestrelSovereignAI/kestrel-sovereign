@@ -25,6 +25,7 @@ from kestrel_sovereign.auth import current_caller_context
 from kestrel_sovereign.security.sovereign_key import (
     is_ephemeral_sovereign_key,
     normalize_sovereign_api_key,
+    sovereign_key_fingerprint,
 )
 
 
@@ -70,8 +71,19 @@ def require_restart_request_authority() -> str:
     if not isinstance(actor, str) or not actor.strip():
         raise RestartAuthorityError("sovereign caller has no durable actor identity")
     # Validate the signing key before callers perform any update-path
-    # inspection. The exact request is sealed later, immediately before insert.
-    _sovereign_secret()
+    # inspection, then bind it to the credential the endpoint actually
+    # authenticated. A request admitted under key A cannot mint authority under
+    # newly rotated key B merely because its agent turn is still running.
+    secret = _sovereign_secret()
+    authenticated_fingerprint = caller.credential_fingerprint
+    if not isinstance(authenticated_fingerprint, str) or not hmac.compare_digest(
+        authenticated_fingerprint,
+        sovereign_key_fingerprint(secret.decode("utf-8")),
+    ):
+        raise RestartAuthorityError(
+            "whole-host restart authority no longer matches the authenticated "
+            "credential at request entry"
+        )
     return actor.strip()
 
 
