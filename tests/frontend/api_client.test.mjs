@@ -151,6 +151,273 @@ test('request hits canonical paths — no companion-prefix rewriting (#863)', as
     assert.equal(client.isMultiAgentMode(), false);
 });
 
+test('host lifecycle controls follow caller-scoped discovery and fail closed on refresh error', async () => {
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            mode: 'multi_agent',
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(403, { detail: 'forbidden' }),
+    );
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-secret' },
+    });
+
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('create'), true);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    await assert.rejects(() => client.getAgents(), /forbidden/i);
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
+test('older lifecycle discovery cannot overwrite a newer principal classification', async () => {
+    let resolveOlder;
+    let resolveNewer;
+    const older = new Promise((resolve) => { resolveOlder = resolve; });
+    const newer = new Promise((resolve) => { resolveNewer = resolve; });
+    let call = 0;
+    const fetchFn = async () => (++call === 1 ? older : newer);
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-secret' },
+    });
+
+    const olderRefresh = client.getAgents();
+    const newerRefresh = client.getAgents();
+    resolveNewer(jsonResponse(200, {
+        agents: [],
+        can_create_agents: false,
+        can_delete_agents: false,
+    }));
+    await newerRefresh;
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+
+    resolveOlder(jsonResponse(200, {
+        agents: [],
+        can_create_agents: true,
+        can_delete_agents: true,
+    }));
+    await olderRefresh;
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
+test('host lifecycle authority is invalidated when mutable auth credentials change', async () => {
+    let token = 'sovereign-machine-key';
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            const signed = new Headers(headers);
+            signed.set('Authorization', `Bearer ${token}`);
+            return signed;
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(200, { models: [] }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    token = 'ordinary-user-jwt';
+    await client.request('/api/models');
+
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
+test('lifecycle mutation aborts before fetch when credentials changed after discovery', async () => {
+    let token = 'sovereign-machine-key';
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return { ...headers, Authorization: `Bearer ${token}` };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        agents: [],
+        can_create_agents: true,
+        can_delete_agents: true,
+    }));
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    token = 'ordinary-user-jwt';
+
+    await assert.rejects(
+        () => client.createAgent('must-not-dispatch'),
+        /authority must be refreshed/i,
+    );
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+});
+
+test('bearer changes invalidate authority even beside a constant API-key header', async () => {
+    let bearer = 'sovereign-machine-key';
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return {
+                ...headers,
+                'X-API-Key': 'stale-or-proxy-key',
+                Authorization: `Bearer ${bearer}`,
+            };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(200, { models: [] }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    bearer = 'ordinary-user-jwt';
+    await client.request('/api/models');
+
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
+test('sequence-form auth headers are normalized before lifecycle tracking', async () => {
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return [
+                ...Object.entries(headers),
+                ['Authorization', 'Bearer sequence-token'],
+            ];
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        agents: [],
+        can_create_agents: true,
+        can_delete_agents: true,
+    }));
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+
+    assert.equal(
+        new Headers(fetchFn.calls[0].options.headers).get('Authorization'),
+        'Bearer sequence-token',
+    );
+    assert.equal(client.canManageHostAgentLifecycle('create'), true);
+});
+
+test('volatile signing headers do not change a stable API-key principal', async () => {
+    let nonce = 0;
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            nonce += 1;
+            return {
+                ...headers,
+                'X-API-Key': 'stable-sovereign-key',
+                Authorization: `Signature request-${nonce}`,
+                'X-Request-Nonce': String(nonce),
+            };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(200, { models: [] }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    await client.request('/api/models');
+
+    assert.equal(client.canManageHostAgentLifecycle('create'), true);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+});
+
+test('provider-supplied principal identity partitions rotating request credentials', async () => {
+    let principal = 'sovereign';
+    let token = 0;
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            token += 1;
+            return { ...headers, Authorization: `Signature ${token}` };
+        },
+        getPrincipalIdentity() { return principal; },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(200, { models: [] }),
+        jsonResponse(200, { models: [] }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    await client.request('/api/models');
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    principal = 'ordinary-user';
+    await client.request('/api/models');
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
+test('a 401 invalidates cached host lifecycle authority before auth recovery', async () => {
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return { ...headers, Authorization: 'Bearer expired-sovereign-key' };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(401, { detail: 'expired' }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    await assert.rejects(() => client.request('/api/models'), /expired/i);
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
 test('renameConversation patches the conversation display name', async () => {
     const fetchFn = createFetchQueue(jsonResponse(200, {
         success: true,

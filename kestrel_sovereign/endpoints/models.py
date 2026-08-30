@@ -1,5 +1,5 @@
 """Model, wallet, and IPFS status endpoints."""
-from fastapi import APIRouter, HTTPException, Request, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
@@ -41,6 +41,18 @@ router = APIRouter(tags=["models"])
 
 # Validation: agent names must be alphanumeric + hyphens/underscores, 1-64 chars
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+
+
+def require_sovereign_host_lifecycle(request: Request):
+    """Admit only the sovereign-key principal to host lifecycle mutations."""
+
+    caller = get_caller(request)
+    if getattr(caller, "is_sovereign", False) is not True:
+        raise HTTPException(
+            status_code=403,
+            detail="Sovereign authority is required.",
+        )
+    return caller
 
 
 def _key_storage_privacy_detail() -> str:
@@ -188,6 +200,10 @@ async def get_agents(request: Request):
     can render a DEMO MODE banner — the browser-side defence in #868.
     """
     server_demo_mode = bool(getattr(request.app.state, "demo_mode", False))
+    caller = get_caller(request)
+    can_manage_host_lifecycle = (
+        getattr(caller, "is_sovereign", False) is True
+    )
 
     def _is_demo(a) -> bool:
         return getattr(a, "is_demo", False) is True
@@ -232,7 +248,8 @@ async def get_agents(request: Request):
             # POST /api/agents works on this in-process manager. Keep the
             # capability explicit so older clients can safely treat absence as
             # false instead of attempting a route the host may not expose.
-            "can_create_agents": True,
+            "can_create_agents": can_manage_host_lifecycle,
+            "can_delete_agents": can_manage_host_lifecycle,
         }
 
     # Single-agent mode
@@ -248,6 +265,7 @@ async def get_agents(request: Request):
             "mode": "standalone",
             "server_demo_mode": server_demo_mode,
             "can_create_agents": False,
+            "can_delete_agents": False,
         }
     except HTTPException:
         raise
@@ -256,7 +274,10 @@ async def get_agents(request: Request):
         raise HTTPException(status_code=500, detail="Error retrieving agents.")
 
 
-@router.post("/api/agents")
+@router.post(
+    "/api/agents",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 @limiter.limit("5/minute")
 async def create_agent(request: Request, body: CreateAgentRequest):
     """Create a new agent via inception.
@@ -592,7 +613,10 @@ def _annotate_custody_registration_detail(
     return detail
 
 
-@router.delete("/api/agents/{agent_name}")
+@router.delete(
+    "/api/agents/{agent_name}",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 @limiter.limit("10/minute")
 async def delete_agent(
     request: Request,

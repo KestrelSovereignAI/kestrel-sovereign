@@ -615,6 +615,26 @@ export function createApiClient({
         // map existed the frontend pane never learned its durable
         // session id and stayed anchored on null indefinitely.
         effectiveSessionIds: new Map(),
+        // Caller-scoped host lifecycle authority learned from the most recent
+        // authenticated /api/agents response. These are reset before every
+        // refresh, so a failed request or auth change fails closed instead of
+        // retaining a prior sovereign session's controls.
+        hostLifecycleAuthority: {
+            classified: false,
+            create: false,
+            delete: false,
+            authGeneration: null,
+        },
+        // Monotonic request generation for caller-scoped lifecycle discovery.
+        // An older sovereign response must never overwrite a newer OAuth/JWT
+        // response when /api/agents refreshes overlap across an auth change.
+        hostLifecycleAuthorityGeneration: 0,
+        // Changes whenever the credential material attached by the auth
+        // provider changes. Lifecycle discovery records the generation used
+        // for its actual HTTP dispatch, so a response from one principal can
+        // never authorize controls after another principal takes over.
+        authIdentity: null,
+        authIdentityGeneration: 0,
         // Cached double-submit CSRF token for host-scoped state-changing
         // requests (#2293). Fetched lazily from GET /api/host/csrf (which also
         // sets the matching cookie) and reused for the page's lifetime. Only
@@ -623,6 +643,73 @@ export function createApiClient({
         csrfToken: null,
     };
     const hostAgentChangeListeners = new Set();
+
+    function invalidateHostLifecycleAuthority() {
+        state.hostLifecycleAuthority = {
+            classified: false,
+            create: false,
+            delete: false,
+            authGeneration: null,
+        };
+    }
+
+    function headerEntries(headers) {
+        // Fetch accepts every HeadersInit representation: Headers/Map-like
+        // iterables, sequences of pairs, and plain records.  Normalizing
+        // through Headers is the one browser-owned interpretation of all
+        // three; calling `.entries()` on a sequence instead yields numeric
+        // array indexes and mistakes the nested pair for a header value.
+        return [...new Headers(headers || {}).entries()];
+    }
+
+    function isRequestSignature(value) {
+        // ``Authorization: Signature …`` authenticates one request, not a
+        // stable caller. Other schemes (especially Bearer) can determine the
+        // server principal and must participate even when X-API-Key is also
+        // present—the server falls through to Bearer when that key is stale.
+        return /^\s*signature(?:\s|$)/i.test(String(value));
+    }
+
+    function credentialIdentity(signedHeaders) {
+        const headers = new Map(
+            headerEntries(signedHeaders).map(
+                ([key, value]) => [key.toLowerCase(), String(value)],
+            ),
+        );
+        const credentials = [];
+        for (const name of ['authorization', 'proxy-authorization', 'x-api-key']) {
+            const value = headers.get(name);
+            if (value === undefined) continue;
+            if (name !== 'x-api-key' && isRequestSignature(value)) continue;
+            credentials.push([name, value]);
+        }
+        return JSON.stringify(credentials);
+    }
+
+    async function applyTrackedAuth(headers) {
+        const unsignedHeaders = { ...(headers || {}) };
+        const signedHeaders = await auth.applyAuth({ ...unsignedHeaders });
+        let identity;
+        if (typeof auth.getPrincipalIdentity === 'function') {
+            // Embedded hosts that use per-request signatures can expose the
+            // stable, host-owned principal identity explicitly.  This value is
+            // only a cache partition: the server response remains the sole
+            // source of lifecycle authority.
+            const principal = await auth.getPrincipalIdentity();
+            identity = `principal:${String(principal ?? '')}`;
+        } else {
+            // Ignore only an explicit request-signature authorization scheme.
+            // Every credential header that can select the server caller stays
+            // in the partition, including Bearer alongside a stale X-API-Key.
+            identity = credentialIdentity(signedHeaders);
+        }
+        if (state.authIdentity !== null && state.authIdentity !== identity) {
+            state.authIdentityGeneration += 1;
+            invalidateHostLifecycleAuthority();
+        }
+        state.authIdentity = identity;
+        return signedHeaders;
+    }
 
     // Fetch (once) and cache the host CSRF token. Returns null on failure so a
     // caller degrades to sending no header (the server then 403s a genuinely
@@ -661,6 +748,12 @@ export function createApiClient({
         // in progress even when the reader itself resolves normally; never
         // turn that cancellation into an auth refresh or typed 401.
         throwIfAborted(signal);
+        // The principal that produced the cached lifecycle classification has
+        // just been rejected. Fail closed before auth refresh mutates or clears
+        // its credentials, even if recovery itself throws or redirects.
+        state.authIdentityGeneration += 1;
+        state.authIdentity = null;
+        invalidateHostLifecycleAuthority();
         try {
             const recovery = await auth.onUnauthorized();
             // Cancellation can happen while a refresh/redirect callback is
@@ -686,7 +779,12 @@ export function createApiClient({
     // out, an explicit-agent call would either skip auth-refresh or
     // re-implement it (drift risk). The url passed in is FINAL — the
     // caller has already applied host-agent prefixing if needed.
-    async function performRequest(url, options = {}, retried = false) {
+    async function performRequest(
+        url,
+        options = {},
+        retried = false,
+        onAuthPrepared = null,
+    ) {
         let alreadyRetried = retried;
         let pendingUnauthorizedError = null;
 
@@ -694,6 +792,9 @@ export function createApiClient({
             let headers;
             try {
                 headers = await buildHeaders(options.headers);
+                if (typeof onAuthPrepared === 'function') {
+                    onAuthPrepared(state.authIdentityGeneration);
+                }
             } catch (error) {
                 throwIfAborted(options.signal);
                 if (pendingUnauthorizedError && !isAbortError(error)) {
@@ -745,6 +846,27 @@ export function createApiClient({
         }
     }
 
+    async function performHostLifecycleMutation(operation, endpoint, options) {
+        return performRequest(
+            buildHostUrl(endpoint),
+            options,
+            false,
+            (preparedAuthGeneration) => {
+                const authority = state.hostLifecycleAuthority;
+                if (
+                    authority.classified !== true
+                    || authority[operation] !== true
+                    || authority.authGeneration !== preparedAuthGeneration
+                ) {
+                    invalidateHostLifecycleAuthority();
+                    throw new Error(
+                        'Host lifecycle authority must be refreshed for the active caller.',
+                    );
+                }
+            },
+        );
+    }
+
     const client = {
         async init() {
             await auth.ensureAuthenticated();
@@ -789,14 +911,42 @@ export function createApiClient({
 
         health: () => client.request('/health'),
         getAgentInfo: () => client.request('/api/agent/info'),
-        getAgents: () => client.request('/api/agents'),
+        async getAgents() {
+            const generation = ++state.hostLifecycleAuthorityGeneration;
+            invalidateHostLifecycleAuthority();
+            let responseAuthGeneration = null;
+            const data = await performRequest(
+                buildHostUrl('/api/agents'),
+                {},
+                false,
+                (authGeneration) => {
+                    responseAuthGeneration = authGeneration;
+                },
+            );
+            if (
+                generation === state.hostLifecycleAuthorityGeneration
+                && responseAuthGeneration === state.authIdentityGeneration
+            ) {
+                state.hostLifecycleAuthority = {
+                    classified: true,
+                    create: data.can_create_agents === true,
+                    delete: data.can_delete_agents === true,
+                    authGeneration: responseAuthGeneration,
+                };
+            }
+            return data;
+        },
+        canManageHostAgentLifecycle(operation) {
+            const authority = state.hostLifecycleAuthority;
+            return authority.classified === true && authority[operation] === true;
+        },
         // Create a fresh top-level (parentless) agent (#2351) — the
         // multi-agent manager's ``POST /api/agents`` (see
         // endpoints/models.py::create_agent). Runs inception + load and returns
         // 409 on a duplicate name / 400 on a bad name; the standalone console's
         // Create Agent dialog surfaces those details inline. Host-level endpoint
         // — never host-agent-prefixed.
-        createAgent: (name) => client.request('/api/agents', {
+        createAgent: (name) => performHostLifecycleMutation('create', '/api/agents', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name }),
@@ -808,10 +958,14 @@ export function createApiClient({
         // the destructive opt-in header like every other destructive UI action
         // (#766) so the demo-isolation rail sees an intentional, user-initiated
         // delete. Host-level endpoint — never host-agent-prefixed.
-        deleteAgent: (name) => client.request(`/api/agents/${encodeURIComponent(name)}`, {
-            method: 'DELETE',
-            headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
-        }),
+        deleteAgent: (name) => performHostLifecycleMutation(
+            'delete',
+            `/api/agents/${encodeURIComponent(name)}`,
+            {
+                method: 'DELETE',
+                headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
+            },
+        ),
         getIdentity: () => client.request('/api/identity'),
         updateIdentity: (data) => client.request('/api/identity', {
             method: 'PATCH',
@@ -1215,7 +1369,7 @@ export function createApiClient({
         // anything that needs Content-Type control (FormData) or a non-JSON
         // protocol (EventSource preflight, etc.).
         async applyAuth(headers = {}) {
-            return await auth.applyAuth({ ...headers });
+            return await applyTrackedAuth(headers);
         },
         parseResponseError,
         setHostAgent(agentName) {
@@ -1314,7 +1468,7 @@ export function createApiClient({
             'Content-Type': 'application/json',
             ...extraHeaders,
         };
-        return await auth.applyAuth(headers);
+        return await applyTrackedAuth(headers);
     }
 
     return client;

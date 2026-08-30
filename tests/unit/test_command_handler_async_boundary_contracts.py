@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sovereign.command_handler import CommandHandler
+from kestrel_sovereign.auth import CallerContext
 
 
 def test_privacy_save_handler_is_explicitly_async():
@@ -60,7 +61,9 @@ async def test_handle_awaits_create_agent_command():
 
     handler = CommandHandler(agent)
 
-    result = await handler.handle("!create-agent buddy")
+    result = await handler.handle(
+        "!create-agent buddy", caller=CallerContext.sovereign()
+    )
 
     assert result == "Created trusted agent 'buddy'"
     agent.create_trusted_agent.assert_awaited_once_with("buddy")

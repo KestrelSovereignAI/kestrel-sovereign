@@ -3591,7 +3591,9 @@ async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backen
             status=TaskStatus(state=TaskState.SUBMITTED),
             history=[Message(role="user", parts=[TextPart(text="build the thing")])],
             metadata={"task_type": "audit", "user_id": user_a, "marker": "first"},
-        )
+        ),
+        creator_agent_id="did:test:creator-a",
+        recipient_agent_id="did:test:recipient-a",
     )
     await store.save(
         Task(
@@ -3599,7 +3601,9 @@ async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backen
             sessionId=session_a,
             status=TaskStatus(state=TaskState.COMPLETED),
             metadata={"task_type": "audit", "user_id": user_a, "marker": "second"},
-        )
+        ),
+        creator_agent_id="did:test:creator-a",
+        recipient_agent_id="did:test:recipient-a",
     )
     await store.save(
         Task(
@@ -3607,7 +3611,9 @@ async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backen
             sessionId=session_b,
             status=TaskStatus(state=TaskState.SUBMITTED),
             metadata={"task_type": "audit", "user_id": user_b, "marker": "other"},
-        )
+        ),
+        creator_agent_id="did:test:creator-b",
+        recipient_agent_id="did:test:recipient-b",
     )
 
     await store.update_status(
