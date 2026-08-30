@@ -57,7 +57,6 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 )
 from kestrel_sovereign.stop import (
     CancellationAuthority,
-    CooperativeStopTarget,
     MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
     StopCleanupRegistry,
@@ -65,6 +64,7 @@ from kestrel_sovereign.stop import (
     StopScope,
     UnavailableStopReceiptStore,
 )
+from kestrel_sovereign.stop.runtime_target import build_runtime_stop_target
 from kestrel_sovereign.telemetry import current_trace_identity
 
 logger = logging.getLogger(__name__)
