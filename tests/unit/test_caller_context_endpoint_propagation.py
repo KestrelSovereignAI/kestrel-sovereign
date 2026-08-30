@@ -470,7 +470,7 @@ def test_bridge_stream_response_failure_completes_owned_lifecycle(monkeypatch):
 
         monkeypatch.setattr(
             bridge_router,
-            "StreamingResponse",
+            "ClosingStreamingResponse",
             ResponseConstructionFailure,
         )
         app.include_router(bridge_router.get_router())
