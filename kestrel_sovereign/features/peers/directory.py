@@ -243,6 +243,9 @@ class LocalHostPeerDirectory:
         local_cancel: Optional[Callable[..., Any]] = None,
         local_get: Optional[Callable[..., Any]] = None,
         local_subscribe: Optional[Callable[..., Any]] = None,
+        principal_payload_factory: Optional[
+            Callable[[str, str], Mapping[str, Any]]
+        ] = None,
     ) -> None:
         self._host_url = host_url.rstrip("/")
         self._api_key = api_key
@@ -251,6 +254,10 @@ class LocalHostPeerDirectory:
         self._local_cancel = local_cancel
         self._local_get = local_get
         self._local_subscribe = local_subscribe
+        # Subprocess peers cannot receive the manager's process-local creator
+        # capability. They authenticate HTTP reads with the same signed,
+        # replay-protected A2A envelope used for mutations.
+        self._principal_payload_factory = principal_payload_factory
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -496,12 +503,39 @@ class LocalHostPeerDirectory:
                         "Local host returned an invalid A2A task result"
                     )
                 return result
-            # The shared host API key proves sovereign transport access, not
-            # which peer created this task.  Legacy HTTP GET carried no signed
-            # requester principal and is therefore not a safe fallback.
-            raise PeerAccessDeniedError(
-                "Local A2A result reads require host-attested creator authority"
-            )
+            if not callable(self._principal_payload_factory):
+                # The shared host API key proves sovereign transport access,
+                # not which peer created this task.
+                raise PeerAccessDeniedError(
+                    "Local A2A result reads require authenticated creator authority"
+                )
+            try:
+                payload = self._principal_payload_factory(task_id, "read_task")
+            except Exception as exc:
+                raise PeerAccessDeniedError(
+                    "Local A2A result read authentication failed"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise PeerProtocolError(
+                    "Local A2A result read authentication is malformed"
+                )
+            async with self._client_factory() as client:
+                response = await client.post(
+                    self._peer_url(
+                        authorized_peer,
+                        f"api/agent/tasks/{quote(task_id, safe='')}/read",
+                    ),
+                    json=dict(payload),
+                    headers=self._headers(),
+                    timeout=httpx.Timeout(
+                        connect=PEER_CONNECT_TIMEOUT,
+                        read=PEER_CONNECT_TIMEOUT,
+                        write=PEER_CONNECT_TIMEOUT,
+                        pool=PEER_CONNECT_TIMEOUT,
+                    ),
+                )
+                self._raise_for_route_status(response, action="fetching A2A task")
+                return self._as_mapping(response, action="fetching A2A task")
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:
@@ -605,11 +639,56 @@ class LocalHostPeerDirectory:
                 if callable(close):
                     await close()
             return
-        # As with point reads, an API key plus a task id is not creator proof.
-        # A managed host injects the process-local capability above.
-        raise PeerAccessDeniedError(
-            "Local A2A subscriptions require host-attested creator authority"
+        if not callable(self._principal_payload_factory):
+            # As with point reads, an API key plus a task id is not creator
+            # proof. A managed in-process host injects the capability above;
+            # subprocess peers must carry a signed principal envelope.
+            raise PeerAccessDeniedError(
+                "Local A2A subscriptions require authenticated creator authority"
+            )
+        try:
+            payload = self._principal_payload_factory(task_id, "subscribe_task")
+        except Exception as exc:
+            raise PeerAccessDeniedError(
+                "Local A2A subscription authentication failed"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise PeerProtocolError(
+                "Local A2A subscription authentication is malformed"
+            )
+        remaining = _remaining()
+        if remaining <= 0:
+            return
+        timeout = httpx.Timeout(
+            connect=min(PEER_CONNECT_TIMEOUT, remaining),
+            read=remaining,
+            write=min(PEER_CONNECT_TIMEOUT, remaining),
+            pool=min(PEER_CONNECT_TIMEOUT, remaining),
         )
+        try:
+            async with self._client_factory(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    self._peer_url(
+                        authorized_peer,
+                        f"api/agent/tasks/{quote(task_id, safe='')}/subscribe",
+                    ),
+                    json=dict(payload),
+                    headers=self._headers(),
+                ) as response:
+                    if response.status_code == 404:
+                        raise PeerSubscriptionUnavailableError(
+                            "Peer does not expose A2A task subscriptions"
+                        )
+                    self._raise_for_route_status(
+                        response, action="subscribing to A2A task"
+                    )
+                    async for event in iter_sse_events(response):
+                        yield event
+        except PeerDirectoryError:
+            raise
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            raise PeerTransportError("A2A subscription transport failed") from exc
 
     def _peer_url(self, peer: PeerIdentity, suffix: str) -> str:
         return (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -25,7 +26,10 @@ from kestrel_sovereign.features.peers.directory import (
     PeerTaskConflictError,
     PeerTransportError,
 )
-from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.features.peers.feature import (
+    OutboundSigningError,
+    PeersFeature,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 
@@ -650,6 +654,108 @@ async def test_local_task_read_has_no_api_key_only_http_fallback():
 
     # Only directory reauthorization used HTTP; no task row was requested.
     assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_subprocess_task_reads_use_signed_http_principal_envelopes():
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=[{
+                    "id": "did:local:recipient",
+                    "routing_name": "recipient-route",
+                }],
+            )
+        payload = json.loads(request.content)
+        assert payload["id"] == "private-task"
+        assert payload["metadata"]["signature"] == {"proof": "signed"}
+        if request.url.path.endswith("/read"):
+            assert payload["metadata"]["a2a_verb"] == "read_task"
+            return httpx.Response(
+                200,
+                json={"id": "private-task", "status": "completed"},
+            )
+        assert request.url.path.endswith("/subscribe")
+        assert payload["metadata"]["a2a_verb"] == "subscribe_task"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                'event: status\n'
+                'data: {"id":"private-task","final":true}\n\n'
+            ),
+        )
+
+    def payload_factory(task_id: str, verb: str):
+        return {
+            "id": task_id,
+            "sessionId": f"a2a-{verb}:{task_id}",
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": f"{verb}:{task_id}"}],
+            },
+            "metadata": {
+                "sender": "did:local:creator",
+                "a2a_verb": verb,
+                "signature": {"proof": "signed"},
+            },
+        }
+
+    transport = httpx.MockTransport(handler)
+    adapter = LocalHostPeerDirectory(
+        "http://local-host",
+        api_key="transport-key",
+        client_factory=lambda *args, **kwargs: httpx.AsyncClient(
+            *args,
+            transport=transport,
+            **kwargs,
+        ),
+        principal_payload_factory=payload_factory,
+    )
+    requester = PeerRequester("did:local:creator", object())
+    peer = PeerIdentity(
+        agent_id="did:local:recipient",
+        slug="recipient",
+        routing_key="recipient-route",
+    )
+
+    result = await adapter.get_a2a_task(requester, peer, "private-task")
+    events = [
+        event async for event in adapter.subscribe_a2a_task(
+            requester,
+            peer,
+            "private-task",
+            timeout_seconds=5,
+        )
+    ]
+
+    assert result["id"] == "private-task"
+    assert [(event.event, event.data) for event in events] == [
+        ("status", '{"id":"private-task","final":true}')
+    ]
+    assert [request.method for request in requests] == [
+        "GET", "POST", "GET", "POST"
+    ]
+    assert requests[1].url.path.endswith("/private-task/read")
+    assert requests[3].url.path.endswith("/private-task/subscribe")
+
+
+def test_subprocess_principal_payload_refuses_unsigned_identity():
+    agent = SimpleNamespace(
+        identity=None,
+        did="did:local:legacy",
+        _agent_name="legacy",
+    )
+    feature = PeersFeature(agent)
+    feature._own_name = "legacy"
+
+    with pytest.raises(OutboundSigningError) as exc_info:
+        feature._build_principal_action_payload("private-task", "read_task")
+    assert exc_info.value.code == "principal_signature_required"
 
 
 @pytest.mark.asyncio

@@ -173,7 +173,8 @@ async def test_worker_wires_its_recipient_into_pending_poll():
     manager = SimpleNamespace(get_pending_tasks=AsyncMock(return_value=[]))
     worker = TaskWorker(
         manager,
-        agent_name=RECIPIENT,
+        agent_name="Recipient Display Name",
+        recipient_agent_id=RECIPIENT,
         max_concurrent=3,
     )
 
@@ -183,6 +184,27 @@ async def test_worker_wires_its_recipient_into_pending_poll():
         limit=3,
         recipient_agent_id=RECIPIENT,
     )
+
+
+def test_worker_derives_recipient_from_manager_host_principal():
+    manager = SimpleNamespace(
+        host_agent_id=RECIPIENT,
+        get_pending_tasks=AsyncMock(return_value=[]),
+    )
+
+    worker = TaskWorker(manager, agent_name="Recipient Display Name")
+
+    assert worker.recipient_agent_id == RECIPIENT
+
+
+def test_worker_rejects_display_name_as_recipient_authority():
+    manager = SimpleNamespace(
+        host_agent_id=None,
+        get_pending_tasks=AsyncMock(return_value=[]),
+    )
+
+    with pytest.raises(ValueError, match="durable recipient_agent_id"):
+        TaskWorker(manager, agent_name="Recipient Display Name")
 
 
 @pytest.mark.asyncio
