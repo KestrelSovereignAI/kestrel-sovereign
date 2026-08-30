@@ -3,11 +3,64 @@ Unit tests for agent request cancellation (stop button).
 """
 
 import asyncio
+import inspect
 import json
 from contextvars import ContextVar
+from dataclasses import replace
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock
+
+
+class _MemoryStopReceiptStore:
+    """Endpoint-test receipt store with the production replay contract."""
+
+    def __init__(self):
+        self.records = {}
+
+    async def load(self, request):
+        from kestrel_sovereign.stop import StopReceiptConflict
+
+        record = self.records.get(request.correlation_id)
+        if record is None:
+            return None
+        prior_request, receipt = record
+        if prior_request != request:
+            raise StopReceiptConflict("conflicting replay")
+        return receipt
+
+    async def persist(self, request, outcomes):
+        from kestrel_sovereign.stop import StopReceipt, StopScope
+
+        replay = await self.load(request)
+        if replay is not None:
+            return replay
+        receipt_id = f"test-receipt-{request.correlation_id}"
+        receipted = tuple(
+            replace(outcome, receipt_id=receipt_id) for outcome in outcomes
+        )
+        receipt = StopReceipt(
+            receipt_id=receipt_id,
+            operation_id=request.correlation_id,
+            request_fingerprint="test-fingerprint",
+            scope=request.scope.value,
+            actor_id=request.actor_id,
+            requested_target=request.target,
+            target_agent_id=request.target_agent_id,
+            reason=request.reason,
+            cascade=request.cascade,
+            occurred_at="2026-08-28T00:00:00+00:00",
+            turn_id=(request.target if request.scope is StopScope.TURN else None),
+            span_id=None,
+            trace_id=None,
+            outcomes=receipted,
+        )
+        self.records[request.correlation_id] = (request, receipt)
+        return receipt
+
+
+def _attach_test_stop_receipts(app):
+    app.state.stop_receipt_store = _MemoryStopReceiptStore()
 
 
 @pytest.mark.asyncio
@@ -67,62 +120,6 @@ async def test_process_input_is_the_canonical_active_turn_inventory():
     assert agent._request_operation_tasks == {}
     release_owner.set()
     await turn
-
-
-@pytest.mark.asyncio
-async def test_stale_caller_cancellation_count_does_not_escape_isolated_stop():
-    """Only cancellation added during the child await belongs to the caller."""
-
-    from kestrel_sovereign.agent.invocation import (
-        InvocationCancelledError,
-        bind_async_invocation,
-    )
-    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
-
-    started = asyncio.Event()
-    continued = asyncio.Event()
-
-    class Owner(RequestLifecycleMixin):
-        def __init__(self):
-            self._current_request_id = None
-            self._active_request_ids = set()
-            self._active_request_counts = {}
-            self._active_request_generations = {}
-            self._next_request_generation = 0
-            self._abandoned_request_generations = {}
-            self._abandoned_request_dispositions = {}
-            self._active_request_started_at = {}
-            self._cancelled_requests = set()
-            self._cancelled_request_generations = set()
-            self._pending_request_cancellations = {}
-            self._request_completion_events = {}
-
-        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-        async def run(self, *, invocation_id=None):
-            started.set()
-            await asyncio.Event().wait()
-
-    owner = Owner()
-
-    async def persistent_caller():
-        caller = asyncio.current_task()
-        assert caller is not None
-        caller.cancel()
-        try:
-            await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            pass
-        assert caller.cancelling() == 1
-        with pytest.raises(InvocationCancelledError):
-            await owner.run(invocation_id="stale-caller-cancel")
-        continued.set()
-
-    turn = asyncio.create_task(persistent_caller())
-    await started.wait()
-    assert owner.cancel_current_request("stale-caller-cancel") is True
-    await asyncio.wait_for(continued.wait(), timeout=1)
-    await turn
-    assert not owner._abandoned_generations("stale-caller-cancel")
 
 
 @pytest.mark.asyncio
@@ -225,6 +222,122 @@ async def test_stop_racing_with_isolated_completion_suppresses_normal_result():
 
 
 @pytest.mark.asyncio
+async def test_stop_waits_for_side_effecting_tool_batch_boundary():
+    """A synchronous Stop cannot cancel a tool halfway through its effect."""
+
+    from kestrel_sovereign.agent.invocation import (
+        InvocationCancelledError,
+        bind_async_invocation,
+    )
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    batch_started = asyncio.Event()
+    release_batch = asyncio.Event()
+    batch_completed = asyncio.Event()
+
+    class Owner(RequestLifecycleMixin):
+        _execute_tool_batch_at_stop_boundary = (
+            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
+        )
+
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+
+        async def _execute_tool_batch(self):
+            batch_started.set()
+            await release_batch.wait()
+            batch_completed.set()
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            await self._execute_tool_batch_at_stop_boundary()
+            return "must not publish"
+
+    owner = Owner()
+    turn = asyncio.create_task(owner.run(invocation_id="safe-tool-batch"))
+    await batch_started.wait()
+
+    assert owner.cancel_current_request("safe-tool-batch") is True
+    await asyncio.sleep(0)
+    assert batch_completed.is_set() is False
+    assert turn.done() is False
+
+    release_batch.set()
+    with pytest.raises(InvocationCancelledError):
+        await turn
+    assert batch_completed.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_owner_preserves_transition_lock_reentry():
+    """The lifecycle owner cannot deadlock a transition-locked tool."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        ReentrantTransitionLock,
+    )
+
+    class Owner:
+        _execute_tool_batch_at_stop_boundary = (
+            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
+        )
+        _capture_transition_reentry_token = (
+            OrchestratorEngineMixin._capture_transition_reentry_token
+        )
+
+        def __init__(self):
+            self.transition_lock = ReentrantTransitionLock()
+
+        def _get_privacy_transition_lock(self):
+            return self.transition_lock
+
+        async def _execute_tool_batch(self):
+            async with self.transition_lock:
+                return "tool completed"
+
+    owner = Owner()
+
+    async def run_transition_locked_turn():
+        async with owner.transition_lock:
+            return await owner._execute_tool_batch_at_stop_boundary()
+
+    result = await asyncio.wait_for(
+        run_transition_locked_turn(),
+        timeout=0.1,
+    )
+
+    assert result == "tool completed"
+
+
+def test_orchestrator_paths_wire_every_tool_batch_through_stop_boundary():
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    for handler in (
+        OrchestratorEngineMixin._handle_orchestrator_response,
+        OrchestratorEngineMixin._handle_orchestrator_response_streaming,
+    ):
+        source = inspect.getsource(handler)
+        assert "await self._execute_tool_batch_at_stop_boundary(" in source
+        assert "await self._execute_tool_batch(" not in source
+
+
+@pytest.mark.asyncio
 async def test_cancelled_isolated_turn_cleanup_failure_is_abandoned():
     from kestrel_sovereign.agent.invocation import bind_async_invocation
     from kestrel_sovereign.agent.request_lifecycle import (
@@ -266,51 +379,12 @@ async def test_cancelled_isolated_turn_cleanup_failure_is_abandoned():
 
 
 @pytest.mark.asyncio
-async def test_caller_cancellation_after_stop_marker_is_clean_completion():
-    """A canceled transport owner does not imply failed child cleanup."""
-
+async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
     from kestrel_sovereign.agent.invocation import bind_async_invocation
     from kestrel_sovereign.agent.request_lifecycle import (
         RequestCompletionDisposition,
         RequestLifecycleMixin,
     )
-
-    started = asyncio.Event()
-
-    class Owner(RequestLifecycleMixin):
-        def __init__(self):
-            self._current_request_id = None
-            self._active_request_ids = set()
-            self._active_request_counts = {}
-            self._active_request_started_at = {}
-            self._cancelled_requests = set()
-            self._request_completion_events = {}
-
-        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-        async def run(self, *, invocation_id=None):
-            started.set()
-            await asyncio.Event().wait()
-
-    owner = Owner()
-    turn = asyncio.create_task(owner.run(invocation_id="caller-shutdown"))
-    await started.wait()
-    assert owner.cancel_current_request("caller-shutdown") is True
-    completion = asyncio.create_task(
-        owner.wait_for_request_completion("caller-shutdown")
-    )
-    turn.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await turn
-
-    assert await completion is RequestCompletionDisposition.COMPLETED
-    assert not owner._abandoned_generations("caller-shutdown")
-
-
-@pytest.mark.asyncio
-async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
-    from kestrel_sovereign.agent.invocation import bind_async_invocation
-    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
     started = asyncio.Event()
@@ -349,6 +423,83 @@ async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
         await advance
 
     assert agent._active_request_ids == set()
+    assert (
+        await agent.wait_for_request_completion("command-stop")
+        is RequestCompletionDisposition.COMPLETED
+    )
+
+
+@pytest.mark.asyncio
+async def test_outer_stream_stop_does_not_abandon_clean_nested_command():
+    """Endpoint-owner cancellation classifies the nested child's real unwind."""
+
+    from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+        bind_request_operation_if_supported,
+    )
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    started = asyncio.Event()
+
+    class CommandAgent(StreamingMixin, RequestLifecycleMixin):
+        def __init__(self):
+            self.storage = object()
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        async def _genesis_audit_cognition_block(self, _user_input):
+            return None
+
+        async def _maybe_audit(self):
+            return None
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def process_input(self, *_args, invocation_id=None, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+    request_id = "outer-command-stop"
+    agent = CommandAgent()
+    endpoint_generation = agent.register_active_request(request_id)
+    owned = OwnedAsyncIterator(
+        lambda: agent.process_input_streaming(
+            "!continue",
+            request_id=request_id,
+        ),
+        operation="endpoint command stream",
+        cleanup_requested=lambda: agent.is_request_cancelled(request_id),
+    )
+    assert bind_request_operation_if_supported(
+        agent,
+        request_id,
+        owned.owner_task,
+    )
+    advance = asyncio.create_task(anext(owned))
+    await started.wait()
+
+    # Deterministically model the set iteration where Stop reaches the outer
+    # iterator owner before the inner process_input operation. Cancellation
+    # then propagates through the await and cleanly terminalizes that child.
+    agent._cancelled_request_generations.add((request_id, endpoint_generation))
+    agent._cancelled_requests.add(request_id)
+    assert owned.owner_task.cancel() is True
+
+    with pytest.raises(StopAsyncIteration):
+        await advance
+    await owned.aclose()
+    agent._cleanup_cancelled_request(request_id)
+
+    assert (
+        await agent.wait_for_request_completion(request_id)
+        is RequestCompletionDisposition.COMPLETED
+    )
 
 
 def test_request_lifecycle_logs_only_one_way_correlation(caplog):
@@ -371,6 +522,120 @@ def test_request_lifecycle_logs_only_one_way_correlation(caplog):
 
     assert request_id not in caplog.text
     assert invocation_log_correlation(request_id) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_durable_stop_fence_survives_expired_memory_race_window():
+    import httpx
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.rate_limit import limiter
+
+    request_id = "delayed-after-durable-stop"
+
+    class DurableStopStore:
+        def __init__(self):
+            self.lookups = []
+
+        async def has_acknowledged_turn_stop(self, agent_id, turn_id):
+            self.lookups.append((agent_id, turn_id))
+            return (agent_id, turn_id) == ("did:test:durable", request_id)
+
+    class Agent(RequestLifecycleMixin):
+        agent_id = "did:test:durable"
+
+        def __init__(self):
+            self.storage = MagicMock()
+            self.storage.resolve_session_id = AsyncMock(return_value=None)
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+            self.cognition_started = False
+
+        async def process_input(self, *_args, **_kwargs):
+            self.cognition_started = True
+            return "must not run"
+
+        def _conversation_response_identity(self, **_kwargs):
+            return {}
+
+    agent = Agent()
+    agent.reserve_request_cancellation(request_id)
+    agent._pending_request_cancellations[request_id] -= 60.0
+    store = DurableStopStore()
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.state.agent = agent
+    app.state.stop_receipt_store = store
+    app.include_router(router)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/agent/invoke",
+            json={"input": "work", "request_id": request_id},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "Request stopped before execution."
+    assert not agent.cognition_started
+    assert store.lookups == [("did:test:durable", request_id)]
+
+
+def test_every_http_turn_door_primes_the_durable_stop_fence():
+    """Mutation tripwire: no HTTP retry door may bypass durable Stop truth."""
+
+    from pathlib import Path
+
+    agent_source = Path("kestrel_sovereign/endpoints/agent.py").read_text()
+    bridge_source = Path(
+        "kestrel_sovereign/features/bridge/router.py"
+    ).read_text()
+    models_source = Path("kestrel_sovereign/endpoints/models.py").read_text()
+    rasa_source = Path("kestrel_sovereign/endpoints/rasa_shim.py").read_text()
+    sovereignty_source = Path(
+        "kestrel_sovereign/endpoints/sovereignty.py"
+    ).read_text()
+    call = "await prime_durable_stop_fence(request, agent, request_id)"
+
+    assert agent_source.count(call) == 2
+    assert bridge_source.count(call) == 2
+    assert models_source.count(call) == 1
+    assert rasa_source.count(call) == 2
+    assert sovereignty_source.count(call) == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_stop_fence_fails_closed_after_store_startup_error():
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.api_errors import ApiHTTPException
+    from kestrel_sovereign.endpoints.agent_helpers import prime_durable_stop_fence
+
+    app = FastAPI()
+    app.state.stop_receipt_store = None
+    app.state.stop_receipt_store_error = "RuntimeError"
+    request = MagicMock()
+    request.app = app
+    agent = MagicMock()
+    agent.agent_id = "did:test:receipt-outage"
+
+    with pytest.raises(ApiHTTPException) as raised:
+        await prime_durable_stop_fence(request, agent, "stopped-turn")
+
+    assert raised.value.status_code == 503
+    assert raised.value.code == "stop_evidence_unavailable"
 
 
 @pytest.mark.asyncio
@@ -584,10 +849,7 @@ class TestAgentCancellation:
         from kestrel_sovereign.agent.invocation import (
             bind_async_generator_invocation,
         )
-        from kestrel_sovereign.agent.request_lifecycle import (
-            RequestCompletionDisposition,
-            RequestLifecycleMixin,
-        )
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
         inner_cleanup_started = asyncio.Event()
@@ -652,6 +914,11 @@ class TestAgentCancellation:
         )
         endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
         response = await endpoint(request)
+        from kestrel_sovereign.endpoints.closing_streaming_response import (
+            ClosingStreamingResponse,
+        )
+
+        assert isinstance(response, ClosingStreamingResponse)
         stream = response.body_iterator
 
         assert await anext(stream) == "first"
@@ -676,8 +943,18 @@ class TestAgentCancellation:
         await asyncio.wait_for(completion, timeout=1)
 
     @pytest.mark.asyncio
-    async def test_stop_interrupts_stream_blocked_before_its_next_chunk(self):
-        """The transport binds the producer task, not only its request marker."""
+    @pytest.mark.parametrize(
+        "emit_first",
+        [
+            pytest.param(False, id="before-first"),
+            pytest.param(True, id="after-partial"),
+        ],
+    )
+    async def test_stop_interrupts_stream_blocked_between_chunks(
+        self,
+        emit_first,
+    ):
+        """The registered generation owns every producer blocked in ``anext``."""
 
         from fastapi import FastAPI
         from starlette.requests import Request
@@ -686,9 +963,10 @@ class TestAgentCancellation:
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
         producer_started = asyncio.Event()
-        producer_closed = asyncio.Event()
+        release_producer = asyncio.Event()
+        producer_finalized = asyncio.Event()
 
-        class LiveAgent(RequestLifecycleMixin):
+        class BlockedStreamAgent(RequestLifecycleMixin):
             def __init__(self):
                 self._current_request_id = None
                 self._active_request_ids = set()
@@ -701,13 +979,15 @@ class TestAgentCancellation:
 
             async def process_input_streaming(self, *_args, **_kwargs):
                 try:
+                    if emit_first:
+                        yield "first"
                     producer_started.set()
-                    await asyncio.Event().wait()
-                    yield "must not escape"
+                    await release_producer.wait()
+                    yield "late"
                 finally:
-                    producer_closed.set()
+                    producer_finalized.set()
 
-        agent = LiveAgent()
+        agent = BlockedStreamAgent()
         app = FastAPI()
         app.state.agent = agent
         body = json.dumps(
@@ -740,35 +1020,30 @@ class TestAgentCancellation:
         )
         endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
         response = await endpoint(request)
-        next_chunk = asyncio.create_task(anext(response.body_iterator))
+        if emit_first:
+            assert await anext(response.body_iterator) == "first"
+        consumer = asyncio.create_task(anext(response.body_iterator))
+
         await asyncio.wait_for(producer_started.wait(), timeout=1)
-
         assert agent.cancel_current_request("blocked-stream") is True
-        completion = asyncio.create_task(
-            agent.wait_for_request_completion("blocked-stream")
+        try:
+            assert "Request stopped" in await asyncio.wait_for(
+                consumer,
+                timeout=0.2,
+            )
+        finally:
+            release_producer.set()
+            if not consumer.done():
+                consumer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await consumer
+            await response.body_iterator.aclose()
+
+        assert producer_finalized.is_set()
+        await asyncio.wait_for(
+            agent.wait_for_request_completion("blocked-stream"),
+            timeout=1,
         )
-        assert "Request stopped" in await asyncio.wait_for(
-            next_chunk, timeout=1
-        )
-        with pytest.raises(StopAsyncIteration):
-            await asyncio.wait_for(anext(response.body_iterator), timeout=1)
-        await asyncio.wait_for(producer_closed.wait(), timeout=1)
-        await asyncio.wait_for(completion, timeout=1)
-
-    def test_both_stream_transports_bind_the_owned_producer_task(self):
-        """Mutation tripwire for the bridge and direct-stream wiring seams."""
-
-        import inspect
-
-        from kestrel_sovereign.endpoints import agent as agent_endpoint
-        from kestrel_sovereign.features.bridge import router as bridge_router
-
-        direct_source = inspect.getsource(agent_endpoint)
-        bridge_source = inspect.getsource(bridge_router)
-        binding = "bind_stream_owner(request_id, agent_stream.owner_task)"
-
-        assert binding in direct_source
-        assert binding in bridge_source
 
     @pytest.mark.asyncio
     async def test_stream_closes_context_bound_turn_in_its_owner_task(self):
@@ -781,10 +1056,7 @@ class TestAgentCancellation:
             bind_async_generator_invocation,
         )
         from kestrel_sovereign.agent.parts import part_collector
-        from kestrel_sovereign.agent.request_lifecycle import (
-            RequestCompletionDisposition,
-            RequestLifecycleMixin,
-        )
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
         from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
@@ -958,10 +1230,7 @@ class TestAgentCancellation:
         from fastapi import FastAPI
         from starlette.requests import Request
 
-        from kestrel_sovereign.agent.request_lifecycle import (
-            RequestCompletionDisposition,
-            RequestLifecycleMixin,
-        )
+        from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
         from kestrel_sovereign.endpoints.agent import stream_agent_response
 
         class FencedAgent(RequestLifecycleMixin):
@@ -1091,8 +1360,8 @@ class TestAgentCancellation:
         completion = asyncio.create_task(
             agent.wait_for_request_completion("natural-cleanup-failure")
         )
-        assert "Request stopped" in await anext(stream)
-        with pytest.raises(RuntimeError, match="natural cleanup failed"):
+        assert "could not be completed" in await anext(stream)
+        with pytest.raises(StopAsyncIteration):
             await anext(stream)
 
         assert (
@@ -1255,6 +1524,11 @@ class TestAgentCancellation:
                 request_id="bridge-inner-cleanup",
             ),
         )
+        from kestrel_sovereign.endpoints.closing_streaming_response import (
+            ClosingStreamingResponse,
+        )
+
+        assert isinstance(response, ClosingStreamingResponse)
         stream = response.body_iterator
 
         assert "first" in await anext(stream)
@@ -1727,6 +2001,7 @@ class TestStopEndpoint:
         app = FastAPI()
         app.include_router(router)
         app.state.agent = agent
+        _attach_test_stop_receipts(app)
         try:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
@@ -1764,6 +2039,7 @@ class TestStopEndpoint:
         
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         
         # Mock agent
         mock_agent = MagicMock()
@@ -1789,6 +2065,7 @@ class TestStopEndpoint:
         
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         
         # Mock agent with no active request
         mock_agent = MagicMock()
@@ -1812,6 +2089,7 @@ class TestStopEndpoint:
 
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
 
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
@@ -1841,6 +2119,7 @@ class TestStopEndpoint:
         header_echo = invocation_id_response_header(request_id)
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
         mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
@@ -1865,6 +2144,7 @@ class TestStopEndpoint:
 
         app = FastAPI()
         app.include_router(router)
+        _attach_test_stop_receipts(app)
         mock_agent = MagicMock()
         mock_agent.cancel_current_request = MagicMock(return_value=True)
         mock_agent.wait_for_request_completion = AsyncMock(return_value=None)
@@ -2045,6 +2325,78 @@ class TestStopEndpoint:
         )
 
     @pytest.mark.asyncio
+    async def test_invoke_cancelled_during_session_resolution_cleans_lifecycle(self):
+        """Every post-registration await is inside the invoke cleanup boundary."""
+
+        from fastapi import FastAPI, Response
+        from starlette.requests import Request
+
+        from kestrel_sovereign.endpoints.agent import invoke_agent
+
+        resolution_started = asyncio.Event()
+
+        class Agent:
+            def __init__(self):
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = self.resolve_session_id
+                self.register_active_request = MagicMock()
+                self._cleanup_cancelled_request = MagicMock()
+
+            async def resolve_session_id(self, _session_id):
+                resolution_started.set()
+                await asyncio.Event().wait()
+
+            @staticmethod
+            def is_request_cancelled(_request_id):
+                return False
+
+        agent = Agent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "cancelled-session-resolution"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/invoke",
+                "raw_path": b"/api/agent/invoke",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(invoke_agent, "__wrapped__", invoke_agent)
+        operation = asyncio.create_task(endpoint(request, Response()))
+        await asyncio.wait_for(resolution_started.wait(), timeout=1.0)
+
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+        agent.register_active_request.assert_called_once_with(
+            "cancelled-session-resolution"
+        )
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "cancelled-session-resolution"
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):
         """#2674 P2: a strict (fail-closed) response audit stopped before dispatch
         WITHHOLDS every chunk and returns cleanly, so ``process_input_streaming``
@@ -2191,7 +2543,11 @@ class TestStopEndpoint:
         mock_agent._cleanup_cancelled_request = MagicMock()
         mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
         app.state.agent = mock_agent
-        monkeypatch.setattr(agent_endpoints, "StreamingResponse", ResponseConstructionFailure)
+        monkeypatch.setattr(
+            agent_endpoints,
+            "ClosingStreamingResponse",
+            ResponseConstructionFailure,
+        )
 
         response = TestClient(app, raise_server_exceptions=False).post(
             "/api/agent/stream",
@@ -2200,6 +2556,126 @@ class TestStopEndpoint:
 
         assert response.status_code == 500
         mock_agent._cleanup_cancelled_request.assert_called_once_with("cleanup-retry-2765")
+        assert AgentStreamTap.get_instance()._queues == {}
+
+    @pytest.mark.asyncio
+    async def test_stream_cancelled_during_durable_admission_cleans_lifecycle(self):
+        """A committed admission cannot outlive pre-response cancellation."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+
+        admission_started = asyncio.Event()
+
+        class Agent:
+            def __init__(self):
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = AsyncMock(return_value=None)
+                self.register_active_request = MagicMock()
+                self._cleanup_cancelled_request = MagicMock()
+
+            async def await_durable_request_admission(self, _request_id):
+                admission_started.set()
+                await asyncio.Event().wait()
+
+        agent = Agent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "cancelled-admission"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        operation = asyncio.create_task(endpoint(request))
+        await asyncio.wait_for(admission_started.wait(), timeout=1.0)
+
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "cancelled-admission"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unstarted_stream_body_close_cleans_tap_and_lifecycle(self):
+        """Closing a response before its first pull cannot leave a live row."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.endpoints.agent import stream_agent_response
+        from kestrel_sovereign.streams.tap import AgentStreamTap
+
+        AgentStreamTap.reset()
+        agent = MagicMock()
+        agent.register_active_request = MagicMock()
+        agent._cleanup_cancelled_request = MagicMock()
+        agent.storage.resolve_session_id = AsyncMock(return_value=None)
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "unstarted-response"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/stream",
+                "raw_path": b"/api/agent/stream",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+        response = await endpoint(request)
+
+        await response.body_iterator.aclose()
+
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "unstarted-response"
+        )
         assert AgentStreamTap.get_instance()._queues == {}
 
     @pytest.mark.asyncio
@@ -2248,14 +2724,12 @@ class TestStopEndpoint:
             yield "The answer "
             yield "is 42."
 
-        # ``is_request_cancelled`` is consulted at the entry and after each
-        # chunk (all must be False so both chunks pass through). An actual
-        # producer-task cancellation adds a before-next boundary without
-        # polling this predicate for a merely late synthetic marker. It would
-        # return True on
+        # ``is_request_cancelled`` is consulted once before cognition and once
+        # per chunk inside the loop (all must be False so both chunks pass
+        # through). It would return True on
         # any later call — modeling a stop that lands only after the final chunk
         # was already yielded. On the pre-fix code the post-loop fallback would
-        # make one later call, see True, and wrongly append the stop notice; the
+        # call this a 3rd time, see True, and wrongly append the stop notice; the
         # fixed fallback short-circuits on ``response_chunk_yielded`` and never
         # reaches this predicate again.
         cancel_calls = {"n": 0}

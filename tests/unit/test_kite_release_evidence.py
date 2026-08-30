@@ -663,6 +663,72 @@ def test_kite_invoke_returns_signed_runtime_observation_without_assistant_dispat
 
 
 @pytest.mark.asyncio
+async def test_kite_invoke_suppresses_evidence_when_stop_arrives_during_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import FastAPI, Response
+    from starlette.requests import Request
+
+    from kestrel_sovereign.endpoints import agent as agent_endpoint
+
+    app = FastAPI()
+    agent = MagicMock()
+    agent.agent_id = "did:test:kite-stop"
+    agent.register_active_request = MagicMock()
+    agent.is_request_cancelled = MagicMock(side_effect=[False, True])
+    agent._cleanup_cancelled_request = MagicMock()
+    app.state.agent = agent
+    evidence = AsyncMock(return_value=("diagnostics", {"count": 1}))
+    signature = MagicMock(return_value="must-not-sign")
+    monkeypatch.setattr(agent_endpoint, "_kite_runtime_observation", evidence)
+    monkeypatch.setattr(agent_endpoint, "_kite_evidence_signature", signature)
+    body = json.dumps(
+        {
+            "request_id": "kite-stop-race",
+            "kite_evidence": {
+                "operation": "diagnostics",
+                "nonce": "f" * 64,
+            },
+        }
+    ).encode()
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/agent/invoke",
+            "headers": [],
+            "query_string": b"",
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "scheme": "http",
+            "app": app,
+        },
+        receive,
+    )
+    endpoint = getattr(
+        agent_endpoint.invoke_agent,
+        "__wrapped__",
+        agent_endpoint.invoke_agent,
+    )
+
+    result = await endpoint(request, Response())
+
+    assert result["response"] == "Request stopped during execution."
+    assert "kite_evidence" not in result
+    signature.assert_not_called()
+    agent._cleanup_cancelled_request.assert_called_once_with("kite-stop-race")
+
+
+@pytest.mark.asyncio
 async def test_kite_paraphrase_recall_uses_the_verified_agent_runtime_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

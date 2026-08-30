@@ -22,18 +22,17 @@ Usage:
         app.include_router(get_router())
 """
 
-import asyncio
 from functools import lru_cache
 import json
 import logging
 import time
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
     stopped_invocation_http_error,
@@ -44,8 +43,12 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
+    bind_request_operation_if_supported,
 )
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.endpoints.closing_streaming_response import (
+    ClosingStreamingResponse,
+)
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -56,6 +59,62 @@ from .protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _register_bridge_request(agent, request_id: str) -> None:
+    """Publish an early bridge lifecycle before any bridge-side writes."""
+
+    if hasattr(agent, "register_active_request"):
+        agent.register_active_request(request_id)
+        await_admission = getattr(
+            type(agent), "await_durable_request_admission", None
+        )
+        try:
+            if callable(await_admission):
+                await await_admission(agent, request_id)
+        except BaseException:
+            cleanup = getattr(agent, "_cleanup_cancelled_request", None)
+            if callable(cleanup):
+                cleanup(request_id)
+            raise
+    else:
+        agent._current_request_id = request_id
+
+
+class _PreStartCleanupIterator:
+    """Release endpoint state when an SSE body is closed before first pull."""
+
+    def __init__(self, iterator, *, started, cleanup) -> None:
+        self._iterator = iterator
+        self._started = started
+        self._cleanup = cleanup
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await anext(self._iterator)
+        except BaseException:
+            self._closed = True
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._iterator.aclose()
+        finally:
+            # Closing an async generator before its first ``anext`` does not
+            # execute its body or ``finally``. The endpoint has already
+            # registered the request, so this outer response iterator owns that
+            # otherwise-unreachable pre-start cleanup boundary.
+            if not self._started():
+                self._cleanup()
 
 
 def _get_bridge_feature(request: Request):
@@ -109,73 +168,104 @@ def get_router() -> APIRouter:
         """
         agent, bridge = _get_bridge_feature(request)
         start_ms = time.monotonic()
-
-        # Resolve or create a session
-        session = await bridge.get_or_create_session(
-            gateway_session_id=body.session_id,
-            channel_type=body.channel_type,
-            sender_id=body.sender_id,
-        )
-
-        # Log inbound request
-        await bridge.log_invocation(
-            session_id=session.id,
-            direction="inbound",
-            content_preview=body.message,
-        )
-
-        # Build context note from gateway context
         context_note = _build_context_note(body)
         request_id = resolve_request_invocation_id(request, body)
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/api/bridge/invoke",
         )
-
-        # Route through the agent's process_input
+        await prime_durable_stop_fence(request, agent, request_id)
+        await _register_bridge_request(agent, request_id)
+        request_cancelled = getattr(agent, "is_request_cancelled", None)
         try:
+            if (
+                callable(request_cancelled)
+                and request_cancelled(request_id) is True
+            ):
+                raise stopped_invocation_http_error(request_id)
+
+            # Session creation and bridge logs are turn side effects. The
+            # request lifecycle above must exist before either starts so an
+            # exact concurrent Stop cannot report ``already_complete`` while
+            # these writes continue.
+            session = await bridge.get_or_create_session(
+                gateway_session_id=body.session_id,
+                channel_type=body.channel_type,
+                sender_id=body.sender_id,
+            )
+            if (
+                callable(request_cancelled)
+                and request_cancelled(request_id) is True
+            ):
+                raise stopped_invocation_http_error(request_id)
+            await bridge.log_invocation(
+                session_id=session.id,
+                direction="inbound",
+                content_preview=body.message,
+            )
+            if (
+                callable(request_cancelled)
+                and request_cancelled(request_id) is True
+            ):
+                raise stopped_invocation_http_error(request_id)
+
             user_input = body.message
             if context_note:
                 user_input = f"{user_input}\n\n[Bridge context: {context_note}]"
+            try:
+                response_text = await agent.process_input(
+                    user_input,
+                    model_override=body.model_override,
+                    session_id=session.id,
+                    caller=get_caller(request),
+                    invocation_id=request_id,
+                    invocation_provenance=invocation_provenance,
+                )
+            except InvocationCancelledError as error:
+                raise stopped_invocation_http_error(request_id) from error
+            except Exception:
+                # Exception text and tracebacks can contain bridge
+                # message/context content. Keep both client and logs bounded.
+                logger.error("Bridge invoke failed")
+                raise HTTPException(
+                    status_code=500, detail="Agent processing error."
+                )
 
-            response_text = await agent.process_input(
-                user_input,
-                model_override=body.model_override,
+            if (
+                callable(request_cancelled)
+                and request_cancelled(request_id) is True
+            ):
+                raise stopped_invocation_http_error(request_id)
+            elapsed_ms = int((time.monotonic() - start_ms) * 1000)
+            await bridge.log_invocation(
                 session_id=session.id,
-                caller=get_caller(request),
-                invocation_id=request_id,
-                invocation_provenance=invocation_provenance,
+                direction="outbound",
+                content_preview=response_text,
+                duration_ms=elapsed_ms,
             )
-        except InvocationCancelledError as error:
-            raise stopped_invocation_http_error(request_id) from error
-        except Exception:
-            # Exception text and tracebacks can contain bridge message/context
-            # content.  The client receives only the fixed HTTP detail below;
-            # logs retain the event category and no request-derived material.
-            logger.error("Bridge invoke failed")
-            raise HTTPException(status_code=500, detail="Agent processing error.")
+            if (
+                callable(request_cancelled)
+                and request_cancelled(request_id) is True
+            ):
+                raise stopped_invocation_http_error(request_id)
 
-        elapsed_ms = int((time.monotonic() - start_ms) * 1000)
-
-        # Log outbound response
-        await bridge.log_invocation(
-            session_id=session.id,
-            direction="outbound",
-            content_preview=response_text,
-            duration_ms=elapsed_ms,
-        )
-
-        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
-        return BridgeResponse(
-            message=response_text,
-            session_id=session.id,
-            metadata={
-                "channel_type": body.channel_type.value,
-                "duration_ms": elapsed_ms,
-                "gateway_session_id": body.session_id,
-                "request_id": request_id,
-            },
-        )
+            http_response.headers["X-Request-ID"] = (
+                invocation_id_response_header(request_id)
+            )
+            return BridgeResponse(
+                message=response_text,
+                session_id=session.id,
+                metadata={
+                    "channel_type": body.channel_type.value,
+                    "duration_ms": elapsed_ms,
+                    "gateway_session_id": body.session_id,
+                    "request_id": request_id,
+                },
+            )
+        finally:
+            cleanup = getattr(agent, "_cleanup_cancelled_request", None)
+            if callable(cleanup):
+                cleanup(request_id)
 
     # ------------------------------------------------------------------
     # POST /api/bridge/stream -- streaming invocation via SSE
@@ -192,20 +282,6 @@ def get_router() -> APIRouter:
         """
         agent, bridge = _get_bridge_feature(request)
         start_ms = time.monotonic()
-
-        # Resolve or create a session
-        session = await bridge.get_or_create_session(
-            gateway_session_id=body.session_id,
-            channel_type=body.channel_type,
-            sender_id=body.sender_id,
-        )
-
-        # Log inbound request
-        await bridge.log_invocation(
-            session_id=session.id,
-            direction="inbound",
-            content_preview=body.message,
-        )
 
         # Check streaming support
         if not hasattr(agent, "process_input_streaming"):
@@ -224,10 +300,51 @@ def get_router() -> APIRouter:
             request,
             source_locator="POST:/api/bridge/stream",
         )
+        await prime_durable_stop_fence(request, agent, request_id)
+        await _register_bridge_request(agent, request_id)
+        request_lifecycle_registered = True
+        request_cancelled = getattr(agent, "is_request_cancelled", None)
+        setup_cancelled = (
+            callable(request_cancelled)
+            and request_cancelled(request_id) is True
+        )
+        session = None
+        try:
+            if not setup_cancelled:
+                session = await bridge.get_or_create_session(
+                    gateway_session_id=body.session_id,
+                    channel_type=body.channel_type,
+                    sender_id=body.sender_id,
+                )
+                setup_cancelled = (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                )
+            if not setup_cancelled:
+                await bridge.log_invocation(
+                    session_id=session.id,
+                    direction="inbound",
+                    content_preview=body.message,
+                )
+                setup_cancelled = (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                )
+        except BaseException:
+            cleanup = getattr(agent, "_cleanup_cancelled_request", None)
+            if callable(cleanup):
+                # A terminal setup failure still has an endpoint owner which
+                # performs lifecycle cleanup here. ABANDONED is reserved for
+                # nested work whose cleanup ownership was actually lost.
+                cleanup(request_id)
+            raise
+
+        response_body_started = False
 
         async def event_generator():
+            nonlocal response_body_started
+            response_body_started = True
             full_response = []
-            request_lifecycle_registered = False
             agent_stream = None
 
             def stopped_event() -> str:
@@ -240,13 +357,7 @@ def get_router() -> APIRouter:
                 return f"data: {stopped_data}\n\n"
 
             try:
-                if hasattr(agent, "register_active_request"):
-                    agent.register_active_request(request_id)
-                else:
-                    agent._current_request_id = request_id
-                request_lifecycle_registered = True
-                request_cancelled = getattr(agent, "is_request_cancelled", None)
-                if (
+                if setup_cancelled or (
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 ):
@@ -271,34 +382,16 @@ def get_router() -> APIRouter:
                         request_id
                     ),
                 )
-                bind_stream_owner = getattr(
-                    agent, "bind_request_operation", None
+                bind_request_operation_if_supported(
+                    agent,
+                    request_id,
+                    agent_stream.owner_task,
                 )
-                if callable(bind_stream_owner):
-                    bind_stream_owner(request_id, agent_stream.owner_task)
-                first_item = True
-                while True:
-                    if (
-                        not first_item
-                        and agent_stream.owner_task.cancelling()
-                        and callable(request_cancelled)
-                        and request_cancelled(request_id) is True
-                    ):
-                        yield stopped_event()
-                        return
-                    first_item = False
-                    try:
-                        chunk = await anext(agent_stream)
-                    except StopAsyncIteration:
-                        break
-                    except asyncio.CancelledError:
-                        if (
-                            callable(request_cancelled)
-                            and request_cancelled(request_id) is True
-                        ):
-                            yield stopped_event()
-                            return
-                        raise
+                async for chunk in agent_stream:
+                    # Stop may land after the producer queued this chunk but
+                    # before the bridge owner publishes it. The exact request
+                    # marker is the linearization evidence; withhold queued
+                    # output once it is set.
                     if (
                         callable(request_cancelled)
                         and request_cancelled(request_id) is True
@@ -312,11 +405,6 @@ def get_router() -> APIRouter:
                     event_data = json.dumps({"type": "chunk", "content": chunk})
                     yield f"data: {event_data}\n\n"
 
-                # Command streaming delegates to an isolated process_input
-                # child. Cooperative Stop unwinds that child as clean iterator
-                # exhaustion so a persistent gateway task survives. Re-read
-                # the exact request marker before publishing success: normal
-                # EOF and stopped command EOF are intentionally distinct here.
                 if (
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
@@ -389,16 +477,27 @@ def get_router() -> APIRouter:
                         else:
                             agent._cleanup_cancelled_request(request_id)
 
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-                "X-Request-ID": invocation_id_response_header(request_id),
-            },
-        )
+        try:
+            response_iterator = _PreStartCleanupIterator(
+                event_generator(),
+                started=lambda: response_body_started,
+                cleanup=lambda: agent._cleanup_cancelled_request(request_id),
+            )
+            return ClosingStreamingResponse(
+                response_iterator,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Request-ID": invocation_id_response_header(request_id),
+                },
+            )
+        except BaseException:
+            cleanup = getattr(agent, "_cleanup_cancelled_request", None)
+            if callable(cleanup):
+                cleanup(request_id)
+            raise
 
     # ------------------------------------------------------------------
     # GET /api/bridge/capabilities -- discovery

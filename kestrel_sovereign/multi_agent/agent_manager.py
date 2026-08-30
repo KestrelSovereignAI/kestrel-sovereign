@@ -774,6 +774,12 @@ class AgentManager:
         self._agent_registration_hook: Optional[
             Callable[[str, KestrelAgent], Awaitable[None]]
         ] = None
+        # Process-wide invocation ownership must be installed before feature
+        # initialization can start scheduler/signal work.  This synchronous
+        # seam is deliberately earlier than app onboarding/publication.
+        self._agent_pre_initialize_hook: Optional[
+            Callable[[str, KestrelAgent], None]
+        ] = None
         # Shared-PostgreSQL hosts install this after the long-lived scheduler
         # storage is ready. It durably prepares a runtime-created DID and
         # returns an async rollback for state seeded before onboarding commits.
@@ -826,6 +832,14 @@ class AgentManager:
         initial and dynamic registration through this one seam.
         """
         self._agent_registration_hook = hook
+
+    def set_agent_pre_initialize_hook(
+        self,
+        hook: Optional[Callable[[str, KestrelAgent], None]],
+    ) -> None:
+        """Install host process authority before agent initialization."""
+
+        self._agent_pre_initialize_hook = hook
 
     def set_scheduler_tenant_registration_hook(
         self,
@@ -1609,6 +1623,9 @@ class AgentManager:
                 agent._dynamic_scheduler_tenant_registration = (
                     scheduler_registration
                 )
+            pre_initialize = self._agent_pre_initialize_hook
+            if pre_initialize is not None:
+                pre_initialize(name, agent)
             await agent.initialize()
         except BaseException:
             if agent is not None:

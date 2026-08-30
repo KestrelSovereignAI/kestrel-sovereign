@@ -43,6 +43,13 @@ def test_canonical_inventory_mentions_all_router_files():
         assert f"`kestrel_sovereign/endpoints/{router_file}`" in text
 
 
+def test_endpoint_helpers_are_not_reported_as_router_files():
+    router_files = discover_endpoint_router_files()
+
+    assert "agent_helpers.py" not in router_files
+    assert "closing_streaming_response.py" not in router_files
+
+
 def test_canonical_inventory_mentions_all_discoverable_feature_modules():
     text = (PROJECT_ROOT / "KESTREL_FEATURES.md").read_text(encoding="utf-8")
     for module in discover_core_feature_modules():

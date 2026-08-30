@@ -282,6 +282,7 @@ def bind_async_invocation(
                 lifecycle_owner = args[0] if args else None
                 registered = False
                 cleanup_abandoned = False
+                operation: asyncio.Task[_T] | None = None
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
                         type(lifecycle_owner),
@@ -291,9 +292,20 @@ def bind_async_invocation(
                     if callable(register):
                         register(lifecycle_owner, invocation_id)
                         registered = True
-                caller_cancellation_baseline = 0
                 try:
                     if registered:
+                        await_admission = getattr(
+                            type(lifecycle_owner),
+                            "await_durable_request_admission",
+                            None,
+                        )
+                        if callable(await_admission) and not await await_admission(
+                            lifecycle_owner, invocation_id
+                        ):
+                            raise InvocationCancelledError(
+                                "invocation was stopped before durable admission "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            )
                         bind_operation = getattr(
                             type(lifecycle_owner),
                             "bind_request_operation",
@@ -316,9 +328,6 @@ def bind_async_invocation(
                             # and does not leak it into the long-lived caller.
                             handoff_lock_ownership(parent_context)
                         operation_context = parent_context.copy()
-                        caller = asyncio.current_task()
-                        if caller is not None:
-                            caller_cancellation_baseline = caller.cancelling()
                         operation = asyncio.create_task(
                             function(*bound.args, **bound.kwargs),
                             name=(
@@ -358,11 +367,7 @@ def bind_async_invocation(
                             return result
                         except asyncio.CancelledError as error:
                             caller = asyncio.current_task()
-                            if (
-                                caller is not None
-                                and caller.cancelling()
-                                > caller_cancellation_baseline
-                            ):
+                            if caller is not None and caller.cancelling():
                                 raise
                             raise InvocationCancelledError(
                                 "isolated invocation was cancelled "
@@ -395,31 +400,35 @@ def bind_async_invocation(
                     raise
                 except BaseException as error:
                     if registered:
-                        request_cancelled = getattr(
-                            type(lifecycle_owner),
-                            "is_request_cancelled",
-                            None,
-                        )
-                        try:
-                            caller = asyncio.current_task()
-                            caller_cancelled = bool(
-                                isinstance(error, asyncio.CancelledError)
-                                and caller is not None
-                                and caller.cancelling()
-                                > caller_cancellation_baseline
-                            )
+                        if isinstance(error, asyncio.CancelledError):
+                            # A caller cancellation propagating through
+                            # ``await operation`` does not resume this wrapper
+                            # until the child has terminally unwound. Classify
+                            # that actual child state, not the Stop marker: the
+                            # endpoint stream owner and this nested command can
+                            # both be cancelled for one generation, and a clean
+                            # child unwind is still COMPLETED.
                             cleanup_abandoned = bool(
-                                not caller_cancelled
-                                and callable(request_cancelled)
-                                and request_cancelled(
-                                    lifecycle_owner, invocation_id
-                                )
+                                operation is not None and not operation.done()
                             )
-                        except Exception:
-                            # Never hide the turn's original failure. A broken
-                            # cancellation predicate is conservatively treated
-                            # as failed cleanup.
-                            cleanup_abandoned = True
+                        else:
+                            request_cancelled = getattr(
+                                type(lifecycle_owner),
+                                "is_request_cancelled",
+                                None,
+                            )
+                            try:
+                                cleanup_abandoned = bool(
+                                    callable(request_cancelled)
+                                    and request_cancelled(
+                                        lifecycle_owner, invocation_id
+                                    )
+                                )
+                            except Exception:
+                                # Never hide the turn's original failure. A
+                                # broken cancellation predicate is
+                                # conservatively treated as failed cleanup.
+                                cleanup_abandoned = True
                     raise
                 finally:
                     if registered:
@@ -449,6 +458,8 @@ def bind_async_invocation(
 
 def bind_async_generator_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., AsyncIterator[_T]]], Callable[..., AsyncIterator[_T]]]:
     """Bind/generate ``parameter`` for an async-generator top-level turn.
 
@@ -486,8 +497,34 @@ def bind_async_generator_invocation(
                 if supplied_provenance is not None
                 else _current_invocation_provenance.get()
             )
-            iterator = function(*bound.args, **bound.kwargs)
+            lifecycle_owner = args[0] if args else None
+            registered = False
+            if track_request_lifecycle and lifecycle_owner is not None:
+                register = getattr(
+                    type(lifecycle_owner),
+                    "register_active_request",
+                    None,
+                )
+                if callable(register):
+                    register(lifecycle_owner, effective_id)
+                    registered = True
+            iterator = None
             try:
+                if registered:
+                    await_admission = getattr(
+                        type(lifecycle_owner),
+                        "await_durable_request_admission",
+                        None,
+                    )
+                    if callable(await_admission) and not await await_admission(
+                        lifecycle_owner, effective_id
+                    ):
+                        raise InvocationCancelledError(
+                            "streaming invocation was stopped before durable "
+                            "admission "
+                            f"({invocation_log_correlation(effective_id)})"
+                        )
+                iterator = function(*bound.args, **bound.kwargs)
                 while True:
                     with _exact_invocation_scope(
                         effective_id,
@@ -499,13 +536,17 @@ def bind_async_generator_invocation(
                             return
                     yield item
             finally:
-                close_iterator = getattr(iterator, "aclose", None)
-                if callable(close_iterator):
-                    with _exact_invocation_scope(
-                        effective_id,
-                        effective_provenance,
-                    ):
-                        await close_iterator()
+                try:
+                    close_iterator = getattr(iterator, "aclose", None)
+                    if callable(close_iterator):
+                        with _exact_invocation_scope(
+                            effective_id,
+                            effective_provenance,
+                        ):
+                            await close_iterator()
+                finally:
+                    if registered:
+                        lifecycle_owner._cleanup_cancelled_request(effective_id)
 
         return wrapped
 
