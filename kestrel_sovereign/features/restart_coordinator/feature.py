@@ -1265,16 +1265,9 @@ class RestartCoordinatorFeature(Feature):
                 logger.error(
                     "restart_coordinator: spawn failed: %s", e,
                 )
-                await update_status(
-                    self._db, req.id,
-                    status="pending",
-                    status_reason=f"spawn failed: {e}",
-                    expected_current_status="executing",
-                    expected_authority_signature=req.authority_signature,
-                )
-                await self._emit_status_event(
-                    req, state="pending",
-                    deferral_reason=f"spawn failed: {e}",
+                await self._recover_failed_restart_dispatch(
+                    req.id,
+                    reason=f"spawn failed: {e}",
                 )
                 continue
 
@@ -1372,6 +1365,80 @@ class RestartCoordinatorFeature(Feature):
                 status_reason=f"authority denied: {reason}",
             )
         return True
+
+    async def _recover_failed_restart_dispatch(
+        self,
+        request_id: str,
+        *,
+        reason: str,
+    ) -> Optional[str]:
+        """Make a demonstrably failed dispatch retryable or terminal.
+
+        An ``executing`` request owns a one-shot retry capability. If its
+        sovereign seal was revoked while the host mutation was in flight,
+        rotating that capability back to ``pending`` must fail. Leaving the
+        row ``executing`` would strand it outside both polling and cancel
+        surfaces, so invalid or missing retry authority is terminalized with
+        exact evidence instead.
+        """
+
+        current = await get_request(self._db, request_id)
+        if current is None or current.status != "executing":
+            return None
+
+        verified, authority_reason = verify_restart_authority(current)
+        if verified:
+            moved = await update_status(
+                self._db,
+                request_id,
+                status="pending",
+                status_reason=reason,
+                expected_current_status="executing",
+                expected_authority_signature=current.authority_signature,
+            )
+            if moved:
+                self._executing_since.pop(request_id, None)
+                current.status = "pending"
+                await self._emit_status_event(
+                    current,
+                    state="pending",
+                    deferral_reason=reason,
+                )
+                return "pending"
+
+            # The verification/update boundary may itself cross a sovereign
+            # key rotation. Re-read before deciding whether this was a benign
+            # concurrent state transition or revoked authority.
+            current = await get_request(self._db, request_id)
+            if current is None or current.status != "executing":
+                return None
+            verified, authority_reason = verify_restart_authority(current)
+
+        terminal_reason = (
+            f"{reason}; authority revoked during failed restart dispatch: "
+            f"{authority_reason}"
+            if not verified
+            else f"{reason}; no durable retry authority remains"
+        )
+        moved = await update_status(
+            self._db,
+            request_id,
+            status="rejected",
+            status_reason=terminal_reason,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            expected_current_status="executing",
+            expected_authority_signature=current.authority_signature,
+        )
+        if not moved:
+            return None
+        self._executing_since.pop(request_id, None)
+        current.status = "rejected"
+        await self._emit_status_event(
+            current,
+            state="rejected",
+            status_reason=terminal_reason,
+        )
+        return "rejected"
 
     async def _emit_status_event(
         self,
@@ -2591,16 +2658,25 @@ class RestartCoordinatorFeature(Feature):
             if give_up else reason
         )
 
-        moved = await update_status(
-            self._db, request_id,
-            status=next_status,
-            status_reason=next_reason,
-            completed_at=(
-                datetime.now(timezone.utc).isoformat() if give_up else None
-            ),
-            expected_current_status="executing",
-        )
+        if give_up:
+            moved = await update_status(
+                self._db, request_id,
+                status=next_status,
+                status_reason=next_reason,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                expected_current_status="executing",
+            )
+        else:
+            recovered_status = await self._recover_failed_restart_dispatch(
+                request_id,
+                reason=next_reason,
+            )
+            moved = recovered_status is not None
         if not moved:
+            return
+        if not give_up:
+            if recovered_status == "rejected":
+                self._dispatch_failures.pop(request_id, None)
             return
         self._executing_since.pop(request_id, None)
         if give_up:
@@ -2674,21 +2750,17 @@ class RestartCoordinatorFeature(Feature):
                     f"after {STALE_EXECUTING_SECONDS}s; the restart did not "
                     "happen"
                 )
-            moved = await update_status(
-                self._db, row.id,
-                status="pending",
-                status_reason=reason,
-                expected_current_status="executing",
+            recovered_status = await self._recover_failed_restart_dispatch(
+                row.id,
+                reason=reason,
             )
-            if not moved:
+            if recovered_status is None:
                 continue
-            self._executing_since.pop(row.id, None)
+            if recovered_status == "rejected":
+                continue
             logger.error(
                 "restart_coordinator: recovered stranded executing row %s "
                 "(%s)", row.id, reason,
-            )
-            await self._emit_status_event(
-                row, state="pending", deferral_reason=reason,
             )
             reset.append(row.id)
         return reset

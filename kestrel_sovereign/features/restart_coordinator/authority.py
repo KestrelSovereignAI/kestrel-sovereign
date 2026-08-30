@@ -197,6 +197,10 @@ def restart_authority_generation(request: Any) -> str:
         raise RestartAuthorityError(
             "restart authority evidence is malformed"
         ) from error
+    if not isinstance(document, dict):
+        raise RestartAuthorityError(
+            "restart authority evidence is malformed"
+        )
     generation = document.get("lifecycle_generation")
     if not isinstance(generation, str) or _GENERATION_RE.fullmatch(generation) is None:
         raise RestartAuthorityError(
