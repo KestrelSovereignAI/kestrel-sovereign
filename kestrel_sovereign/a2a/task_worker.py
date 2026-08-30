@@ -85,13 +85,18 @@ class TaskWorker:
         max_concurrent: int = 5,
         max_retries: int = 3,
         retry_delay: float = 5.0,
+        *,
+        recipient_agent_id: Optional[str] = None,
     ):
         """
         Initialize the task worker.
 
         Args:
             task_manager: TaskManager instance for task operations
-            agent_name: Name of the agent running this worker
+            agent_name: Display name of the agent running this worker
+            recipient_agent_id: Durable recipient DID used for every scoped
+                read and mutation. Defaults to the manager's host principal;
+                a DID-valued legacy ``agent_name`` remains source compatible.
             poll_interval: Seconds between polling for new tasks
             max_concurrent: Maximum concurrent task processing
             max_retries: Maximum retry attempts for failed tasks
@@ -99,6 +104,18 @@ class TaskWorker:
         """
         self.task_manager = task_manager
         self.agent_name = agent_name
+        manager_principal = getattr(task_manager, "host_agent_id", None)
+        principal = recipient_agent_id or manager_principal
+        if principal is None and isinstance(agent_name, str) and agent_name.startswith(
+            "did:"
+        ):
+            principal = agent_name
+        if not isinstance(principal, str) or not principal.strip():
+            raise ValueError(
+                "TaskWorker requires a durable recipient_agent_id or "
+                "TaskManager.host_agent_id"
+            )
+        self.recipient_agent_id = principal
         self.poll_interval = poll_interval
         self.max_concurrent = max_concurrent
         self.max_retries = max_retries
@@ -164,8 +181,8 @@ class TaskWorker:
         """Poll for pending tasks and dispatch them."""
         # Get pending tasks
         pending = await self.task_manager.get_pending_tasks(
+            recipient_agent_id=self.recipient_agent_id,
             limit=self.max_concurrent,
-            recipient_agent_id=self.agent_name,
         )
 
         for task in pending:
@@ -205,7 +222,7 @@ class TaskWorker:
                     task_id=task_id,
                     new_state=TaskState.WORKING,
                     agent_name=self.agent_name,
-                    recipient_agent_id=self.agent_name,
+                    recipient_agent_id=self.recipient_agent_id,
                 )
 
                 # Execute handler
@@ -232,7 +249,7 @@ class TaskWorker:
                         new_state=TaskState.INPUT_REQUIRED,
                         message=message,
                         agent_name=self.agent_name,
-                        recipient_agent_id=self.agent_name,
+                        recipient_agent_id=self.recipient_agent_id,
                     )
                 elif result.success:
                     # Complete successfully
@@ -241,7 +258,7 @@ class TaskWorker:
                         response=result.response or "Task completed.",
                         agent_name=self.agent_name,
                         artifacts=result.artifacts,
-                        recipient_agent_id=self.agent_name,
+                        recipient_agent_id=self.recipient_agent_id,
                     )
                     # Clear retry count on success
                     self._retry_counts.pop(task_id, None)
@@ -271,7 +288,7 @@ class TaskWorker:
                 task_id=task_id,
                 new_state=TaskState.SUBMITTED,
                 agent_name=self.agent_name,
-                recipient_agent_id=self.agent_name,
+                recipient_agent_id=self.recipient_agent_id,
             )
 
             await asyncio.sleep(self.retry_delay)
@@ -282,7 +299,7 @@ class TaskWorker:
                 task_id=task_id,
                 error=f"Failed after {self.max_retries} attempts: {error}",
                 agent_name=self.agent_name,
-                recipient_agent_id=self.agent_name,
+                recipient_agent_id=self.recipient_agent_id,
             )
             self._retry_counts.pop(task_id, None)
 

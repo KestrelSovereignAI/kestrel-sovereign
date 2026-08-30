@@ -14,6 +14,7 @@ inbound requests.
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from kestrel_sovereign.a2a.types import (
@@ -24,6 +25,16 @@ from kestrel_sovereign.a2a.types import (
     TextPart,
 )
 from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+
+RECIPIENT = "did:kestrel:recipient"
+
+
+def _recipient_feature() -> TaskFeature:
+    feature = TaskFeature(agent=None)
+    feature.agent = SimpleNamespace(did=RECIPIENT)
+    feature.task_manager = MagicMock()
+    return feature
 
 
 def _make_feature_with_inbox_task(
@@ -49,12 +60,12 @@ def _make_feature_with_inbox_task(
         metadata={"sender": sender, "a2a_verb": "question"},
     )
 
-    async def get_task(task_id):
+    async def get_task_for_recipient(task_id, recipient_agent_id):
+        assert recipient_agent_id == RECIPIENT
         return task if task_id == task.id else None
 
-    feature = TaskFeature(agent=None)
-    feature.task_manager = MagicMock()
-    feature.task_manager.get_task = get_task
+    feature = _recipient_feature()
+    feature.task_manager.get_task_for_recipient = get_task_for_recipient
     return feature, task
 
 
@@ -125,11 +136,11 @@ async def test_list_my_tasks_includes_request_content_per_row():
         metadata={"sender": "Claw", "a2a_verb": "question"},
     )
 
-    async def get_pending_tasks(limit=10):
+    async def get_pending_tasks(limit=10, *, recipient_agent_id):
+        assert recipient_agent_id == RECIPIENT
         return [task_a, task_b][:limit]
 
-    feature = TaskFeature(agent=None)
-    feature.task_manager = MagicMock()
+    feature = _recipient_feature()
     feature.task_manager.get_pending_tasks = get_pending_tasks
 
     result = await feature.list_my_tasks(limit=10)
@@ -168,19 +179,27 @@ async def test_list_my_tasks_status_filter_queries_full_table_not_pending():
         metadata={"sender": "Emma"},
     )
 
-    async def get_pending_tasks(limit=10):
+    async def get_pending_tasks(limit=10, *, recipient_agent_id):
+        assert recipient_agent_id == RECIPIENT
         # The real store returns ONLY submitted tasks here — no completed ones.
         return []
 
     captured = {}
 
-    async def list_tasks(status=None, limit=100, session_id=None, user_id=None):
+    async def list_tasks(
+        status=None,
+        limit=100,
+        session_id=None,
+        user_id=None,
+        *,
+        recipient_agent_id,
+    ):
+        assert recipient_agent_id == RECIPIENT
         captured["status"] = status
         captured["limit"] = limit
         return [completed_task] if status == TaskState.COMPLETED else []
 
-    feature = TaskFeature(agent=None)
-    feature.task_manager = MagicMock()
+    feature = _recipient_feature()
     feature.task_manager.get_pending_tasks = get_pending_tasks
     feature.task_manager.list_tasks = list_tasks
 
@@ -201,8 +220,7 @@ async def test_list_my_tasks_status_filter_queries_full_table_not_pending():
 @pytest.mark.asyncio
 async def test_list_my_tasks_invalid_status_rejected():
     """An unknown status is rejected up-front (case-insensitive validation)."""
-    feature = TaskFeature(agent=None)
-    feature.task_manager = MagicMock()
+    feature = _recipient_feature()
 
     result = await feature.list_my_tasks(status="bogus")
     assert result.status.value == "error"
@@ -238,13 +256,20 @@ async def test_list_my_tasks_type_filter_overfetches_then_truncates():
     rows = [_task(0, "other"), _task(1, "other"), _task(2, "foo")]
     captured = {}
 
-    async def list_tasks(status=None, limit=100, session_id=None, user_id=None):
+    async def list_tasks(
+        status=None,
+        limit=100,
+        session_id=None,
+        user_id=None,
+        *,
+        recipient_agent_id,
+    ):
+        assert recipient_agent_id == RECIPIENT
         captured["limit"] = limit
         # The store honours whatever limit it is given; return up to that many.
         return rows[:limit]
 
-    feature = TaskFeature(agent=None)
-    feature.task_manager = MagicMock()
+    feature = _recipient_feature()
     feature.task_manager.list_tasks = list_tasks
 
     result = await feature.list_my_tasks(status="completed", task_type="foo", limit=1)
@@ -307,12 +332,12 @@ async def test_check_task_status_surfaces_sender_attached_artifacts():
         ],
     )
 
-    async def get_task(task_id):
+    async def get_task_for_recipient(task_id, recipient_agent_id):
+        assert recipient_agent_id == RECIPIENT
         return task if task_id == task.id else None
 
-    feature = TaskFeature(agent=None)
-    feature.task_manager = MagicMock()
-    feature.task_manager.get_task = get_task
+    feature = _recipient_feature()
+    feature.task_manager.get_task_for_recipient = get_task_for_recipient
 
     result = await feature.check_task_status(task_id=task.id)
     assert result.status.value == "ok", result

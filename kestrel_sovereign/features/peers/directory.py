@@ -12,6 +12,7 @@ host behaviour.  It is deliberately an adapter, not a hosted tenancy policy.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import quote
@@ -240,12 +241,23 @@ class LocalHostPeerDirectory:
         api_key: str = "",
         client_factory: Callable[..., Any] = httpx.AsyncClient,
         local_cancel: Optional[Callable[..., Any]] = None,
+        local_get: Optional[Callable[..., Any]] = None,
+        local_subscribe: Optional[Callable[..., Any]] = None,
+        principal_payload_factory: Optional[
+            Callable[[str, str], Mapping[str, Any]]
+        ] = None,
     ) -> None:
         self._host_url = host_url.rstrip("/")
         self._api_key = api_key
         self._client_factory = client_factory
         # Host-owned process-local capability; never serialized onto the wire.
         self._local_cancel = local_cancel
+        self._local_get = local_get
+        self._local_subscribe = local_subscribe
+        # Subprocess peers cannot receive the manager's process-local creator
+        # capability. They authenticate HTTP reads with the same signed,
+        # replay-protected A2A envelope used for mutations.
+        self._principal_payload_factory = principal_payload_factory
 
     def _headers(self) -> dict[str, str]:
         from kestrel_sovereign.auth import (
@@ -490,12 +502,38 @@ class LocalHostPeerDirectory:
         self._require_requester(requester)
         try:
             authorized_peer = await self._authorize_peer(requester, peer)
+            if callable(self._local_get):
+                result = self._local_get(requester, authorized_peer, task_id)
+                if hasattr(result, "__await__"):
+                    result = await result
+                if not isinstance(result, Mapping):
+                    raise PeerProtocolError(
+                        "Local host returned an invalid A2A task result"
+                    )
+                return result
+            if not callable(self._principal_payload_factory):
+                # The shared host API key proves sovereign transport access,
+                # not which peer created this task.
+                raise PeerAccessDeniedError(
+                    "Local A2A result reads require authenticated creator authority"
+                )
+            try:
+                payload = self._principal_payload_factory(task_id, "read_task")
+            except Exception as exc:
+                raise PeerAccessDeniedError(
+                    "Local A2A result read authentication failed"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise PeerProtocolError(
+                    "Local A2A result read authentication is malformed"
+                )
             async with self._client_factory() as client:
-                response = await client.get(
+                response = await client.post(
                     self._peer_url(
                         authorized_peer,
-                        f"api/agent/tasks/{quote(task_id, safe='')}",
+                        f"api/agent/tasks/{quote(task_id, safe='')}/read",
                     ),
+                    json=dict(payload),
                     headers=self._headers(),
                     timeout=httpx.Timeout(
                         connect=PEER_CONNECT_TIMEOUT,
@@ -568,28 +606,91 @@ class LocalHostPeerDirectory:
         timeout_seconds: float,
     ) -> AsyncIterator[PeerSubscriptionEvent]:
         self._require_requester(requester)
-        authorized_peer = await self._authorize_peer(requester, peer)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout_seconds))
+
+        def _remaining() -> float:
+            return max(0.0, deadline - loop.time())
+
+        try:
+            authorized_peer = await asyncio.wait_for(
+                self._authorize_peer(requester, peer),
+                timeout=_remaining(),
+            )
+        except TimeoutError:
+            return
+        if callable(self._local_subscribe):
+            stream = self._local_subscribe(
+                requester,
+                authorized_peer,
+                task_id,
+            )
+            iterator = stream.__aiter__()
+            try:
+                while _remaining() > 0:
+                    try:
+                        event = await asyncio.wait_for(
+                            anext(iterator),
+                            timeout=_remaining(),
+                        )
+                    except StopAsyncIteration:
+                        return
+                    except TimeoutError:
+                        return
+                    if not isinstance(event, PeerSubscriptionEvent):
+                        raise PeerProtocolError(
+                            "Local host returned an invalid A2A subscription event"
+                        )
+                    yield event
+            finally:
+                close = getattr(iterator, "aclose", None)
+                if callable(close):
+                    await close()
+            return
+        if not callable(self._principal_payload_factory):
+            # As with point reads, an API key plus a task id is not creator
+            # proof. A managed in-process host injects the capability above;
+            # subprocess peers must carry a signed principal envelope.
+            raise PeerAccessDeniedError(
+                "Local A2A subscriptions require authenticated creator authority"
+            )
+        try:
+            payload = self._principal_payload_factory(task_id, "subscribe_task")
+        except Exception as exc:
+            raise PeerAccessDeniedError(
+                "Local A2A subscription authentication failed"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise PeerProtocolError(
+                "Local A2A subscription authentication is malformed"
+            )
+        remaining = _remaining()
+        if remaining <= 0:
+            return
         timeout = httpx.Timeout(
-            connect=min(PEER_CONNECT_TIMEOUT, timeout_seconds),
-            read=timeout_seconds,
-            write=min(PEER_CONNECT_TIMEOUT, timeout_seconds),
-            pool=min(PEER_CONNECT_TIMEOUT, timeout_seconds),
+            connect=min(PEER_CONNECT_TIMEOUT, remaining),
+            read=remaining,
+            write=min(PEER_CONNECT_TIMEOUT, remaining),
+            pool=min(PEER_CONNECT_TIMEOUT, remaining),
         )
         try:
             async with self._client_factory(timeout=timeout) as client:
                 async with client.stream(
-                    "GET",
+                    "POST",
                     self._peer_url(
                         authorized_peer,
                         f"api/agent/tasks/{quote(task_id, safe='')}/subscribe",
                     ),
+                    json=dict(payload),
                     headers=self._headers(),
                 ) as response:
                     if response.status_code == 404:
                         raise PeerSubscriptionUnavailableError(
                             "Peer does not expose A2A task subscriptions"
                         )
-                    self._raise_for_route_status(response, action="subscribing to A2A task")
+                    self._raise_for_route_status(
+                        response, action="subscribing to A2A task"
+                    )
                     async for event in iter_sse_events(response):
                         yield event
         except PeerDirectoryError:

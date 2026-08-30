@@ -24,6 +24,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.a2a.task_manager import TaskCancellationAuthorizationError
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sdk.tools.base import ToolCategory
@@ -93,6 +94,14 @@ class TaskFeature(Feature):
         self.task_manager = task_manager
         logger.info("TaskFeature connected to TaskManager")
 
+    def _recipient_agent_id(self) -> str:
+        """Return the runtime-bound inbox principal for every task operation."""
+
+        value = getattr(self.agent, "did", None)
+        if not isinstance(value, str) or not value:
+            raise ValueError("Task recipient identity unavailable")
+        return value
+
     # ------------------------------------------------------------------
     # Internal helpers
     #
@@ -116,7 +125,11 @@ class TaskFeature(Feature):
             return {"ok": False, "error": "Task manager not available"}
 
         try:
-            task = await self.task_manager.get_task(task_id)
+            recipient_agent_id = self._recipient_agent_id()
+            task = await self.task_manager.get_task_for_recipient(
+                task_id,
+                recipient_agent_id,
+            )
         except Exception as e:
             logger.error(f"Failed to fetch task {task_id}: {e}")
             return {"ok": False, "error": str(e)}
@@ -867,11 +880,16 @@ class TaskFeature(Feature):
                 # back empty in production (#1946). Route through the store-level
                 # list_tasks passthrough which filters by state in SQL.
                 tasks = await self.task_manager.list_tasks(
-                    status=task_state, limit=fetch_limit
+                    recipient_agent_id=self._recipient_agent_id(),
+                    status=task_state,
+                    limit=fetch_limit,
                 )
             else:
                 # No status filter — the inbox view (pending/submitted work).
-                tasks = await self.task_manager.get_pending_tasks(limit=fetch_limit)
+                tasks = await self.task_manager.get_pending_tasks(
+                    recipient_agent_id=self._recipient_agent_id(),
+                    limit=fetch_limit,
+                )
 
             if task_type:
                 tasks = [
@@ -1075,7 +1093,10 @@ class TaskFeature(Feature):
             return await self.cancel_task(task_id, reason=content)
 
         try:
-            task = await self.task_manager.get_task(task_id)
+            task = await self.task_manager.get_task_for_recipient(
+                task_id,
+                self._recipient_agent_id(),
+            )
         except Exception as e:
             logger.error(f"Failed to fetch task {task_id} for respond: {e}")
             return ToolResult.failed(str(e))
@@ -1307,33 +1328,33 @@ class TaskFeature(Feature):
         # current peer-scope reauthorization and recipient-side notification.
         # ``None`` is the PeersFeature contract for an exact absent outbound
         # route; every unsafe/unreadable route is a fail-closed ToolResult.
+        try:
+            local_recipient_match = await self.task_manager.is_task_recipient(
+                task_id,
+                actor_agent_id,
+            )
+        except Exception as error:
+            logger.error(
+                "Could not resolve task direction for %s: %s",
+                task_id,
+                error,
+                exc_info=True,
+            )
+            return ToolResult.failed(
+                "Could not resolve task cancellation direction",
+                data={"task_id": task_id},
+            )
         features = getattr(self.agent, "features", None)
         values = (
             features.values()
             if hasattr(features, "values")
             else features or ()
         )
+        outbound_router_available = False
         for feature in values:
             cancel_outbound = getattr(feature, "cancel_outbound_task", None)
             if callable(cancel_outbound):
-                try:
-                    local_recipient_match = (
-                        await self.task_manager.is_task_recipient(
-                            task_id,
-                            actor_agent_id,
-                        )
-                    )
-                except Exception as error:
-                    logger.error(
-                        "Could not resolve task direction for %s: %s",
-                        task_id,
-                        error,
-                        exc_info=True,
-                    )
-                    return ToolResult.failed(
-                        "Could not resolve task cancellation direction",
-                        data={"task_id": task_id},
-                    )
+                outbound_router_available = True
                 outbound_result = await cancel_outbound(
                     task_id,
                     reason=reason,
@@ -1342,11 +1363,30 @@ class TaskFeature(Feature):
                 if outbound_result is not None:
                     return outbound_result
 
+        if not local_recipient_match:
+            return ToolResult.failed(
+                f"Task {task_id} not found"
+                if not outbound_router_available
+                else "Task cancellation direction is not unambiguous",
+                data={"task_id": task_id},
+            )
+
         try:
             task = await self.task_manager.cancel_task(
                 task_id,
                 reason=reason,
                 agent_name=actor_agent_id,
+                recipient_agent_id=actor_agent_id,
+            )
+        except TaskCancellationAuthorizationError:
+            # This tool is a public task-discovery boundary.  Do not let a
+            # durable-principal authorization failure prove that the task ID
+            # exists; callers without creator/recipient authority receive the
+            # same result as an absent task.
+            logger.info("Task %s was not found for cancellation", task_id)
+            return ToolResult.failed(
+                f"Task {task_id} not found",
+                data={"task_id": task_id},
             )
         except ValueError as e:
             logger.error(f"Failed to cancel task {task_id}: {e}", exc_info=True)

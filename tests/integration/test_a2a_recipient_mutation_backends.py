@@ -59,7 +59,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         )
         assert allowed is True
         assert denied is False
-        assert (await store.get(status_id)).status.state is TaskState.WORKING
+        assert (await store._get_unscoped(status_id)).status.state is TaskState.WORKING
 
         artifact = Artifact(name="result", parts=[TextPart(text="payload")])
         with pytest.raises(TaskMutationAuthorizationError):
@@ -73,11 +73,11 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
             artifact,
             recipient_agent_id=recipient,
         )
-        assert [item.name for item in (await store.get(artifact_id)).artifacts] == [
+        assert [item.name for item in (await store._get_unscoped(artifact_id)).artifacts] == [
             "result"
         ]
 
-        worker_copy = await store.get(lifecycle_id)
+        worker_copy = await store._get_unscoped(lifecycle_id)
         worker_copy.status = TaskStatus(state=TaskState.WORKING)
         assert not await store.save_recipient_lifecycle(
             worker_copy,
@@ -87,7 +87,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
             worker_copy,
             recipient_agent_id=recipient,
         )
-        assert (await store.get(lifecycle_id)).status.state is TaskState.WORKING
+        assert (await store._get_unscoped(lifecycle_id)).status.state is TaskState.WORKING
     finally:
         for task_id in (status_id, artifact_id, lifecycle_id):
             await store.delete(task_id)
@@ -101,7 +101,6 @@ async def test_recipient_mutation_authority_sqlite(tmp_path):
         await _exercise_recipient_mutations(TaskStore(backend))
     finally:
         await backend.close()
-
 
 @pytest.mark.asyncio
 async def test_recipient_mutation_authority_postgres():
@@ -117,4 +116,3 @@ async def test_recipient_mutation_authority_postgres():
         await _exercise_recipient_mutations(TaskStore(backend))
     finally:
         await backend.close()
-

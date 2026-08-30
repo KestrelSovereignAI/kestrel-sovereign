@@ -21,11 +21,11 @@ from kestrel_sovereign.a2a.types import (
 )
 from kestrel_sovereign.a2a.stores.base import json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
 
-_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v2"
+_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v3"
 
 
 class TaskAlreadyExistsError(ValueError):
@@ -207,7 +207,7 @@ class TaskStore(UnifiedStoreBase):
                       ON namespace.oid = relation.relnamespace
                     WHERE namespace.nspname = current_schema()
                       AND relation.relname = 'a2a_tasks'
-                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v3'
                       AND NOT trigger.tgisinternal
                 )
                 AND (
@@ -285,10 +285,11 @@ class TaskStore(UnifiedStoreBase):
                         RAISE EXCEPTION 'canceled A2A task is terminal'
                             USING ERRCODE = 'check_violation';
                     END IF;
-                    IF NEW.status IN ('submitted', 'working', 'input-required')
+                    IF (TG_OP = 'INSERT'
+                        OR NEW.status IN ('submitted', 'working', 'input-required'))
                        AND (NEW.creator_agent_id IS NULL
                             OR NEW.recipient_agent_id IS NULL) THEN
-                        RAISE EXCEPTION 'live A2A task requires durable authority'
+                        RAISE EXCEPTION 'A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
                     END IF;
                     RETURN NEW;
@@ -299,7 +300,9 @@ class TaskStore(UnifiedStoreBase):
                     ON a2a_tasks;
                 DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v2
                     ON a2a_tasks;
-                CREATE TRIGGER a2a_tasks_authority_fence_v2
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v3
+                    ON a2a_tasks;
+                CREATE TRIGGER a2a_tasks_authority_fence_v3
                 BEFORE INSERT OR UPDATE ON a2a_tasks
                 FOR EACH ROW
                 EXECUTE FUNCTION a2a_tasks_enforce_authority_fence();
@@ -316,14 +319,27 @@ class TaskStore(UnifiedStoreBase):
                 SELECT RAISE(ABORT, 'canceled A2A task is terminal');
             END;
 
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_insert_fence_v3;
+            CREATE TRIGGER a2a_tasks_canceled_insert_fence_v3
             BEFORE INSERT ON a2a_tasks
             FOR EACH ROW
-            WHEN NEW.status IN ('submitted', 'working', 'input-required')
-              AND (NEW.creator_agent_id IS NULL
-                   OR NEW.recipient_agent_id IS NULL)
+            WHEN EXISTS (
+                SELECT 1 FROM a2a_tasks existing
+                WHERE existing.id = NEW.id AND existing.status = 'canceled'
+            )
             BEGIN
-                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
+                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+            END;
+
+            DROP TRIGGER IF EXISTS a2a_tasks_live_authority_v2;
+            DROP TRIGGER IF EXISTS a2a_tasks_insert_authority_v3;
+            CREATE TRIGGER a2a_tasks_insert_authority_v3
+            BEFORE INSERT ON a2a_tasks
+            FOR EACH ROW
+            WHEN NEW.creator_agent_id IS NULL
+              OR NEW.recipient_agent_id IS NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'A2A task requires durable authority');
             END;
 
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_update_v2
@@ -442,36 +458,91 @@ class TaskStore(UnifiedStoreBase):
         )
         user_id = metadata.get("user_id")
 
-        rows_affected = await self._backend.execute(
-            f"""
-            INSERT INTO a2a_tasks
-            (id, session_id, user_id, task_type, status, message, artifacts,
-             history, metadata, updated_at, creator_agent_id, recipient_agent_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()}, ?, ?)
-            ON CONFLICT (id) DO NOTHING
-            """,
-            (
-                task.id,
-                task.sessionId,
-                user_id,
-                task_type,
-                task.status.state.value,
-                message_json,
-                artifacts_json,
-                history_json,
-                metadata_json,
-                creator_agent_id,
-                recipient_agent_id,
-            ),
-        )
+        try:
+            rows_affected = await self._backend.execute(
+                f"""
+                INSERT INTO a2a_tasks
+                (id, session_id, user_id, task_type, status, message, artifacts,
+                 history, metadata, updated_at, creator_agent_id, recipient_agent_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()}, ?, ?)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    task.id,
+                    task.sessionId,
+                    user_id,
+                    task_type,
+                    task.status.state.value,
+                    message_json,
+                    artifacts_json,
+                    history_json,
+                    metadata_json,
+                    creator_agent_id,
+                    recipient_agent_id,
+                ),
+            )
+        except QueryError as insert_error:
+            # SQLite fires BEFORE INSERT triggers before applying this
+            # statement's ON CONFLICT policy. The terminal canceled-row fence
+            # must continue blocking legacy INSERT OR REPLACE writers, but an
+            # ordinary duplicate submission still has the backend-independent
+            # TaskAlreadyExists contract. Re-probe the canonical key after the
+            # failed statement; do not translate unrelated storage failures.
+            try:
+                occupied = await self._backend.fetch_one(
+                    "SELECT 1 FROM a2a_tasks WHERE id = ?",
+                    (task.id,),
+                )
+            except QueryError:
+                raise insert_error
+            if occupied is not None:
+                raise TaskAlreadyExistsError(
+                    f"Task already exists: {task.id}"
+                ) from insert_error
+            raise
         if rows_affected != 1:
             raise TaskAlreadyExistsError(f"Task already exists: {task.id}")
 
-    async def get(self, task_id: str) -> Optional[Task]:
-        """Retrieve a task by ID."""
+    async def _get_unscoped(self, task_id: str) -> Optional[Task]:
+        """Internal canonical-row read after an already-authorized mutation."""
         row = await self._backend.fetch_one(
             "SELECT * FROM a2a_tasks WHERE id = ?",
             (task_id,),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    async def get_for_creator(
+        self,
+        task_id: str,
+        creator_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a sender-owned result through its durable creator."""
+
+        if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
+            raise ValueError("Task creator lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? AND creator_agent_id = ?",
+            (task_id, creator_agent_id),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    async def get_for_principal(
+        self,
+        task_id: str,
+        principal_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a task visible to either one of its durable principals."""
+
+        if not isinstance(principal_agent_id, str) or not principal_agent_id.strip():
+            raise ValueError("Task principal lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? "
+            "AND (creator_agent_id = ? OR recipient_agent_id = ?)",
+            (task_id, principal_agent_id, principal_agent_id),
         )
         if not row:
             return None
@@ -497,12 +568,18 @@ class TaskStore(UnifiedStoreBase):
     async def get_cancellation_snapshot(
         self,
         task_id: str,
+        *,
+        recipient_agent_id: str,
     ) -> Optional[TaskCancellationSnapshot]:
         """Read cancellation authority without loading task payload columns."""
 
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+            raise ValueError("Cancellation snapshot requires a concrete recipient")
+
         row = await self._backend.fetch_one(
-            "SELECT status, canceled_by FROM a2a_tasks WHERE id = ?",
-            (task_id,),
+            "SELECT status, canceled_by FROM a2a_tasks "
+            "WHERE id = ? AND recipient_agent_id = ?",
+            (task_id, recipient_agent_id),
         )
         if not row:
             return None
@@ -533,34 +610,21 @@ class TaskStore(UnifiedStoreBase):
 
     async def get_pending_tasks(
         self,
-        limit: int = 10,
         *,
-        recipient_agent_id: Optional[str] = None,
+        recipient_agent_id: str,
+        limit: int = 10,
     ) -> list[Task]:
-        """Get submitted work, optionally constrained to one worker recipient."""
-
-        if recipient_agent_id is not None and (
-            not isinstance(recipient_agent_id, str)
-            or not recipient_agent_id.strip()
-        ):
-            raise ValueError("Pending-task recipient must be a concrete identity")
-        recipient_predicate = (
-            " AND recipient_agent_id = ?" if recipient_agent_id is not None else ""
-        )
-        params = (
-            (recipient_agent_id, limit)
-            if recipient_agent_id is not None
-            else (limit,)
-        )
+        """Get SUBMITTED work addressed to one durable recipient."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Pending-task reads require a concrete recipient")
         rows = await self._backend.fetch_all(
             f"""
             SELECT * FROM a2a_tasks
-            WHERE status = 'submitted'
-            {recipient_predicate}
+            WHERE status = 'submitted' AND recipient_agent_id = ?
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            params,
+            (recipient_agent_id, limit),
         )
         return [self._row_to_task(row) for row in rows]
 
@@ -678,8 +742,19 @@ class TaskStore(UnifiedStoreBase):
         async with transaction:
             lock_suffix = " FOR UPDATE" if self.is_postgres else ""
             current = await self._backend.fetch_one(
-                f"SELECT * FROM a2a_tasks WHERE id = ?{lock_suffix}",
-                (task_id,),
+                f"""
+                SELECT * FROM a2a_tasks
+                WHERE id = ?
+                  AND (creator_agent_id = ? OR recipient_agent_id = ?)
+                  {recipient_predicate}
+                {lock_suffix}
+                """,
+                (
+                    task_id,
+                    actor_agent_id,
+                    actor_agent_id,
+                    *recipient_values,
+                ),
             )
             if current is None:
                 return None
@@ -836,14 +911,18 @@ class TaskStore(UnifiedStoreBase):
 
     async def list_tasks(
         self,
+        *,
+        recipient_agent_id: str,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         status: Optional[TaskState] = None,
         limit: int = 100,
     ) -> list[Task]:
-        """List tasks with optional filters."""
-        conditions = []
-        params = []
+        """List only tasks addressed to one durable recipient."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task listing requires a concrete recipient")
+        conditions = ["recipient_agent_id = ?"]
+        params = [recipient_agent_id]
 
         if session_id:
             conditions.append("session_id = ?")

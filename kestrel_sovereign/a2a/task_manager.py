@@ -448,7 +448,13 @@ class TaskManager:
                             f"Result lost for skill={skill_id}, agent={agent_id}"
                         )
                 if saved is False:
-                    task = await self.task_store.get(task.id) or task
+                    task = (
+                        await self.task_store.get_for_recipient(
+                            task.id,
+                            authority_agent_id,
+                        )
+                        or task
+                    )
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
@@ -562,7 +568,10 @@ class TaskManager:
                 task_payload=task,
             )
         except ValueError:
-            current = await self.task_store.get(task.id)
+            current = await self.task_store.get_for_recipient(
+                task.id,
+                authority_agent_id,
+            )
             if current is not None and current.status.state in {
                 TaskState.COMPLETED,
                 TaskState.FAILED,
@@ -634,7 +643,14 @@ class TaskManager:
             # Another terminal writer won its CAS and owns the corresponding
             # completion signal. Returning its durable state must not emit the
             # same terminal event a second time.
-            return (await self.task_store.get(task.id) or task), False
+            return (
+                await self.task_store.get_for_recipient(
+                    task.id,
+                    authority_agent_id,
+                )
+                or task,
+                False,
+            )
         return task, True
 
     async def execute_command(self, user_input: str) -> Optional[dict]:
@@ -863,7 +879,7 @@ class TaskManager:
         # SUBMITTED snapshot after a terminal transition already committed.
         readback_succeeded = False
         try:
-            canonical = await self.task_store.get(task.id)
+            canonical = await self.task_store._get_unscoped(task.id)
             readback_succeeded = canonical is not None
         except (Exception, asyncio.CancelledError):
             canonical = None
@@ -1018,17 +1034,37 @@ class TaskManager:
         logger.info(f"Artifact added to task {task_id}: {artifact.name}")
         return task
 
-    async def get_task(self, task_id: str) -> Optional[Task]:
-        """Get a task by ID."""
-        return await self.task_store.get(task_id)
+    async def get_task_for_recipient(
+        self,
+        task_id: str,
+        recipient_agent_id: str,
+    ) -> Optional[Task]:
+        """Get one inbox task through its durable recipient principal."""
+        return await self.task_store.get_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
+
+    async def get_task_for_creator(
+        self,
+        task_id: str,
+        creator_agent_id: str,
+    ) -> Optional[Task]:
+        """Get one outbound result through its durable creator principal."""
+        return await self.task_store.get_for_creator(task_id, creator_agent_id)
 
     async def get_task_cancellation_snapshot(
         self,
         task_id: str,
+        *,
+        recipient_agent_id: str,
     ) -> Optional[TaskCancellationSnapshot]:
         """Read the minimal durable state used to withdraw live cognition."""
 
-        return await self.task_store.get_cancellation_snapshot(task_id)
+        return await self.task_store.get_cancellation_snapshot(
+            task_id,
+            recipient_agent_id=recipient_agent_id,
+        )
 
     async def is_task_recipient(self, task_id: str, agent_id: str) -> bool:
         """Whether this manager's durable task row delegates execution to agent."""
@@ -1038,26 +1074,33 @@ class TaskManager:
     async def get_session_tasks(
         self,
         session_id: str,
+        *,
+        recipient_agent_id: str,
         limit: int = 100,
     ) -> list[Task]:
         """Get all tasks in a session."""
-        return await self.task_store.list_tasks(session_id=session_id, limit=limit)
+        return await self.task_store.list_tasks(
+            recipient_agent_id=recipient_agent_id,
+            session_id=session_id,
+            limit=limit,
+        )
 
     async def get_pending_tasks(
         self,
-        limit: int = 100,
         *,
-        recipient_agent_id: Optional[str] = None,
+        recipient_agent_id: str,
+        limit: int = 100,
     ) -> list[Task]:
-        """Get pending tasks, with durable recipient scoping for workers."""
-
+        """Get all pending (submitted) tasks ready for processing."""
         return await self.task_store.get_pending_tasks(
-            limit=limit,
             recipient_agent_id=recipient_agent_id,
+            limit=limit,
         )
 
     async def list_tasks(
         self,
+        *,
+        recipient_agent_id: str,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         status: Optional[TaskState] = None,
@@ -1070,6 +1113,7 @@ class TaskManager:
         filter by any ``TaskState`` (completed, failed, working, canceled).
         """
         return await self.task_store.list_tasks(
+            recipient_agent_id=recipient_agent_id,
             session_id=session_id,
             user_id=user_id,
             status=status,
@@ -1153,7 +1197,10 @@ class TaskManager:
             # original store outcome only after that reconciliation completes.
             store_failure = error
             try:
-                current = await self.task_store.get(task_id)
+                current = await self.task_store.get_for_principal(
+                    task_id,
+                    agent_name,
+                )
                 committed_here = (
                     current is not None
                     and await is_this_actor_receipt(current)
@@ -1171,7 +1218,10 @@ class TaskManager:
             task = current
         if task is None:
             try:
-                current = await self.task_store.get(task_id)
+                current = await self.task_store.get_for_principal(
+                    task_id,
+                    agent_name,
+                )
             except BaseException:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
@@ -1179,7 +1229,10 @@ class TaskManager:
             if current is None:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
-                raise ValueError(f"Task not found: {task_id}")
+                raise TaskCancellationAuthorizationError(
+                    "Task cancellation was not authorized or task was not found: "
+                    f"{task_id}"
+                )
             if await is_this_actor_receipt(current):
                 # The first atomic cancellation owns every derived projection.
                 # Its cancellation-safe projection join completes those side
@@ -1292,7 +1345,10 @@ class TaskManager:
 
         # Log error to observability
         if agent_name:
-            task = await self.task_store.get(task_id)
+            task = await self.task_store.get_for_recipient(
+                task_id,
+                recipient_agent_id,
+            )
             await self.observability_store.log_error(
                 agent_name=agent_name,
                 error_type="task_failure",
@@ -1437,7 +1493,13 @@ class TaskManager:
     # SSE Streaming
     # =========================================================================
 
-    async def subscribe(self, task_id: str) -> AsyncGenerator[dict, None]:
+    async def subscribe(
+        self,
+        task_id: str,
+        *,
+        creator_agent_id: Optional[str] = None,
+        recipient_agent_id: Optional[str] = None,
+    ) -> AsyncGenerator[dict, None]:
         """
         Subscribe to task updates via SSE.
 
@@ -1447,6 +1509,23 @@ class TaskManager:
         Yields:
             SSE event dictionaries with 'event' and 'data' keys
         """
+        if (creator_agent_id is None) == (recipient_agent_id is None):
+            raise ValueError(
+                "Task subscription requires exactly one durable principal role"
+            )
+        if creator_agent_id is not None:
+            authorized_task = await self.task_store.get_for_creator(
+                task_id,
+                creator_agent_id,
+            )
+        else:
+            authorized_task = await self.task_store.get_for_recipient(
+                task_id,
+                str(recipient_agent_id),
+            )
+        if authorized_task is None:
+            return
+
         queue: asyncio.Queue = asyncio.Queue()
 
         # Register subscriber
@@ -1455,6 +1534,24 @@ class TaskManager:
         self._subscribers[task_id].append(queue)
 
         try:
+            # Close the admission race: a terminal transition between the
+            # authorization read above and queue registration could not have
+            # notified this subscriber.  Once registered, repeat the same
+            # principal-scoped read; any later transition must enqueue its
+            # update.
+            if creator_agent_id is not None:
+                authorized_task = await self.task_store.get_for_creator(
+                    task_id,
+                    creator_agent_id,
+                )
+            else:
+                authorized_task = await self.task_store.get_for_recipient(
+                    task_id,
+                    str(recipient_agent_id),
+                )
+            if authorized_task is None:
+                return
+
             # Send current state first. If the task is already terminal
             # (late subscriber), yield with top-level ``final`` so the
             # endpoint loop breaks cleanly — without this, the SSE
@@ -1462,26 +1559,25 @@ class TaskManager:
             # timed out (codex round 1 P2 on PR #1453). Match the same
             # envelope shape ``_notify_status_update`` uses for the
             # live-update path so subscribers can rely on one contract.
-            task = await self.task_store.get(task_id)
-            if task:
-                terminal = task.status.state in (
-                    TaskState.COMPLETED,
-                    TaskState.CANCELED,
-                    TaskState.FAILED,
-                )
-                yield {
-                    "event": "status",
-                    "data": TaskStatusUpdateEvent(
-                        id=task_id,
-                        status=task.status,
-                        final=terminal,
-                    ).model_dump_json(),
-                    "final": terminal,
-                }
-                if terminal:
-                    # Don't enter the keepalive loop — the subscriber
-                    # already has the terminal frame.
-                    return
+            task = authorized_task
+            terminal = task.status.state in (
+                TaskState.COMPLETED,
+                TaskState.CANCELED,
+                TaskState.FAILED,
+            )
+            yield {
+                "event": "status",
+                "data": TaskStatusUpdateEvent(
+                    id=task_id,
+                    status=task.status,
+                    final=terminal,
+                ).model_dump_json(),
+                "final": terminal,
+            }
+            if terminal:
+                # Don't enter the keepalive loop — the subscriber
+                # already has the terminal frame.
+                return
 
             # Stream updates
             while True:
