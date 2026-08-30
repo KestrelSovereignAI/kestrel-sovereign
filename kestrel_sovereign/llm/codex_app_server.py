@@ -1010,7 +1010,27 @@ class CodexAppServerClient:
             # Server→client request. Dispatch in a task so the read loop
             # keeps pumping concurrent notifications/requests while a
             # long-running tool handler is running.
-            asyncio.create_task(self._handle_server_request(mid, method, msg.get("params") or {}))
+            params = msg.get("params") or {}
+            tid = params.get("threadId")
+            handler = self._server_request_handlers.get((method, tid))
+            if handler is None:
+                handler = self._server_request_handlers.get((method, None))
+            task = asyncio.create_task(
+                self._handle_server_request(
+                    mid,
+                    method,
+                    params,
+                    selected_handler=handler,
+                    handler_selected=True,
+                )
+            )
+            active_tasks = getattr(handler, "_codex_active_tasks", None)
+            if isinstance(active_tasks, set):
+                # Admission is synchronous with task creation. A cooperative
+                # Stop may unregister the handler on the very next instruction,
+                # but it will still see and join this already-selected request.
+                active_tasks.add(task)
+                task.add_done_callback(active_tasks.discard)
             return
         # Notification — route to the OWNING turn by threadId so
         # concurrent turns never cross-contaminate. Thread-less global
@@ -1034,6 +1054,8 @@ class CodexAppServerClient:
         params: dict,
         *,
         cancellation_token: Optional[AuthCancellationToken] = None,
+        selected_handler: Optional[ServerRequestHandler] = None,
+        handler_selected: bool = False,
     ) -> None:
         tid = (params or {}).get("threadId")
         if cancellation_token is None:
@@ -1049,9 +1071,11 @@ class CodexAppServerClient:
         try:
             # Prefer a handler scoped to the owning thread; fall back to
             # a global (None) registration; then to safe defaults.
-            handler = self._server_request_handlers.get((method, tid))
-            if handler is None:
-                handler = self._server_request_handlers.get((method, None))
+            handler = selected_handler
+            if not handler_selected:
+                handler = self._server_request_handlers.get((method, tid))
+                if handler is None:
+                    handler = self._server_request_handlers.get((method, None))
             if handler is not None:
                 result = await handler(params)
             elif method == "account/chatgptAuthTokens/refresh":

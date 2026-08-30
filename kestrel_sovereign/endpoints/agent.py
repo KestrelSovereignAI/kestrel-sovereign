@@ -477,14 +477,42 @@ async def invoke_agent(request: Request, http_response: Response):
         if isinstance(kite_evidence_request, dict):
             if user_input not in (None, ""):
                 raise _kite_evidence_error("Kite evidence requests cannot include input.")
-            operation, observation = await _kite_runtime_observation(
-                agent,
-                request_id=request_id,
-                provenance=request_invocation_provenance(
-                    request, source_locator="POST:/api/agent/invoke#kite-release-evidence",
+            observation_task = asyncio.create_task(
+                _kite_runtime_observation(
+                    agent,
+                    request_id=request_id,
+                    provenance=request_invocation_provenance(
+                        request,
+                        source_locator=(
+                            "POST:/api/agent/invoke#kite-release-evidence"
+                        ),
+                    ),
+                    request=kite_evidence_request,
                 ),
-                request=kite_evidence_request,
+                name=f"kite-runtime-observation:{request_id}",
             )
+            bind_request_operation_if_supported(
+                agent,
+                request_id,
+                observation_task,
+            )
+            try:
+                operation, observation = await observation_task
+            except asyncio.CancelledError:
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    http_response.headers["X-Request-ID"] = (
+                        invocation_id_response_header(request_id)
+                    )
+                    return {
+                        "response": "Request stopped during execution.",
+                        "session_id": None,
+                        "model": None,
+                        "provider": None,
+                    }
+                raise
             if callable(request_cancelled) and request_cancelled(request_id) is True:
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)

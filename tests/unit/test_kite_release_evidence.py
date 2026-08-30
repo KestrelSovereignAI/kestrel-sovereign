@@ -729,6 +729,100 @@ async def test_kite_invoke_suppresses_evidence_when_stop_arrives_during_observat
 
 
 @pytest.mark.asyncio
+async def test_kite_observation_is_bound_to_cooperative_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from fastapi import FastAPI, Response
+    from starlette.requests import Request
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints import agent as agent_endpoint
+
+    class _Agent(RequestLifecycleMixin):
+        def __init__(self) -> None:
+            self.agent_id = "did:test:kite-bound-stop"
+            self.did = self.agent_id
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+            self._request_operation_tasks = {}
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def evidence(*_args, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "diagnostics", {"count": 1}
+
+    monkeypatch.setattr(agent_endpoint, "_kite_runtime_observation", evidence)
+    app = FastAPI()
+    agent = _Agent()
+    app.state.agent = agent
+    body = json.dumps(
+        {
+            "request_id": "kite-bound-stop",
+            "kite_evidence": {
+                "operation": "diagnostics",
+                "nonce": "e" * 64,
+            },
+        }
+    ).encode()
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/agent/invoke",
+            "headers": [],
+            "query_string": b"",
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "scheme": "http",
+            "app": app,
+        },
+        receive,
+    )
+    endpoint = getattr(
+        agent_endpoint.invoke_agent,
+        "__wrapped__",
+        agent_endpoint.invoke_agent,
+    )
+    invoke = asyncio.create_task(endpoint(request, Response()))
+    await started.wait()
+    try:
+        assert agent.cancel_current_request("kite-bound-stop") is True
+        await asyncio.sleep(0)
+        assert cancelled.is_set()
+    finally:
+        release.set()
+    result = await invoke
+    assert result["response"] == "Request stopped during execution."
+
+
+@pytest.mark.asyncio
 async def test_kite_paraphrase_recall_uses_the_verified_agent_runtime_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

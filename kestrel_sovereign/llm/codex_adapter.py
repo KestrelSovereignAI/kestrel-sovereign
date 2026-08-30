@@ -2109,6 +2109,12 @@ class CodexAdapter(LLMAdapter):
                 if active_handlers is not None and task is not None:
                     active_handlers.discard(task)
 
+        # CodexAppServerClient reads this marker synchronously when it creates
+        # the reader-owned dispatch task. The coroutine-level add above remains
+        # useful for compatible test/client doubles, but it is too late to
+        # close the create_task-before-first-timeslice Stop race by itself.
+        if active_handlers is not None:
+            setattr(handler, "_codex_active_tasks", active_handlers)
         return handler
 
     def _make_codex_approval_handler(

@@ -28,6 +28,7 @@ from kestrel_sovereign.llm.codex_adapter import (
     _usage_from,
 )
 from kestrel_sovereign.llm.codex_app_server import (
+    CodexAppServerClient,
     CodexAppServerError,
     CodexAppServerFrameTooLarge,
 )
@@ -2118,6 +2119,52 @@ class TestToolExecutorBridge:
             await turn
         assert tool_finished.is_set()
         assert app.handler_task is not None and app.handler_task.done()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_admits_inline_handler_before_its_first_timeslice(self):
+        """A Stop between create_task and coroutine start still joins it."""
+        import asyncio
+
+        release_tool = asyncio.Event()
+        active_handlers: set[asyncio.Task[Any]] = set()
+
+        async def execute(_name, _args):
+            await release_tool.wait()
+            return {"success": True, "result": "committed"}
+
+        adapter = CodexAdapter()
+        handler = adapter._make_tool_call_handler(
+            execute,
+            "thr-admission",
+            frozenset({"side_effect"}),
+            active_handlers=active_handlers,
+        )
+        client = CodexAppServerClient(binary="codex")
+        client._send = lambda _message: None
+        unregister = client.register_server_request_handler(
+            "item/tool/call", handler, thread_id="thr-admission"
+        )
+        client._dispatch(
+            {
+                "id": 7,
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "thr-admission",
+                    "callId": "call-admission",
+                    "tool": "side_effect",
+                    "arguments": {},
+                },
+            }
+        )
+        unregister()
+        try:
+            assert len(active_handlers) == 1
+        finally:
+            await asyncio.sleep(0)
+            admitted = tuple(active_handlers)
+            release_tool.set()
+            if admitted:
+                await asyncio.gather(*admitted)
 
     @pytest.mark.asyncio
     async def test_inline_executed_tools_absent_from_final_response(self):
