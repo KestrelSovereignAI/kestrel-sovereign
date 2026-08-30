@@ -23,6 +23,7 @@ from .enforcement import (
     HoldTurnRefusal,
     build_bound_host_context,
     close_bound_host_context,
+    initialize_with_bound_hold_context,
     require_context_hold_store,
     require_turn_start_allowed,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "HoldTurnRefusal",
     "build_bound_host_context",
     "close_bound_host_context",
+    "initialize_with_bound_hold_context",
     "require_context_hold_store",
     "require_turn_start_allowed",
 ]

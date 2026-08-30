@@ -354,6 +354,11 @@ class HoldStore:
                 "CHECK (scope <> 'host' OR target_id = 'host'))"
             )
             await self._db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_hold_receipts_operation_unique_v1 "
+                "ON hold_receipts(operation_id)"
+            )
+            await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
                 "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
             )
@@ -440,10 +445,15 @@ class HoldStore:
             )
 
     async def _read_receipt_by_operation(self, operation_id: str) -> Any:
-        return await self._db.fetchone(
+        rows = await self._db.fetchall(
             f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE operation_id = ?",
             (operation_id,),
         )
+        if len(rows) > 1:
+            raise HoldCorruptStateError(
+                "Hold receipt history has duplicate operation identities"
+            )
+        return rows[0] if rows else None
 
     async def _read_receipt_by_id(self, receipt_id: str) -> Any:
         return await self._db.fetchone(
@@ -486,6 +496,17 @@ class HoldStore:
             for receipt in applied
             if receipt.action is HoldAction.HOLD
         }
+        for receipt in receipts:
+            if receipt.disposition is HoldDisposition.APPLIED:
+                continue
+            for referenced_authority in {
+                receipt.prior_hold_receipt_id,
+                receipt.resulting_hold_receipt_id,
+            }:
+                if referenced_authority and referenced_authority not in authorities:
+                    raise HoldCorruptStateError(
+                        "non-applied Hold history references missing authority"
+                    )
         consumers: dict[str, HoldReceipt] = {}
         for receipt in applied:
             prior = receipt.prior_hold_receipt_id

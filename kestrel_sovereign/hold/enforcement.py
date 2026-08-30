@@ -7,10 +7,15 @@ when neither the host nor the addressed agent latch is active.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from typing import Any
 
 from .state import EffectiveHoldState, HoldState, HoldStateError
+
+
+logger = logging.getLogger(__name__)
 
 
 class HoldEnforcementUnavailableError(HoldStateError):
@@ -128,8 +133,58 @@ async def close_bound_host_context(context: Any) -> None:
             await factory.close()
     finally:
         db = getattr(context, "db", None)
-        if db is not None and hasattr(db, "close"):
-            await db.close()
+        hold_database = getattr(context, "hold_database", None)
+        try:
+            if (
+                hold_database is not None
+                and hold_database is not db
+                and hasattr(hold_database, "close")
+            ):
+                await hold_database.close()
+        finally:
+            if db is not None and hasattr(db, "close"):
+                await db.close()
+
+
+async def initialize_with_bound_hold_context(
+    agent: Any,
+    *,
+    config: Any = None,
+) -> Any:
+    """Bind Hold and initialize one standalone agent as one owned lifecycle."""
+
+    context = await build_bound_host_context(agent, config=config)
+    try:
+        await agent.initialize()
+    except BaseException as startup_failure:
+        # Initialization may be cancelled repeatedly. Give resource cleanup its
+        # own task and use the repository's cancellation-resilient join before
+        # propagating the original startup outcome.
+        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
+
+        close_task = asyncio.create_task(
+            close_bound_host_context(context),
+            name="initialize_with_bound_hold_context:close",
+        )
+        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
+            close_task
+        )
+        if cleanup_failure is not None:
+            logger.warning(
+                "Hold context cleanup failed after agent initialization: %s",
+                cleanup_failure,
+                exc_info=(
+                    type(cleanup_failure),
+                    cleanup_failure,
+                    cleanup_failure.__traceback__,
+                ),
+            )
+        if cleanup_cancelled and not isinstance(
+            startup_failure, asyncio.CancelledError
+        ):
+            raise asyncio.CancelledError() from startup_failure
+        raise
+    return context
 
 
 async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
@@ -173,6 +228,7 @@ __all__ = [
     "HoldTurnRefusal",
     "build_bound_host_context",
     "close_bound_host_context",
+    "initialize_with_bound_hold_context",
     "require_context_hold_store",
     "require_turn_start_allowed",
 ]

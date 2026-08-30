@@ -1682,14 +1682,29 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                             if host_context is not None
                             else None
                         )
-                        if host_db is not None and hasattr(host_db, "close"):
-                            try:
-                                await host_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Host feature database shutdown failed: %s", exc
-                                )
-                        app.state.host_context = None
+                        hold_db = (
+                            getattr(host_context, "hold_database", None)
+                            if host_context is not None
+                            else None
+                        )
+                        try:
+                            if (
+                                hold_db is not None
+                                and hold_db is not host_db
+                                and hasattr(hold_db, "close")
+                            ):
+                                await hold_db.close()
+                        except Exception as exc:  # noqa: BLE001 - close host DB too
+                            logger.warning("Hold database shutdown failed: %s", exc)
+                        finally:
+                            if host_db is not None and hasattr(host_db, "close"):
+                                try:
+                                    await host_db.close()
+                                except Exception as exc:  # noqa: BLE001 - terminal cleanup
+                                    logger.warning(
+                                        "Host feature database shutdown failed: %s", exc
+                                    )
+                            app.state.host_context = None
 
 
 def _uses_shared_postgres_scheduler() -> bool:

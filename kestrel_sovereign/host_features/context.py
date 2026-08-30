@@ -129,6 +129,7 @@ class SovereignHostContext:
         config: Any = None,
         session_factory: Optional[FleetSessionFactory] = None,
         hold_store: Any = None,
+        hold_database: Any = None,
         backend_error: str = "",
     ) -> None:
         self._db = db
@@ -136,6 +137,7 @@ class SovereignHostContext:
         self._config = config if config is not None else {}
         self._session_factory = session_factory
         self._hold_store = hold_store
+        self._hold_database = hold_database
         self._backend_error = str(backend_error or "")
 
     @property
@@ -160,6 +162,12 @@ class SovereignHostContext:
         """Durable host/agent Hold latches on the host control backend."""
 
         return self._hold_store
+
+    @property
+    def hold_database(self) -> Any:
+        """Database owning Hold state; distinct only on shared PostgreSQL."""
+
+        return self._hold_database
 
     @property
     def backend_error(self) -> str:
@@ -199,6 +207,7 @@ async def build_host_context(
     db = None
     session_factory: Optional[FleetSessionFactory] = None
     hold_store = None
+    hold_database = None
     backend_error = ""
     try:
         from kestrel_sovereign.host_features.storage import (
@@ -208,29 +217,16 @@ async def build_host_context(
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
 
-        backend_type = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
-        database_url = os.environ.get("KESTREL_DATABASE_URL")
-        if backend_type == "postgres":
-            if not database_url:
-                raise RuntimeError(
-                    "KESTREL_DATABASE_URL is required for the PostgreSQL host backend"
-                )
-            db = await AsyncDatabase.postgres(database_url)
-            backend_label = "shared PostgreSQL"
-        else:
-            resolved = prepare_host_database(db_path)
-            db = await AsyncDatabase.sqlite(str(resolved))
-            validate_sqlite_family_private(resolved)
-            backend_label = str(resolved)
+        # Host-feature storage predates Hold and has its own documented path.
+        # Never redirect that state merely because agents use PostgreSQL.
+        resolved = prepare_host_database(db_path)
+        db = await AsyncDatabase.sqlite(str(resolved))
+        validate_sqlite_family_private(resolved)
         inner = make_session_factory(db)
         session_factory = FleetSessionFactory(inner)
-        from kestrel_sovereign.hold import HoldStore
-
-        hold_store = HoldStore(db)
-        await hold_store.ensure_schema()
         logger.info(
             "Host backend opened at %s (fleet tenant=%s)",
-            backend_label,
+            resolved,
             FLEET_TENANT_ID,
         )
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
@@ -248,6 +244,7 @@ async def build_host_context(
                 logger.warning("Could not close partial host backend: %s", close_exc)
         session_factory = None
         hold_store = None
+        hold_database = None
         db = None
         backend_error = f"{type(exc).__name__}: {exc}"
         # ERROR, not warning: everything that depends on the host store is
@@ -255,12 +252,49 @@ async def build_host_context(
         # result rather than a failure (#3058).
         logger.error("Could not open host backend/session factory: %s", exc)
 
+    if db is not None:
+        try:
+            from kestrel_sovereign.hold import HoldStore
+            from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+            backend_type = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+            if backend_type == "postgres":
+                database_url = os.environ.get("KESTREL_DATABASE_URL")
+                if not database_url:
+                    raise RuntimeError(
+                        "KESTREL_DATABASE_URL is required for the PostgreSQL Hold backend"
+                    )
+                hold_database = await AsyncDatabase.postgres(database_url)
+                hold_label = "shared PostgreSQL"
+            else:
+                hold_database = db
+                hold_label = str(resolved)
+            hold_store = HoldStore(hold_database)
+            await hold_store.ensure_schema()
+            logger.info("Hold backend opened at %s", hold_label)
+        except Exception as exc:  # noqa: BLE001 - named gap; admission fails closed
+            if hold_database is not None and hold_database is not db:
+                try:
+                    await hold_database.close()
+                except Exception as close_exc:  # noqa: BLE001
+                    logger.warning("Could not close partial Hold backend: %s", close_exc)
+            hold_database = None
+            hold_store = None
+            hold_error = f"{type(exc).__name__}: {exc}"
+            backend_error = (
+                f"{backend_error}; Hold backend: {hold_error}"
+                if backend_error
+                else f"Hold backend: {hold_error}"
+            )
+            logger.error("Could not open Hold backend: %s", exc)
+
     return SovereignHostContext(
         db=db,
         backplane=None,
         config=config,
         session_factory=session_factory,
         hold_store=hold_store,
+        hold_database=hold_database,
         backend_error=backend_error,
     )
 

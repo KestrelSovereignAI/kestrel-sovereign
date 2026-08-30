@@ -117,6 +117,45 @@ async def test_get_agent_by_did_closes_hold_context_when_initialize_fails(
 
 
 @pytest.mark.asyncio
+async def test_bound_hold_initialization_closes_context_on_failure(monkeypatch) -> None:
+    import kestrel_sovereign.hold.enforcement as enforcement
+
+    context = SimpleNamespace()
+    close_context = AsyncMock()
+
+    class _Agent:
+        async def initialize(self) -> None:
+            raise RuntimeError("startup refused")
+
+    async def build_context(_agent, *, config=None):
+        assert config == {"mode": "test"}
+        return context
+
+    monkeypatch.setattr(enforcement, "build_bound_host_context", build_context)
+    monkeypatch.setattr(enforcement, "close_bound_host_context", close_context)
+
+    with pytest.raises(RuntimeError, match="startup refused"):
+        await enforcement.initialize_with_bound_hold_context(
+            _Agent(),
+            config={"mode": "test"},
+        )
+
+    close_context.assert_awaited_once_with(context)
+
+
+def test_standalone_entrypoints_use_atomic_hold_initialization_wiring() -> None:
+    import kestrel_sovereign.cli as cli_module
+    import kestrel_sovereign.main as main_module
+
+    cli_source = inspect.getsource(cli_module._run_shell)
+    main_source = inspect.getsource(main_module.main)
+    assert "initialize_with_bound_hold_context(agent)" in cli_source
+    assert "initialize_with_bound_hold_context(agent)" in main_source
+    assert "build_bound_host_context(agent)" not in cli_source
+    assert "build_bound_host_context(agent)" not in main_source
+
+
+@pytest.mark.asyncio
 async def test_process_input_refuses_at_unconditional_hold_seam() -> None:
     """Mutation tripwire: deleting the non-streaming check must run onward."""
 

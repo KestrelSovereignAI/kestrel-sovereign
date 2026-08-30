@@ -354,6 +354,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
         config={},
         session_factory=Closeable("session-close"),
         hold_store=hold_store,
+        hold_database=Closeable("hold-db-close"),
     )
 
     async def build_context(*, config):
@@ -417,11 +418,12 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "host-ui-mount",
         ]
 
-    assert events[-5:] == [
+    assert events[-6:] == [
         "agents-stop",
         "host-stop",
         "host-unmount",
         "session-close",
+        "hold-db-close",
         "db-close",
     ]
 
@@ -461,14 +463,16 @@ def test_host_context_satisfies_sdk_protocol():
 @pytest.mark.asyncio
 async def test_host_context_uses_shared_postgres_for_durable_hold(
     monkeypatch,
+    tmp_path,
 ):
-    """Cloud replicas must not put Hold latches on disposable local SQLite."""
+    """Cloud replicas share Hold without moving host-feature state."""
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    db = SimpleNamespace(backend_type="postgres", close=AsyncMock())
-    postgres = AsyncMock(return_value=db)
-    sqlite = AsyncMock(side_effect=AssertionError("local SQLite must not open"))
+    host_db = SimpleNamespace(backend_type="sqlite", close=AsyncMock())
+    hold_db = SimpleNamespace(backend_type="postgres", close=AsyncMock())
+    postgres = AsyncMock(return_value=hold_db)
+    sqlite = AsyncMock(return_value=host_db)
     monkeypatch.setattr(AsyncDatabase, "postgres", postgres)
     monkeypatch.setattr(AsyncDatabase, "sqlite", sqlite)
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
@@ -483,12 +487,16 @@ async def test_host_context_uses_shared_postgres_for_durable_hold(
         lambda _db: SimpleNamespace(ensure_schema=ensured),
     )
 
-    ctx = await build_host_context(config={})
+    ctx = await build_host_context(
+        config={},
+        db_path=str(tmp_path / "host-features.db"),
+    )
 
     postgres.assert_awaited_once_with("postgresql://shared/hold")
-    sqlite.assert_not_awaited()
+    sqlite.assert_awaited_once_with(str(tmp_path / "host-features.db"))
     ensured.assert_awaited_once_with()
-    assert ctx.db is db
+    assert ctx.db is host_db
+    assert ctx.hold_database is hold_db
     assert ctx.hold_store is not None
 
 

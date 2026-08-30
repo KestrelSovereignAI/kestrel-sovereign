@@ -243,12 +243,11 @@ async def main():
     llm_service = LLMService()
     agent = KestrelAgent(did=agent_did, storage_path=storage_path, llm_service=llm_service)
     from kestrel_sovereign.hold import (
-        build_bound_host_context,
         close_bound_host_context,
+        initialize_with_bound_hold_context,
     )
 
-    hold_context = await build_bound_host_context(agent)
-    await agent.initialize()
+    hold_context = await initialize_with_bound_hold_context(agent)
 
     if args.app:
         extension_class = None

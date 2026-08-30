@@ -329,6 +329,149 @@ async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_postgres_hold_backend_does_not_replace_host_feature_store(
+    monkeypatch,
+    tmp_path,
+):
+    """A shared Hold rail must not move unrelated host-feature state."""
+
+    import kestrel_sovereign.host_features.storage as host_storage
+    import kestrel_sovereign.storage.async_database as database_module
+    import kestrel_sovereign.storage.sqla.session as session_module
+
+    class _FakeDatabase:
+        def __init__(self, backend_type):
+            self.backend_type = backend_type
+            self.closed = False
+
+        @asynccontextmanager
+        async def migration_lock(self, _name):
+            yield
+
+        async def execute(self, _sql, _params=()):
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    class _FakeFactory:
+        async def close(self):
+            return None
+
+    sqlite_db = _FakeDatabase("sqlite")
+    postgres_db = _FakeDatabase("postgres")
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://hold.example/db")
+    monkeypatch.setattr(
+        database_module.AsyncDatabase,
+        "sqlite",
+        AsyncMock(return_value=sqlite_db),
+    )
+    monkeypatch.setattr(
+        database_module.AsyncDatabase,
+        "postgres",
+        AsyncMock(return_value=postgres_db),
+    )
+    monkeypatch.setattr(
+        host_storage,
+        "prepare_host_database",
+        lambda _path=None: tmp_path / "host-features.db",
+    )
+    monkeypatch.setattr(host_storage, "validate_sqlite_family_private", lambda _path: None)
+    monkeypatch.setattr(session_module, "make_session_factory", lambda _db: _FakeFactory())
+
+    context = await build_host_context(db_path=str(tmp_path / "configured-host.db"))
+    try:
+        assert context.db is sqlite_db
+        assert context.hold_database is postgres_db
+        assert context.hold_store._db is postgres_db
+    finally:
+        if context.session_factory is not None:
+            await context.session_factory.close()
+        await context.hold_database.close()
+        await context.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surviving_disposition", ["already", "stale"])
+async def test_non_applied_receipt_cannot_outlive_referenced_authority(
+    hold_db,
+    surviving_disposition,
+):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:referenced",
+        actor_id="did:sovereign:operator",
+        reason="preserve authority",
+        operation_id="referenced-authority",
+    )
+    if surviving_disposition == "already":
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:referenced",
+            actor_id="did:sovereign:operator",
+            reason="preserve authority",
+            operation_id="surviving-already",
+        )
+    else:
+        stale = await store.release_hold(
+            scope="agent",
+            target_id="did:agent:referenced",
+            actor_id="did:sovereign:operator",
+            reason="wrong authority",
+            operation_id="surviving-stale",
+            expected_hold_receipt_id="missing-client-authority",
+        )
+        assert stale.receipt.disposition is HoldDisposition.REFUSED_STALE
+
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+    await db.execute(
+        "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:referenced"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing authority"):
+        await store.get_effective("did:agent:referenced")
+
+
+@pytest.mark.asyncio
+async def test_existing_receipt_table_gains_unique_operation_index(tmp_path):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "weak-hold-schema.db"))
+    try:
+        await db.execute(
+            "CREATE TABLE hold_receipts ("
+            "receipt_id TEXT NOT NULL PRIMARY KEY, operation_id TEXT NOT NULL, "
+            "action TEXT NOT NULL, disposition TEXT NOT NULL, scope TEXT NOT NULL, "
+            "target_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
+            "actor_id TEXT NOT NULL, occurred_at TEXT NOT NULL, "
+            "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+            "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+            "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '')"
+        )
+        store = HoldStore(db)
+        await store.ensure_schema()
+        values = (
+            "hold", "applied", "agent", "did:agent:weak", "reason",
+            "did:sovereign:operator", "2026-08-30T00:00:00+00:00", "", "", "receipt-one",
+        )
+        await db.execute(
+            "INSERT INTO hold_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("receipt-one", "duplicate-operation", *values),
+        )
+        with pytest.raises(Exception):
+            await db.execute(
+                "INSERT INTO hold_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("receipt-two", "duplicate-operation", *values[:-1], "receipt-two"),
+            )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
