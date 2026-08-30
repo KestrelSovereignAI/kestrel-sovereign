@@ -1343,6 +1343,11 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         router=peer_router,
         requester=peer_requester,
     )
+    distributed_stop = getattr(
+        app.state, "distributed_invocation_registry", None
+    )
+    if distributed_stop is not None:
+        distributed_stop.attach(agent)
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
 
@@ -1564,14 +1569,20 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
     app.state.stop_receipt_store = None
     app.state.stop_receipt_db = None
     app.state.stop_receipt_store_error = ""
+    app.state.distributed_invocation_registry = None
     db = None
+    distributed_stop = None
     try:
         from kestrel_sovereign.host_features.storage import (
             prepare_host_database,
             validate_sqlite_family_private,
         )
         from kestrel_sovereign.storage.async_database import AsyncDatabase
-        from kestrel_sovereign.stop import StopReceiptStore
+        from kestrel_sovereign.stop import (
+            DistributedInvocationRegistry,
+            DistributedInvocationStore,
+            StopReceiptStore,
+        )
 
         backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
         if backend == "postgres":
@@ -1594,9 +1605,19 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
             validate_sqlite_family_private(path)
         store = StopReceiptStore(db)
         await store.ensure_schema()
+        invocation_store = DistributedInvocationStore(db)
+        await invocation_store.ensure_schema()
+        distributed_stop = DistributedInvocationRegistry(invocation_store)
+        distributed_stop.start()
         app.state.stop_receipt_db = db
         app.state.stop_receipt_store = store
+        app.state.distributed_invocation_registry = distributed_stop
     except Exception as error:  # noqa: BLE001 - host remains diagnosable
+        if distributed_stop is not None:
+            try:
+                await distributed_stop.close()
+            except Exception:  # noqa: BLE001 - preserve primary failure
+                pass
         if db is not None:
             try:
                 await db.close()
@@ -1612,11 +1633,26 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
 
 
 async def _shutdown_stop_receipts(app: FastAPI) -> None:
+    # Keep this primitive safe for focused tests and recovery callers that do
+    # not drive the full ordered server teardown.
+    registry = getattr(app.state, "distributed_invocation_registry", None)
+    app.state.distributed_invocation_registry = None
+    if registry is not None:
+        await registry.close()
     db = getattr(app.state, "stop_receipt_db", None)
     app.state.stop_receipt_store = None
     app.state.stop_receipt_db = None
     if db is not None:
         await db.close()
+
+
+async def _shutdown_distributed_invocations(app: FastAPI) -> None:
+    """Retire this process's ownership rows after agents finish cleanup."""
+
+    registry = getattr(app.state, "distributed_invocation_registry", None)
+    app.state.distributed_invocation_registry = None
+    if registry is not None:
+        await registry.close()
 
 
 async def _shutdown_stop_cleanup(app: FastAPI) -> None:
@@ -2212,6 +2248,10 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         ("host-features", lambda: _shutdown_host_features(app)),
         ("stop-cleanup", lambda: _shutdown_stop_cleanup(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        (
+            "distributed-stop-invocations",
+            lambda: _shutdown_distributed_invocations(app),
+        ),
         ("stop-receipts", lambda: _shutdown_stop_receipts(app)),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
@@ -2415,6 +2455,18 @@ async def _lifespan_startup(app: FastAPI):
                     app, manager, name, agent
                 )
             )
+            distributed_stop = getattr(
+                app.state, "distributed_invocation_registry", None
+            )
+            if distributed_stop is not None:
+                set_pre_initialize = getattr(
+                    type(manager), "set_agent_pre_initialize_hook", None
+                )
+                if callable(set_pre_initialize):
+                    set_pre_initialize(
+                        manager,
+                        lambda _name, agent: distributed_stop.attach(agent),
+                    )
             # Seed the database-global scheduler provenance and every local
             # DID's durable protocol row before concurrent agent
             # initialization and post-load default seeding.
@@ -2547,6 +2599,12 @@ async def _lifespan_startup(app: FastAPI):
                     llm_service=llm_service,
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+
+            distributed_stop = getattr(
+                app.state, "distributed_invocation_registry", None
+            )
+            if distributed_stop is not None:
+                distributed_stop.attach(app.state.agent)
 
             # Lifecycle hardening: provider availability (#377) is verified
             # inside KestrelAgent.initialize so every boot path — including

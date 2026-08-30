@@ -60,6 +60,45 @@ def bind_request_operation_if_supported(
 class RequestLifecycleMixin:
     """Mixin providing request tracking and cancellation for KestrelAgent."""
 
+    async def await_durable_request_admission(self, request_id: str) -> bool:
+        """Publish this exact generation before any cognition can begin.
+
+        A host without the distributed registry retains the local lifecycle
+        contract.  A host with one fails closed if an exact Stop fence won the
+        shared-database race.
+        """
+
+        generation = self._request_generation_for_current_task(request_id)
+        if generation is None:
+            raise RuntimeError("durable admission requires an active generation")
+        registry = getattr(self, "_distributed_invocation_registry", None)
+        if registry is None:
+            return True
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            raise TypeError("distributed invocation registry cannot register")
+        admitted = await register(self, request_id, generation)
+        if admitted is not True:
+            self.reserve_request_cancellation(request_id)
+            self._consume_pending_request_cancellation(request_id, generation)
+            return False
+        return True
+
+    def _complete_durable_request_generation(
+        self,
+        request_id: str,
+        generation: int | None,
+    ) -> None:
+        if generation is None:
+            return
+        registry = getattr(self, "_distributed_invocation_registry", None)
+        if registry is None:
+            return
+        complete = getattr(registry, "complete_soon", None)
+        if not callable(complete):
+            raise TypeError("distributed invocation registry cannot complete")
+        complete(self, request_id, generation)
+
     def register_active_request(self, request_id: str) -> int:
         """Track an active delivery and bind its generation to this task."""
         if not hasattr(self, "_active_request_ids"):
@@ -593,6 +632,7 @@ class RequestLifecycleMixin:
                 final_disposition,
                 generation=generation,
             )
+            self._complete_durable_request_generation(request_id, generation)
             return
 
         cleans_active_generation = (
@@ -638,6 +678,7 @@ class RequestLifecycleMixin:
                 effective_disposition,
                 generation=generation,
             )
+            self._complete_durable_request_generation(request_id, generation)
 
     def _release_cancelled_generation(
         self,

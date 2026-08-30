@@ -17,6 +17,11 @@ from .receipt import (
     StopReceiptStore,
     UnavailableStopReceiptStore,
 )
+from .invocation import (
+    DistributedInvocationRegistry,
+    DistributedInvocationStore,
+    DistributedStopTicket,
+)
 from .types import (
     MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
@@ -28,6 +33,9 @@ from .types import (
 __all__ = [
     "CancellationAuthority",
     "CooperativeStopTarget",
+    "DistributedInvocationRegistry",
+    "DistributedInvocationStore",
+    "DistributedStopTicket",
     "MAX_STOP_CORRELATION_ID_BYTES",
     "StopDisposition",
     "StopCleanupRegistry",

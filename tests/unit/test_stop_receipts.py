@@ -11,6 +11,7 @@ import pytest
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     CooperativeStopTarget,
+    DistributedStopTicket,
     StopCleanupRegistry,
     StopDisposition,
     StopOutcome,
@@ -773,6 +774,40 @@ def test_live_endpoint_without_receipt_store_refuses_before_cancellation():
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
     agent.cancel_current_request.assert_not_called()
+
+
+def test_live_endpoint_waits_for_remote_owner_before_reporting_stopped():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    remote = MagicMock()
+    remote.request_turn = AsyncMock(
+        return_value=DistributedStopTicket(("remote-generation",))
+    )
+    remote.wait_for_stop = AsyncMock(return_value=StopDisposition.STOPPED)
+    app.state.distributed_invocation_registry = remote
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = set()
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"request_id": "turn-on-replica-a"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] is True
+    remote.request_turn.assert_awaited_once_with(
+        "did:test:agent", "turn-on-replica-a"
+    )
+    remote.wait_for_stop.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

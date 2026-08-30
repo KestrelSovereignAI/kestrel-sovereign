@@ -408,6 +408,15 @@ async def invoke_agent(request: Request, http_response: Response):
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
             agent.register_active_request(request_id)
+            await_admission = getattr(
+                type(agent), "await_durable_request_admission", None
+            )
+            try:
+                if callable(await_admission):
+                    await await_admission(agent, request_id)
+            except BaseException:
+                agent._cleanup_cancelled_request(request_id)
+                raise
         else:
             agent._current_request_id = request_id
 
@@ -717,6 +726,12 @@ async def stream_agent_response(request: Request):
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
             agent.register_active_request(request_id)
+            request_lifecycle_registered = True
+            await_admission = getattr(
+                type(agent), "await_durable_request_admission", None
+            )
+            if callable(await_admission):
+                await await_admission(agent, request_id)
         else:
             agent._current_request_id = request_id
         request_lifecycle_registered = True
@@ -1014,6 +1029,22 @@ async def stop_agent_request(request: Request):
         active_turns = live_turn_ids()
 
         async def cancel_request(stop_request: StopRequest) -> StopDisposition:
+            distributed_stop = getattr(
+                request.app.state,
+                "distributed_invocation_registry",
+                None,
+            )
+            distributed_ticket = None
+            if distributed_stop is not None:
+                if stop_request.scope is StopScope.TURN:
+                    distributed_ticket = await distributed_stop.request_turn(
+                        agent_id,
+                        stop_request.target,
+                    )
+                else:
+                    distributed_ticket = await distributed_stop.request_agent(
+                        agent_id
+                    )
             cancelled_request_ids: list[Optional[str]] = []
             if stop_request.scope is StopScope.TURN:
                 canceled = agent.cancel_current_request(
@@ -1077,9 +1108,19 @@ async def stop_agent_request(request: Request):
                     )
                 if abandoned:
                     return StopDisposition.UNREACHABLE
+            distributed_disposition = StopDisposition.ALREADY_COMPLETE
+            if distributed_ticket is not None:
+                distributed_disposition = await distributed_stop.wait_for_stop(
+                    distributed_ticket
+                )
+                if distributed_disposition is StopDisposition.UNREACHABLE:
+                    return StopDisposition.UNREACHABLE
             return (
                 StopDisposition.STOPPED
-                if canceled
+                if (
+                    canceled
+                    or distributed_disposition is StopDisposition.STOPPED
+                )
                 else StopDisposition.ALREADY_COMPLETE
             )
 
