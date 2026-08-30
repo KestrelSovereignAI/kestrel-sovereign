@@ -787,6 +787,13 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
+        # Snapshot reads deliberately do not occupy the writer guard, but they
+        # still belong to this backend's lifecycle. Without this check a Hold
+        # admission read issued after ``close()`` could silently create a fresh
+        # connection after the host context revoked access to its database.
+        if self._closing:
+            raise ConnectionError("SQLite database is closing")
+        self._ensure_connected()
         conn = await aiosqlite.connect(
             self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
         )
@@ -1270,6 +1277,9 @@ class SQLiteBackend(DatabaseBackend):
             return await self.fetch_all(query, params)
         record_write_query(query)
         try:
+            if self._closing:
+                raise ConnectionError("SQLite database is closing")
+            self._ensure_connected()
             await self._wait_for_cancelled_write_drain()
             self._raise_cancelled_write_drain_error()
             read_conn = await self._open_snapshot_read_connection()

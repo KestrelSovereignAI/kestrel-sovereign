@@ -864,6 +864,30 @@ async def test_postgres_read_targets_take_shared_locks_in_global_order():
 
 
 @pytest.mark.asyncio
+async def test_postgres_dirty_triggers_are_rebuilt_on_the_exact_receipt_table():
+    """A same-named trigger in another schema cannot suppress installation."""
+
+    execute = AsyncMock()
+    store = HoldStore(SimpleNamespace(backend_type="postgres", execute=execute))
+
+    await store._ensure_checkpoint_dirty_triggers()
+
+    statements = [call.args[0] for call in execute.await_args_list]
+    for operation in ("insert", "update", "delete"):
+        name = f"hold_receipts_checkpoint_dirty_{operation}"
+        drop = f"DROP TRIGGER IF EXISTS {name} ON hold_receipts"
+        create = f"CREATE TRIGGER {name} "
+        assert drop in statements
+        assert sum(statement.startswith(create) for statement in statements) == 1
+        assert statements.index(drop) < next(
+            index
+            for index, statement in enumerate(statements)
+            if statement.startswith(create)
+        )
+    assert all("pg_trigger" not in statement for statement in statements)
+
+
+@pytest.mark.asyncio
 async def test_sqlite_effective_read_does_not_wait_for_writer_guard(hold_db):
     """Turn admission reads the last commit while an unrelated writer is open."""
 

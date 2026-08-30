@@ -509,17 +509,18 @@ class HoldStore:
             )
             for operation in ("INSERT", "UPDATE", "DELETE"):
                 trigger_name = f"hold_receipts_checkpoint_dirty_{operation.lower()}"
-                exists = await self._db.fetchone(
-                    "SELECT 1 FROM pg_trigger "
-                    "WHERE tgname = ? AND NOT tgisinternal",
-                    (trigger_name,),
+                # Trigger names are relation-local in PostgreSQL. A catalog
+                # lookup by name alone can find another schema's trigger and
+                # leave this authority table without invalidation. Rebuild the
+                # inexpensive trigger on the exact target relation instead.
+                await self._db.execute(
+                    f"DROP TRIGGER IF EXISTS {trigger_name} ON hold_receipts"
                 )
-                if exists is None:
-                    await self._db.execute(
-                        f"CREATE TRIGGER {trigger_name} "
-                        f"AFTER {operation} ON hold_receipts FOR EACH ROW "
-                        "EXECUTE FUNCTION kestrel_hold_checkpoint_dirty()"
-                    )
+                await self._db.execute(
+                    f"CREATE TRIGGER {trigger_name} "
+                    f"AFTER {operation} ON hold_receipts FOR EACH ROW "
+                    "EXECUTE FUNCTION kestrel_hold_checkpoint_dirty()"
+                )
             return
         await self._db.execute(
             "DROP TRIGGER IF EXISTS hold_receipts_checkpoint_dirty"

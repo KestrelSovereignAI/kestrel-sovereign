@@ -157,6 +157,21 @@ class TestSQLiteBackend:
         assert len(rows) == 2
         assert rows[0] == (1, "Alice")
         assert rows[1] == (2, "Bob")
+
+    @pytest.mark.asyncio
+    async def test_snapshot_read_cannot_reopen_a_closed_backend(
+        self, backend, monkeypatch
+    ):
+        """A lifecycle-revoked backend cannot serve a fresh authority snapshot."""
+
+        await backend.close()
+        opened = AsyncMock()
+        monkeypatch.setattr(backend, "_open_snapshot_read_connection", opened)
+
+        with pytest.raises(QueryError, match="Not connected to database"):
+            await backend.fetch_all_snapshot("SELECT 1")
+
+        opened.assert_not_awaited()
     
     @pytest.mark.asyncio
     async def test_fetch_val(self, backend):
