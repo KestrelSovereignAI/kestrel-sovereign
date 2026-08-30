@@ -1197,21 +1197,65 @@ async def test_rotated_parent_restores_pre_cutoff_classical_child_from_public_ke
 ):
     """Rotation keeps archival verification without legacy private custody."""
 
-    legacy_did = "did:pkh:eip155:1:0xArchivedParent"
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+    from kestrel_sovereign.identity.succession import (
+        finalize,
+        sign_predecessor,
+        sign_successor,
+    )
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ECDSA_SECP256K1_SHA256,
+        get_suite,
+    )
+    from kestrel_sovereign.inception_service import public_key_to_ethereum_address
+
     child_did = "did:test:archived-child"
-    private_key, public_key = generate_secp256k1_keypair()
+    legacy_suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    legacy = legacy_suite.generate_keypair()
+    private_key, public_key = legacy.private_key, legacy.public_key
+    legacy_did = (
+        "did:pkh:eip155:1:"
+        f"{public_key_to_ethereum_address(public_key)}"
+    )
+    successor = generate_hybrid_keypair()
+    successor_did = "did:web:example.test:archived-parent"
+    legacy_methods = build_verification_methods(
+        legacy_did, [(legacy_suite, public_key)]
+    )
+    successor_methods = build_verification_methods(
+        successor_did, successor.public_keys()
+    )
     statement = SuccessionStatement(
         predecessor_did=legacy_did,
-        successor_did="did:web:example.test:archived-parent",
+        successor_did=successor_did,
         effective_from="2026-08-20T00:00:00+00:00",
         reason="test rotation",
+        predecessor_verification_methods=legacy_methods,
+        successor_verification_methods=successor_methods,
     )
+    statement = sign_predecessor(
+        statement,
+        [(legacy, legacy_methods[0]["id"].rsplit("#", 1)[-1])],
+    )
+    statement = sign_successor(
+        statement,
+        [
+            (
+                successor.classical,
+                successor_methods[0]["id"].rsplit("#", 1)[-1],
+            ),
+            (successor.pq, successor_methods[1]["id"].rsplit("#", 1)[-1]),
+        ],
+    )
+    statement = finalize(statement)
     parent = _make_mock_agent(legacy_did)
     parent._private_key = None
     parent.identity = SimpleNamespace(
         is_hybrid=True,
         legacy_did=legacy_did,
-        new_did=statement.successor_did,
+        new_did=successor_did,
+        new_verification_methods=successor_methods,
         legacy_keypair=SimpleNamespace(public_key=public_key),
         succession_chain=build_chain([statement]),
     )

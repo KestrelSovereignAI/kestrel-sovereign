@@ -317,6 +317,11 @@ def verify_mandate(
         legacy_did = getattr(parent_identity, "legacy_did", None)
         chain = getattr(parent_identity, "succession_chain", None)
         classical_was_active = False
+        from kestrel_sovereign.identity.succession_chain import (
+            SuccessionChainError,
+            resolve_active_identity,
+            verify_chain_signatures,
+        )
         try:
             if (
                 isinstance(legacy_did, str)
@@ -325,11 +330,28 @@ def verify_mandate(
                 and chain is not None
                 and getattr(chain, "statements", ())
             ):
-                from kestrel_sovereign.identity.succession_chain import (
-                    resolve_active_identity,
+                first = chain.statements[0]
+                new_did = getattr(parent_identity, "new_did", None)
+                new_methods = getattr(
+                    parent_identity, "new_verification_methods", None
                 )
 
-                first = chain.statements[0]
+                def resolve_current_successor(did: str):
+                    if did == new_did and isinstance(new_methods, list):
+                        return {
+                            "id": did,
+                            "verificationMethod": list(new_methods),
+                        }
+                    raise SuccessionChainError(
+                        f"trusted runtime identity cannot resolve succession DID {did!r}"
+                    )
+
+                chain_verdict = verify_chain_signatures(
+                    chain,
+                    did_web_resolver=resolve_current_successor,
+                )
+                if not chain_verdict.ok:
+                    raise SuccessionChainError(chain_verdict.reason)
                 active = resolve_active_identity(
                     root_did=legacy_did,
                     root_verification_methods=(
@@ -339,7 +361,7 @@ def verify_mandate(
                     artifact_timestamp=mandate.created_at,
                 )
                 classical_was_active = active.is_root and active.did == legacy_did
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError, SuccessionChainError):
             classical_was_active = False
         if not classical_was_active:
             logger.warning(

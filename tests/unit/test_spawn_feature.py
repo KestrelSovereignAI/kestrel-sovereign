@@ -336,6 +336,46 @@ class TestSpawnFeatureWithManager:
         )
 
     @pytest.mark.asyncio
+    async def test_persistent_spawn_commits_startup_registration_before_success(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = MagicMock()
+        manager.spawn_agent = AsyncMock(return_value=child)
+        manager.persist_created_agent_registration = AsyncMock()
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.spawn_agent(
+            name="durable-helper",
+            purpose="survive restart",
+            ttl=0,
+        )
+
+        assert envelope.status is ToolResultStatus.OK
+        manager.persist_created_agent_registration.assert_awaited_once_with(
+            "durable-helper"
+        )
+
+    @pytest.mark.asyncio
+    async def test_persistent_spawn_surfaces_startup_registration_failure(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = MagicMock()
+        manager.spawn_agent = AsyncMock(return_value=child)
+        manager.persist_created_agent_registration = AsyncMock(
+            side_effect=OSError("registry unavailable")
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.spawn_agent(
+            name="durable-helper",
+            purpose="survive restart",
+            ttl=0,
+        )
+
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "registry unavailable" in envelope.error
+
+    @pytest.mark.asyncio
     async def test_spawn_agent_failure(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
@@ -2135,6 +2175,74 @@ class TestAgentManagerSpawn:
         assert "helper" in manager.get_children("did:parent")
         assert manager.get_mandate("helper") is mandate
         assert mandate.child_did == "did:child"
+
+    @pytest.mark.asyncio
+    async def test_spawn_revalidates_exact_parent_after_inception_yields(self):
+        parent = _make_mock_agent("did:parent")
+        parent._private_key, _ = generate_secp256k1_keypair()
+        child = _make_mock_agent("did:child")
+        manager = AgentManager()
+        _register_spawn_parent(manager, parent)
+        mandate = SpawnMandate(parent_did=parent.agent_id, purpose="test")
+        budget_started = asyncio.Event()
+        continue_commit = asyncio.Event()
+
+        async def create_and_publish(name, **_kwargs):
+            await _persist_and_publish_spawn_test_child(manager, name, child)
+            return child
+
+        async def yield_after_inception(*_args, **_kwargs):
+            budget_started.set()
+            await continue_commit.wait()
+
+        manager._apply_delegated_budget = yield_after_inception
+        with patch.object(manager, "create_agent", side_effect=create_and_publish):
+            spawn = asyncio.create_task(
+                manager.spawn_agent("helper", parent, mandate)
+            )
+            await asyncio.wait_for(budget_started.wait(), timeout=1.0)
+            manager._agents.pop("Parent")
+            manager._agent_names.pop(parent.agent_id)
+            continue_commit.set()
+            with pytest.raises(RuntimeError, match="parent authority changed"):
+                await spawn
+
+        assert manager.get_mandate("helper") is None
+
+    @pytest.mark.asyncio
+    async def test_spawned_parent_receipt_is_reverified_before_child_commit(self):
+        parent = _make_mock_agent("did:spawned-parent")
+        parent._private_key, _ = generate_secp256k1_keypair()
+        child = _make_mock_agent("did:child")
+        manager = AgentManager()
+        _register_spawn_parent(manager, parent)
+        parent_mandate = SpawnMandate(
+            parent_did="did:grandparent",
+            child_did=parent.agent_id,
+            max_child_depth=2,
+            parent_signature="durable-parent-receipt",
+            authority_committed=True,
+        )
+        manager._child_mandates["Parent"] = parent_mandate
+        mandate = SpawnMandate(
+            parent_did=parent.agent_id,
+            purpose="test",
+            max_child_depth=1,
+        )
+
+        async def create_and_publish(name, **_kwargs):
+            await _persist_and_publish_spawn_test_child(manager, name, child)
+            return child
+
+        manager._verified_spawn_relations_under_lease = AsyncMock(
+            return_value={}
+        )
+        with patch.object(manager, "create_agent", side_effect=create_and_publish):
+            with pytest.raises(RuntimeError, match="revoked or expired"):
+                await manager.spawn_agent("helper", parent, mandate)
+
+        manager._verified_spawn_relations_under_lease.assert_awaited_once_with()
+        assert manager.get_mandate("helper") is None
 
     @pytest.mark.asyncio
     async def test_spawn_agent_duplicate_raises(self):

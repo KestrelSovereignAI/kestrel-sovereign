@@ -521,6 +521,11 @@ class AgentOperationAdmission:
     spawn_receipt_source_id: str | None = None
     spawn_receipt_target_id: str | None = None
     spawn_receipt_unsigned_properties: dict[str, object] | None = None
+    # Exact parent authority captured at spawn admission. The child commit must
+    # revalidate these witnesses after inception/provider I/O has yielded.
+    spawn_parent_name: str | None = None
+    spawn_parent_agent: Optional[KestrelAgent] = None
+    spawn_parent_mandate: Optional[SpawnMandate] = None
     # A live spawn installs this private initializer handoff before entering
     # create -> load. The load path must await it after initialization and
     # before routing publication, so the final-child-DID signed receipt is
@@ -859,6 +864,9 @@ class AgentManager:
         # LocalAgentConfig per agent created at runtime via create_agent —
         # consumed by the create-agent endpoint to persist registrations.
         self._created_configs: dict[str, "LocalAgentConfig"] = {}
+        self._created_agent_persistence_hook: Optional[
+            Callable[[str, LocalAgentConfig], Awaitable[None]]
+        ] = None
 
     def _isolated_runtime_scope(self, agent_did: str) -> tuple[Path, str]:
         """Return this host's canonical mutable runtime scope for one agent.
@@ -899,6 +907,32 @@ class AgentManager:
         initial and dynamic registration through this one seam.
         """
         self._agent_registration_hook = hook
+
+    def set_created_agent_persistence_hook(
+        self,
+        hook: Optional[Callable[[str, LocalAgentConfig], Awaitable[None]]],
+    ) -> None:
+        """Install the config-registry commit used by persistent runtime agents."""
+
+        self._created_agent_persistence_hook = hook
+
+    async def persist_created_agent_registration(self, name: str) -> None:
+        """Commit one created agent to the startup registry when configured.
+
+        Auto-discovered deployments intentionally have no hook: their durable
+        identity directory is the startup registry. Config-file deployments
+        install a hook and its failure is authoritative—callers must not promise
+        restart durability until it returns.
+        """
+
+        config = self._created_configs.get(name)
+        if config is None:
+            raise RuntimeError(
+                f"Created agent {name!r} has no published startup configuration"
+            )
+        hook = self._created_agent_persistence_hook
+        if hook is not None:
+            await hook(name, config)
 
     def set_scheduler_tenant_registration_hook(
         self,
@@ -5837,6 +5871,9 @@ class AgentManager:
                 parent_mandate = (
                     self._child_mandates.get(parent_name) if parent_name else None
                 )
+                admission.spawn_parent_name = parent_name
+                admission.spawn_parent_agent = parent_agent
+                admission.spawn_parent_mandate = parent_mandate
                 if parent_mandate is not None and getattr(
                     parent_mandate, "max_child_depth", 0
                 ) <= 0:
@@ -6030,6 +6067,10 @@ class AgentManager:
                             raise RuntimeError(
                                 "Spawn was fenced before its budget and mandate could commit"
                             )
+                        if not self._spawn_parent_authority_is_admitted(admission):
+                            raise RuntimeError(
+                                "Spawn parent authority changed before governance commit"
+                            )
                         if (
                             mandate.ttl_seconds > 0
                             and remaining_spawn_ttl_seconds(
@@ -6079,6 +6120,20 @@ class AgentManager:
                                     raise RuntimeError(
                                         "Spawn cap reservation was lost before commit"
                                     )
+                    if (
+                        capacity_waiter is None
+                        and admission.spawn_parent_mandate is not None
+                    ):
+                        relations = await self._verified_spawn_relations_under_lease()
+                        parent_relation = relations.get(parent_did)
+                        if (
+                            parent_relation is None
+                            or parent_relation[1] != admission.spawn_parent_name
+                        ):
+                            raise RuntimeError(
+                                "Spawned parent durable authority was revoked or expired "
+                                "before child governance commit"
+                            )
                     if capacity_waiter is None:
                         # Only after provider custody and every governance/cap
                         # check have succeeded may the durable receipt become
@@ -6240,6 +6295,24 @@ class AgentManager:
             and self._agents.get(admission.name) is child
             and isinstance(child_id, str)
             and self._agent_names.get(child_id) == admission.name
+        )
+
+    def _spawn_parent_authority_is_admitted(
+        self, admission: AgentOperationAdmission
+    ) -> bool:
+        """Whether the exact parent registration and authority remain current."""
+
+        parent = admission.spawn_parent_agent
+        parent_name = admission.spawn_parent_name
+        if parent is None or not isinstance(parent_name, str):
+            return admission.kind == "direct-spawn-test"
+        parent_did = _loaded_agent_did(parent)
+        return (
+            isinstance(parent_did, str)
+            and self._agents.get(parent_name) is parent
+            and self._agent_names.get(parent_did) == parent_name
+            and self._child_mandates.get(parent_name)
+            is admission.spawn_parent_mandate
         )
 
     async def _ensure_spawn_operation_admitted(

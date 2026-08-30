@@ -839,6 +839,15 @@ class SpawnFeature(Feature):
                     ),
                     started_at=mandate.created_at,
                 )
+            if mandate.ttl_seconds <= 0:
+                persist_registration = getattr(
+                    manager, "persist_created_agent_registration", None
+                )
+                if not callable(persist_registration):
+                    raise RuntimeError(
+                        "Persistent spawn has no startup-registry persistence seam"
+                    )
+                await persist_registration(name)
             return ToolResult.ok(
                 f"Spawned child '{name}' (did={child.agent_id}, ttl={ttl}s).",
                 data={

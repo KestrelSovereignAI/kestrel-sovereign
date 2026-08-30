@@ -2320,6 +2320,30 @@ async def _lifespan_startup(app: FastAPI):
             app.state.multi_agent_config_path = (
                 multi_agent_path if multi_agent_path.exists() else None
             )
+            if app.state.multi_agent_config_path is not None:
+                async def persist_created_agent_registration(name, agent_config):
+                    """Merge a persistent runtime child into fresh disk state."""
+
+                    current = MultiAgentConfig.from_file(
+                        app.state.multi_agent_config_path
+                    )
+                    collisions = {
+                        existing.casefold()
+                        for existing in current.agents
+                        if existing != name
+                    }
+                    if name.casefold() in collisions or name in current.agents:
+                        raise RuntimeError(
+                            f"Agent {name!r} is already present in the startup registry"
+                        )
+                    current.agents[name] = agent_config
+                    type(current).model_validate(current.model_dump())
+                    current.save(app.state.multi_agent_config_path)
+                    app.state.multi_agent_config = current
+
+                manager.set_created_agent_persistence_hook(
+                    persist_created_agent_registration
+                )
             app.state.agent = None  # No single default agent
             # Registration is the one path shared by autostart, runtime
             # creation, spawning, and scheduler cold wakes.  Install the
