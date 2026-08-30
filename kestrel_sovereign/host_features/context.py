@@ -131,6 +131,7 @@ class SovereignHostContext:
         session_factory: Optional[FleetSessionFactory] = None,
         hold_store: Any = None,
         hold_db: Any = None,
+        hold_boot_state: tuple[Any, ...] = (),
         backend_error: str = "",
     ) -> None:
         self._db = db
@@ -139,6 +140,7 @@ class SovereignHostContext:
         self._session_factory = session_factory
         self._hold_store = hold_store
         self._hold_db = hold_db
+        self._hold_boot_state = tuple(hold_boot_state)
         self._backend_error = str(backend_error or "")
 
     @property
@@ -169,6 +171,12 @@ class SovereignHostContext:
         """Backend owned solely by Hold, or :attr:`db` when they coincide."""
 
         return self._hold_db
+
+    @property
+    def hold_boot_state(self) -> tuple[Any, ...]:
+        """Validated active latches observed before work admission opens."""
+
+        return self._hold_boot_state
 
     @property
     def backend_error(self) -> str:
@@ -280,6 +288,7 @@ async def build_host_context(
     session_factory: Optional[FleetSessionFactory] = None
     hold_store = None
     hold_db = None
+    hold_boot_state: tuple[Any, ...] = ()
     backend_error = ""
     try:
         from kestrel_sovereign.host_features.storage import (
@@ -309,9 +318,14 @@ async def build_host_context(
             hold_db = db
             hold_location = str(resolved)
         from kestrel_sovereign.hold import HoldStore
+        from kestrel_sovereign.hold.state import hold_initialization_witness_path
 
-        hold_store = HoldStore(hold_db)
+        hold_store = HoldStore(
+            hold_db,
+            initialization_witness_path=hold_initialization_witness_path(resolved),
+        )
         await hold_store.ensure_schema()
+        hold_boot_state = await hold_store.read_boot_state()
         logger.info(
             "Host backend opened at %s (fleet tenant=%s); Hold backend=%s",
             resolved,
@@ -343,6 +357,7 @@ async def build_host_context(
         session_factory=session_factory,
         hold_store=hold_store,
         hold_db=hold_db,
+        hold_boot_state=hold_boot_state,
         backend_error=backend_error,
     )
 
