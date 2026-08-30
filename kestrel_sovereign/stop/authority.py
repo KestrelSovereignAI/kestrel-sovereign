@@ -150,6 +150,26 @@ class CancellationAuthority:
             return replay.outcomes
 
         targets = self._resolve(request)
+        owner = asyncio.create_task(
+            self._claim_stop_and_persist(request, targets),
+            name="cooperative-stop-operation",
+        )
+        outcome = await await_owned_task(owner)
+        return raise_owned_outcome(outcome, operation="cooperative Stop receipt")
+
+    async def _claim_stop_and_persist(
+        self,
+        request: StopRequest,
+        targets: tuple[CooperativeStopTarget, ...],
+    ) -> tuple[StopOutcome, ...]:
+        """Own the durable claim through its effects and terminal receipt.
+
+        Claiming and creating an effect owner cannot be two caller-owned
+        awaits: cancellation in that gap would leave durable ``in progress``
+        evidence with no task capable of completing it.  This task owns the
+        entire claim-to-receipt transaction boundary.
+        """
+
         claim_id: str | None = None
         claim_operation = getattr(self._receipt_store, "claim", None)
         if callable(claim_operation):
@@ -185,12 +205,11 @@ class CancellationAuthority:
                 )
             claim_id = claim.claim_id
 
-        owner = asyncio.create_task(
-            self._stop_and_persist(request, targets, claim_id=claim_id),
-            name="cooperative-stop-operation",
+        return await self._stop_and_persist(
+            request,
+            targets,
+            claim_id=claim_id,
         )
-        outcome = await await_owned_task(owner)
-        return raise_owned_outcome(outcome, operation="cooperative Stop receipt")
 
     async def _stop_and_persist(
         self,

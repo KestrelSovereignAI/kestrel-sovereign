@@ -58,6 +58,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._closed = False
         self._interrupted_by_cleanup = False
         self._cleanup_error: BaseException | None = None
+        self._cancellation_watch_started = False
         self._owner = asyncio.create_task(
             self._run(),
             name=f"owned_async_iterator:{operation}",
@@ -65,6 +66,9 @@ class OwnedAsyncIterator(Generic[_T]):
         self._cancellation_owner = asyncio.create_task(
             self._watch_owner_cancellation(),
             name=f"owned_async_iterator_cancel:{operation}",
+        )
+        self._cancellation_owner.add_done_callback(
+            self._interrupt_if_watch_never_started
         )
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
@@ -129,6 +133,7 @@ class OwnedAsyncIterator(Generic[_T]):
     async def _watch_owner_cancellation(self) -> None:
         """Translate lifecycle cancellation without racing a delivered item."""
 
+        self._cancellation_watch_started = True
         completion = asyncio.Event()
 
         def mark_complete(_task: asyncio.Task[None]) -> None:
@@ -157,6 +162,27 @@ class OwnedAsyncIterator(Generic[_T]):
             raise
         finally:
             self._owner.remove_done_callback(mark_complete)
+
+    def _interrupt_if_watch_never_started(
+        self,
+        watcher: asyncio.Task[None],
+    ) -> None:
+        """Close the pre-first-turn cancellation gap of the watcher task.
+
+        ``Task.cancel()`` can terminally cancel a newly-created task without
+        running one byte of its coroutine.  In that case the watcher's
+        ``except CancelledError`` cannot translate cancellation to the source
+        owner, so do that one missing handoff from a synchronous done callback.
+        Once the watcher has started, its handshake-aware body remains the
+        sole owner of cancellation ordering.
+        """
+
+        if (
+            watcher.cancelled()
+            and not self._cancellation_watch_started
+            and not self._owner.done()
+        ):
+            self._owner.cancel()
 
     def _cancel_owner_if_running(self) -> None:
         if not self._owner.done():

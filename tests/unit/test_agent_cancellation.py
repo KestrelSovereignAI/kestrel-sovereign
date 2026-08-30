@@ -349,7 +349,10 @@ async def test_cancelled_isolated_turn_cleanup_failure_is_abandoned():
 @pytest.mark.asyncio
 async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
     from kestrel_sovereign.agent.invocation import bind_async_invocation
-    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
     started = asyncio.Event()
@@ -388,6 +391,83 @@ async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
         await advance
 
     assert agent._active_request_ids == set()
+    assert (
+        await agent.wait_for_request_completion("command-stop")
+        is RequestCompletionDisposition.COMPLETED
+    )
+
+
+@pytest.mark.asyncio
+async def test_outer_stream_stop_does_not_abandon_clean_nested_command():
+    """Endpoint-owner cancellation classifies the nested child's real unwind."""
+
+    from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+        bind_request_operation_if_supported,
+    )
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    started = asyncio.Event()
+
+    class CommandAgent(StreamingMixin, RequestLifecycleMixin):
+        def __init__(self):
+            self.storage = object()
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        async def _genesis_audit_cognition_block(self, _user_input):
+            return None
+
+        async def _maybe_audit(self):
+            return None
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def process_input(self, *_args, invocation_id=None, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+    request_id = "outer-command-stop"
+    agent = CommandAgent()
+    endpoint_generation = agent.register_active_request(request_id)
+    owned = OwnedAsyncIterator(
+        lambda: agent.process_input_streaming(
+            "!continue",
+            request_id=request_id,
+        ),
+        operation="endpoint command stream",
+        cleanup_requested=lambda: agent.is_request_cancelled(request_id),
+    )
+    assert bind_request_operation_if_supported(
+        agent,
+        request_id,
+        owned.owner_task,
+    )
+    advance = asyncio.create_task(anext(owned))
+    await started.wait()
+
+    # Deterministically model the set iteration where Stop reaches the outer
+    # iterator owner before the inner process_input operation. Cancellation
+    # then propagates through the await and cleanly terminalizes that child.
+    agent._cancelled_request_generations.add((request_id, endpoint_generation))
+    agent._cancelled_requests.add(request_id)
+    assert owned.owner_task.cancel() is True
+
+    with pytest.raises(StopAsyncIteration):
+        await advance
+    await owned.aclose()
+    agent._cleanup_cancelled_request(request_id)
+
+    assert (
+        await agent.wait_for_request_completion(request_id)
+        is RequestCompletionDisposition.COMPLETED
+    )
 
 
 def test_request_lifecycle_logs_only_one_way_correlation(caplog):
