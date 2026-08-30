@@ -43,11 +43,9 @@ class OwnedAsyncIterator(Generic[_T]):
         iterator_factory: Callable[[], AsyncIterator[_T]],
         *,
         operation: str,
-        cleanup_requested: Callable[[], bool] | None = None,
     ) -> None:
         self._iterator_factory = iterator_factory
         self._operation = operation
-        self._cleanup_requested = cleanup_requested
         self._items: asyncio.Queue[tuple[object, _T | None]] = asyncio.Queue()
         self._continue = asyncio.Event()
         self._stop = asyncio.Event()
@@ -115,13 +113,6 @@ class OwnedAsyncIterator(Generic[_T]):
                 # source execution. Preserve that distinction for lifecycle
                 # acknowledgement at the transport boundary.
                 cleanup_requested = self._stop.is_set()
-                if not cleanup_requested and self._cleanup_requested is not None:
-                    try:
-                        cleanup_requested = self._cleanup_requested() is True
-                    except Exception:
-                        # An observability predicate must not replace the
-                        # iterator's actual terminal failure.
-                        cleanup_requested = False
                 if cleanup_requested and not isinstance(
                     error,
                     asyncio.CancelledError,

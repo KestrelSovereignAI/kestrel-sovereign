@@ -531,6 +531,62 @@ def test_live_stop_endpoint_routes_request_through_typed_authority() -> None:
     agent.cancel_current_request.assert_not_called()
 
 
+def test_stop_endpoint_preserves_whitespace_only_opaque_turn_id() -> None:
+    """Every ID accepted by invoke/stream remains exactly addressable by Stop."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:opaque-stop-id"
+    agent._active_request_ids = {" "}
+    app.state.agent = agent
+
+    with patch(
+        "kestrel_sovereign.endpoints.agent.CancellationAuthority.stop",
+        new=AsyncMock(return_value=()),
+    ) as authority_stop:
+        response = TestClient(app).post(
+            "/api/agent/stop",
+            json={"request_id": " "},
+        )
+
+    assert response.status_code == 200
+    routed_request = authority_stop.await_args.args[0]
+    assert routed_request.scope is StopScope.TURN
+    assert routed_request.target == " "
+
+
+def test_stop_types_preserve_whitespace_only_opaque_turn_addresses() -> None:
+    async def cancel(_request: StopRequest) -> StopDisposition:
+        return StopDisposition.STOPPED
+
+    request = StopRequest(
+        scope=StopScope.TURN,
+        actor_id="did:test:operator",
+        target=" ",
+        target_agent_id="did:test:opaque-agent",
+    )
+    target = CooperativeStopTarget(
+        target_id="did:test:opaque-agent",
+        agent_id="did:test:opaque-agent",
+        cancel=cancel,
+        turn_ids=frozenset({" "}),
+    )
+    outcome = StopOutcome(
+        scope=StopScope.TURN,
+        requested_target=" ",
+        resolved_target=target.target_id,
+        agent_id=target.agent_id,
+        disposition=StopDisposition.STOPPED,
+        correlation_id=request.correlation_id,
+    )
+
+    assert request.target in target.turn_ids
+    assert StopOutcome.from_dict(outcome.to_dict()) == outcome
+
+
 @pytest.mark.parametrize(
     "request_kwargs",
     (

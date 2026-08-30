@@ -269,6 +269,48 @@ async def test_disconnect_after_terminal_stopped_child_is_not_abandoned():
 
 
 @pytest.mark.asyncio
+async def test_stop_after_terminal_child_failure_is_not_abandoned():
+    """A late Stop marker cannot turn a settled provider failure into cleanup debt."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        def bind_request_operation(self, request_id, operation):
+            super().bind_request_operation(request_id, operation)
+
+            def stop_after_terminal(_completed):
+                assert self.cancel_current_request(request_id) is True
+
+            operation.add_done_callback(stop_after_terminal)
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            raise RuntimeError("ordinary provider failure")
+
+    owner = Owner()
+    with pytest.raises(RuntimeError, match="ordinary provider failure"):
+        await owner.run(invocation_id="terminal-provider-failure")
+
+    assert (
+        await owner.wait_for_request_completion("terminal-provider-failure")
+        is RequestCompletionDisposition.COMPLETED
+    )
+    assert getattr(owner, "_abandoned_request_generations", {}) == {}
+
+
+@pytest.mark.asyncio
 async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
     from kestrel_sovereign.agent.invocation import bind_async_invocation
     from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
@@ -888,8 +930,8 @@ class TestAgentCancellation:
         assert "late-stream" not in agent._active_request_ids
 
     @pytest.mark.asyncio
-    async def test_stop_at_final_item_preserves_natural_unwind_failure(self):
-        """The final anext failure is cleanup when Stop already landed."""
+    async def test_stop_at_final_item_keeps_natural_source_failure_terminal(self):
+        """A marker alone cannot relabel final iteration as failed cleanup."""
 
         from fastapi import FastAPI
         from starlette.requests import Request
@@ -961,10 +1003,7 @@ class TestAgentCancellation:
         with pytest.raises(StopAsyncIteration):
             await anext(stream)
 
-        assert (
-            await completion
-            is RequestCompletionDisposition.ABANDONED
-        )
+        assert await completion is RequestCompletionDisposition.COMPLETED
 
     @pytest.mark.asyncio
     async def test_decorated_stream_can_close_from_its_owned_cleanup_task(self):
@@ -1321,6 +1360,83 @@ class TestAgentCancellation:
         assert '"type": "done"' not in event
         with pytest.raises(StopAsyncIteration):
             await anext(stream)
+
+    @pytest.mark.asyncio
+    async def test_bridge_stop_marker_does_not_relabel_source_failure_as_abandoned(
+        self,
+    ):
+        """A provider failure after the marker is terminal, not failed cleanup."""
+
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+            RequestLifecycleMixin,
+        )
+        from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        request_id = "bridge-marker-before-source-failure"
+
+        class LiveAgent(RequestLifecycleMixin):
+            def __init__(self):
+                self._current_request_id = None
+                self._active_request_ids = set()
+                self._active_request_counts = {}
+                self._active_request_started_at = {}
+                self._cancelled_requests = set()
+                self._request_completion_events = {}
+
+            async def process_input_streaming(self, *_args, **_kwargs):
+                assert self.cancel_current_request(request_id) is True
+                if False:
+                    yield "unreachable"
+                raise RuntimeError("ordinary provider failure after Stop marker")
+
+        agent = LiveAgent()
+        bridge = MagicMock()
+        bridge.get_or_create_session = AsyncMock(
+            return_value=MagicMock(id="bridge-session")
+        )
+        bridge.log_invocation = AsyncMock()
+        agent.features = {"BridgeFeature": bridge}
+        app = FastAPI()
+        app.state.agent = agent
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/bridge/stream",
+                "raw_path": b"/api/bridge/stream",
+                "query_string": b"",
+                "headers": [],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            }
+        )
+        route = next(
+            route
+            for route in get_router().routes
+            if route.path == "/api/bridge/stream"
+        )
+        endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+        response = await endpoint(
+            request,
+            BridgeRequest(message="work", request_id=request_id),
+        )
+
+        events = [event async for event in response.body_iterator]
+
+        assert events
+        assert (
+            await agent.wait_for_request_completion(request_id)
+            is RequestCompletionDisposition.COMPLETED
+        )
+        assert getattr(agent, "_abandoned_request_generations", {}) == {}
 
     @pytest.mark.asyncio
     async def test_bridge_cleanup_failure_releases_stop_as_abandoned(self):

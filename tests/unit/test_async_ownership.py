@@ -152,10 +152,8 @@ async def test_closing_owned_iterator_interrupts_blocked_source():
 
 
 @pytest.mark.asyncio
-async def test_natural_unwind_failure_is_cleanup_when_stop_was_requested():
-    """A Stop between the final item and terminal anext preserves cleanup failure."""
-
-    stop_requested = False
+async def test_natural_source_failure_is_not_cleanup_debt():
+    """Only an initiated close, not ordinary iteration, owns cleanup debt."""
 
     async def source():
         try:
@@ -166,13 +164,38 @@ async def test_natural_unwind_failure_is_cleanup_when_stop_was_requested():
     owned = OwnedAsyncIterator(
         source,
         operation="naturally unwound source",
-        cleanup_requested=lambda: stop_requested,
     )
     assert await anext(owned) == "last item"
-    stop_requested = True
 
     with pytest.raises(RuntimeError, match="natural unwind cleanup failed"):
         await anext(owned)
+
+    assert owned.cleanup_error is None
+
+
+@pytest.mark.asyncio
+async def test_initiated_close_still_records_source_unwind_failure_as_cleanup():
+    """The real close boundary retains failures from cancellation-driven unwind."""
+
+    entered = asyncio.Event()
+
+    async def source():
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+            yield "unreachable"
+        finally:
+            raise RuntimeError("close unwind cleanup failed")
+
+    owned = OwnedAsyncIterator(source, operation="failed close")
+    consumer = asyncio.create_task(anext(owned))
+    await entered.wait()
+
+    with pytest.raises(RuntimeError, match="close unwind cleanup failed"):
+        await owned.aclose()
+    consumer.cancel()
+    with pytest.raises(RuntimeError, match="close unwind cleanup failed"):
+        await consumer
 
     assert isinstance(owned.cleanup_error, RuntimeError)
 

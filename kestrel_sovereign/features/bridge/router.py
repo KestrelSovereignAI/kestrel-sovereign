@@ -263,9 +263,6 @@ def get_router() -> APIRouter:
                         invocation_provenance=invocation_provenance,
                     ),
                     operation="bridge agent stream cleanup",
-                    cleanup_requested=lambda: agent.is_request_cancelled(
-                        request_id
-                    ),
                 )
                 async for chunk in agent_stream:
                     # The iterator owner and this SSE serializer are separate

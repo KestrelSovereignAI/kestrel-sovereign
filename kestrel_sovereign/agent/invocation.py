@@ -395,16 +395,26 @@ def bind_async_invocation(
                             None,
                         )
                         try:
-                            if (
-                                isinstance(error, asyncio.CancelledError)
-                                and isolated_operation is not None
+                            terminal_without_cleanup_debt = bool(
+                                isolated_operation is not None
                                 and isolated_operation.done()
+                                and (
+                                    isinstance(error, asyncio.CancelledError)
+                                    or isolated_operation.cancelling() == 0
+                                )
+                            )
+                            if (
+                                terminal_without_cleanup_debt
                             ):
-                                # A disconnect which races a Stop can cancel
-                                # this long-lived owner after the isolated turn
-                                # has already reached a terminal state. The
-                                # request marker says Stop happened; the child
-                                # task says whether cleanup was abandoned.
+                                # Stop may land after the child has already
+                                # returned or failed, or a disconnect may race
+                                # its terminal state. A completed task with no
+                                # cancellation request has already run its
+                                # cleanup; the later marker cannot turn an
+                                # ordinary terminal failure into abandonment.
+                                # A cancellation-driven non-CancelledError
+                                # retains ``Task.cancelling() > 0`` and remains
+                                # cleanup debt below.
                                 cleanup_abandoned = False
                             else:
                                 cleanup_abandoned = bool(

@@ -7,6 +7,8 @@ import math
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 
+from kestrel_sovereign.agent.invocation import validate_invocation_id
+
 from .types import StopDisposition, StopOutcome, StopRequest, StopScope
 
 StopOperation = Callable[[StopRequest], Awaitable[StopDisposition]]
@@ -37,13 +39,17 @@ class CooperativeStopTarget:
             ("turn_ids", self.turn_ids),
             ("tool_call_ids", self.tool_call_ids),
         ):
-            if not isinstance(addresses, frozenset) or any(
-                not isinstance(address, str) or not address.strip()
-                for address in addresses
-            ):
+            if not isinstance(addresses, frozenset):
                 raise TypeError(
                     f"Stop target {field_name} must be a frozenset of concrete strings"
                 )
+            try:
+                for address in addresses:
+                    validate_invocation_id(address)
+            except ValueError as error:
+                raise TypeError(
+                    f"Stop target {field_name} must contain valid opaque work addresses"
+                ) from error
 
 
 class StopCleanupRegistry:

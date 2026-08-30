@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from kestrel_sovereign.agent.invocation import validate_invocation_id
+
 
 class StopScope(str, Enum):
     """The addressable work boundary affected by a cooperative Stop.
@@ -49,6 +51,13 @@ class StopRequest:
         if self.scope is StopScope.HOST:
             if self.target is not None:
                 raise ValueError("host Stop cannot carry a target")
+        elif self.scope in {StopScope.TURN, StopScope.TOOL_CALL}:
+            try:
+                validate_invocation_id(self.target)
+            except ValueError as error:
+                raise ValueError(
+                    f"{self.scope.value} Stop requires a target"
+                ) from error
         elif not isinstance(self.target, str) or not self.target.strip():
             raise ValueError(f"{self.scope.value} Stop requires a target")
         if self.scope in {StopScope.TURN, StopScope.TOOL_CALL} and (
@@ -123,15 +132,34 @@ class StopOutcome:
             raise ValueError(
                 f"{self.scope.value} Stop outcome requires a requested target"
             )
-        if self.requested_target is not None and (
-            not isinstance(self.requested_target, str)
-            or not self.requested_target.strip()
+        if self.requested_target is not None:
+            if self.scope in {StopScope.TURN, StopScope.TOOL_CALL}:
+                try:
+                    validate_invocation_id(self.requested_target)
+                except ValueError as error:
+                    raise ValueError(
+                        "requested_target must be a valid opaque work address"
+                    ) from error
+            elif (
+                not isinstance(self.requested_target, str)
+                or not self.requested_target.strip()
+            ):
+                raise ValueError(
+                    "requested_target must be a non-empty string when supplied"
+                )
+        if self.scope in {StopScope.TURN, StopScope.TOOL_CALL}:
+            try:
+                validate_invocation_id(self.resolved_target)
+            except ValueError as error:
+                raise ValueError(
+                    "resolved_target must be a valid opaque work address"
+                ) from error
+        elif (
+            not isinstance(self.resolved_target, str)
+            or not self.resolved_target.strip()
         ):
-            raise ValueError(
-                "requested_target must be a non-empty string when supplied"
-            )
+            raise ValueError("resolved_target must be a concrete string")
         for field_name, value in (
-            ("resolved_target", self.resolved_target),
             ("agent_id", self.agent_id),
             ("correlation_id", self.correlation_id),
         ):

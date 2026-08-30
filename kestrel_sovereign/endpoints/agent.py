@@ -763,9 +763,6 @@ async def stream_agent_response(request: Request):
                         attachments=attachments,
                     ),
                     operation="agent stream cleanup",
-                    cleanup_requested=lambda: agent.is_request_cancelled(
-                        request_id
-                    ),
                 )
                 async for chunk in agent_stream:
                     # Check if request was cancelled
