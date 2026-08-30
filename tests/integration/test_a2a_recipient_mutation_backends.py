@@ -180,8 +180,6 @@ async def test_recipient_mutation_authority_postgres():
         await _exercise_recipient_mutations(TaskStore(backend))
     finally:
         await backend.close()
-
-
 @pytest.mark.asyncio
 async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
     backend = SQLiteBackend(str(tmp_path / "recipient-terminal-replace.db"))
@@ -221,7 +219,7 @@ async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
         )
         assert rows == 0
 
-        persisted = await store.get(task_id)
+        persisted = await store._get_unscoped(task_id)
         assert persisted.status.state is TaskState.CANCELED
         assert persisted.metadata["cancellation_receipt"]["actor_agent_id"] == creator
     finally:
