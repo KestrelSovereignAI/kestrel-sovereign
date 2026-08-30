@@ -31,7 +31,13 @@ from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore
 from .destructive_audit import DestructiveAuditLog, destructive_audit_caller
-from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
+from .async_graph_store import (
+    AsyncGraphStore,
+    Edge,
+    GraphNode,
+    NodeDeleteResult,
+    NodeSwapResult,
+)
 from .async_assertion_store import (
     AsyncAssertionStore,
     AssertionChange,
@@ -149,6 +155,7 @@ __all__ = [
     # Graph types
     "GraphNode",
     "Edge",
+    "NodeDeleteResult",
     "NodeSwapResult",
     "AssertionChange",
     "AssertionCheckpoint",
