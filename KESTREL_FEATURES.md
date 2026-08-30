@@ -388,6 +388,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `assess_substrate` | `!identity assess` | `system` |  | 42 | `enabled` |
 | `export_identity` | `!identity export` | `system` | `storage_tier`, `sign`, `include_wallet` | 208 | `enabled` |
 | `import_identity` | `!identity import` | `system` | `source`, `verify_signature`, `merge_mode`, `key_hash`, `allow_unsigned`, `identity_trust_policy` | 303 | `enabled` |
+| `inspect_hold_state` | `!identity hold` | `system` |  | 85 | `enabled` |
 | `lifecycle_status` | `!identity status` | `system` |  | 70 | `enabled` |
 | `migration_history` | `!identity history` | `system` |  | 38 | `enabled` |
 | `verify_identity` | `!identity verify` | `system` | `source`, `key_hash`, `identity_trust_policy` | 149 | `enabled` |
@@ -983,6 +984,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!identity assess` | `identity` |  | Assess the current LLM substrate's capabilities and compare with agent requirements. Helps understand limitations when migrating. |
 | `!identity export` | `identity` | `[storage_tier] [sign] [include_wallet]` | Export the agent's complete identity to a portable, signed package. This creates a JSON package containing DID, constitution, memories, personality, relationships, and skills that can be imported to another substrate. storage_tier must be one of 'local' (default), 'ipfs', or 'filecoin'; an unrecognized value is rejected (it is NOT silently downgraded to local). |
 | `!identity history` | `identity` |  | View the agent's migration history - all substrate changes with timestamps, verification scores, and audit trail. |
+| `!identity hold` | `identity` |  | Inspect the durable host and agent Hold latches that apply to this agent. The trusted runtime fixes the subject to this agent's DID; there is no target parameter and this read-only tool cannot release a Hold. Reasons and times are visible, while raw actor, target, and receipt identities are redacted. |
 | `!identity import` | `identity` | `<source> [verify_signature] [merge_mode] [key_hash] [allow_unsigned] [identity_trust_policy]` | Import agent identity from a portable package. This restores memories, personality, relationships, and skills from a previously exported identity package. merge_mode must be one of: replace, merge (default), skip_existing. |
 | `!identity status` | `identity` |  | Show the agent's lifecycle standing — is_test_instance flag, graduation/retirement timestamps, and the list of lifecycle_event records linked to this agent. Lets the agent verify her own graduation/retirement state directly from her DB. |
 | `!identity verify` | `identity` | `<source> [key_hash] [identity_trust_policy]` | Verify the integrity of an identity package without importing it. Checks constitution hash, content hash, and signature. |
@@ -1111,6 +1113,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 

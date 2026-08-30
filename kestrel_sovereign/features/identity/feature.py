@@ -38,6 +38,39 @@ from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
+_HOLD_REDACTION_POLICY = {
+    "subject_identity": "implicit_self",
+    "target_identity": "omitted",
+    "receipt_identity": "omitted",
+    "actor_identity": "role_only",
+    "reason": "visible_to_held_subject",
+    "timestamp": "visible_to_held_subject",
+}
+
+
+def _hold_actor_role(actor_id: str, subject_did: str) -> str:
+    """Classify a Hold actor without disclosing its sovereign identity."""
+
+    if actor_id == subject_did:
+        return "self"
+    if actor_id.startswith("did:sovereign:"):
+        return "sovereign"
+    if actor_id.startswith("did:"):
+        return "agent"
+    return "operator"
+
+
+def _self_hold_latch_view(state: Any, *, subject_did: str) -> Dict[str, Any]:
+    """Render one verified latch under the self-introspection redaction policy."""
+
+    return {
+        "scope": state.scope.value,
+        "reason": state.reason,
+        "actor_role": _hold_actor_role(state.actor_id, subject_did),
+        "set_at": state.set_at,
+        "revision": state.revision,
+    }
+
 # Synonyms LLMs reach for on import_identity's merge_mode.
 _MERGE_MODE_ALIASES = {
     "overwrite": "replace", "replace_all": "replace", "reset": "replace",
@@ -160,6 +193,98 @@ class IdentityFeature(Feature):
     async def initialize(self):
         """Initialize the identity feature."""
         logger.info("Initializing IdentityFeature")
+
+    @tool(
+        name="inspect_hold_state",
+        description=(
+            "Inspect the durable host and agent Hold latches that apply to this "
+            "agent. The trusted runtime fixes the subject to this agent's DID; "
+            "there is no target parameter and this read-only tool cannot release "
+            "a Hold. Reasons and times are visible, while raw actor, target, and "
+            "receipt identities are redacted."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!identity hold",
+    )
+    async def inspect_hold_state(self) -> ToolResult:
+        """Return independently visible host and agent latches for self only."""
+
+        subject_did = vars(self.agent).get("_self_hold_subject_did")
+        reader = vars(self.agent).get("_self_hold_state_reader")
+        unknown = {
+            "state": "unknown",
+            "held": None,
+            "sources": [],
+            "latches": {"host": None, "agent": None},
+            "redaction_policy": dict(_HOLD_REDACTION_POLICY),
+        }
+        if not isinstance(subject_did, str) or not subject_did or not callable(reader):
+            return ToolResult.failed(
+                "Hold state is unavailable because the host control reader is not bound.",
+                data=unknown,
+            )
+
+        try:
+            from kestrel_sovereign.hold import (
+                EffectiveHoldState,
+                HOST_HOLD_TARGET,
+                HoldScope,
+            )
+
+            effective = await reader()
+            if not isinstance(effective, EffectiveHoldState):
+                raise TypeError("host reader returned an invalid Hold snapshot")
+            if effective.host is not None and (
+                effective.host.scope is not HoldScope.HOST
+                or effective.host.target_id != HOST_HOLD_TARGET
+            ):
+                raise ValueError("host reader returned a foreign host latch")
+            if effective.agent is not None and (
+                effective.agent.scope is not HoldScope.AGENT
+                or effective.agent.target_id != subject_did
+            ):
+                raise ValueError("host reader returned a foreign agent latch")
+        except Exception as exc:  # noqa: BLE001 - read failure is typed below
+            logger.error(
+                "Self Hold introspection failed (cause_type=%s)",
+                type(exc).__name__,
+            )
+            unknown["failure"] = "read_failed"
+            unknown["cause_type"] = type(exc).__name__
+            return ToolResult.failed(
+                "Hold state could not be read; current Hold status is unknown.",
+                data=unknown,
+            )
+
+        host_view = (
+            _self_hold_latch_view(effective.host, subject_did=subject_did)
+            if effective.host is not None
+            else None
+        )
+        agent_view = (
+            _self_hold_latch_view(effective.agent, subject_did=subject_did)
+            if effective.agent is not None
+            else None
+        )
+        sources = [source.value for source in effective.sources]
+        data = {
+            "state": "held" if effective.held else "not_held",
+            "held": effective.held,
+            "sources": sources,
+            "latches": {"host": host_view, "agent": agent_view},
+            "redaction_policy": dict(_HOLD_REDACTION_POLICY),
+        }
+        if effective.held:
+            return ToolResult.ok(
+                confirmation=(
+                    "This agent is held by: " + ", ".join(sources) + "."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation="No host or agent Hold currently applies to this agent.",
+            data=data,
+        )
 
     def _load_import_package(self, package_json: str):
         """Parse a loaded export into an AgentIdentityPackage.

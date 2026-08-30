@@ -686,6 +686,12 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
+        # Host-bound, read-only capability used by IdentityFeature's
+        # self-scoped Hold introspection.  The server installs a zero-argument
+        # closure after its control store is ready; tool payloads never select
+        # a subject DID or receive the store itself.
+        self._self_hold_subject_did: Optional[str] = None
+        self._self_hold_state_reader = None
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
         effective_db_backend = db_backend or os.environ.get(
@@ -1635,6 +1641,29 @@ class KestrelAgent(
         See: https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/500
         """
         return self.did
+
+    def bind_self_hold_state_reader(
+        self,
+        *,
+        subject_did: str,
+        reader: Any,
+    ) -> None:
+        """Bind the host's read-only Hold capability to this exact identity.
+
+        This is an embedding-runtime seam, not a tool surface.  The subject
+        must equal the construction-bound DID at binding time and the reader
+        accepts no subject argument, preventing a later tool payload from
+        redirecting introspection to a peer.
+        """
+
+        if not isinstance(subject_did, str) or not subject_did:
+            raise ValueError("Hold introspection requires a concrete subject DID")
+        if subject_did != self.did:
+            raise ValueError("Hold introspection subject does not match this agent")
+        if not callable(reader):
+            raise TypeError("Hold introspection reader must be callable")
+        self._self_hold_subject_did = subject_did
+        self._self_hold_state_reader = reader
 
     def get_feature(self, name: str):
         """Look up a registered feature by class name, tool_name, or a

@@ -1293,6 +1293,42 @@ def _hosted_peer_directory_context(app: FastAPI, agent) -> tuple[object, object]
     )
 
 
+def _bind_agent_self_hold_reader(app: FastAPI, agent) -> bool:
+    """Give one agent a read-only capability closed over its exact boot DID."""
+
+    context = getattr(app.state, "host_context", None)
+    store = getattr(context, "hold_store", None) if context is not None else None
+    binder = getattr(agent, "bind_self_hold_state_reader", None)
+    subject_did = getattr(agent, "did", None)
+    if store is None or not callable(binder):
+        return False
+    if not isinstance(subject_did, str) or not subject_did:
+        raise RuntimeError("Cannot bind Hold introspection without an agent DID")
+
+    async def read_self_hold_state():
+        return await store.get_effective(subject_did)
+
+    binder(subject_did=subject_did, reader=read_self_hold_state)
+    return True
+
+
+def _bind_loaded_self_hold_readers(app: FastAPI) -> None:
+    """Bind every currently loaded agent after the host store is published."""
+
+    seen: set[int] = set()
+    agent = getattr(app.state, "agent", None)
+    if agent is not None:
+        seen.add(id(agent))
+        _bind_agent_self_hold_reader(app, agent)
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        for managed in manager.list_agents().values():
+            if id(managed) in seen:
+                continue
+            seen.add(id(managed))
+            _bind_agent_self_hold_reader(app, managed)
+
+
 async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent) -> None:
     """Apply host-owned integration to every newly registered agent.
 
@@ -1338,6 +1374,10 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         router=peer_router,
         requester=peer_requester,
     )
+    # Initial agents reach this hook before the host context exists and are
+    # bound in one pass after it is published. Dynamic registrations arrive
+    # later and bind here before any feature route becomes reachable.
+    _bind_agent_self_hold_reader(app, agent)
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
 
@@ -2594,6 +2634,7 @@ async def _lifespan_startup(app: FastAPI):
             _hf.mount_host_feature_ui(app, candidate_started)
             app.state.host_features = list(started_features)
             app.state.host_context = ctx
+            _bind_loaded_self_hold_readers(app)
             runtime = getattr(ctx, "feature_contribution_runtime", None)
             if runtime is not None:
                 app.state.host_operator_registry = runtime.operator_registry
@@ -2610,6 +2651,7 @@ async def _lifespan_startup(app: FastAPI):
             # default zero-feature installation as well.
             app.state.host_features = []
             app.state.host_context = ctx
+            _bind_loaded_self_hold_readers(app)
             logger.info("Host features initialized: 0")
     except BaseException as exc:  # noqa: BLE001 - close unpublished context
         fatal = isinstance(
