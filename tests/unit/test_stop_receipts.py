@@ -451,6 +451,45 @@ async def test_receipt_store_startup_failure_prevents_host_readiness(
 
 
 @pytest.mark.asyncio
+async def test_receipt_store_startup_cancellation_closes_unpublished_database(
+    monkeypatch,
+):
+    from fastapi import FastAPI
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.host_features import storage
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    schema_started = asyncio.Event()
+    db = MagicMock()
+    db.close = AsyncMock()
+
+    async def blocked_schema(_store):
+        schema_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(AsyncDatabase, "sqlite", AsyncMock(return_value=db))
+    monkeypatch.setattr(StopReceiptStore, "ensure_schema", blocked_schema)
+    monkeypatch.setattr(storage, "prepare_host_database", lambda: "/tmp/stop.db")
+    monkeypatch.setattr(
+        storage, "validate_sqlite_family_private", lambda _path: None
+    )
+    app = FastAPI()
+
+    startup = asyncio.create_task(server._initialize_stop_receipts(app))
+    await asyncio.wait_for(schema_started.wait(), timeout=1)
+    startup.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+
+    db.close.assert_awaited_once()
+    assert app.state.stop_receipt_store is None
+    assert app.state.stop_receipt_db is None
+    assert app.state.stop_receipt_store_error == "CancelledError"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_exact_writers_return_one_receipt(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 

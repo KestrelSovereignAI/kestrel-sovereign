@@ -27,7 +27,6 @@ import json
 import logging
 import time
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.endpoints.agent_helpers import (
@@ -47,6 +46,9 @@ from kestrel_sovereign.agent.request_lifecycle import (
     bind_request_operation_if_supported,
 )
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.endpoints.closing_streaming_response import (
+    ClosingStreamingResponse,
+)
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -481,7 +483,7 @@ def get_router() -> APIRouter:
                 started=lambda: response_body_started,
                 cleanup=lambda: agent._cleanup_cancelled_request(request_id),
             )
-            return StreamingResponse(
+            return ClosingStreamingResponse(
                 response_iterator,
                 media_type="text/event-stream",
                 headers={

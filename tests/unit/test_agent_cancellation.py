@@ -802,6 +802,11 @@ class TestAgentCancellation:
         )
         endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
         response = await endpoint(request)
+        from kestrel_sovereign.endpoints.closing_streaming_response import (
+            ClosingStreamingResponse,
+        )
+
+        assert isinstance(response, ClosingStreamingResponse)
         stream = response.body_iterator
 
         assert await anext(stream) == "first"
@@ -1407,6 +1412,11 @@ class TestAgentCancellation:
                 request_id="bridge-inner-cleanup",
             ),
         )
+        from kestrel_sovereign.endpoints.closing_streaming_response import (
+            ClosingStreamingResponse,
+        )
+
+        assert isinstance(response, ClosingStreamingResponse)
         stream = response.body_iterator
 
         assert "first" in await anext(stream)
@@ -2349,7 +2359,11 @@ class TestStopEndpoint:
         mock_agent._cleanup_cancelled_request = MagicMock()
         mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
         app.state.agent = mock_agent
-        monkeypatch.setattr(agent_endpoints, "StreamingResponse", ResponseConstructionFailure)
+        monkeypatch.setattr(
+            agent_endpoints,
+            "ClosingStreamingResponse",
+            ResponseConstructionFailure,
+        )
 
         response = TestClient(app, raise_server_exceptions=False).post(
             "/api/agent/stream",

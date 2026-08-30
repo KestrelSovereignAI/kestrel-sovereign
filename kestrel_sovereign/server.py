@@ -1612,18 +1612,47 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
         app.state.stop_receipt_db = db
         app.state.stop_receipt_store = store
         app.state.distributed_invocation_registry = distributed_stop
-    except Exception as error:  # noqa: BLE001 - preserve typed startup cause
+    except (Exception, asyncio.CancelledError) as error:
+        cleanup_cancelled = isinstance(error, asyncio.CancelledError)
+        cleanup_failures: list[BaseException] = []
         if distributed_stop is not None:
-            try:
-                await distributed_stop.close()
-            except Exception:  # noqa: BLE001 - preserve primary failure
-                pass
+            close_registry = asyncio.create_task(
+                distributed_stop.close(),
+                name="stop_receipts_startup:close_registry",
+            )
+            cancelled, failure = await await_lifecycle_task_completion(
+                close_registry
+            )
+            cleanup_cancelled = cleanup_cancelled or cancelled
+            if failure is not None:
+                cleanup_failures.append(failure)
         if db is not None:
-            try:
-                await db.close()
-            except Exception:  # noqa: BLE001 - preserve the primary failure
-                pass
+            close_db = asyncio.create_task(
+                db.close(),
+                name="stop_receipts_startup:close_database",
+            )
+            cancelled, failure = await await_lifecycle_task_completion(close_db)
+            cleanup_cancelled = cleanup_cancelled or cancelled
+            if failure is not None:
+                cleanup_failures.append(failure)
         app.state.stop_receipt_store_error = type(error).__name__
+        for failure in cleanup_failures:
+            error.add_note(
+                "Durable Stop startup cleanup also failed: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        if cleanup_cancelled:
+            cancellation = (
+                error
+                if isinstance(error, asyncio.CancelledError)
+                else asyncio.CancelledError()
+            )
+            if cancellation is not error:
+                cancellation.add_note(
+                    "Durable Stop startup failed before cancellation: "
+                    f"{type(error).__name__}: {error}"
+                )
+            raise cancellation
         logger.error(
             "Durable Stop receipt storage failed to initialize (%s); "
             "the host will not become ready",
