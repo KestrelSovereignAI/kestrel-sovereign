@@ -204,6 +204,38 @@ class TestLLMServicePrometheus:
         assert output_after == output_before + 25
 
     @pytest.mark.asyncio
+    async def test_llm_input_tokens_keep_cache_buckets_in_legacy_counter(self):
+        from kestrel_sovereign.llm.service import LLMService
+        from kestrel_sdk.metrics import REGISTRY
+
+        service = LLMService.__new__(LLMService)
+        service._observability_store = None
+        service._metering_callback = None
+        service._observability_context = {}
+
+        before = REGISTRY.get_sample_value(
+            "kestrel_llm_tokens_total",
+            {"model": "cache_token_model", "direction": "input"},
+        ) or 0.0
+
+        await service._log_llm_call(
+            provider="p",
+            model="cache_token_model",
+            duration_ms=100,
+            success=True,
+            input_tokens=75,
+            output_tokens=25,
+            cache_creation_input_tokens=7,
+            cache_read_input_tokens=80,
+        )
+
+        after = REGISTRY.get_sample_value(
+            "kestrel_llm_tokens_total",
+            {"model": "cache_token_model", "direction": "input"},
+        )
+        assert after == before + 162
+
+    @pytest.mark.asyncio
     async def test_llm_duration_histogram(self):
         from kestrel_sovereign.llm.service import LLMService
         from kestrel_sdk.metrics import REGISTRY
