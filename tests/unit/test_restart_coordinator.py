@@ -1520,6 +1520,24 @@ async def test_executor_rejects_tampered_signed_request_bounds(tmp_path):
     assert "do not match signed authority bounds" in row.status_reason
     mock_spawn.assert_not_called()
 
+    # A terminal authority rejection consumes the signed lifecycle generation.
+    # Rewriting only the request row back to its sealed public fields must not
+    # make that rejected whole-host mutation executable again.
+    await backend.execute(
+        "UPDATE restart_requests SET policy = 'idle_agents_only', "
+        "status = 'pending', completed_at = NULL WHERE id = ?",
+        (request_id,),
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as replay_spawn:
+        await feat.restart_coordinator()
+
+    replayed = await get_request(backend, request_id)
+    assert replayed.status == "rejected"
+    assert "already consumed" in replayed.status_reason
+    replay_spawn.assert_not_called()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_status", ["completed", "rejected"])

@@ -1027,6 +1027,7 @@ async def update_status(
     authority_evidence: Optional[str] = None
     authority_signature: Optional[str] = None
     retry_generation: Optional[str] = None
+    terminal_generation: Optional[str] = None
     retry_transition = (
         status == "pending" and expected_current_status not in PENDING_STATES
     )
@@ -1073,6 +1074,20 @@ async def update_status(
             # even when an older caller omitted the optional signature CAS.
             if expected_authority_signature is None:
                 expected_authority_signature = current.authority_signature
+        elif status in TERMINAL_STATES:
+            # A terminal transition revokes the row's lifecycle capability even
+            # when public request fields were tampered and signature verification
+            # therefore fails. The unpredictable generation lives inside the
+            # signed evidence; consuming it in this same transaction prevents a
+            # writer from restoring those public fields and replaying the
+            # rejected whole-host mutation.
+            current = await get_request(db, request_id)
+            if current is not None:
+                try:
+                    terminal_generation = restart_authority_generation(current)
+                except RestartAuthorityError:
+                    # Unsigned/malformed rows contain no executable generation.
+                    terminal_generation = None
 
         sql = (
             "UPDATE restart_requests SET status = ?, status_reason = ?"
@@ -1105,6 +1120,18 @@ async def update_status(
         )
         if not landed:
             return False
+        if terminal_generation is not None:
+            await db.execute(
+                "INSERT INTO restart_authority_consumptions "
+                "(lifecycle_generation, request_id, consumed_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(lifecycle_generation) DO NOTHING",
+                (
+                    terminal_generation,
+                    request_id,
+                    (await database_clock(db)).isoformat(),
+                ),
+            )
         if retry_generation is not None:
             await db.execute(
                 "DELETE FROM restart_authority_retry_permissions "
