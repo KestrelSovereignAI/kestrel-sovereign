@@ -1131,3 +1131,24 @@ def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
+
+
+def test_turn_stop_capability_endpoint_is_explicit_and_versioned() -> None:
+    """External inspectors can fail closed against older agent-wide doors."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    response = TestClient(app).get("/api/agent/stop/capabilities")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "protocol": "kestrel.cooperative_stop",
+        "version": 1,
+        "scopes": ["agent", "turn"],
+        "turn_address": "turn_id",
+        "typed_outcomes": True,
+        "durable_receipts": True,
+    }
