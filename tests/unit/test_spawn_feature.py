@@ -364,6 +364,7 @@ class TestSpawnFeatureWithManager:
         manager.persist_created_agent_registration = AsyncMock(
             side_effect=OSError("registry unavailable")
         )
+        manager.terminate_child = AsyncMock(return_value=True)
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
         envelope = await feature.spawn_agent(
@@ -374,6 +375,36 @@ class TestSpawnFeatureWithManager:
 
         assert envelope.status is ToolResultStatus.ERROR
         assert "registry unavailable" in envelope.error
+        manager.terminate_child.assert_awaited_once_with(
+            parent.agent_id,
+            "durable-helper",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_persistent_spawn_surfaces_committed_child_rollback_failure(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = MagicMock()
+        manager.spawn_agent = AsyncMock(return_value=child)
+        manager.persist_created_agent_registration = AsyncMock(
+            side_effect=OSError("registry unavailable")
+        )
+        manager.terminate_child = AsyncMock(
+            side_effect=RuntimeError("child shutdown refused")
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.spawn_agent(
+            name="durable-helper",
+            purpose="survive restart",
+            ttl=0,
+        )
+
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "registration failed" in envelope.error
+        assert "rollback also failed" in envelope.error
+        assert "child shutdown refused" in envelope.error
 
     @pytest.mark.asyncio
     async def test_spawn_agent_failure(self):
@@ -506,6 +537,35 @@ class TestSpawnFeatureWithManager:
         # alive for the next delegate_task / get_child_result.
         manager._lifecycle.report_result.assert_not_awaited()
         assert feature._child_results["helper"]["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_delegate_binds_replacement_after_authority_check(self):
+        parent = _make_mock_agent("did:parent")
+        removed_child = _make_mock_agent("did:removed")
+        replacement = _make_mock_agent("did:replacement")
+        manager = MagicMock()
+        manager.get_agent = MagicMock(return_value=removed_child)
+
+        async def verify_after_replacement(_parent_did):
+            manager.get_agent.return_value = replacement
+            return ["helper"]
+
+        manager.get_authoritative_children = AsyncMock(
+            side_effect=verify_after_replacement
+        )
+        manager._lifecycle = SpawnedAgentLifecycle(manager)
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.delegate_task(
+            child_name="helper", task="run on current generation"
+        )
+        await asyncio.sleep(0)
+
+        assert envelope.status is ToolResultStatus.OK
+        replacement.process_input.assert_awaited_once_with(
+            "run on current generation"
+        )
+        removed_child.process_input.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delegate_twice_keeps_child_alive(self):

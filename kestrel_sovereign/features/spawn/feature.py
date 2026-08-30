@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -847,7 +848,61 @@ class SpawnFeature(Feature):
                     raise RuntimeError(
                         "Persistent spawn has no startup-registry persistence seam"
                     )
-                await persist_registration(name)
+                try:
+                    await persist_registration(name)
+                except (Exception, asyncio.CancelledError) as persistence_error:
+                    # A persistent spawn is not committed until both its live
+                    # signed authority receipt and its startup registration
+                    # exist.  The manager has already published the child by
+                    # this boundary, so own the inverse explicitly rather than
+                    # returning an error with an authoritative orphan still
+                    # routable until restart.
+                    rollback_task = asyncio.create_task(
+                        manager.terminate_child(
+                            self.agent.agent_id,
+                            name,
+                            offboard_runtime=True,
+                        ),
+                        name=f"rollback_persistent_spawn:{name}",
+                    )
+                    rollback_cancelled, rollback_error = (
+                        await await_lifecycle_task_completion(rollback_task)
+                    )
+                    if rollback_error is not None:
+                        if isinstance(rollback_error, asyncio.CancelledError):
+                            raise BaseExceptionGroup(
+                                "Persistent spawn registration failed and its "
+                                "committed child rollback was cancelled",
+                                [persistence_error, rollback_error],
+                            )
+                        raise RuntimeError(
+                            "Persistent spawn registration failed and the "
+                            "committed child rollback also failed: "
+                            f"{type(rollback_error).__name__}: {rollback_error}"
+                        ) from BaseExceptionGroup(
+                            "persistent spawn registration and rollback failed",
+                            [persistence_error, rollback_error],
+                        )
+                    rolled_back = rollback_task.result()
+                    if not rolled_back:
+                        raise RuntimeError(
+                            "Persistent spawn registration failed and the "
+                            "committed child rollback was refused"
+                        ) from persistence_error
+                    if isinstance(
+                        persistence_error, asyncio.CancelledError
+                    ) or rollback_cancelled:
+                        cancellations = [persistence_error]
+                        if not isinstance(
+                            persistence_error, asyncio.CancelledError
+                        ):
+                            cancellations.append(asyncio.CancelledError())
+                        raise BaseExceptionGroup(
+                            "Persistent spawn registration was cancelled after "
+                            "the committed child rollback completed",
+                            cancellations,
+                        )
+                    raise
             return ToolResult.ok(
                 f"Spawned child '{name}' (did={child.agent_id}, ttl={ttl}s).",
                 data={
@@ -957,8 +1012,9 @@ class SpawnFeature(Feature):
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
 
-        child_agent = manager.get_agent(child_name)
-        if child_agent is None:
+        # Preserve the cheap absent-child response without retaining this
+        # pre-verification object as the execution binding.
+        if manager.get_agent(child_name) is None:
             return ToolResult.failed(
                 error=f"Child agent '{child_name}' not found or not running"
             )
@@ -969,6 +1025,16 @@ class SpawnFeature(Feature):
         if child_name not in authoritative_children:
             return ToolResult.failed(
                 error=f"Agent '{child_name}' is not a child of this agent"
+            )
+
+        # Bind routing only after the awaited receipt verification. Removal and
+        # a same-name replacement can complete while that check is in flight;
+        # retaining a pre-check object would execute on the removed generation
+        # even though the returned authority snapshot names its replacement.
+        child_agent = manager.get_agent(child_name)
+        if child_agent is None:
+            return ToolResult.failed(
+                error=f"Child agent '{child_name}' not found or not running"
             )
 
         # Run the task asynchronously via the child agent's chat method.
