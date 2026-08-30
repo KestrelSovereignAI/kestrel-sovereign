@@ -127,6 +127,21 @@ def _use_runtime_projection_as_authority_test_double(manager: AgentManager) -> N
 
     manager.get_authoritative_children = AsyncMock(side_effect=manager.get_children)
 
+    def relations() -> dict[str, tuple[str, str]]:
+        projected: dict[str, tuple[str, str]] = {}
+        for parent_did, child_names in manager._parent_children.items():
+            for child_name in child_names:
+                child = manager.get_agent(child_name)
+                child_did = getattr(child, "agent_id", None)
+                mandate = manager.get_mandate(child_name)
+                if not isinstance(child_did, str) or not child_did:
+                    child_did = getattr(mandate, "child_did", None)
+                if isinstance(child_did, str) and child_did:
+                    projected[child_did] = (parent_did, child_name)
+        return projected
+
+    manager.get_authoritative_spawn_relations = AsyncMock(side_effect=relations)
+
 
 class TestSpawnFeatureTools:
     """Verify SpawnFeature exposes the correct tools."""
@@ -1402,8 +1417,16 @@ class TestSpawnFeatureWithManager:
             cause=OSError("descendant-secret"),
         )
 
-        async def remove_agent(name: str, *, offboard_runtime: bool) -> bool:
+        async def remove_agent(
+            name: str,
+            *,
+            offboard_runtime: bool,
+            _lifecycle_cleanup_expected_agent_id: str,
+        ) -> bool:
             assert offboard_runtime is True
+            assert _lifecycle_cleanup_expected_agent_id == manager.get_agent(
+                name
+            ).agent_id
             removed = manager._agents.pop(name, None)
             if removed is None:
                 return False
@@ -1429,8 +1452,20 @@ class TestSpawnFeatureWithManager:
         assert "Grandchild" in envelope.error
         assert "descendant-secret" not in str(envelope.to_dict())
         assert manager.remove_agent.await_args_list == [
-            (("Grandchild",), {"offboard_runtime": True}),
-            (("Child",), {"offboard_runtime": True}),
+            (
+                ("Grandchild",),
+                {
+                    "offboard_runtime": True,
+                    "_lifecycle_cleanup_expected_agent_id": "did:grandchild",
+                },
+            ),
+            (
+                ("Child",),
+                {
+                    "offboard_runtime": True,
+                    "_lifecycle_cleanup_expected_agent_id": "did:child",
+                },
+            ),
         ]
         assert manager.get_agent("Child") is None
         assert manager.get_agent("Grandchild") is None
@@ -1462,9 +1497,15 @@ class TestSpawnFeatureWithManager:
             )
         )
 
-        async def remove_named_child(name: str, *, offboard_runtime: bool) -> bool:
+        async def remove_named_child(
+            name: str,
+            *,
+            offboard_runtime: bool,
+            _lifecycle_cleanup_expected_agent_id: str,
+        ) -> bool:
             assert name == "Child"
             assert offboard_runtime is True
+            assert _lifecycle_cleanup_expected_agent_id == child.agent_id
             removed = manager._agents.pop(name)
             manager._agent_names.pop(removed.agent_id)
             return True
@@ -1497,6 +1538,7 @@ class TestSpawnFeatureWithManager:
         manager.remove_agent.assert_awaited_once_with(
             "Child",
             offboard_runtime=True,
+            _lifecycle_cleanup_expected_agent_id=child.agent_id,
         )
         assert manager.get_agent("Grandchild") is grandchild
 

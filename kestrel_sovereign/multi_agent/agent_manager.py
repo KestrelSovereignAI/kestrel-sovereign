@@ -864,6 +864,12 @@ class AgentManager:
         # LocalAgentConfig per agent created at runtime via create_agent —
         # consumed by the create-agent endpoint to persist registrations.
         self._created_configs: dict[str, "LocalAgentConfig"] = {}
+        # A persistent spawn keeps consuming fleet capacity while it is cold or
+        # intentionally stopped: its startup registration will publish it again
+        # on the next host boot.  Key by canonical name and exact DID so a
+        # same-name replacement cannot inherit or retire the reservation.
+        self._persistent_spawn_registrations: dict[str, tuple[str, str]] = {}
+        self._persistent_spawn_offboarding: set[tuple[str, str]] = set()
         self._created_agent_persistence_hook: Optional[
             Callable[[str, LocalAgentConfig], Awaitable[None]]
         ] = None
@@ -940,9 +946,38 @@ class AgentManager:
             raise RuntimeError(
                 f"Created agent {name!r} has no published startup configuration"
             )
+        async with self._lock:
+            published_name, agent = self._published_agent_binding(name)
+            child_did = _loaded_agent_did(agent) if agent is not None else None
+            mandate = self._child_mandates.get(published_name or name)
+            if (
+                not isinstance(child_did, str)
+                or not child_did
+                or not isinstance(mandate, SpawnMandate)
+                or mandate.child_did != child_did
+                or mandate.ttl_seconds > 0
+            ):
+                raise RuntimeError(
+                    "Persistent startup registration no longer names the exact "
+                    "published spawned child"
+                )
+            canonical_name = self._canonical_agent_name(published_name or name)
+            self._persistent_spawn_registrations[canonical_name] = (
+                published_name or name,
+                child_did,
+            )
         hook = self._created_agent_persistence_hook
-        if hook is not None:
-            await hook(name, config)
+        try:
+            if hook is not None:
+                await hook(name, config)
+        except BaseException:
+            async with self._lock:
+                if self._persistent_spawn_registrations.get(canonical_name) == (
+                    published_name or name,
+                    child_did,
+                ):
+                    self._persistent_spawn_registrations.pop(canonical_name, None)
+            raise
 
     async def rollback_unregistered_persistent_spawn(
         self,
@@ -2053,7 +2088,7 @@ class AgentManager:
         retained_cleanup_slots = self._retained_spawn_cleanup_slots()
         if (
             existing is None
-            and len(self._child_mandates) + retained_cleanup_slots
+            and self._committed_spawn_cap_slots() + retained_cleanup_slots
             >= self._max_spawned_agents
         ):
             raise RuntimeError(
@@ -2203,6 +2238,16 @@ class AgentManager:
         if retained < 0:
             raise RuntimeError("Spawn cap reservation accounting underflowed")
         return retained
+
+    def _committed_spawn_cap_slots(self) -> int:
+        """Count live receipts and cold persistent registrations once each."""
+
+        names = {
+            self._canonical_agent_name(name)
+            for name in self._child_mandates
+        }
+        names.update(self._persistent_spawn_registrations)
+        return len(names)
 
     @staticmethod
     async def _run_hosted_agent_ready_hooks(agent: KestrelAgent) -> None:
@@ -6036,7 +6081,7 @@ class AgentManager:
         # counts in-flight spawns whose mandate isn't registered yet.
         try:
             async with self._lock:
-                in_use = len(self._child_mandates) + self._pending_spawns
+                in_use = self._committed_spawn_cap_slots() + self._pending_spawns
                 if in_use >= self._max_spawned_agents:
                     raise ValueError(
                         f"Spawn refused: at the spawned-agent cap "
@@ -6271,7 +6316,7 @@ class AgentManager:
                         # rejecting against the same transient over-cap count.
                         if admission.kind == "spawn":
                             in_use = (
-                                len(self._child_mandates)
+                                self._committed_spawn_cap_slots()
                                 + self._pending_spawns
                             )
                             if in_use > self._max_spawned_agents:
@@ -6903,6 +6948,24 @@ class AgentManager:
         """Forget one fully removed child from parent spawn-cap bookkeeping."""
 
         mandate = self._child_mandates.get(child_name)
+        canonical_name = self._canonical_agent_name(child_name)
+        persistent_registration = self._persistent_spawn_registrations.get(
+            canonical_name
+        )
+        registered_did = (
+            persistent_registration[1]
+            if persistent_registration is not None
+            else (
+                mandate.child_did
+                if isinstance(mandate, SpawnMandate)
+                else None
+            )
+        )
+        if isinstance(registered_did, str) and registered_did:
+            offboarding_key = (canonical_name, registered_did)
+            if offboarding_key in self._persistent_spawn_offboarding:
+                self._persistent_spawn_registrations.pop(canonical_name, None)
+                self._persistent_spawn_offboarding.discard(offboarding_key)
         from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 
         lifecycle = getattr(self, "_lifecycle", None)
@@ -7249,7 +7312,7 @@ class AgentManager:
 
         if not isinstance(parent_did, str) or not parent_did:
             return []
-        relations = await self._verified_spawn_relations()
+        relations = await self.get_authoritative_spawn_relations()
         return sorted(
             (
                 child_name
@@ -7320,9 +7383,17 @@ class AgentManager:
         Returns:
             True if the child was found and terminated.
         """
-        children = await self.get_authoritative_children(parent_did)
+        relations = await self.get_authoritative_spawn_relations()
+        authority_child_did = next(
+            (
+                child_did
+                for child_did, (relation_parent, relation_name) in relations.items()
+                if relation_parent == parent_did and relation_name == child_name
+            ),
+            None,
+        )
         cleanup_child_did: Optional[str] = None
-        if child_name not in children:
+        if authority_child_did is None:
             lifecycle = vars(self).get("_lifecycle")
             cleanup_authority = getattr(
                 type(lifecycle), "cleanup_authority_child_did", None
@@ -7345,14 +7416,19 @@ class AgentManager:
         # siblings or the now-stopped parent. Preserve it for the caller after
         # every reachable lifecycle target has received its teardown attempt.
         child_agent = self.get_agent(child_name)
-        if _unregistered_persistent_spawn_expected_agent_id is not None:
+        expected_child_did = (
+            authority_child_did
+            or cleanup_child_did
+            or _unregistered_persistent_spawn_expected_agent_id
+        )
+        if expected_child_did is not None:
             actual_child_did = (
                 _loaded_agent_did(child_agent) if child_agent is not None else None
             )
-            if actual_child_did != _unregistered_persistent_spawn_expected_agent_id:
-                raise RuntimeError(
-                    "Unregistered persistent spawn rollback no longer names the "
-                    "exact live child"
+            if child_agent is not None and actual_child_did != expected_child_did:
+                raise ValueError(
+                    "Termination authority does not match the exact loaded agent; "
+                    "removal was refused."
                 )
         if child_agent is not None:
             try:
@@ -7391,25 +7467,34 @@ class AgentManager:
                     "Destructive offboarding of a persistent spawned child requires "
                     "a startup-registration removal hook"
                 )
-            expected_child_did = cleanup_child_did
-            if expected_child_did is None and child_agent is not None:
-                expected_child_did = _loaded_agent_did(child_agent)
-            if not expected_child_did:
-                expected_child_did = mandate.child_did
-            if not isinstance(expected_child_did, str) or not expected_child_did:
+            offboard_child_did = expected_child_did
+            if offboard_child_did is None and child_agent is not None:
+                offboard_child_did = _loaded_agent_did(child_agent)
+            if not offboard_child_did:
+                offboard_child_did = mandate.child_did
+            if not isinstance(offboard_child_did, str) or not offboard_child_did:
                 raise RuntimeError(
                     "Persistent spawned child identity is unavailable; "
                     "destructive offboarding was refused"
                 )
             registration_rollback = await removal_hook(
                 child_name,
-                expected_child_did,
+                offboard_child_did,
             )
             if not callable(registration_rollback):
                 raise RuntimeError(
                     "Persistent startup registration removal did not provide "
                     "a compensation callback"
                 )
+            canonical_offboard_name = self._canonical_agent_name(child_name)
+            offboarding_key = (canonical_offboard_name, offboard_child_did)
+            self._persistent_spawn_offboarding.add(offboarding_key)
+            raw_registration_rollback = registration_rollback
+
+            async def registration_rollback() -> None:
+                await raw_registration_rollback()
+                self._persistent_spawn_offboarding.discard(offboarding_key)
+
             offboarding_admission = RuntimeOffboardingAdmission()
 
         async def compensate_registration_if_not_admitted() -> tuple[
@@ -7446,14 +7531,11 @@ class AgentManager:
             }
             if offboarding_admission is not None:
                 removal_kwargs["offboarding_admission"] = offboarding_admission
-            exact_cleanup_child_did = (
-                cleanup_child_did
-                or _unregistered_persistent_spawn_expected_agent_id
-            )
+            exact_cleanup_child_did = expected_child_did
             if exact_cleanup_child_did is not None:
-                # Bind cleanup-only custody to the exact tracked child so a
-                # same-name replacement cannot be removed after the authority
-                # snapshot. Governance callers retain their existing API.
+                # Bind every signed or cleanup-only authority snapshot to the
+                # exact tracked child so a same-name replacement cannot be
+                # removed after any await.
                 removal_kwargs["_lifecycle_cleanup_expected_agent_id"] = (
                     exact_cleanup_child_did
                 )
@@ -7778,27 +7860,66 @@ class AgentManager:
 
             if removed:
                 removed_names.add(name)
+                mandate = self._child_mandates.get(name)
+                if isinstance(mandate, SpawnMandate):
+                    # Make the successful leaf removal visible before its
+                    # parent reaches the direct-removal orphan guard, but only
+                    # after every shutdown/refund/quarantine owner is gone.
+                    await self._prune_child_tracking_if_fully_removed(
+                        mandate.parent_did,
+                        name,
+                    )
             elif not failure_recorded:
                 record_failure(
                     name,
                     RuntimeError("remove_agent returned False; agent remains published"),
                 )
 
-        for child_name in reversed(list(self._child_budgets.keys())):
-            # A partially completed spawn/boot can leave a delegated hold
-            # without ever publishing its agent.  It has no live process to
-            # stop, but the leaf-first refund is still required before its
-            # parent's hold may be released.
-            await attempt_removal(
-                child_name,
-                unpublished_hold=child_name not in self._agents,
-            )
+        # Durable receipts, not insertion order, define the teardown topology.
+        # Restored/cold agents can be published in any order, and a parent-first
+        # DELETE is correctly refused while its signed child remains.  Walk the
+        # retained relationship projection post-order so every descendant gets
+        # its shutdown/refund attempt before its authority parent.
+        candidates = list(dict.fromkeys((*self._agents, *self._child_budgets)))
+        candidate_by_canonical = {
+            self._canonical_agent_name(name): name for name in candidates
+        }
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        removal_order: list[str] = []
 
-        # A failed child remains published and must not be retried as an
-        # unrelated root agent.  Every other agent still receives one attempt.
-        names = [name for name in self._agents if name not in attempted_names]
-        for name in names:
-            await attempt_removal(name)
+        def visit_removal_candidate(name: str) -> None:
+            canonical_name = self._canonical_agent_name(name)
+            if canonical_name in visited:
+                return
+            if canonical_name in visiting:
+                # Corrupt cycles are still attempted and reported by the
+                # ordinary removal guard; never recurse forever during drain.
+                return
+            visiting.add(canonical_name)
+            child_did = self._budgeted_child_agent_id(name)
+            if child_did:
+                for child_name in self._parent_children.get(child_did, ()):
+                    candidate = candidate_by_canonical.get(
+                        self._canonical_agent_name(child_name)
+                    )
+                    if candidate is not None:
+                        visit_removal_candidate(candidate)
+            visiting.discard(canonical_name)
+            visited.add(canonical_name)
+            removal_order.append(name)
+
+        for candidate in candidates:
+            visit_removal_candidate(candidate)
+
+        for name in removal_order:
+            # A partially completed spawn/boot can leave a delegated hold
+            # without ever publishing its agent. It has no process to stop, but
+            # its leaf-first refund remains part of the same topology.
+            await attempt_removal(
+                name,
+                unpublished_hold=name not in self._agents,
+            )
 
         # ``remove_agent`` is intentionally allowed to return once it has
         # quarantined cancellation-resistant cleanup.  Fleet/server shutdown

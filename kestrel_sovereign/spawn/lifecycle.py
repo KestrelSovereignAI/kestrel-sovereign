@@ -289,9 +289,36 @@ class SpawnedAgentLifecycle:
         tracked = self._tracked.get(child_name)
         if tracked is None or tracked.parent_did != parent_did:
             return None
-        if not self._tracked_child_has_cleanup_authority(tracked):
+        if tracked.child_did not in self._cleanup_authority_subtree_child_dids():
             return None
         return tracked.child_did
+
+    def _cleanup_authority_subtree_child_dids(self) -> set[str]:
+        """Return exact descendants owned by a retained cleanup capability.
+
+        Expiry withdraws governance for an entire spawned branch, but it must
+        not make that branch impossible to dismantle.  A finalizer/refusal on
+        one exact tracked child therefore carries cleanup-only custody through
+        its retained, signed tracker subtree.  This never restores delegation:
+        callers still receive only exact child identities for teardown.
+        """
+
+        owned = {
+            tracked.child_did
+            for tracked in self._tracked.values()
+            if self._tracked_child_has_cleanup_authority(tracked)
+        }
+        changed = True
+        while changed:
+            changed = False
+            for tracked in self._tracked.values():
+                if (
+                    tracked.parent_did in owned
+                    and tracked.child_did not in owned
+                ):
+                    owned.add(tracked.child_did)
+                    changed = True
+        return owned
 
     def _tracked_child_has_cleanup_authority(self, tracked: _TrackedChild) -> bool:
         """Whether one exact tracker still owns cleanup, never governance."""
@@ -329,11 +356,12 @@ class SpawnedAgentLifecycle:
         can retain its same-name replacement fence.
         """
 
+        owned = self._cleanup_authority_subtree_child_dids()
         return tuple(
             (tracked.child_name, tracked.child_did)
             for tracked in self._tracked.values()
             if tracked.parent_did == parent_did
-            and self._tracked_child_has_cleanup_authority(tracked)
+            and tracked.child_did in owned
         )
 
     @staticmethod
