@@ -20,6 +20,10 @@ Mutation traps this file is written against:
   The second pass here runs against an already-populated target.
 """
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 
 from kestrel_sovereign.identity.birth_record import (
@@ -45,6 +49,28 @@ from kestrel_sovereign.storage.async_rag_store import (
 
 TEST_DOMAIN = "agents.kestrel-sovereign.test"
 TEST_DATA_KEY = "test-master-key-for-encryption-32chars!"
+
+
+def test_replication_prelocks_graph_write_set_before_first_graph_write():
+    """The outer transaction cannot acquire endpoint locks piecemeal."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(replicate_birth_record)))
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {
+                "lock_nodes_for_update",
+                "add_node",
+                "add_edge",
+                "add_trusted_cross_agent_edge",
+            }:
+                calls.append((node.lineno, node.func.attr))
+    calls.sort()
+    lock_calls = [line for line, name in calls if name == "lock_nodes_for_update"]
+    write_calls = [line for line, name in calls if name != "lock_nodes_for_update"]
+    assert len(lock_calls) == 1
+    assert write_calls
+    assert lock_calls[0] < write_calls[0]
 
 
 @pytest.fixture
@@ -957,10 +983,10 @@ async def test_a_dangling_governing_target_is_refused_not_committed(
     """The edge is not the record — the node it names is.
 
     A bound ``get_node`` returns None for a node with no ownership witness as
-    well as for one that does not exist, so a target can be skipped while its
-    edge still lands (``add_trusted_cross_agent_edge`` needs only the source).
-    That commits an agent whose ``constitution_hash`` points at nothing, and a
-    check that only counted edges would then call it healthy forever.
+    well as for one that does not exist. Ordinary bound edge admission refuses
+    both with the same tenant-neutral error; the whole copy must still roll back
+    rather than committing an agent whose ``constitution_hash`` points at
+    nothing.
     """
     creds, anchor = await _incept(tmp_path, name="Dangling Target Bird")
     runtime = await _fresh_runtime(tmp_path)
@@ -978,7 +1004,7 @@ async def test_a_dangling_governing_target_is_refused_not_committed(
 
         monkeypatch.setattr(AsyncGraphStore, "add_node", _lose_the_document_row)
 
-        with pytest.raises(Exception, match="not readable in the runtime database"):
+        with pytest.raises(Exception, match="not both owned by the bound agent"):
             await replicate_birth_record(
                 runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
             )
