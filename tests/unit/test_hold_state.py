@@ -640,7 +640,7 @@ async def test_existing_foreign_host_receipt_fails_closed_on_every_state_path(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read", ["one", "effective"])
-async def test_state_read_validates_projection_inside_one_locked_snapshot(
+async def test_state_read_validates_projection_inside_one_read_snapshot(
     hold_db,
     monkeypatch,
     read,
@@ -693,7 +693,7 @@ async def test_state_read_validates_projection_inside_one_locked_snapshot(
                 (HoldScope.AGENT, "did:agent:snapshot"),
             )
         ]
-    assert transaction_modes == [True]
+    assert transaction_modes == [False]
 
 
 @pytest.mark.asyncio
@@ -1003,6 +1003,34 @@ async def test_two_sqlite_workers_serialize_replacement_and_stale_release(tmp_pa
     finally:
         await db_one.close()
         await db_two.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_effective_hold_read_does_not_wait_for_unrelated_writer(tmp_path):
+    """Turn admission needs a snapshot, not SQLite's global writer slot."""
+
+    path = tmp_path / "host.db"
+    writer_db = await AsyncDatabase.sqlite(str(path))
+    reader_db = await AsyncDatabase.sqlite(str(path))
+    reader = HoldStore(reader_db)
+    await reader.ensure_schema()
+    read_task = None
+    try:
+        async with writer_db.transaction(immediate=True):
+            read_task = asyncio.create_task(
+                reader.get_effective("did:agent:independent-reader")
+            )
+            done, _pending = await asyncio.wait({read_task}, timeout=0.25)
+        if read_task not in done:
+            await read_task
+        assert read_task in done
+        assert read_task.result().held is False
+    finally:
+        if read_task is not None and not read_task.done():
+            read_task.cancel()
+            await asyncio.gather(read_task, return_exceptions=True)
+        await writer_db.close()
+        await reader_db.close()
 
 
 @pytest.mark.asyncio

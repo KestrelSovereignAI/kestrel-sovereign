@@ -36,6 +36,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     resolve_request_invocation_id,
 )
 from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign.hold import HoldTurnRefusal
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -132,6 +133,8 @@ def get_router() -> APIRouter:
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             )
+        except HoldTurnRefusal as exc:
+            raise exc.as_http_exception() from exc
         except Exception:
             # Exception text and tracebacks can contain bridge message/context
             # content.  The client receives only the fixed HTTP detail below;
@@ -256,6 +259,11 @@ def get_router() -> APIRouter:
                     direction="outbound",
                     content_preview=response_text,
                     duration_ms=elapsed_ms,
+                )
+            except HoldTurnRefusal as exc:
+                yield (
+                    "event: refusal\n"
+                    f"data: {exc.wire_json()}\n\n"
                 )
             except Exception as e:
                 # The SSE client gets only the stable safe payload built by

@@ -864,7 +864,7 @@ class HoldStore:
         resolved_scope = _coerce_scope(scope)
         resolved_target = _target(resolved_scope, target_id)
         targets = ((resolved_scope, resolved_target),)
-        async with self._db.transaction(immediate=True):
+        async with self._db.transaction():
             await self._lock_read_targets(targets)
             await self._assert_host_latch_shape()
             latch = _latch_from_row(
@@ -894,7 +894,7 @@ class HoldStore:
             (HoldScope.HOST, HOST_HOLD_TARGET),
             (HoldScope.AGENT, agent),
         )
-        async with self._db.transaction(immediate=True):
+        async with self._db.transaction():
             await self._lock_read_targets(targets)
             await self._assert_host_latch_shape()
             rows = await self._db.fetchall(

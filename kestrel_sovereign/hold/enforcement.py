@@ -7,9 +7,10 @@ when neither the host nor the addressed agent latch is active.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from .state import EffectiveHoldState, HoldStateError
+from .state import EffectiveHoldState, HoldState, HoldStateError
 
 
 class HoldEnforcementUnavailableError(HoldStateError):
@@ -46,6 +47,52 @@ class HoldTurnRefusal(RuntimeError):
             "agent_hold": effective_state.agent,
         }
         super().__init__(f"Agent {agent_id!r} is held and cannot begin a turn")
+
+    @staticmethod
+    def _latch_payload(latch: HoldState | None) -> dict[str, Any] | None:
+        if latch is None:
+            return None
+        return {
+            "scope": latch.scope.value,
+            "target_id": latch.target_id,
+            "reason": latch.reason,
+            "actor_id": latch.actor_id,
+            "set_at": latch.set_at,
+            "hold_receipt_id": latch.hold_receipt_id,
+            "revision": latch.revision,
+        }
+
+    def wire_payload(self) -> dict[str, Any]:
+        """Return the stable, exact refusal envelope for non-Python callers."""
+
+        return {
+            "code": self.code,
+            "message": str(self),
+            "agent_id": self.agent_id,
+            "host_hold": self._latch_payload(self.host_hold),
+            "agent_hold": self._latch_payload(self.agent_hold),
+        }
+
+    def wire_json(self) -> str:
+        """Serialize the refusal without turning it into agent-authored prose."""
+
+        return json.dumps(
+            self.wire_payload(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def as_http_exception(self):
+        """Map this intentional refusal to the canonical HTTP error envelope."""
+
+        from kestrel_sovereign.api_errors import ApiHTTPException
+
+        return ApiHTTPException(
+            status_code=423,
+            code=self.code,
+            message=str(self),
+            details=[self.wire_payload()],
+        )
 
 
 def require_context_hold_store(context: Any) -> Any:

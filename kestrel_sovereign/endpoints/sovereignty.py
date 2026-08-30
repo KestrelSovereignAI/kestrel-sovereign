@@ -19,6 +19,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     resolve_request_invocation_id,
 )
 from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign.hold import HoldTurnRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +313,8 @@ async def trigger_sovereignty_import(request: Request, http_response: Response):
 
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return {"success": True, "message": result}
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         raise
     except Exception as e:

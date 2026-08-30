@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from kestrel_sovereign.hold import (
     EffectiveHoldState,
@@ -134,3 +138,180 @@ def test_held_refusal_cannot_be_built_from_an_unheld_snapshot() -> None:
             agent_id="did:test:held",
             effective_state=EffectiveHoldState(host=None, agent=None),
         )
+
+
+def _held_refusal() -> HoldTurnRefusal:
+    return HoldTurnRefusal(
+        agent_id="did:test:held",
+        effective_state=EffectiveHoldState(
+            host=_latch(HoldScope.HOST, "hold:http", target="host"),
+            agent=None,
+        ),
+    )
+
+
+def _agent_api_app(agent) -> FastAPI:
+    from kestrel_sovereign.api_errors import register_api_error_handlers
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.rate_limit import limiter
+
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.state.agent = agent
+    app.include_router(router)
+    register_api_error_handlers(app)
+    return app
+
+
+def _transport_app(agent, *routers) -> FastAPI:
+    from kestrel_sovereign.api_errors import register_api_error_handlers
+    from kestrel_sovereign.rate_limit import limiter
+
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.state.agent = agent
+    for router in routers:
+        app.include_router(router)
+    register_api_error_handlers(app)
+    return app
+
+
+def test_invoke_maps_hold_to_typed_http_refusal() -> None:
+    refusal = _held_refusal()
+    agent = MagicMock()
+    agent.process_input = AsyncMock(side_effect=refusal)
+    agent.register_active_request = MagicMock()
+    agent._cleanup_cancelled_request = MagicMock()
+    agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+
+    response = TestClient(_agent_api_app(agent)).post(
+        "/api/agent/invoke",
+        json={"input": "do not run", "request_id": "held-http-turn"},
+    )
+
+    assert response.status_code == 423
+    body = response.json()
+    assert body["error"]["code"] == "agent_held"
+    evidence = body["error"]["details"][0]
+    assert evidence == refusal.wire_payload()
+    assert evidence["host_hold"]["hold_receipt_id"] == "hold:http"
+    assert evidence["agent_hold"] is None
+    agent._cleanup_cancelled_request.assert_called_once_with("held-http-turn")
+
+
+def test_stream_emits_machine_typed_hold_record_not_agent_prose() -> None:
+    refusal = _held_refusal()
+
+    async def held_stream(*_args, **_kwargs):
+        raise refusal
+        yield  # pragma: no cover - keeps this an async generator
+
+    agent = MagicMock()
+    agent.process_input_streaming = held_stream
+    agent.register_active_request = MagicMock()
+    agent._cleanup_cancelled_request = MagicMock()
+    agent.is_request_cancelled = MagicMock(return_value=False)
+    agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+
+    response = TestClient(_agent_api_app(agent)).post(
+        "/api/agent/stream",
+        json={"input": "do not stream", "request_id": "held-stream-turn"},
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.text) == refusal.wire_payload()
+    assert "selected model route" not in response.text
+    agent._cleanup_cancelled_request.assert_called_once_with("held-stream-turn")
+
+
+def test_compatibility_http_surfaces_preserve_typed_hold_refusal(
+    monkeypatch,
+) -> None:
+    """OpenAI, Rasa, and sovereignty adapters cannot collapse Hold to 500."""
+
+    from kestrel_sovereign.endpoints.models import router as models_router
+    from kestrel_sovereign.endpoints.rasa_shim import router as rasa_router
+    from kestrel_sovereign.endpoints.sovereignty import router as sovereignty_router
+
+    refusal = _held_refusal()
+    agent = MagicMock()
+    agent.process_input = AsyncMock(side_effect=refusal)
+    agent.llm_service.get_active_model_id.return_value = "gpt-test"
+    app = _transport_app(
+        agent,
+        models_router,
+        rasa_router,
+        sovereignty_router,
+    )
+    monkeypatch.setenv("KESTREL_RASA_WEBHOOK_TOKEN", "rasa-secret")
+
+    with TestClient(app) as client:
+        responses = (
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-test",
+                    "messages": [{"role": "user", "content": "held"}],
+                },
+            ),
+            client.post(
+                "/webhooks/rest/webhook",
+                headers={"X-Webhook-Token": "rasa-secret"},
+                json={"sender": "patient-1", "message": "held"},
+            ),
+            client.post(
+                "/api/sovereignty/import",
+                json={"cid": "bafyHeldTransport"},
+            ),
+        )
+
+    for response in responses:
+        assert response.status_code == 423, response.text
+        body = response.json()["error"]
+        assert body["code"] == "agent_held"
+        assert body["details"] == [refusal.wire_payload()]
+
+
+def test_bridge_surfaces_preserve_typed_hold_refusal() -> None:
+    """Bridge sync and SSE clients receive the same exact refusal evidence."""
+
+    from kestrel_sovereign.features.bridge.router import get_router
+
+    refusal = _held_refusal()
+    bridge = MagicMock()
+    bridge.get_or_create_session = AsyncMock(
+        return_value=SimpleNamespace(id="held-bridge-session")
+    )
+    bridge.log_invocation = AsyncMock()
+    agent = MagicMock()
+    agent.features = {"BridgeFeature": bridge}
+    agent.process_input = AsyncMock(side_effect=refusal)
+
+    async def held_stream(*_args, **_kwargs):
+        raise refusal
+        yield  # pragma: no cover - keeps this an async generator
+
+    agent.process_input_streaming = held_stream
+    agent.register_active_request = MagicMock()
+    agent._cleanup_cancelled_request = MagicMock()
+    app = _transport_app(agent, get_router())
+
+    with TestClient(app) as client:
+        invoke = client.post(
+            "/api/bridge/invoke",
+            json={"message": "held", "channel_type": "api"},
+        )
+        stream = client.post(
+            "/api/bridge/stream",
+            json={"message": "held", "channel_type": "api"},
+        )
+
+    assert invoke.status_code == 423
+    assert invoke.json()["error"]["details"] == [refusal.wire_payload()]
+    assert stream.status_code == 200
+    assert "event: refusal" in stream.text
+    data_line = next(
+        line for line in stream.text.splitlines() if line.startswith("data: ")
+    )
+    assert json.loads(data_line.removeprefix("data: ")) == refusal.wire_payload()
+    agent._cleanup_cancelled_request.assert_called_once()

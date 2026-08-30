@@ -8,6 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
+from kestrel_sovereign.hold import (
+    EffectiveHoldState,
+    HoldScope,
+    HoldState,
+    HoldTurnRefusal,
+)
 from kestrel_sovereign.features.isolated_runtime import (
     derive_isolated_runtime_namespace,
     prepare_isolated_runtime_namespace,
@@ -380,6 +386,38 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.get_child_result(child_name="helper")
         assert envelope.data["ready"] is True
         assert envelope.data["result"] == "analysis complete: 42"
+
+    @pytest.mark.asyncio
+    async def test_delegated_held_child_records_typed_refusal(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        latch = HoldState(
+            scope=HoldScope.AGENT,
+            target_id=child.agent_id,
+            reason="operator hold",
+            actor_id="did:sovereign:operator",
+            set_at="2026-08-28T12:00:00+00:00",
+            hold_receipt_id="hold:delegated-child",
+            revision=2,
+        )
+        refusal = HoldTurnRefusal(
+            agent_id=child.agent_id,
+            effective_state=EffectiveHoldState(host=None, agent=latch),
+        )
+        child.process_input = AsyncMock(side_effect=refusal)
+        manager = MagicMock()
+        manager.get_agent.return_value = child
+        manager.get_children.return_value = ["helper"]
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        await feature.delegate_task(child_name="helper", task="held task")
+        await feature._child_tasks["helper"]
+
+        result = await feature.get_child_result(child_name="helper")
+        assert result.data["ready"] is True
+        assert result.data["success"] is False
+        assert result.data["refusal"] == refusal.wire_payload()
+        assert "error" not in result.data
 
     @pytest.mark.asyncio
     async def test_get_child_result_still_running(self):

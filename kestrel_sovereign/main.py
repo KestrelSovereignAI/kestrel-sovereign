@@ -7,6 +7,7 @@ import asyncio
 import os
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.security.encryption import DecryptionError
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     await_agent_shutdown_completion,
@@ -246,6 +247,8 @@ async def main():
                 response = await agent.process_input(user_input)
                 decryption_error_count = 0  # Reset on success
                 print(f"\nKestrel: {response}")
+            except HoldTurnRefusal as exc:
+                print(f"\n{exc.wire_json()}")
             except DecryptionError as e:
                 decryption_error_count += 1
                 logger.error(f"DecryptionError during processing: {e}")

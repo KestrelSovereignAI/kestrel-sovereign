@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.hold import HoldTurnRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -943,6 +944,12 @@ class SpawnFeature(Feature):
                 self._child_results[child_name] = {
                     "success": True,
                     "result": result,
+                    "completed_at": time.time(),
+                }
+            except HoldTurnRefusal as exc:
+                self._child_results[child_name] = {
+                    "success": False,
+                    "refusal": exc.wire_payload(),
                     "completed_at": time.time(),
                 }
             except Exception as e:

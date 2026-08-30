@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -455,6 +456,40 @@ def test_host_context_satisfies_sdk_protocol():
 
     ctx = SovereignHostContext(db=object(), backplane=object(), config={})
     assert isinstance(ctx, HostContext)
+
+
+@pytest.mark.asyncio
+async def test_host_context_uses_shared_postgres_for_durable_hold(
+    monkeypatch,
+):
+    """Cloud replicas must not put Hold latches on disposable local SQLite."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = SimpleNamespace(backend_type="postgres", close=AsyncMock())
+    postgres = AsyncMock(return_value=db)
+    sqlite = AsyncMock(side_effect=AssertionError("local SQLite must not open"))
+    monkeypatch.setattr(AsyncDatabase, "postgres", postgres)
+    monkeypatch.setattr(AsyncDatabase, "sqlite", sqlite)
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://shared/hold")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.sqla.session.make_session_factory",
+        lambda _db: SimpleNamespace(engine=object(), close=AsyncMock()),
+    )
+    ensured = AsyncMock()
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.HoldStore",
+        lambda _db: SimpleNamespace(ensure_schema=ensured),
+    )
+
+    ctx = await build_host_context(config={})
+
+    postgres.assert_awaited_once_with("postgresql://shared/hold")
+    sqlite.assert_not_awaited()
+    ensured.assert_awaited_once_with()
+    assert ctx.db is db
+    assert ctx.hold_store is not None
 
 
 # ---------------------------------------------------------------------------

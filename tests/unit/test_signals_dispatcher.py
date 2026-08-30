@@ -47,6 +47,12 @@ from kestrel_sovereign.signals import (
     SourceRegistrationWithPromptOverride,
     SourceRegistry,
 )
+from kestrel_sovereign.hold import (
+    EffectiveHoldState,
+    HoldScope,
+    HoldState,
+    HoldTurnRefusal,
+)
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -228,6 +234,40 @@ async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp
     )
     assert result.status == Status.OK
     assert "scrubbed" in c.agent.process_input_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_held_cognition_is_terminal_typed_refusal(
+    dispatcher_components,
+    tmp_path,
+):
+    c = dispatcher_components
+    template = tmp_path / "held.md"
+    template.write_text("wake")
+    c.registry.register(_cognition_reg(template, name="held_signal"))
+    latch = HoldState(
+        scope=HoldScope.AGENT,
+        target_id=c.agent.did,
+        reason="operator hold",
+        actor_id="did:sovereign:operator",
+        set_at="2026-08-28T12:00:00+00:00",
+        hold_receipt_id="hold:signal",
+        revision=3,
+    )
+    refusal = HoldTurnRefusal(
+        agent_id=c.agent.did,
+        effective_state=EffectiveHoldState(host=None, agent=latch),
+    )
+    c.agent.process_input = AsyncMock(side_effect=refusal)
+
+    result = await c.dispatcher.dispatch_signal(
+        _signal("held_signal", mode=SignalMode.COGNITION)
+    )
+
+    assert result.status is Status.DROPPED_VALIDATION
+    assert result.error == refusal.wire_json()
+    assert '"code":"agent_held"' in result.error
+    assert '"hold_receipt_id":"hold:signal"' in result.error
 
 
 @pytest.mark.asyncio
