@@ -409,6 +409,8 @@ async def invoke_agent(request: Request, http_response: Response):
       - 'model' parameter to override the default model
       - 'session_id' to load context from a specific conversation session
     """
+    cleanup_agent = None
+    cleanup_request_id = None
     try:
         data = await _parse_json_body(request)
         user_input = data.get("input")
@@ -455,21 +457,24 @@ async def invoke_agent(request: Request, http_response: Response):
                 raise
         else:
             agent._current_request_id = request_id
+        # From this point onward every return, validation failure, ordinary
+        # exception, and task cancellation must retire the registration.  In
+        # particular, session resolution below is an await before process_input
+        # begins and therefore cannot rely on process_input's local finally.
+        cleanup_agent = agent
+        cleanup_request_id = request_id
 
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         if callable(request_cancelled) and request_cancelled(request_id) is True:
-            try:
-                http_response.headers["X-Request-ID"] = (
-                    invocation_id_response_header(request_id)
-                )
-                return {
-                    "response": "Request stopped before execution.",
-                    "session_id": session_id,
-                    "model": None,
-                    "provider": None,
-                }
-            finally:
-                agent._cleanup_cancelled_request(request_id)
+            http_response.headers["X-Request-ID"] = invocation_id_response_header(
+                request_id
+            )
+            return {
+                "response": "Request stopped before execution.",
+                "session_id": session_id,
+                "model": None,
+                "provider": None,
+            }
 
         if isinstance(kite_evidence_request, dict):
             if user_input not in (None, ""):
@@ -601,8 +606,6 @@ async def invoke_agent(request: Request, http_response: Response):
                     "provider": None,
                 }
             raise
-        finally:
-            agent._cleanup_cancelled_request(request_id)
         # Extract model/provider identity for frontend footer rendering (#1373)
         identity = agent._conversation_response_identity(use_last_identity=True)
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
@@ -624,6 +627,9 @@ async def invoke_agent(request: Request, http_response: Response):
             code="invoke_failed",
             message="An internal error occurred.",
         )
+    finally:
+        if cleanup_agent is not None and cleanup_request_id is not None:
+            cleanup_agent._cleanup_cancelled_request(cleanup_request_id)
 
 
 # Chat attachments (#1662). Images can be sent to the model as vision input
