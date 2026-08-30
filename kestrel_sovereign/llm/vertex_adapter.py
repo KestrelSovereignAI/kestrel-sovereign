@@ -28,6 +28,7 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
+from .google_adapter import _normalized_google_genai_usage
 
 logger = logging.getLogger(__name__)
 
@@ -421,17 +422,15 @@ class VertexAIAdapter(LLMAdapter):
 
             # Extract token usage from response
             # Google/Vertex uses usage_metadata with prompt_token_count and candidates_token_count
-            input_tokens = None
-            output_tokens = None
-            total_tokens = None
+            input_tokens = output_tokens = total_tokens = None
+            cache_read_input_tokens = None
             if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                usage = response.usage_metadata
-                input_tokens = getattr(usage, 'prompt_token_count', None)
-                output_tokens = getattr(usage, 'candidates_token_count', None)
-                total_tokens = getattr(usage, 'total_token_count', None)
-                # Compute total if not provided
-                if total_tokens is None and input_tokens is not None and output_tokens is not None:
-                    total_tokens = input_tokens + output_tokens
+                (
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_read_input_tokens,
+                ) = _normalized_google_genai_usage(response.usage_metadata)
 
             return LLMResponse(
                 content=content,
@@ -440,6 +439,7 @@ class VertexAIAdapter(LLMAdapter):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except Exception as e:
@@ -518,18 +518,21 @@ class VertexAIAdapter(LLMAdapter):
                                     yield part.text
 
             input_tokens = output_tokens = total_tokens = None
+            cache_read_input_tokens = None
             if usage_meta is not None:
-                input_tokens = getattr(usage_meta, 'prompt_token_count', None)
-                output_tokens = getattr(usage_meta, 'candidates_token_count', None)
-                total_tokens = getattr(usage_meta, 'total_token_count', None)
-                if total_tokens is None and input_tokens is not None and output_tokens is not None:
-                    total_tokens = input_tokens + output_tokens
+                (
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_read_input_tokens,
+                ) = _normalized_google_genai_usage(usage_meta)
             yield LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except Exception as e:

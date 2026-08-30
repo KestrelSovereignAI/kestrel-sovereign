@@ -1573,6 +1573,9 @@ class ConstitutionMixin:
         """
         pruned: list[str] = []
         async with self.storage.transaction():
+            await self.storage.lock_nodes_for_update(
+                [self.agent_id, constitution_hash]
+            )
             if await self.storage.get_node(constitution_hash) is None:
                 constitution_node = GraphNode(
                     node_id=constitution_hash,
@@ -1857,6 +1860,12 @@ class ConstitutionMixin:
                         "signer": verification.signer,
                         "created_at": amendment_artifact.get("created_at"),
                     },
+                )
+                # The runtime and setup reanchor writers touch these shared
+                # rows in different semantic order. Take the complete set first
+                # so PostgreSQL always observes one canonical lock order.
+                await self.storage.lock_nodes_for_update(
+                    [self.agent_id, artifact_hash, stored_hash]
                 )
                 await self.storage.add_node(
                     artifact_node,

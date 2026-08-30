@@ -115,6 +115,67 @@ def _object_to_dict(obj: Any) -> Dict[str, Any]:
     return data
 
 
+def _normalized_openai_usage(
+    usage: Any,
+) -> tuple[
+    Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]
+]:
+    """Return SDK-semantic usage with cached prompt tokens split out.
+
+    OpenAI-compatible routes are not perfectly uniform. Current OpenAI SDK
+    objects put both counters under ``prompt_tokens_details``; some compatible
+    providers return ``cached_tokens`` (and occasionally ``cache_write_tokens``)
+    at the top level. Preserve either reported shape, preferring the canonical
+    nested value when both exist.
+    """
+    def field(source: Any, name: str) -> Any:
+        if isinstance(source, dict):
+            return source.get(name)
+        return getattr(source, name, None)
+
+    def token_count(value: Any) -> Optional[int]:
+        return (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            else None
+        )
+
+    input_tokens = field(usage, "prompt_tokens")
+    output_tokens = field(usage, "completion_tokens")
+    total_tokens = field(usage, "total_tokens")
+    details = field(usage, "prompt_tokens_details")
+    cache_creation_input_tokens = token_count(
+        field(details, "cache_write_tokens")
+    )
+    if cache_creation_input_tokens is None:
+        cache_creation_input_tokens = token_count(
+            field(usage, "cache_write_tokens")
+        )
+    cache_read_input_tokens = token_count(field(details, "cached_tokens"))
+    if cache_read_input_tokens is None:
+        cache_read_input_tokens = token_count(field(usage, "cached_tokens"))
+
+    separated_cache_tokens = sum(
+        value for value in (
+            cache_creation_input_tokens, cache_read_input_tokens
+        ) if value is not None
+    )
+    if separated_cache_tokens:
+        if isinstance(input_tokens, int) and not isinstance(input_tokens, bool):
+            input_tokens = max(0, input_tokens - separated_cache_tokens)
+        if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
+            total_tokens = max(0, total_tokens - separated_cache_tokens)
+    return (
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    )
+
+
 async def _maybe_await(value: Any) -> Any:
     if hasattr(value, "__await__"):
         return await value
@@ -446,10 +507,16 @@ class OpenAIAdapter(LLMAdapter):
             input_tokens = None
             output_tokens = None
             total_tokens = None
+            cache_creation_input_tokens = None
+            cache_read_input_tokens = None
             if hasattr(response, 'usage') and response.usage:
-                input_tokens = getattr(response.usage, 'prompt_tokens', None)
-                output_tokens = getattr(response.usage, 'completion_tokens', None)
-                total_tokens = getattr(response.usage, 'total_tokens', None)
+                (
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                ) = _normalized_openai_usage(response.usage)
 
             _, content = _split_thinking_from_content(
                 message.content,
@@ -463,6 +530,8 @@ class OpenAIAdapter(LLMAdapter):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except openai.RateLimitError as e:
@@ -693,14 +762,20 @@ class OpenAIAdapter(LLMAdapter):
             input_tokens = None
             output_tokens = None
             total_tokens = None
+            cache_creation_input_tokens = None
+            cache_read_input_tokens = None
             call_cost = None
 
             async for chunk in stream:
                 # Extract usage from final chunk (OpenAI sends it with stream_options)
                 if hasattr(chunk, 'usage') and chunk.usage:
-                    input_tokens = getattr(chunk.usage, 'prompt_tokens', None)
-                    output_tokens = getattr(chunk.usage, 'completion_tokens', None)
-                    total_tokens = getattr(chunk.usage, 'total_tokens', None)
+                    (
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
+                    ) = _normalized_openai_usage(chunk.usage)
                     # OpenRouter reports exact per-call cost on the usage-only
                     # final chunk when ``usage: {include: true}`` was sent
                     # (kestrel #1806). Stash it for the terminal response.
@@ -833,6 +908,8 @@ class OpenAIAdapter(LLMAdapter):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except openai.RateLimitError as e:
@@ -1456,13 +1533,22 @@ class OpenAIAdapter(LLMAdapter):
                     )
                 )
         usage = body.get("usage") or {}
+        (
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        ) = _normalized_openai_usage(usage)
         return LLMResponse(
             content=message.get("content"),
             tool_calls=tool_calls,
             raw=response_body,
-            input_tokens=usage.get("prompt_tokens"),
-            output_tokens=usage.get("completion_tokens"),
-            total_tokens=usage.get("total_tokens"),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
         )
 
     def _normalize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
