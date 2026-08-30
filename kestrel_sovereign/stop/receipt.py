@@ -440,6 +440,14 @@ class StopReceiptStore:
             raise StopReceiptCorruptError(
                 "Stop receipt operation lookup identity is invalid"
             )
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise StopReceiptCorruptError("Stop receipt fingerprint is invalid")
+        if fingerprint != _fingerprint(request):
+            raise StopReceiptConflict(
+                "Stop operation identity was reused for a different request"
+            )
         if row[5] != expected_requested_target or row[10] != expected_turn_id:
             raise StopReceiptCorruptError(
                 "Stop receipt opaque target identity is invalid"
@@ -452,10 +460,6 @@ class StopReceiptStore:
             ) from error
         if scope not in {"host", "agent", "turn", "tool_call"}:
             raise StopReceiptCorruptError("Stop receipt scope is invalid")
-        if len(fingerprint) != 64 or any(
-            character not in "0123456789abcdef" for character in fingerprint
-        ):
-            raise StopReceiptCorruptError("Stop receipt fingerprint is invalid")
         if cascade_int not in (0, 1):
             raise StopReceiptCorruptError("Stop receipt cascade flag is invalid")
         for field_name, value in (

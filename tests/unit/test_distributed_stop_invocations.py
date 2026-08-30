@@ -195,6 +195,48 @@ async def test_unjoined_remote_owner_is_unreachable_not_already_complete(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_transient_completion_failure_is_retried_until_row_is_removed(
+    tmp_path,
+):
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:retry-completion-agent")
+    replica_a.attach(agent)
+    original_complete = store.complete
+    attempts = 0
+
+    async def flaky_complete(generation_id, owner_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient database outage")
+        await original_complete(generation_id, owner_id)
+
+    store.complete = flaky_complete
+    try:
+        assert await replica_a.register(agent, "retry-completion-turn", 1)
+        generation_id = replica_a._by_local_generation[
+            (id(agent), "retry-completion-turn", 1)
+        ]
+
+        replica_a.complete_soon(agent, "retry-completion-turn", 1)
+        for _ in range(100):
+            if generation_id not in replica_a._active:
+                break
+            await asyncio.sleep(0.01)
+
+        assert attempts == 2
+        assert generation_id not in replica_a._active
+        assert await store.remaining((generation_id,)) == ()
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
 async def test_acknowledged_receipt_fences_direct_non_http_invocation(tmp_path):
     first_db, second_db, _store, replica_a, replica_b = await _shared_registries(
         tmp_path
