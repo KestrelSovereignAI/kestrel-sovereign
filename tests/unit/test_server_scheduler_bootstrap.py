@@ -224,8 +224,14 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     class _Manager:
         init_failures = []
 
+        def __init__(self) -> None:
+            self.created_agent_persistence_hook = None
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
+
+        def set_created_agent_persistence_hook(self, hook) -> None:
+            self.created_agent_persistence_hook = hook
 
         async def load_from_config(self, config) -> int:
             assert config is fake_config
@@ -234,6 +240,9 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
 
         def list_agents(self):
             return {}
+
+        async def shutdown_all(self) -> None:
+            return None
 
     manager = _Manager()
 
@@ -270,3 +279,4 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         pass
 
     assert events == ["preflight", "load", "host-start"]
+    assert callable(manager.created_agent_persistence_hook)
