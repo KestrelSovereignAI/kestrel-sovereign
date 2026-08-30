@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
@@ -20,6 +21,7 @@ from kestrel_sovereign.agent.parts import (
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     bind_async_generator_invocation,
     current_invocation_id,
 )
@@ -913,7 +915,9 @@ class StreamingMixin:
             images.append(data)
         return images
 
-    @bind_async_generator_invocation("request_id")
+    @bind_async_generator_invocation(
+        "request_id", track_request_lifecycle=True
+    )
     async def process_input_streaming(
         self,
         user_input: str,
@@ -1068,14 +1072,21 @@ class StreamingMixin:
                 # Preserve the pre-existing positional call shape
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
-                result = await self.process_input(
-                    user_input,
-                    model_override,
-                    session_id=session_id,
-                    caller=caller,
-                    invocation_context=invocation_context,
-                    invocation_id=current_invocation_id(),
-                )
+                try:
+                    result = await self.process_input(
+                        user_input,
+                        model_override,
+                        session_id=session_id,
+                        caller=caller,
+                        invocation_context=invocation_context,
+                        invocation_id=current_invocation_id(),
+                    )
+                except InvocationCancelledError:
+                    # The command delegate owns an isolated child so Stop does
+                    # not cancel a persistent transport task. Its typed unwind
+                    # is normal end-of-stream; the endpoint's post-loop check
+                    # emits the standard Stop notice and completes cleanup.
+                    return
                 yield result
                 release_parts = not getattr(result, "denied", False) and not (
                     getattr(result, "enforcing", False)
@@ -2467,8 +2478,8 @@ class StreamingMixin:
         but the next turn's history loader can't find it. Surfaced by
         Meridian's "I don't see my own quantum response" report.
 
-        ``asyncio.shield`` keeps the persist task alive even when the
-        outer generator is cancelled. The exception handler logs and
+        An explicitly owned task keeps persistence alive and is joined even
+        when the outer generator is cancelled. The exception handler logs and
         emits a metric so production can detect this happening at all.
         We never re-raise — the request is already over from the
         client's perspective; raising here would only mask the original
@@ -2501,21 +2512,20 @@ class StreamingMixin:
             kwargs["model"] = resolved_model
         if resolved_provider is not None:
             kwargs["provider"] = resolved_provider
-        try:
-            await asyncio.shield(
-                self.privacy_agent.add_conversation(
-                    "assistant",
-                    text,
-                    **kwargs,
-                )
-            )
-        except asyncio.CancelledError:
-            # Outer task cancelled mid-persist. shield() means the
-            # add_conversation coroutine keeps running to completion in
-            # the background — we just don't get to await it. Re-raise
-            # so the cancellation propagates correctly.
-            raise
-        except Exception as exc:
+        persistence = asyncio.create_task(
+            self.privacy_agent.add_conversation(
+                "assistant",
+                text,
+                **kwargs,
+            ),
+            name="persist-assistant-turn",
+        )
+        outcome = await await_owned_task(persistence)
+        if outcome.error is not None and not isinstance(
+            outcome.error,
+            asyncio.CancelledError,
+        ):
+            exc = outcome.error
             logging.error(
                 "Failed to persist assistant turn (session_id=%s): %s",
                 session_id, exc, exc_info=True,
@@ -2537,6 +2547,15 @@ class StreamingMixin:
                 # broken, the logged ERROR above is the last line of
                 # defense.
                 pass
+        if outcome.cancellation is not None:
+            if outcome.error is not None:
+                outcome.cancellation.add_note(
+                    f"assistant turn persistence also failed: {outcome.error}"
+                )
+                raise outcome.cancellation from outcome.error
+            raise outcome.cancellation
+        if isinstance(outcome.error, asyncio.CancelledError):
+            raise outcome.error
 
     async def _fire_post_response_hook(
         self,

@@ -128,6 +128,11 @@ SSE_PATHS = {
     "/agent/stream",
 }
 
+# Stop receipts execute short primary-key lookups and serial inserts. One
+# dedicated PostgreSQL connection keeps this evidence lane independent without
+# consuming the host's operational/advisory pool budget a second time.
+STOP_RECEIPT_POSTGRES_POOL_SIZE = 1
+
 
 def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
     """Compute the multi_agent.toml path the lifespan should load (#868).
@@ -1338,6 +1343,11 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         router=peer_router,
         requester=peer_requester,
     )
+    distributed_stop = getattr(
+        app.state, "distributed_invocation_registry", None
+    )
+    if distributed_stop is not None:
+        distributed_stop.attach(agent)
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
 
@@ -1551,6 +1561,146 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
     cancelled = await await_agent_shutdown_completion(agent) or cancelled
     if cancelled:
         raise asyncio.CancelledError()
+
+
+async def _initialize_stop_receipts(app: FastAPI) -> None:
+    """Open the host-owned evidence store before any agent can accept work."""
+
+    app.state.stop_receipt_store = None
+    app.state.stop_receipt_db = None
+    app.state.stop_receipt_store_error = ""
+    app.state.distributed_invocation_registry = None
+    db = None
+    distributed_stop = None
+    try:
+        from kestrel_sovereign.host_features.storage import (
+            prepare_host_database,
+            validate_sqlite_family_private,
+        )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.stop import (
+            DistributedInvocationRegistry,
+            DistributedInvocationStore,
+            StopReceiptStore,
+        )
+
+        backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+        if backend == "postgres":
+            dsn = os.environ.get("KESTREL_DATABASE_URL")
+            if not dsn:
+                raise RuntimeError(
+                    "PostgreSQL Stop receipt storage requires KESTREL_DATABASE_URL"
+                )
+            db = await AsyncDatabase.create(
+                {
+                    "backend": "postgres",
+                    "dsn": dsn,
+                    "min_pool_size": STOP_RECEIPT_POSTGRES_POOL_SIZE,
+                    "max_pool_size": STOP_RECEIPT_POSTGRES_POOL_SIZE,
+                }
+            )
+        else:
+            path = prepare_host_database()
+            db = await AsyncDatabase.sqlite(str(path))
+            validate_sqlite_family_private(path)
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        invocation_store = DistributedInvocationStore(db)
+        await invocation_store.ensure_schema()
+        distributed_stop = DistributedInvocationRegistry(invocation_store)
+        distributed_stop.start()
+        app.state.stop_receipt_db = db
+        app.state.stop_receipt_store = store
+        app.state.distributed_invocation_registry = distributed_stop
+    except (Exception, asyncio.CancelledError) as error:
+        cleanup_cancelled = isinstance(error, asyncio.CancelledError)
+        cleanup_failures: list[BaseException] = []
+        if distributed_stop is not None:
+            close_registry = asyncio.create_task(
+                distributed_stop.close(),
+                name="stop_receipts_startup:close_registry",
+            )
+            cancelled, failure = await await_lifecycle_task_completion(
+                close_registry
+            )
+            cleanup_cancelled = cleanup_cancelled or cancelled
+            if failure is not None:
+                cleanup_failures.append(failure)
+        if db is not None:
+            close_db = asyncio.create_task(
+                db.close(),
+                name="stop_receipts_startup:close_database",
+            )
+            cancelled, failure = await await_lifecycle_task_completion(close_db)
+            cleanup_cancelled = cleanup_cancelled or cancelled
+            if failure is not None:
+                cleanup_failures.append(failure)
+        app.state.stop_receipt_store_error = type(error).__name__
+        for failure in cleanup_failures:
+            error.add_note(
+                "Durable Stop startup cleanup also failed: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        if cleanup_cancelled:
+            cancellation = (
+                error
+                if isinstance(error, asyncio.CancelledError)
+                else asyncio.CancelledError()
+            )
+            if cancellation is not error:
+                cancellation.add_note(
+                    "Durable Stop startup failed before cancellation: "
+                    f"{type(error).__name__}: {error}"
+                )
+            raise cancellation
+        logger.error(
+            "Durable Stop receipt storage failed to initialize (%s); "
+            "the host will not become ready",
+            type(error).__name__,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            "Durable Stop evidence failed to initialize"
+        ) from error
+
+
+async def _shutdown_stop_receipts(app: FastAPI) -> None:
+    # Keep this primitive safe for focused tests and recovery callers that do
+    # not drive the full ordered server teardown.
+    registry = getattr(app.state, "distributed_invocation_registry", None)
+    app.state.distributed_invocation_registry = None
+    if registry is not None:
+        await registry.close()
+    db = getattr(app.state, "stop_receipt_db", None)
+    app.state.stop_receipt_store = None
+    app.state.stop_receipt_db = None
+    if db is not None:
+        await db.close()
+
+
+async def _shutdown_distributed_invocations(app: FastAPI) -> None:
+    """Retire this process's ownership rows after agents finish cleanup."""
+
+    registry = getattr(app.state, "distributed_invocation_registry", None)
+    app.state.distributed_invocation_registry = None
+    if registry is not None:
+        await registry.close()
+
+
+async def _shutdown_stop_cleanup(app: FastAPI) -> None:
+    """Drain application-owned Stop tails before their agents are released."""
+
+    from kestrel_sovereign.stop import StopCleanupRegistry
+
+    registry = getattr(app.state, "stop_cleanup_registry", None)
+    if registry is None:
+        return
+    if not isinstance(registry, StopCleanupRegistry):
+        raise TypeError("app Stop cleanup registry has an invalid type")
+    try:
+        await registry.drain()
+    finally:
+        app.state.stop_cleanup_registry = None
 
 
 async def _shutdown_phoenix(app: FastAPI) -> bool:
@@ -2144,7 +2294,13 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # it before unmounting host and feature surfaces, otherwise that late
         # onboarding can remount routes or UI after their only teardown pass.
         ("host-features", lambda: _shutdown_host_features(app)),
+        ("stop-cleanup", lambda: _shutdown_stop_cleanup(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        (
+            "distributed-stop-invocations",
+            lambda: _shutdown_distributed_invocations(app),
+        ),
+        ("stop-receipts", lambda: _shutdown_stop_receipts(app)),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
         phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
@@ -2198,6 +2354,7 @@ async def _lifespan_startup(app: FastAPI):
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
+    await _initialize_stop_receipts(app)
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -2346,6 +2503,18 @@ async def _lifespan_startup(app: FastAPI):
                     app, manager, name, agent
                 )
             )
+            distributed_stop = getattr(
+                app.state, "distributed_invocation_registry", None
+            )
+            if distributed_stop is not None:
+                set_pre_initialize = getattr(
+                    type(manager), "set_agent_pre_initialize_hook", None
+                )
+                if callable(set_pre_initialize):
+                    set_pre_initialize(
+                        manager,
+                        lambda _name, agent: distributed_stop.attach(agent),
+                    )
             # Seed the database-global scheduler provenance and every local
             # DID's durable protocol row before concurrent agent
             # initialization and post-load default seeding.
@@ -2478,6 +2647,12 @@ async def _lifespan_startup(app: FastAPI):
                     llm_service=llm_service,
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+
+            distributed_stop = getattr(
+                app.state, "distributed_invocation_registry", None
+            )
+            if distributed_stop is not None:
+                distributed_stop.attach(app.state.agent)
 
             # Lifecycle hardening: provider availability (#377) is verified
             # inside KestrelAgent.initialize so every boot path — including
@@ -2823,6 +2998,7 @@ from kestrel_sovereign.endpoints import (
     features_router,
     ui_router,
     github_router,
+    host_stop_router,
 )
 from kestrel_sovereign.endpoints.rasa_shim import router as rasa_shim_router
 
@@ -2849,6 +3025,7 @@ app.include_router(features_router)
 app.include_router(ui_router)
 app.include_router(rasa_shim_router)
 app.include_router(github_router)
+app.include_router(host_stop_router)
 
 
 # Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}

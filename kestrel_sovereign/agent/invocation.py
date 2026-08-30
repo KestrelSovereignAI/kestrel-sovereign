@@ -8,10 +8,11 @@ operation identity with the task that is actually executing the turn.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from functools import wraps
 import hashlib
 import inspect
@@ -53,6 +54,10 @@ _current_invocation_provenance: ContextVar[InvocationProvenance | None] = Contex
 )
 
 _T = TypeVar("_T")
+
+
+class InvocationCancelledError(Exception):
+    """An isolated turn ended without cancelling its long-lived caller."""
 
 
 def validate_invocation_id(value: object) -> str:
@@ -217,6 +222,22 @@ def current_invocation_provenance() -> InvocationProvenance | None:
 
 
 @contextmanager
+def _exact_invocation_scope(
+    invocation_id: str,
+    provenance: InvocationProvenance | None,
+) -> Iterator[str]:
+    """Bind an already-resolved identity and an exact provenance value."""
+
+    id_token = _current_invocation_id.set(invocation_id)
+    provenance_token = _current_invocation_provenance.set(provenance)
+    try:
+        yield invocation_id
+    finally:
+        _current_invocation_provenance.reset(provenance_token)
+        _current_invocation_id.reset(id_token)
+
+
+@contextmanager
 def invocation_scope(
     invocation_id: object = None,
     *,
@@ -231,19 +252,22 @@ def invocation_scope(
         if provenance is not None
         else _current_invocation_provenance.get()
     )
-    id_token = _current_invocation_id.set(effective_id)
-    provenance_token = _current_invocation_provenance.set(effective_provenance)
-    try:
+    with _exact_invocation_scope(effective_id, effective_provenance):
         yield effective_id
-    finally:
-        _current_invocation_provenance.reset(provenance_token)
-        _current_invocation_id.reset(id_token)
 
 
 def bind_async_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., Awaitable[_T]]], Callable[..., Awaitable[_T]]]:
-    """Bind/generate ``parameter`` for an async top-level turn method."""
+    """Bind/generate ``parameter`` for an async top-level turn method.
+
+    ``track_request_lifecycle`` makes the decorated method the canonical
+    inventory boundary for every transport that calls it. This avoids a Stop
+    implementation that works only for endpoints which remembered to install
+    their own lifecycle wrapper.
+    """
     def decorate(function: Callable[..., Awaitable[_T]]) -> Callable[..., Awaitable[_T]]:
         signature = inspect.signature(function)
 
@@ -255,7 +279,165 @@ def bind_async_invocation(
                 provenance=bound.arguments.get("invocation_provenance"),
             ) as invocation_id:
                 bound.arguments[parameter] = invocation_id
-                return await function(*bound.args, **bound.kwargs)
+                lifecycle_owner = args[0] if args else None
+                registered = False
+                cleanup_abandoned = False
+                if track_request_lifecycle and lifecycle_owner is not None:
+                    register = getattr(
+                        type(lifecycle_owner),
+                        "register_active_request",
+                        None,
+                    )
+                    if callable(register):
+                        register(lifecycle_owner, invocation_id)
+                        registered = True
+                caller_cancellation_baseline = 0
+                try:
+                    if registered:
+                        await_admission = getattr(
+                            type(lifecycle_owner),
+                            "await_durable_request_admission",
+                            None,
+                        )
+                        if callable(await_admission) and not await await_admission(
+                            lifecycle_owner, invocation_id
+                        ):
+                            raise InvocationCancelledError(
+                                "invocation was stopped before durable admission "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            )
+                        bind_operation = getattr(
+                            type(lifecycle_owner),
+                            "bind_request_operation",
+                            None,
+                        )
+                        parent_context = copy_context()
+                        operation_context = parent_context.copy()
+                        caller = asyncio.current_task()
+                        if caller is not None:
+                            caller_cancellation_baseline = caller.cancelling()
+                        operation = asyncio.create_task(
+                            function(*bound.args, **bound.kwargs),
+                            name=(
+                                "invocation-turn:"
+                                f"{invocation_log_correlation(invocation_id)}"
+                            ),
+                            context=operation_context,
+                        )
+                        if callable(bind_operation):
+                            bind_operation(
+                                lifecycle_owner,
+                                invocation_id,
+                                operation,
+                            )
+                        try:
+                            result = await operation
+                            # ``Task.cancel()`` is a no-op once the isolated
+                            # child has produced a result.  Stop can linearize
+                            # in the narrow window between that completion and
+                            # this owner resuming, so re-read the exact active
+                            # generation before publishing normal output.  No
+                            # await follows this check: another request cannot
+                            # interleave between the verdict and return.
+                            is_cancelled = getattr(
+                                type(lifecycle_owner),
+                                "is_request_cancelled",
+                                None,
+                            )
+                            if callable(is_cancelled) and is_cancelled(
+                                lifecycle_owner, invocation_id
+                            ):
+                                raise InvocationCancelledError(
+                                    "isolated invocation was stopped after "
+                                    "operation completion "
+                                    f"({invocation_log_correlation(invocation_id)})"
+                                )
+                            return result
+                        except asyncio.CancelledError as error:
+                            caller = asyncio.current_task()
+                            if (
+                                caller is not None
+                                and caller.cancelling()
+                                > caller_cancellation_baseline
+                            ):
+                                raise
+                            raise InvocationCancelledError(
+                                "isolated invocation was cancelled "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            ) from error
+                        finally:
+                            # A normal ``await function(...)`` shares ContextVar
+                            # updates with its caller. Isolating the cancellable
+                            # task must preserve that contract (notably the
+                            # constitution-injection audit read immediately
+                            # after process_input returns).
+                            missing = object()
+                            for variable in operation_context:
+                                child_value = operation_context.get(
+                                    variable, missing
+                                )
+                                parent_value = parent_context.get(
+                                    variable, missing
+                                )
+                                if (
+                                    child_value is not missing
+                                    and child_value != parent_value
+                                ):
+                                    variable.set(child_value)
+                    return await function(*bound.args, **bound.kwargs)
+                except InvocationCancelledError:
+                    # The isolated child cooperatively unwound after Stop. Its
+                    # cancellation is a successful lifecycle completion, not a
+                    # cleanup failure.
+                    raise
+                except BaseException as error:
+                    if registered:
+                        request_cancelled = getattr(
+                            type(lifecycle_owner),
+                            "is_request_cancelled",
+                            None,
+                        )
+                        try:
+                            caller = asyncio.current_task()
+                            caller_cancelled = bool(
+                                isinstance(error, asyncio.CancelledError)
+                                and caller is not None
+                                and caller.cancelling()
+                                > caller_cancellation_baseline
+                            )
+                            cleanup_abandoned = bool(
+                                not caller_cancelled
+                                and callable(request_cancelled)
+                                and request_cancelled(
+                                    lifecycle_owner, invocation_id
+                                )
+                            )
+                        except Exception:
+                            # Never hide the turn's original failure. A broken
+                            # cancellation predicate is conservatively treated
+                            # as failed cleanup.
+                            cleanup_abandoned = True
+                    raise
+                finally:
+                    if registered:
+                        if cleanup_abandoned:
+                            # Imported lazily to avoid the module cycle:
+                            # request_lifecycle imports the correlation helper
+                            # from this module during class definition.
+                            from .request_lifecycle import (
+                                RequestCompletionDisposition,
+                            )
+
+                            lifecycle_owner._cleanup_cancelled_request(
+                                invocation_id,
+                                disposition=(
+                                    RequestCompletionDisposition.ABANDONED
+                                ),
+                            )
+                        else:
+                            lifecycle_owner._cleanup_cancelled_request(
+                                invocation_id
+                            )
 
         return wrapped
 
@@ -264,6 +446,8 @@ def bind_async_invocation(
 
 def bind_async_generator_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., AsyncIterator[_T]]], Callable[..., AsyncIterator[_T]]]:
     """Bind/generate ``parameter`` for an async-generator top-level turn.
 
@@ -280,12 +464,77 @@ def bind_async_generator_invocation(
         @wraps(function)
         async def wrapped(*args: Any, **kwargs: Any) -> AsyncIterator[_T]:
             bound = signature.bind_partial(*args, **kwargs)
-            with invocation_scope(
-                bound.arguments.get(parameter),
-                provenance=bound.arguments.get("invocation_provenance"),
+            # Do not hold ContextVar tokens across an outward ``yield``. The
+            # consumer is allowed to close this iterator from a cancellation-
+            # safe owner task; resetting a token created by the original task
+            # from that closer's Context raises ValueError and can falsely make
+            # request cleanup look complete. Bind only while advancing or
+            # closing the underlying generator, and retain one effective id and
+            # provenance for every advance even if different tasks drive it.
+            effective_id = ensure_invocation_id(bound.arguments.get(parameter))
+            supplied_provenance = bound.arguments.get("invocation_provenance")
+            if supplied_provenance is not None and not isinstance(
+                supplied_provenance, InvocationProvenance
             ):
-                async for item in function(*bound.args, **bound.kwargs):
+                raise TypeError(
+                    "invocation provenance must be endpoint-owned "
+                    "InvocationProvenance"
+                )
+            effective_provenance = (
+                supplied_provenance
+                if supplied_provenance is not None
+                else _current_invocation_provenance.get()
+            )
+            lifecycle_owner = args[0] if args else None
+            registered = False
+            if track_request_lifecycle and lifecycle_owner is not None:
+                register = getattr(
+                    type(lifecycle_owner),
+                    "register_active_request",
+                    None,
+                )
+                if callable(register):
+                    register(lifecycle_owner, effective_id)
+                    registered = True
+            iterator = None
+            try:
+                if registered:
+                    await_admission = getattr(
+                        type(lifecycle_owner),
+                        "await_durable_request_admission",
+                        None,
+                    )
+                    if callable(await_admission) and not await await_admission(
+                        lifecycle_owner, effective_id
+                    ):
+                        raise InvocationCancelledError(
+                            "streaming invocation was stopped before durable "
+                            "admission "
+                            f"({invocation_log_correlation(effective_id)})"
+                        )
+                iterator = function(*bound.args, **bound.kwargs)
+                while True:
+                    with _exact_invocation_scope(
+                        effective_id,
+                        effective_provenance,
+                    ):
+                        try:
+                            item = await anext(iterator)
+                        except StopAsyncIteration:
+                            return
                     yield item
+            finally:
+                try:
+                    close_iterator = getattr(iterator, "aclose", None)
+                    if callable(close_iterator):
+                        with _exact_invocation_scope(
+                            effective_id,
+                            effective_provenance,
+                        ):
+                            await close_iterator()
+                finally:
+                    if registered:
+                        lifecycle_owner._cleanup_cancelled_request(effective_id)
 
         return wrapped
 

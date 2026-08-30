@@ -169,19 +169,69 @@ test('non-streaming fallback also adopts session_id from response.session_id', a
     pane.sessionId = null;
 
     const origInvokeForAgent = apiModule.default.invokeForAgent;
+    const origCompleteRequest = apiModule.default.completeCurrentStreamRequestId;
     const origUseStreaming = state.useStreaming;
     state.useStreaming = false;  // force non-streaming path
-    apiModule.default.invokeForAgent = async () => ({
-        response: 'plain reply',
-        session_id: 'json-sess-7',
-    });
+    let invokeArgs;
+    const completedRequests = [];
+    apiModule.default.invokeForAgent = async (...args) => {
+        invokeArgs = args;
+        return {
+            response: 'plain reply',
+            session_id: 'json-sess-7',
+        };
+    };
+    apiModule.default.completeCurrentStreamRequestId = (...args) => {
+        completedRequests.push(args);
+        return true;
+    };
 
     messageInput.value = 'hi';
     await sendMessage();
 
     state.useStreaming = origUseStreaming;
     apiModule.default.invokeForAgent = origInvokeForAgent;
+    apiModule.default.completeCurrentStreamRequestId = origCompleteRequest;
 
     assert.equal(pane.sessionId, 'json-sess-7',
         'non-streaming path must adopt pane.sessionId from response.session_id');
+    assert.equal(typeof invokeArgs[5], 'string');
+    assert.ok(invokeArgs[5].length > 0,
+        'non-streaming chat must carry an exact Stop request id');
+    assert.deepEqual(completedRequests, [['nonstream-A', invokeArgs[5]]],
+        'the owning UI turn must release the exact Stop address with busy state');
+});
+
+test('a superseded non-streaming response cannot paint into the replacement turn', async () => {
+    const pane = getOrCreateChatPane('nonstream-stale');
+    apiModule.default.setHostAgent('nonstream-stale');
+    mountChatPane('nonstream-stale');
+
+    const origInvokeForAgent = apiModule.default.invokeForAgent;
+    const origUseStreaming = state.useStreaming;
+    state.useStreaming = false;
+    let release;
+    apiModule.default.invokeForAgent = () => new Promise((resolve) => {
+        release = resolve;
+    });
+
+    messageInput.value = 'old turn';
+    const pending = sendMessage();
+    await Promise.resolve();
+    await Promise.resolve();
+    pane.activeTurnId += 1;
+    release({ response: 'must not paint' });
+    await pending;
+
+    state.useStreaming = origUseStreaming;
+    apiModule.default.invokeForAgent = origInvokeForAgent;
+    state.waitingAgents.delete('nonstream-stale');
+
+    assert.equal(
+        pane.element.children.filter(
+            (child) => child.className?.includes('agent-message'),
+        ).length,
+        0,
+        'only the current turn owner may render a non-streaming response',
+    );
 });

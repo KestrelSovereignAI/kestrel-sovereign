@@ -54,6 +54,8 @@ from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
 
+from kestrel_sovereign._async_ownership import await_owned_task
+
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
 from kestrel_sdk.llm import (
@@ -1943,6 +1945,7 @@ class CodexAdapter(LLMAdapter):
         allowed_tools: frozenset,
         executed_log: Optional[List[Dict[str, Any]]] = None,
         tool_aliases: Optional[Dict[str, str]] = None,
+        active_handlers: Optional[set[asyncio.Task[Any]]] = None,
     ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
         """Wrap ``executor`` into an app-server ``item/tool/call``
         handler scoped to this turn's thread.
@@ -1973,7 +1976,7 @@ class CodexAdapter(LLMAdapter):
         trails align with codex-side ids.
         """
 
-        async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
+        async def _handle(params: Dict[str, Any]) -> Dict[str, Any]:
             if params.get("threadId") != thread_id:
                 return {
                     "contentItems": [{
@@ -2095,6 +2098,16 @@ class CodexAdapter(LLMAdapter):
                     else None
                 ),
             )
+
+        async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
+            task = asyncio.current_task()
+            if active_handlers is not None and task is not None:
+                active_handlers.add(task)
+            try:
+                return await _handle(params)
+            finally:
+                if active_handlers is not None and task is not None:
+                    active_handlers.discard(task)
 
         return handler
 
@@ -2795,6 +2808,10 @@ class CodexAdapter(LLMAdapter):
         # chat-history breadcrumbs generically (any adapter that runs
         # tools inline uses this same channel).
         executed_log: List[Dict[str, Any]] = []
+        # App-server dispatches item/tool/call on reader-owned tasks that are
+        # independent of this turn task. Track the whole handler lifetime so a
+        # cooperative Stop cannot resolve while a side effect is still live.
+        active_inline_tool_handlers: set[asyncio.Task[Any]] = set()
         unregisters: List[Callable[[], None]] = []
         if tool_executor is not None and dyn:
             # Only register an item/tool/call handler when tools were
@@ -2814,7 +2831,7 @@ class CodexAdapter(LLMAdapter):
                 "item/tool/call",
                 self._make_tool_call_handler(
                     tool_executor, thread_id, allowed_tools, executed_log,
-                    tool_aliases,
+                    tool_aliases, active_inline_tool_handlers,
                 ),
                 thread_id=thread_id,
             ))
@@ -3227,12 +3244,40 @@ class CodexAdapter(LLMAdapter):
             app.close_turn_sink(thread_id)
             for path in temp_image_paths:
                 path.unlink(missing_ok=True)
+            # Close admission before joining. A handler selected by the reader
+            # before this point registers itself in ``active_inline_tool_handlers``
+            # synchronously, before its first await, so it cannot slip between
+            # unregistration and the snapshot below.
             for _unreg in unregisters:
                 try:
                     _unreg()
                 except Exception:  # noqa: BLE001 - cleanup is best-effort
                     pass
-            lock.release()
+            pending_cleanup_cancellation = None
+            try:
+                if active_inline_tool_handlers:
+                    async def settle_inline_tools() -> None:
+                        while active_inline_tool_handlers:
+                            await asyncio.gather(
+                                *tuple(active_inline_tool_handlers),
+                                return_exceptions=True,
+                            )
+
+                    owner = asyncio.create_task(
+                        settle_inline_tools(),
+                        name="codex-inline-tool-stop-boundary",
+                    )
+                    outcome = await await_owned_task(owner)
+                    pending_cleanup_cancellation = outcome.cancellation
+                    if outcome.error is not None:
+                        logger.warning(
+                            "codex inline-tool settlement failed: %s",
+                            outcome.error,
+                        )
+            finally:
+                lock.release()
+            if pending_cleanup_cancellation is not None:
+                raise pending_cleanup_cancellation
 
     async def _run_turn_with_retry(
         self,
