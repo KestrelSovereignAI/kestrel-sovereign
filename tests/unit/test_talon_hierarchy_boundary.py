@@ -12,7 +12,10 @@ def test_talon_run_orchestration_is_explicitly_outside_both_agent_axes() -> None
         "Repository-run orchestration is not agent hierarchy.",
         "`kestrel-talon` coordinates issue-processing runs",
         "no agent DID, `CausationFrame`, verified parent-signed spawn",
+        "gives an agent a governed control surface",
         "does not turn Talon runs into agents",
+        "bridge Talon",
+        "process relationships onto either agent relationship axis",
         "outside agent causation and authority",
     }
     for phrase in required:
