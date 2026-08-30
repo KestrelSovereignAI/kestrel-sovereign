@@ -66,6 +66,51 @@ test('adapter feed → rows render with the default console-row renderer', async
     handle.destroy();
 });
 
+test('per-card Stop preserves its routed target and renders every typed outcome distinctly', async () => {
+    const calls = [];
+    const outcomes = ['refused', 'unreachable', 'already_complete', 'stopped'];
+    const { el, handle } = mountInto({
+        adapter: fakeAdapter([{
+            name: 'EmmaRoute',
+            displayName: 'Renamed Emma',
+            id: 'did:agent:emma',
+            status: 'online',
+        }]),
+        isThinking: () => true,
+        onStop: async (target) => {
+            calls.push(target);
+            return {
+                outcomes: [{
+                    resolved_target: 'did:agent:emma',
+                    disposition: outcomes.shift(),
+                }],
+            };
+        },
+    });
+    await tick();
+
+    const button = el.querySelector('.agent-stop-btn');
+    const status = el.querySelector('.agent-stop-outcome');
+    const expected = [
+        ['refused', 'Stop refused'],
+        ['unreachable', 'Stop unreachable'],
+        ['already_complete', 'Already complete'],
+        ['stopped', 'Stopped'],
+    ];
+    for (const [disposition, label] of expected) {
+        button.click();
+        await tick();
+        assert.equal(status.dataset.disposition, disposition);
+        assert.equal(status.textContent, label);
+    }
+    assert.deepEqual(
+        calls,
+        ['EmmaRoute', 'EmmaRoute', 'EmmaRoute', 'EmmaRoute'],
+        'display renames and retries never drift from the captured routing key',
+    );
+    handle.destroy();
+});
+
 test('renderCard override replaces the body and receives ctx (actionsAnchor + escapeHtml)', async () => {
     let seenCtx = null;
     const { el, handle } = mountInto({
@@ -230,6 +275,11 @@ test('source-contract: identity.js drives mountAgentListPane, no hand-rolled age
     // wraps the shared list surface.
     assert.match(src, /import \{ mountAgentListPane, createDefaultAgentAdapter \} from '\.\/agent_list\.js'/);
     assert.match(src, /mountAgentListPane\(container, \{/, 'loadAgents mounts the pane component');
+    assert.match(
+        src,
+        /onStop: \(name\) => stopAgentDetailed\(name\)/,
+        'the production card preserves typed Stop outcomes instead of the boolean chat wrapper',
+    );
     // The bespoke per-agent innerHTML loop is gone (the tell-tale inline markup).
     assert.ok(!src.includes('class="agent-status-dot'), 'no hand-rolled status-dot markup');
     assert.ok(!/for \(const agent of agents\)/.test(src), 'no hand-rolled agent loop');
