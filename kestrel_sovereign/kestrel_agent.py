@@ -6807,6 +6807,18 @@ Expected Duration: {expected_duration}
             await storage_preclose()
         if storage is not None and hasattr(storage, "close"):
             await storage.close()
+        await self._close_standalone_hold_context()
+
+    async def _close_standalone_hold_context(self) -> None:
+        """Close the standalone Hold backend after every retained user exits."""
+
+        standalone_hold_context = self.__dict__.get("_standalone_hold_context")
+        if standalone_hold_context is None:
+            return
+        from kestrel_sovereign.hold import close_bound_host_context
+
+        await close_bound_host_context(standalone_hold_context)
+        self._standalone_hold_context = None
 
     async def _ensure_durable_shutdown_continuation(self, dispatcher) -> asyncio.Task:
         """Return the single agent-owned dispatcher-to-storage continuation."""
@@ -7457,12 +7469,9 @@ Expected Duration: {expected_duration}
         # ``main.get_agent_by_did`` transfers its standalone Hold context to
         # the agent.  Close that separately-owned backend only after the
         # durable agent tail has finished, including cancellation paths.
-        standalone_hold_context = self.__dict__.get("_standalone_hold_context")
-        if standalone_hold_context is not None:
-            from kestrel_sovereign.hold import close_bound_host_context
-
+        if self._durable_shutdown_continuation is None:
             try:
-                await close_bound_host_context(standalone_hold_context)
+                await self._close_standalone_hold_context()
             except asyncio.CancelledError:
                 shutdown_cancelled = True
                 tail_degraded = True
@@ -7473,8 +7482,6 @@ Expected Duration: {expected_duration}
                     error,
                     exc_info=True,
                 )
-            else:
-                self._standalone_hold_context = None
 
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer

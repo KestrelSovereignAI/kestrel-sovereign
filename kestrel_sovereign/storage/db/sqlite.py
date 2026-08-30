@@ -683,14 +683,15 @@ class SQLiteBackend(DatabaseBackend):
         # close itself, so spawning a rollback task would orphan it after the
         # final state reset below.
         try:
-            try:
-                await self._begin_snapshot_close()
-            except asyncio.CancelledError as exc:
-                # Shutdown owns every snapshot worker it opened. Preserve
-                # caller cancellation, but deliver it only after readers have
-                # relinquished their registered connections.
-                pending_cancellation = exc
-                await self._begin_snapshot_close()
+            while True:
+                try:
+                    await self._begin_snapshot_close()
+                    break
+                except asyncio.CancelledError as exc:
+                    # Shutdown owns every snapshot worker it opened. Preserve
+                    # repeated caller cancellation, but deliver it only after
+                    # readers have relinquished their registered connections.
+                    pending_cancellation = pending_cancellation or exc
             drain = self._cancelled_write_drain
             # Cancelling the Python rollback task does not stop a SQLite VM
             # already executing in aiosqlite's worker.  Interrupt the actual

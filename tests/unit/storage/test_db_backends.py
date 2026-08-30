@@ -216,6 +216,90 @@ class TestSQLiteBackend:
 
         assert events[-1] == "close-completed"
         assert backend.is_connected is False
+
+    @pytest.mark.asyncio
+    async def test_repeated_close_cancellation_still_drains_snapshot_open(
+        self, backend, monkeypatch
+    ):
+        """Repeated cancellation cannot orphan the primary SQLite worker."""
+
+        original_connect = sqlite_backend_module.aiosqlite.connect
+        opening = asyncio.Event()
+        release_open = asyncio.Event()
+
+        async def paused_connect(*args, **kwargs):
+            opening.set()
+            await release_open.wait()
+            return await original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            sqlite_backend_module.aiosqlite, "connect", paused_connect
+        )
+        snapshot = asyncio.create_task(backend.fetch_all_snapshot("SELECT 1"))
+        close = None
+        try:
+            await opening.wait()
+            close = asyncio.create_task(backend.close())
+            await asyncio.sleep(0)
+
+            close.cancel()
+            await asyncio.sleep(0)
+            close.cancel()
+            await asyncio.sleep(0)
+            assert close.done() is False
+
+            release_open.set()
+            with pytest.raises(asyncio.CancelledError):
+                await close
+            await asyncio.gather(snapshot, return_exceptions=True)
+            assert backend.is_connected is False
+        finally:
+            release_open.set()
+            for task in (snapshot, close):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (snapshot, close) if task is not None),
+                return_exceptions=True,
+            )
+            if backend.is_connected:
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_repeated_snapshot_fence_cancellation_reaches_primary_close(
+        self, monkeypatch
+    ):
+        """Every cancellation is retained while primary-close ownership survives."""
+
+        backend = SQLiteBackend(":memory:")
+        connection = object()
+        backend._connection = connection
+        begin_snapshot_close = AsyncMock(
+            side_effect=[
+                asyncio.CancelledError(),
+                asyncio.CancelledError(),
+                None,
+            ]
+        )
+        close_connection = AsyncMock()
+        monkeypatch.setattr(
+            backend,
+            "_begin_snapshot_close",
+            begin_snapshot_close,
+        )
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "_close_aiosqlite_connection",
+            close_connection,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await backend.close()
+
+        assert begin_snapshot_close.await_count == 3
+        close_connection.assert_awaited_once()
+        assert close_connection.await_args.args[0] is connection
+        assert backend._connection is None
     
     @pytest.mark.asyncio
     async def test_fetch_val(self, backend):

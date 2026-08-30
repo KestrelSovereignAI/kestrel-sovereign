@@ -1,62 +1,45 @@
-"""Standalone training launcher Hold lifecycle coverage."""
+"""Standalone training retains Hold authority through deferred shutdown."""
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 
 @pytest.mark.asyncio
-async def test_training_cycle_binds_hold_before_initialize_and_closes_it(
-    tmp_path, monkeypatch
-):
+async def test_training_joins_deferred_shutdown_before_closing_hold(monkeypatch):
     from scripts import training_cycle
     from kestrel_sovereign import hold
-    from kestrel_sovereign import kestrel_agent
-    from kestrel_sovereign.llm import service as llm_service_module
 
-    events = []
-    hold_store = object()
-    hold_context = SimpleNamespace(hold_store=hold_store)
-    reflection = SimpleNamespace(
-        reflect=AsyncMock(return_value={"actions": []})
-    )
+    events: list[str] = []
+    context = object()
 
-    class FakeAgent:
-        def __init__(self, **_kwargs):
-            self.features = {"ReflectionFeature": reflection}
-
-        async def initialize(self):
-            assert self._hold_store is hold_store
-            events.append("initialize")
-
+    class Agent:
         async def shutdown(self):
-            events.append("shutdown")
+            events.append("shutdown-returned")
 
-    async def bind(agent, **_kwargs):
-        events.append("bind")
-        agent._hold_store = hold_store
-        return hold_context
+        async def wait_for_shutdown_completion(self):
+            events.append("deferred-shutdown-joined")
 
-    async def close(context):
-        assert context is hold_context
-        events.append("close")
+    agent = Agent()
 
-    database = tmp_path / "training.db"
-    database.touch()
+    async def run_cycle(**kwargs):
+        kwargs["lifecycle"].update(agent=agent, hold_context=context)
+        return "complete"
+
+    async def close_context(received):
+        assert received is context
+        events.append("hold-closed")
+
+    monkeypatch.setattr(training_cycle, "_run_training_cycle", run_cycle)
     monkeypatch.setattr(
-        training_cycle,
-        "get_agent_did",
-        AsyncMock(return_value="did:agent:training"),
-    )
-    monkeypatch.setattr(kestrel_agent, "KestrelAgent", FakeAgent)
-    monkeypatch.setattr(llm_service_module, "LLMService", lambda: object())
-    monkeypatch.setattr(hold, "build_bound_host_context", bind)
-    monkeypatch.setattr(hold, "close_bound_host_context", close)
-
-    await training_cycle.run_training_cycle(
-        str(database), max_iterations=1, wait_between=0
+        hold,
+        "close_bound_host_context",
+        AsyncMock(side_effect=close_context),
     )
 
-    assert events == ["bind", "initialize", "shutdown", "close"]
-
+    assert await training_cycle.run_training_cycle("unused.db") == "complete"
+    assert events == [
+        "shutdown-returned",
+        "deferred-shutdown-joined",
+        "hold-closed",
+    ]

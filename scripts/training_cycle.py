@@ -377,6 +377,11 @@ async def run_training_cycle(
         try:
             if agent is not None:
                 await agent.shutdown()
+                from kestrel_sovereign.kestrel_agent import (
+                    await_agent_shutdown_completion,
+                )
+
+                await await_agent_shutdown_completion(agent)
         finally:
             if context is not None:
                 from kestrel_sovereign.hold import close_bound_host_context

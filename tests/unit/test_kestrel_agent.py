@@ -1988,6 +1988,13 @@ class TestLifecycle:
         release_entered = asyncio.Event()
         allow_release = asyncio.Event()
         storage_close_attempts: list[str] = []
+        hold_context = object()
+        agent._standalone_hold_context = hold_context
+        close_hold_context = AsyncMock()
+        close_hold_patch = patch(
+            "kestrel_sovereign.hold.close_bound_host_context",
+            close_hold_context,
+        )
 
         async def block_release(*args, **kwargs):
             release_entered.set()
@@ -2007,6 +2014,7 @@ class TestLifecycle:
         agent.storage = _Storage()
 
         try:
+            close_hold_patch.start()
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(agent.shutdown(), timeout=0.05)
             await asyncio.wait_for(release_entered.wait(), timeout=1.0)
@@ -2015,6 +2023,7 @@ class TestLifecycle:
             # cleanup remains live. Storage must stay untouched until the
             # agent-owned continuation sees owner release complete.
             assert storage_close_attempts == []
+            close_hold_context.assert_not_awaited()
             assert dispatcher._durable_shutdown_completion is not None
             assert not dispatcher._durable_shutdown_completion.done()
             assert agent._durable_shutdown_continuation is not None
@@ -2022,8 +2031,11 @@ class TestLifecycle:
             allow_release.set()
             await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=1.0)
             assert storage_close_attempts == ["closed"]
+            close_hold_context.assert_awaited_once_with(hold_context)
+            assert agent._standalone_hold_context is None
             assert dispatcher._durable_shutdown_completion.done()
         finally:
+            close_hold_patch.stop()
             allow_release.set()
             dispatcher._durable_store.release_initial_reservations = original_release
             if agent._durable_shutdown_continuation is not None:
