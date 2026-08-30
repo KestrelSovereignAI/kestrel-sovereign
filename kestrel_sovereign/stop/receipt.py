@@ -106,7 +106,23 @@ def _optional_identifier_digest(kind: str, value: str | None) -> str | None:
     return None if value is None else _identifier_digest(kind, value)
 
 
-def _stored_outcome_identity(value: str, request: StopRequest) -> str:
+def _stored_outcome_identity(
+    value: str,
+    request: StopRequest,
+    *,
+    resolved_target: bool = False,
+) -> str:
+    # A public turn address can resolve to a private request-generation key.
+    # That process-local route is necessary only while delivering Stop; the
+    # durable receipt witnesses the caller's public address and must not retain
+    # the remapped identifier. Canonicalizing it to the known target also lets
+    # replay reconstruct useful evidence without a reversible lookup table.
+    if (
+        resolved_target
+        and request.target_is_turn_id
+        and request.target is not None
+    ):
+        value = request.target
     if request.target is not None and value == request.target:
         return _identifier_digest("target", value)
     return value
@@ -389,7 +405,9 @@ class StopReceiptStore:
                             receipt_id,
                             ordinal,
                             _stored_outcome_identity(
-                                outcome.resolved_target, request
+                                outcome.resolved_target,
+                                request,
+                                resolved_target=True,
                             ),
                             _stored_outcome_identity(outcome.agent_id, request),
                             outcome.disposition.value,

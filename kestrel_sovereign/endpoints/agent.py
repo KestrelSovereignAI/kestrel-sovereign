@@ -18,7 +18,11 @@ from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,
     SSE_PING_INTERVAL_SECONDS,
 )
-from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.rate_limit import (
+    STOP_ADMISSION_RATE_LIMIT,
+    durable_stop_rate_limit_key,
+    limiter,
+)
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
@@ -980,7 +984,11 @@ async def stream_agent_response(request: Request):
 
 
 @router.post("/stop")
-async def stop_agent_request(request: Request):
+@limiter.limit(
+    STOP_ADMISSION_RATE_LIMIT,
+    key_func=durable_stop_rate_limit_key,
+)
+async def stop_agent_request(request: Request, response: Response):
     """
     Stop the current agent request/streaming.
     Used by the stop button in the UI.

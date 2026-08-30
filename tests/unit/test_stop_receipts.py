@@ -243,6 +243,46 @@ async def test_opaque_stop_identities_are_blinded_in_claims_and_receipts(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_public_turn_receipt_never_persists_remapped_request_identity(
+    tmp_path,
+):
+    """A public turn alias must not disclose its private routing key at rest."""
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-remapped-id.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        public_turn_id = "public turn: patient@example.test"
+        private_request_id = "private request: diagnosis-123"
+        request = replace(
+            _request(correlation_id="public-turn-stop"),
+            target=public_turn_id,
+            turn_id=public_turn_id,
+            target_is_turn_id=True,
+        )
+        outcomes = (
+            replace(
+                _outcomes(request)[0],
+                resolved_target=private_request_id,
+            ),
+        )
+
+        receipt = await store.persist(request, outcomes)
+        durable = await db.fetchone(
+            "SELECT resolved_target FROM stop_receipt_outcomes "
+            "WHERE receipt_id = ?",
+            (receipt.receipt_id,),
+        )
+
+        assert private_request_id not in json.dumps(durable)
+        assert receipt.outcomes[0].resolved_target == public_turn_id
+        assert await store.load(request) == receipt
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_receipt_survives_sqlite_connection_restart(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -1101,3 +1141,86 @@ def test_live_endpoint_replays_client_stop_correlation_without_recancelling():
     assert first.json()["stop_outcomes"] == retry.json()["stop_outcomes"]
     assert first.json()["stop_outcomes"][0]["receipt_id"]
     agent.cancel_current_request.assert_called_once_with(request_id="turn-7")
+
+
+def test_live_endpoint_bounds_durable_admissions_per_authenticated_caller():
+    from fastapi import FastAPI, Request
+    from fastapi.testclient import TestClient
+    from slowapi import _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+
+    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.rate_limit import limiter
+
+    class _StatelessReceiptStore:
+        async def load(self, _request):
+            return None
+
+        async def persist(self, request, outcomes):
+            receipt_id = f"receipt-{request.correlation_id}"
+            return StopReceipt(
+                receipt_id=receipt_id,
+                operation_id=request.correlation_id,
+                request_fingerprint="test-fingerprint",
+                scope=request.scope.value,
+                actor_id=request.actor_id,
+                requested_target=request.target,
+                target_agent_id=request.target_agent_id,
+                reason=request.reason,
+                cascade=request.cascade,
+                occurred_at="2026-08-30T00:00:00+00:00",
+                turn_id=request.turn_id,
+                span_id=request.span_id,
+                trace_id=request.trace_id,
+                outcomes=tuple(
+                    replace(outcome, receipt_id=receipt_id)
+                    for outcome in outcomes
+                ),
+            )
+
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.add_exception_handler(
+        RateLimitExceeded,
+        _rate_limit_exceeded_handler,
+    )
+    app.include_router(router)
+    app.state.stop_receipt_store = _StatelessReceiptStore()
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = set()
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    @app.middleware("http")
+    async def bind_caller(request: Request, call_next):
+        request.state.caller = CallerContext.authenticated(
+            request.headers["X-Test-Caller"]
+        )
+        return await call_next(request)
+
+    client = TestClient(app)
+    first_caller = f"caller-a-{uuid4()}"
+    statuses = [
+        client.post(
+            "/api/agent/stop",
+            headers={"X-Test-Caller": first_caller},
+            json={
+                "request_id": f"missing-request-{index}",
+                "correlation_id": f"bounded-stop-{index}-{uuid4()}",
+            },
+        ).status_code
+        for index in range(61)
+    ]
+
+    assert statuses[:60] == [200] * 60
+    assert statuses[60] == 429
+    assert client.post(
+        "/api/agent/stop",
+        headers={"X-Test-Caller": f"caller-b-{uuid4()}"},
+        json={
+            "request_id": "other-callers-request",
+            "correlation_id": f"other-callers-stop-{uuid4()}",
+        },
+    ).status_code == 200
