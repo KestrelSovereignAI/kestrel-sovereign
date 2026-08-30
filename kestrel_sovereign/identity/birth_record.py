@@ -651,6 +651,11 @@ async def replicate_birth_record(
     )
 
     result = ReplicationResult()
+    graph_write_ids = {agent_did, *(node.node_id for node in targets)}
+    for edge in edges:
+        graph_write_ids.add(edge.source_id)
+        if edge.target_id == agent_did or edge.target_id in copyable:
+            graph_write_ids.add(edge.target_id)
 
     async with runtime_db.transaction():
         # Repair what is ABSENT; never overwrite what is present. The anchor is
@@ -738,6 +743,14 @@ async def replicate_birth_record(
                 content, original_name or content_hash, metadata=metadata,
             )
             result.files += 1
+
+        # The transaction composes node creation with ordinary and explicitly
+        # trusted edges. Reserve its complete graph write set once, before its
+        # first graph read/write, so nested add_node/add_edge calls cannot take
+        # overlapping PostgreSQL locks in semantic order and deadlock another
+        # replication. Trusted foreign targets are intentionally omitted: only
+        # their locally-owned source is mutable in this transaction.
+        await runtime_graph.lock_nodes_for_update(graph_write_ids)
 
         for node in targets:
             if await runtime_graph.get_node(node.node_id) is not None:
