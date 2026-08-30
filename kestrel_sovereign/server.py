@@ -1612,7 +1612,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
         app.state.stop_receipt_db = db
         app.state.stop_receipt_store = store
         app.state.distributed_invocation_registry = distributed_stop
-    except Exception as error:  # noqa: BLE001 - host remains diagnosable
+    except Exception as error:  # noqa: BLE001 - preserve typed startup cause
         if distributed_stop is not None:
             try:
                 await distributed_stop.close()
@@ -1625,11 +1625,14 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
                 pass
         app.state.stop_receipt_store_error = type(error).__name__
         logger.error(
-            "Durable Stop receipt storage is unavailable (%s); "
-            "cooperative Stop will fail closed",
+            "Durable Stop receipt storage failed to initialize (%s); "
+            "the host will not become ready",
             type(error).__name__,
             exc_info=True,
         )
+        raise RuntimeError(
+            "Durable Stop evidence failed to initialize"
+        ) from error
 
 
 async def _shutdown_stop_receipts(app: FastAPI) -> None:
