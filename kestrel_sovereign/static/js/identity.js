@@ -882,6 +882,7 @@ function openNewAgentFlow() {
     openCreateAgentDialog({
         modal: Modal,
         api: API,
+        canCreate: () => API.canManageHostAgentLifecycle('create'),
         toast: Toast,
         spawnAvailable,
         onSpawn: () => goToSpawnTab(),

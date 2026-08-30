@@ -166,6 +166,35 @@ test('stale native delete button disappears instead of opening after revocation'
     assert.equal(deleted, false);
 });
 
+test('stale native delete panel keeps its rendered routing target', async () => {
+    resetPanel();
+    Modal.hide();
+    let selected = 'emma';
+    let deleted = null;
+    const container = document.getElementById('identity-danger-zone');
+    const api = {
+        getHostAgent: () => selected,
+        canManageHostAgentLifecycle: () => true,
+        deleteAgent: async (name) => { deleted = name; },
+    };
+    assert.equal(renderIdentityDangerZone({
+        container,
+        identity: { name: 'Emma' },
+        api,
+        Modal,
+        Toast: {},
+    }), true);
+
+    selected = 'ava';
+    container.querySelector('#danger-zone-delete-btn').click();
+    const input = document.getElementById('danger-zone-confirm-input');
+    input.value = 'Emma';
+    document.querySelector('#modal-overlay .modal-btn-danger').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(deleted, 'emma');
+});
+
 test('loadIdentity() renders a host-injected delete handler even without native capability (#2208)', async () => {
     resetPanel();
     API.getIdentity = async () => ({ name: 'Companion', did: 'did:pkh:companion' });
