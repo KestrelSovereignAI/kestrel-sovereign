@@ -88,6 +88,39 @@ async def test_constitution_agent_and_edge_all_commit(external_db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_inception_prelocks_complete_identity_graph_write_set(
+    external_db, tmp_path, monkeypatch
+):
+    """Inception joins replication's canonical multi-node lock order."""
+    events = []
+    original_lock = AsyncGraphStore.lock_nodes_for_update
+    original_add_node = AsyncGraphStore.add_node
+
+    async def observe_lock(self, node_ids):
+        materialized = tuple(node_ids)
+        events.append(("lock", materialized))
+        return await original_lock(self, materialized)
+
+    async def observe_add_node(self, node):
+        events.append(("add_node", node.node_id))
+        return await original_add_node(self, node)
+
+    monkeypatch.setattr(
+        AsyncGraphStore, "lock_nodes_for_update", observe_lock
+    )
+    monkeypatch.setattr(AsyncGraphStore, "add_node", observe_add_node)
+
+    creds = await _incept(external_db, tmp_path)
+    constitution = await external_db.fetchone(
+        "SELECT node_id FROM graph_nodes WHERE label = 'KESTREL_CONSTITUTION'"
+    )
+
+    assert events[0][0] == "lock"
+    assert set(events[0][1]) == {creds.agent_did, constitution[0]}
+    assert [event[0] for event in events].count("lock") == 1
+
+
+@pytest.mark.asyncio
 async def test_failure_between_agent_node_and_edge_leaves_no_agent_node(
     external_db, tmp_path, monkeypatch
 ):
