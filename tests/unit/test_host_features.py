@@ -318,9 +318,13 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
     class FakeManager:
         init_failures = []
+        persistence_hook = None
 
         def set_agent_registration_hook(self, _hook) -> None:
             return None
+
+        def set_created_agent_persistence_hook(self, hook) -> None:
+            self.persistence_hook = hook
 
         async def load_from_config(self, config):
             assert config is fake_config
@@ -402,6 +406,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert fake_config.host.port == 9090
         assert test_app.state.host_features == [feature]
         assert test_app.state.host_context is ctx
+        assert callable(fake_manager.persistence_hook)
         assert events == [
             "agents-load",
             "context-build",
