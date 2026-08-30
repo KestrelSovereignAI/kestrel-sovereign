@@ -2213,6 +2213,78 @@ class TestStopEndpoint:
         )
 
     @pytest.mark.asyncio
+    async def test_invoke_cancelled_during_session_resolution_cleans_lifecycle(self):
+        """Every post-registration await is inside the invoke cleanup boundary."""
+
+        from fastapi import FastAPI, Response
+        from starlette.requests import Request
+
+        from kestrel_sovereign.endpoints.agent import invoke_agent
+
+        resolution_started = asyncio.Event()
+
+        class Agent:
+            def __init__(self):
+                self.storage = MagicMock()
+                self.storage.resolve_session_id = self.resolve_session_id
+                self.register_active_request = MagicMock()
+                self._cleanup_cancelled_request = MagicMock()
+
+            async def resolve_session_id(self, _session_id):
+                resolution_started.set()
+                await asyncio.Event().wait()
+
+            @staticmethod
+            def is_request_cancelled(_request_id):
+                return False
+
+        agent = Agent()
+        app = FastAPI()
+        app.state.agent = agent
+        body = json.dumps(
+            {"input": "work", "request_id": "cancelled-session-resolution"}
+        ).encode()
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agent/invoke",
+                "raw_path": b"/api/agent/invoke",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("test", 1),
+                "server": ("test", 80),
+                "app": app,
+            },
+            receive,
+        )
+        endpoint = getattr(invoke_agent, "__wrapped__", invoke_agent)
+        operation = asyncio.create_task(endpoint(request, Response()))
+        await asyncio.wait_for(resolution_started.wait(), timeout=1.0)
+
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+        agent.register_active_request.assert_called_once_with(
+            "cancelled-session-resolution"
+        )
+        agent._cleanup_cancelled_request.assert_called_once_with(
+            "cancelled-session-resolution"
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):
         """#2674 P2: a strict (fail-closed) response audit stopped before dispatch
         WITHHOLDS every chunk and returns cleanly, so ``process_input_streaming``
