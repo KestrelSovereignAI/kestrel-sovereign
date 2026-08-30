@@ -18,6 +18,7 @@ from kestrel_sovereign.identity.graph_namespace import (
     namespace_imported_record,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
 
 
 @pytest_asyncio.fixture
@@ -74,6 +75,51 @@ async def test_unsigned_allowed_with_allow_unsigned_true(graph_db):
     )
 
     assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_replace_cleanup_locks_graph_before_removing_edge_ownership(
+    graph_db, monkeypatch
+):
+    """Importer cleanup follows the graph-before-ownership lock order."""
+
+    import kestrel_sovereign.identity.importer as importer_module
+
+    agent_id = "did:test:replace-lock-order"
+    skill_id = "skill:replace-lock-order"
+    graph = AsyncGraphStore(graph_db, agent_id=agent_id)
+    await graph.add_node(
+        GraphNode(agent_id, "agent", "Agent", {"agent_id": agent_id})
+    )
+    await graph.add_node(
+        GraphNode(skill_id, "skill", "Skill", {"agent_id": agent_id})
+    )
+    await graph.add_edge(agent_id, skill_id, "has_skill")
+
+    events = []
+    real_lock = importer_module.lock_graph_nodes_for_update
+    real_execute = graph_db.execute
+
+    async def observe_lock(db, node_ids, *, agent_id=""):
+        events.append(("graph-lock", tuple(node_ids)))
+        return await real_lock(db, events[-1][1], agent_id=agent_id)
+
+    async def observe_execute(query, params=()):
+        if query.startswith("DELETE FROM graph_edge_owners"):
+            events.append(("edge-owner-delete", params))
+        return await real_execute(query, params)
+
+    monkeypatch.setattr(
+        importer_module, "lock_graph_nodes_for_update", observe_lock
+    )
+    monkeypatch.setattr(graph_db, "execute", observe_execute)
+
+    await IdentityImporter(graph_db)._clear_graph_component(
+        agent_id, "skill", label="has_skill"
+    )
+
+    assert events[0] == ("graph-lock", (agent_id, skill_id))
+    assert events[1][0] == "edge-owner-delete"
 
 
 @pytest.mark.asyncio
