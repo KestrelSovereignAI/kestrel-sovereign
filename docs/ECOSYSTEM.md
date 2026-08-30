@@ -124,8 +124,10 @@ platform.
 
 Repository-run orchestration is not agent hierarchy. In particular,
 `kestrel-talon` coordinates issue-processing runs and operating-system
-processes; it has no agent DID, `CausationFrame`, verified parent-signed spawn
-mandate, or `spawned_by` authority. The independently installed
+processes. It has no agent DID or `CausationFrame`.
+It has no `spawned_by` lineage graph edge.
+It has no verified parent-signed spawn mandate or durable lineage receipt.
+The independently installed
 `kestrel-feature-talon` package gives an agent a governed control surface for
 that separate runner. It does not turn Talon runs into agents or bridge Talon
 process relationships onto either agent relationship axis.
