@@ -352,6 +352,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
         db=Closeable("db-close"),
         config={},
         session_factory=Closeable("session-close"),
+        hold_store=object(),
     )
 
     async def build_context(*, config):
@@ -404,8 +405,8 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert test_app.state.host_features == [feature]
         assert test_app.state.host_context is ctx
         assert events == [
-            "agents-load",
             "context-build",
+            "agents-load",
             "host-start",
             "host-router-mount",
             "host-ui-mount",
@@ -421,7 +422,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
 
 @pytest.mark.asyncio
-async def test_server_closes_unpublished_host_context_after_mount_failure(
+async def test_server_retains_control_context_after_optional_mount_failure(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -466,6 +467,7 @@ async def test_server_closes_unpublished_host_context_after_mount_failure(
         db=host_db,
         hold_db=hold_db,
         session_factory=session_factory,
+        hold_store=object(),
     )
 
     async def build_context(*, config):
@@ -504,14 +506,41 @@ async def test_server_closes_unpublished_host_context_after_mount_failure(
 
     test_app = FastAPI()
     async with server.lifespan(test_app):
-        assert test_app.state.host_context is None
-        session_factory.close.assert_awaited_once()
-        hold_db.close.assert_awaited_once()
-        host_db.close.assert_awaited_once()
+        assert test_app.state.host_context is candidate
+        session_factory.close.assert_not_awaited()
+        hold_db.close.assert_not_awaited()
+        host_db.close.assert_not_awaited()
 
     session_factory.close.assert_awaited_once()
     hold_db.close.assert_awaited_once()
     host_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_host_control_context_fails_closed_before_publication_without_hold(
+    monkeypatch,
+):
+    from kestrel_sovereign import server
+    from kestrel_sovereign.host_features import context as context_module
+
+    degraded = SovereignHostContext(
+        backend_error="Hold schema is corrupt",
+        hold_store=None,
+    )
+    close_resources = AsyncMock()
+    monkeypatch.setattr(hf, "build_host_context", AsyncMock(return_value=degraded))
+    monkeypatch.setattr(
+        context_module,
+        "close_host_context_resources",
+        close_resources,
+    )
+    test_app = FastAPI()
+
+    with pytest.raises(RuntimeError, match="before work admission"):
+        await server._build_host_control_context(test_app, None)
+
+    assert getattr(test_app.state, "host_context", None) is None
+    close_resources.assert_awaited_once_with(degraded)
 
 
 # ---------------------------------------------------------------------------

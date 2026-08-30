@@ -9,18 +9,37 @@ turn-start refusal is the separate enforcement seam tracked by #3162.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping, Optional
 from uuid import uuid4
 
+from kestrel_sovereign.private_storage import (
+    PrivateStorageError,
+    absolute_without_following_leaf,
+    open_private_file,
+    path_exists,
+)
 from kestrel_sovereign.storage.database_clock import database_now_sql
 
 
 HOST_HOLD_TARGET = "host"
 _SCHEMA_LOCK = "hold_state_v1"
 _WITNESS_BACKFILL = "hold_state_witness_ledgers_v1"
+_INITIALIZATION_WITNESS_PAYLOAD = b"kestrel-hold-state-initialized-v1\n"
+_HOLD_SCHEMA_TABLES = frozenset(
+    {
+        "hold_latches",
+        "hold_receipts",
+        "hold_receipt_witnesses",
+        "hold_receipt_content_witnesses",
+        "hold_operation_witnesses",
+        "hold_schema_migrations",
+    }
+)
 _LATCH_COLUMNS = (
     "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
 )
@@ -126,6 +145,13 @@ class HoldReceipt:
 class HoldMutation:
     receipt: HoldReceipt
     current: Optional[HoldState]
+
+
+def hold_initialization_witness_path(control_db_path: str | Path) -> Path:
+    """Return the external witness paired with one host control database."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    return Path(f"{path}.hold-initialized-v1")
 
 
 def _terminal_authority_ids(
@@ -362,24 +388,137 @@ def _receipt_content_digest(row: Any) -> str:
 class HoldStore:
     """Durable latch + append-only receipt store on an ``AsyncDatabase``."""
 
-    def __init__(self, db: Any):
+    def __init__(
+        self,
+        db: Any,
+        *,
+        initialization_witness_path: str | Path | None = None,
+    ):
         self._db = db
+        if initialization_witness_path is not None:
+            self._initialization_witness_path = absolute_without_following_leaf(
+                Path(initialization_witness_path)
+            )
+        elif getattr(db, "backend_type", "") == "sqlite":
+            backend = getattr(db, "backend", None)
+            db_path = getattr(backend, "db_path", None)
+            self._initialization_witness_path = (
+                None
+                if not db_path or db_path == ":memory:"
+                else hold_initialization_witness_path(db_path)
+            )
+        else:
+            self._initialization_witness_path = None
+
+    def _read_initialization_witness(self) -> bool:
+        """Return whether the external initialized marker is present and valid."""
+
+        path = self._initialization_witness_path
+        if path is None:
+            raise HoldStateError(
+                "durable Hold requires an external initialization witness path"
+            )
+        if not path_exists(path):
+            return False
+        try:
+            descriptor = open_private_file(
+                path,
+                os.O_RDONLY,
+                label="Hold initialization witness",
+            )
+            try:
+                payload = os.read(descriptor, len(_INITIALIZATION_WITNESS_PAYLOAD) + 1)
+            finally:
+                os.close(descriptor)
+        except PrivateStorageError as exc:
+            raise HoldCorruptStateError(
+                f"Hold initialization witness cannot be trusted: {exc}"
+            ) from exc
+        if payload != _INITIALIZATION_WITNESS_PAYLOAD:
+            raise HoldCorruptStateError(
+                "Hold initialization witness has invalid durable evidence"
+            )
+        return True
+
+    def _write_initialization_witness(self) -> None:
+        """Create the external initialized marker after the schema commits."""
+
+        path = self._initialization_witness_path
+        assert path is not None
+        try:
+            descriptor = open_private_file(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                label="Hold initialization witness",
+            )
+        except PrivateStorageError as exc:
+            # A concurrent schema initializer may have published the same
+            # marker after our transaction committed. Trust it only after an
+            # exact read through the private-file custody checks.
+            if path_exists(path) and self._read_initialization_witness():
+                return
+            raise HoldStateError(
+                f"could not persist Hold initialization witness: {exc}"
+            ) from exc
+        try:
+            view = memoryview(_INITIALIZATION_WITNESS_PAYLOAD)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write while persisting Hold witness")
+                view = view[written:]
+            os.fsync(descriptor)
+        except OSError as exc:
+            raise HoldStateError(
+                f"could not persist Hold initialization witness: {exc}"
+            ) from exc
+        finally:
+            os.close(descriptor)
+
+    async def _existing_schema_tables(self) -> set[str]:
+        placeholders = ", ".join("?" for _ in _HOLD_SCHEMA_TABLES)
+        names = tuple(sorted(_HOLD_SCHEMA_TABLES))
+        if getattr(self._db, "backend_type", "") == "postgres":
+            rows = await self._db.fetchall(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = current_schema() "
+                f"AND table_name IN ({placeholders})",
+                names,
+            )
+        else:
+            rows = await self._db.fetchall(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                f"AND name IN ({placeholders})",
+                names,
+            )
+        return {str(row[0]) for row in rows}
 
     async def ensure_schema(self) -> None:
         """Create the Hold schema while preserving typed integrity failures."""
 
         try:
-            await self._ensure_schema_transaction()
+            initialized = self._read_initialization_witness()
+            await self._ensure_schema_transaction(initialized=initialized)
+            if not initialized:
+                self._write_initialization_witness()
         except BaseException as exc:
             domain_error = _domain_error_from_chain(exc)
             if domain_error is not None:
                 raise domain_error from exc
             raise
 
-    async def _ensure_schema_transaction(self) -> None:
+    async def _ensure_schema_transaction(self, *, initialized: bool) -> None:
         """Create both Hold tables as one serialized schema unit."""
 
         async with self._db.migration_lock(_SCHEMA_LOCK):
+            if initialized:
+                existing = await self._existing_schema_tables()
+                missing = sorted(_HOLD_SCHEMA_TABLES - existing)
+                if missing:
+                    raise HoldCorruptStateError(
+                        "initialized Hold schema is missing required tables: "
+                        + ", ".join(missing)
+                    )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS hold_latches ("
                 "scope TEXT NOT NULL, "
@@ -578,6 +717,42 @@ class HoldStore:
             raise HoldCorruptStateError(
                 "Hold operation witness refers to a missing receipt"
             )
+
+    async def read_boot_state(self) -> tuple[HoldState, ...]:
+        """Validate and return every active latch before work producers start."""
+
+        rows = await self._db.fetchall(
+            "SELECT scope, target_id FROM hold_latches "
+            "UNION SELECT scope, target_id FROM hold_receipts"
+        )
+        targets: set[tuple[HoldScope, str]] = {(HoldScope.HOST, HOST_HOLD_TARGET)}
+        for row in rows:
+            if len(row) != 2:
+                raise HoldCorruptStateError(
+                    "Hold boot-state target row has an unexpected shape"
+                )
+            try:
+                scope = HoldScope(str(row[0]))
+            except (TypeError, ValueError) as exc:
+                raise HoldCorruptStateError(
+                    "Hold boot-state target has an invalid scope"
+                ) from exc
+            target_id = str(row[1])
+            if not target_id.strip():
+                raise HoldCorruptStateError(
+                    "Hold boot-state target is missing its identity"
+                )
+            targets.add((scope, target_id))
+
+        active: list[HoldState] = []
+        for scope, target_id in sorted(
+            targets,
+            key=lambda item: (item[0].value, item[1]),
+        ):
+            state = await self.get_hold(scope, target_id)
+            if state is not None:
+                active.append(state)
+        return tuple(active)
 
     async def _lock_operation_and_target(
         self, operation_id: str, scope: HoldScope, target_id: str

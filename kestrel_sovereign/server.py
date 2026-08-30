@@ -2186,6 +2186,23 @@ async def _lifespan_teardown_owner(app: FastAPI):
                 raise teardown_failure
 
 
+async def _build_host_control_context(app: FastAPI, host_config) -> object:
+    """Publish validated Hold state before any agent or scheduler can run."""
+
+    from kestrel_sovereign import host_features as _hf
+    from kestrel_sovereign.host_features.context import close_host_context_resources
+
+    ctx = await _hf.build_host_context(config=_host_config_mapping(host_config))
+    if getattr(ctx, "hold_store", None) is None:
+        reason = str(getattr(ctx, "backend_error", "") or "unknown backend failure")
+        await close_host_context_resources(ctx)
+        raise RuntimeError(
+            "Host Hold control state is unavailable before work admission: " + reason
+        )
+    app.state.host_context = ctx
+    return ctx
+
+
 @asynccontextmanager
 async def _lifespan_startup(app: FastAPI):
     """Initialize server resources; outer lifespan ownership handles teardown."""
@@ -2198,6 +2215,9 @@ async def _lifespan_startup(app: FastAPI):
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
+    app.state.host_features = []
+    app.state.host_context = None
+    app.state.host_ui_manifest = []
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -2325,6 +2345,7 @@ async def _lifespan_startup(app: FastAPI):
                 auto_discover_fallback=True,
             )
             _apply_platform_host_port(config, os.environ)
+            await _build_host_control_context(app, config)
             manager = AgentManager(base_data_dir=Path.cwd())
             app.state.agent_manager = manager
             # Persistence context for runtime agent creation (#2358): when the
@@ -2445,6 +2466,7 @@ async def _lifespan_startup(app: FastAPI):
         app.state.agent_manager = None
         llm_service = None
         try:
+            await _build_host_control_context(app, None)
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
 
@@ -2544,10 +2566,10 @@ async def _lifespan_startup(app: FastAPI):
     # --- Host-scoped features (issue #2293, consolidated onto server:app in
     # #2382) ---
     # Discover + mount host features at the host root (no agent prefix, no
-    # get_agent dependency), aggregate their host-scoped UI, build the fleet
-    # HostContext, and run their host lifecycle. Mounted UNCONDITIONALLY after
-    # agent setup — host features are host-scoped and independent of single- vs
-    # multi-agent mode. Reversible imperative failures remain isolated; an
+    # get_agent dependency), aggregate their host-scoped UI, and run their host
+    # lifecycle on the fleet HostContext already validated before agent work
+    # admission. Contributions mount after agent setup, but Hold custody does
+    # not wait for them. Reversible imperative failures remain isolated; an
     # invalid complete contribution set fails startup before mounted state is
     # changed.
     from kestrel_sovereign import host_features as _hf
@@ -2557,14 +2579,8 @@ async def _lifespan_startup(app: FastAPI):
     )
     from kestrel_sovereign.paths import project_dir as _host_project_dir
 
-    if not hasattr(app.state, "host_features"):
-        app.state.host_features = []
-    if not hasattr(app.state, "host_context"):
-        app.state.host_context = None
-    if not hasattr(app.state, "host_ui_manifest"):
-        app.state.host_ui_manifest = []
     replacing_host_state = bool(app.state.host_features)
-    candidate_ctx = None
+    candidate_ctx = app.state.host_context
     candidate_started = []
     try:
         # Resolve the host manifest from the resolved PROJECT_DIR (KESTREL_HOME /
@@ -2575,9 +2591,11 @@ async def _lifespan_startup(app: FastAPI):
         features = _hf.instantiate_host_features(
             manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
         )
-        host_cfg = getattr(app.state, "multi_agent_config", None)
-        ctx = await _hf.build_host_context(config=_host_config_mapping(host_cfg))
-        candidate_ctx = ctx
+        ctx = candidate_ctx
+        if ctx is None:
+            raise RuntimeError(
+                "Host features cannot start without validated Hold control state"
+            )
         if features:
             # Validate and activate the complete prospective contribution set
             # before changing any already-valid mounted host surface.
@@ -2622,10 +2640,10 @@ async def _lifespan_startup(app: FastAPI):
             if candidate_ctx is not None and candidate_started:
                 await _hf.stop_host_features(candidate_started, candidate_ctx)
         finally:
-            # Until publication, outer lifespan teardown cannot see this
-            # context. Close its distinct Hold pool and host resources here on
-            # validation, activation, mounting, cancellation, or process
-            # control failure. A published context remains teardown-owned.
+            # A future replacement context might still fail before publication;
+            # close only that unpublished candidate. The boot Hold context is
+            # published before agents start and remains teardown-owned even when
+            # an optional contribution fails to mount.
             if (
                 candidate_ctx is not None
                 and getattr(app.state, "host_context", None) is not candidate_ctx

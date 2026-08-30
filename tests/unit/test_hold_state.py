@@ -122,8 +122,10 @@ async def test_state_and_receipts_survive_database_restart(tmp_path):
     await second.ensure_schema()
     try:
         restored = await second.get_effective("did:agent:durable")
+        boot_state = await second.read_boot_state()
         receipt = await second.get_receipt("durable-operation")
         assert restored.agent == mutation.current
+        assert boot_state == (mutation.current,)
         assert receipt == mutation.receipt
         assert datetime.fromisoformat(receipt.occurred_at).tzinfo is not None
     finally:
@@ -513,6 +515,7 @@ async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_p
             "did:agent:boot-held"
         )
         assert effective.agent == held.current
+        assert reopened.hold_boot_state == (held.current,)
     finally:
         if reopened.session_factory is not None:
             await reopened.session_factory.close()
@@ -559,6 +562,10 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     async def _ensure_schema(self):
         events.append(("hold-schema", self._db))
 
+    async def _read_boot_state(self):
+        events.append(("hold-boot-read", self._db))
+        return ()
+
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
@@ -567,6 +574,7 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         session_module, "make_session_factory", lambda db: _InnerFactory()
     )
     monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
+    monkeypatch.setattr(HoldStore, "read_boot_state", _read_boot_state)
 
     host_path = tmp_path / "existing-host-features.db"
     ctx = await build_host_context(db_path=str(host_path))
@@ -574,10 +582,11 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     assert ctx.db is fake_host_db
     assert ctx.hold_db is fake_hold_db
     assert ctx.hold_store._db is fake_hold_db
-    assert events[:3] == [
+    assert events[:4] == [
         ("sqlite", str(host_path)),
         ("postgres", "postgresql://durable/host"),
         ("hold-schema", fake_hold_db),
+        ("hold-boot-read", fake_hold_db),
     ]
 
 
@@ -1657,6 +1666,43 @@ async def test_upgraded_foreign_host_row_fails_closed_for_reads_and_mutation(
 
 
 @pytest.mark.asyncio
+async def test_external_initialization_witness_rejects_total_hold_schema_loss(
+    tmp_path,
+):
+    """The tables cannot erase the only evidence that Hold was initialized."""
+
+    path = tmp_path / "replaceable-hold.db"
+    first_db = await AsyncDatabase.sqlite(str(path))
+    first = HoldStore(first_db)
+    await first.ensure_schema()
+    await first.set_hold(
+        scope="agent",
+        target_id="did:agent:held-before-loss",
+        actor_id="did:sovereign:operator",
+        reason="must survive replacement",
+        operation_id="hold-before-total-schema-loss",
+    )
+    await first_db.close()
+
+    second_db = await AsyncDatabase.sqlite(str(path))
+    try:
+        for table in (
+            "hold_operation_witnesses",
+            "hold_receipt_content_witnesses",
+            "hold_receipt_witnesses",
+            "hold_receipts",
+            "hold_latches",
+            "hold_schema_migrations",
+        ):
+            await second_db.execute(f"DROP TABLE {table}")
+
+        with pytest.raises(HoldCorruptStateError, match="schema.*missing"):
+            await HoldStore(second_db).ensure_schema()
+    finally:
+        await second_db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["get", "set", "release"])
 async def test_imported_duplicate_latch_fails_closed_on_single_target_paths(
     tmp_path,
@@ -1921,9 +1967,12 @@ async def test_two_sqlite_workers_serialize_replacement_and_stale_release(tmp_pa
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_hold_store_sql_is_backend_portable(db_backend):
+async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
     db = AsyncDatabase(db_backend)
-    store = HoldStore(db)
+    store = HoldStore(
+        db,
+        initialization_witness_path=tmp_path / "backend-parity.hold-initialized-v1",
+    )
     await store.ensure_schema()
     suffix = uuid4().hex
     target = f"did:agent:{suffix}"
@@ -1949,6 +1998,17 @@ async def test_hold_store_sql_is_backend_portable(db_backend):
         assert await store.get_hold("agent", target) is None
     finally:
         await db.execute(
+            "DELETE FROM hold_operation_witnesses "
+            "WHERE operation_id IN (?, ?)",
+            (hold_operation, release_operation),
+        )
+        await db.execute(
+            "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id IN ("
+            "SELECT receipt_id FROM hold_receipts "
+            "WHERE operation_id IN (?, ?))",
+            (hold_operation, release_operation),
+        )
+        await db.execute(
             "DELETE FROM hold_receipts WHERE operation_id IN (?, ?)",
             (hold_operation, release_operation),
         )
@@ -1956,3 +2016,12 @@ async def test_hold_store_sql_is_backend_portable(db_backend):
             "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
             (HoldScope.AGENT.value, target),
         )
+        await db.execute(
+            "DELETE FROM hold_receipt_witnesses "
+            "WHERE scope = ? AND target_id = ?",
+            (HoldScope.AGENT.value, target),
+        )
+
+    # A reusable PostgreSQL test database must not retain append-only witness
+    # rows after the generated receipt history is removed.
+    await store.ensure_schema()

@@ -207,7 +207,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch,
     tmp_path,
 ) -> None:
-    """The full multi-agent startup order is preflight → load → host runner."""
+    """Hold state exists before preflight, agent load, and the host runner."""
     from kestrel_sovereign import host_features as hf
     from kestrel_sovereign.a2a import did_registry
     from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
@@ -223,6 +223,9 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     hold_store = object()
     host_context = SimpleNamespace(
         hold_store=hold_store,
+        hold_db=None,
+        db=None,
+        session_factory=None,
         feature_contribution_runtime=None,
     )
 
@@ -281,6 +284,6 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     async with server._lifespan_startup(app):
         pass
 
-    assert events == ["preflight", "load", "host-start", "context-build"]
+    assert events == ["context-build", "preflight", "load", "host-start"]
     assert app.state.host_context is host_context
     assert app.state.host_context.hold_store is hold_store
