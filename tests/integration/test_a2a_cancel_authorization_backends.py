@@ -16,7 +16,6 @@ from kestrel_sovereign.a2a.types import (
     TextPart,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
-from kestrel_sovereign.storage.db.interface import QueryError
 
 
 POSTGRES_URL = (
@@ -213,15 +212,15 @@ async def test_sqlite_legacy_insert_or_replace_cannot_overwrite_cancellation(tmp
             reason="committed before stale writer",
         )
 
-        with pytest.raises(QueryError, match="canceled A2A task is terminal"):
-            await backend.execute(
-                """
-                INSERT OR REPLACE INTO a2a_tasks
-                    (id, task_type, status, metadata)
-                VALUES (?, 'generic', 'completed', '{}')
-                """,
-                (task_id,),
-            )
+        rows = await backend.execute(
+            """
+            INSERT OR REPLACE INTO a2a_tasks
+                (id, task_type, status, metadata)
+            VALUES (?, 'generic', 'completed', '{}')
+            """,
+            (task_id,),
+        )
+        assert rows == 0
 
         canceled = await store.get(task_id)
         assert canceled is not None

@@ -310,6 +310,7 @@ class TaskStore(UnifiedStoreBase):
         await self._backend.execute_script("""
             DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
             DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v2;
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_replace_v3;
             DROP TRIGGER IF EXISTS a2a_tasks_terminal_replace_v3;
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_update_v3
             BEFORE UPDATE ON a2a_tasks
@@ -334,19 +335,6 @@ class TaskStore(UnifiedStoreBase):
                 -- REPLACE while allowing modern INSERT ... ON CONFLICT DO
                 -- NOTHING to report its normal zero-row duplicate outcome.
                 SELECT RAISE(IGNORE);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_replace_v3
-            BEFORE INSERT ON a2a_tasks
-            FOR EACH ROW
-            WHEN EXISTS (
-                SELECT 1
-                FROM a2a_tasks AS existing
-                WHERE existing.id = NEW.id
-                  AND existing.status = 'canceled'
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
             END;
 
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
