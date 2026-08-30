@@ -215,6 +215,7 @@ class TestTaskStore:
             "task-002",
             new_status,
             recipient_agent_id="did:test:recipient",
+            expected_state=TaskState.SUBMITTED,
         )
 
         retrieved = await store.get("task-002")
