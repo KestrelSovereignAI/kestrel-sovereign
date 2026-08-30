@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.auth import CallerContext
+from kestrel_sovereign.rate_limit import (
+    STOP_ADMISSION_RATE_LIMIT,
+    durable_stop_rate_limit_key,
+    limiter,
+)
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     MAX_STOP_CORRELATION_ID_BYTES,
@@ -97,8 +102,13 @@ def _host_agents(request: Request) -> tuple[tuple[str, object], ...]:
 
 
 @router.post("/stop")
+@limiter.limit(
+    STOP_ADMISSION_RATE_LIMIT,
+    key_func=durable_stop_rate_limit_key,
+)
 async def stop_host(
     request: Request,
+    response: Response,
     body: HostStopBody | None = None,
 ):
     """Cooperatively stop every currently loaded agent; never stop a process."""

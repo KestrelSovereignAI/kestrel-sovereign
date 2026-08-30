@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response,
 from fastapi.responses import StreamingResponse
 from typing import Any, Dict, List, Optional
 import asyncio
-import hashlib
 import inspect
 import json
 import logging
@@ -20,8 +19,11 @@ from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,
     SSE_PING_INTERVAL_SECONDS,
 )
-from kestrel_sovereign.rate_limit import limiter
-from slowapi.util import get_remote_address
+from kestrel_sovereign.rate_limit import (
+    STOP_ADMISSION_RATE_LIMIT,
+    durable_stop_rate_limit_key,
+    limiter,
+)
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
@@ -86,39 +88,6 @@ LEGACY_CONTEXT_MODEL = "legacy/unknown"
 _KITE_EVIDENCE_CONTRACT = "kite-http-evidence-v1"
 _KITE_EVIDENCE_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
 _KITE_EVIDENCE_VALUE_RE = re.compile(r"^kite-evidence-[A-Za-z0-9_-]{20,128}$")
-
-
-def _stop_rate_limit_key(request: Request) -> str:
-    """Return one opaque admission bucket per authenticated principal.
-
-    Stop remains a generously provisioned emergency rail, but a caller cannot
-    multiply its append-only receipt writes by changing source addresses or
-    routing across hosted agents. The transport address is only a fail-closed
-    fallback for tests or deployments that bypass the authentication
-    middleware.
-    """
-
-    caller = getattr(request.state, "caller", None)
-    credential_fingerprint = getattr(
-        caller,
-        "credential_fingerprint",
-        None,
-    )
-    identity = getattr(caller, "identity", None)
-    role = getattr(getattr(caller, "role", None), "value", None)
-    auth_method = getattr(
-        getattr(caller, "auth_method", None),
-        "value",
-        None,
-    )
-    if isinstance(credential_fingerprint, str) and credential_fingerprint:
-        principal = f"credential:{credential_fingerprint}"
-    elif isinstance(identity, str) and identity:
-        principal = f"identity:{role}:{auth_method}:{identity}"
-    else:
-        principal = f"transport:{get_remote_address(request)}"
-    digest = hashlib.sha256(principal.encode("utf-8")).hexdigest()
-    return f"stop-principal:{digest}"
 
 
 class _CloseAwareStreamBody:
@@ -1104,7 +1073,10 @@ async def stream_agent_response(request: Request):
 
 
 @router.post("/stop")
-@limiter.limit("120/minute", key_func=_stop_rate_limit_key)
+@limiter.limit(
+    STOP_ADMISSION_RATE_LIMIT,
+    key_func=durable_stop_rate_limit_key,
+)
 async def stop_agent_request(request: Request):
     """
     Stop the current agent request/streaming.
