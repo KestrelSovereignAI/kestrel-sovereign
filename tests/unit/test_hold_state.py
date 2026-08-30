@@ -205,6 +205,46 @@ def test_malformed_or_naive_latch_timestamp_fails_closed(timestamp) -> None:
         )
 
 
+@pytest.mark.parametrize("field_index", [0, 1, 5, 6, 7, 8])
+def test_whitespace_only_required_receipt_evidence_fails_closed(field_index) -> None:
+    row = [
+        "receipt-id",
+        "legacy-operation",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "legacy import",
+        "did:sovereign:operator",
+        "2026-08-28T00:00:00+00:00",
+        "",
+        "",
+        "receipt-id",
+    ]
+    row[field_index] = "   "
+
+    with pytest.raises(HoldCorruptStateError, match="invariant"):
+        _receipt_from_row(tuple(row))
+
+
+@pytest.mark.parametrize("field_index", [1, 3, 4, 5])
+def test_whitespace_only_required_latch_evidence_fails_closed(field_index) -> None:
+    row = [
+        "agent",
+        "did:agent:kite",
+        1,
+        "receipt-id",
+        "legacy import",
+        "did:sovereign:operator",
+        "2026-08-28T00:00:00+00:00",
+        1,
+    ]
+    row[field_index] = "   "
+
+    with pytest.raises(HoldCorruptStateError, match="missing|required"):
+        _latch_from_row(tuple(row))
+
+
 @pytest.mark.parametrize("field_index", [1, 7, 8])
 @pytest.mark.parametrize("bad_value", [None, 42])
 def test_existing_invalid_required_receipt_evidence_fails_closed_on_read(
@@ -347,7 +387,10 @@ async def test_inactive_revision_rejects_deleted_closed_receipt_chain(hold_db):
         ("agent", "did:agent:closed-history"),
     )
 
-    with pytest.raises(HoldCorruptStateError, match="revision"):
+    # Either the target-local revision witness or the global append-only
+    # operation tombstone may detect the deletion first. Both are the same
+    # required fail-closed outcome.
+    with pytest.raises(HoldCorruptStateError):
         await store.get_effective("did:agent:closed-history")
 
 
@@ -1112,6 +1155,41 @@ async def test_deleted_receipt_operation_id_cannot_be_rebound_to_other_target(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_orphaned_operation_witness_fails_closed_on_read_and_restart(hold_db):
+    """A surviving append-only tombstone proves deleted Hold history existed."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:orphaned-operation",
+        actor_id="did:sovereign:operator",
+        reason="evidence must survive",
+        operation_id="orphaned-operation-witness",
+    )
+    await db.execute(
+        "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
+        (held.receipt.scope.value, held.receipt.target_id),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipt_witnesses WHERE scope = ? AND target_id = ?",
+        (held.receipt.scope.value, held.receipt.target_id),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.get_hold("agent", held.receipt.target_id)
+    with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.ensure_schema()
 
 
 @pytest.mark.asyncio
