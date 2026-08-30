@@ -59,6 +59,26 @@ from .protocol import (
 logger = logging.getLogger(__name__)
 
 
+async def _register_bridge_request(agent, request_id: str) -> None:
+    """Publish an early bridge lifecycle before any bridge-side writes."""
+
+    if hasattr(agent, "register_active_request"):
+        agent.register_active_request(request_id)
+        await_admission = getattr(
+            type(agent), "await_durable_request_admission", None
+        )
+        try:
+            if callable(await_admission):
+                await await_admission(agent, request_id)
+        except BaseException:
+            cleanup = getattr(agent, "_cleanup_cancelled_request", None)
+            if callable(cleanup):
+                cleanup(request_id)
+            raise
+    else:
+        agent._current_request_id = request_id
+
+
 class _PreStartCleanupIterator:
     """Release endpoint state when an SSE body is closed before first pull."""
 
@@ -153,10 +173,7 @@ def get_router() -> APIRouter:
             source_locator="POST:/api/bridge/invoke",
         )
         await prime_durable_stop_fence(request, agent, request_id)
-        if hasattr(agent, "register_active_request"):
-            agent.register_active_request(request_id)
-        else:
-            agent._current_request_id = request_id
+        await _register_bridge_request(agent, request_id)
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         try:
             if (
@@ -282,10 +299,7 @@ def get_router() -> APIRouter:
             source_locator="POST:/api/bridge/stream",
         )
         await prime_durable_stop_fence(request, agent, request_id)
-        if hasattr(agent, "register_active_request"):
-            agent.register_active_request(request_id)
-        else:
-            agent._current_request_id = request_id
+        await _register_bridge_request(agent, request_id)
         request_lifecycle_registered = True
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         setup_cancelled = (

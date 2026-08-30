@@ -800,6 +800,39 @@ class TestGetRouter:
         assert "/api/bridge/health" in route_paths
         assert "/api/bridge/session" in route_paths
 
+    @pytest.mark.asyncio
+    async def test_early_bridge_registration_awaits_distributed_admission(self):
+        from kestrel_sovereign.features.bridge.router import (
+            _register_bridge_request,
+        )
+
+        events = []
+
+        class _Agent:
+            def register_active_request(self, request_id):
+                events.append(("registered", request_id))
+
+            async def await_durable_request_admission(self, request_id):
+                events.append(("admitted", request_id))
+                return True
+
+        await _register_bridge_request(_Agent(), "bridge-turn")
+
+        assert events == [
+            ("registered", "bridge-turn"),
+            ("admitted", "bridge-turn"),
+        ]
+
+    def test_both_bridge_turn_doors_publish_before_side_effects(self):
+        from pathlib import Path
+
+        import kestrel_sovereign.features.bridge.router as bridge_router
+
+        source = Path(bridge_router.__file__).read_text(encoding="utf-8")
+        assert source.count(
+            "await _register_bridge_request(agent, request_id)"
+        ) == 2
+
 
 # ============================================================================
 # Graceful Degradation Tests
