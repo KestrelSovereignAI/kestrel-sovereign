@@ -431,7 +431,27 @@ def _mgr_with_mock_child(child):
 def _use_runtime_projection_as_authority_test_double(manager) -> None:
     """Keep budget-only fixtures focused on refund/custody behavior."""
 
-    manager.get_authoritative_children = AsyncMock(side_effect=manager.get_children)
+    known_child_ids = {}
+
+    async def runtime_relations():
+        relations = {}
+        for parent_did, child_names in manager._parent_children.items():
+            for child_name in child_names:
+                child = manager.get_agent(child_name)
+                child_did = getattr(child, "agent_id", None)
+                if not isinstance(child_did, str) or not child_did:
+                    mandate = manager.get_mandate(child_name)
+                    child_did = getattr(mandate, "child_did", None)
+                if not isinstance(child_did, str) or not child_did:
+                    child_did = known_child_ids.get(child_name)
+                if isinstance(child_did, str) and child_did:
+                    known_child_ids[child_name] = child_did
+                    relations[child_did] = (parent_did, child_name)
+        return relations
+
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        side_effect=runtime_relations
+    )
 
 
 def _register_spawn_parent(manager, parent) -> None:

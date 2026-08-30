@@ -7884,6 +7884,27 @@ class AgentManager:
         candidate_by_canonical = {
             self._canonical_agent_name(name): name for name in candidates
         }
+        # A partially committed spawn can own a delegated budget before its
+        # signed relationship projection is published.  That hold still has a
+        # concrete parent-wallet edge: a grandchild's parent wallet is the
+        # exact DelegatedWallet owned by its budgeted parent.  Include those
+        # edges in the same post-order walk so even unpublished descendants
+        # refund into their parent before that parent refunds to the root.
+        budget_owner_by_wallet = {
+            id(delegated_wallet): child_name
+            for child_name, (delegated_wallet, _parent_wallet) in (
+                self._child_budgets.items()
+            )
+        }
+        budget_children_by_parent: dict[str, list[str]] = {}
+        for child_name, (_delegated_wallet, parent_wallet) in (
+            self._child_budgets.items()
+        ):
+            parent_name = budget_owner_by_wallet.get(id(parent_wallet))
+            if parent_name is not None:
+                budget_children_by_parent.setdefault(parent_name, []).append(
+                    child_name
+                )
         visiting: set[str] = set()
         visited: set[str] = set()
         removal_order: list[str] = []
@@ -7905,6 +7926,12 @@ class AgentManager:
                     )
                     if candidate is not None:
                         visit_removal_candidate(candidate)
+            for child_name in budget_children_by_parent.get(name, ()):
+                candidate = candidate_by_canonical.get(
+                    self._canonical_agent_name(child_name)
+                )
+                if candidate is not None:
+                    visit_removal_candidate(candidate)
             visiting.discard(canonical_name)
             visited.add(canonical_name)
             removal_order.append(name)
