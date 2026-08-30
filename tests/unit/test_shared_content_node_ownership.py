@@ -558,7 +558,7 @@ class TestTheSwapDoorDeclinesSharedRows:
         )
         assert "source_path" not in (row[0] or "")
 
-    async def test_the_swap_path_reads_nothing_before_it_writes(
+    async def test_sqlite_swap_reads_nothing_before_it_writes(
         self, db, artifact_bytes
     ):
         """Pins the regression that ended the duplicated-rules design.
@@ -570,8 +570,13 @@ class TestTheSwapDoorDeclinesSharedRows:
         instead of returning PREDICATE_FAILED, for every node type in the
         system. White-box on purpose: the ordering is the guarantee, and no
         black-box assertion distinguishes "no read" from "a read that happened
-        to win".
+        to win". PostgreSQL deliberately takes its reservation shard and a
+        scoped row lock before the conditional UPDATE; its lock ordering is
+        covered by the real-backend CAS reservation test.
         """
+        if db.backend_type != "sqlite":
+            pytest.skip("This deferred-snapshot invariant is SQLite-specific")
+
         node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
         graph = _graph(db, AGENT_A)
         await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
