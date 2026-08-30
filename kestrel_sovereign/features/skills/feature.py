@@ -348,7 +348,7 @@ class SkillsFeature(Feature):
         storage = getattr(self.agent, "storage", None)
         graph_attempted = (
             storage is not None
-            and hasattr(storage, "delete_node")
+            and hasattr(storage, "compare_and_delete_node")
             and hasattr(storage, "get_node")
         )
         if graph_attempted:
@@ -357,11 +357,18 @@ class SkillsFeature(Feature):
                 # node if it actually exists AND is a skill node — never
                 # let a hallucinated/typo'd/malicious id blow away a memory
                 # concept, the agent identity node, or a channel_link node
-                # (delete_node cascades to every touching edge). See F257.
+                # (node deletion cascades to every touching edge). Pin both
+                # identity fields in the atomic delete so a concurrent writer
+                # cannot replace the observed skill before deletion. See F257.
                 node = await storage.get_node(skill_id)
                 if node is not None and getattr(node, "node_type", None) == SKILL_NODE_TYPE:
-                    await storage.delete_node(skill_id)
-                    removed_node = True
+                    result = await storage.compare_and_delete_node(
+                        skill_id,
+                        expected_node_type=SKILL_NODE_TYPE,
+                        expected_label=node.label,
+                    )
+                    removed_node = result == "deleted"
+                    graph_delete_failed = result == "predicate_failed"
             except Exception as e:
                 logger.warning("Could not remove skill node %s: %s", skill_id, e)
                 graph_delete_failed = True
@@ -379,11 +386,11 @@ class SkillsFeature(Feature):
         # 1. File unlink genuinely failed (file existed, OSError) AND
         #    graph delete succeeded — the file will resurrect on the
         #    next list/save.
-        # 2. File deletion succeeded AND a graph get_node/delete_node
-        #    call actually *raised* — the graph node may still surface
-        #    in associative recall. (We can't reliably tell "raised
-        #    because already absent" from "raised because backend down"
-        #    without backend-specific introspection, so this caveat is
+        # 2. File deletion succeeded AND a graph get_node/compare-and-delete
+        #    call raised or its atomic identity predicate failed — the graph
+        #    node may still surface in associative recall. (We can't reliably
+        #    tell "raised because already absent" from "raised because backend
+        #    down" without backend-specific introspection, so this caveat is
         #    conservatively spoken.)
         #
         # Cases that are NOT asymmetric and stay OK (codex round 2 of
@@ -410,7 +417,7 @@ class SkillsFeature(Feature):
                 data=data,
             )
         if removed_file and graph_delete_failed:
-            # Case 2: file went, graph get_node/delete_node raised.
+            # Case 2: file went, graph deletion raised or lost an identity race.
             # Conservative PARTIAL — see comment above.
             caveat = (
                 f"file removed but graph node {skill_id} could not be "

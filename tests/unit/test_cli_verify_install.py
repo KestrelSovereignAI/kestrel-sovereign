@@ -15,8 +15,8 @@ Covers:
 
 Subprocess invocations are mocked via ``monkeypatch.setattr`` against
 the module-private helpers so unit tests stay hermetic — the real
-venv/pip/uvicorn matrix is exercised end-to-end via the integration
-tier (and CI's real-pip sandbox).
+venv/installer/uvicorn matrix is exercised end-to-end via the integration
+tier.
 """
 
 from __future__ import annotations
@@ -246,6 +246,37 @@ def test_venv_exec_picks_per_platform(monkeypatch, tmp_path):
     assert mod._venv_exec(venv, "python") == venv / "Scripts" / "python.exe"
 
 
+def test_pip_install_targets_fresh_venv_python_with_uv(monkeypatch, tmp_path):
+    """Installer selection cannot regress to requiring a seeded pip binary."""
+
+    from kestrel_sovereign import cli_verify_install as mod
+
+    venv = tmp_path / ".venv"
+    python = mod._venv_exec(venv, "python")
+    python.parent.mkdir(parents=True)
+    python.touch()
+    captured = {}
+
+    def fake_run(cmd, *, env=None, **_kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = env
+        return 0
+
+    monkeypatch.setattr(mod, "_run_streaming", fake_run)
+
+    assert mod._pip_install(venv, "--no-deps", "local-package")
+    assert captured["cmd"] == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        str(python),
+        "--no-deps",
+        "local-package",
+    ]
+    assert captured["env"]["VIRTUAL_ENV"] == str(venv)
+
+
 # ---------------------------------------------------------------------------
 # Streaming subprocess — no capture_output
 # ---------------------------------------------------------------------------
@@ -295,7 +326,7 @@ def test_install_targets_use_pypi_packages_not_dead_local_paths(monkeypatch):
         ):
             fn(mod.Path(tmp))
 
-    # Walk every ``pip install`` argv and confirm the install target is
+    # Walk every ``uv pip install`` argv and confirm the install target is
     # a PyPI package name, not a local repo subpath. We can't just grep
     # the flattened command line — the Python ``import`` statements
     # legitimately contain ``kestrel_feature_wallet`` (the module name),
@@ -303,19 +334,15 @@ def test_install_targets_use_pypi_packages_not_dead_local_paths(monkeypatch):
     # invocation specifically and check the LAST positional (the target).
     pip_install_targets: list[str] = []
     for argv in captured:
-        # First arg is the pip exec path (ends with ``/pip`` or
-        # ``\\pip.exe``); next must be ``install``; rest are flags +
-        # the target.
-        if not argv:
+        # The target interpreter is explicit because ``uv venv`` does not seed
+        # a pip executable. The final positional is still the install target.
+        if len(argv) < 3:
             continue
-        first = argv[0]
-        if not (first.endswith("/pip") or first.endswith("\\pip.exe")):
-            continue
-        if "install" not in argv:
+        if argv[:3] != ["uv", "pip", "install"]:
             continue
         positionals = [
-            a for a in argv[1:]
-            if not a.startswith("-") and a != "install"
+            a for a in argv[3:]
+            if not a.startswith("-")
         ]
         if positionals:
             pip_install_targets.append(positionals[-1])
