@@ -3083,6 +3083,35 @@ async def test_failed_update_with_rotated_authority_never_stays_updating(
 
 
 @pytest.mark.asyncio
+async def test_failed_update_emits_each_lifecycle_transition_once(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    await feat.request_restart(
+        reason="failed update has one recovery event",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+
+    async def failed_update(_req, _profile):
+        return {
+            "ok": False,
+            "failed_step": "install",
+            "steps": [],
+            "resolved_ref": "",
+            "migration": {"ran": False},
+        }
+
+    feat._run_update = failed_update
+    await feat.restart_coordinator()
+
+    assert [
+        event["status"] for event in _restart_status_events(captured)
+    ] == ["pending", "updating", "pending"]
+
+
+@pytest.mark.asyncio
 async def test_run_update_records_steps_and_resolved_ref(tmp_path):
     feat, _ = await _make_feature(tmp_path)
     profile = get_update_profile("sovereign_local_uv_sync")
