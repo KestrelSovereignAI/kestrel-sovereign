@@ -514,7 +514,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `acknowledge_restart_escalation` | `!restart acknowledge-escalation` | `system` | `request_id` | 109 | `enabled` |
+| `acknowledge_restart_escalation` | `!restart acknowledge-escalation` | `system` | `request_id` | 125 | `enabled` |
 | `cancel_restart_request` | `!restart cancel` | `system` | `request_id`, `reason` | 144 | `enabled` |
 | `list_restart_requests` | `!restart list` | `data_access` | `status` | 119 | `enabled` |
 | `list_restart_status_events` | `!restart events` | `data_access` | `limit`, `since` | 103 | `enabled` |
@@ -1040,7 +1040,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!audit` | `response_audit` |  | Show audit configuration and status |
 | `!audit-off` | `response_audit` |  | Disable per-response audit |
 | `!audit-on` | `response_audit` | `[mode]` | Enable per-response audit. mode: 'warn' (annotate risky responses) or 'strict' (block risky responses). |
-| `!restart acknowledge-escalation` | `restart_coordinator` | `<request_id>` | Acknowledge the bounded host-wide escalation policy for one pending restart request filed by this agent and migrated from an older release. Requests filed by another agent cannot be acknowledged. This is required once for legacy rows before a continuous busy deferral may override fleet quiescence. Pass request_id from list_restart_requests. |
+| `!restart acknowledge-escalation` | `restart_coordinator` | `<request_id>` | Explicitly re-authorize and acknowledge the bounded host-wide escalation policy for one pending restart request filed by this agent and migrated from an older release. Requests filed by another agent cannot be acknowledged. Sovereign-key authority is required. This is required once for legacy rows before a continuous busy deferral may override fleet quiescence. Pass request_id from list_restart_requests. |
 | `!restart cancel` | `restart_coordinator` | `<request_id> [reason]` | Cancel this agent's still-pending restart request (status pending or approved). Another agent's request cannot be canceled. Rows already updating/executing/completed/rejected/canceled cannot be canceled. Pass request_id from data.request.id of request_restart (or data.requests[].id of list_restart_requests).<br><br>Returns: data={canceled: bool, request_id: str} (plus current_status when the cancel is refused). |
 | `!restart coordinator` | `restart_coordinator` |  | ACTION cron task — scan restart_requests, run safety checks, and execute pending requests by spawning a detached restart subprocess. No LLM cost. |
 | `!restart events` | `restart_coordinator` | `[limit] [since]` | List this agent's recent restart_status lifecycle events for chat-history reload and its pre-turn snapshot. Other agents' events are never visible. Newest first; uses the typed event records persisted alongside each SSE emit (#1562). |
@@ -1111,6 +1111,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 
