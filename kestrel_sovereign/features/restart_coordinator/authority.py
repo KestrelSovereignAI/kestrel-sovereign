@@ -56,6 +56,23 @@ def _sovereign_secret() -> bytes:
         ) from error
 
 
+def require_restart_request_authority() -> str:
+    """Return the current sovereign actor after validating durable key custody."""
+
+    caller = current_caller_context()
+    if caller is None or caller.is_sovereign is not True:
+        raise RestartAuthorityError(
+            "whole-host restart requires an authenticated sovereign-key caller"
+        )
+    actor = caller.identity
+    if not isinstance(actor, str) or not actor.strip():
+        raise RestartAuthorityError("sovereign caller has no durable actor identity")
+    # Validate the signing key before callers perform any update-path
+    # inspection. The exact request is sealed later, immediately before insert.
+    _sovereign_secret()
+    return actor.strip()
+
+
 def _request_claims(
     *,
     request_id: str,
@@ -135,18 +152,11 @@ def issue_restart_authority(
 ) -> tuple[str, str]:
     """Seal exact request bounds for the current sovereign caller."""
 
-    caller = current_caller_context()
-    if caller is None or caller.is_sovereign is not True:
-        raise RestartAuthorityError(
-            "whole-host restart requires an authenticated sovereign-key caller"
-        )
-    actor = caller.identity
-    if not isinstance(actor, str) or not actor.strip():
-        raise RestartAuthorityError("sovereign caller has no durable actor identity")
+    actor = require_restart_request_authority()
     document = {
         "version": AUTHORITY_VERSION,
         "kind": AUTHORITY_KIND,
-        "actor": actor.strip(),
+        "actor": actor,
         "issued_at": datetime.now(timezone.utc).isoformat(),
         "request": _request_claims(
             request_id=request_id,

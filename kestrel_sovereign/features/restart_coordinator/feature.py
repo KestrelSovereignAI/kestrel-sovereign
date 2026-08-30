@@ -40,7 +40,11 @@ from kestrel_sovereign.features.enum_coerce import normalize_choice as _normaliz
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.storage.database_clock import database_clock
 
-from .authority import RestartAuthorityError, verify_restart_authority
+from .authority import (
+    RestartAuthorityError,
+    require_restart_request_authority,
+    verify_restart_authority,
+)
 from .event_store import (
     ensure_restart_status_events_table,
     list_recent_events_for_history,
@@ -570,6 +574,17 @@ class RestartCoordinatorFeature(Feature):
                 data={"created": False},
             )
 
+        # Authority is checked before update-mode path discovery or checkout
+        # inspection. A caller who cannot request a whole-host mutation must
+        # not be able to use its validation errors as a filesystem oracle.
+        try:
+            require_restart_request_authority()
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error),
+                data={"created": False, "authority": "required"},
+            )
+
         # Validate and normalise the update-mode parameters up front so an
         # unsafe/unknown profile never reaches the durable table.
         update_repo_path = ""
@@ -761,11 +776,11 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="acknowledge_restart_escalation",
         description=(
-            "Acknowledge the bounded host-wide escalation policy for one "
-            "pending restart request filed by this agent and migrated from "
-            "an older release. Requests filed by another agent cannot be "
-            "acknowledged. This "
-            "is required once for legacy rows before a continuous busy "
+            "Explicitly re-authorize and acknowledge the bounded host-wide "
+            "escalation policy for one pending restart request filed by this "
+            "agent and migrated from an older release. Requests filed by "
+            "another agent cannot be acknowledged. Sovereign-key authority "
+            "is required. This is required once for legacy rows before a continuous busy "
             "deferral may override fleet quiescence. Pass request_id from "
             "list_restart_requests."
         ),
@@ -790,11 +805,23 @@ class RestartCoordinatorFeature(Feature):
                 "Restart request access requires this agent's durable identity",
                 data={"acknowledged": False, "request_id": normalized},
             )
-        if not await acknowledge_escalation(
-            self._db,
-            normalized,
-            requested_by_agent=requester,
-        ):
+        try:
+            require_restart_request_authority()
+            acknowledged = await acknowledge_escalation(
+                self._db,
+                normalized,
+                requested_by_agent=requester,
+            )
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error),
+                data={
+                    "acknowledged": False,
+                    "request_id": normalized,
+                    "authority": "required",
+                },
+            )
+        if not acknowledged:
             row = await get_request_for_agent(self._db, normalized, requester)
             if row is not None and row.status not in PENDING_STATES:
                 return ToolResult.failed(
@@ -953,8 +980,9 @@ class RestartCoordinatorFeature(Feature):
         for req in candidates:
             # Reject unsigned legacy, forged, tampered, or key-revoked rows
             # before policy/safety can defer them indefinitely. This is the
-            # explicit legacy migration policy: no authority backfill and no
-            # inference from historical approval state.
+            # explicit legacy migration policy: no automatic authority
+            # backfill and no inference from historical approval state. The
+            # sovereign acknowledgement tool is the only re-authorization door.
             if await self._reject_invalid_authority(
                 req,
                 expected_current_status=req.status,
