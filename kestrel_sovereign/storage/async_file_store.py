@@ -13,7 +13,7 @@ from .async_database import AsyncDatabase
 from .async_graph_store import (
     AsyncGraphStore,
     GraphNode,
-    record_graph_node_owner,
+    reserve_provisional_agent_owner,
 )
 from .encryption import get_fernet, encrypt_bytes, decrypt_bytes
 from kestrel_sovereign.kestrel_config.constants import MAX_FILE_SIZE
@@ -301,18 +301,16 @@ class AsyncFileStore:
             # rows. The graph id is tenant/type namespaced because identical
             # bytes do not imply shared avatar metadata (#2649).
             graph = AsyncGraphStore(self.db, agent_id=agent_id)
-            root = await self.db.fetchone(
-                "SELECT node_type FROM graph_nodes WHERE node_id = ?",
-                (agent_id,),
-            )
-            if root and root[0] != "agent":
-                raise ValueError(
-                    "Avatar owner id collides with a non-agent graph node"
-                )
             # Some bootstrap/test callers store an avatar before the physical
             # agent root is inserted. The DID is still the canonical self-owner,
             # so reserve that witness; later root creation uses the same owner.
-            await record_graph_node_owner(self.db, agent_id, agent_id)
+            # Lock both possibly-absent IDs first so source deletion and another
+            # bootstrap writer observe the same canonical serialization order.
+            await reserve_provisional_agent_owner(
+                self.db,
+                agent_id,
+                additional_graph_node_ids=[avatar_node_id],
+            )
             await graph.add_node(
                 GraphNode(
                     node_id=avatar_node_id,

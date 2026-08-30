@@ -24,7 +24,14 @@ from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore, _rows_affected
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
-from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
+from .async_graph_store import (
+    AsyncGraphStore,
+    Edge,
+    GraphNode,
+    NodeDeleteResult,
+    NodeSwapResult,
+    reserve_provisional_agent_owner,
+)
 from .async_assertion_store import (
     AsyncAssertionStore,
     _AssertionTenantCapability,
@@ -477,7 +484,7 @@ class AsyncStorage:
             checker()
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self, *, immediate: bool = False):
         """Run the enclosed storage operations as one atomic write unit.
 
         Delegates to the backend's transaction context manager: every write
@@ -487,10 +494,16 @@ class AsyncStorage:
         backends are re-entrant for the SAME asyncio task, so nested
         ``transaction()`` scopes (e.g. a helper opening its own around a
         caller's outer one) join the outer transaction.
+
+        ``immediate`` is forwarded to SQLite so a composed read-then-write unit
+        can acquire the writer slot before its first read. This is required for
+        nesting conditional graph mutations: SQLite cannot upgrade a deferred
+        snapshot after another connection has committed. Other backends ignore
+        the hint and use their normal row-locking primitives.
         """
         if not self._initialized:
             await self.initialize()
-        async with self.db.transaction():
+        async with self.db.transaction(immediate=immediate):
             yield
 
     # --- File Operations ---
@@ -1402,6 +1415,17 @@ class AsyncStorage:
             await self.initialize()
         await self.graph.add_node(node)
 
+    async def lock_nodes_for_update(self, node_ids) -> List[str]:
+        """Lock a complete graph write set in canonical order.
+
+        Call inside :meth:`transaction` before the first graph read/write in a
+        multi-node operation. The graph store owns backend-specific locking.
+        """
+
+        if not self._initialized:
+            await self.initialize()
+        return await self.graph.lock_nodes_for_update(node_ids)
+
     async def compare_and_swap_node(
         self,
         node_id: str,
@@ -1409,6 +1433,8 @@ class AsyncStorage:
         new_node: GraphNode,
         allowed_node_types: Optional[frozenset] = None,
         *,
+        expected_node_type: Optional[str] = None,
+        expected_label: Optional[str] = None,
         capability: Any = None,
     ) -> NodeSwapResult:
         """Atomically update a graph node's properties only if they still match.
@@ -1420,13 +1446,20 @@ class AsyncStorage:
         is written (``node_type`` / ``label`` are left as-is). ``allowed_node_types``
         (optional) constrains the effective node type the swap/create may touch
         — the privacy wrapper uses it to govern durable graph CAS in volatile
-        modes. Returns a :class:`NodeSwapResult` (``swapped`` /
-        ``predicate_failed`` / ``not_found`` / ``type_not_allowed``).
+        modes. ``expected_node_type`` and ``expected_label`` optionally add one
+        exact atomic identity predicate. Returns a :class:`NodeSwapResult`
+        (``swapped`` / ``predicate_failed`` / ``not_found`` /
+        ``type_not_allowed``).
         """
         if not self._initialized:
             await self.initialize()
         return await self.graph.compare_and_swap_node(
-            node_id, expected, new_node, allowed_node_types=allowed_node_types
+            node_id,
+            expected,
+            new_node,
+            allowed_node_types=allowed_node_types,
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
         )
 
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
@@ -1464,6 +1497,23 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         await self.graph.delete_node(node_id)
+
+    async def compare_and_delete_node(
+        self,
+        node_id: str,
+        *,
+        expected_node_type: str,
+        expected_label: str,
+    ) -> NodeDeleteResult:
+        """Delete a node only while its exact graph identity still matches."""
+
+        if not self._initialized:
+            await self.initialize()
+        return await self.graph.compare_and_delete_node(
+            node_id,
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
+        )
 
     async def get_edges_from(self, node_id: str) -> List[Edge]:
         """Get outgoing edges from a node."""
@@ -2863,6 +2913,10 @@ class AsyncStorage:
         Expects a result compatible with FilecoinAdapter.StorageResult.
         Returns the backup node_id.
         """
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError(
+                "A bound storage facade cannot record another agent's backup"
+            )
         if not self._initialized:
             await self.initialize()
             
@@ -2881,6 +2935,20 @@ class AsyncStorage:
             label="Backup Artifact",
             properties=properties
         )
-        await self.add_node(backup_node)
-        await self.add_edge(agent_id, backup_node.node_id, "backup")
+        async with self.db.transaction():
+            # Backup can run before the physical agent root is materialized.
+            # Reserve its canonical self-owner exactly like avatar bootstrap,
+            # then use a bound graph writer so edge admission can distinguish
+            # this provisional source from an arbitrary missing endpoint.
+            graph = self.graph if self.agent_id else AsyncGraphStore(
+                self.db, agent_id=agent_id
+            )
+            assert graph is not None
+            await reserve_provisional_agent_owner(
+                self.db,
+                agent_id,
+                additional_graph_node_ids=[backup_node.node_id],
+            )
+            await graph.add_node(backup_node)
+            await graph.add_edge(agent_id, backup_node.node_id, "backup")
         return backup_node.node_id
