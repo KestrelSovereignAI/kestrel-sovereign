@@ -121,7 +121,12 @@ def discover_endpoint_router_files() -> list[str]:
     return sorted(
         path.name
         for path in ENDPOINTS_ROOT.glob("*.py")
-        if path.name not in {"__init__.py", "agent_helpers.py"}
+        if path.name
+        not in {
+            "__init__.py",
+            "agent_helpers.py",
+            "closing_streaming_response.py",
+        }
     )
 
 
