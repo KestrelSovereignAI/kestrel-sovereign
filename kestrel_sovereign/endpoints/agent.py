@@ -47,7 +47,6 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 )
 from kestrel_sovereign.stop import (
     CancellationAuthority,
-    CooperativeStopTarget,
     MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
     StopCleanupRegistry,
@@ -55,6 +54,7 @@ from kestrel_sovereign.stop import (
     StopScope,
     UnavailableStopReceiptStore,
 )
+from kestrel_sovereign.stop.runtime_target import build_runtime_stop_target
 from kestrel_sovereign.telemetry import current_trace_identity
 
 logger = logging.getLogger(__name__)
@@ -1076,190 +1076,16 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        def live_turn_ids() -> set[str]:
-            active = set(
-                getattr(agent, "_active_request_ids", set()) or set()
-            )
-            abandoned_turns = getattr(
-                agent, "_abandoned_request_generations", None
-            )
-            if isinstance(abandoned_turns, dict):
-                active.update(abandoned_turns)
-            current_turn = getattr(agent, "_current_request_id", None)
-            if isinstance(current_turn, str) and current_turn:
-                active.add(current_turn)
-            if request_id is not None:
-                active.add(request_id)
-            return active
-
-        active_request_ids = live_turn_ids()
-        instance_binding_accessor = vars(agent).get(
-            "active_turn_request_bindings"
-        )
-        if callable(instance_binding_accessor):
-            has_binding_accessor = True
-            raw_turn_bindings = instance_binding_accessor()
-        else:
-            class_binding_accessor = getattr(
-                type(agent),
-                "active_turn_request_bindings",
-                None,
-            )
-            has_binding_accessor = callable(class_binding_accessor)
-            raw_turn_bindings = (
-                class_binding_accessor(agent) if has_binding_accessor else None
-            )
-        if has_binding_accessor:
-            if not isinstance(raw_turn_bindings, dict):
-                raise TypeError("agent turn binding inventory has an invalid type")
-            turn_request_ids = {}
-            turn_request_generations = {}
-            for indexed_turn_id, binding in raw_turn_bindings.items():
-                if (
-                    not isinstance(indexed_turn_id, str)
-                    or not indexed_turn_id.strip()
-                    or not isinstance(binding, tuple)
-                    or len(binding) != 2
-                    or not isinstance(binding[0], str)
-                    or not binding[0].strip()
-                ):
-                    raise TypeError("agent turn binding inventory is malformed")
-                turn_request_ids[indexed_turn_id] = binding[0]
-                if binding[1] is not None:
-                    if (
-                        not isinstance(binding[1], int)
-                        or isinstance(binding[1], bool)
-                        or binding[1] <= 0
-                    ):
-                        raise TypeError("agent turn generation is malformed")
-                    turn_request_generations[indexed_turn_id] = binding[1]
-        else:
-            turn_index_accessor = vars(agent).get("active_turn_request_ids")
-            if not callable(turn_index_accessor):
-                turn_index_accessor = getattr(
-                    type(agent),
-                    "active_turn_request_ids",
-                    None,
-                )
-                if callable(turn_index_accessor):
-                    turn_request_ids = turn_index_accessor(agent)
-                else:
-                    turn_request_ids = {}
-            else:
-                turn_request_ids = turn_index_accessor()
-            turn_request_generations = {}
-        if not isinstance(turn_request_ids, dict):
-            raise TypeError("agent turn request inventory has an invalid type")
-        turn_addresses = active_request_ids.union(turn_request_ids)
-
-        async def cancel_request(stop_request: StopRequest) -> StopDisposition:
-            distributed_stop = getattr(
+        runtime_target = build_runtime_stop_target(
+            agent,
+            agent_id=agent_id,
+            explicit_request_id=request_id,
+            distributed_registry=getattr(
                 request.app.state,
                 "distributed_invocation_registry",
                 None,
-            )
-            distributed_ticket = None
-            if distributed_stop is not None:
-                if stop_request.scope is StopScope.TURN:
-                    distributed_ticket = await distributed_stop.request_turn(
-                        agent_id,
-                        stop_request.target,
-                    )
-                else:
-                    distributed_ticket = await distributed_stop.request_agent(
-                        agent_id
-                    )
-            cancelled_request_ids: list[Optional[str]] = []
-            if stop_request.scope is StopScope.TURN:
-                cancel_kwargs = {"request_id": stop_request.target}
-                if stop_request.request_generation is not None:
-                    cancel_kwargs["generation"] = stop_request.request_generation
-                canceled = agent.cancel_current_request(**cancel_kwargs)
-                if canceled:
-                    cancelled_request_ids.append(stop_request.target)
-                else:
-                    # The matching invoke/stream may have been dispatched by
-                    # the client but not yet reached lifecycle registration.
-                    # Fence that exact ID briefly; registration consumes the
-                    # tombstone before cognition can begin.  Unknown IDs keep
-                    # the historical ALREADY_COMPLETE result.
-                    reserve = getattr(
-                        type(agent),
-                        "reserve_request_cancellation",
-                        None,
-                    )
-                    if (
-                        stop_request.request_generation is None
-                        and callable(reserve)
-                    ):
-                        reserve(agent, stop_request.target)
-            else:
-                # Receipt load/claim may await after the endpoint's inventory
-                # snapshot. Re-read at the cancellation linearization point so
-                # a turn registered during those awaits cannot outlive an
-                # agent-wide STOPPED receipt.
-                turns_to_cancel = active_request_ids | live_turn_ids()
-                canceled = False
-                for active_request_id in sorted(turns_to_cancel):
-                    request_cancelled = agent.cancel_current_request(
-                        request_id=active_request_id
-                    )
-                    if request_cancelled:
-                        cancelled_request_ids.append(active_request_id)
-                    canceled = request_cancelled or canceled
-                if not turns_to_cancel:
-                    canceled = agent.cancel_current_request(request_id=None)
-                    if canceled:
-                        cancelled_request_ids.append(None)
-            if canceled:
-                wait_for_completion = getattr(
-                    agent,
-                    "wait_for_request_completion",
-                    None,
-                )
-                if not callable(wait_for_completion):
-                    raise RuntimeError(
-                        "agent cannot confirm request lifecycle completion"
-                    )
-                # Every cancellation marker is installed before the first
-                # await, so agent-wide Stop reaches all snapshotted turns at
-                # once. STOPPED is returned only after each one has run its
-                # endpoint cleanup; CancellationAuthority bounds this wait.
-                abandoned = False
-                for cancelled_request_id in cancelled_request_ids:
-                    wait_kwargs = {}
-                    if (
-                        stop_request.scope is StopScope.TURN
-                        and stop_request.request_generation is not None
-                    ):
-                        wait_kwargs["generation"] = (
-                            stop_request.request_generation
-                        )
-                    completion_disposition = await wait_for_completion(
-                        cancelled_request_id,
-                        **wait_kwargs,
-                    )
-                    abandoned = abandoned or (
-                        completion_disposition
-                        is RequestCompletionDisposition.ABANDONED
-                    )
-                if abandoned:
-                    return StopDisposition.UNREACHABLE
-            distributed_disposition = StopDisposition.ALREADY_COMPLETE
-            if distributed_ticket is not None:
-                distributed_disposition = await distributed_stop.wait_for_stop(
-                    distributed_ticket
-                )
-                if distributed_disposition is StopDisposition.UNREACHABLE:
-                    return StopDisposition.UNREACHABLE
-            return (
-                StopDisposition.STOPPED
-                if (
-                    canceled
-                    or distributed_disposition is StopDisposition.STOPPED
-                )
-                else StopDisposition.ALREADY_COMPLETE
-            )
+            ),
+        )
 
         cleanup_registry = getattr(
             request.app.state,
@@ -1273,16 +1099,7 @@ async def stop_agent_request(request: Request):
             raise TypeError("app Stop cleanup registry has an invalid type")
 
         authority = CancellationAuthority(
-            lambda: (
-                CooperativeStopTarget(
-                    target_id=agent_id,
-                    agent_id=agent_id,
-                    cancel=cancel_request,
-                    turn_ids=frozenset(turn_addresses),
-                    turn_request_ids=turn_request_ids,
-                    turn_request_generations=turn_request_generations,
-                ),
-            ),
+            lambda: (runtime_target,),
             cleanup_registry=cleanup_registry,
             receipt_store=(
                 getattr(request.app.state, "stop_receipt_store", None)
