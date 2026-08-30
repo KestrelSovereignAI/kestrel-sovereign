@@ -637,6 +637,16 @@ async def create_kestrel_identity_async(
     spawn_edge_properties = (
         spawn_mandate.to_edge_properties() if spawn_mandate is not None else None
     )
+    if spawn_edge_properties is not None:
+        # AsyncGraphStore persists this exact mapping as JSON.  Validate the
+        # complete nested shape now, before identity/key/database creation,
+        # rather than relying on the shallow copies in to_edge_properties().
+        json.dumps(
+            spawn_edge_properties,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
 
     # Generate test cycle ID if needed
     if is_test_instance and not test_cycle_id:

@@ -1557,6 +1557,50 @@ def test_cold_restore_rejects_features_beyond_parent_ceiling(tmp_path):
     assert manager.get_agent("Child") is None
 
 
+def test_cold_restore_rejects_descendant_through_expired_loaded_parent(
+    tmp_path,
+    monkeypatch,
+):
+    root_did = "did:pkh:eip155:1:0xExpiryRoot"
+    parent_did = "did:pkh:eip155:1:0xExpiryParent"
+    child_did = "did:pkh:eip155:1:0xExpiryChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=111,
+        max_child_depth=2,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=222,
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("Parent", parent)
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+        lambda _created_at, ttl_seconds, **_kwargs: (
+            0 if ttl_seconds == 111 else 999
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="parent spawn mandate has expired"):
+        manager._register_agent("Child", child)
+
+    assert manager.get_agent("Child") is None
+
+
 def test_cold_restore_rejects_non_decreasing_depth(tmp_path):
     root_did = "did:pkh:eip155:1:0xDepthRoot"
     parent_did = "did:pkh:eip155:1:0xDepthParent"

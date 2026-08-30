@@ -1885,6 +1885,7 @@ class AgentManager:
                 "is loaded"
             )
         _parent_name, parent = parent_matches[0]
+        self._validate_loaded_spawn_authority_chain(_parent_name, parent)
         authority_parent_did = _loaded_agent_did(parent)
         if authority_parent_did is None:
             raise PersistedSpawnParentUnavailableError(
@@ -2018,6 +2019,87 @@ class AgentManager:
             authority_parent_did=parent_did,
             arm_ttl=False,
         )
+
+    def _validate_loaded_spawn_authority_chain(
+        self,
+        child_name: str,
+        child_agent: KestrelAgent,
+    ) -> None:
+        """Require every spawned ancestor to retain live signed authority.
+
+        A loaded process is not itself a mandate.  TTL cleanup can be delayed
+        or fail closed while the process remains addressable, so descendant
+        restoration must walk the durable relation chain and re-prove each
+        receipt at the moment it grants authority to another generation.
+        """
+
+        from kestrel_sovereign.spawn.mandate import verify_mandate
+
+        current_name = child_name
+        current_agent: object = child_agent
+        visited: set[str] = set()
+        while True:
+            receipt = vars(current_agent).get("_persisted_spawn_mandate")
+            if receipt is None:
+                return
+            if not isinstance(receipt, SpawnMandate):
+                raise TypeError("persisted spawn authority must be a SpawnMandate")
+            current_did = _loaded_agent_did(current_agent)
+            if current_did is None or current_did in visited:
+                raise RuntimeError("Persisted spawn authority chain is invalid")
+            visited.add(current_did)
+            if self._child_mandates.get(current_name) is not receipt:
+                raise PersistedSpawnParentUnavailableError(
+                    "Refusing descendant authority through a parent whose "
+                    "spawn relation is no longer active"
+                )
+            if not receipt.parent_signature or not receipt.authority_committed:
+                raise RuntimeError(
+                    "Persisted spawn authority chain contains an inactive receipt"
+                )
+            if receipt.child_did != current_did:
+                raise RuntimeError(
+                    "Persisted spawn authority chain has a mismatched child DID"
+                )
+            if (
+                receipt.ttl_seconds > 0
+                and remaining_spawn_ttl_seconds(
+                    receipt.created_at,
+                    receipt.ttl_seconds,
+                ) <= 0
+            ):
+                raise RuntimeError("Persisted parent spawn mandate has expired")
+
+            ancestor_matches = [
+                (candidate_name, candidate)
+                for candidate_name, candidate in self._agents.items()
+                if receipt.parent_did in _loaded_agent_bound_dids(candidate)
+            ]
+            if len(ancestor_matches) != 1:
+                raise PersistedSpawnParentUnavailableError(
+                    "Refusing descendant authority without one loaded parent chain"
+                )
+            ancestor_name, ancestor = ancestor_matches[0]
+            ancestor_state = vars(ancestor)
+            ancestor_identity = ancestor_state.get("identity")
+            ancestor_private_key = ancestor_state.get("_private_key")
+            public_key = None
+            public_key_getter = getattr(ancestor_private_key, "public_key", None)
+            if callable(public_key_getter):
+                public_key = public_key_getter()
+            if public_key is None and ancestor_identity is not None:
+                legacy_keypair = getattr(ancestor_identity, "legacy_keypair", None)
+                public_key = getattr(legacy_keypair, "public_key", None)
+            if not verify_mandate(
+                receipt,
+                public_key,
+                parent_identity=ancestor_identity,
+            ):
+                raise RuntimeError(
+                    "Persisted parent spawn mandate signature is invalid"
+                )
+            current_name = ancestor_name
+            current_agent = ancestor
 
     def _prepare_agent_authority(
         self, name: str, agent: KestrelAgent

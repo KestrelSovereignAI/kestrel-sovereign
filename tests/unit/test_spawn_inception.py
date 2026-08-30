@@ -182,3 +182,27 @@ async def test_unrepresentable_mandate_budget_fails_before_identity_creation(
         )
 
     assert not output.exists()
+
+
+@pytest.mark.asyncio
+async def test_nested_unserializable_mandate_fails_before_identity_creation(
+    tmp_path,
+    constitution_path,
+):
+    output = tmp_path / "never-created-nested"
+    mandate = SpawnMandate(
+        parent_did="did:pkh:eip155:1:0xParentNested",
+        additional_constraints={"behavioral_rules": {"limit": Decimal("1.5")}},
+    )
+
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        await create_kestrel_identity_async(
+            output_dir=str(output),
+            constitution_path=constitution_path,
+            identity_method="did:pkh",
+            is_test_instance=True,
+            parent_did=mandate.parent_did,
+            spawn_mandate=mandate,
+        )
+
+    assert not output.exists()
