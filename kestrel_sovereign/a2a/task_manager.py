@@ -418,6 +418,7 @@ class TaskManager:
 
         if sync:
             # Execute synchronously with transaction safety
+            expected_state = task.status.state
             task = await handler.handle_task(task)
             if task.status.state is TaskState.CANCELED:
                 task = await self._persist_handler_cancellation(
@@ -431,6 +432,7 @@ class TaskManager:
                         saved = await self.task_store.save_recipient_lifecycle(
                             task,
                             recipient_agent_id=authority_agent_id,
+                            expected_state=expected_state,
                         )
                 except Exception as save_err:
                     logger.error(
@@ -441,6 +443,7 @@ class TaskManager:
                         saved = await self.task_store.save_recipient_lifecycle(
                             task,
                             recipient_agent_id=authority_agent_id,
+                            expected_state=expected_state,
                         )
                     except Exception as retry_err:
                         logger.critical(
@@ -578,10 +581,13 @@ class TaskManager:
         authority_agent_id: str,
     ) -> None:
         """Execute a task asynchronously and update the store."""
+        expected_state = task.status.state
         try:
             task = await handler.handle_task(task)
             task, owns_notification = await self._persist_execution_outcome(
-                task, authority_agent_id=authority_agent_id
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
             )
             if owns_notification:
                 await self._notify_status_update(task, final=True)
@@ -604,7 +610,9 @@ class TaskManager:
                 message=Message(role="agent", parts=[TextPart(text=str(e))])
             )
             task, owns_notification = await self._persist_execution_outcome(
-                task, authority_agent_id=authority_agent_id
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
             )
             if owns_notification:
                 await self._notify_status_update(task, final=True)
@@ -614,6 +622,7 @@ class TaskManager:
         task: Task,
         *,
         authority_agent_id: str,
+        expected_state: TaskState,
     ) -> tuple[Task, bool]:
         """Persist a worker result and report ownership of terminal notification."""
 
@@ -629,6 +638,7 @@ class TaskManager:
         saved = await self.task_store.save_recipient_lifecycle(
             task,
             recipient_agent_id=authority_agent_id,
+            expected_state=expected_state,
         )
         if saved is False:
             # Another terminal writer won its CAS and owns the corresponding
@@ -949,6 +959,7 @@ class TaskManager:
         saved = await self.task_store.save_recipient_lifecycle(
             task,
             recipient_agent_id=recipient_agent_id,
+            expected_state=current_state,
         )
         if saved is False:
             persisted = await self.task_store.get_for_recipient(

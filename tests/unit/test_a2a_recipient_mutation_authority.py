@@ -131,12 +131,14 @@ async def test_worker_lifecycle_has_only_typed_recipient_owned_save(tmp_path):
         assert not await manager.task_store.save_recipient_lifecycle(
             task,
             recipient_agent_id=CREATOR,
+            expected_state=TaskState.SUBMITTED,
         )
         assert (await manager.get_task(task.id)).status.state is TaskState.SUBMITTED
 
         assert await manager.task_store.save_recipient_lifecycle(
             task,
             recipient_agent_id=RECIPIENT,
+            expected_state=TaskState.SUBMITTED,
         )
         assert (await manager.get_task(task.id)).status.state is TaskState.WORKING
     finally:

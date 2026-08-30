@@ -18,6 +18,7 @@ from kestrel_sovereign.a2a.types import (
     TextPart,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.db.interface import QueryError
 
 
 POSTGRES_URL = (
@@ -31,11 +32,19 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
     status_id = f"recipient-status-{uuid4().hex}"
     artifact_id = f"recipient-artifact-{uuid4().hex}"
     lifecycle_id = f"recipient-lifecycle-{uuid4().hex}"
+    lifecycle_race_id = f"recipient-lifecycle-race-{uuid4().hex}"
+    status_race_id = f"recipient-status-race-{uuid4().hex}"
     creator = f"did:test:creator:{uuid4().hex}"
     recipient = f"did:test:recipient:{uuid4().hex}"
     try:
         await store.initialize()
-        for task_id in (status_id, artifact_id, lifecycle_id):
+        for task_id in (
+            status_id,
+            artifact_id,
+            lifecycle_id,
+            lifecycle_race_id,
+            status_race_id,
+        ):
             await store.save(
                 Task(
                     id=task_id,
@@ -50,11 +59,13 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
                 status_id,
                 TaskStatus(state=TaskState.WORKING),
                 recipient_agent_id=recipient,
+                expected_state=TaskState.SUBMITTED,
             ),
             store.update_status(
                 status_id,
                 TaskStatus(state=TaskState.FAILED),
                 recipient_agent_id=creator,
+                expected_state=TaskState.SUBMITTED,
             ),
         )
         assert allowed is True
@@ -82,14 +93,66 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         assert not await store.save_recipient_lifecycle(
             worker_copy,
             recipient_agent_id=creator,
+            expected_state=TaskState.SUBMITTED,
         )
         assert await store.save_recipient_lifecycle(
             worker_copy,
             recipient_agent_id=recipient,
+            expected_state=TaskState.SUBMITTED,
         )
         assert (await store.get(lifecycle_id)).status.state is TaskState.WORKING
+
+        first = await store.get(lifecycle_race_id)
+        second = await store.get(lifecycle_race_id)
+        first.status = TaskStatus(state=TaskState.COMPLETED)
+        second.status = TaskStatus(state=TaskState.FAILED)
+        lifecycle_winners = await asyncio.gather(
+            store.save_recipient_lifecycle(
+                first,
+                recipient_agent_id=recipient,
+                expected_state=TaskState.SUBMITTED,
+            ),
+            store.save_recipient_lifecycle(
+                second,
+                recipient_agent_id=recipient,
+                expected_state=TaskState.SUBMITTED,
+            ),
+        )
+        assert lifecycle_winners.count(True) == 1
+        assert lifecycle_winners.count(False) == 1
+        assert (await store.get(lifecycle_race_id)).status.state in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+        }
+
+        status_winners = await asyncio.gather(
+            store.update_status(
+                status_race_id,
+                TaskStatus(state=TaskState.COMPLETED),
+                recipient_agent_id=recipient,
+                expected_state=TaskState.SUBMITTED,
+            ),
+            store.update_status(
+                status_race_id,
+                TaskStatus(state=TaskState.FAILED),
+                recipient_agent_id=recipient,
+                expected_state=TaskState.SUBMITTED,
+            ),
+        )
+        assert status_winners.count(True) == 1
+        assert status_winners.count(False) == 1
+        assert (await store.get(status_race_id)).status.state in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+        }
     finally:
-        for task_id in (status_id, artifact_id, lifecycle_id):
+        for task_id in (
+            status_id,
+            artifact_id,
+            lifecycle_id,
+            lifecycle_race_id,
+            status_race_id,
+        ):
             await store.delete(task_id)
 
 
@@ -118,3 +181,45 @@ async def test_recipient_mutation_authority_postgres():
     finally:
         await backend.close()
 
+
+@pytest.mark.asyncio
+async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "recipient-terminal-replace.db"))
+    await backend.connect()
+    store = TaskStore(backend)
+    task_id = f"legacy-replace-{uuid4().hex}"
+    creator = f"did:test:creator:{uuid4().hex}"
+    recipient = f"did:test:recipient:{uuid4().hex}"
+    try:
+        await store.initialize()
+        await store.save(
+            Task(id=task_id, status=TaskStatus(state=TaskState.SUBMITTED)),
+            creator_agent_id=creator,
+            recipient_agent_id=recipient,
+        )
+        canceled = await store.cancel_if_authorized(
+            task_id,
+            actor_agent_id=creator,
+            expected_recipient_agent_id=recipient,
+        )
+        assert canceled is not None
+
+        with pytest.raises(
+            QueryError,
+            match="terminal A2A task cannot be replaced",
+        ):
+            await backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks
+                    (id, task_type, status, creator_agent_id, recipient_agent_id)
+                VALUES (?, 'generic', 'completed', ?, ?)
+                """,
+                (task_id, creator, recipient),
+            )
+
+        persisted = await store.get(task_id)
+        assert persisted.status.state is TaskState.CANCELED
+        assert persisted.metadata["cancellation_receipt"]["actor_agent_id"] == creator
+    finally:
+        await store.delete(task_id)
+        await backend.close()
