@@ -256,6 +256,36 @@ class TestAvatarStorage:
         ) == (0,)
 
     @pytest.mark.asyncio
+    async def test_store_avatar_rejects_foreign_node_at_provisional_agent_id(
+        self, file_store
+    ):
+        """Avatar bootstrap cannot claim a graph id controlled by another tenant."""
+
+        agent_id = "did:test:avatar-victim"
+        attacker_id = "did:test:avatar-attacker"
+        await file_store.db.execute_commit(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, 'skill', 'Squat', ?)",
+            (agent_id, json.dumps({"agent_id": attacker_id})),
+        )
+        await file_store.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (agent_id, attacker_id),
+        )
+
+        with pytest.raises(TransactionError, match="collides"):
+            await file_store.store_avatar(b"must-not-persist", agent_id, "primary")
+
+        assert await file_store.db.fetchone("SELECT COUNT(*) FROM files") == (0,)
+        assert await file_store.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            (agent_id,),
+        ) == [(attacker_id,)]
+        assert await file_store.db.fetchone(
+            "SELECT 1 FROM graph_nodes WHERE node_type = 'avatar'"
+        ) is None
+
+    @pytest.mark.asyncio
     async def test_avatar_metadata_includes_source_url(self, file_store):
         """Avatar metadata includes original source URL"""
         agent_id = "did:pkh:eip155:1:0xsource"
