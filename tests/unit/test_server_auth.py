@@ -197,6 +197,23 @@ def test_temporary_sovereign_key_provenance_survives_a_child_process(monkeypatch
     assert proc.stdout.strip() == "True"
 
 
+def test_quoted_empty_sovereign_key_is_replaced_by_ephemeral_bootstrap(monkeypatch):
+    """Docker-style quotes must not turn an absent secret into empty authority."""
+
+    from kestrel_sovereign.security.sovereign_key import (
+        is_ephemeral_sovereign_key,
+    )
+
+    monkeypatch.setenv("KESTREL_API_KEY", '""')
+
+    selected = server_module.get_api_key()
+
+    assert selected
+    assert selected == os.environ["KESTREL_API_KEY"]
+    assert selected != '""'
+    assert is_ephemeral_sovereign_key(selected)
+
+
 def test_restart_authority_is_bound_to_the_key_authenticated_at_entry(client):
     response = client.get(
         "/api/test/restart-authority-after-rotation",
