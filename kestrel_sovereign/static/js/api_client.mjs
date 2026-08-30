@@ -651,13 +651,20 @@ export function createApiClient({
         };
     }
 
+    function headerEntries(headers) {
+        if (headers && typeof headers.entries === 'function') {
+            return [...headers.entries()];
+        }
+        return Object.entries(headers || {});
+    }
+
     function authAddedHeaders(unsignedHeaders, signedHeaders) {
         const before = new Map(
-            Object.entries(unsignedHeaders || {}).map(
+            headerEntries(unsignedHeaders).map(
                 ([key, value]) => [key.toLowerCase(), String(value)],
             ),
         );
-        return Object.entries(signedHeaders || {})
+        return headerEntries(signedHeaders)
             .map(([key, value]) => [key.toLowerCase(), String(value)])
             .filter(([key, value]) => before.get(key) !== value)
             .sort(([left], [right]) => left.localeCompare(right));

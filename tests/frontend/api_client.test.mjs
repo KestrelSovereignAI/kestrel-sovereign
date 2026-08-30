@@ -215,7 +215,9 @@ test('host lifecycle authority is invalidated when mutable auth credentials chan
     const authProvider = {
         async ensureAuthenticated() {},
         async applyAuth(headers) {
-            return { ...headers, Authorization: `Bearer ${token}` };
+            const signed = new Headers(headers);
+            signed.set('Authorization', `Bearer ${token}`);
+            return signed;
         },
         async onUnauthorized() { return 'failed'; },
     };
