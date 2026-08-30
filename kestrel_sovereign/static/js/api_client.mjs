@@ -623,6 +623,7 @@ export function createApiClient({
             classified: false,
             create: false,
             delete: false,
+            authGeneration: null,
         },
         // Monotonic request generation for caller-scoped lifecycle discovery.
         // An older sovereign response must never overwrite a newer OAuth/JWT
@@ -648,6 +649,7 @@ export function createApiClient({
             classified: false,
             create: false,
             delete: false,
+            authGeneration: null,
         };
     }
 
@@ -660,22 +662,33 @@ export function createApiClient({
         return [...new Headers(headers || {}).entries()];
     }
 
-    function authAddedHeaders(unsignedHeaders, signedHeaders) {
-        const before = new Map(
-            headerEntries(unsignedHeaders).map(
+    function isRequestSignature(value) {
+        // ``Authorization: Signature …`` authenticates one request, not a
+        // stable caller. Other schemes (especially Bearer) can determine the
+        // server principal and must participate even when X-API-Key is also
+        // present—the server falls through to Bearer when that key is stale.
+        return /^\s*signature(?:\s|$)/i.test(String(value));
+    }
+
+    function credentialIdentity(signedHeaders) {
+        const headers = new Map(
+            headerEntries(signedHeaders).map(
                 ([key, value]) => [key.toLowerCase(), String(value)],
             ),
         );
-        return headerEntries(signedHeaders)
-            .map(([key, value]) => [key.toLowerCase(), String(value)])
-            .filter(([key, value]) => before.get(key) !== value)
-            .sort(([left], [right]) => left.localeCompare(right));
+        const credentials = [];
+        for (const name of ['authorization', 'proxy-authorization', 'x-api-key']) {
+            const value = headers.get(name);
+            if (value === undefined) continue;
+            if (name !== 'x-api-key' && isRequestSignature(value)) continue;
+            credentials.push([name, value]);
+        }
+        return JSON.stringify(credentials);
     }
 
     async function applyTrackedAuth(headers) {
         const unsignedHeaders = { ...(headers || {}) };
         const signedHeaders = await auth.applyAuth({ ...unsignedHeaders });
-        const addedHeaders = authAddedHeaders(unsignedHeaders, signedHeaders);
         let identity;
         if (typeof auth.getPrincipalIdentity === 'function') {
             // Embedded hosts that use per-request signatures can expose the
@@ -685,24 +698,10 @@ export function createApiClient({
             const principal = await auth.getPrincipalIdentity();
             identity = `principal:${String(principal ?? '')}`;
         } else {
-            // Ignore non-credential signing material (nonce, date, digest,
-            // request signature) so ordinary requests by the same principal
-            // do not revoke a freshly classified UI. Prefer the host API key
-            // when both it and a volatile Authorization signature are present;
-            // otherwise an exact bearer/API-key change fails closed.
-            const credentials = new Map(addedHeaders);
-            const apiKey = credentials.get('x-api-key');
-            const authorization = credentials.get('authorization');
-            const proxyAuthorization = credentials.get('proxy-authorization');
-            identity = JSON.stringify(
-                apiKey !== undefined
-                    ? [['x-api-key', apiKey]]
-                    : authorization !== undefined
-                        ? [['authorization', authorization]]
-                        : proxyAuthorization !== undefined
-                            ? [['proxy-authorization', proxyAuthorization]]
-                            : [],
-            );
+            // Ignore only an explicit request-signature authorization scheme.
+            // Every credential header that can select the server caller stays
+            // in the partition, including Bearer alongside a stale X-API-Key.
+            identity = credentialIdentity(signedHeaders);
         }
         if (state.authIdentity !== null && state.authIdentity !== identity) {
             state.authIdentityGeneration += 1;
@@ -847,6 +846,27 @@ export function createApiClient({
         }
     }
 
+    async function performHostLifecycleMutation(operation, endpoint, options) {
+        return performRequest(
+            buildHostUrl(endpoint),
+            options,
+            false,
+            (preparedAuthGeneration) => {
+                const authority = state.hostLifecycleAuthority;
+                if (
+                    authority.classified !== true
+                    || authority[operation] !== true
+                    || authority.authGeneration !== preparedAuthGeneration
+                ) {
+                    invalidateHostLifecycleAuthority();
+                    throw new Error(
+                        'Host lifecycle authority must be refreshed for the active caller.',
+                    );
+                }
+            },
+        );
+    }
+
     const client = {
         async init() {
             await auth.ensureAuthenticated();
@@ -911,6 +931,7 @@ export function createApiClient({
                     classified: true,
                     create: data.can_create_agents === true,
                     delete: data.can_delete_agents === true,
+                    authGeneration: responseAuthGeneration,
                 };
             }
             return data;
@@ -925,7 +946,7 @@ export function createApiClient({
         // 409 on a duplicate name / 400 on a bad name; the standalone console's
         // Create Agent dialog surfaces those details inline. Host-level endpoint
         // — never host-agent-prefixed.
-        createAgent: (name) => client.request('/api/agents', {
+        createAgent: (name) => performHostLifecycleMutation('create', '/api/agents', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name }),
@@ -937,10 +958,14 @@ export function createApiClient({
         // the destructive opt-in header like every other destructive UI action
         // (#766) so the demo-isolation rail sees an intentional, user-initiated
         // delete. Host-level endpoint — never host-agent-prefixed.
-        deleteAgent: (name) => client.request(`/api/agents/${encodeURIComponent(name)}`, {
-            method: 'DELETE',
-            headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
-        }),
+        deleteAgent: (name) => performHostLifecycleMutation(
+            'delete',
+            `/api/agents/${encodeURIComponent(name)}`,
+            {
+                method: 'DELETE',
+                headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
+            },
+        ),
         getIdentity: () => client.request('/api/identity'),
         updateIdentity: (data) => client.request('/api/identity', {
             method: 'PATCH',

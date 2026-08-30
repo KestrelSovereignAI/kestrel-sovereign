@@ -241,6 +241,66 @@ test('host lifecycle authority is invalidated when mutable auth credentials chan
     assert.equal(client.canManageHostAgentLifecycle('delete'), false);
 });
 
+test('lifecycle mutation aborts before fetch when credentials changed after discovery', async () => {
+    let token = 'sovereign-machine-key';
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return { ...headers, Authorization: `Bearer ${token}` };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        agents: [],
+        can_create_agents: true,
+        can_delete_agents: true,
+    }));
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    token = 'ordinary-user-jwt';
+
+    await assert.rejects(
+        () => client.createAgent('must-not-dispatch'),
+        /authority must be refreshed/i,
+    );
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+});
+
+test('bearer changes invalidate authority even beside a constant API-key header', async () => {
+    let bearer = 'sovereign-machine-key';
+    const authProvider = {
+        async ensureAuthenticated() {},
+        async applyAuth(headers) {
+            return {
+                ...headers,
+                'X-API-Key': 'stale-or-proxy-key',
+                Authorization: `Bearer ${bearer}`,
+            };
+        },
+        async onUnauthorized() { return 'failed'; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, {
+            agents: [],
+            can_create_agents: true,
+            can_delete_agents: true,
+        }),
+        jsonResponse(200, { models: [] }),
+    );
+    const { client } = createClient({ fetchFn, authProvider });
+
+    await client.getAgents();
+    assert.equal(client.canManageHostAgentLifecycle('delete'), true);
+
+    bearer = 'ordinary-user-jwt';
+    await client.request('/api/models');
+
+    assert.equal(client.canManageHostAgentLifecycle('create'), false);
+    assert.equal(client.canManageHostAgentLifecycle('delete'), false);
+});
+
 test('sequence-form auth headers are normalized before lifecycle tracking', async () => {
     const authProvider = {
         async ensureAuthenticated() {},
