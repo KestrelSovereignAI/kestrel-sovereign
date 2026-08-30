@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -419,6 +420,100 @@ async def test_server_lifespan_wires_and_closes_host_features(
     ]
 
 
+@pytest.mark.asyncio
+async def test_server_closes_unpublished_host_context_after_mount_failure(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A failed host contribution cannot leak its separate Hold pool."""
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.a2a import did_registry
+    from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
+    from kestrel_sovereign.security import demo_isolation
+
+    config_path = tmp_path / "multi_agent.toml"
+    config_path.write_text("[host]\nport = 8888\n")
+    fake_config = SimpleNamespace(
+        host=SimpleNamespace(bind="127.0.0.1", port=8888),
+        agents={"Kite": object()},
+    )
+    fake_agent = SimpleNamespace(is_test_instance=True)
+
+    class FakeManager:
+        init_failures = []
+
+        def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
+        async def load_from_config(self, _config):
+            return 1
+
+        def list_agents(self):
+            return ["Kite"]
+
+        def get_agent(self, _name):
+            return fake_agent
+
+        async def shutdown_all(self):
+            return None
+
+    feature = _UIHostFeature()
+    host_db = SimpleNamespace(close=AsyncMock())
+    hold_db = SimpleNamespace(close=AsyncMock())
+    session_factory = SimpleNamespace(close=AsyncMock())
+    candidate = SovereignHostContext(
+        db=host_db,
+        hold_db=hold_db,
+        session_factory=session_factory,
+    )
+
+    async def build_context(*, config):
+        assert config["host_port"] == 8888
+        return candidate
+
+    async def start_features(features, context):
+        assert features == [feature]
+        assert context is candidate
+        return [feature]
+
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *a, **k: fake_config)
+    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_kwargs: FakeManager())
+    monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *a, **k: None)
+    monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda _agents: True)
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "_unmount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_unmount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
+    monkeypatch.setattr(hf, "instantiate_host_features", lambda **_kwargs: [feature])
+    monkeypatch.setattr(hf, "build_host_context", build_context)
+    monkeypatch.setattr(hf, "start_host_features", start_features)
+    monkeypatch.setattr(hf, "stop_host_features", AsyncMock())
+    monkeypatch.setattr(
+        hf,
+        "mount_host_feature_routers",
+        lambda _app, _features: (_ for _ in ()).throw(
+            RuntimeError("router mount failed")
+        ),
+    )
+    monkeypatch.setattr(hf, "mount_host_feature_ui", lambda _app, _features: None)
+    monkeypatch.setattr(hf, "unmount_host_features", lambda _app: None)
+
+    test_app = FastAPI()
+    async with server.lifespan(test_app):
+        assert test_app.state.host_context is None
+        session_factory.close.assert_awaited_once()
+        hold_db.close.assert_awaited_once()
+        host_db.close.assert_awaited_once()
+
+    session_factory.close.assert_awaited_once()
+    hold_db.close.assert_awaited_once()
+    host_db.close.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Host context: entities session factory on a host backend under fleet tenancy
 # (AC #2)
@@ -449,6 +544,28 @@ def test_host_context_satisfies_sdk_protocol():
 
     ctx = SovereignHostContext(db=object(), backplane=object(), config={})
     assert isinstance(ctx, HostContext)
+
+
+@pytest.mark.asyncio
+async def test_host_shutdown_closes_separate_hold_backend_once():
+    from kestrel_sovereign import server
+
+    host_db = SimpleNamespace(close=AsyncMock())
+    hold_db = SimpleNamespace(close=AsyncMock())
+    session_factory = SimpleNamespace(close=AsyncMock())
+    app = FastAPI()
+    app.state.host_features = []
+    app.state.host_context = SovereignHostContext(
+        db=host_db,
+        session_factory=session_factory,
+        hold_db=hold_db,
+    )
+
+    await server._shutdown_host_features(app)
+
+    session_factory.close.assert_awaited_once()
+    hold_db.close.assert_awaited_once()
+    host_db.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

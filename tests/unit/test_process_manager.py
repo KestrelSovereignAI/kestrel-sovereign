@@ -739,8 +739,8 @@ class TestStopAgent:
         assert ap.pid_file.exists()
         assert ap.pid == 99999
 
-    def test_stop_all_names_the_agents_that_survived(self, pm, project_dir):
-        """stop_all reports which agents outlived the stop rather than dropping it."""
+    def test_terminate_all_names_the_agents_that_survived(self, pm, project_dir):
+        """terminate_all reports which agents outlived it rather than dropping it."""
         for name, port in (("claw", 8801), ("testbot", 8802)):
             ap = pm.register_agent(name, LocalAgentConfig(
                 data_dir=Path(f"agent_data/{name}"), port=port,
@@ -754,7 +754,7 @@ class TestStopAgent:
         with patch.object(ProcessManager, "is_process_running", side_effect=_running), \
              patch.object(ProcessManager, "kill_process"), \
              patch("time.sleep"):
-            survivors = pm.stop_all(timeout=0.01)
+            survivors = pm.terminate_all(timeout=0.01)
 
         assert survivors == ["claw"]
 
@@ -867,8 +867,8 @@ class TestStartStopAll:
         assert "bad" not in started
         assert "claw" in started
 
-    def test_stop_all(self, pm, project_dir):
-        """stop_all stops all registered agents."""
+    def test_terminate_all(self, pm, project_dir):
+        """terminate_all terminates all registered agent processes."""
         cfg1 = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -879,7 +879,7 @@ class TestStartStopAll:
         pm.register_agent("testbot", cfg2)
 
         with patch.object(pm, "stop_agent") as mock_stop:
-            pm.stop_all()
+            pm.terminate_all()
 
         assert mock_stop.call_count == 2
 

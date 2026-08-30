@@ -97,6 +97,14 @@ The bar is: a future engineer reading the diff or the issue tracker should
 be able to act on what you saw, even if you didn't fix it yourself. Silent
 bystanders are how rot spreads.
 
+### 7. Stop Work; Terminate Processes
+
+**Stop** is cooperative cancellation of in-flight work. Its scopes are host,
+agent, turn, and tool call. Operating-system process termination is a separate
+runtime lifecycle operation and must be named **terminate**, never wired as a
+Stop implementation. Stop is an event; it does not grant or imply the durable
+authority to Hold an agent.
+
 ---
 
 ## Anti-Patterns to Avoid

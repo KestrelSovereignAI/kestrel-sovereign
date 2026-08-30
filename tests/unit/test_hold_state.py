@@ -1,0 +1,1958 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+
+from kestrel_sovereign.hold import (
+    HoldAction,
+    HoldDisposition,
+    HoldIdempotencyConflict,
+    HoldReceipt,
+    HoldScope,
+    HoldStateError,
+    HoldStore,
+)
+from kestrel_sovereign.hold.state import (
+    HoldCorruptStateError,
+    _latch_from_row,
+    _receipt_from_row,
+    _terminal_authority_ids,
+)
+from kestrel_sovereign.host_features.context import build_host_context
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+
+@pytest.fixture
+async def hold_db(tmp_path):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "host.db"))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    try:
+        yield db, store
+    finally:
+        await db.close()
+
+
+async def _create_legacy_hold_tables(db) -> None:
+    """Create the pre-witness Hold tables used by upgrade regressions."""
+
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (scope, target_id))"
+    )
+    await db.execute(
+        "CREATE TABLE hold_receipts ("
+        "receipt_id TEXT NOT NULL PRIMARY KEY, operation_id TEXT NOT NULL, "
+        "action TEXT NOT NULL, disposition TEXT NOT NULL, scope TEXT NOT NULL, "
+        "target_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
+        "actor_id TEXT NOT NULL, occurred_at TEXT NOT NULL, "
+        "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '')"
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_and_agent_holds_compose_and_release_independently(hold_db):
+    _db, store = hold_db
+    host = await store.set_hold(
+        scope=HoldScope.HOST,
+        actor_id="did:sovereign:operator",
+        reason="fleet investigation",
+        operation_id="hold-host-1",
+    )
+    agent = await store.set_hold(
+        scope=HoldScope.AGENT,
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="agent investigation",
+        operation_id="hold-agent-1",
+    )
+
+    effective = await store.get_effective("did:agent:kite")
+    assert effective.held
+    assert effective.sources == (HoldScope.HOST, HoldScope.AGENT)
+    assert effective.host == host.current
+    assert effective.agent == agent.current
+
+    released = await store.release_hold(
+        scope=HoldScope.HOST,
+        actor_id="did:sovereign:operator",
+        reason="fleet cleared",
+        operation_id="release-host-1",
+        expected_hold_receipt_id=host.receipt.receipt_id,
+    )
+    assert released.receipt.disposition is HoldDisposition.APPLIED
+    assert released.current is None
+
+    effective = await store.get_effective("did:agent:kite")
+    assert effective.held
+    assert effective.host is None
+    assert effective.agent == agent.current
+
+
+@pytest.mark.asyncio
+async def test_state_and_receipts_survive_database_restart(tmp_path):
+    path = tmp_path / "host.db"
+    first_db = await AsyncDatabase.sqlite(str(path))
+    first = HoldStore(first_db)
+    await first.ensure_schema()
+    mutation = await first.set_hold(
+        scope="agent",
+        target_id="did:agent:durable",
+        actor_id="did:sovereign:operator",
+        reason="leave down",
+        operation_id="durable-operation",
+    )
+    await first_db.close()
+
+    second_db = await AsyncDatabase.sqlite(str(path))
+    second = HoldStore(second_db)
+    await second.ensure_schema()
+    try:
+        restored = await second.get_effective("did:agent:durable")
+        receipt = await second.get_receipt("durable-operation")
+        assert restored.agent == mutation.current
+        assert receipt == mutation.receipt
+        assert datetime.fromisoformat(receipt.occurred_at).tzinfo is not None
+    finally:
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_primary_key_is_explicitly_not_null(hold_db):
+    db, _store = hold_db
+    columns = await db.fetchall("PRAGMA table_info(hold_receipts)")
+    receipt_id = next(row for row in columns if row[1] == "receipt_id")
+    assert receipt_id[3] == 1
+
+
+@pytest.mark.asyncio
+async def test_content_witness_lookup_has_target_index(hold_db):
+    db, _store = hold_db
+    columns = await db.fetchall(
+        "PRAGMA index_info(idx_hold_receipt_content_witnesses_target)"
+    )
+    assert [row[2] for row in columns] == ["scope", "target_id"]
+
+
+def test_existing_null_receipt_identity_fails_closed_on_read() -> None:
+    with pytest.raises(HoldCorruptStateError, match="missing required evidence"):
+        _receipt_from_row(
+            (
+                None,
+                "legacy-operation",
+                "release",
+                "already_in_state",
+                "agent",
+                "did:agent:kite",
+                "legacy import",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                "expected-receipt",
+                "",
+                "",
+            )
+        )
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-timestamp", "2026-08-28T00:00:00"])
+def test_malformed_or_naive_receipt_timestamp_fails_closed(timestamp) -> None:
+    with pytest.raises(HoldCorruptStateError, match="receipt timestamp"):
+        _receipt_from_row(
+            (
+                "receipt-id",
+                "legacy-operation",
+                "hold",
+                "applied",
+                "agent",
+                "did:agent:kite",
+                "legacy import",
+                "did:sovereign:operator",
+                timestamp,
+                "",
+                "",
+                "receipt-id",
+            )
+        )
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-timestamp", "2026-08-28T00:00:00"])
+def test_malformed_or_naive_latch_timestamp_fails_closed(timestamp) -> None:
+    with pytest.raises(HoldCorruptStateError, match="latch timestamp"):
+        _latch_from_row(
+            (
+                "agent",
+                "did:agent:kite",
+                1,
+                "receipt-id",
+                "legacy import",
+                "did:sovereign:operator",
+                timestamp,
+                1,
+            )
+        )
+
+
+@pytest.mark.parametrize("field_index", [1, 7, 8])
+@pytest.mark.parametrize("bad_value", [None, 42])
+def test_existing_invalid_required_receipt_evidence_fails_closed_on_read(
+    field_index,
+    bad_value,
+) -> None:
+    row = [
+        "receipt-id",
+        "legacy-operation",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "legacy import",
+        "did:sovereign:operator",
+        "2026-08-28T00:00:00+00:00",
+        "",
+        "",
+        "receipt-id",
+    ]
+    row[field_index] = bad_value
+
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="missing required evidence|invalid evidence types",
+    ):
+        _receipt_from_row(tuple(row))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projection_loss", ["delete", "reset"])
+@pytest.mark.parametrize("operation", ["get", "effective", "set", "release"])
+async def test_surviving_hold_authority_fails_closed_after_projection_loss(
+    hold_db,
+    projection_loss,
+    operation,
+):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="leave stopped",
+        operation_id="hold-before-projection-loss",
+    )
+    if projection_loss == "delete":
+        await db.execute(
+            "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
+            ("agent", "did:agent:kite"),
+        )
+    else:
+        await db.execute(
+            "UPDATE hold_latches SET active = 0, hold_receipt_id = '', "
+            "reason = '', actor_id = '', set_at = '' "
+            "WHERE scope = ? AND target_id = ?",
+            ("agent", "did:agent:kite"),
+        )
+
+    with pytest.raises(HoldCorruptStateError, match="active Hold authority"):
+        if operation == "get":
+            await store.get_hold("agent", "did:agent:kite")
+        elif operation == "effective":
+            await store.get_effective("did:agent:kite")
+        elif operation == "set":
+            await store.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="do not overwrite missing projection",
+                operation_id="set-after-projection-loss",
+            )
+        else:
+            await store.release_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="do not release missing projection",
+                operation_id="release-after-projection-loss",
+                expected_hold_receipt_id=held.receipt.receipt_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_cyclic_applied_hold_history_fails_closed_when_projection_is_unheld(
+    hold_db,
+):
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="first hold",
+        operation_id="cycle-first",
+    )
+    second = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="second hold",
+        operation_id="cycle-second",
+    )
+    await db.execute(
+        "UPDATE hold_receipts SET prior_hold_receipt_id = ? "
+        "WHERE receipt_id = ?",
+        (second.receipt.receipt_id, first.receipt.receipt_id),
+    )
+    await db.execute(
+        "UPDATE hold_latches SET active = 0, hold_receipt_id = '', "
+        "reason = '', actor_id = '', set_at = '' "
+        "WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:kite"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="cycle"):
+        await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
+async def test_inactive_revision_rejects_deleted_closed_receipt_chain(hold_db):
+    """Mutation tripwire: an empty graph cannot erase proven prior mutations."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:closed-history",
+        actor_id="did:sovereign:operator",
+        reason="closed history",
+        operation_id="closed-history-hold",
+    )
+    await store.release_hold(
+        scope="agent",
+        target_id="did:agent:closed-history",
+        actor_id="did:sovereign:operator",
+        reason="closed history release",
+        operation_id="closed-history-release",
+        expected_hold_receipt_id=held.receipt.receipt_id,
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:closed-history"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="revision"):
+        await store.get_effective("did:agent:closed-history")
+
+
+@pytest.mark.asyncio
+async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db):
+    """The receipt-count witness covers idempotent audit outcomes too."""
+
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:non-applied-loss",
+        actor_id="did:sovereign:operator",
+        reason="first reason",
+        operation_id="first-applied",
+    )
+    duplicate = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:non-applied-loss",
+        actor_id="did:sovereign:operator",
+        reason="first reason",
+        operation_id="old-idempotent-operation",
+    )
+    assert duplicate.receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+    replacement = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:non-applied-loss",
+        actor_id="did:sovereign:operator",
+        reason="newer reason",
+        operation_id="newer-applied",
+    )
+    assert replacement.receipt.receipt_id != first.receipt.receipt_id
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE operation_id = ?",
+        ("old-idempotent-operation",),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="receipt-count"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:non-applied-loss",
+            actor_id="did:sovereign:operator",
+            reason="first reason",
+            operation_id="old-idempotent-operation",
+        )
+
+    with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.get_receipt("old-idempotent-operation")
+    with pytest.raises(HoldCorruptStateError, match="receipt-count"):
+        await store.get_hold("agent", "did:agent:non-applied-loss")
+
+
+@pytest.mark.asyncio
+async def test_release_rejects_latch_rewound_to_consumed_hold_authority(hold_db):
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="first hold",
+        operation_id="rewind-first",
+    )
+    await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="second hold",
+        operation_id="rewind-second",
+    )
+    await db.execute(
+        "UPDATE hold_latches SET active = 1, hold_receipt_id = ?, "
+        "reason = ?, actor_id = ?, set_at = ? "
+        "WHERE scope = ? AND target_id = ?",
+        (
+            first.receipt.receipt_id,
+            first.receipt.reason,
+            first.receipt.actor_id,
+            first.receipt.occurred_at,
+            "agent",
+            "did:agent:kite",
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="terminal authority"):
+        await store.release_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="must not release rewound projection",
+            operation_id="rewind-release",
+            expected_hold_receipt_id=first.receipt.receipt_id,
+        )
+    assert await store.get_receipt("rewind-release") is None
+
+
+@pytest.mark.asyncio
+async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_path):
+    """The host boot context, not an agent-local DB, owns the durable latch."""
+
+    path = str(tmp_path / "host-control.db")
+    first = await build_host_context(db_path=path)
+    try:
+        assert first.hold_store is not None
+        held = await first.hold_store.set_hold(
+            scope="agent",
+            target_id="did:agent:boot-held",
+            actor_id="did:sovereign:operator",
+            reason="remain held through restart",
+            operation_id="boot-hold",
+        )
+    finally:
+        if first.session_factory is not None:
+            await first.session_factory.close()
+        if first.db is not None:
+            await first.db.close()
+
+    reopened = await build_host_context(db_path=path)
+    try:
+        assert reopened.hold_store is not None
+        effective = await reopened.hold_store.get_effective(
+            "did:agent:boot-held"
+        )
+        assert effective.agent == held.current
+    finally:
+        if reopened.session_factory is not None:
+            await reopened.session_factory.close()
+        if reopened.db is not None:
+            await reopened.db.close()
+
+
+@pytest.mark.asyncio
+async def test_host_context_uses_configured_postgres_for_durable_hold(
+    monkeypatch,
+    tmp_path,
+):
+    """Cloud Hold uses PG without cutting existing host features off SQLite."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[object] = []
+
+    class _DB:
+        def __init__(self, backend_type):
+            self.backend_type = backend_type
+
+        async def close(self):
+            events.append(("db-close", self.backend_type))
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close")
+
+    fake_host_db = _DB("sqlite")
+    fake_hold_db = _DB("postgres")
+
+    async def _sqlite(_cls, path):
+        events.append(("sqlite", path))
+        return fake_host_db
+
+    async def _postgres(_cls, dsn):
+        events.append(("postgres", dsn))
+        return fake_hold_db
+
+    async def _ensure_schema(self):
+        events.append(("hold-schema", self._db))
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module, "make_session_factory", lambda db: _InnerFactory()
+    )
+    monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
+
+    host_path = tmp_path / "existing-host-features.db"
+    ctx = await build_host_context(db_path=str(host_path))
+
+    assert ctx.db is fake_host_db
+    assert ctx.hold_db is fake_hold_db
+    assert ctx.hold_store._db is fake_hold_db
+    assert events[:3] == [
+        ("sqlite", str(host_path)),
+        ("postgres", "postgresql://durable/host"),
+        ("hold-schema", fake_hold_db),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_factory_closes_pool_when_core_schema_init_fails(
+    monkeypatch,
+):
+    """A factory failure cannot hide its newly connected pool from cleanup."""
+
+    from kestrel_sovereign.storage import async_database as database_module
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    events: list[str] = []
+
+    class _Backend:
+        backend_type = "postgres"
+
+        async def connect(self):
+            events.append("connect")
+
+        async def close(self):
+            events.append("close")
+
+    async def _fail_schema(_self):
+        events.append("schema")
+        raise RuntimeError("core schema failed")
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", lambda dsn: _Backend())
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
+
+    with pytest.raises(RuntimeError, match="core schema failed"):
+        await database_module.AsyncDatabase.postgres("postgresql://durable/host")
+
+    assert events == ["connect", "schema", "close"]
+
+
+@pytest.mark.asyncio
+async def test_database_factory_preserves_schema_error_when_cleanup_also_fails(
+    monkeypatch,
+    caplog,
+):
+    """A secondary close failure cannot replace the initialization defect."""
+
+    from kestrel_sovereign.storage import async_database as database_module
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    class _Backend:
+        backend_type = "postgres"
+
+        async def connect(self):
+            return None
+
+        async def close(self):
+            raise RuntimeError("cleanup failed")
+
+    async def _fail_schema(_self):
+        raise RuntimeError("primary schema failure")
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", lambda dsn: _Backend())
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
+
+    with pytest.raises(RuntimeError, match="primary schema failure"):
+        await database_module.AsyncDatabase.postgres("postgresql://durable/host")
+
+    assert "cleanup failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_host_context_bootstrap_closes_partial_resources(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancellation before context handoff cannot strand either database."""
+
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[object] = []
+    schema_entered = asyncio.Event()
+    factory_close_started = asyncio.Event()
+    release_factory_close = asyncio.Event()
+
+    class _DB:
+        def __init__(self, backend_type):
+            self.backend_type = backend_type
+
+        async def close(self):
+            events.append(("db-close", self.backend_type))
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close-started")
+            factory_close_started.set()
+            await release_factory_close.wait()
+            events.append("factory-close-finished")
+
+    fake_host_db = _DB("sqlite")
+    fake_hold_db = _DB("postgres")
+
+    async def _sqlite(_cls, _path):
+        return fake_host_db
+
+    async def _postgres(_cls, _dsn):
+        return fake_hold_db
+
+    async def _ensure_schema(_self):
+        schema_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module, "make_session_factory", lambda _db: _InnerFactory()
+    )
+    monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
+
+    bootstrap = asyncio.create_task(
+        build_host_context(db_path=str(tmp_path / "host.db"))
+    )
+    await schema_entered.wait()
+    bootstrap.cancel()
+    await factory_close_started.wait()
+    bootstrap.cancel()
+    release_factory_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await bootstrap
+
+    assert events == [
+        "factory-close-started",
+        "factory-close-finished",
+        ("db-close", "postgres"),
+        ("db-close", "sqlite"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
+    monkeypatch,
+    tmp_path,
+):
+    """An opening error cannot turn later shutdown into a degraded context."""
+
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[object] = []
+    factory_close_started = asyncio.Event()
+    release_factory_close = asyncio.Event()
+
+    class _DB:
+        def __init__(self, backend_type):
+            self.backend_type = backend_type
+
+        async def close(self):
+            events.append(("db-close", self.backend_type))
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close-started")
+            factory_close_started.set()
+            await release_factory_close.wait()
+            events.append("factory-close-finished")
+
+    fake_host_db = _DB("sqlite")
+    fake_hold_db = _DB("postgres")
+
+    async def _sqlite(_cls, _path):
+        return fake_host_db
+
+    async def _postgres(_cls, _dsn):
+        return fake_hold_db
+
+    async def _fail_schema(_self):
+        raise RuntimeError("schema opening failed")
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module,
+        "make_session_factory",
+        lambda _db: _InnerFactory(),
+    )
+    monkeypatch.setattr(HoldStore, "ensure_schema", _fail_schema)
+
+    bootstrap = asyncio.create_task(
+        build_host_context(db_path=str(tmp_path / "host.db"))
+    )
+    await factory_close_started.wait()
+    bootstrap.cancel()
+    release_factory_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await bootstrap
+
+    assert events == [
+        "factory-close-started",
+        "factory-close-finished",
+        ("db-close", "postgres"),
+        ("db-close", "sqlite"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receipt_lookup_rejects_missing_authority_history(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:receipt-history",
+        actor_id="did:sovereign:operator",
+        reason="inspect authority",
+        operation_id="receipt-authority-hold",
+    )
+    released = await store.release_hold(
+        scope="agent",
+        target_id="did:agent:receipt-history",
+        actor_id="did:sovereign:operator",
+        reason="inspect release",
+        operation_id="receipt-authority-release",
+        expected_hold_receipt_id=held.receipt.receipt_id,
+    )
+    assert released.receipt.disposition is HoldDisposition.APPLIED
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE operation_id = ?",
+        ("receipt-authority-hold",),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing authority"):
+        await store.get_receipt("receipt-authority-release")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["already_in_state", "refused_stale"])
+async def test_non_applied_receipt_rejects_missing_referenced_authority(
+    hold_db,
+    disposition,
+):
+    """Audit-only outcomes cannot survive deletion of their authority proof."""
+
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:non-applied-history",
+        actor_id="did:sovereign:operator",
+        reason="first hold",
+        operation_id=f"{disposition}-first",
+    )
+    if disposition == "already_in_state":
+        non_applied = await store.set_hold(
+            scope="agent",
+            target_id="did:agent:non-applied-history",
+            actor_id="did:sovereign:operator",
+            reason="first hold",
+            operation_id="already-in-state-receipt",
+        )
+    else:
+        second = await store.set_hold(
+            scope="agent",
+            target_id="did:agent:non-applied-history",
+            actor_id="did:sovereign:operator",
+            reason="replacement hold",
+            operation_id="refused-stale-second",
+        )
+        non_applied = await store.release_hold(
+            scope="agent",
+            target_id="did:agent:non-applied-history",
+            actor_id="did:sovereign:operator",
+            reason="stale release",
+            operation_id="refused-stale-receipt",
+            expected_hold_receipt_id=first.receipt.receipt_id,
+        )
+        assert non_applied.current == second.current
+    assert non_applied.receipt.disposition.value == disposition
+
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE disposition = 'applied'"
+    )
+    await db.execute(
+        "UPDATE hold_latches SET active = 0, hold_receipt_id = '', "
+        "reason = '', actor_id = '', set_at = '' "
+        "WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:non-applied-history"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing authority"):
+        await store.get_receipt(non_applied.receipt.operation_id)
+
+
+@pytest.mark.asyncio
+async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
+    _db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:one",
+        actor_id="did:sovereign:operator",
+        reason="inspect",
+        operation_id="same-operation",
+    )
+    replay = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:one",
+        actor_id="did:sovereign:operator",
+        reason="inspect",
+        operation_id="same-operation",
+    )
+    assert replay.receipt == first.receipt
+    assert replay.current == first.current
+
+    with pytest.raises(HoldIdempotencyConflict):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:two",
+            actor_id="did:sovereign:operator",
+            reason="inspect",
+            operation_id="same-operation",
+        )
+
+
+@pytest.mark.asyncio
+async def test_legacy_receipts_gain_witnesses_once_before_marker(tmp_path):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-witness-upgrade.db"))
+    await _create_legacy_hold_tables(db)
+    receipt_id = "legacy-upgrade-receipt"
+    target_id = "did:agent:legacy-upgrade"
+    occurred_at = "2026-08-28T00:00:00+00:00"
+    await db.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, resulting_hold_receipt_id"
+        ") VALUES (?, ?, 'hold', 'applied', 'agent', ?, ?, ?, ?, ?)",
+        (
+            receipt_id,
+            "legacy-upgrade-operation",
+            target_id,
+            "legacy import",
+            "did:sovereign:operator",
+            occurred_at,
+            receipt_id,
+        ),
+    )
+    await db.execute(
+        "INSERT INTO hold_latches ("
+        "scope, target_id, active, hold_receipt_id, reason, actor_id, "
+        "set_at, revision"
+        ") VALUES ('agent', ?, 1, ?, ?, ?, ?, 1)",
+        (
+            target_id,
+            receipt_id,
+            "legacy import",
+            "did:sovereign:operator",
+            occurred_at,
+        ),
+    )
+    store = HoldStore(db)
+    try:
+        await store.ensure_schema()
+
+        effective = await store.get_effective(target_id)
+        receipt = await store.get_receipt("legacy-upgrade-operation")
+        marker = await db.fetchone(
+            "SELECT 1 FROM hold_schema_migrations "
+            "WHERE name = 'hold_state_witness_ledgers_v1'"
+        )
+
+        assert effective.held is True
+        assert effective.agent is not None
+        assert effective.agent.hold_receipt_id == receipt_id
+        assert receipt is not None and receipt.receipt_id == receipt_id
+        assert marker is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_duplicate_operation_ids_fail_closed(tmp_path):
+    """Runtime reads cannot trust a UNIQUE constraint an old table may lack."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-duplicate-operation.db"))
+    await _create_legacy_hold_tables(db)
+    store = HoldStore(db)
+    await store.ensure_schema()
+    try:
+        for suffix in ("one", "two"):
+            receipt_id = f"duplicate-operation-receipt-{suffix}"
+            target_id = f"did:agent:{suffix}"
+            await db.execute(
+                "INSERT INTO hold_receipts ("
+                "receipt_id, operation_id, action, disposition, scope, "
+                "target_id, reason, actor_id, occurred_at, "
+                "resulting_hold_receipt_id"
+                ") VALUES (?, ?, 'hold', 'applied', 'agent', ?, ?, ?, ?, ?)",
+                (
+                    receipt_id,
+                    "duplicate-operation",
+                    target_id,
+                    "legacy import",
+                    "did:sovereign:operator",
+                    "2026-08-28T00:00:00+00:00",
+                    receipt_id,
+                ),
+            )
+            await db.execute(
+                "INSERT INTO hold_latches ("
+                "scope, target_id, active, hold_receipt_id, reason, actor_id, "
+                "set_at, revision"
+                ") VALUES ('agent', ?, 1, ?, ?, ?, ?, 1)",
+                (
+                    target_id,
+                    receipt_id,
+                    "legacy import",
+                    "did:sovereign:operator",
+                    "2026-08-28T00:00:00+00:00",
+                ),
+            )
+
+        with pytest.raises(HoldCorruptStateError, match="duplicate operation"):
+            await store.get_receipt("duplicate-operation")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_duplicate_operations_block_witness_migration(tmp_path):
+    """Backfill cannot bless one receipt while hiding its duplicate peer."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-duplicate-backfill.db"))
+    await _create_legacy_hold_tables(db)
+    for suffix in ("one", "two"):
+        receipt_id = f"preexisting-duplicate-{suffix}"
+        await db.execute(
+            "INSERT INTO hold_receipts ("
+            "receipt_id, operation_id, action, disposition, scope, target_id, "
+            "reason, actor_id, occurred_at, resulting_hold_receipt_id"
+            ") VALUES (?, 'duplicate-before-backfill', 'hold', 'applied', "
+            "'agent', ?, 'legacy import', 'did:sovereign:operator', "
+            "'2026-08-28T00:00:00+00:00', ?)",
+            (receipt_id, f"did:agent:{suffix}", receipt_id),
+        )
+    store = HoldStore(db)
+    try:
+        with pytest.raises(HoldCorruptStateError, match="duplicate operation"):
+            await store.ensure_schema()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fractional_latch_revision_fails_closed(hold_db):
+    """SQLite integer affinity cannot turn 1.9 into a valid revision one."""
+
+    db, store = hold_db
+    await store.set_hold(
+        scope="agent",
+        target_id="did:agent:fractional-revision",
+        actor_id="did:sovereign:operator",
+        reason="inspect revision",
+        operation_id="fractional-revision-hold",
+    )
+    await db.execute(
+        "UPDATE hold_latches SET revision = ? "
+        "WHERE scope = 'agent' AND target_id = ?",
+        (1.9, "did:agent:fractional-revision"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="revision"):
+        await store.get_hold("agent", "did:agent:fractional-revision")
+
+
+@pytest.mark.asyncio
+async def test_fractional_latch_active_flag_fails_closed(tmp_path):
+    """Legacy tables cannot truncate a fractional flag into active state."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-fractional-active.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, active INTEGER NOT NULL, "
+        "hold_receipt_id TEXT NOT NULL, reason TEXT NOT NULL, "
+        "actor_id TEXT NOT NULL, set_at TEXT NOT NULL, revision INTEGER NOT NULL, "
+        "PRIMARY KEY (scope, target_id))"
+    )
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await db.execute(
+        "INSERT INTO hold_latches VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "agent",
+            "did:agent:fractional-active",
+            1.5,
+            "receipt",
+            "inspect active flag",
+            "did:sovereign:operator",
+            "2026-08-28T00:00:00+00:00",
+            1,
+        ),
+    )
+    try:
+        with pytest.raises(HoldCorruptStateError, match="active flag"):
+            await store.get_hold("agent", "did:agent:fractional-active")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_semantic_hold_is_receipted_without_replacing_latch(hold_db):
+    _db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="investigate",
+        operation_id="hold-once",
+    )
+    second = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="investigate",
+        operation_id="hold-twice",
+    )
+
+    assert second.receipt.disposition is HoldDisposition.ALREADY_IN_STATE
+    assert second.receipt.receipt_id != first.receipt.receipt_id
+    assert second.receipt.resulting_hold_receipt_id == first.receipt.receipt_id
+    assert second.current == first.current
+
+
+@pytest.mark.asyncio
+async def test_mutated_receipt_content_cannot_reopen_an_operation_id(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:mutated-receipt",
+        actor_id="did:sovereign:operator",
+        reason="inspect",
+        operation_id="immutable-hold-operation",
+    )
+    await store.release_hold(
+        scope="agent",
+        target_id="did:agent:mutated-receipt",
+        actor_id="did:sovereign:operator",
+        reason="clear",
+        operation_id="immutable-release-operation",
+        expected_hold_receipt_id=held.receipt.receipt_id,
+    )
+    await db.execute(
+        "UPDATE hold_receipts SET operation_id = ? WHERE operation_id = ?",
+        ("tampered-operation", "immutable-hold-operation"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="content witness"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:mutated-receipt",
+            actor_id="did:sovereign:operator",
+            reason="inspect",
+            operation_id="immutable-hold-operation",
+        )
+
+
+@pytest.mark.asyncio
+async def test_deleted_receipt_operation_id_cannot_be_rebound_to_other_target(
+    hold_db,
+):
+    """A global operation tombstone survives loss of its receipt row."""
+
+    db, store = hold_db
+    original = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:original-operation-owner",
+        actor_id="did:sovereign:operator",
+        reason="first use",
+        operation_id="globally-retired-operation",
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (original.receipt.receipt_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:attempted-new-owner",
+            actor_id="did:sovereign:operator",
+            reason="second use",
+            operation_id="globally-retired-operation",
+        )
+
+    assert (
+        await db.fetchone(
+            "SELECT operation_id FROM hold_receipts WHERE target_id = ?",
+            ("did:agent:attempted-new-owner",),
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("witness_kind", ["content", "operation", "receipt-count"])
+async def test_completed_witness_migration_never_reblesses_missing_evidence(
+    hold_db, witness_kind
+):
+    """A later boot treats missing ledgers as corruption, not legacy state."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:backfill",
+        actor_id="did:sovereign:operator",
+        reason="original evidence",
+        operation_id="witness-must-survive",
+    )
+    if witness_kind == "content":
+        # Deleting the digest after mutating the row was the dangerous case:
+        # repeat startup used to hash the attacker-controlled replacement and
+        # thereby bless it as the new integrity witness.
+        await db.execute(
+            "UPDATE hold_receipts SET reason = ? WHERE receipt_id = ?",
+            ("tampered evidence", held.receipt.receipt_id),
+        )
+        await db.execute(
+            "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id = ?",
+            (held.receipt.receipt_id,),
+        )
+    elif witness_kind == "operation":
+        await db.execute(
+            "DELETE FROM hold_operation_witnesses WHERE operation_id = ?",
+            (held.receipt.operation_id,),
+        )
+    else:
+        await db.execute(
+            "DELETE FROM hold_receipt_witnesses "
+            "WHERE scope = 'agent' AND target_id = ?",
+            (held.receipt.target_id,),
+        )
+
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="completed Hold witness migration",
+    ):
+        await store.ensure_schema()
+
+
+@pytest.mark.asyncio
+async def test_every_target_read_validates_operation_witness_binding(hold_db):
+    """Operation tombstones are load-bearing outside direct receipt lookup."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:operation-witness",
+        actor_id="did:sovereign:operator",
+        reason="witness every state path",
+        operation_id="operation-witness-everywhere",
+    )
+    await db.execute(
+        "DELETE FROM hold_operation_witnesses WHERE operation_id = ?",
+        (held.receipt.operation_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="operation witness"):
+        await store.get_effective("did:agent:operation-witness")
+
+
+@pytest.mark.asyncio
+async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
+    _db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:one",
+        reason="first reason",
+        operation_id="hold-first",
+    )
+    second = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:two",
+        reason="replacement reason",
+        operation_id="hold-second",
+    )
+
+    stale = await store.release_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:one",
+        reason="release old observation",
+        operation_id="release-stale",
+        expected_hold_receipt_id=first.receipt.receipt_id,
+    )
+    assert stale.receipt.disposition is HoldDisposition.REFUSED_STALE
+    assert stale.current == second.current
+    assert await store.get_hold("agent", "did:agent:kite") == second.current
+
+
+@pytest.mark.asyncio
+async def test_release_rejects_latch_with_missing_authority_receipt(hold_db):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:sovereign:operator",
+        reason="investigate",
+        operation_id="hold-before-receipt-loss",
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing authority receipt"):
+        await store.release_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="must remain held",
+            operation_id="release-without-authority",
+            expected_hold_receipt_id=held.receipt.receipt_id,
+        )
+
+    row = await db.fetchone(
+        "SELECT active, hold_receipt_id FROM hold_latches "
+        "WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:kite"),
+    )
+    assert row == (1, held.receipt.receipt_id)
+    assert await store.get_receipt("release-without-authority") is None
+
+
+@pytest.mark.asyncio
+async def test_release_rejects_latch_bound_to_another_targets_receipt(hold_db):
+    db, store = hold_db
+    first = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:first",
+        actor_id="did:sovereign:operator",
+        reason="first investigation",
+        operation_id="hold-first-target",
+    )
+    other = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:other",
+        actor_id="did:sovereign:operator",
+        reason="other investigation",
+        operation_id="hold-other-target",
+    )
+    await db.execute(
+        "UPDATE hold_latches SET hold_receipt_id = ? "
+        "WHERE scope = ? AND target_id = ?",
+        (other.receipt.receipt_id, "agent", "did:agent:first"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="does not match"):
+        await store.release_hold(
+            scope="agent",
+            target_id="did:agent:first",
+            actor_id="did:sovereign:operator",
+            reason="must remain held",
+            operation_id="release-mismatched-authority",
+            expected_hold_receipt_id=other.receipt.receipt_id,
+        )
+
+    row = await db.fetchone(
+        "SELECT active, hold_receipt_id FROM hold_latches "
+        "WHERE scope = ? AND target_id = ?",
+        ("agent", "did:agent:first"),
+    )
+    assert row == (1, other.receipt.receipt_id)
+    assert first.receipt.receipt_id != other.receipt.receipt_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "target_id", "expected_lock"),
+    [
+        (HoldScope.AGENT, "did:agent:independent", False),
+        (HoldScope.HOST, None, True),
+    ],
+)
+async def test_mutation_locks_host_shape_only_for_host_scope(
+    hold_db, monkeypatch, scope, target_id, expected_lock,
+):
+    _db, store = hold_db
+    inspect_shape = AsyncMock(wraps=store._assert_host_latch_shape)
+    monkeypatch.setattr(store, "_assert_host_latch_shape", inspect_shape)
+
+    await store.set_hold(
+        scope=scope,
+        target_id=target_id,
+        actor_id="did:sovereign:operator",
+        reason="scope-specific lock",
+        operation_id=f"lock-{scope.value}",
+    )
+
+    inspect_shape.assert_awaited_once_with(for_update=expected_lock)
+
+
+@pytest.mark.asyncio
+async def test_receipt_and_latch_roll_back_as_one_unit(hold_db, monkeypatch):
+    _db, store = hold_db
+    insert = store._insert_receipt
+
+    async def fail_after_receipt(**kwargs):
+        await insert(**kwargs)
+        raise RuntimeError("injected crash after receipt")
+
+    monkeypatch.setattr(store, "_insert_receipt", fail_after_receipt)
+    with pytest.raises(Exception, match="injected crash"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="investigate",
+            operation_id="rolled-back",
+        )
+
+    assert await store.get_hold("agent", "did:agent:kite") is None
+    assert await store.get_receipt("rolled-back") is None
+
+
+@pytest.mark.asyncio
+async def test_corrupt_active_latch_fails_closed(hold_db, monkeypatch):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_read_latch_row",
+        AsyncMock(
+            return_value=(
+                "agent",
+                "did:agent:kite",
+                2,
+                "receipt",
+                "reason",
+                "actor",
+                "2026-08-28T00:00:00+00:00",
+                1,
+            )
+        ),
+    )
+    with pytest.raises(HoldCorruptStateError, match="active flag"):
+        await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
+async def test_greenfield_schema_rejects_foreign_host_target(hold_db):
+    db, _store = hold_db
+    with pytest.raises(Exception, match="CHECK constraint"):
+        await db.execute(
+            "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?)",
+            ("host", "foreign"),
+        )
+    with pytest.raises(Exception, match="CHECK constraint"):
+        await db.execute(
+            "INSERT INTO hold_receipts ("
+            "receipt_id, operation_id, action, disposition, scope, target_id, "
+            "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+            "prior_hold_receipt_id, resulting_hold_receipt_id"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "foreign-host-receipt",
+                "foreign-host-operation",
+                "hold",
+                "applied",
+                "host",
+                "foreign",
+                "invalid imported authority",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                "",
+                "",
+                "foreign-host-receipt",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_foreign_host_receipt_fails_closed_on_every_state_path(
+    hold_db,
+):
+    """Runtime validation remains load-bearing for upgraded/imported schemas."""
+
+    db, store = hold_db
+    await db.execute("PRAGMA ignore_check_constraints = ON")
+    await db.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+        "prior_hold_receipt_id, resulting_hold_receipt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "imported-foreign-host-receipt",
+            "imported-foreign-host-operation",
+            "hold",
+            "applied",
+            "host",
+            "foreign",
+            "invalid imported authority",
+            "did:sovereign:operator",
+            "2026-08-28T00:00:00+00:00",
+            "",
+            "",
+            "imported-foreign-host-receipt",
+        ),
+    )
+    await db.execute("PRAGMA ignore_check_constraints = OFF")
+
+    with pytest.raises(HoldCorruptStateError, match="foreign target"):
+        await store.get_hold("host")
+    with pytest.raises(HoldCorruptStateError, match="foreign target"):
+        await store.get_effective("did:agent:kite")
+    with pytest.raises(HoldCorruptStateError, match="foreign target"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="must fail closed",
+            operation_id="foreign-host-receipt-mutation",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read", ["one", "effective"])
+async def test_state_read_validates_projection_inside_one_locked_snapshot(
+    hold_db,
+    monkeypatch,
+    read,
+):
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:snapshot",
+        actor_id="did:sovereign:operator",
+        reason="snapshot authority",
+        operation_id="snapshot-hold",
+    )
+    original_transaction = db.transaction
+    original_validate = store._validate_latch_projection
+    active = False
+    transaction_modes: list[bool] = []
+    locked_targets: list[tuple[tuple[HoldScope, str], ...]] = []
+
+    @asynccontextmanager
+    async def traced_transaction(*, immediate=False):
+        nonlocal active
+        transaction_modes.append(immediate)
+        async with original_transaction(immediate=immediate):
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    async def inspect_projection(latch, scope, target_id):
+        assert active, "latch and receipt graph escaped their read snapshot"
+        return await original_validate(latch, scope, target_id)
+
+    async def inspect_locks(targets):
+        locked_targets.append(tuple(targets))
+
+    monkeypatch.setattr(db, "transaction", traced_transaction)
+    monkeypatch.setattr(store, "_validate_latch_projection", inspect_projection)
+    monkeypatch.setattr(store, "_lock_read_targets", inspect_locks)
+
+    if read == "one":
+        assert await store.get_hold("agent", "did:agent:snapshot") == held.current
+        assert locked_targets == [((HoldScope.AGENT, "did:agent:snapshot"),)]
+    else:
+        effective = await store.get_effective("did:agent:snapshot")
+        assert effective.agent == held.current
+        assert locked_targets == [
+            (
+                (HoldScope.HOST, "host"),
+                (HoldScope.AGENT, "did:agent:snapshot"),
+            )
+        ]
+    assert transaction_modes == [False]
+
+
+@pytest.mark.asyncio
+async def test_postgres_read_targets_take_shared_locks_in_global_order():
+    execute = AsyncMock()
+    store = HoldStore(SimpleNamespace(backend_type="postgres", execute=execute))
+
+    await store._lock_read_targets(
+        (
+            (HoldScope.HOST, "host"),
+            (HoldScope.AGENT, "did:agent:snapshot"),
+            (HoldScope.HOST, "host"),
+        )
+    )
+
+    assert [call.args for call in execute.await_args_list] == [
+        (
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+            ("kestrel:hold:target:agent:did:agent:snapshot",),
+        ),
+        (
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+            ("kestrel:hold:target:host:host",),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_receipt_read_locks_operation_before_witness_lookup(
+    monkeypatch,
+):
+    events: list[str] = []
+
+    class _Database:
+        backend_type = "postgres"
+
+        @asynccontextmanager
+        async def transaction(self):
+            events.append("transaction")
+            yield
+
+        async def execute(self, sql, params=()):
+            assert "pg_advisory_xact_lock_shared" in sql
+            assert params == ("kestrel:hold:operation:concurrent-operation",)
+            events.append("operation-lock")
+
+    store = HoldStore(_Database())
+
+    async def validate(_operation):
+        assert events == ["transaction", "operation-lock"]
+        events.append("witness-read")
+        return None
+
+    monkeypatch.setattr(store, "_validate_operation_witness", validate)
+
+    assert await store.get_receipt("concurrent-operation") is None
+    assert events == ["transaction", "operation-lock", "witness-read"]
+
+
+def test_authority_graph_walk_is_linear_in_number_of_receipts():
+    class CountingConsumers(dict[str, HoldReceipt]):
+        get_count = 0
+
+        def get(self, key, default=None):
+            self.get_count += 1
+            return super().get(key, default)
+
+    authorities: dict[str, HoldReceipt] = {}
+    consumers = CountingConsumers()
+    previous = ""
+    count = 2_000
+    for index in range(count):
+        receipt_id = f"hold-{index}"
+        receipt = HoldReceipt(
+            receipt_id=receipt_id,
+            operation_id=f"operation-{index}",
+            action=HoldAction.HOLD,
+            disposition=HoldDisposition.APPLIED,
+            scope=HoldScope.AGENT,
+            target_id="did:agent:linear",
+            reason="linear history",
+            actor_id="did:sovereign:operator",
+            occurred_at=f"2026-08-28T00:00:{index:05d}+00:00",
+            expected_hold_receipt_id="",
+            prior_hold_receipt_id=previous,
+            resulting_hold_receipt_id=receipt_id,
+        )
+        authorities[receipt_id] = receipt
+        if previous:
+            consumers[previous] = receipt
+        previous = receipt_id
+
+    assert _terminal_authority_ids(authorities, consumers) == {previous}
+    assert consumers.get_count <= count
+
+
+@pytest.mark.asyncio
+async def test_upgraded_foreign_host_row_fails_closed_for_reads_and_mutation(
+    tmp_path,
+):
+    """Existing v1 tables lack the new CHECK, so runtime validation is load-bearing."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-hold.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (scope, target_id), "
+        "CHECK (scope IN ('host', 'agent')), CHECK (active IN (0, 1)), "
+        "CHECK (revision >= 0))"
+    )
+    await db.execute(
+        "INSERT INTO hold_latches "
+        "(scope, target_id, active, hold_receipt_id, reason, actor_id, set_at) "
+        "VALUES ('host', 'foreign', 1, 'receipt', 'reason', 'actor', 'time')"
+    )
+    store = HoldStore(db)
+    await store.ensure_schema()
+    try:
+        with pytest.raises(HoldCorruptStateError, match="foreign target"):
+            await store.get_hold("host")
+        with pytest.raises(HoldCorruptStateError, match="foreign target"):
+            await store.get_effective("did:agent:kite")
+        with pytest.raises(HoldCorruptStateError, match="foreign target"):
+            await store.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="must fail closed",
+                operation_id="foreign-host-row",
+            )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["get", "set", "release"])
+async def test_imported_duplicate_latch_fails_closed_on_single_target_paths(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    """A legacy table without its key cannot make one duplicate authoritative."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / f"duplicate-{operation}.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0)"
+    )
+    await db.execute(
+        "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?)",
+        ("agent", "did:agent:duplicate"),
+    )
+    await db.execute(
+        "INSERT INTO hold_latches (scope, target_id) VALUES (?, ?)",
+        ("agent", "did:agent:duplicate"),
+    )
+    store = HoldStore(db)
+    await store.ensure_schema()
+    if operation != "get":
+        # The imported rows already exist. Bypass the insert-if-absent helper,
+        # whose ON CONFLICT target also depends on the missing legacy key, so
+        # this regression reaches the shared single-latch read itself.
+        monkeypatch.setattr(store, "_ensure_latch_row", AsyncMock())
+    try:
+        with pytest.raises(HoldCorruptStateError, match="duplicate hold latch key"):
+            if operation == "get":
+                await store.get_hold("agent", "did:agent:duplicate")
+            elif operation == "set":
+                await store.set_hold(
+                    scope="agent",
+                    target_id="did:agent:duplicate",
+                    actor_id="did:sovereign:operator",
+                    reason="must reject ambiguous projection",
+                    operation_id="set-duplicate-projection",
+                )
+            else:
+                await store.release_hold(
+                    scope="agent",
+                    target_id="did:agent:duplicate",
+                    actor_id="did:sovereign:operator",
+                    reason="must reject ambiguous projection",
+                    operation_id="release-duplicate-projection",
+                    expected_hold_receipt_id="unknown-authority",
+                )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_inactive_latch_with_retained_evidence_fails_closed(
+    hold_db,
+    monkeypatch,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_read_latch_row",
+        AsyncMock(
+            return_value=(
+                "agent",
+                "did:agent:kite",
+                0,
+                "retained-receipt",
+                "retained reason",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                2,
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="inactive latch"):
+        await store.get_hold("agent", "did:agent:kite")
+
+
+@pytest.mark.asyncio
+async def test_malformed_applied_hold_replay_fails_closed(
+    hold_db,
+    monkeypatch,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_validate_operation_witness",
+        AsyncMock(
+            return_value=(
+                "receipt-id",
+                "poisoned-replay",
+                "hold",
+                "applied",
+                "agent",
+                "did:agent:kite",
+                "investigate",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                "",
+                "",
+                "",
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="receipt invariant"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="investigate",
+            operation_id="poisoned-replay",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "disposition", "expected", "prior", "resulting"),
+    [
+        ("hold", "refused_stale", "", "prior", "prior"),
+        ("hold", "already_in_state", "", "", ""),
+        ("release", "applied", "expected", "other", ""),
+        ("release", "already_in_state", "expected", "prior", "prior"),
+        ("release", "refused_stale", "expected", "expected", "expected"),
+    ],
+)
+async def test_impossible_receipt_state_combinations_fail_closed(
+    hold_db,
+    monkeypatch,
+    action,
+    disposition,
+    expected,
+    prior,
+    resulting,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_validate_operation_witness",
+        AsyncMock(
+            return_value=(
+                "receipt-id",
+                "corrupt-combination",
+                action,
+                disposition,
+                "agent",
+                "did:agent:kite",
+                "investigate",
+                "did:sovereign:operator",
+                "2026-08-28T00:00:00+00:00",
+                expected,
+                prior,
+                resulting,
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="receipt invariant"):
+        await store.get_receipt("corrupt-combination")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["set", "release"])
+async def test_mutations_preserve_typed_corrupt_state_error(
+    hold_db,
+    monkeypatch,
+    operation,
+):
+    _db, store = hold_db
+    monkeypatch.setattr(
+        store,
+        "_read_latch_row",
+        AsyncMock(
+            return_value=(
+                "agent",
+                "did:agent:kite",
+                2,
+                "receipt",
+                "reason",
+                "actor",
+                "2026-08-28T00:00:00+00:00",
+                1,
+            )
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="active flag"):
+        if operation == "set":
+            await store.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="replace corrupt latch",
+                operation_id="corrupt-set",
+            )
+        else:
+            await store.release_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:operator",
+                reason="release corrupt latch",
+                operation_id="corrupt-release",
+                expected_hold_receipt_id="receipt",
+            )
+
+
+def test_package_exports_shared_hold_state_error() -> None:
+    assert issubclass(HoldCorruptStateError, HoldStateError)
+    assert issubclass(HoldIdempotencyConflict, HoldStateError)
+
+
+@pytest.mark.asyncio
+async def test_two_sqlite_workers_serialize_replacement_and_stale_release(tmp_path):
+    path = tmp_path / "host.db"
+    db_one = await AsyncDatabase.sqlite(str(path))
+    db_two = await AsyncDatabase.sqlite(str(path))
+    one = HoldStore(db_one)
+    two = HoldStore(db_two)
+    await asyncio.gather(one.ensure_schema(), two.ensure_schema())
+    try:
+        results = await asyncio.gather(
+            one.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:one",
+                reason="one",
+                operation_id="race-one",
+            ),
+            two.set_hold(
+                scope="agent",
+                target_id="did:agent:kite",
+                actor_id="did:sovereign:two",
+                reason="two",
+                operation_id="race-two",
+            ),
+        )
+        current = await one.get_hold("agent", "did:agent:kite")
+        assert current is not None
+        winner = next(item for item in results if item.current == current)
+        loser = next(item for item in results if item.receipt != winner.receipt)
+
+        stale = await two.release_hold(
+            scope="agent",
+            target_id="did:agent:kite",
+            actor_id="did:sovereign:operator",
+            reason="stale concurrent observation",
+            operation_id="race-release",
+            expected_hold_receipt_id=loser.receipt.receipt_id,
+        )
+        assert stale.receipt.disposition is HoldDisposition.REFUSED_STALE
+        assert stale.current == current
+    finally:
+        await db_one.close()
+        await db_two.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_hold_store_sql_is_backend_portable(db_backend):
+    db = AsyncDatabase(db_backend)
+    store = HoldStore(db)
+    await store.ensure_schema()
+    suffix = uuid4().hex
+    target = f"did:agent:{suffix}"
+    hold_operation = f"hold-{suffix}"
+    release_operation = f"release-{suffix}"
+    try:
+        held = await store.set_hold(
+            scope="agent",
+            target_id=target,
+            actor_id="did:sovereign:operator",
+            reason="backend parity",
+            operation_id=hold_operation,
+        )
+        released = await store.release_hold(
+            scope="agent",
+            target_id=target,
+            actor_id="did:sovereign:operator",
+            reason="backend parity complete",
+            operation_id=release_operation,
+            expected_hold_receipt_id=held.receipt.receipt_id,
+        )
+        assert released.receipt.disposition is HoldDisposition.APPLIED
+        assert await store.get_hold("agent", target) is None
+    finally:
+        await db.execute(
+            "DELETE FROM hold_receipts WHERE operation_id IN (?, ?)",
+            (hold_operation, release_operation),
+        )
+        await db.execute(
+            "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
+            (HoldScope.AGENT.value, target),
+        )
