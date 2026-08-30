@@ -3623,6 +3623,7 @@ async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backen
             message=Message(role="agent", parts=[TextPart(text="underway")]),
         ),
         recipient_agent_id="did:test:recipient-a",
+        expected_state=TaskState.SUBMITTED,
     )
     await store.add_artifact(
         task_a,

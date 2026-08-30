@@ -1452,6 +1452,7 @@ async def test_lifecycle_save_strips_forged_cancellation_receipt(tmp_path):
         assert await manager.task_store.save_recipient_lifecycle(
             task,
             recipient_agent_id="did:test:recipient",
+            expected_state=TaskState.SUBMITTED,
         ) is True
 
         persisted = await manager.task_store._get_unscoped("forged-save-receipt")
@@ -1783,6 +1784,7 @@ async def test_stale_worker_save_cannot_overwrite_authorized_cancellation(tmp_pa
         await manager.task_store.save_recipient_lifecycle(
             stale_worker_copy,
             recipient_agent_id="did:test:recipient",
+            expected_state=TaskState.SUBMITTED,
         )
 
         persisted = await manager.task_store._get_unscoped("stale-worker")
@@ -1833,12 +1835,14 @@ async def test_generic_status_and_store_writes_cannot_cancel_task(tmp_path):
             await manager.task_store.save_recipient_lifecycle(
                 task,
                 recipient_agent_id="did:test:recipient",
+                expected_state=TaskState.SUBMITTED,
             )
         with pytest.raises(ValueError, match="cancel_if_authorized"):
             await manager.task_store.update_status(
                 task.id,
                 TaskStatus(state=TaskState.CANCELED),
                 recipient_agent_id="did:test:recipient",
+                expected_state=TaskState.SUBMITTED,
             )
 
         assert (await manager.task_store._get_unscoped(task.id)).status.state is TaskState.SUBMITTED
@@ -2134,6 +2138,7 @@ async def test_handler_cancellation_merges_concurrently_committed_payload(tmp_pa
         assert await manager.task_store.save_recipient_lifecycle(
             concurrent,
             recipient_agent_id=host_did,
+            expected_state=TaskState.SUBMITTED,
         ) is True
 
         release.set()
@@ -2291,6 +2296,7 @@ async def test_async_canceling_handler_preserves_concurrent_completed_winner(tmp
         assert await manager.task_store.save_recipient_lifecycle(
             winning,
             recipient_agent_id=host_did,
+            expected_state=TaskState.SUBMITTED,
         ) is True
 
         release.set()
@@ -2715,7 +2721,7 @@ async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
             agent_name="did:test:creator",
         )
 
-        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+        with pytest.raises(Exception, match="terminal A2A task cannot be replaced"):
             await manager.task_store.backend.execute(
                 "UPDATE a2a_tasks SET status = 'completed' WHERE id = ?",
                 ("terminal-cancel",),
@@ -2747,20 +2753,20 @@ async def test_database_fence_blocks_legacy_replace_of_canceled_task(tmp_path):
             agent_name="did:test:creator",
         )
 
-        with pytest.raises(Exception, match="canceled A2A task is terminal"):
-            await manager.task_store.backend.execute(
-                """
-                INSERT OR REPLACE INTO a2a_tasks
-                    (id, task_type, status, creator_agent_id, recipient_agent_id)
-                VALUES (?, ?, 'completed', ?, ?)
-                """,
-                (
-                    "terminal-replace",
-                    "generic",
-                    "did:test:replacement-creator",
-                    "did:test:replacement-recipient",
-                ),
-            )
+        rows = await manager.task_store.backend.execute(
+            """
+            INSERT OR REPLACE INTO a2a_tasks
+                (id, task_type, status, creator_agent_id, recipient_agent_id)
+            VALUES (?, ?, 'completed', ?, ?)
+            """,
+            (
+                "terminal-replace",
+                "generic",
+                "did:test:replacement-creator",
+                "did:test:replacement-recipient",
+            ),
+        )
+        assert rows == 0
 
         canceled = await manager.get_task_for_creator(
             "terminal-replace",
@@ -2788,7 +2794,7 @@ async def test_database_fence_blocks_all_mutation_of_canceled_task(tmp_path):
             agent_name="did:test:creator",
         )
 
-        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+        with pytest.raises(Exception, match="terminal A2A task cannot be replaced"):
             await manager.task_store.backend.execute(
                 "UPDATE a2a_tasks SET metadata = ? WHERE id = ?",
                 ('{"legacy":"overwrite"}', "immutable-cancel"),
@@ -2935,7 +2941,7 @@ async def test_database_fence_blocks_legacy_writer_on_available_backends(db_back
         )
         assert canceled is not None
 
-        with pytest.raises(Exception, match="canceled A2A task is terminal"):
+        with pytest.raises(Exception, match="terminal A2A task cannot be replaced"):
             await db_backend.execute(
                 "UPDATE a2a_tasks SET status = 'completed' WHERE id = ?",
                 (task_id,),
@@ -3000,7 +3006,7 @@ async def test_cancel_readback_failure_rolls_back_transition_on_available_backen
 
 
 @pytest.mark.asyncio
-async def test_postgres_initialization_installs_canceled_terminal_trigger():
+async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
     @asynccontextmanager
     async def transaction():
         yield
@@ -3019,7 +3025,9 @@ async def test_postgres_initialization_installs_canceled_terminal_trigger():
         call.args[0] for call in backend.execute_script.await_args_list
     )
     assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence" in scripts
-    assert "OLD.status = 'canceled'" in scripts
+    assert "OLD.status IN ('completed', 'failed', 'canceled')" in scripts
+    assert "terminal A2A task cannot be replaced" in scripts
+    assert "NEW.status IN ('submitted', 'working', 'input-required')" in scripts
     assert "A2A task requires durable authority" in scripts
     assert "CREATE TRIGGER a2a_tasks_authority_fence_v3" in scripts
 
