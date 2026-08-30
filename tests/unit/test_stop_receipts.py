@@ -431,6 +431,41 @@ async def test_exact_retry_preserves_first_transport_trace_evidence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_request_id_retry_replays_after_inferred_turn_index_is_gone(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-turn-correlation-retry.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        first = StopRequest(
+            scope=StopScope.TURN,
+            actor_id="did:test:operator",
+            target="request-private",
+            target_agent_id="did:test:agent",
+            correlation_id="same-request-id-stop",
+            turn_id="turn-visible-while-live",
+            target_is_turn_id=False,
+        )
+        written = await store.persist(first, _outcomes(first))
+        retry = replace(first, turn_id=None)
+
+        loaded = await store.load(retry)
+        replayed = await store.persist(
+            retry,
+            _outcomes(retry, StopDisposition.ALREADY_COMPLETE),
+        )
+
+        assert loaded is not None
+        assert loaded.receipt_id == written.receipt_id
+        assert loaded.outcomes == written.outcomes
+        assert replayed.receipt_id == written.receipt_id
+        assert replayed.outcomes == written.outcomes
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_operation_reuse_for_different_request_fails_closed(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 

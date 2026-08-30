@@ -37,6 +37,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.telemetry import (
+    KESTREL_TURN_ID,
     current_turn_id as telemetry_current_turn_id,
     span_trace_identity,
     turn_span_scope,
@@ -323,6 +324,12 @@ class TurnLifecycleMixin:
     def bind_current_turn_span(self, span: object) -> bool:
         """Bind a concrete OTel span to the live turn when it is valid."""
 
+        turn_id = self.get_current_turn_id()
+        if turn_id is None or turn_id != getattr(self, "_live_turn_id", None):
+            return False
+        set_attribute = getattr(span, "set_attribute", None)
+        if callable(set_attribute):
+            set_attribute(KESTREL_TURN_ID, turn_id)
         trace_id, span_id = span_trace_identity(span)
         if trace_id is None or span_id is None:
             return False

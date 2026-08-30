@@ -314,6 +314,9 @@ class TestTurnSpansCarryCanonicalStopCorrelation:
         assert set(observed) == {"turn_stream"}
         assert len(observed["turn_stream"][0]) == 32
         assert len(observed["turn_stream"][1]) == 16
+        spans = _roots(span_exporter, "agent.process_input_streaming")
+        assert len(spans) == 1
+        assert dict(spans[0].attributes).get("kestrel.turn_id") == "turn_stream"
         assert host.active_turn_trace_identities() == {}
 
 
