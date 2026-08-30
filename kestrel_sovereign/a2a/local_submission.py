@@ -175,11 +175,13 @@ async def submit_host_attested_local_a2a_task(
                 params=params,
                 agent_name=recipient_id,
                 artifacts=artifacts or None,
+                creator_agent_id=sender_requester.identity,
             )
     return await recipient.task_manager.create_task(
         params=params,
         agent_name=recipient_id,
         artifacts=artifacts or None,
+        creator_agent_id=sender_requester.identity,
     )
 
 

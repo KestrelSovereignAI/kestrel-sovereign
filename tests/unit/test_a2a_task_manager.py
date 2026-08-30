@@ -121,13 +121,39 @@ class TestTaskManager:
 
         task_store = MagicMock()
 
-        async def save_task(task):
+        async def save_task(task, **_authority):
             call_order.append(f"save:{task.status.state.value}")
 
         async def close_task_store():
             call_order.append("close:task_store")
 
+        canceled_task = None
+
+        async def cancel_if_authorized(
+            task_id, *, actor_agent_id, reason=None, operation_id=None
+        ):
+            nonlocal canceled_task
+            if canceled_task is not None:
+                return None
+            call_order.append("save:canceled")
+            canceled_task = Task(
+                id=task_id,
+                status=TaskStatus(state=TaskState.CANCELED),
+                metadata={
+                    "cancellation_receipt": {
+                        "actor_agent_id": actor_agent_id,
+                        "reason": reason,
+                        "status_before": "submitted",
+                    }
+                },
+            )
+            return canceled_task
+
         task_store.save = AsyncMock(side_effect=save_task)
+        task_store.cancel_if_authorized = AsyncMock(
+            side_effect=cancel_if_authorized
+        )
+        task_store.get = AsyncMock(side_effect=lambda _task_id: canceled_task)
         task_store.close = AsyncMock(side_effect=close_task_store)
         session_service = MagicMock()
         session_service.close = AsyncMock()
@@ -454,6 +480,32 @@ class TestOnTaskSubmittedCallback:
             "callback fires while task is still SUBMITTED, before any "
             "status transition"
         )
+
+    @pytest.mark.asyncio
+    async def test_committed_task_wakes_before_cancellable_projection(self, db_path):
+        """Cancellation after commit cannot strand an accepted task unwoken."""
+
+        from kestrel_sovereign.a2a.task_manager import create_task_manager
+
+        received = []
+        manager = await create_task_manager(db_path)
+        manager._on_task_submitted = received.append
+        manager.session_service.get_session = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+        track_manager(manager)
+        params = TaskSendParams(
+            id="cancel-during-admission-projection",
+            message=Message(role="user", parts=[TextPart(text="wake me")]),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await manager.create_task(params, agent_name="did:test:recipient")
+
+        persisted = await manager.task_store.get(params.id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+        assert [task.id for task in received] == [params.id]
 
     @pytest.mark.asyncio
     async def test_callback_exception_does_not_break_create_task(self, db_path):
