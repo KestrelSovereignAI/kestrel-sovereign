@@ -2019,6 +2019,19 @@ class AgentManager:
         self._validate_restored_mandate_ceiling(parent, mandate)
 
         canonical_name = self._canonical_agent_name(name)
+        persistent_registration = (
+            self._persistent_spawn_registrations.get(canonical_name)
+            if mandate.ttl_seconds <= 0
+            else None
+        )
+        if (
+            persistent_registration is not None
+            and persistent_registration[1] != agent_id
+        ):
+            raise RuntimeError(
+                f"Agent {name!r} conflicts with a different persistent spawn "
+                "registration"
+            )
         for recorded_parent, children in self._parent_children.items():
             if recorded_parent == parent_did:
                 continue
@@ -2088,6 +2101,7 @@ class AgentManager:
         retained_cleanup_slots = self._retained_spawn_cleanup_slots()
         if (
             existing is None
+            and persistent_registration is None
             and self._committed_spawn_cap_slots() + retained_cleanup_slots
             >= self._max_spawned_agents
         ):
@@ -2097,6 +2111,11 @@ class AgentManager:
         if not project:
             return
 
+        if mandate.ttl_seconds <= 0:
+            self._persistent_spawn_registrations[canonical_name] = (
+                name,
+                agent_id,
+            )
         children = self._parent_children.setdefault(parent_did, [])
         if not any(
             self._canonical_agent_name(child) == canonical_name for child in children
@@ -3734,6 +3753,22 @@ class AgentManager:
             raise BaseExceptionGroup(
                 "Agent removal had multiple terminal outcomes", outcomes
             )
+        if removed and offboard_runtime and known_agent_id is not None:
+            # The general administrative DELETE removes the startup row before
+            # entering the manager. A successful exact-DID runtime offboarding
+            # is therefore the terminal proof that this durable spawn
+            # reservation can leave the cap, even though relationship pruning
+            # already ran through the ordinary single-agent path.
+            canonical_name = self._canonical_agent_name(name)
+            async with self._lock:
+                persistent_registration = (
+                    self._persistent_spawn_registrations.get(canonical_name)
+                )
+                if (
+                    persistent_registration is not None
+                    and persistent_registration[1] == known_agent_id
+                ):
+                    self._persistent_spawn_registrations.pop(canonical_name, None)
         return removed
 
     async def _join_active_spawn_before_removal(self, name: str) -> bool:

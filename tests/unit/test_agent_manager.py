@@ -1200,6 +1200,35 @@ def test_cold_restore_counts_quarantined_spawn_cap_reservation(tmp_path):
     assert manager.get_children(parent_did) == []
 
 
+def test_stopped_cold_restored_persistent_child_keeps_spawn_cap_slot(tmp_path):
+    """Restart restoration must rebuild the durable registration reservation."""
+
+    parent_did = "did:pkh:eip155:1:0xRestoredPersistentParent"
+    child_did = "did:pkh:eip155:1:0xRestoredPersistentChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._max_spawned_agents = 1
+    manager._register_agent("RestoredPersistentParent", parent)
+    manager._register_agent("RestoredPersistentChild", child)
+
+    # Model a cooperative/non-destructive stop after restart. The live
+    # parent/mandate indexes are pruned, but the startup registration remains.
+    manager._agents.pop("RestoredPersistentChild")
+    manager._agent_names.pop(child_did)
+    manager._prune_child_relationship_and_mandate(
+        parent_did,
+        "RestoredPersistentChild",
+    )
+
+    assert manager._committed_spawn_cap_slots() == 1
+
+
 def test_hybrid_parent_signing_alias_restores_to_stable_parent(tmp_path):
     from kestrel_sovereign.identity.did_web import build_verification_methods
     from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
@@ -2028,6 +2057,49 @@ async def test_stopped_persistent_registration_keeps_spawn_cap_slot(tmp_path):
         parent.agent_id,
         "PersistentChild",
     )
+    assert manager._committed_spawn_cap_slots() == 0
+
+
+@pytest.mark.asyncio
+async def test_endpoint_offboarding_retires_persistent_spawn_cap_slot(tmp_path):
+    """A successful general DELETE must retire its durable child reservation."""
+
+    parent_did = "did:test:endpoint-offboard-parent"
+    child_did = "did:test:endpoint-offboard-child"
+    child = _make_mock_agent(child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["PersistentChild"] = child
+    manager._agent_names[child_did] = "PersistentChild"
+    manager._child_mandates["PersistentChild"] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=child_did,
+        ttl_seconds=0,
+    )
+    manager._parent_children[parent_did] = ["PersistentChild"]
+    manager._persistent_spawn_registrations[
+        manager._canonical_agent_name("PersistentChild")
+    ] = ("PersistentChild", child_did)
+    config = LocalAgentConfig(
+        data_dir=Path("agent_data") / "PersistentChild",
+        port=8801,
+        autostart=True,
+    )
+    manager._start_agent_runtime_offboarding = MagicMock(
+        return_value=SimpleNamespace()
+    )
+    manager._finish_agent_runtime_offboarding = AsyncMock(
+        return_value=(False, None)
+    )
+    admission = RuntimeOffboardingAdmission()
+
+    assert await manager.remove_agent(
+        "PersistentChild",
+        offboard_runtime=True,
+        known_agent_id=child_did,
+        known_agent_config=config,
+        offboarding_admission=admission,
+    )
+    assert admission.started is True
     assert manager._committed_spawn_cap_slots() == 0
 
 
