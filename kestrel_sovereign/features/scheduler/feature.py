@@ -436,7 +436,13 @@ class SchedulerFeature(Feature):
         for task in existing_tasks:
             if task["task_name"] in authority_bound:
                 task_id = task["id"]
-                await self.schedule_remove(task_id)
+                removal = await self.schedule_remove(task_id)
+                if removal.status is not ToolResultStatus.OK:
+                    raise RuntimeError(
+                        "Failed to remove authority-bound schedule "
+                        f"'{task['task_name']}' (id={task_id}): "
+                        f"{removal.error or 'unknown scheduler error'}"
+                    )
                 logger.warning(
                     "Removed authority-bound schedule '%s' (id=%s): this "
                     "request surface requires a live sovereign caller",
