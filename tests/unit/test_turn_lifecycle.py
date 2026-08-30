@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from kestrel_sdk.signals import CausationFrame, ResourceLock
@@ -189,6 +190,41 @@ async def test_turn_index_carries_the_exact_request_generation():
             }
 
     assert agent.active_turn_request_bindings() == {}
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_publishes_public_alias_before_turn_body():
+    agent = _RequestTurnAgent()
+    registry = type("Registry", (), {})()
+    registry.bind_public_turn = AsyncMock(return_value=True)
+    agent._distributed_invocation_registry = registry
+
+    with invocation_scope("private-request"):
+        generation = agent.register_active_request("private-request")
+        async with agent._turn_lifecycle() as turn_id:
+            registry.bind_public_turn.assert_awaited_once_with(
+                agent,
+                "private-request",
+                generation,
+                turn_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_never_enters_body_after_public_stop_wins():
+    agent = _RequestTurnAgent()
+    registry = type("Registry", (), {})()
+    registry.bind_public_turn = AsyncMock(return_value=False)
+    agent._distributed_invocation_registry = registry
+    entered = False
+
+    with invocation_scope("stopped-private-request"):
+        agent.register_active_request("stopped-private-request")
+        with pytest.raises(asyncio.CancelledError, match="public turn"):
+            async with agent._turn_lifecycle():
+                entered = True
+
+    assert entered is False
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,7 @@ class CooperativeStopTarget:
     tool_call_ids: frozenset[str] = field(default_factory=frozenset)
     turn_request_ids: Mapping[str, str] = field(default_factory=dict)
     turn_request_generations: Mapping[str, int] = field(default_factory=dict)
+    accepts_remote_turn_ids: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -43,6 +44,8 @@ class CooperativeStopTarget:
             raise ValueError("Stop targets require concrete target and agent identities")
         if not callable(self.cancel):
             raise TypeError("Stop target cancel operation must be callable")
+        if not isinstance(self.accepts_remote_turn_ids, bool):
+            raise TypeError("Stop target remote-turn capability must be boolean")
         for field_name, addresses in (
             ("turn_ids", self.turn_ids),
             ("tool_call_ids", self.tool_call_ids),
@@ -523,6 +526,10 @@ class CancellationAuthority:
                 and (
                     request.target in target.turn_ids
                     or request.target in target.turn_request_ids
+                    or (
+                        request.target_is_turn_id
+                        and target.accepts_remote_turn_ids
+                    )
                 )
             )
         else:

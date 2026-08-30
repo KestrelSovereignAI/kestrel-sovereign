@@ -158,6 +158,39 @@ async def test_acknowledged_turn_stop_is_queryable_by_durable_target(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_public_turn_receipt_does_not_fence_colliding_request_id(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.stop import DistributedInvocationStore
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-address-kind.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        public_turn = replace(
+            _request(correlation_id="public-turn-stop"),
+            target="colliding-address",
+            turn_id="colliding-address",
+            target_is_turn_id=True,
+        )
+        await store.persist(public_turn, _outcomes(public_turn))
+
+        assert not await store.has_acknowledged_turn_stop(
+            "did:test:agent",
+            "colliding-address",
+        )
+        invocations = DistributedInvocationStore(db)
+        await invocations.ensure_schema()
+        assert await invocations.register(
+            generation_id="request-generation-after-public-stop",
+            agent_id="did:test:agent",
+            turn_id="colliding-address",
+            owner_id="request-owner",
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_opaque_stop_identities_are_blinded_in_claims_and_receipts(tmp_path):
     """Caller retry/turn IDs remain usable without a plaintext footprint."""
 
@@ -925,6 +958,43 @@ def test_live_endpoint_waits_for_remote_owner_before_reporting_stopped():
         "did:test:agent", "turn-on-replica-a"
     )
     remote.wait_for_stop.assert_awaited_once()
+
+
+def test_public_turn_stop_reaches_remote_owner_without_local_alias():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    remote = MagicMock()
+    remote.request_public_turn = AsyncMock(
+        return_value=DistributedStopTicket(("remote-public-generation",))
+    )
+    remote.wait_for_stop = AsyncMock(return_value=StopDisposition.STOPPED)
+    app.state.distributed_invocation_registry = remote
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = set()
+    agent.active_turn_request_bindings = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "public-turn-on-replica-a"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] is True
+    remote.request_public_turn.assert_awaited_once_with(
+        "did:test:agent",
+        "public-turn-on-replica-a",
+    )
+    remote.wait_for_stop.assert_awaited_once()
+    agent.cancel_current_request.assert_not_called()
 
 
 @pytest.mark.parametrize(

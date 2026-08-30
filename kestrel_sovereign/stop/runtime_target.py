@@ -118,7 +118,14 @@ def build_runtime_stop_target(
         distributed_ticket = None
         if distributed_registry is not None:
             if stop_request.scope is StopScope.TURN:
-                if stop_request.request_generation is not None:
+                if stop_request.target_is_turn_id:
+                    distributed_ticket = (
+                        await distributed_registry.request_public_turn(
+                            agent_id,
+                            stop_request.target,
+                        )
+                    )
+                elif stop_request.request_generation is not None:
                     distributed_ticket = (
                         await distributed_registry.request_generation(
                             agent,
@@ -141,16 +148,22 @@ def build_runtime_stop_target(
             raise RuntimeError("agent has no cooperative request cancellation seam")
         cancelled_request_ids: list[str | None] = []
         if stop_request.scope is StopScope.TURN:
-            cancel_kwargs: dict[str, object] = {"request_id": stop_request.target}
-            if stop_request.request_generation is not None:
-                cancel_kwargs["generation"] = stop_request.request_generation
-            cancelled = bool(cancel_current(**cancel_kwargs))
-            if cancelled:
-                cancelled_request_ids.append(stop_request.target)
+            # An unresolved public turn address belongs to a distinct namespace
+            # and may be owned by another replica. Never feed it to the local
+            # request-ID cancellation or reservation seams.
+            if stop_request.target_is_turn_id:
+                cancelled = False
             else:
-                reserve = getattr(type(agent), "reserve_request_cancellation", None)
-                if stop_request.request_generation is None and callable(reserve):
-                    reserve(agent, stop_request.target)
+                cancel_kwargs: dict[str, object] = {"request_id": stop_request.target}
+                if stop_request.request_generation is not None:
+                    cancel_kwargs["generation"] = stop_request.request_generation
+                cancelled = bool(cancel_current(**cancel_kwargs))
+                if cancelled:
+                    cancelled_request_ids.append(stop_request.target)
+                else:
+                    reserve = getattr(type(agent), "reserve_request_cancellation", None)
+                    if stop_request.request_generation is None and callable(reserve):
+                        reserve(agent, stop_request.target)
         else:
             # Receipt preflight and claim I/O happen after the inventory
             # snapshot. Re-read at cancellation linearization so an admitted
@@ -206,6 +219,7 @@ def build_runtime_stop_target(
         turn_ids=frozenset(turn_addresses),
         turn_request_ids=turn_request_ids,
         turn_request_generations=turn_request_generations,
+        accepts_remote_turn_ids=distributed_registry is not None,
     )
 
 

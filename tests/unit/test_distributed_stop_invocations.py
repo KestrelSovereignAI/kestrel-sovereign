@@ -175,6 +175,117 @@ async def test_stop_on_replica_b_cancels_invocation_owned_by_replica_a(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_public_turn_alias_routes_stop_to_remote_request_generation(tmp_path):
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:public-turn-agent")
+    replica_a.attach(agent)
+    agent.cancel_current_request = MagicMock(return_value=True)
+    try:
+        assert await replica_a.register(agent, "private-request", 1)
+        generation_id = replica_a._by_local_generation[
+            (id(agent), "private-request", 1)
+        ]
+        assert await replica_a.bind_public_turn(
+            agent,
+            "private-request",
+            1,
+            "public-turn",
+        )
+
+        ticket = await replica_b.request_public_turn(
+            agent.agent_id,
+            "public-turn",
+        )
+        assert ticket.generation_ids == (generation_id,)
+        for _ in range(100):
+            if agent.cancel_current_request.called:
+                break
+            await asyncio.sleep(0.01)
+
+        agent.cancel_current_request.assert_called_once_with(
+            request_id="private-request",
+            generation=1,
+        )
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_turn_stop_wins_race_before_alias_binding(tmp_path):
+    first_db, second_db, _store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:public-turn-race")
+    try:
+        assert await replica_a.register(agent, "private-race-request", 1)
+        ticket = await replica_b.request_public_turn(
+            agent.agent_id,
+            "public-race-turn",
+        )
+        assert ticket.generation_ids == ()
+
+        assert not await replica_a.bind_public_turn(
+            agent,
+            "private-race-request",
+            1,
+            "public-race-turn",
+        )
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_registration_finishing_during_close_is_retired_and_refused(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "registration-close.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(store, poll_seconds=0.01)
+    agent = _ReplicaAgent("did:test:closing-registration")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_register = store.register
+
+    async def delayed_register(**kwargs):
+        admitted = await original_register(**kwargs)
+        entered.set()
+        await release.wait()
+        return admitted
+
+    store.register = delayed_register
+    registration = asyncio.create_task(registry.register(agent, "closing-turn", 1))
+    try:
+        await entered.wait()
+        closing = asyncio.create_task(registry.close())
+        await asyncio.sleep(0)
+        assert registry._closing is True
+        release.set()
+
+        assert await registration is False
+        await closing
+        assert await db.fetchone(
+            "SELECT 1 FROM stop_active_invocations LIMIT 1"
+        ) is None
+    finally:
+        release.set()
+        if not registration.done():
+            registration.cancel()
+            await asyncio.gather(registration, return_exceptions=True)
+        if not registry._closing:
+            await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pruned", [False, True])
 async def test_abandoned_cleanup_preserves_indeterminate_durable_generation(
     tmp_path,

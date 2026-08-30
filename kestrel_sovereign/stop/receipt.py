@@ -16,7 +16,7 @@ from .types import StopOutcome, StopRequest
 _SCHEMA_LOCK = "stop_receipts_v1"
 _RECEIPT_COLUMNS = (
     "receipt_id, operation_id, request_fingerprint, scope, actor_id, "
-    "requested_target, target_agent_id, reason, cascade, occurred_at, "
+    "requested_target, target_is_turn_id, target_agent_id, reason, cascade, occurred_at, "
     "turn_id, span_id, trace_id"
 )
 _OUTCOME_COLUMNS = (
@@ -62,6 +62,7 @@ class StopReceipt:
     span_id: str | None
     trace_id: str | None
     outcomes: tuple[StopOutcome, ...]
+    target_is_turn_id: bool = False
 
 
 def _fingerprint(request: StopRequest) -> str:
@@ -141,6 +142,7 @@ class StopReceiptStore:
                 "scope TEXT NOT NULL, "
                 "actor_id TEXT NOT NULL, "
                 "requested_target TEXT, "
+                "target_is_turn_id INTEGER NOT NULL DEFAULT 0, "
                 "target_agent_id TEXT, "
                 "reason TEXT, "
                 "cascade INTEGER NOT NULL, "
@@ -149,8 +151,19 @@ class StopReceiptStore:
                 "span_id TEXT, "
                 "trace_id TEXT, "
                 "CHECK (scope IN ('host', 'agent', 'turn', 'tool_call')), "
+                "CHECK (target_is_turn_id IN (0, 1)), "
                 "CHECK (cascade IN (0, 1)))"
             )
+            column_exists = getattr(self._db, "_column_exists", None)
+            if callable(column_exists) and not await column_exists(
+                "stop_receipts", "target_is_turn_id"
+            ):
+                # All receipts predating public turn addressing named the
+                # transport request key, so zero is the exact legacy meaning.
+                await self._db.execute(
+                    "ALTER TABLE stop_receipts ADD COLUMN "
+                    "target_is_turn_id INTEGER NOT NULL DEFAULT 0"
+                )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS stop_receipt_outcomes ("
                 "receipt_id TEXT NOT NULL, "
@@ -224,6 +237,7 @@ class StopReceiptStore:
             "JOIN stop_receipt_outcomes AS outcome "
             "ON outcome.receipt_id = receipt.receipt_id "
             "WHERE receipt.scope = 'turn' "
+            "AND receipt.target_is_turn_id = 0 "
             "AND receipt.target_agent_id = ? "
             "AND receipt.requested_target = ? "
             "AND outcome.disposition IN ('stopped', 'already_complete') "
@@ -346,9 +360,10 @@ class StopReceiptStore:
                 await self._db.execute(
                     "INSERT INTO stop_receipts ("
                     "receipt_id, operation_id, request_fingerprint, scope, "
-                    "actor_id, requested_target, target_agent_id, reason, "
+                    "actor_id, requested_target, target_is_turn_id, "
+                    "target_agent_id, reason, "
                     "cascade, occurred_at, turn_id, span_id, trace_id"
-                    f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?)",
+                    f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?)",
                     (
                         receipt_id,
                         stored_operation_id,
@@ -356,6 +371,7 @@ class StopReceiptStore:
                         request.scope.value,
                         request.actor_id,
                         _optional_identifier_digest("target", request.target),
+                        int(request.target_is_turn_id),
                         request.target_agent_id,
                         request.reason,
                         int(request.cascade),
@@ -417,7 +433,7 @@ class StopReceiptStore:
     async def _receipt_from_row(
         self, row: Any, *, request: StopRequest
     ) -> StopReceipt:
-        if row is None or len(row) != 13:
+        if row is None or len(row) != 14:
             raise StopReceiptCorruptError(
                 "Stop receipt row has an unexpected shape"
             )
@@ -426,7 +442,7 @@ class StopReceiptStore:
         fingerprint = _required_text(row[2], "request_fingerprint")
         scope = _required_text(row[3], "scope")
         actor_id = _required_text(row[4], "actor_id")
-        occurred_at = _required_text(row[9], "occurred_at")
+        occurred_at = _required_text(row[10], "occurred_at")
         expected_operation_id = _identifier_digest(
             "operation", request.correlation_id
         )
@@ -448,25 +464,39 @@ class StopReceiptStore:
             raise StopReceiptConflict(
                 "Stop operation identity was reused for a different request"
             )
-        if row[5] != expected_requested_target or row[10] != expected_turn_id:
+        if row[5] != expected_requested_target or row[11] != expected_turn_id:
             raise StopReceiptCorruptError(
                 "Stop receipt opaque target identity is invalid"
             )
         try:
-            cascade_int = int(row[8])
+            target_is_turn_id_int = int(row[6])
+        except (TypeError, ValueError) as error:
+            raise StopReceiptCorruptError(
+                "Stop receipt target address kind is invalid"
+            ) from error
+        try:
+            cascade_int = int(row[9])
         except (TypeError, ValueError) as error:
             raise StopReceiptCorruptError(
                 "Stop receipt cascade flag is invalid"
             ) from error
         if scope not in {"host", "agent", "turn", "tool_call"}:
             raise StopReceiptCorruptError("Stop receipt scope is invalid")
+        if target_is_turn_id_int not in (0, 1):
+            raise StopReceiptCorruptError(
+                "Stop receipt target address kind is invalid"
+            )
+        if bool(target_is_turn_id_int) is not request.target_is_turn_id:
+            raise StopReceiptCorruptError(
+                "Stop receipt target address kind does not match request"
+            )
         if cascade_int not in (0, 1):
             raise StopReceiptCorruptError("Stop receipt cascade flag is invalid")
         for field_name, value in (
-            ("target_agent_id", row[6]),
-            ("reason", row[7]),
-            ("span_id", row[11]),
-            ("trace_id", row[12]),
+            ("target_agent_id", row[7]),
+            ("reason", row[8]),
+            ("span_id", row[12]),
+            ("trace_id", row[13]),
         ):
             if value is not None and (
                 not isinstance(value, str) or not value.strip()
@@ -480,8 +510,8 @@ class StopReceiptStore:
             raise StopReceiptCorruptError(
                 "Stop receipt requested_target is invalid"
             )
-        if row[10] is not None and (
-            not isinstance(row[10], str) or not row[10]
+        if row[11] is not None and (
+            not isinstance(row[11], str) or not row[11]
         ):
             raise StopReceiptCorruptError("Stop receipt turn_id is invalid")
         outcome_rows = await self._db.fetchall(
@@ -539,14 +569,15 @@ class StopReceiptStore:
             scope=scope,
             actor_id=actor_id,
             requested_target=request.target,
-            target_agent_id=row[6],
-            reason=row[7],
+            target_agent_id=row[7],
+            reason=row[8],
             cascade=bool(cascade_int),
             occurred_at=occurred_at,
             turn_id=request.turn_id,
-            span_id=row[11],
-            trace_id=row[12],
+            span_id=row[12],
+            trace_id=row[13],
             outcomes=tuple(outcomes),
+            target_is_turn_id=bool(target_is_turn_id_int),
         )
 
     @staticmethod
@@ -568,6 +599,7 @@ class StopReceiptStore:
             receipt.reason,
             receipt.cascade,
             receipt.turn_id,
+            receipt.target_is_turn_id,
         )
         supplied = (
             request.correlation_id,
@@ -578,6 +610,7 @@ class StopReceiptStore:
             request.reason,
             request.cascade,
             request.turn_id,
+            request.target_is_turn_id,
         )
         if recorded != supplied:
             raise StopReceiptCorruptError(

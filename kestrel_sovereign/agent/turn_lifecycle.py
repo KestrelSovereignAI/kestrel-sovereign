@@ -17,6 +17,7 @@ The dispatcher does NOT pre-acquire `CONVERSATION` for COGNITION sources
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import time
@@ -420,6 +421,42 @@ class TurnLifecycleMixin:
                         request_generation,
                     )
                     request_binding_registered = True
+                    registry = vars(self).get(
+                        "_distributed_invocation_registry"
+                    )
+                    if registry is not None and request_generation is not None:
+                        bind_public_turn = getattr(
+                            registry,
+                            "bind_public_turn",
+                            None,
+                        )
+                        if not callable(bind_public_turn):
+                            raise TypeError(
+                                "distributed invocation registry cannot bind public turns"
+                            )
+                        admitted = await bind_public_turn(
+                            self,
+                            request_id,
+                            request_generation,
+                            turn_id,
+                        )
+                        if admitted is not True:
+                            reserve = getattr(
+                                type(self),
+                                "reserve_request_cancellation",
+                                None,
+                            )
+                            consume = getattr(
+                                type(self),
+                                "_consume_pending_request_cancellation",
+                                None,
+                            )
+                            if callable(reserve) and callable(consume):
+                                reserve(self, request_id)
+                                consume(self, request_id, request_generation)
+                            raise asyncio.CancelledError(
+                                "public turn was stopped before durable binding"
+                            )
                 yield turn_id
             finally:
                 try:
