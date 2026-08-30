@@ -24,6 +24,51 @@ from .image_utils import process_images
 logger = logging.getLogger(__name__)
 
 
+def _normalized_google_genai_usage(
+    usage: Any,
+) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """Return SDK-semantic Gemini usage with cached prompt tokens split out.
+
+    google-genai reports ``prompt_token_count`` and ``total_token_count``
+    inclusive of ``cached_content_token_count``. ``LLMResponse`` defines its
+    input and total fields as excluding separately reported cache buckets, so
+    normalize that provider shape once for both Google API and Vertex routes.
+    """
+
+    def field(name: str) -> Any:
+        if isinstance(usage, dict):
+            return usage.get(name)
+        return getattr(usage, name, None)
+
+    def token_count(name: str) -> Optional[int]:
+        value = field(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+
+    input_tokens = token_count("prompt_token_count")
+    output_tokens = token_count("candidates_token_count")
+    total_tokens = token_count("total_token_count")
+    cache_read_input_tokens = token_count("cached_content_token_count")
+
+    if cache_read_input_tokens is not None:
+        if input_tokens is not None:
+            input_tokens = max(0, input_tokens - cache_read_input_tokens)
+        if total_tokens is not None:
+            total_tokens = max(0, total_tokens - cache_read_input_tokens)
+    if total_tokens is None and (
+        input_tokens is not None or output_tokens is not None
+    ):
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+    return (
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cache_read_input_tokens,
+    )
+
+
 class GoogleAdapter(LLMAdapter):
     """
     Adapter for Google Gemini API.
@@ -261,29 +306,43 @@ class GoogleAdapter(LLMAdapter):
                         arguments=args
                     ))
 
+            input_tokens = output_tokens = total_tokens = None
+            cache_read_input_tokens = None
+            usage_metadata = getattr(response, "usage_metadata", None)
+            if usage_metadata is not None:
+                (
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_read_input_tokens,
+                ) = _normalized_google_genai_usage(usage_metadata)
+
             return LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
-                raw=response
+                raw=response,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             )
 
         except Exception as e:
             logger.error(f"Google Gemini API error: {e}", exc_info=True)
             raise
 
-    async def get_streaming_response(
+    async def _stream_with_usage(
         self,
         client: Any,
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
-        """
-        Get streaming response from Google Gemini.
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Stream text plus one terminal response carrying final usage.
 
         Yields:
-            Text chunks as they arrive
+            Text chunks as they arrive, then a usage-bearing response.
         """
         try:
             config: Dict[str, Any] = {
@@ -306,13 +365,95 @@ class GoogleAdapter(LLMAdapter):
                 config=config,
             )
 
+            text_content = ""
+            usage_metadata = None
             async for chunk in stream:
-                if chunk.text:
-                    yield chunk.text
+                if getattr(chunk, "usage_metadata", None) is not None:
+                    usage_metadata = chunk.usage_metadata
+                text = getattr(chunk, "text", None)
+                if text:
+                    text_content += text
+                    yield text
+
+            input_tokens = output_tokens = total_tokens = None
+            cache_read_input_tokens = None
+            if usage_metadata is not None:
+                (
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_read_input_tokens,
+                ) = _normalized_google_genai_usage(usage_metadata)
+            yield LLMResponse(
+                content=text_content or None,
+                tool_calls=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+            )
 
         except Exception as e:
             logger.error(f"Google Gemini streaming error: {e}", exc_info=True)
             raise
+
+    async def get_streaming_response(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """Preserve the public text-only stream while retaining one source."""
+        async for item in self._stream_with_usage(
+            client=client,
+            model=model,
+            messages=messages,
+            tools=tools,
+            **kwargs,
+        ):
+            if isinstance(item, str):
+                yield item
+
+    async def get_streaming_response_with_tools(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Expose Gemini's usage-bearing stream to the service finalizer.
+
+        Google declares non-streaming tool fallback. Probe once when tools are
+        present so function calls remain structured; text-only calls use the
+        provider stream and always finish with one usage-bearing response.
+        """
+        if tools:
+            response = await self.get_response(
+                client=client,
+                model=model,
+                messages=messages,
+                tools=tools,
+                **kwargs,
+            )
+            if response.has_tool_calls:
+                yield response
+                return
+            if response.content:
+                yield response.content
+            yield response
+            return
+
+        async for item in self._stream_with_usage(
+            client=client,
+            model=model,
+            messages=messages,
+            tools=tools,
+            **kwargs,
+        ):
+            yield item
 
     async def continue_with_tool_results(
         self,

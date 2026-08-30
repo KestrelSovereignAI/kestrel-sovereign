@@ -130,12 +130,16 @@ def _make_mock_agent(tmp_path: Path, db=None):
     agent.storage.db = db or _make_mock_db()
     agent.storage.add_node = AsyncMock()
     agent.storage.delete_node = AsyncMock()
+    agent.storage.compare_and_delete_node = AsyncMock(return_value="deleted")
     agent.storage.get_nodes_by_type = AsyncMock(return_value=[])
     # skill_delete now fetches the node first and only deletes skill-typed
     # nodes (F257). Default to a skill-typed node so the ordinary delete
     # path exercises delete_node; individual tests override as needed.
     agent.storage.get_node = AsyncMock(
-        return_value=SimpleNamespace(node_type=SKILL_NODE_TYPE)
+        return_value=SimpleNamespace(
+            node_type=SKILL_NODE_TYPE,
+            label="Observed skill",
+        )
     )
 
     # Skills feature resolves agent data dir via bootstrap_service.
@@ -408,12 +412,19 @@ class TestListShowDelete:
         assert envelope.data["removed_file"] is True
         assert envelope.data["removed_node"] is True
         assert not path.exists()
-        feature.agent.storage.delete_node.assert_awaited_once_with("skill_del")
+        feature.agent.storage.compare_and_delete_node.assert_awaited_once_with(
+            "skill_del",
+            expected_node_type=SKILL_NODE_TYPE,
+            expected_label="Observed skill",
+        )
+        feature.agent.storage.delete_node.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_missing(self, feature):
         # Make the graph delete raise so removed_node stays False
-        feature.agent.storage.delete_node = AsyncMock(side_effect=Exception("no node"))
+        feature.agent.storage.compare_and_delete_node = AsyncMock(
+            side_effect=Exception("no node")
+        )
         envelope = await feature.skill_delete(skill_id="skill_nope")
         assert envelope.status is not ToolResultStatus.OK
 
@@ -422,7 +433,7 @@ class TestListShowDelete:
         """F257: skill_id is LLM-controlled. A node that exists but is
         NOT a skill (memory concept, identity node, channel_link, ...)
         must never be deleted — the tool fetches it first and returns
-        not-found without touching delete_node.
+        not-found without touching compare_and_delete_node.
         """
         feature.agent.storage.get_node = AsyncMock(
             return_value=SimpleNamespace(node_type="identity")
@@ -433,6 +444,7 @@ class TestListShowDelete:
 
         assert envelope.status is not ToolResultStatus.OK
         assert envelope.data is None or not envelope.data.get("removed_node")
+        feature.agent.storage.compare_and_delete_node.assert_not_awaited()
         feature.agent.storage.delete_node.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -446,22 +458,86 @@ class TestListShowDelete:
         envelope = await feature.skill_delete(skill_id="skill_absent")
 
         assert envelope.status is not ToolResultStatus.OK
+        feature.agent.storage.compare_and_delete_node.assert_not_awaited()
         feature.agent.storage.delete_node.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_skill_node_checks_type_before_delete(self, feature):
         """A genuine skill node is fetched, type-verified, then deleted."""
         feature.agent.storage.get_node = AsyncMock(
-            return_value=SimpleNamespace(node_type=SKILL_NODE_TYPE)
+            return_value=SimpleNamespace(
+                node_type=SKILL_NODE_TYPE,
+                label="Observed skill",
+            )
         )
-        feature.agent.storage.delete_node = AsyncMock(return_value=None)
+        feature.agent.storage.compare_and_delete_node = AsyncMock(
+            return_value="deleted"
+        )
 
         envelope = await feature.skill_delete(skill_id="skill_real")
 
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["removed_node"] is True
         feature.agent.storage.get_node.assert_awaited_once_with("skill_real")
-        feature.agent.storage.delete_node.assert_awaited_once_with("skill_real")
+        feature.agent.storage.compare_and_delete_node.assert_awaited_once_with(
+            "skill_real",
+            expected_node_type=SKILL_NODE_TYPE,
+            expected_label="Observed skill",
+        )
+        feature.agent.storage.delete_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_uses_observed_graph_identity_atomically(self, feature):
+        """A replacement between read and delete must survive the skill tool."""
+
+        feature._skills_dir = None
+        feature.agent.storage.get_node = AsyncMock(
+            return_value=SimpleNamespace(
+                node_type=SKILL_NODE_TYPE,
+                label="Observed skill",
+            )
+        )
+        feature.agent.storage.compare_and_delete_node = AsyncMock(
+            return_value="predicate_failed"
+        )
+        feature.agent.storage.delete_node = AsyncMock()
+
+        envelope = await feature.skill_delete(skill_id="skill-raced")
+
+        assert envelope.status is not ToolResultStatus.OK
+        feature.agent.storage.compare_and_delete_node.assert_awaited_once_with(
+            "skill-raced",
+            expected_node_type=SKILL_NODE_TYPE,
+            expected_label="Observed skill",
+        )
+        feature.agent.storage.delete_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_race_after_file_unlink_reports_partial(self, feature):
+        """A replacement graph node surviving file deletion is spoken aloud."""
+
+        skill_id = "skill-raced-after-unlink"
+        path = feature._skill_path(skill_id)
+        path.write_text("authoritative skill", encoding="utf-8")
+        feature.agent.storage.get_node = AsyncMock(
+            return_value=SimpleNamespace(
+                node_type=SKILL_NODE_TYPE,
+                label="Observed skill",
+            )
+        )
+        feature.agent.storage.compare_and_delete_node = AsyncMock(
+            return_value="predicate_failed"
+        )
+
+        envelope = await feature.skill_delete(skill_id=skill_id)
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data == {
+            "skill_id": skill_id,
+            "removed_file": True,
+            "removed_node": False,
+        }
+        assert not path.exists()
 
 
 # =============================================================================
@@ -903,7 +979,9 @@ class TestPartialFailures:
         )
         (tmp_path / "skills" / f"{s.id}.md").write_text(s.to_markdown(), encoding="utf-8")
 
-        feature.agent.storage.delete_node = AsyncMock(side_effect=Exception("not in graph"))
+        feature.agent.storage.compare_and_delete_node = AsyncMock(
+            side_effect=Exception("not in graph")
+        )
         envelope = await feature.skill_delete(skill_id="skill_partial")
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["removed_file"] is True

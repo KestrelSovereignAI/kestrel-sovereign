@@ -24,7 +24,7 @@ Usage::
 
 Exit codes mirror the bash original: 0 on all-pass, 1 on any-fail.
 
-Cross-platform: the venv ``python`` / ``pip`` / ``uvicorn``
+Cross-platform: the venv ``python`` / ``uvicorn``
 executables live under ``Scripts\\`` on Windows and ``bin/`` elsewhere;
 :func:`_venv_exec` picks the right one. Subprocess output is **streamed**
 to stdout/stderr (not captured) — matches the Tier 1.3 lesson that
@@ -140,16 +140,23 @@ def _pip_install(
     venv_dir: Path,
     *args: str,
 ) -> bool:
-    """Run ``<venv>/bin/pip install <args>`` with VIRTUAL_ENV set so
-    pip resolves the right interpreter on platforms (Linux) where it
-    matters. Returns True on success.
+    """Install with ``uv pip install --python <venv-python> <args>``.
+
+    ``_make_venv`` deliberately creates uv's lean, unseeded environment, so a
+    ``pip`` executable is not present.  The verifier follows Kestrel's house
+    convention and points uv at the target interpreter explicitly rather than
+    changing the environment shape with ``uv venv --seed``. Returns True on
+    success.
     """
-    pip = _venv_exec(venv_dir, "pip")
-    if not pip.exists():
+    python = _venv_exec(venv_dir, "python")
+    if not python.exists():
         return False
     env = os.environ.copy()
     env["VIRTUAL_ENV"] = str(venv_dir)
-    rc = _run_streaming([str(pip), "install", *args], env=env)
+    rc = _run_streaming(
+        ["uv", "pip", "install", "--python", str(python), *args],
+        env=env,
+    )
     return rc == 0
 
 
