@@ -125,6 +125,14 @@ example, requires no relationship at all; its universality creates no
 hierarchy. Durable Hold does require authority and therefore remains scoped to
 the signed creation axis.
 
+### 8. Stop Work; Terminate Processes
+
+**Stop** is cooperative cancellation of in-flight work. Its scopes are host,
+agent, turn, and tool call. Operating-system process termination is a separate
+runtime lifecycle operation and must be named **terminate**, never wired as a
+Stop implementation. Stop is an event; it does not grant or imply the durable
+authority to Hold an agent.
+
 ---
 
 ## Anti-Patterns to Avoid

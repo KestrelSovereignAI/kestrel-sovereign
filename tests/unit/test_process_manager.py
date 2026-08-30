@@ -645,22 +645,22 @@ class TestStartAgent:
 # Stop agent tests
 # -----------------------------------------------------------------------
 
-class TestStopAgent:
-    """Test stopping agent processes."""
+class TestTerminateAgent:
+    """Test terminating agent processes."""
 
     def test_stop_unregistered_agent_returns_true(self, pm):
         """Stopping an unregistered agent is a no-op (returns True)."""
-        assert pm.stop_agent("nonexistent") is True
+        assert pm.terminate_agent("nonexistent") is True
 
-    def test_stop_agent_not_running_returns_true(self, pm, project_dir):
+    def test_terminate_agent_not_running_returns_true(self, pm, project_dir):
         """Stopping a registered but non-running agent returns True."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
         pm.register_agent("claw", cfg)
-        assert pm.stop_agent("claw") is True
+        assert pm.terminate_agent("claw") is True
 
-    def test_stop_agent_sends_sigterm(self, pm, project_dir):
+    def test_terminate_agent_sends_sigterm(self, pm, project_dir):
         """Stopping a running agent sends SIGTERM first."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
@@ -675,13 +675,13 @@ class TestStopAgent:
                           side_effect=[True, False, False, False]), \
              patch.object(ProcessManager, "kill_process") as mock_kill, \
              patch("time.sleep"):
-            pm.stop_agent("claw")
+            pm.terminate_agent("claw")
 
         # The identity is carried into the signal so a PID that changed
         # hands since registration is not signalled (#2995).
         mock_kill.assert_called_once_with(99999, force=False, started_at=None)
 
-    def test_stop_agent_escalates_to_sigkill(self, pm, project_dir):
+    def test_terminate_agent_escalates_to_sigkill(self, pm, project_dir):
         """If agent doesn't stop gracefully, SIGKILL is sent."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
@@ -693,7 +693,7 @@ class TestStopAgent:
         with patch.object(ProcessManager, "is_process_running", return_value=True), \
              patch.object(ProcessManager, "kill_process") as mock_kill, \
              patch("time.sleep"):
-            pm.stop_agent("claw", timeout=0.01)
+            pm.terminate_agent("claw", timeout=0.01)
 
         # Should have been called at least twice: SIGTERM then SIGKILL
         assert mock_kill.call_count >= 2
@@ -704,7 +704,7 @@ class TestStopAgent:
         last_call = mock_kill.call_args_list[-1]
         assert last_call == ((99999,), {"force": True, "started_at": None})
 
-    def test_stop_agent_clears_pid(self, pm, project_dir):
+    def test_terminate_agent_clears_pid(self, pm, project_dir):
         """Stopping an agent clears its PID file."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
@@ -716,11 +716,11 @@ class TestStopAgent:
         ProcessManager.write_pid(ap.pid_file, 99999)
 
         with patch.object(ProcessManager, "is_process_running", return_value=False):
-            pm.stop_agent("claw")
+            pm.terminate_agent("claw")
 
         assert not ap.pid_file.exists()
 
-    def test_stop_agent_that_survives_sigkill_reports_failure(self, pm, project_dir):
+    def test_terminate_agent_that_survives_sigkill_reports_failure(self, pm, project_dir):
         """An agent still running after SIGKILL must not be reported stopped."""
         cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
         ap = pm.register_agent("claw", cfg)
@@ -731,7 +731,7 @@ class TestStopAgent:
         with patch.object(ProcessManager, "is_process_running", return_value=True), \
              patch.object(ProcessManager, "kill_process"), \
              patch("time.sleep"):
-            result = pm.stop_agent("claw", timeout=0.01)
+            result = pm.terminate_agent("claw", timeout=0.01)
 
         assert result is False
         # The PID file is the only record of a process that outlived the stop;
@@ -739,8 +739,8 @@ class TestStopAgent:
         assert ap.pid_file.exists()
         assert ap.pid == 99999
 
-    def test_stop_all_names_the_agents_that_survived(self, pm, project_dir):
-        """stop_all reports which agents outlived the stop rather than dropping it."""
+    def test_terminate_all_names_the_agents_that_survived(self, pm, project_dir):
+        """terminate_all reports which agents outlived it rather than dropping it."""
         for name, port in (("claw", 8801), ("testbot", 8802)):
             ap = pm.register_agent(name, LocalAgentConfig(
                 data_dir=Path(f"agent_data/{name}"), port=port,
@@ -754,7 +754,7 @@ class TestStopAgent:
         with patch.object(ProcessManager, "is_process_running", side_effect=_running), \
              patch.object(ProcessManager, "kill_process"), \
              patch("time.sleep"):
-            survivors = pm.stop_all(timeout=0.01)
+            survivors = pm.terminate_all(timeout=0.01)
 
         assert survivors == ["claw"]
 
@@ -806,7 +806,7 @@ class TestStopAgent:
         ProcessManager.write_pid(ap.pid_file, child.pid)
 
         try:
-            result = pm.stop_agent("claw", timeout=0.01)
+            result = pm.terminate_agent("claw", timeout=0.01)
             # Observed BEFORE the cleanup below. Waiting first would reap the
             # child itself and the assertion would be checking this test's own
             # housekeeping rather than the stop's.
@@ -867,8 +867,8 @@ class TestStartStopAll:
         assert "bad" not in started
         assert "claw" in started
 
-    def test_stop_all(self, pm, project_dir):
-        """stop_all stops all registered agents."""
+    def test_terminate_all(self, pm, project_dir):
+        """terminate_all terminates all registered agent processes."""
         cfg1 = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -878,8 +878,8 @@ class TestStartStopAll:
         pm.register_agent("claw", cfg1)
         pm.register_agent("testbot", cfg2)
 
-        with patch.object(pm, "stop_agent") as mock_stop:
-            pm.stop_all()
+        with patch.object(pm, "terminate_agent") as mock_stop:
+            pm.terminate_all()
 
         assert mock_stop.call_count == 2
 
