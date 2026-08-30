@@ -297,6 +297,8 @@ async def build_host_context(
         )
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
+        from kestrel_sovereign.hold import HoldStore
+        from kestrel_sovereign.hold.state import hold_initialization_witness_path
 
         resolved = prepare_host_database(db_path)
         db = await AsyncDatabase.sqlite(str(resolved))
@@ -305,24 +307,20 @@ async def build_host_context(
         session_factory = FleetSessionFactory(inner)
 
         backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
-        if backend == "postgres":
-            dsn = os.environ.get("KESTREL_DATABASE_URL")
-            if not dsn:
-                raise ValueError(
-                    "KESTREL_DATABASE_URL is required for durable Hold "
-                    "when KESTREL_DB_BACKEND=postgres"
-                )
+        dsn = os.environ.get("KESTREL_DATABASE_URL")
+        if backend == "postgres" and dsn:
             hold_db = await AsyncDatabase.postgres(dsn)
             hold_location = "configured PostgreSQL database"
+            initialization_witness_path = None
         else:
             hold_db = db
             hold_location = str(resolved)
-        from kestrel_sovereign.hold import HoldStore
-        from kestrel_sovereign.hold.state import hold_initialization_witness_path
-
+            initialization_witness_path = hold_initialization_witness_path(
+                resolved
+            )
         hold_store = HoldStore(
             hold_db,
-            initialization_witness_path=hold_initialization_witness_path(resolved),
+            initialization_witness_path=initialization_witness_path,
         )
         await hold_store.ensure_schema()
         hold_boot_state = await hold_store.read_boot_state()
