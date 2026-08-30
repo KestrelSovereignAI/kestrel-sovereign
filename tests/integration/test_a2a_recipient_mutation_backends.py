@@ -102,7 +102,6 @@ async def test_recipient_mutation_authority_sqlite(tmp_path):
     finally:
         await backend.close()
 
-
 @pytest.mark.asyncio
 async def test_recipient_mutation_authority_postgres():
     if not POSTGRES_URL:  # pragma: no cover - environment gate
@@ -117,4 +116,3 @@ async def test_recipient_mutation_authority_postgres():
         await _exercise_recipient_mutations(TaskStore(backend))
     finally:
         await backend.close()
-
