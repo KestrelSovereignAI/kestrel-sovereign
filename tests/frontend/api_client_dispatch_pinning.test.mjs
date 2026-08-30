@@ -154,6 +154,56 @@ test('invokeForAgent pins the non-streaming POST to the explicit agent', async (
         'invokeForAgent must address the explicit agent regardless of selectedHostAgent');
 });
 
+test('invokeForAgent publishes and sends an exact non-streaming Stop id', async () => {
+    const calls = [];
+    let releaseFetch;
+    const fetchReleased = new Promise((resolve) => { releaseFetch = resolve; });
+    const client = createApiClient({
+        fetchFn: async (url, options) => {
+            calls.push({ url, options });
+            await fetchReleased;
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ response: 'r' }),
+                headers: { get: () => null },
+            };
+        },
+        sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+        location: { href: '/', search: '' },
+        AbortControllerCtor: StubAbort,
+        TextDecoderCtor: StubDecoder,
+        authProvider: makeAuthProvider(),
+    });
+
+    const pending = client.invokeForAgent(
+        'hi', null, null, null, 'dispatch-A', 'nonstream-turn-1',
+    );
+    assert.equal(client.getCurrentStreamRequestId('dispatch-A'), 'nonstream-turn-1');
+    releaseFetch();
+    await pending;
+
+    assert.equal(
+        JSON.parse(calls[0].options.body).request_id,
+        'nonstream-turn-1',
+    );
+    assert.equal(
+        client.getCurrentStreamRequestId('dispatch-A'),
+        'nonstream-turn-1',
+        'response settlement must not erase the Stop address before the UI owner settles',
+    );
+    assert.equal(
+        client.completeCurrentStreamRequestId('dispatch-A', 'wrong-owner'),
+        false,
+    );
+    assert.equal(client.getCurrentStreamRequestId('dispatch-A'), 'nonstream-turn-1');
+    assert.equal(
+        client.completeCurrentStreamRequestId('dispatch-A', 'nonstream-turn-1'),
+        true,
+    );
+    assert.equal(client.getCurrentStreamRequestId('dispatch-A'), null);
+});
+
 test('invokeForAgent without explicit agent falls back to current selected (preserves invoke() behavior)', async () => {
     const calls = [];
     const client = createApiClient({

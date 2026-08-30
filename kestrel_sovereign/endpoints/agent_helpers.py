@@ -6,6 +6,7 @@ from fastapi import HTTPException, Request
 
 from kestrel_sovereign.agent.invocation import (
     InvocationProvenance,
+    invocation_id_response_header,
     request_provenance,
     resolve_transport_invocation_id,
 )
@@ -71,6 +72,78 @@ def request_invocation_provenance(
         actor=actor,
         source_kind="http_request",
         source_locator=source_locator,
+    )
+
+
+async def prime_durable_stop_fence(
+    request: Request,
+    agent: object,
+    invocation_id: str,
+) -> bool:
+    """Reinstall a durable exact-turn Stop before lifecycle registration.
+
+    The in-memory reservation closes the live race between Stop and request
+    registration. This lookup closes the longer restart/delivery-delay window:
+    an acknowledged durable Stop remains authoritative even after that short
+    reservation ages out. Stores without this optional query are retained for
+    compatibility in tests and embedded deployments that do not expose Stop.
+    """
+
+    store = getattr(request.app.state, "stop_receipt_store", None)
+    lookup = getattr(store, "has_acknowledged_turn_stop", None)
+    if not callable(lookup):
+        startup_error = getattr(
+            request.app.state, "stop_receipt_store_error", ""
+        )
+        if isinstance(startup_error, str) and startup_error:
+            raise ApiHTTPException(
+                status_code=503,
+                code="stop_evidence_unavailable",
+                message=(
+                    "Durable Stop evidence could not be checked before execution."
+                ),
+            )
+        return False
+    agent_id = getattr(agent, "agent_id", None)
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        agent_id = "local-agent"
+    try:
+        stopped = await lookup(agent_id, invocation_id)
+    except Exception as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_evidence_unavailable",
+            message=(
+                "Durable Stop evidence could not be checked before execution."
+            ),
+        ) from error
+    if not isinstance(stopped, bool):
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_evidence_unavailable",
+            message="Durable Stop evidence returned an invalid result.",
+        )
+    if not stopped:
+        return False
+    reserve = getattr(type(agent), "reserve_request_cancellation", None)
+    if not callable(reserve):
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_fence_unavailable",
+            message="The stopped request cannot be fenced safely.",
+        )
+    reserve(agent, invocation_id)
+    return True
+
+
+def stopped_invocation_http_error(invocation_id: str) -> ApiHTTPException:
+    """Translate cooperative turn cancellation at a synchronous HTTP door."""
+
+    return ApiHTTPException(
+        status_code=409,
+        code="request_stopped",
+        message="Request stopped during execution.",
+        headers={"X-Request-ID": invocation_id_response_header(invocation_id)},
     )
 
 

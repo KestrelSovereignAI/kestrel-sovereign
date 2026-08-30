@@ -236,7 +236,7 @@ backend:
 
 ```bash
 # Local checkout: stop the old server before asking the new CLI to restart it.
-kestrel stop
+kestrel terminate
 kestrel update
 
 # systemd: repeat for every unit/replica that uses the database.

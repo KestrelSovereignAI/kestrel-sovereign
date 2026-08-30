@@ -234,6 +234,11 @@ class DurableAdmissionResult:
 
 
 @dataclass
+class _StoppedCognitionResult(SignalResult):
+    """Typed terminal no-op produced by an acknowledged cooperative Stop."""
+
+
+@dataclass
 class SignalDispatchHandle(SignalHandle):
     """SDK terminal handle plus the earlier durable-admission receipt.
 
@@ -3446,7 +3451,10 @@ class SignalDispatcher:
         # Rate limits, quiet hours, coalescing, and cognition failures are
         # recoverable for cursor-owning ingress. Validation/cycle refusal is a
         # proven terminal no-op and may be acknowledged idempotently.
-        terminal = result.status in {Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE}
+        terminal = isinstance(result, _StoppedCognitionResult) or result.status in {
+            Status.DROPPED_VALIDATION,
+            Status.DROPPED_CYCLE,
+        }
         released = await self.nack_durable_delivery(
             consumer_id=consumer_id,
             delivery_id=delivery.delivery_id,
@@ -3893,6 +3901,7 @@ class SignalDispatcher:
         from kestrel_sovereign.agent.context_manager import (
             reset_injection_tracking,
         )
+        from kestrel_sovereign.agent.invocation import InvocationCancelledError
 
         reset_injection_tracking()
 
@@ -3948,6 +3957,28 @@ class SignalDispatcher:
                         "kestrel.signal.status", result.status.value
                     )
                 return result
+        except InvocationCancelledError as error:
+            # Cooperative Stop is neither a provider failure nor retry
+            # authority. Preserve the ordinary route audit while carrying a
+            # typed disposition to the durable settlement boundary below.
+            stopped = self._fail(
+                signal,
+                start,
+                Status.COALESCED,
+                error=f"stop_acknowledged: {error}",
+                registration=registration,
+                audit=audit,
+            )
+            return _StoppedCognitionResult(
+                signal_id=stopped.signal_id,
+                status=stopped.status,
+                mode=stopped.mode,
+                duration_ms=stopped.duration_ms,
+                turn_id=stopped.turn_id,
+                artifact=stopped.artifact,
+                action_result=stopped.action_result,
+                error=stopped.error,
+            )
         except Exception as e:
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in

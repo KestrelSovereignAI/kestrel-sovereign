@@ -122,6 +122,11 @@ const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 chatModule.initChat();
 
+const confirmedStopResponse = () => ({
+    success: true,
+    stop_outcomes: [{ disposition: 'stopped' }],
+});
+
 
 function controlledStream() {
     let resolveNext = null;
@@ -206,14 +211,16 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
     // Stop ack: pretend the server returns 200.
     apiModule.default.stop = async (requestId, agent) => {
         eventLog.push(`stop:${requestId}:${agent}`);
-        return { ok: true };
+        return confirmedStopResponse();
     };
 
     // New stream: capture that we got there, then end cleanly so
     // sendMessage's await resolves.
     const ctrl = controlledStream();
+    let dispatchedRequestId = null;
     apiModule.default.streamInvoke = (...args) => {
         eventLog.push('streamInvoke');
+        dispatchedRequestId = args[7];
         return ctrl.iter;
     };
     apiModule.default.invoke = async () => ({ response: '' });
@@ -244,6 +251,378 @@ test('sendMessage interrupts the in-flight turn before dispatching the new one (
         'POST /api/agent/stop must resolve BEFORE the new streamInvoke opens');
     assert.ok(abortIdx <= stopIdx,
         'client-side abort must precede or coincide with the stop POST');
+    assert.equal(typeof dispatchedRequestId, 'string');
+    assert.ok(dispatchedRequestId.length > 0,
+        'chat must allocate the next turn address before opening its stream');
+});
+
+
+test('sendMessage does not dispatch a replacement when Stop is unconfirmed', async () => {
+    const agent = 'agent-stop-failed';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    let currentRequestId = 'prior-request';
+    apiModule.default.getCurrentStreamRequestId = () => currentRequestId;
+    let stopAttempts = 0;
+    const stoppedRequestIds = [];
+    const stopCorrelationIds = [];
+    apiModule.default.stop = async (requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        stoppedRequestIds.push(requestId);
+        stopCorrelationIds.push(correlationId);
+        throw new Error('stop_not_confirmed');
+    };
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return (async function* () {})();
+    };
+
+    messageInput.value = 'do not overlap this turn';
+    await sendMessage();
+
+    assert.equal(replacementStarted, false,
+        'an unconfirmed Stop must not open a concurrent replacement turn');
+    assert.equal(messageInput.value, 'do not overlap this turn',
+        'the unsent redirect remains available for retry');
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'failed Stop must leave a guard that abort cleanup cannot erase');
+
+    // Simulate the aborted prior stream's finally clearing its own ordinary
+    // busy marker, then retry Send. The unconfirmed-Stop latch must still
+    // route this through Stop and refuse to open a replacement stream.
+    state.waitingAgents.delete(agent);
+    currentRequestId = null;
+    messageInput.value = 'still do not overlap';
+    await sendMessage();
+    assert.equal(stopAttempts, 2,
+        'a retry while Stop is unconfirmed must retry Stop first');
+    assert.equal(replacementStarted, false,
+        'clearing waitingAgents must not bypass the unconfirmed-Stop latch');
+    assert.deepEqual(stoppedRequestIds, ['prior-request', 'prior-request'],
+        'a failed Stop retry must retain the original turn ID');
+    assert.equal(typeof stopCorrelationIds[0], 'string');
+    assert.equal(stopCorrelationIds[1], stopCorrelationIds[0],
+        'a failed Stop retry must replay the original durable operation ID');
+
+    state.unconfirmedStopAgents.delete(agent);
+    state.unconfirmedStopRequestIds.delete(agent);
+    state.unconfirmedStopCorrelationIds.delete(agent);
+});
+
+
+test('terminal failed Stop receipt retries with a new durable operation ID', async () => {
+    const agent = 'agent-stop-terminal-reconcile';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-terminal-request';
+    const correlationIds = [];
+    const requestIds = [];
+    let stopAttempts = 0;
+    apiModule.default.stop = async (requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        requestIds.push(requestId);
+        correlationIds.push(correlationId);
+        if (stopAttempts === 1) {
+            const error = new Error('terminal stop receipt');
+            error.body = {
+                error: {
+                    code: 'stop_not_confirmed',
+                    details: [{
+                        disposition: 'unreachable',
+                        receipt_id: 'durable-terminal-receipt',
+                    }],
+                },
+            };
+            throw error;
+        }
+        return confirmedStopResponse();
+    };
+    const ctrl = controlledStream();
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return ctrl.iter;
+    };
+    apiModule.default.invoke = async () => ({ response: '' });
+
+    messageInput.value = 'first reconciliation attempt';
+    await sendMessage();
+    assert.equal(replacementStarted, false);
+    assert.equal(state.unconfirmedStopAgents.has(agent), true);
+
+    state.waitingAgents.delete(agent);
+    messageInput.value = 'retry after terminal evidence';
+    const retry = sendMessage();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(replacementStarted, true);
+    ctrl.end();
+    await retry;
+
+    assert.deepEqual(
+        requestIds,
+        ['prior-terminal-request', 'prior-terminal-request'],
+        'reconciliation retains the exact stopped turn address',
+    );
+    assert.equal(typeof correlationIds[0], 'string');
+    assert.equal(typeof correlationIds[1], 'string');
+    assert.notEqual(
+        correlationIds[1],
+        correlationIds[0],
+        'a terminal receipt cannot be replayed as the next Stop operation',
+    );
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+});
+
+
+test('durable operation identity conflict rotates the reconciliation operation', async () => {
+    const agent = 'agent-stop-operation-conflict';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'conflicted-stop-turn';
+    const correlationIds = [];
+    const requestIds = [];
+    let stopAttempts = 0;
+    apiModule.default.stop = async (requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        requestIds.push(requestId);
+        correlationIds.push(correlationId);
+        if (stopAttempts === 1) {
+            const error = new Error('durable operation identity conflict');
+            error.body = {
+                error: {
+                    code: 'stop_not_confirmed',
+                    details: [{
+                        disposition: 'refused',
+                        receipt_id: null,
+                        detail: 'Stop operation identity conflicts with durable evidence',
+                    }],
+                },
+            };
+            throw error;
+        }
+        return confirmedStopResponse();
+    };
+    const ctrl = controlledStream();
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return ctrl.iter;
+    };
+    apiModule.default.invoke = async () => ({ response: '' });
+
+    messageInput.value = 'first conflict reconciliation';
+    await sendMessage();
+    assert.equal(replacementStarted, false);
+    assert.equal(state.unconfirmedStopAgents.has(agent), true);
+
+    state.waitingAgents.delete(agent);
+    messageInput.value = 'retry after operation conflict';
+    const retry = sendMessage();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(replacementStarted, true);
+    ctrl.end();
+    await retry;
+
+    assert.deepEqual(requestIds, ['conflicted-stop-turn', 'conflicted-stop-turn']);
+    assert.equal(typeof correlationIds[0], 'string');
+    assert.equal(typeof correlationIds[1], 'string');
+    assert.notEqual(correlationIds[1], correlationIds[0]);
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+});
+
+
+test('receipt persistence failure retries with a fresh reconciliation operation', async () => {
+    const agent = 'agent-stop-persistence-reconcile';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'persist-failed-turn';
+    const correlationIds = [];
+    const requestIds = [];
+    let stopAttempts = 0;
+    apiModule.default.stop = async (requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        requestIds.push(requestId);
+        correlationIds.push(correlationId);
+        if (stopAttempts === 1) {
+            const error = new Error('stop receipt persistence failed');
+            error.body = {
+                error: {
+                    code: 'stop_not_confirmed',
+                    details: [{
+                        disposition: 'refused',
+                        receipt_id: null,
+                        detail: (
+                            'Cancellation may have completed, but its durable '
+                            + 'Stop receipt could not be persisted'
+                        ),
+                    }],
+                },
+            };
+            throw error;
+        }
+        return confirmedStopResponse();
+    };
+    const ctrl = controlledStream();
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return ctrl.iter;
+    };
+    apiModule.default.invoke = async () => ({ response: '' });
+
+    messageInput.value = 'first persistence reconciliation';
+    await sendMessage();
+    assert.equal(replacementStarted, false);
+    assert.equal(state.unconfirmedStopAgents.has(agent), true);
+
+    state.waitingAgents.delete(agent);
+    messageInput.value = 'retry after receipt storage recovers';
+    const retry = sendMessage();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(replacementStarted, true);
+    ctrl.end();
+    await retry;
+
+    assert.deepEqual(requestIds, ['persist-failed-turn', 'persist-failed-turn']);
+    assert.equal(typeof correlationIds[0], 'string');
+    assert.equal(typeof correlationIds[1], 'string');
+    assert.notEqual(
+        correlationIds[1],
+        correlationIds[0],
+        'an indeterminate persisted claim cannot wedge every future retry',
+    );
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+});
+
+
+test('ownerless durable claim retries with a fresh reconciliation operation', async () => {
+    const agent = 'agent-stop-ownerless-claim';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'ownerless-claim-turn';
+    const correlationIds = [];
+    let stopAttempts = 0;
+    apiModule.default.stop = async (_requestId, _agent, correlationId) => {
+        stopAttempts += 1;
+        correlationIds.push(correlationId);
+        if (stopAttempts === 1) {
+            const error = new Error('ownerless durable claim');
+            error.body = {
+                error: {
+                    code: 'stop_not_confirmed',
+                    details: [{
+                        disposition: 'refused',
+                        receipt_id: null,
+                        detail: 'An exact Stop operation is already in progress',
+                    }],
+                },
+            };
+            throw error;
+        }
+        return confirmedStopResponse();
+    };
+
+    assert.equal(await chatModule.stopAgent(agent), false);
+    assert.equal(state.unconfirmedStopAgents.has(agent), true);
+    assert.equal(await chatModule.stopAgent(agent), true);
+
+    assert.equal(correlationIds.length, 2);
+    assert.notEqual(
+        correlationIds[1],
+        correlationIds[0],
+        'a claim whose process owner vanished cannot wedge exact retries forever',
+    );
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+});
+
+
+test('queue mode preserves composer input behind an unconfirmed Stop', async () => {
+    const agent = 'agent-queue-stop-failed';
+    const pane = getOrCreateChatPane(agent);
+    pane.composerMode = 'queue';
+    pane.queuedMessage = null;
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    // The prior local stream has already aborted, but its backend Stop never
+    // acknowledged. There is no live stream completion left to drain a queue.
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => null;
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-request';
+    let stopAttempts = 0;
+    apiModule.default.stop = async () => {
+        stopAttempts += 1;
+        throw new Error('stop_not_confirmed');
+    };
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return (async function* () {})();
+    };
+
+    messageInput.value = 'keep this queued redirect editable';
+    await sendMessage();
+
+    assert.equal(stopAttempts, 1,
+        'Send retries the unconfirmed Stop before applying queue behavior');
+    assert.equal(replacementStarted, false);
+    assert.equal(messageInput.value, 'keep this queued redirect editable',
+        'an unacknowledged Stop must not consume composer input');
+    assert.equal(pane.queuedMessage, null,
+        'there is no live completion path that could drain a queued message');
+
+    state.unconfirmedStopAgents.delete(agent);
+});
+
+
+test('missing Stop response cannot clear the unconfirmed latch', async () => {
+    const agent = 'agent-stop-no-response';
+    getOrCreateChatPane(agent);
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+
+    state.waitingAgents.add(agent);
+    apiModule.default.getStreamAbortController = () => ({ abort() {}, signal: {} });
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-request';
+    apiModule.default.stop = async () => undefined;
+    let replacementStarted = false;
+    apiModule.default.streamInvoke = () => {
+        replacementStarted = true;
+        return (async function* () {})();
+    };
+
+    messageInput.value = 'preserve after auth redirect';
+    await sendMessage();
+
+    assert.equal(replacementStarted, false);
+    assert.equal(messageInput.value, 'preserve after auth redirect');
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'undefined/malformed responses are not Stop acknowledgements');
+
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
 });
 
 
@@ -260,7 +639,7 @@ test('sendMessage does NOT call stopAgent when the agent is idle (#1255)', async
     apiModule.default.getCurrentStreamRequestId = () => null;
     apiModule.default.stop = async () => {
         eventLog.push('stop-should-not-fire');
-        return { ok: true };
+        return confirmedStopResponse();
     };
 
     const ctrl = controlledStream();
@@ -347,7 +726,7 @@ test('concurrent sendMessage: prior turn\'s finally cannot un-mark the new turn 
         signal: {},
     });
     apiModule.default.getCurrentStreamRequestId = () => 'prior-req';
-    apiModule.default.stop = async () => ({ ok: true });
+    apiModule.default.stop = async () => confirmedStopResponse();
 
     // New turn: a fresh controllable stream so we can hold the new
     // dispatch in its streamInvoke await.
@@ -399,7 +778,7 @@ test('sendMessage with empty text returns early regardless of busy state (#1255)
     apiModule.default.getCurrentStreamRequestId = () => 'rid';
     apiModule.default.stop = async () => {
         eventLog.push('stop');
-        return { ok: true };
+        return confirmedStopResponse();
     };
     apiModule.default.streamInvoke = () => {
         eventLog.push('streamInvoke');

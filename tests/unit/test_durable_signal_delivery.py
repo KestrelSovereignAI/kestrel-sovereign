@@ -48,6 +48,7 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_TERMINAL_MARKER_VALUE,
     build_channel_message_registration,
 )
+from kestrel_sovereign.agent.invocation import InvocationCancelledError
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
@@ -1946,6 +1947,60 @@ async def test_cognition_retry_uses_canonical_persisted_channel_input(tmp_path):
         assert "original Telegram content" in prompts[1]
         assert "attacker replacement content" not in prompts[1]
         assert (await dispatcher.list_durable_deliveries())[0].status == ACKNOWLEDGED
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_stop_terminalizes_durable_cognition(tmp_path):
+    """A stopped turn cannot be resurrected under a retry's fresh UUID."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "stopped-cognition-terminal.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    stopped_turn = AsyncMock(
+        side_effect=InvocationCancelledError("agent-wide Stop was acknowledged")
+    )
+    agent.process_input = stopped_turn
+    source_event_id = "telegram:update:stopped-cognition"
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        initial = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "stopped-cognition"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        result = await initial.wait()
+        [delivery] = await dispatcher.list_durable_deliveries()
+
+        assert result.status is Status.COALESCED
+        assert result.error is not None
+        assert result.error.startswith("stop_acknowledged:")
+        assert delivery.status == TERMINAL_ACKABLE
+        assert delivery.attempts == 1
+
+        dispatcher._coalescing.reset()
+        retry = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "stopped-cognition"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await retry.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.TERMINAL
+        assert (await retry.wait()).status is Status.COALESCED
+        stopped_turn.assert_awaited_once()
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)

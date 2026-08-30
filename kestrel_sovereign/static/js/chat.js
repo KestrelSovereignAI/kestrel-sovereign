@@ -99,6 +99,35 @@ function deps() {
     };
 }
 
+function unconfirmedStopAgents() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopAgents instanceof Set)) {
+        currentState.unconfirmedStopAgents = new Set();
+    }
+    return currentState.unconfirmedStopAgents;
+}
+
+function unconfirmedStopRequestIds() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopRequestIds instanceof Map)) {
+        currentState.unconfirmedStopRequestIds = new Map();
+    }
+    return currentState.unconfirmedStopRequestIds;
+}
+
+function unconfirmedStopCorrelationIds() {
+    const currentState = deps().state;
+    if (!(currentState.unconfirmedStopCorrelationIds instanceof Map)) {
+        currentState.unconfirmedStopCorrelationIds = new Map();
+    }
+    return currentState.unconfirmedStopCorrelationIds;
+}
+
+function isAgentBusy(agentName) {
+    return deps().state.waitingAgents.has(agentName)
+        || unconfirmedStopAgents().has(agentName);
+}
+
 // Wave 5E in-band revising sentinel — pairs with kestrel_sovereign/
 // agent/streaming.py:_build_revise_sentinel. Format:
 //   \x1eKESTREL:REVISE:<json>\x1e
@@ -2507,7 +2536,7 @@ export function disconnectNotifications() {
  */
 export function updateThinkingIndicator() {
     const current = deps().api.getHostAgent();
-    const busy = deps().state.waitingAgents.has(current);
+    const busy = isAgentBusy(current);
     if (thinkingIndicator) {
         thinkingIndicator.style.display = busy ? 'flex' : 'none';
         // Drive the one-word status from the visible agent's current
@@ -2541,7 +2570,7 @@ export function refreshAgentThinkingDot(agentName) {
     if (typeof document === 'undefined') return;
     const row = document.querySelector(`.agent-item[data-agent-name="${CSS.escape(String(agentName))}"]`);
     if (!row) return;
-    const busy = deps().state.waitingAgents.has(agentName);
+    const busy = isAgentBusy(agentName);
     row.classList.toggle('agent-thinking', busy);
 }
 
@@ -2556,6 +2585,36 @@ export function refreshAgentThinkingDot(agentName) {
  */
 async function stopRequest() {
     return stopAgent(deps().api.getHostAgent());
+}
+
+function hasTerminalStopReceipt(error) {
+    const details = error?.body?.error?.details;
+    return Array.isArray(details) && details.some((outcome) => (
+        outcome
+        && typeof outcome === 'object'
+        && typeof outcome.receipt_id === 'string'
+        && outcome.receipt_id.length > 0
+    ));
+}
+
+function stopFailureRequiresFreshOperation(error) {
+    if (hasTerminalStopReceipt(error)) return true;
+    const canonicalError = error?.body?.error;
+    if (canonicalError?.code !== 'stop_not_confirmed') return false;
+    const details = canonicalError.details;
+    return Array.isArray(details) && details.some((outcome) => (
+        outcome
+        && typeof outcome === 'object'
+        && !outcome.receipt_id
+        && (
+            outcome.detail === (
+                'Cancellation may have completed, but its durable '
+                + 'Stop receipt could not be persisted'
+            )
+            || outcome.detail === 'An exact Stop operation is already in progress'
+            || outcome.detail === 'Stop operation identity conflicts with durable evidence'
+        )
+    ));
 }
 
 /**
@@ -2589,25 +2648,90 @@ export async function stopAgent(agentName) {
         clearQueuedChip(pane);
     }
 
+    // The server-side turn may outlive the locally aborted response stream.
+    // Set this before abort() so the prior stream's microtask/finally cannot
+    // erase the only guard against opening an overlapping backend turn.
+    unconfirmedStopAgents().add(agentName);
+    refreshAgentThinkingDot(agentName);
+    if (agentName === deps().api.getHostAgent()) {
+        updateThinkingIndicator();
+    }
+
     const abortController = deps().api.getStreamAbortController(agentName);
     if (abortController) {
         try { abortController.abort(); } catch (_) { /* noop */ }
     }
 
-    const requestId = deps().api.getCurrentStreamRequestId(agentName);
+    const retainedRequestIds = unconfirmedStopRequestIds();
+    const retainedCorrelationIds = unconfirmedStopCorrelationIds();
+    let requestId = retainedRequestIds.get(agentName) || null;
+    if (!requestId) {
+        requestId = deps().api.getCurrentStreamRequestId(agentName);
+        if (requestId) retainedRequestIds.set(agentName, requestId);
+    }
+    let correlationId = retainedCorrelationIds.get(agentName) || null;
+    if (!correlationId) {
+        correlationId = newChatRequestId();
+        retainedCorrelationIds.set(agentName, correlationId);
+    }
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
-        await deps().api.stop(requestId, agentName);
+        const response = await deps().api.stop(
+            requestId,
+            agentName,
+            correlationId,
+        );
+        const stopOutcomes = Array.isArray(response?.stop_outcomes)
+            ? response.stop_outcomes
+            : [];
+        const confirmed = response?.success === true
+            && stopOutcomes.length > 0
+            && stopOutcomes.every(
+                (outcome) => outcome?.disposition === 'stopped'
+                    || outcome?.disposition === 'already_complete'
+            );
+        if (!confirmed) {
+            throw new Error('Cooperative Stop was not confirmed');
+        }
     } catch (e) {
         console.error(`Error stopping request on ${agentName}:`, e);
+        // A receipt-bearing failure is definitive and immutable for this
+        // operation ID. Retain the exact request address, but let the next
+        // reconciliation allocate a fresh operation so it can observe that
+        // the old turn subsequently completed. Transport/malformed failures
+        // remain ambiguous and must replay the original durable operation.
+        if (stopFailureRequiresFreshOperation(e)) {
+            retainedCorrelationIds.delete(agentName);
+        }
+        refreshAgentThinkingDot(agentName);
+        if (agentName === deps().api.getHostAgent()) {
+            updateThinkingIndicator();
+        }
+        return false;
     }
 
+    unconfirmedStopAgents().delete(agentName);
+    retainedRequestIds.delete(agentName);
+    retainedCorrelationIds.delete(agentName);
+    deps().api.completeCurrentStreamRequestId(agentName, requestId);
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === deps().api.getHostAgent()) {
         updateThinkingIndicator();
     }
+    return true;
+}
+
+function newChatRequestId() {
+    const randomUuid = globalThis.crypto?.randomUUID;
+    if (typeof randomUuid === 'function') {
+        return randomUuid.call(globalThis.crypto);
+    }
+    // Cancellation identity is uniqueness, not a secret. The timestamp and
+    // two independent random components keep legacy browsers turn-addressable
+    // without introducing a dependency on response headers.
+    return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
 // ============================================================================
@@ -2724,8 +2848,17 @@ export async function sendMessage(overrideText, overrideAgent) {
     // dropping it (and leaving it staged for the next turn).
     if (fromComposer) await awaitPendingUploads(pane);
 
+    // A failed/unreachable Stop is not an ordinary busy turn: the local
+    // stream was already aborted, so there is no completion ``finally`` left
+    // that can drain queue mode. Retry the acknowledgement without consuming
+    // the composer or staged attachments. Only a confirmed Stop may proceed.
+    if (unconfirmedStopAgents().has(dispatchAgent)) {
+        const stopConfirmed = await stopAgent(dispatchAgent);
+        if (!stopConfirmed) return;
+    }
+
     // Send-while-busy. Behavior depends on the pane's composerMode.
-    if (deps().state.waitingAgents.has(dispatchAgent)) {
+    if (isAgentBusy(dispatchAgent)) {
         if (pane.composerMode === 'queue') {
             // #1257 queue mode: stash the message and surface it as a
             // pending chip. The completing turn's finally dispatches
@@ -2755,7 +2888,8 @@ export async function sendMessage(overrideText, overrideAgent) {
         // rendered. Note: ``stopAgent`` removes the agent from
         // ``state.waitingAgents`` itself, so the subsequent ``add``
         // below is the correct next state.
-        await stopAgent(dispatchAgent);
+        const stopConfirmed = await stopAgent(dispatchAgent);
+        if (!stopConfirmed) return;
     }
 
     // #1573: claim this turn's ownership of the pane's stream paint
@@ -2857,6 +2991,9 @@ export async function sendMessage(overrideText, overrideAgent) {
     };
 
     let wasAborted = false;
+    // Allocate one exact turn address for streaming, fallback, and explicitly
+    // non-streaming delivery. The API publishes it before either fetch awaits.
+    const clientRequestId = newChatRequestId();
 
     try {
         if (deps().state.useStreaming) {
@@ -2906,7 +3043,16 @@ export async function sendMessage(overrideText, overrideAgent) {
                 // no visible char after it; consumed when the next
                 // packet's leading visible text is welded onto fullContent.
                 let pendingReviseBoundary = false;
-                for await (const rawChunk of deps().api.streamInvoke(text, null, sessionId, null, false, dispatchAgent, turnAttachments)) {
+                for await (const rawChunk of deps().api.streamInvoke(
+                    text,
+                    null,
+                    sessionId,
+                    null,
+                    false,
+                    dispatchAgent,
+                    turnAttachments,
+                    clientRequestId,
+                )) {
                     const merged = sentinelBuffer + rawChunk;
                     sentinelBuffer = '';
                     let processable = merged;
@@ -3217,17 +3363,19 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // unprefixed invoke() routes via the currently
                     // selected agent and would land on the wrong
                     // backend if the user has switched.
-                    const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+                    const response = await deps().api.invokeForAgent(
+                        text, null, sessionId, null, dispatchAgent, clientRequestId,
+                    );
                     if (response && response.session_id && !pane.sessionId) {
                         pane.sessionId = response.session_id;
                     }
-                    if (isPaneFresh()) {
+                    if (isPaneFresh() && ownsStream()) {
                         await addMessage(
                             'agent', response.response, pane.element, null,
                             { model: response.model, provider: response.provider },
                         );
                     }
-                    if (isCurrentVisible()) {
+                    if (isCurrentVisible() && ownsStream()) {
                         await checkForModelChange(response.response);
                     }
                 } else {
@@ -3235,24 +3383,26 @@ export async function sendMessage(overrideText, overrideAgent) {
                 }
             }
         } else {
-            const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+            const response = await deps().api.invokeForAgent(
+                text, null, sessionId, null, dispatchAgent, clientRequestId,
+            );
             if (response && response.session_id && !pane.sessionId) {
                 pane.sessionId = response.session_id;
             }
-            if (isPaneFresh()) {
+            if (isPaneFresh() && ownsStream()) {
                 await addMessage(
                     'agent', response.response, pane.element, null,
                     { model: response.model, provider: response.provider },
                 );
             }
-            if (isCurrentVisible()) {
+            if (isCurrentVisible() && ownsStream()) {
                 await checkForModelChange(response.response);
             }
         }
     } catch (e) {
         if (e && e.name === 'AbortError') {
             wasAborted = true;
-        } else if (isPaneFresh()) {
+        } else if (isPaneFresh() && ownsStream()) {
             addTextMessage('agent', `Error: ${e && e.message ? e.message : 'Request failed.'}`, pane.element);
         } else {
             console.warn(
@@ -3282,6 +3432,10 @@ export async function sendMessage(overrideText, overrideAgent) {
             // skips the interrupt path. The newest dispatch always owns,
             // so the last turn to settle does the real cleanup.
             deps().state.waitingAgents.delete(dispatchAgent);
+            deps().api.completeCurrentStreamRequestId(
+                dispatchAgent,
+                clientRequestId,
+            );
         }
         refreshAgentThinkingDot(dispatchAgent);
         // Drive the visible thinking indicator from whatever agent the

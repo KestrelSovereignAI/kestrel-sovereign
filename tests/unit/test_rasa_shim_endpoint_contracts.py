@@ -73,3 +73,69 @@ def test_rasa_webhook_does_not_force_hardcoded_model_override():
         assert "model_override" not in kwargs
     finally:
         _restore_app(app, original)
+
+
+def test_rasa_webhook_reports_cooperative_stop_as_conflict():
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+
+    agent = MagicMock()
+    agent.process_input = AsyncMock(
+        side_effect=InvocationCancelledError("isolated turn stopped")
+    )
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_API_KEY": "test-key",
+                "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+            },
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/webhooks/rest/webhook",
+                    headers={
+                        **_api_headers(),
+                        "X-Request-ID": "rasa-stopped-turn",
+                    },
+                    json={"sender": "patient-123", "message": "stop this"},
+                )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Request stopped during execution."
+        assert response.headers["X-Request-ID"] == "rasa-stopped-turn"
+    finally:
+        _restore_app(app, original)
+
+
+def test_rasa_webhook_rechecks_durable_stop_after_semaphore_admission():
+    agent = MagicMock()
+    agent.process_input = AsyncMock(return_value="still here")
+    durable_fence = AsyncMock(return_value=False)
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_API_KEY": "test-key",
+                "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+            },
+        ), patch(
+            "kestrel_sovereign.endpoints.rasa_shim.prime_durable_stop_fence",
+            durable_fence,
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/webhooks/rest/webhook",
+                    headers={
+                        **_api_headers(),
+                        "X-Request-ID": "rasa-queued-stop",
+                    },
+                    json={"sender": "patient-123", "message": "hello"},
+                )
+
+        assert response.status_code == 200
+        assert durable_fence.await_count == 2
+        agent.process_input.assert_awaited_once()
+    finally:
+        _restore_app(app, original)

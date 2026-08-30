@@ -237,7 +237,7 @@
             const actions = agent.running
                 ? `
                     <a href="http://localhost:${agent.port}" target="_blank" class="chat-link">Open Chat →</a>
-                    <button class="danger" onclick="stopAgent('${agent.id}')">Stop</button>
+                    <button class="danger" onclick="terminateAgent('${agent.id}')">Terminate</button>
                 `
                 : `<button class="primary" onclick="startAgent('${agent.id}')">Start</button>`;
             
@@ -297,22 +297,22 @@
             }
         }
         
-        async function stopAgent(agentId) {
+        async function terminateAgent(agentId) {
             const btn = event.target;
             btn.disabled = true;
-            btn.textContent = 'Stopping...';
+            btn.textContent = 'Terminating...';
             
             try {
-                const res = await fetch(`/api/agents/${agentId}/stop`, { method: 'POST' });
+                const res = await fetch(`/api/agents/${agentId}/terminate`, { method: 'POST' });
                 if (!res.ok) {
                     const data = await res.json();
-                    throw new Error(data.detail || 'Failed to stop agent');
+                    throw new Error(data.detail || 'Failed to terminate agent');
                 }
                 await loadAgents();
             } catch (e) {
                 showError(e.message);
                 btn.disabled = false;
-                btn.textContent = 'Stop';
+                btn.textContent = 'Terminate';
             }
         }
         

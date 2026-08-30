@@ -20,6 +20,7 @@ from kestrel_sovereign.agent.parts import (
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     bind_async_generator_invocation,
     current_invocation_id,
 )
@@ -913,7 +914,9 @@ class StreamingMixin:
             images.append(data)
         return images
 
-    @bind_async_generator_invocation("request_id")
+    @bind_async_generator_invocation(
+        "request_id", track_request_lifecycle=True
+    )
     async def process_input_streaming(
         self,
         user_input: str,
@@ -1068,14 +1071,21 @@ class StreamingMixin:
                 # Preserve the pre-existing positional call shape
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
-                result = await self.process_input(
-                    user_input,
-                    model_override,
-                    session_id=session_id,
-                    caller=caller,
-                    invocation_context=invocation_context,
-                    invocation_id=current_invocation_id(),
-                )
+                try:
+                    result = await self.process_input(
+                        user_input,
+                        model_override,
+                        session_id=session_id,
+                        caller=caller,
+                        invocation_context=invocation_context,
+                        invocation_id=current_invocation_id(),
+                    )
+                except InvocationCancelledError:
+                    # The command delegate owns an isolated child so Stop does
+                    # not cancel a persistent transport task. Its typed unwind
+                    # is normal end-of-stream; the endpoint's post-loop check
+                    # emits the standard Stop notice and completes cleanup.
+                    return
                 yield result
                 release_parts = not getattr(result, "denied", False) and not (
                     getattr(result, "enforcing", False)
