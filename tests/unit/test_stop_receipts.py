@@ -413,7 +413,7 @@ async def test_initialize_receipts_uses_bounded_dedicated_postgres_pool(
 
 
 @pytest.mark.asyncio
-async def test_receipt_store_startup_failure_degrades_to_fail_closed(
+async def test_receipt_store_startup_failure_prevents_host_readiness(
     monkeypatch,
 ):
     from fastapi import FastAPI
@@ -427,7 +427,10 @@ async def test_receipt_store_startup_failure_degrades_to_fail_closed(
     monkeypatch.setattr(storage, "prepare_host_database", fail_prepare)
     app = FastAPI()
 
-    await server._initialize_stop_receipts(app)
+    with pytest.raises(
+        RuntimeError, match="Durable Stop evidence failed to initialize"
+    ):
+        await server._initialize_stop_receipts(app)
 
     assert app.state.stop_receipt_store is None
     assert app.state.stop_receipt_db is None
