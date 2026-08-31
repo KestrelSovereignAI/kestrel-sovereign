@@ -4328,7 +4328,6 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         #
         # Re-deriving a predicate that exists is how the two ends drift apart
         # in the first place. One question, one implementation.
-        audit_selection_is_explicit = self._compute_route_authorization().explicit_selection
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
             pref_vendor = self._mandate_preference.get("vendor")
@@ -4340,6 +4339,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     target_selector = f"{pref_vendor}/{pref_model}"
                 else:
                     target_selector = pref_model
+
+        # Explicitness comes from the CANONICAL routing logic, computed for the
+        # selector actually dispatched (#3190 r7 P1, r8 P1).
+        #
+        # Two mistakes were made here in successive rounds, and they are worth
+        # distinguishing. First I hand-rolled the predicate, which disagreed
+        # with `_compute_route_authorization` about bare models and multi-route
+        # vendor selectors. Then I called the canonical function but passed it
+        # NOTHING, so it answered about `_mandate_preference` while the audit
+        # may actually dispatch `[llm.mandate.defaults].preferred` — the right
+        # question asked about the wrong subject. A bare or vendor-wide default
+        # would be classified explicit here and skip a guard generation keeps,
+        # letting that model reach the first non-local route unchecked.
+        #
+        # Computed after `target_selector` is final, so the two cannot drift.
+        audit_selection_is_explicit = self._compute_route_authorization(
+            model_override=target_selector,
+        ).explicit_selection
 
         available_providers = self._available_providers()
         target_model = None

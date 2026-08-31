@@ -119,8 +119,25 @@ class ModelPreferenceMixin:
                 # If the pin really is unservable, `resolve_provider_routing`
                 # raises `LLMProviderUnavailableError` at use time. Loud at the
                 # point of use beats silent at boot.
+                # Local model-ignoring routes keep their validation (#3190
+                # r8 P2). `llama_cpp` and `ollama` serve whatever model is
+                # currently loaded and ignore the requested id, and the
+                # streaming paths never call `_model_available_for_route`. So a
+                # stale persisted id restored without validation is not merely
+                # a wrong pin — responses from the newly loaded model get
+                # reported and METERED as the model that is no longer there.
+                #
+                # The bypass exists because a remote vendor's catalog can be
+                # transiently unfetchable while the route still serves the
+                # pinned model perfectly. That argument does not hold for a
+                # local server: its catalog is what it has actually loaded, so
+                # a populated local catalog that disagrees is evidence, not a
+                # discovery artefact.
+                from kestrel_sovereign.llm.service import _MODEL_IGNORING_VENDORS
+
+                revalidate = vendor in _MODEL_IGNORING_VENDORS
                 self.llm_service.set_model_preference(
-                    model, vendor, route, validate=False
+                    model, vendor, route, validate=revalidate
                 )
                 if vendor and route:
                     logging.info("Loaded persisted model preference: %s:%s/%s", vendor, route, model)

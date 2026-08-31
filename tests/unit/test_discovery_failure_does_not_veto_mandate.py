@@ -72,6 +72,36 @@ def _make_service(*, providers=None, discovery_failures=None):
     return svc
 
 
+def _loader_harness(pref):
+    """A minimal agent whose `_load_model_preference` records its set call."""
+    import json
+
+    from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
+
+    calls = []
+
+    class _Agent(ModelPreferenceMixin):
+        agent_id = "did:test:loader"
+
+        def __init__(self):
+            self.llm_service = MagicMock()
+            self.llm_service.set_model_preference = (
+                lambda m, v=None, r=None, *, validate=True: calls.append(
+                    (m, v, r, validate)
+                )
+            )
+            db = MagicMock()
+
+            async def _fetchall(*a, **k):
+                return [(json.dumps(pref),)]
+
+            db.fetchall = _fetchall
+            self._raw_storage = MagicMock()
+            self._raw_storage.db = db
+
+    return _Agent(), calls
+
+
 # The exact catalog state observed on the host after the 401: one stale entry.
 _COLLAPSED_ANTHROPIC_CATALOG = [_mk_model("claude-sonnet-5", "anthropic")]
 
@@ -118,16 +148,39 @@ class TestReplayedPinIsNotRevalidated:
         sig = inspect.signature(LLMService.set_model_preference)
         assert sig.parameters["validate"].default is True
 
-    def test_the_boot_loader_passes_validate_false(self):
-        """Wiring: testing the flag says nothing about who uses it."""
-        import inspect
+    @pytest.mark.asyncio
+    async def test_the_boot_loader_skips_validation_for_a_remote_pin(self):
+        """Wiring, behaviourally: testing the flag says nothing about its user.
 
-        from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
+        Asserted through the call the loader actually makes rather than by
+        grepping its source — a source assertion breaks the moment the value
+        stops being a literal, which is exactly what happened when local
+        vendors gained their own rule.
+        """
+        agent, calls = _loader_harness(
+            {"vendor": "anthropic", "model": "claude-opus-5", "route": "plan"}
+        )
+        await agent._load_model_preference()
+        assert calls == [("claude-opus-5", "anthropic", "plan", False)], (
+            "a remote pin must be replayed without re-validation"
+        )
 
-        src = inspect.getsource(ModelPreferenceMixin._load_model_preference)
-        assert "validate=False" in src, (
-            "the boot loader must re-apply its own persisted decision without "
-            "re-validating it against a live catalog"
+    @pytest.mark.asyncio
+    async def test_a_local_model_ignoring_pin_is_STILL_validated(self):
+        """`ollama`/`llama_cpp` serve whatever is loaded and ignore the id.
+
+        A stale id restored unvalidated is not just a wrong pin: streaming
+        never calls `_model_available_for_route`, so responses from the newly
+        loaded model are reported and METERED as the absent one. The bypass's
+        justification — a transiently unfetchable remote catalog — does not
+        apply to a local server, whose catalog IS what it has loaded.
+        """
+        agent, calls = _loader_harness(
+            {"vendor": "ollama", "model": "llama3.2:1b", "route": "local"}
+        )
+        await agent._load_model_preference()
+        assert calls == [("llama3.2:1b", "ollama", "local", True)], (
+            "a local model-ignoring route must keep its validation"
         )
 
 
@@ -521,4 +574,68 @@ class TestAuditPathAgreesWithGeneration:
         assert "_MODEL_IGNORING_VENDORS" in audit, (
             "and must honour the same vendor exemption, or local routes "
             "diverge between generation and audit"
+        )
+
+
+class TestAuditAuthorizesTheDispatchedSelector:
+    """The audit must authorize the selector it will actually use (#3190 r8 P1).
+
+    `target_selector` can come from `[llm.mandate.defaults].preferred`, which is
+    a different thing from `_mandate_preference`. Calling the canonical
+    authorization with no argument answers about the mandate while the audit
+    dispatches the default — the right question about the wrong subject. A bare
+    or vendor-wide default would then be classified explicit and skip a guard
+    that generation keeps.
+
+    The behavioural tests could not see this: in them the mandate IS the
+    selector source, so both spellings agree. This asserts the input.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_configured_default_is_what_gets_authorized(self):
+        adapter = MagicMock()
+        adapter.provider_capabilities.return_value = MagicMock(
+            supports_structured_output=True
+        )
+        provider = {
+            "name": "anthropic:plan", "vendor": "anthropic", "route": "plan",
+            "model": "auto", "adapter": adapter, "client": MagicMock(),
+        }
+        svc = _make_service(providers=[provider])
+        # A persisted route pin AND a configured default that differ.
+        svc._mandate_preference = {
+            "vendor": "anthropic", "model": "claude-opus-5", "route": "plan",
+        }
+        svc._get_default_mandate_selector = lambda: "some-bare-default-model"
+        svc._check_policy = lambda: None
+        svc._resolve_invocation_context = lambda ctx: ctx
+        svc._available_providers = lambda: [provider]
+        svc._resolve_model_selector = lambda sel, providers=None: {
+            "provider": "anthropic:plan", "model": "claude-opus-5",
+        }
+        svc._resolve_concrete_model = lambda target, prov: "claude-opus-5"
+
+        seen = {}
+
+        def _auth(*, model_override=None, force_local_only=False):
+            seen["model_override"] = model_override
+            return MagicMock(explicit_selection=False)
+
+        svc._compute_route_authorization = _auth
+
+        async def _attempt(*a, **k):
+            return '{"risk_level": 1, "reasoning": "fine"}'
+
+        svc._run_provider_attempt = _attempt
+
+        cache = _cached([_mk_model("claude-opus-5", "anthropic")])
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            await svc.get_audit_response("some response text")
+
+        assert seen.get("model_override") == "some-bare-default-model", (
+            "authorization must be computed for the selector the audit will "
+            f"dispatch, not for the mandate; got {seen.get('model_override')!r}"
         )
