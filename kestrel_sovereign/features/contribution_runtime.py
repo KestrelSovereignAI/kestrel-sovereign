@@ -1018,25 +1018,34 @@ class FeatureContributionRuntime:
 
         failed = False
 
-        def attempt(operation) -> None:
+        def attempt(operation, *, require_true: bool = False) -> None:
             nonlocal failed
             try:
-                operation()
+                result = operation()
             except Exception:
                 # The public error below is deliberately fixed text. Registry
                 # exceptions can include third-party names or representations.
                 failed = True
+            else:
+                # Capability-set quarantine is an authenticated withdrawal:
+                # ``False`` means the retained set was not accepted and its
+                # services/workflows/targets may still be executable.  Do not
+                # erase the active lifecycle record or report cleanup success.
+                if require_true and result is not True:
+                    failed = True
 
         for registration_set in reversed(active.execution_target_registrations):
             attempt(
                 lambda item=registration_set: (
                     self.operator_registry.quarantine_registration_set(item)
-                )
+                ),
+                require_true=True,
             )
         attempt(
             lambda: self.operator_registry.quarantine_registration_set(
                 active.operator_registrations
-            )
+            ),
+            require_true=True,
         )
 
         for registration in active.prepared.contributions.wait_providers:

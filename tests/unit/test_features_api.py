@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign import cli
@@ -1849,6 +1849,39 @@ class TestUpdateFeatureConfig:
         response = await asyncio.wait_for(update, timeout=1)
         assert response["config"] == {"mode": "old"}
         assert applied.is_set()
+
+    @pytest.mark.asyncio
+    async def test_queued_config_update_re_resolves_after_feature_removal(self):
+        """A waiter cannot mutate the stale feature generation it first saw."""
+
+        stale = _make_feature(config={"mode": "old"})
+        agent = _lifecycle_agent(features={"TestFeature": stale})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            update = asyncio.create_task(
+                features_endpoint.update_feature_config(
+                    request,
+                    "TestFeature",
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                )
+            )
+            await asyncio.sleep(0)
+            assert not update.done()
+            assert agent.features.pop("TestFeature") is stale
+
+        with pytest.raises(HTTPException) as exc_info:
+            await asyncio.wait_for(update, timeout=1)
+
+        assert exc_info.value.status_code == 404
+        stale.set_config.assert_not_awaited()
+        agent.refresh_feature_context_clauses.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_config_setter_can_reenter_privacy_transition(self):

@@ -1011,7 +1011,6 @@ async def update_feature_config(
     leave an unchanged secret out of the PATCH without clearing it.
     """
     agent = get_agent(request)
-    feature = _get_feature_or_404(agent, name)
 
     # Snapshot -> setter -> context publication is serialized per tenant. A
     # host-wide mutex lets one slow out-of-tree setter block every other agent.
@@ -1020,7 +1019,12 @@ async def update_feature_config(
     async with _feature_config_update_lock(agent):
         return await _settle_feature_transition(
             agent,
-            lambda: _update_feature_config_locked(agent, feature, name, body),
+            lambda: _update_feature_config_locked(
+                agent,
+                _get_feature_or_404(agent, name),
+                name,
+                body,
+            ),
             feature_name=name,
             operation="configuration reconciliation",
         )

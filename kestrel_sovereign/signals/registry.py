@@ -368,9 +368,9 @@ class SourceRegistry:
         The ordinary ownership inverse removes the resident source when its
         final claim is released. Recovery additionally knows the exact source
         objects declared by the lifecycle. If the claim ledger is already
-        absent, an exact unheld resident is still removed. If a different
-        object now occupies that name, release the stale claim but preserve the
-        replacement.
+        absent, an exact unheld resident is still removed. If a different,
+        non-equivalent object now occupies that name, release the stale claim
+        but preserve the replacement.
         """
 
         if owner is None:
@@ -397,7 +397,11 @@ class SourceRegistry:
                 released.append(registration.name)
             if not holders:
                 self._claims.pop(registration.name, None)
-                if self._sources.get(registration.name) is registration:
+                resident = self._sources.get(registration.name)
+                if resident is registration or (
+                    resident is not None
+                    and self.contract_equivalent(resident, registration)
+                ):
                     self._sources.pop(registration.name, None)
         self._forget_owner_if_unreferenced(key)
         return tuple(released)

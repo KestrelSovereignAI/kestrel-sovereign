@@ -1369,6 +1369,31 @@ def test_quarantine_removes_operator_survivors_without_set_ledger(tmp_path):
     ) is None
 
 
+def test_quarantine_reports_rejected_operator_issuance(tmp_path):
+    """A rejected capability withdrawal cannot be reported as successful."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    active = runtime._active[id(feature)].operator_registrations
+    del runtime.operator_registry._issued_set_seals[id(active)]
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="feature contributions could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    assert runtime.is_active(feature)
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is feature.service
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is feature.actor
+
+
 def test_quarantine_removes_exact_signal_source_without_claim_ledger(tmp_path):
     """An unheld exact source cannot remain dispatchable after fail-close."""
 
