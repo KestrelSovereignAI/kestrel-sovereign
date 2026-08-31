@@ -133,10 +133,14 @@ uv run python -m kestrel_sovereign.identity.custody_bundle create \
   --output "$KESTREL_CEREMONY_DIR/custody.json"
 ```
 
-The Hold evidence URL must name a different PostgreSQL database in an
-independent backup/restore domain. Its history head and pending-publication
+The Hold evidence URL must name a database on a different PostgreSQL
+cluster/Cloud SQL instance in an independent backup/restore domain. Another
+database or schema on the primary cluster is refused because one cluster-level
+restore would roll both back together. Its history head and pending-publication
 journal are deliberately excluded from restores of `KESTREL_DATABASE_URL`, so
-rolling the primary database back cannot silently erase a later Hold.
+rolling the primary database back cannot silently erase a later Hold. Kestrel
+also binds both databases to their original primary/evidence roles; swapping
+the two URLs fails closed rather than bootstrapping empty state.
 
 Upload both database URLs, the data key, and `custody.json` as separate Secret
 Manager secrets. Grant the Cloud Run runtime service account
