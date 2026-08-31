@@ -1347,3 +1347,38 @@ def test_quarantine_removes_operator_survivors_after_partial_drift(tmp_path):
     assert runtime.operator_registry.resolve_workflow_actor(
         feature.workflow_registration.name
     ) is None
+
+
+def test_quarantine_removes_operator_survivors_without_set_ledger(tmp_path):
+    """The retained exact objects remain cleanup authority after ledger drift."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    active = runtime._active[id(feature)].operator_registrations
+    del runtime.operator_registry._active_sets[id(active)]
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is None
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is None
+
+
+def test_quarantine_removes_exact_signal_source_without_claim_ledger(tmp_path):
+    """An unheld exact source cannot remain dispatchable after fail-close."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    del runtime.source_registry._claims[feature.source.name]
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.source_registry.get(feature.source.name) is None
+    assert runtime.source_registry.owners_of(feature.source.name) == ()

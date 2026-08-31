@@ -290,6 +290,23 @@ def test_quarantine_preserves_foreign_operator_replacements() -> None:
     assert registry.resolve_workflow_actor(workflow.name) is foreign_actor
 
 
+def test_quarantine_removes_exact_survivors_when_set_ledger_is_missing() -> None:
+    registry = _registry()
+    service = _service("owner", "1.0.0", object())
+    workflow = WorkflowRegistration("owner", "workflow", lambda: None)
+    active = registry.register(
+        "owner",
+        services=(service,),
+        workflows=(workflow,),
+    )
+    del registry._active_sets[id(active)]
+
+    assert registry.quarantine_registration_set(active) is True
+    assert registry.resolve_service(service.reference) is None
+    assert registry.resolve_workflow_actor(workflow.name) is None
+    assert registry.quarantine_registration_set(active) is False
+
+
 def test_removing_middle_version_does_not_disturb_or_resurrect_other_sets() -> None:
     registry = _registry()
     first = _service("first", "1.0.0", object())

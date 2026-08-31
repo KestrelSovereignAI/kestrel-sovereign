@@ -210,16 +210,19 @@ class OperatorRuntimeRegistry:
         Ordinary :meth:`unregister` is an atomic exact inverse and therefore
         refuses a partially missing set. Lifecycle recovery has a different
         job: remove each retained object that is still exactly resident,
-        tolerate an already-absent object, preserve any replacement, and retire
-        the original set capability so a complete generation can be prepared.
+        tolerate an already-absent object or set ledger, preserve any
+        replacement, and retire the original set capability so a complete
+        generation can be prepared.
         """
 
         if not isinstance(registration_set, OperatorRegistrationSet):
             raise TypeError("registration_set must be an OperatorRegistrationSet")
         with self._lock:
             active = self._active_sets.get(id(registration_set))
-            if active is not registration_set:
-                return False
+            had_active_set = active is registration_set
+            if not had_active_set:
+                active = registration_set
+            removed_survivor = False
             for registration in active.services:
                 resident = self._services.get(registration.reference)
                 if (
@@ -227,10 +230,12 @@ class OperatorRuntimeRegistry:
                     and resident.service is registration.service
                 ):
                     del self._services[registration.reference]
+                    removed_survivor = True
             for registration in active.workflows:
                 resident = self._workflows.get(registration.name)
                 if resident is registration and resident.actor is registration.actor:
                     del self._workflows[registration.name]
+                    removed_survivor = True
             for registration in active.execution_targets:
                 key = (
                     registration.descriptor.tenant_id,
@@ -242,8 +247,10 @@ class OperatorRuntimeRegistry:
                     and resident.handle is registration.handle
                 ):
                     del self._targets[key]
-            del self._active_sets[id(active)]
-            return True
+                    removed_survivor = True
+            if had_active_set:
+                del self._active_sets[id(active)]
+            return had_active_set or removed_survivor
 
     def validate_registration_set(
         self, registration_set: OperatorRegistrationSet

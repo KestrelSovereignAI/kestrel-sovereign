@@ -90,6 +90,18 @@ def test_new_source_is_registered():
     assert "a" in reg
 
 
+def test_quarantine_removes_exact_unheld_source_when_claim_ledger_is_missing():
+    registry = SourceRegistry()
+    owner = object()
+    source = _action_reg("orphaned")
+    registry.register(source, owner=owner)
+    registry._claims.pop(source.name)
+
+    assert registry.quarantine_claims(owner, (source,)) == ()
+    assert registry.get(source.name) is None
+    assert registry.owners_of(source.name) == ()
+
+
 def test_equivalent_reregistration_is_a_noop_success():
     reg = SourceRegistry()
     reg.register_with_policy(_action_reg("a"), RegistrationPolicy.MANDATORY)

@@ -2096,6 +2096,9 @@ class TestUpdateFeatureConfig:
         agent.refresh_feature_context_clauses = MagicMock(
             side_effect=RuntimeError("private renderer detail")
         )
+        # Simulate ownership-ledger drift before the config transition must
+        # fail closed. The retained exact source must still be withdrawn.
+        del agent.signal_registry._claims[feature.source.name]
         agent.wait_registry.deregister(
             feature.wait_provider.kind, feature.wait_provider
         )
@@ -2117,6 +2120,7 @@ class TestUpdateFeatureConfig:
         assert agent.features[feature.name] is feature
         assert not agent.feature_contribution_runtime.is_active(feature)
         assert not agent.feature_contribution_runtime.active_context_clauses()
+        assert agent.signal_registry.get(feature.source.name) is None
 
     def test_failed_refresh_and_rollback_disables_feature_runtime(self):
         """A doubly-failed transition is quarantined instead of split-brain."""
