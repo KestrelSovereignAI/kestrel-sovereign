@@ -985,8 +985,21 @@ class TaskManager:
         # canonical row before create_task returns. Never publish an older
         # SUBMITTED snapshot after a terminal transition already committed.
         canonical_read_succeeded = False
+        canonical_read = asyncio.create_task(
+            self.task_store._get_unscoped(task.id),
+            name=f"a2a-task-create-readback:{task.id}",
+        )
+        readback_outcome = await await_owned_task(canonical_read)
+        if readback_outcome.cancellation is not None:
+            raise_owned_outcome(
+                readback_outcome,
+                operation="A2A task creation canonical readback",
+            )
         try:
-            canonical = await self.task_store._get_unscoped(task.id)
+            canonical = raise_owned_outcome(
+                readback_outcome,
+                operation="A2A task creation canonical readback",
+            )
             canonical_read_succeeded = canonical is not None
         except (Exception, asyncio.CancelledError):
             canonical = None

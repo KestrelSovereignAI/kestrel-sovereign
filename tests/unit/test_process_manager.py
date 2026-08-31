@@ -472,6 +472,7 @@ class TestStartAgent:
         assert env["KESTREL_SERVE_UI"] == "false"
         assert env["KESTREL_A2A_TRANSPORT_KEY"]
         assert env["KESTREL_API_KEY"] == ""
+        assert env["KESTREL_A2A_TRANSPORT_ONLY"] == "true"
         assert set(json.loads(env[A2A_PEER_IDENTITY_ROOTS_ENV])) == {
             str((project_dir / "agent_data" / "claw").resolve()),
             str((project_dir / "agent_data" / "testbot").resolve()),
@@ -498,6 +499,7 @@ class TestStartAgent:
 
         env = mock_popen.call_args.kwargs["env"]
         assert env["KESTREL_API_KEY"] == "test-key"
+        assert env["KESTREL_A2A_TRANSPORT_ONLY"] == "false"
         assert env["KESTREL_SERVE_UI"] == "true"
 
     def test_start_agent_passes_per_agent_semantic_inference_profile(

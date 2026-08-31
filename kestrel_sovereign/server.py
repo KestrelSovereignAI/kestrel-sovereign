@@ -46,6 +46,7 @@ from kestrel_sovereign.a2a.transport_auth import (
     A2A_TRANSPORT_KEY_HEADER,
     ensure_a2a_transport_key,
     is_a2a_transport_path,
+    is_a2a_transport_only_process,
 )
 from kestrel_sovereign.auth import normalize_api_key
 
@@ -540,7 +541,7 @@ def _oauth_required() -> bool:
 
 def _bootstrap_key_enabled() -> bool:
     """Localhost API-key bootstrap is available when OAuth is not required."""
-    return not _oauth_required()
+    return not _oauth_required() and not is_a2a_transport_only_process()
 
 
 def get_api_key():
@@ -3170,7 +3171,16 @@ async def auth_middleware(request: Request, call_next):
     # like every other /api/ endpoint.
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/ui/"]
 
-    if request.url.path in public_paths or request.url.path in auth_paths:
+    transport_only_process = is_a2a_transport_only_process()
+    if request.url.path in public_paths:
+        return await call_next(request)
+    if request.url.path in auth_paths:
+        if transport_only_process:
+            return api_error_response(
+                status_code=404,
+                code="not_found",
+                message="Not found",
+            )
         return await call_next(request)
     # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth.
     # Matches the bare /webhooks/{name} AND the per-agent
@@ -3254,6 +3264,18 @@ async def auth_middleware(request: Request, call_next):
             )
         request.state.caller = CallerContext.a2a_transport()
         return await call_next(request)
+
+    # A host-managed child is a peer transport endpoint, never an operator
+    # authority domain. Do not call ``get_api_key`` here: an empty child
+    # sentinel would otherwise mint a fresh sovereign key, and localhost
+    # bootstrap or child code could recover it. Standalone launches set this
+    # marker false and retain their normal API-key/OAuth surfaces.
+    if transport_only_process:
+        return api_error_response(
+            status_code=401,
+            code="authentication_required",
+            message="Managed peer processes accept only A2A transport",
+        )
 
     # Credential evaluation only happens inside this try. Dispatch of an
     # authenticated (or deliberately unauthenticated) request stays OUTSIDE

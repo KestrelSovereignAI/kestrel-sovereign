@@ -538,6 +538,54 @@ class TestOnTaskSubmittedCallback:
         assert [task.id for task in received] == [params.id]
 
     @pytest.mark.asyncio
+    async def test_committed_task_rethrows_cancel_after_owned_canonical_readback(
+        self,
+        db_path,
+    ):
+        """Post-commit reconciliation finishes before caller cancellation wins."""
+
+        manager = await create_task_manager(db_path)
+        track_manager(manager)
+        received = []
+        manager._on_task_submitted = received.append
+        canonical_get = manager.task_store._get_unscoped
+        read_started = asyncio.Event()
+        finish_read = asyncio.Event()
+        read_finished = asyncio.Event()
+
+        async def delayed_canonical_get(task_id):
+            read_started.set()
+            await finish_read.wait()
+            try:
+                return await canonical_get(task_id)
+            finally:
+                read_finished.set()
+
+        manager.task_store._get_unscoped = delayed_canonical_get
+        params = TaskSendParams(
+            id="cancel-during-canonical-readback",
+            message=Message(role="user", parts=[TextPart(text="wake me")]),
+        )
+        creation = asyncio.create_task(
+            manager.create_task(params, agent_name="did:test:recipient")
+        )
+
+        await read_started.wait()
+        creation.cancel()
+        await asyncio.sleep(0)
+        assert not creation.done()
+        finish_read.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await creation
+
+        assert read_finished.is_set()
+        assert [task.id for task in received] == [params.id]
+        persisted = await canonical_get(params.id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+
+    @pytest.mark.asyncio
     async def test_callback_exception_does_not_break_create_task(self, db_path):
         """A failing on_task_submitted callback must NOT roll back the
         task creation. The task is the source of truth; the callback

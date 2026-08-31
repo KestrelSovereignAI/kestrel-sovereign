@@ -15,7 +15,7 @@ import re
 import secrets
 import stat
 import tempfile
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
 from kestrel_sovereign.auth import normalize_api_key
@@ -24,6 +24,7 @@ from kestrel_sovereign.auth import normalize_api_key
 A2A_TRANSPORT_KEY_ENV = "KESTREL_A2A_TRANSPORT_KEY"
 A2A_TRANSPORT_KEY_HEADER = "X-Kestrel-A2A-Key"
 A2A_TRANSPORT_KEY_FILE = ".kestrel-a2a-transport.key"
+A2A_TRANSPORT_ONLY_ENV = "KESTREL_A2A_TRANSPORT_ONLY"
 _MAX_TRANSPORT_KEY_BYTES = 4096
 _SOVEREIGN_API_KEY_ENV = "KESTREL_API_KEY"
 
@@ -246,11 +247,27 @@ def is_a2a_transport_path(method: str, path: str) -> bool:
     )
 
 
+def is_a2a_transport_only_process(
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Whether this process is a host-managed peer with no sovereign lane."""
+
+    environ = os.environ if environment is None else environment
+    return environ.get(A2A_TRANSPORT_ONLY_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 __all__ = [
     "A2A_TRANSPORT_KEY_ENV",
     "A2A_TRANSPORT_KEY_FILE",
     "A2A_TRANSPORT_KEY_HEADER",
+    "A2A_TRANSPORT_ONLY_ENV",
     "A2ATransportKeyError",
     "ensure_a2a_transport_key",
     "is_a2a_transport_path",
+    "is_a2a_transport_only_process",
 ]

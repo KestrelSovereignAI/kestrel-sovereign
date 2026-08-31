@@ -31,7 +31,10 @@ from pathlib import Path
 from typing import Optional
 
 from kestrel_sovereign.a2a.did_registry import A2A_PEER_IDENTITY_ROOTS_ENV
-from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
+from kestrel_sovereign.a2a.transport_auth import (
+    A2A_TRANSPORT_ONLY_ENV,
+    ensure_a2a_transport_key,
+)
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
@@ -896,6 +899,7 @@ class ProcessManager:
         # sovereign operator key. The selected key is shared by this host's
         # child processes and is route-scoped again by server auth.
         ensure_a2a_transport_key(env, project_root=self.project_dir)
+        env[A2A_TRANSPORT_ONLY_ENV] = "false" if standalone else "true"
         if not standalone:
             # A host-managed peer must not inherit sovereign authority. The
             # child's server imports ``.env`` with override=False, so keep an

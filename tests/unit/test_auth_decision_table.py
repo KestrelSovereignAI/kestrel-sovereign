@@ -1,6 +1,7 @@
 """Decision-table tests for auth classes in server.py."""
 
 from contextlib import asynccontextmanager
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI, Request
@@ -99,6 +100,39 @@ def test_bootstrap_key_is_localhost_only_when_enabled():
         assert ok_response.status_code == 200
         assert ok_response.json()["key"] == "bootstrap-key"
         assert denied_response.status_code == 403
+    finally:
+        _restore_app(app, original)
+
+
+def test_managed_peer_process_cannot_bootstrap_or_use_sovereign_key():
+    """A transport-only child has no recoverable local operator lane."""
+
+    app, original = _prepare_app()
+    try:
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_A2A_TRANSPORT_ONLY": "true",
+                "KESTREL_API_KEY": "",
+                "KESTREL_REQUIRE_OAUTH": "false",
+            },
+        ):
+            with TestClient(app, client=("127.0.0.1", 55000)) as client:
+                bootstrap = client.get("/api/auth/key")
+                assert bootstrap.status_code == 404
+                assert os.environ["KESTREL_API_KEY"] == ""
+
+                # Even an accidentally configured child-local key must not
+                # recreate operator authority inside the managed process.
+                os.environ["KESTREL_API_KEY"] = "child-local-sovereign-key"
+                protected = client.get(
+                    "/api/agent/tasks",
+                    headers={"X-API-Key": "child-local-sovereign-key"},
+                )
+                assert protected.status_code == 401
+                assert protected.json()["error"]["code"] == (
+                    "authentication_required"
+                )
     finally:
         _restore_app(app, original)
 
