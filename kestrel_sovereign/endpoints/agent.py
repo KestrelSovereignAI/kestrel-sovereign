@@ -3187,15 +3187,21 @@ async def _parse_a2a_principal_action(
             status_code=400,
             detail="A2A principal action requires one text part",
         )
-    params = TaskSendParams(
-        id=str(body.get("id") or ""),
-        sessionId=str(body.get("sessionId") or ""),
-        message=Message(
-            role=str(message_data.get("role") or "user"),
-            parts=parts,
-        ),
-        metadata=metadata,
-    )
+    try:
+        params = TaskSendParams(
+            id=str(body.get("id") or ""),
+            sessionId=str(body.get("sessionId") or ""),
+            message=Message(
+                role=str(message_data.get("role") or "user"),
+                parts=parts,
+            ),
+            metadata=metadata,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid A2A principal action: {exc}",
+        ) from exc
     if params.id != task_id or not params.sessionId:
         raise HTTPException(
             status_code=400,

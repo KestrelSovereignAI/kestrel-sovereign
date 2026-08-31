@@ -319,6 +319,80 @@ def test_signed_http_read_uses_verified_creator_principal(monkeypatch):
     )
 
 
+def test_process_resolver_verifies_signed_http_result_read(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+    from datetime import datetime, timezone
+
+    from kestrel_sovereign.a2a.did_registry import ProcessA2ADidResolver
+    from kestrel_sovereign.a2a.envelope_signing import (
+        bound_envelope_fields,
+        canonical_message,
+        sign_envelope,
+    )
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    sender_did = "did:web:example.com:process-sender"
+    sender_keypair = generate_hybrid_keypair()
+    sender_root = tmp_path / "process-sender"
+    sender_root.mkdir()
+    (sender_root / "sender_did.json").write_text(
+        json.dumps(
+            {
+                "id": sender_did,
+                "verificationMethod": build_verification_methods(
+                    sender_did,
+                    sender_keypair.public_keys(),
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    task = SimpleNamespace(
+        id="process-read",
+        status=SimpleNamespace(state=TaskState.COMPLETED, message=None),
+        artifacts=[],
+        metadata={"private": "creator-only"},
+    )
+    manager = SimpleNamespace(
+        get_task_for_creator=AsyncMock(return_value=task),
+    )
+    resolver = ProcessA2ADidResolver((sender_root,))
+    agent = SimpleNamespace(
+        agent_id=RECIPIENT_A,
+        did=RECIPIENT_A,
+        task_manager=manager,
+        a2a_did_resolver=resolver.resolve,
+    )
+    app = _principal_endpoint_app(monkeypatch, agent)
+    body = _principal_action_body("process-read", "read_task")
+    body["metadata"]["sender"] = sender_did
+    body["metadata"]["signature"] = sign_envelope(
+        sender_keypair,
+        sender=sender_did,
+        task_id="process-read",
+        message=canonical_message(["read_task:process-read"]),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        session_id=body["sessionId"],
+        bound=bound_envelope_fields(body["metadata"]),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/agent/tasks/process-read/read",
+            json=body,
+        )
+
+    assert response.status_code == 200
+    manager.get_task_for_creator.assert_awaited_once_with(
+        "process-read",
+        sender_did,
+    )
+
+
 @pytest.mark.parametrize(
     "malformed_message",
     [
@@ -354,6 +428,32 @@ def test_principal_action_rejects_malformed_message_shape(
 
     assert response.status_code == 400
     assert "message" in response.json()["detail"]
+    manager.get_task_for_creator.assert_not_awaited()
+
+
+def test_principal_action_rejects_invalid_message_role_as_client_error(
+    monkeypatch,
+):
+    manager = SimpleNamespace(
+        get_task_for_creator=AsyncMock(return_value=None),
+    )
+    agent = SimpleNamespace(
+        agent_id=RECIPIENT_A,
+        did=RECIPIENT_A,
+        task_manager=manager,
+    )
+    app = _principal_endpoint_app(monkeypatch, agent)
+    body = _principal_action_body("wire-read", "read_task")
+    body["message"]["role"] = "operator"
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/agent/tasks/wire-read/read",
+            json=body,
+        )
+
+    assert response.status_code == 400
+    assert "Invalid A2A principal action" in response.json()["detail"]
     manager.get_task_for_creator.assert_not_awaited()
 
 

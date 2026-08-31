@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from kestrel_sovereign.a2a.did_registry import (
+    A2A_PEER_IDENTITY_ROOTS_ENV,
     HostA2ADidResolver,
+    ProcessA2ADidResolver,
     install_a2a_did_resolver,
 )
 from kestrel_sovereign.a2a.envelope_signing import (
@@ -196,3 +199,85 @@ def test_cold_registration_installs_only_new_recipient_resolver():
     assert warm.a2a_did_resolver.__self__ is warm_resolver
     assert cold.a2a_did_resolver.__self__ is not warm_resolver
     assert cold.a2a_did_resolver(DID_A)["id"] == DID_A
+
+
+def test_process_registry_installs_local_peer_verification(
+    tmp_path,
+    monkeypatch,
+):
+    from kestrel_sovereign.a2a.transport_auth import A2A_TRANSPORT_KEY_ENV
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    sender, sender_keypair = _hybrid_agent(DID_A)
+    recipient, _ = _hybrid_agent(DID_B)
+    sender_root = tmp_path / "sender"
+    sender_root.mkdir()
+    (sender_root / "sender_did.json").write_text(
+        json.dumps(
+            {
+                "id": DID_A,
+                "verificationMethod": (
+                    sender.identity.new_verification_methods
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv(
+        A2A_PEER_IDENTITY_ROOTS_ENV,
+        json.dumps([str(sender_root)]),
+    )
+    monkeypatch.setenv(A2A_TRANSPORT_KEY_ENV, "process-transport-key")
+    feature = PeersFeature(recipient)
+    asyncio.run(feature.initialize())
+    metadata = {"sender": DID_A, "a2a_verb": "read_task"}
+    metadata["signature"] = sign_envelope(
+        sender_keypair,
+        sender=DID_A,
+        task_id="process-read",
+        message="read_task:process-read",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        session_id="a2a-read_task:process-read",
+        bound=bound_envelope_fields(metadata),
+    )
+
+    verdict = asyncio.run(
+        verify_inbound_envelope(
+            metadata,
+            task_id="process-read",
+            message="read_task:process-read",
+            session_id="a2a-read_task:process-read",
+            resolver=recipient.a2a_did_resolver,
+        )
+    )
+
+    assert callable(recipient.a2a_did_resolver)
+    assert verdict.ok is True
+    assert verdict.sender == DID_A
+
+
+def test_process_registry_resolves_rotated_successor_material(tmp_path):
+    sender, _ = _hybrid_agent(DID_A)
+    sender_root = tmp_path / "rotated-sender"
+    successions = sender_root / "successions"
+    successions.mkdir(parents=True)
+    (successions / "rotation.json").write_text(
+        json.dumps(
+            {
+                "successor_did": DID_A,
+                "successor_verification_methods": (
+                    sender.identity.new_verification_methods
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    document = ProcessA2ADidResolver((sender_root,)).resolve(DID_A)
+
+    assert document is not None
+    assert document["id"] == DID_A
+    assert document["verificationMethod"] == (
+        sender.identity.new_verification_methods
+    )

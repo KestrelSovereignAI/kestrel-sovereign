@@ -30,10 +30,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from kestrel_sovereign.multi_agent.config import (
-    LocalAgentConfig,
-    MultiAgentConfig,
-)
+from kestrel_sovereign.a2a.did_registry import A2A_PEER_IDENTITY_ROOTS_ENV
+from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
@@ -41,7 +39,11 @@ from kestrel_sovereign.config import (
     SEMANTIC_MAINTENANCE_CONFIG_ENV,
     SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
 )
-from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
+from kestrel_sovereign.multi_agent.config import (
+    MULTI_AGENT_CONFIG_FILENAME,
+    LocalAgentConfig,
+    MultiAgentConfig,
+)
 
 # NOTE: ``IDENTITY_EXPORT_DIR_ENV`` is imported lazily inside ``start_agent``
 # (its only use). Pulling it in at module scope would force ``identity``'s
@@ -894,6 +896,28 @@ class ProcessManager:
         # sovereign operator key. The selected key is shared by this host's
         # child processes and is route-scoped again by server auth.
         ensure_a2a_transport_key(env, project_root=self.project_dir)
+        # The child's server imports ``.env`` with override=False. Keep an
+        # explicit blank sentinel after collision validation rather than
+        # deleting this key: deletion would let import-time dotenv loading
+        # silently resurrect the host's sovereign credential in the child.
+        env["KESTREL_API_KEY"] = ""
+        try:
+            roster = MultiAgentConfig.load(
+                self.project_dir / MULTI_AGENT_CONFIG_FILENAME,
+                auto_discover_fallback=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not build the subprocess A2A identity registry"
+            ) from exc
+        identity_roots = {resolved_dir}
+        identity_roots.update(
+            peer_config.resolve_data_dir(self.project_dir)
+            for peer_config in roster.get_local_agents().values()
+        )
+        env[A2A_PEER_IDENTITY_ROOTS_ENV] = json.dumps(
+            sorted(str(root) for root in identity_roots)
+        )
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
         # the resolved custody root in a dedicated child-only variable so

@@ -274,6 +274,15 @@ class PeersFeature(Feature):
     async def initialize(self):
         self._host_url = _discover_host_url()
         self._transport_key = ensure_a2a_transport_key()
+        # ProcessManager children boot through the single-agent server branch
+        # and therefore never receive AgentManager's in-memory DID resolver.
+        # Their launcher supplies only explicit local identity roots; install
+        # that public-material resolver before accepting signed peer actions.
+        from kestrel_sovereign.a2a.did_registry import (
+            install_process_a2a_did_resolver,
+        )
+
+        install_process_a2a_did_resolver(self.agent)
         self._own_name = self._get_own_name()
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and

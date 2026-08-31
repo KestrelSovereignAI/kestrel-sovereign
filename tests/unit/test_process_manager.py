@@ -25,6 +25,7 @@ from kestrel_sovereign.multi_agent.process_manager import (
     AgentProcess,
     PidStatus,
 )
+from kestrel_sovereign.a2a.did_registry import A2A_PEER_IDENTITY_ROOTS_ENV
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
@@ -470,7 +471,11 @@ class TestStartAgent:
         assert env["PORT"] == "8801"
         assert env["KESTREL_SERVE_UI"] == "false"
         assert env["KESTREL_A2A_TRANSPORT_KEY"]
-        assert env["KESTREL_A2A_TRANSPORT_KEY"] != env["KESTREL_API_KEY"]
+        assert env["KESTREL_API_KEY"] == ""
+        assert set(json.loads(env[A2A_PEER_IDENTITY_ROOTS_ENV])) == {
+            str((project_dir / "agent_data" / "claw").resolve()),
+            str((project_dir / "agent_data" / "testbot").resolve()),
+        }
         persisted_transport_key = project_dir / ".kestrel-a2a-transport.key"
         assert persisted_transport_key.read_text(encoding="utf-8").strip() == (
             env["KESTREL_A2A_TRANSPORT_KEY"]
