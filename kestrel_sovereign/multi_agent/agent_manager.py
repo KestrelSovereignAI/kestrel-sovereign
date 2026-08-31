@@ -1433,12 +1433,20 @@ class AgentManager:
         if hook is not None:
             await hook(name, agent)
 
-        # The server opens the host-context gate and snapshots the registered
-        # fleet once. An agent that deferred readiness while initializing can
-        # miss that snapshot and publish immediately afterward. Registration
-        # is the complementary side of the race: once the gate is open, consume
-        # deferred readiness before this onboarding transaction commits. The
-        # agent serializes this with the snapshot path for exactly-once hooks.
+    async def _complete_registered_agent_readiness(
+        self,
+        agent: KestrelAgent,
+    ) -> None:
+        """Finish deferred hooks after onboarding releases the topology writer.
+
+        A ready hook may start a cognition turn whose tools acquire a shared
+        A2A execution lease.  Registration therefore must not run it while
+        retaining the exclusive lifecycle writer used for publication and
+        app-owned onboarding.  Drive the hook task to settlement so caller
+        cancellation cannot strand a successfully published agent forever in
+        its deferred-ready state.
+        """
+
         gate = self._host_context_publication_gate
         complete_readiness = getattr(
             agent,
@@ -1446,7 +1454,42 @@ class AgentManager:
             None,
         )
         if gate is not None and gate.is_set() and callable(complete_readiness):
-            await complete_readiness()
+            task = asyncio.create_task(
+                complete_readiness(),
+                name=(
+                    "agent_deferred_readiness:"
+                    f"{_loaded_agent_did(agent) or 'unknown'}"
+                ),
+            )
+            cancelled, failure = await await_lifecycle_task_completion(task)
+            if failure is not None:
+                raise failure
+            if cancelled:
+                raise asyncio.CancelledError()
+
+    async def complete_deferred_agent_readiness(self) -> None:
+        """Complete startup readiness behind the registration writer boundary.
+
+        The server opens the host-context gate after publishing host policy.
+        A registration may already have inserted an agent into ``_agents`` but
+        still be awaiting app-owned onboarding under the A2A lifecycle writer.
+        Taking that same writer here makes the startup sweep linearize either
+        before publication or after onboarding; it can never run a feature's
+        ``on_agent_ready`` hook in the partial interval between them.
+
+        Registrations that publish after this sweep retain the complementary
+        post-onboarding call in the registration path.
+        """
+
+        async with self._a2a_lifecycle_lock:
+            agents = list(self._agents.values())
+
+        seen: set[int] = set()
+        for agent in agents:
+            if id(agent) in seen:
+                continue
+            seen.add(id(agent))
+            await self._complete_registered_agent_readiness(agent)
 
     async def _initialize_agent(
         self,
@@ -2377,6 +2420,7 @@ class AgentManager:
                         raise
                     committed = True
                     admission.published = True
+                await self._complete_registered_agent_readiness(agent)
                 return agent
             except BaseException:
                 if not committed:
@@ -2564,6 +2608,7 @@ class AgentManager:
                             admission.published = True
                         unpublished.pop(name, None)
                         loaded += 1
+                        await self._complete_registered_agent_readiness(result)
                     except BaseException as onboarding_failure:
                         # Claim before the first cleanup await.  If that cleanup
                         # fails, the outer batch handler must not discover and

@@ -4345,9 +4345,156 @@ class TestLoadFromConfig:
         manager._register_agent("late-ready", agent)
 
         await manager._on_agent_registered("late-ready", agent)
+        await manager._complete_registered_agent_readiness(agent)
 
         assert manager.get_agent("late-ready") is agent
         agent.complete_deferred_agent_readiness.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_readiness_snapshot_waits_for_registration_onboarding(self):
+        """The startup sweep cannot observe a half-onboarded publication."""
+
+        manager = AgentManager()
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        onboarding_started = asyncio.Event()
+        release_onboarding = asyncio.Event()
+        onboarding_done = False
+
+        async def onboard(_name, _agent):
+            nonlocal onboarding_done
+            onboarding_started.set()
+            await release_onboarding.wait()
+            onboarding_done = True
+
+        manager.set_agent_registration_hook(onboard)
+        agent = _make_mock_agent("did:registering")
+
+        async def complete_readiness():
+            assert onboarding_done is True
+            # A feature-ready cognition may execute an A2A tool. The manager
+            # must release its publication writer before invoking the hook.
+            async with manager.a2a_execution_lease():
+                pass
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+
+        async def publish_and_onboard():
+            async with manager.a2a_lifecycle_lease():
+                manager._register_agent("registering", agent)
+                await manager._on_agent_registered("registering", agent)
+            await manager._complete_registered_agent_readiness(agent)
+
+        registration = asyncio.create_task(publish_and_onboard())
+        await asyncio.wait_for(onboarding_started.wait(), timeout=1)
+
+        startup_sweep = asyncio.create_task(
+            manager.complete_deferred_agent_readiness()
+        )
+        await asyncio.sleep(0)
+        agent.complete_deferred_agent_readiness.assert_not_awaited()
+
+        release_onboarding.set()
+        await asyncio.wait_for(
+            asyncio.gather(registration, startup_sweep),
+            timeout=1,
+        )
+
+        # Registration consumes the deferred hook after onboarding; the
+        # serialized startup sweep then observes the same exact-once agent
+        # contract and becomes a no-op in production.
+        assert agent.complete_deferred_agent_readiness.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_dynamic_registration_releases_writer_before_ready_cognition(
+        self,
+        tmp_path,
+    ):
+        """The real load path lets a ready-hook turn acquire an A2A reader."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        onboarding_done = False
+
+        async def onboard(_name, _agent):
+            nonlocal onboarding_done
+            onboarding_done = True
+
+        manager.set_agent_registration_hook(onboard)
+        agent = _make_mock_agent("did:dynamic-ready")
+
+        async def complete_readiness():
+            assert onboarding_done is True
+            async with manager.a2a_execution_lease():
+                pass
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+        manager._initialize_agent = AsyncMock(return_value=agent)
+
+        loaded = await asyncio.wait_for(
+            manager.load_agent(
+                "dynamic-ready",
+                LocalAgentConfig(data_dir=Path("dynamic-ready"), port=8801),
+            ),
+            timeout=1,
+        )
+
+        assert loaded is agent
+        assert manager.get_agent("dynamic-ready") is agent
+        agent.complete_deferred_agent_readiness.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_dynamic_registration_cancellation_settles_ready_hook(
+        self,
+        tmp_path,
+    ):
+        """Caller cancellation cannot strand a published deferred-ready agent."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        agent = _make_mock_agent("did:dynamic-cancel")
+        readiness_started = asyncio.Event()
+        release_readiness = asyncio.Event()
+        readiness_done = False
+
+        async def complete_readiness():
+            nonlocal readiness_done
+            readiness_started.set()
+            await release_readiness.wait()
+            readiness_done = True
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+        manager._initialize_agent = AsyncMock(return_value=agent)
+
+        load = asyncio.create_task(
+            manager.load_agent(
+                "dynamic-cancel",
+                LocalAgentConfig(data_dir=Path("dynamic-cancel"), port=8801),
+            )
+        )
+        await asyncio.wait_for(readiness_started.wait(), timeout=1)
+        load.cancel()
+        await asyncio.sleep(0)
+        assert load.done() is False
+
+        release_readiness.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(load, timeout=1)
+
+        assert readiness_done is True
+        assert manager.get_agent("dynamic-cancel") is agent
+        assert manager._agent_operations == {}
 
     @pytest.mark.asyncio
     async def test_load_from_config_initializes_concurrently_and_registers_in_order(self):

@@ -2668,6 +2668,14 @@ async def _complete_deferred_agent_readiness(app: FastAPI) -> None:
 
     manager = getattr(app.state, "agent_manager", None)
     if manager is not None:
+        complete_manager_readiness = getattr(
+            manager,
+            "complete_deferred_agent_readiness",
+            None,
+        )
+        if callable(complete_manager_readiness):
+            await complete_manager_readiness()
+            return
         agents = [
             manager.get_agent(name)
             for name in manager.list_agents()

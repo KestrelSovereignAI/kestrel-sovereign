@@ -326,6 +326,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
     class FakeManager:
         init_failures = []
+        readiness_sweep_calls = 0
 
         def set_host_context_publication_gate(self, gate) -> None:
             self.host_context_publication_gate = gate
@@ -338,6 +339,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
             assert not self.host_context_publication_gate.is_set()
             events.append("agents-load")
             return 1
+
+        async def complete_deferred_agent_readiness(self):
+            assert self.host_context_publication_gate.is_set()
+            self.readiness_sweep_calls += 1
+            await fake_agent.complete_deferred_agent_readiness()
 
         def list_agents(self):
             return ["Kite"]
@@ -456,6 +462,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "agents-stop",
         ]
         assert not fake_manager.host_context_publication_gate.is_set()
+        assert fake_manager.readiness_sweep_calls == 0
         return
 
     async with server.lifespan(test_app):
@@ -474,6 +481,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "host-context-bind",
             "agent-ready",
         ]
+        assert fake_manager.readiness_sweep_calls == 1
 
     assert events[-5:] == [
         "host-stop",
