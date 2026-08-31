@@ -122,6 +122,69 @@ def test_non_ascii_transport_key_file_fails_before_http_serialization(
         transport_auth.ensure_a2a_transport_key(project_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "configured_sovereign_key",
+    [
+        "shared-authority-key",
+        "'shared-authority-key'",
+        '"shared-authority-key"',
+    ],
+)
+def test_transport_key_cannot_alias_effective_sovereign_key(
+    monkeypatch,
+    tmp_path,
+    configured_sovereign_key,
+):
+    monkeypatch.setenv("KESTREL_API_KEY", configured_sovereign_key)
+    monkeypatch.setenv(
+        transport_auth.A2A_TRANSPORT_KEY_ENV,
+        "shared-authority-key",
+    )
+
+    with pytest.raises(
+        transport_auth.A2ATransportKeyError,
+        match="distinct from the sovereign API key",
+    ):
+        transport_auth.ensure_a2a_transport_key(project_root=tmp_path)
+
+
+def test_child_transport_key_cannot_alias_child_sovereign_key(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("KESTREL_API_KEY", "host-sovereign-key")
+    environment = {
+        "KESTREL_API_KEY": "child-sovereign-key",
+        transport_auth.A2A_TRANSPORT_KEY_ENV: "child-sovereign-key",
+    }
+
+    with pytest.raises(
+        transport_auth.A2ATransportKeyError,
+        match="distinct from the sovereign API key",
+    ):
+        transport_auth.ensure_a2a_transport_key(
+            environment,
+            project_root=tmp_path,
+        )
+
+
+def test_durable_transport_key_cannot_alias_sovereign_key(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv(transport_auth.A2A_TRANSPORT_KEY_ENV, raising=False)
+    monkeypatch.setenv("KESTREL_API_KEY", "shared-durable-key")
+    key_path = tmp_path / transport_auth.A2A_TRANSPORT_KEY_FILE
+    key_path.write_text("shared-durable-key\n", encoding="utf-8")
+    key_path.chmod(0o600)
+
+    with pytest.raises(
+        transport_auth.A2ATransportKeyError,
+        match="distinct from the sovereign API key",
+    ):
+        transport_auth.ensure_a2a_transport_key(project_root=tmp_path)
+
+
 def test_generated_key_survives_independent_launcher_processes(
     monkeypatch,
     tmp_path,

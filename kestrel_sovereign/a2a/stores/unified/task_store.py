@@ -25,7 +25,10 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
 
-_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v3"
+# Keep the v2 lock identity through the mixed-version window. A v2 worker uses
+# this exact advisory lock before probing/installing its compatibility trigger;
+# changing the key would let v2 and v3 replace database functions concurrently.
+_CANCELLATION_SCHEMA_LOCK = "a2a_tasks_cancel_authority_v2"
 
 
 class TaskAlreadyExistsError(ValueError):
@@ -302,6 +305,25 @@ class TaskStore(UnifiedStoreBase):
                     RETURN NEW;
                 END;
                 $a2a_fence_function$ LANGUAGE plpgsql;
+
+                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v3()
+                RETURNS trigger AS $a2a_fence_function_v3$
+                BEGIN
+                    IF TG_OP = 'UPDATE'
+                       AND OLD.status IN ('completed', 'failed', 'canceled') THEN
+                        RAISE EXCEPTION 'terminal A2A task cannot be replaced'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    IF (TG_OP = 'INSERT'
+                        OR NEW.status IN ('submitted', 'working', 'input-required'))
+                       AND (NEW.creator_agent_id IS NULL
+                            OR NEW.recipient_agent_id IS NULL) THEN
+                        RAISE EXCEPTION 'A2A task requires durable authority'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $a2a_fence_function_v3$ LANGUAGE plpgsql;
 
                 DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1
                     ON a2a_tasks;

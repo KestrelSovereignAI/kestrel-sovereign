@@ -4,6 +4,17 @@ from enum import Enum
 from typing import Optional
 
 
+def normalize_api_key(value: Optional[str]) -> Optional[str]:
+    """Normalize a configured API credential exactly once for every auth lane."""
+
+    if value is None:
+        return None
+    # Docker ``--env-file`` retains matching surrounding quotes literally.
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 class AuthMethod(str, Enum):
     """How the caller authenticated."""
     API_KEY = "api_key"

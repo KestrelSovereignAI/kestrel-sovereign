@@ -47,6 +47,7 @@ from kestrel_sovereign.a2a.transport_auth import (
     ensure_a2a_transport_key,
     is_a2a_transport_path,
 )
+from kestrel_sovereign.auth import normalize_api_key
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -551,10 +552,7 @@ def get_api_key():
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
-    # Strip surrounding quotes (Docker --env-file includes them literally)
-    if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in ('"', "'"):
-        api_key = api_key[1:-1]
-    return api_key
+    return normalize_api_key(api_key)
 
 
 async def verify_api_key(

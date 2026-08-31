@@ -180,6 +180,82 @@ async def test_recipient_mutation_authority_postgres():
         await _exercise_recipient_mutations(TaskStore(backend))
     finally:
         await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_v3_fence_remains_strong_during_v2_rollout():
+    if not POSTGRES_URL:  # pragma: no cover - environment gate
+        pytest.skip(
+            "TEST_POSTGRES_URL / KESTREL_DATABASE_URL / DATABASE_URL required"
+        )
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    backend = PostgresBackend(POSTGRES_URL)
+    await backend.connect()
+    terminal_id = f"mixed-version-terminal-{uuid4().hex}"
+    authorityless_id = f"mixed-version-authorityless-{uuid4().hex}"
+    try:
+        store = TaskStore(backend)
+        await store.initialize()
+
+        # This is the compatibility marker an already-deployed v2 worker probes
+        # before deciding whether to replace its shared trigger function.
+        v2_ready = await backend.fetch_one("""
+            SELECT
+                EXISTS (
+                    SELECT 1
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = procedure.pronamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND procedure.proname =
+                          'a2a_tasks_enforce_authority_fence'
+                      AND pg_get_function_identity_arguments(procedure.oid) = ''
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_trigger trigger
+                    JOIN pg_class relation
+                      ON relation.oid = trigger.tgrelid
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND relation.relname = 'a2a_tasks'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
+                      AND NOT trigger.tgisinternal
+                )
+        """)
+        assert v2_ready and v2_ready[0] is True
+
+        await backend.execute(
+            """
+            INSERT INTO a2a_tasks
+                (id, task_type, status, creator_agent_id, recipient_agent_id)
+            VALUES (?, 'generic', 'completed', ?, ?)
+            """,
+            (terminal_id, "did:test:creator", "did:test:recipient"),
+        )
+        with pytest.raises(Exception, match="terminal A2A task cannot be replaced"):
+            await backend.execute(
+                "UPDATE a2a_tasks SET status = 'failed' WHERE id = ?",
+                (terminal_id,),
+            )
+        with pytest.raises(Exception, match="requires durable authority"):
+            await backend.execute(
+                """
+                INSERT INTO a2a_tasks (id, task_type, status)
+                VALUES (?, 'generic', 'completed')
+                """,
+                (authorityless_id,),
+            )
+    finally:
+        await backend.execute(
+            "DELETE FROM a2a_tasks WHERE id IN (?, ?)",
+            (terminal_id, authorityless_id),
+        )
+        await backend.close()
+
+
 @pytest.mark.asyncio
 async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
     backend = SQLiteBackend(str(tmp_path / "recipient-terminal-replace.db"))

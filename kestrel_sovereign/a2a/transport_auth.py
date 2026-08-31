@@ -18,11 +18,14 @@ import tempfile
 from collections.abc import MutableMapping
 from pathlib import Path
 
+from kestrel_sovereign.auth import normalize_api_key
+
 
 A2A_TRANSPORT_KEY_ENV = "KESTREL_A2A_TRANSPORT_KEY"
 A2A_TRANSPORT_KEY_HEADER = "X-Kestrel-A2A-Key"
 A2A_TRANSPORT_KEY_FILE = ".kestrel-a2a-transport.key"
 _MAX_TRANSPORT_KEY_BYTES = 4096
+_SOVEREIGN_API_KEY_ENV = "KESTREL_API_KEY"
 
 _ROUTED_A2A_PATH = re.compile(
     r"^(?:/api/agents/[^/]+)?/api/agent/"
@@ -48,6 +51,20 @@ def _validate_transport_key(value: str, *, source: str) -> str:
             f"{source} must contain only header-safe ASCII characters"
         )
     return selected
+
+
+def _configured_sovereign_api_key(
+    environment: MutableMapping[str, str] | None,
+) -> str | None:
+    """Return the operator credential exactly as server auth compares it."""
+
+    if environment is not None and _SOVEREIGN_API_KEY_ENV in environment:
+        configured = environment.get(_SOVEREIGN_API_KEY_ENV)
+    else:
+        configured = os.environ.get(_SOVEREIGN_API_KEY_ENV)
+    if not isinstance(configured, str) or not configured:
+        return None
+    return normalize_api_key(configured)
 
 
 def _read_transport_key(path: Path) -> str:
@@ -181,6 +198,15 @@ def ensure_a2a_transport_key(
 
             project_root = project_dir()
         selected = _load_or_create_transport_key(Path(project_root).resolve())
+
+    sovereign_key = _configured_sovereign_api_key(environment)
+    if sovereign_key is not None and secrets.compare_digest(
+        selected.encode("utf-8"),
+        sovereign_key.encode("utf-8"),
+    ):
+        raise A2ATransportKeyError(
+            "A2A transport key must be distinct from the sovereign API key"
+        )
 
     if environment is not None:
         environment[A2A_TRANSPORT_KEY_ENV] = selected
