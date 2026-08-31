@@ -802,13 +802,44 @@ async def _remove_feature_locked(
         # Package removal has not crossed its irreversible on_remove/pip
         # boundary yet. Restore the complete group before propagating a hook
         # failure (including an internally-originated CancelledError).
-        for class_name, feature, was_enabled in reversed(attempted):
+        enabled = tuple(
+            feature for _class_name, feature, was_enabled in attempted if was_enabled
+        )
+        prepared_by_feature: Dict[int, Any] = {}
+        if enabled:
             try:
-                if was_enabled:
-                    await agent._activate_feature_runtime(feature)
-                else:
+                # Cross-feature setup before/after references are valid only as
+                # one prospective set. Collect and preflight the complete
+                # rollback generation once, then pass each retained item into
+                # activation so no member revalidates against a partial set.
+                prepared = agent._prepare_feature_contribution_transition(enabled)
+                prepared_by_feature = {
+                    id(feature): item
+                    for feature, item in prepared.activatable(enabled)
+                }
+            except (Exception, asyncio.CancelledError):
+                logger.exception(
+                    "Remove rollback contribution batch preparation failed",
+                )
+        # Preserve package activation order. The retained batch preparation
+        # above has already validated forward references across the full set;
+        # passing its exact per-feature items suppresses invalid partial-set
+        # preflight during each activation.
+        for class_name, feature, was_enabled in attempted:
+            try:
+                if not was_enabled:
                     agent.features[class_name] = feature
                     feature.enabled = False
+                elif id(feature) in prepared_by_feature:
+                    await agent._activate_feature_runtime(
+                        feature,
+                        prepared_contributions=prepared_by_feature[id(feature)],
+                    )
+                else:
+                    logger.error(
+                        "Remove rollback could not prepare enabled feature '%s'",
+                        class_name,
+                    )
             except (Exception, asyncio.CancelledError):
                 logger.exception(
                     "Remove rollback (re-activate) failed for feature '%s'",

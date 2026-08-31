@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -578,6 +579,68 @@ def test_every_contribution_getter_uses_one_sanitized_typed_boundary(
     assert error.stage == expected_stage
     assert f"credential-from-{getter}" not in str(error)
     assert error.__cause__ is original
+    assert runtime.active_owners() == ()
+
+
+def test_context_clause_getter_failure_discards_secret_exception_chain(
+    tmp_path, monkeypatch
+):
+    """User-authored context collection errors never reach traceback logging."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    secret = "api-key=context-getter-must-stay-private"
+
+    def fail_collection():
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        feature,
+        "get_context_clause_registrations",
+        fail_collection,
+    )
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((feature,))
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.getter == "get_context_clause_registrations"
+    assert error.stage == "context-clause collection"
+    assert error.__cause__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert runtime.active_owners() == ()
+
+
+def test_context_clause_getter_cannot_forge_cancellation_with_secret_text(
+    tmp_path, monkeypatch
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    secret = "token=context-getter-cancel-must-stay-private"
+
+    def cancel_collection():
+        raise asyncio.CancelledError(secret)
+
+    monkeypatch.setattr(
+        feature,
+        "get_context_clause_registrations",
+        cancel_collection,
+    )
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((feature,))
+
+    error = exc_info.value
+    assert error.getter == "get_context_clause_registrations"
+    assert error.__cause__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
     assert runtime.active_owners() == ()
 
 

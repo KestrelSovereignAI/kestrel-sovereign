@@ -1172,6 +1172,7 @@ class FeatureContributionRuntime:
             "get_context_clause_registrations",
             materialize=True,
             optional=True,
+            discard_cause=True,
         )
         try:
             contributions = validate_feature_contributions(
@@ -1221,6 +1222,7 @@ class FeatureContributionRuntime:
         *,
         materialize: bool,
         optional: bool = False,
+        discard_cause: bool = False,
     ) -> object:
         """Read one SDK getter once and keep all failures at one typed edge."""
 
@@ -1230,7 +1232,15 @@ class FeatureContributionRuntime:
                 return ()
             value = method()
             return tuple(value) if materialize else value
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            if discard_cause:
+                # Context clauses are user-authored prompt material and their
+                # getters commonly read secret-bearing feature configuration.
+                # Startup/API logging formats complete exception chains, so the
+                # fixed boundary must not retain arbitrary out-of-tree text.
+                raise FeatureContributionCollectionError(feature, getter) from None
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise FeatureContributionCollectionError(feature, getter) from exc
 
     @staticmethod
