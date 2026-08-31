@@ -65,27 +65,23 @@ class ModelDiscoveryMixin:
     ) -> None:
         """Record whether ``vendor``'s catalog was actually retrieved (#3190).
 
-        Success and failure are recorded as two separate facts rather than
-        inferred from the returned list's length. A failed ``list_models`` and
-        a vendor that genuinely serves nothing both yield ``[]``, and only the
-        first must be barred from vetoing an operator's pinned model in
+        Failure is recorded as its own fact rather than inferred from the
+        returned list's length. A failed ``list_models`` and a vendor that
+        genuinely serves nothing both yield ``[]``, and only the first must be
+        barred from vetoing an operator's pinned model in
         ``_validate_explicit_mandate``.
 
-        A vendor that succeeded earlier and fails now LOSES its trusted status:
-        the catalog we hold for it may be a stale remnant, and the safe
-        direction for a convenience guard is to permit (resolve-time still
-        defends).
+        Success CLEARS a prior failure: once the catalog is retrievable again
+        the veto must resume, or a single transient outage would disable the
+        guard for the life of the process.
         """
-        ok = getattr(self, "_discovery_ok", None)
         failures = getattr(self, "_discovery_failures", None)
-        if ok is None or failures is None:
+        if failures is None:
             # Bare harness / partially-constructed instance — nothing to record.
             return
         if error is None:
-            ok.add(vendor)
             failures.pop(vendor, None)
         else:
-            ok.discard(vendor)
             failures[vendor] = f"{type(error).__name__}: {error}"[:300]
 
     async def discover_all_models(
@@ -1572,9 +1568,10 @@ class ModelDiscoveryMixin:
                 self._note_discovery_outcome(vendor, None)
                 return models
         except NotImplementedError:
-            # Not a failure and not a success: the adapter publishes no catalog
-            # at all, so we still hold no trustworthy list for this vendor and
-            # must not let whatever rows exist disprove a model.
+            # Not a failure: the adapter simply publishes no catalog. Recording
+            # it as one would excuse the serveability veto for every such
+            # vendor, which is broader than this fix intends — the veto is
+            # relaxed only where discovery was ATTEMPTED and failed.
             logger.debug("%s: adapter.list_models not implemented", vendor)
         except Exception as e:
             logger.warning("%s: model discovery failed: %s", vendor, e)

@@ -455,21 +455,19 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
 
-        # Per-vendor model-discovery outcome (#3190). A vendor is listed here
-        # ONLY after ``list_models`` returned successfully for it, so the set
-        # answers "do we hold a catalog for this vendor that is complete enough
-        # to disprove a model?" — a question ``len(catalog) > 0`` cannot answer.
+        # vendor -> last model-discovery error (#3190). Records the fact that a
+        # vendor's catalog could NOT be retrieved, which ``len(catalog) > 0``
+        # cannot express: a failed ``list_models`` and a vendor that genuinely
+        # serves nothing both yield an empty list.
         #
-        # This distinction is load-bearing: when the Anthropic key was disabled
-        # on 2026-08-31, ``GET /v1/models`` 401ed and the vendor catalog
-        # collapsed to a single stale entry. Non-empty was read as complete, so
+        # Load-bearing twice over. When the Anthropic key was disabled on
+        # 2026-08-31, ``GET /v1/models`` 401ed and that vendor's catalog
+        # collapsed to a single stale entry; non-empty was read as complete, so
         # ``_validate_explicit_mandate`` "proved" claude-opus-5 unservable and
-        # every agent's persisted pin was discarded at boot — dropping the
-        # fleet onto a 1B local model. Only a *successful* discovery may veto.
-        self._discovery_ok: set[str] = set()
-        # vendor -> last discovery error string, for the health surface. An
-        # operator-actionable condition (dead key, network) must not live only
-        # in a log line.
+        # every agent's persisted pin was discarded at boot, dropping the fleet
+        # onto a 1B local model. It also drives the ``model_discovery`` health
+        # check — an operator-actionable condition (dead key, network) must not
+        # live only in a log line.
         self._discovery_failures: Dict[str, str] = {}
         # Set when a PERSISTED mandate failed to apply at boot (#3190) — the
         # operator set a model and it is not in effect. Cleared by a successful
@@ -2007,10 +2005,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # vendor, permit (resolve-time still defends). Only a *populated*
             # vendor catalog can prove a model invalid.
             return
-        if vendor not in getattr(self, "_discovery_ok", set()):
-            # We hold rows for this vendor but never completed a successful
-            # discovery for it, so those rows are a stale or partial remnant —
-            # unknown, not disproof (#3190).
+        if vendor in getattr(self, "_discovery_failures", {}):
+            # Discovery for THIS vendor failed, so whatever rows we hold for it
+            # are a stale or partial remnant — unknown, not disproof (#3190).
             #
             # "Non-empty" is not "complete". On 2026-08-31 the Anthropic key was
             # disabled, GET /v1/models 401ed, and this vendor's catalog
@@ -2019,6 +2016,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # that very route. The rejection propagated to every agent's boot
             # load, which discards a failed mandate on a WARNING line, leaving
             # the whole fleet unpinned and routed to a 1B local model.
+            #
+            # Deliberately a BLOCKLIST, not an allowlist. Keying on "discovery
+            # succeeded" instead would also disable the guard whenever discovery
+            # simply had not run — including the case it exists for, an LLM
+            # naming a model that does not exist against a healthy catalog
+            # (#1927/#1946). Only a KNOWN failure may excuse the veto.
             return
         if model in vendor_models:
             return

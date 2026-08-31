@@ -44,7 +44,7 @@ def _cached(models):
     return cache
 
 
-def _make_service(*, discovery_ok=(), providers=None):
+def _make_service(*, discovery_failures=None, providers=None):
     """Bare LLMService wired just enough for _validate_explicit_mandate."""
     svc = LLMService.__new__(LLMService)
     svc.providers = providers if providers is not None else [
@@ -55,8 +55,7 @@ def _make_service(*, discovery_ok=(), providers=None):
     svc._preference_persistence_tasks = set()
     svc._route_catalogs = {}
     svc._ensure_route_catalogs_sync = lambda: None
-    svc._discovery_ok = set(discovery_ok)
-    svc._discovery_failures = {}
+    svc._discovery_failures = dict(discovery_failures or {})
     svc._mandate_load_error = None
     return svc
 
@@ -68,7 +67,7 @@ _COLLAPSED_ANTHROPIC_CATALOG = [_mk_model("claude-sonnet-5", "anthropic")]
 class TestFailedDiscoveryMustNotVeto:
     def test_partial_catalog_from_failed_discovery_permits_the_pinned_model(self):
         """THE motivating case. Discovery failed -> catalog is a remnant, not proof."""
-        svc = _make_service(discovery_ok=())  # anthropic discovery never succeeded
+        svc = _make_service(discovery_failures={"anthropic": "AuthenticationError: 401"})  # anthropic discovery never succeeded
         cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
         with patch(
             "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
@@ -79,7 +78,7 @@ class TestFailedDiscoveryMustNotVeto:
 
     def test_successful_discovery_still_rejects_an_unserved_model(self):
         """The converse. Proves the guard was gated, not deleted (#1927/#1946)."""
-        svc = _make_service(discovery_ok={"anthropic"})
+        svc = _make_service()
         cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
         with patch(
             "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
@@ -89,7 +88,7 @@ class TestFailedDiscoveryMustNotVeto:
                 svc._validate_explicit_mandate("claude-opus-5", "anthropic", "plan")
 
     def test_successful_discovery_permits_a_model_it_lists(self):
-        svc = _make_service(discovery_ok={"anthropic"})
+        svc = _make_service()
         cache = _cached(
             [_mk_model("claude-sonnet-5", "anthropic"), _mk_model("claude-opus-5", "anthropic")]
         )
@@ -101,7 +100,7 @@ class TestFailedDiscoveryMustNotVeto:
 
     def test_empty_vendor_catalog_still_permits(self):
         """Pre-existing cold-start behaviour is unchanged."""
-        svc = _make_service(discovery_ok={"anthropic"})
+        svc = _make_service()
         cache = _cached([_mk_model("gpt-5.6-luna", "openai")])
         with patch(
             "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
@@ -111,28 +110,26 @@ class TestFailedDiscoveryMustNotVeto:
 
     def test_unknown_route_is_still_a_hard_error(self):
         """Route existence is a separate, stricter check — untouched by this fix."""
-        svc = _make_service(discovery_ok=())
+        svc = _make_service(discovery_failures={"anthropic": "AuthenticationError: 401"})
         with pytest.raises(ValueError, match="no configured route matches"):
             svc._validate_explicit_mandate("claude-opus-5", "anthropic", "nonexistent")
 
 
 class TestDiscoveryOutcomeRecording:
-    def test_success_marks_vendor_trusted_and_clears_prior_failure(self):
-        svc = _make_service()
-        svc._discovery_failures["anthropic"] = "AuthenticationError: 401"
+    def test_success_clears_a_prior_failure(self):
+        """The veto must RESUME once the catalog is retrievable again.
+
+        Without this, one transient outage disables the guard for the life of
+        the process.
+        """
+        svc = _make_service(discovery_failures={"anthropic": "AuthenticationError: 401"})
         svc._note_discovery_outcome("anthropic", None)
-        assert "anthropic" in svc._discovery_ok
         assert "anthropic" not in svc._discovery_failures
 
-    def test_failure_records_reason_and_revokes_prior_trust(self):
-        """A vendor that succeeded earlier and fails now must LOSE trust.
-
-        The catalog we still hold for it may be a stale remnant; a convenience
-        guard must fail open, not keep vetoing from cached rows.
-        """
-        svc = _make_service(discovery_ok={"anthropic"})
+    def test_failure_records_the_reason(self):
+        """The recorded reason is what the health surface shows the operator."""
+        svc = _make_service()
         svc._note_discovery_outcome("anthropic", RuntimeError("401 Unauthorized"))
-        assert "anthropic" not in svc._discovery_ok
         assert "401 Unauthorized" in svc._discovery_failures["anthropic"]
 
     def test_failure_reason_is_bounded(self):
@@ -149,7 +146,7 @@ class TestDiscoveryOutcomeRecording:
 class TestMandateLoadErrorLifecycle:
     def test_successful_set_clears_a_recorded_load_error(self):
         """Both ends: the flag that gets set must also get cleared."""
-        svc = _make_service(discovery_ok={"anthropic"})
+        svc = _make_service()
         svc._mandate_load_error = "Cannot set model 'claude-opus-5' ..."
         cache = _cached([_mk_model("claude-opus-5", "anthropic")])
         with patch(
@@ -226,12 +223,12 @@ class TestVendorAttributionInGather:
 
 
 class TestSafeListModelsRecordsOutcome:
-    """``_safe_list_models`` is the only path that GRANTS a vendor trust.
+    """``_safe_list_models`` is where a vendor's failure is first observed.
 
-    If it stopped recording success, ``_discovery_ok`` would be empty forever
-    and the serveability guard would never fire again — silently reverting
-    #1927/#1946 while every test still passed. That is the failure this class
-    exists to catch.
+    If it stopped recording, ``_discovery_failures`` would stay empty and the
+    outage in this module's docstring would recur unchanged — the veto would go
+    on trusting a collapsed catalog. If it stopped CLEARING, one transient 401
+    would disable the #1927/#1946 guard for the life of the process.
     """
 
     @pytest.mark.asyncio
@@ -243,9 +240,10 @@ class TestSafeListModelsRecordsOutcome:
             return [_mk_model("claude-opus-5", "anthropic")]
 
         adapter.list_models = _list
+        svc._discovery_failures["anthropic"] = "stale prior failure"
         models = await svc._safe_list_models("anthropic", adapter, MagicMock())
         assert len(models) == 1
-        assert "anthropic" in svc._discovery_ok
+        assert "anthropic" not in svc._discovery_failures
 
     @pytest.mark.asyncio
     async def test_exception_records_failure_and_withholds_trust(self):
@@ -258,7 +256,6 @@ class TestSafeListModelsRecordsOutcome:
         adapter.list_models = _list
         models = await svc._safe_list_models("anthropic", adapter, MagicMock())
         assert models == []
-        assert "anthropic" not in svc._discovery_ok
         assert "401 Unauthorized" in svc._discovery_failures["anthropic"]
 
     @pytest.mark.asyncio
@@ -277,5 +274,4 @@ class TestSafeListModelsRecordsOutcome:
         adapter.list_models = _list
         models = await svc._safe_list_models("anthropic", adapter, MagicMock())
         assert models == []
-        assert "anthropic" not in svc._discovery_ok
         assert "anthropic" not in svc._discovery_failures

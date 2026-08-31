@@ -264,7 +264,12 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             # a model and it is NOT in effect, so this agent is running on
             # whatever route_priority picks. Previously this state existed only
             # as one WARNING line at boot.
+            # Require a real string: ``getattr`` on a test double returns a
+            # truthy stub, which would report every mocked service as UNPINNED
+            # and then fail to JSON-serialise when the heartbeat is persisted.
             mandate_load_error = getattr(llm_service, "_mandate_load_error", None)
+            if not isinstance(mandate_load_error, str):
+                mandate_load_error = None
             if mandate_load_error:
                 status = worst_status(status, "warn")
                 details["mandate_load_error"] = mandate_load_error
