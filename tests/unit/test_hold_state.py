@@ -554,6 +554,39 @@ async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_boot_validates_global_history_once_for_all_targets(
+    hold_db,
+    monkeypatch,
+):
+    _db, store = hold_db
+    for index in range(3):
+        await store.set_hold(
+            scope="agent",
+            target_id=f"did:agent:boot-{index}",
+            actor_id="did:sovereign:operator",
+            reason="boot validation scaling",
+            operation_id=f"boot-validation-{index}",
+        )
+
+    validate_anchor = AsyncMock(wraps=store._assert_history_anchor_intact)
+    validate_operations = AsyncMock(
+        wraps=store._assert_no_orphaned_operation_witnesses
+    )
+    monkeypatch.setattr(store, "_assert_history_anchor_intact", validate_anchor)
+    monkeypatch.setattr(
+        store,
+        "_assert_no_orphaned_operation_witnesses",
+        validate_operations,
+    )
+
+    states = await store.read_boot_state()
+
+    assert len(states) == 3
+    assert validate_anchor.await_count == 1
+    assert validate_operations.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_host_context_uses_configured_postgres_for_durable_hold(
     monkeypatch,
     tmp_path,
@@ -3059,18 +3092,36 @@ async def test_two_sqlite_workers_serialize_replacement_and_stale_release(tmp_pa
         await db_two.close()
 
 
+def _portable_hold_store(db_backend, tmp_path):
+    """Build the SQL parity store with disposable, backend-neutral custody."""
+
+    db = AsyncDatabase(db_backend)
+    # This test exercises SQL portability, not production custody topology.
+    # Give both parameter branches an explicit disposable sidecar so the
+    # PostgreSQL case does not silently depend on an unavailable second
+    # cluster while still exercising the file-evidence protocol.
+    store = HoldStore(
+        db,
+        initialization_witness_path=tmp_path / "backend-parity.hold-initialized-v1",
+    )
+    return db, store
+
+
+def test_postgres_portability_harness_provides_disposable_evidence(tmp_path):
+    _db, store = _portable_hold_store(
+        SimpleNamespace(backend_type="postgres"),
+        tmp_path,
+    )
+
+    assert store._initialization_witness_path == (
+        tmp_path / "backend-parity.hold-initialized-v1"
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
-    db = AsyncDatabase(db_backend)
-    store = HoldStore(
-        db,
-        initialization_witness_path=(
-            None
-            if getattr(db, "backend_type", "") == "postgres"
-            else tmp_path / "backend-parity.hold-initialized-v1"
-        ),
-    )
+    db, store = _portable_hold_store(db_backend, tmp_path)
     await store.ensure_schema()
     suffix = uuid4().hex
     target = f"did:agent:{suffix}"
