@@ -609,6 +609,31 @@ async def test_boot_rejects_null_target_before_addressing_the_latch(hold_db):
 
 
 @pytest.mark.asyncio
+async def test_boot_rejects_whitespace_changing_persisted_target(hold_db):
+    """Boot cannot normalize a malformed key and silently query another row."""
+
+    db, store = hold_db
+    await db.execute(
+        "INSERT INTO hold_latches ("
+        "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "agent",
+            " did:agent:noncanonical ",
+            1,
+            "missing-authority",
+            "inspect malformed target",
+            "did:sovereign:operator",
+            "2026-08-31T00:00:00+00:00",
+            1,
+        ),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="noncanonical identity"):
+        await store.read_boot_state()
+
+
+@pytest.mark.asyncio
 async def test_host_context_uses_configured_postgres_for_durable_hold(
     monkeypatch,
     tmp_path,
@@ -1501,6 +1526,21 @@ async def test_orphaned_operation_witness_fails_closed_on_read_and_restart(hold_
         await store.get_hold("agent", held.receipt.target_id)
     with pytest.raises(HoldCorruptStateError, match="missing receipt"):
         await store.ensure_schema()
+
+
+@pytest.mark.asyncio
+async def test_absent_receipt_lookup_rejects_any_global_orphaned_tombstone(hold_db):
+    """An unrelated absence cannot certify a globally corrupt operation ledger."""
+
+    db, store = hold_db
+    await db.execute(
+        "INSERT INTO hold_operation_witnesses (operation_id, receipt_id) "
+        "VALUES (?, ?)",
+        ("orphaned-operation", "missing-receipt"),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.get_receipt("different-absent-operation")
 
 
 @pytest.mark.asyncio
@@ -2511,15 +2551,23 @@ async def test_postgres_missing_receipt_locks_history_before_validation(monkeypa
         events.append("validate-operation")
         return None
 
-    async def validate_anchor():
-        events.append("validate-anchor")
+    async def validate_global_history():
+        events.append("validate-global-history")
 
     monkeypatch.setattr(store, "_lock_read_history", lock_history, raising=False)
     monkeypatch.setattr(store, "_validate_operation_witness", validate)
-    monkeypatch.setattr(store, "_assert_history_anchor_intact", validate_anchor)
+    monkeypatch.setattr(
+        store,
+        "_assert_global_history_intact",
+        validate_global_history,
+    )
 
     assert await store._get_receipt("missing-operation") is None
-    assert events == ["history-lock", "validate-operation", "validate-anchor"]
+    assert events == [
+        "history-lock",
+        "validate-operation",
+        "validate-global-history",
+    ]
 
 
 @pytest.mark.asyncio
