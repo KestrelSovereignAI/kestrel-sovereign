@@ -280,6 +280,29 @@ class TestAgentManagerBasics:
             )
         assert manager._host_context_clause_registry is registry
 
+    def test_registration_rebinds_host_context_published_during_initialization(self):
+        """A cold agent cannot retain the registry snapshot from construction."""
+
+        manager = AgentManager()
+        current_registry = object()
+        publication_gate = asyncio.Event()
+        # Model the window after construction but before registration: neither
+        # fan-out can see the still-unpublished agent.
+        manager.bind_host_context_clause_registry(current_registry)
+        manager.set_host_context_publication_gate(publication_gate)
+        agent = _make_mock_agent("did:cold")
+
+        manager._register_agent("Cold", agent)
+
+        agent.validate_host_context_clause_registry.assert_called_once_with(
+            current_registry
+        )
+        agent.bind_host_context_clause_registry.assert_called_once_with(
+            current_registry
+        )
+        assert agent._host_context_publication_gate is publication_gate
+        assert manager.get_agent("Cold") is agent
+
     def test_get_agent_name(self):
         manager = AgentManager()
         mock = _make_mock_agent("did:pkh:test")

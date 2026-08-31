@@ -1844,6 +1844,32 @@ class AgentManager:
                 "Cannot publish an agent DID already routed under a different "
                 f"name: {agent_id!r} -> {bound_name!r}"
             )
+
+        # Initialization snapshots host context before its first await.  Host
+        # feature publication can finish while a cold agent is still starting,
+        # after the manager's fan-out has already walked ``_agents``.  Rebind
+        # the authoritative registry at this single admission seam so the new
+        # agent cannot publish with that stale snapshot.  Do the validation
+        # before adding either routing entry: a namespace collision must reject
+        # onboarding without making the agent briefly addressable.
+        registry = self._host_context_clause_registry
+        validate_registry = getattr(
+            agent, "validate_host_context_clause_registry", None
+        )
+        bind_registry = getattr(agent, "bind_host_context_clause_registry", None)
+        if registry is not None and (
+            not callable(validate_registry) or not callable(bind_registry)
+        ):
+            raise RuntimeError(
+                f"Cannot publish agent {name!r} without host context registry support"
+            )
+        if callable(validate_registry) and callable(bind_registry):
+            validate_registry(registry)
+            bind_registry(registry)
+
+        # The publication gate has the same construction/fan-out race.  Refresh
+        # it together with the registry before the agent becomes routable.
+        agent._host_context_publication_gate = self._host_context_publication_gate
         self._agents[name] = agent
         self._agent_names[agent_id] = name
         # Publish the registered routing key as the human display name so the
