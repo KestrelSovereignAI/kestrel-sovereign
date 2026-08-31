@@ -128,10 +128,13 @@ class OperatorRuntimeRegistry:
             tuple[str, str], ExecutionTargetRegistration
         ] = {}
         self._active_sets: dict[int, OperatorRegistrationSet] = {}
-        # Registry-private minting authority. A set retains this seal even if
-        # the mutable active-set index drifts, so recovery can distinguish the
-        # exact issued teardown capability from a caller-constructed wrapper.
-        self._registration_set_seal = object()
+        # Independent issuance provenance. This survives active-set index drift
+        # while binding a unique seal to one exact returned set. A caller cannot
+        # reuse its own legitimate seal on a wrapper around another owner's
+        # publicly projected registration.
+        self._issued_set_seals: dict[
+            int, tuple[OperatorRegistrationSet, object]
+        ] = {}
 
     def register(
         self,
@@ -189,15 +192,16 @@ class OperatorRuntimeRegistry:
             if any(key in self._targets for key in target_keys):
                 raise OperatorRegistrationConflictError(_TARGET_CONFLICT)
 
-            object.__setattr__(
-                registration_set,
-                "_registry_seal",
-                self._registration_set_seal,
-            )
+            seal = object()
+            object.__setattr__(registration_set, "_registry_seal", seal)
             self._services.update(zip(service_keys, service_values, strict=True))
             self._workflows.update(zip(workflow_keys, workflow_values, strict=True))
             self._targets.update(zip(target_keys, target_values, strict=True))
             self._active_sets[id(registration_set)] = registration_set
+            self._issued_set_seals[id(registration_set)] = (
+                registration_set,
+                seal,
+            )
         return registration_set
 
     def unregister(self, registration_set: OperatorRegistrationSet) -> None:
@@ -216,6 +220,7 @@ class OperatorRuntimeRegistry:
                     (registration.descriptor.tenant_id, registration.descriptor.target_id)
                 ]
             del self._active_sets[id(active)]
+            del self._issued_set_seals[id(active)]
             object.__setattr__(active, "_registry_seal", None)
 
     def quarantine_registration_set(
@@ -234,7 +239,12 @@ class OperatorRuntimeRegistry:
         if not isinstance(registration_set, OperatorRegistrationSet):
             raise TypeError("registration_set must be an OperatorRegistrationSet")
         with self._lock:
-            if registration_set._registry_seal is not self._registration_set_seal:
+            issued = self._issued_set_seals.get(id(registration_set))
+            if (
+                issued is None
+                or issued[0] is not registration_set
+                or issued[1] is not registration_set._registry_seal
+            ):
                 return False
             active = self._active_sets.get(id(registration_set))
             had_active_set = active is registration_set
@@ -266,6 +276,7 @@ class OperatorRuntimeRegistry:
                     del self._targets[key]
             if had_active_set:
                 del self._active_sets[id(active)]
+            del self._issued_set_seals[id(active)]
             object.__setattr__(active, "_registry_seal", None)
             return True
 
@@ -443,9 +454,12 @@ class OperatorRuntimeRegistry:
         """Return the exact active set while ``self._lock`` is held."""
 
         active = self._active_sets.get(id(registration_set))
+        issued = self._issued_set_seals.get(id(registration_set))
         if (
             active is not registration_set
-            or registration_set._registry_seal is not self._registration_set_seal
+            or issued is None
+            or issued[0] is not registration_set
+            or issued[1] is not registration_set._registry_seal
         ):
             raise OperatorRegistrationIdentityError(
                 "operator registration set is not active"

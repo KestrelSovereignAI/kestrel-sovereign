@@ -320,6 +320,35 @@ def test_quarantine_rejects_forged_set_wrapping_public_registration() -> None:
     registry.unregister(active)
 
 
+def test_quarantine_rejects_another_issued_sets_copied_seal() -> None:
+    registry = _registry()
+    attacker_workflow = WorkflowRegistration(
+        "attacker", "attacker-workflow", lambda: "attacker"
+    )
+    victim_workflow = WorkflowRegistration(
+        "victim", "victim-workflow", lambda: "victim"
+    )
+    attacker = registry.register("attacker", workflows=(attacker_workflow,))
+    victim = registry.register("victim", workflows=(victim_workflow,))
+    public_victim = registry.get_workflow_registration(victim_workflow.name)
+    assert public_victim is victim_workflow
+    forged = OperatorRegistrationSet(
+        owner="victim",
+        workflows=(public_victim,),
+    )
+    object.__setattr__(forged, "_registry_seal", attacker._registry_seal)
+
+    assert registry.quarantine_registration_set(forged) is False
+    assert registry.resolve_workflow_actor(victim_workflow.name) is (
+        victim_workflow.actor
+    )
+    assert registry.resolve_workflow_actor(attacker_workflow.name) is (
+        attacker_workflow.actor
+    )
+    registry.unregister(victim)
+    registry.unregister(attacker)
+
+
 def test_removing_middle_version_does_not_disturb_or_resurrect_other_sets() -> None:
     registry = _registry()
     first = _service("first", "1.0.0", object())
