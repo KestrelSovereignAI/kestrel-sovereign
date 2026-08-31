@@ -758,6 +758,31 @@ async def test_reenable_on_agent_ready_failure_is_non_fatal(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_boot_ready_hook_waits_until_host_context_is_published(tmp_path):
+    """A readiness hook may await cognition without circular startup waiting."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    agent._host_context_publication_gate = gate
+    entered = asyncio.Event()
+
+    class CognitionReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            async with ready_agent._turn_lifecycle():
+                entered.set()
+
+    feature = CognitionReadyFeature(agent)
+    agent.features[feature.name] = feature
+
+    await asyncio.wait_for(agent._run_or_defer_agent_ready_hooks(), timeout=1)
+    assert not entered.is_set()
+
+    gate.set()
+    await asyncio.wait_for(agent.complete_deferred_agent_readiness(), timeout=1)
+    assert entered.is_set()
+
+
+@pytest.mark.asyncio
 async def test_runtime_enable_registers_contributed_hard_permission_immediately(
     tmp_path,
 ):

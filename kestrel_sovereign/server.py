@@ -2655,11 +2655,35 @@ async def _lifespan_startup(app: FastAPI):
     )
     if host_context_publication_gate is not None:
         host_context_publication_gate.set()
+    await _complete_deferred_agent_readiness(app)
 
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
 
     yield
+
+
+async def _complete_deferred_agent_readiness(app: FastAPI) -> None:
+    """Run ready hooks postponed until host prompt policy was published."""
+
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        agents = [
+            manager.get_agent(name)
+            for name in manager.list_agents()
+        ]
+    else:
+        agent = getattr(app.state, "agent", None)
+        agents = [] if agent is None else [agent]
+
+    seen: set[int] = set()
+    for agent in agents:
+        if agent is None or id(agent) in seen:
+            continue
+        seen.add(id(agent))
+        complete = getattr(agent, "complete_deferred_agent_readiness", None)
+        if callable(complete):
+            await complete()
 
 
 @asynccontextmanager

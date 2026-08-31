@@ -472,12 +472,14 @@ class TurnLifecycleMixin:
         """
 
         transition_lock = self._get_privacy_transition_lock()
-        if self._caller_belongs_to_live_turn():
+        mgr = self._get_lock_manager()
+        if self._caller_belongs_to_live_turn() or mgr.is_owned_by_current_task(
+            ResourceLock.CONVERSATION
+        ):
             async with transition_lock:
                 yield
             return
 
-        mgr = self._get_lock_manager()
         label = f"{getattr(self, 'agent_name', None) or 'agent'} privacy-transition"
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
             async with transition_lock:
@@ -506,67 +508,81 @@ class TurnLifecycleMixin:
         mgr = self._get_lock_manager()
         label = f"{getattr(self, 'agent_name', None) or 'agent'} {turn_id}"
         started = time.monotonic()
+        holder = mgr.holder(ResourceLock.CONVERSATION)
+        current_task = asyncio.current_task()
+        if (
+            holder is not None
+            and holder.owner_task is current_task
+            and current_task is not getattr(self, "_live_turn_task", None)
+        ):
+            # Feature mutations own CONVERSATION in the same task that runs
+            # their hooks. A hook may synchronously drive cognition; reuse that
+            # exact boundary instead of recursively acquiring the non-reentrant
+            # lock. A genuine live turn is excluded so accidental recursive
+            # process_input calls still fail by waiting rather than replacing
+            # the outer turn's session/causation authority.
+            async with self._active_turn_scope(turn_id, label, started):
+                yield turn_id
+            return
+
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
-            logger.info("turn_lifecycle: %s begin", label)
-            token = _CURRENT_TURN_ID.set(turn_id)
-            # Agent-scoped mirror of "which turn is LIVE" — i.e. which one
-            # holds the CONVERSATION lock and therefore owns the value of
-            # `_active_session_id`. Set and cleared inside the lock, so at most
-            # one turn is ever live. `get_turn_bound_session_id` compares it
-            # against the task-local id to tell a caller that owns the turn
-            # from one that merely inherited its ContextVar (#2877).
-            self._live_turn_id = turn_id
-            self._live_turn_task = asyncio.current_task()
-            # A background task created inside an explicitly-bound callback
-            # inherits that binding. If it later enters its own cognition turn
-            # (the signal-dispatch wake path), turn entry is the unambiguous
-            # ownership boundary: the new turn's lifecycle/session authority
-            # supersedes the callback binding it inherited. Passive callbacks
-            # never enter this boundary, so their explicit stale/unbound veto
-            # remains intact (#2928 review P1).
-            bound_token = _BOUND_TURN_SESSION.set(None)
-            request_id = current_invocation_id()
-            request_generation = None
-            request_binding_registered = False
+            async with self._active_turn_scope(turn_id, label, started):
+                yield turn_id
+
+    @asynccontextmanager
+    async def _active_turn_scope(
+        self,
+        turn_id: str,
+        label: str,
+        started: float,
+    ) -> AsyncIterator[None]:
+        """Publish one live turn inside an already-owned conversation bound."""
+
+        logger.info("turn_lifecycle: %s begin", label)
+        token = _CURRENT_TURN_ID.set(turn_id)
+        # Agent-scoped mirror of "which turn is LIVE" — i.e. which one holds
+        # the CONVERSATION lock and therefore owns `_active_session_id`.
+        self._live_turn_id = turn_id
+        self._live_turn_task = asyncio.current_task()
+        # A background task created inside an explicitly-bound callback inherits
+        # that binding. New turn entry supersedes it with turn-owned authority.
+        bound_token = _BOUND_TURN_SESSION.set(None)
+        request_id = current_invocation_id()
+        request_generation = None
+        request_binding_registered = False
+        try:
+            if request_id is not None:
+                generation_accessor = getattr(
+                    self,
+                    "_request_generation_for_current_task",
+                    None,
+                )
+                if callable(generation_accessor):
+                    request_generation = generation_accessor(request_id)
+                self._register_turn_request_id(
+                    turn_id,
+                    request_id,
+                    request_generation,
+                )
+                request_binding_registered = True
+            yield
+        finally:
             try:
-                if request_id is not None:
-                    generation_accessor = getattr(
-                        self,
-                        "_request_generation_for_current_task",
-                        None,
-                    )
-                    if callable(generation_accessor):
-                        request_generation = generation_accessor(request_id)
-                    self._register_turn_request_id(
+                if request_binding_registered:
+                    self._unregister_turn_request_id(
                         turn_id,
                         request_id,
                         request_generation,
                     )
-                    request_binding_registered = True
-                yield turn_id
             finally:
-                try:
-                    if request_binding_registered:
-                        self._unregister_turn_request_id(
-                            turn_id,
-                            request_id,
-                            request_generation,
-                        )
-                finally:
-                    _BOUND_TURN_SESSION.reset(bound_token)
-                    _CURRENT_TURN_ID.reset(token)
-                    self._live_turn_id = None
-                    self._live_turn_task = None
-                    # Clear the per-turn active session on exit so an out-of-turn
-                    # caller (e.g. a CLI/system-filed request_restart after a chat
-                    # turn) cannot read a stale session and misroute its wake into
-                    # an old chat window (#1809). Set inside the turn body by
-                    # process_input / the streaming turn; both run under this lock.
-                    self._active_session_id = None
-                    # Duration on the exit line so a slow turn is measurable from
-                    # the log alone, without correlating two timestamps by hand.
-                    logger.info(
-                        "turn_lifecycle: %s end after %.1fs",
-                        label,
-                        time.monotonic() - started,
-                    )
+                _BOUND_TURN_SESSION.reset(bound_token)
+                _CURRENT_TURN_ID.reset(token)
+                self._live_turn_id = None
+                self._live_turn_task = None
+                # An out-of-turn caller must never reuse a stale chat session.
+                self._active_session_id = None
+                logger.info(
+                    "turn_lifecycle: %s end after %.1fs",
+                    label,
+                    time.monotonic() - started,
+                )

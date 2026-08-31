@@ -1434,31 +1434,12 @@ class ContextManager:
             if callable(context_clause_probe)
             else False
         )
-        if (
+        requires_tracking = bool(
             system_prompt_budget_bytes is not None
             or anchored_doctrine
             or has_context_clauses
-        ):
-            tracking_result = self.context_builder.build_system_prompt_with_tracking(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                budget_bytes=system_prompt_budget_bytes,
-                budget_tokens=system_prompt_budget_tokens,
-                required_suffix=system_prompt_addendum,
-                anchored_doctrine=anchored_doctrine,
-            )
-            system_prompt = tracking_result.prompt
-            injected_clauses = list(tracking_result.injected_clauses)
-            dropped_clauses = list(tracking_result.dropped_clauses)
-            subsections = list(tracking_result.subsections)
-            if system_prompt_addendum:
-                system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
-                subsections.append(
-                    ("system_prompt_addendum", system_prompt_addendum)
-                )
-        else:
+        )
+        if not requires_tracking:
             system_prompt, subsections = (
                 self.context_builder.build_system_prompt_with_subsections(
                     constitution=constitution,
@@ -1467,6 +1448,37 @@ class ContextManager:
                     state_of_mind=None,
                     system_prompt_addendum=system_prompt_addendum,
                 )
+            )
+            # Keep the zero-contribution cache prefix byte-identical whenever
+            # it fits. Only an over-budget legacy render switches to the
+            # priority-aware assembler so optional bootstrap/briefing content
+            # can yield to the real tool-aware system ceiling.
+            if self.counter.count(system_prompt) <= system_prompt_budget_tokens:
+                return (
+                    system_prompt,
+                    injected_clauses,
+                    dropped_clauses,
+                    subsections,
+                )
+
+        tracking_result = self.context_builder.build_system_prompt_with_tracking(
+            constitution=constitution,
+            include_briefing=include_briefing,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=None,
+            budget_bytes=system_prompt_budget_bytes,
+            budget_tokens=system_prompt_budget_tokens,
+            required_suffix=system_prompt_addendum,
+            anchored_doctrine=anchored_doctrine,
+        )
+        system_prompt = tracking_result.prompt
+        injected_clauses = list(tracking_result.injected_clauses)
+        dropped_clauses = list(tracking_result.dropped_clauses)
+        subsections = list(tracking_result.subsections)
+        if system_prompt_addendum:
+            system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
+            subsections.append(
+                ("system_prompt_addendum", system_prompt_addendum)
             )
         return system_prompt, injected_clauses, dropped_clauses, subsections
 

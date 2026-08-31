@@ -127,6 +127,46 @@ class TestMeasureMandatoryFloor:
 
 class TestDegradedModeFlow:
     @pytest.mark.asyncio
+    async def test_optional_legacy_prompt_is_trimmed_for_tool_aware_ceiling(self):
+        """Large optional bootstrap text yields to required tool schemas.
+
+        Ordinary zero-contribution turns still start from the byte-stable
+        legacy renderer, but once that rendering exceeds the actual system
+        allocation it must use priority eviction instead of declaring the
+        whole otherwise-valid request degraded.
+        """
+
+        storage = MagicMock()
+        cb = ContextBuilder(storage)
+        cb._bootstrap_loader._cache = OrderedDict(
+            [
+                ("SOUL.md", "id"),
+                ("TOOLS.md", "optional " * 15_000),
+            ]
+        )
+        cb._bootstrap_loader._loaded = True
+        cm = ContextManager(storage=storage, context_builder=cb)
+
+        result = await cm.build_context_plan(
+            query="",
+            constitution="C",
+            include_briefing=False,
+            include_memories=False,
+            include_rag=False,
+            conversation_history=[],
+            tools=[
+                {
+                    "name": "large",
+                    "description": "schema " * 25_000,
+                }
+            ],
+        )
+
+        assert result.degraded_mode is False
+        assert "optional" not in result.assembly.system_prompt
+        assert result.total_tokens <= result.total_budget
+
+    @pytest.mark.asyncio
     async def test_floor_exceeds_window_returns_degraded_result(self):
         """When the mandatory floor cannot fit, ``build_context``
         returns ``ContextResult(degraded_mode=True)`` and warns

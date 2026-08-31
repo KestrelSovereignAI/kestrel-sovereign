@@ -315,7 +315,14 @@ async def test_server_lifespan_wires_and_closes_host_features(
         host=SimpleNamespace(bind="127.0.0.1", port=8888),
         agents={"Kite": object()},
     )
-    fake_agent = SimpleNamespace(is_test_instance=True)
+    class FakeAgent:
+        is_test_instance = True
+
+        async def complete_deferred_agent_readiness(self):
+            assert fake_manager.host_context_publication_gate.is_set()
+            events.append("agent-ready")
+
+    fake_agent = FakeAgent()
 
     class FakeManager:
         init_failures = []
@@ -465,6 +472,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "host-ui-mount",
             "host-context-validate",
             "host-context-bind",
+            "agent-ready",
         ]
 
     assert events[-5:] == [

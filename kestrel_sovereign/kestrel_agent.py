@@ -3325,7 +3325,11 @@ class KestrelAgent(
 
 
     async def _boot_phase_periodic_services_readiness(self, ctx: BootContext) -> None:
-        """Phase 6 — periodic services (heartbeat, resume monitor, salvage worker), spawn-mandate reattach, provider-reachability readiness, and the on_agent_ready hooks. Readiness fires only after every prior phase committed."""
+        """Start periodic services and schedule ready hooks after validation.
+
+        Server-owned agents may defer the hooks until host context publication;
+        direct-agent boots run them before this phase returns.
+        """
         # Initialize heartbeat system (periodic agent self-checks).
         # Registers the heartbeat source with the dispatcher so its
         # ticks route through the signal pipeline (Phase 3 of #889).
@@ -3463,13 +3467,16 @@ class KestrelAgent(
         await verify_llm_providers_reachable(self.llm_service)
 
         # All subsystems are now up (memory system, context manager, dispatcher,
-        # LLM). Notify features that the agent is fully ready, so any that must
-        # run a COGNITION turn at boot — notably RestartCoordinator's
-        # post-restart wake — fire NOW, after the context manager exists. This
-        # is deliberately distinct from post_all_features_loaded, which runs
-        # during the feature-load phase BEFORE memory/context are built; a wake
-        # dispatched there could not run a turn and would defer for a full cron
-        # interval (#1809). Best-effort per feature; the hook is optional.
+        # LLM). On direct-agent boots, notify features now. Server-owned agents
+        # defer while the host policy gate is closed: an on_agent_ready hook is
+        # allowed to await cognition, and awaiting that turn here while the
+        # server awaits initialize() is a circular gate wait. The server binds
+        # host context, opens the gate, then completes this same hook pass.
+        await self._run_or_defer_agent_ready_hooks()
+
+    async def _notify_agent_ready_hooks(self) -> None:
+        """Run the best-effort ready-phase hook once services are usable."""
+
         for feature in list(self.features.values()):
             ready_hook = getattr(feature, "on_agent_ready", None)
             if ready_hook is None:
@@ -3481,6 +3488,29 @@ class KestrelAgent(
                     "on_agent_ready failed for %s: %s",
                     getattr(feature, "name", type(feature).__name__), e,
                 )
+
+    async def _run_or_defer_agent_ready_hooks(self) -> None:
+        """Run ready hooks now, or defer them behind host policy publication."""
+
+        gate = getattr(self, "_host_context_publication_gate", None)
+        if gate is not None and not gate.is_set():
+            self._agent_ready_hooks_deferred = True
+            return
+        await self._notify_agent_ready_hooks()
+        self._agent_ready_hooks_deferred = False
+
+    async def complete_deferred_agent_readiness(self) -> None:
+        """Complete the server-deferred ready hooks after host publication."""
+
+        if not bool(getattr(self, "_agent_ready_hooks_deferred", False)):
+            return
+        gate = getattr(self, "_host_context_publication_gate", None)
+        if gate is not None and not gate.is_set():
+            raise RuntimeError(
+                "cannot complete agent readiness before host context publication"
+            )
+        await self._notify_agent_ready_hooks()
+        self._agent_ready_hooks_deferred = False
 
     # ------------------------------------------------------------------
     # Boot rollback teardown helpers (#2522)

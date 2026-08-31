@@ -301,6 +301,63 @@ class TestGetFeatureDetail:
 
 class TestEnableFeature:
     @pytest.mark.asyncio
+    async def test_enable_hook_can_reenter_privacy_transition(self):
+        """The owned mutation task must own the conversation boundary.
+
+        A feature hook is allowed to perform a privacy-governed write.  If the
+        HTTP parent owns ``CONVERSATION`` while the hook runs in the shielded
+        child task, the child waits on its parent forever.
+        """
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        entered = asyncio.Event()
+
+        async def enable_with_privacy_transition():
+            async with agent.privacy_transition():
+                entered.set()
+
+        feature.on_enable.side_effect = enable_with_privacy_transition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await asyncio.wait_for(
+            features_endpoint.enable_feature(request, "TestFeature"),
+            timeout=1,
+        )
+
+        assert response["status"] == "enabled"
+        assert entered.is_set()
+
+    @pytest.mark.asyncio
+    async def test_enable_hook_can_await_cognition_without_deadlock(self):
+        """A lifecycle hook may synchronously drive a cognition turn."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        entered = asyncio.Event()
+
+        async def enable_with_cognition():
+            async with agent._turn_lifecycle():
+                entered.set()
+
+        feature.on_enable.side_effect = enable_with_cognition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await asyncio.wait_for(
+            features_endpoint.enable_feature(request, "TestFeature"),
+            timeout=1,
+        )
+
+        assert response["status"] == "enabled"
+        assert entered.is_set()
+
+    @pytest.mark.asyncio
     async def test_enable_waits_for_active_turn_before_publication(self):
         """No contribution can become prompt-visible mid-turn."""
 
@@ -1496,6 +1553,84 @@ class TestUpdateFeatureConfig:
         response = await asyncio.wait_for(update, timeout=1)
         assert response["config"] == {"mode": "old"}
         assert applied.is_set()
+
+    @pytest.mark.asyncio
+    async def test_config_setter_can_reenter_privacy_transition(self):
+        """A hosted setter cannot deadlock on its mutation's own turn lock."""
+
+        feature = _make_feature(config={"mode": "old"})
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        entered = asyncio.Event()
+
+        async def set_config(_config):
+            async with agent.privacy_transition():
+                entered.set()
+
+        feature.set_config.side_effect = set_config
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        await asyncio.wait_for(
+            features_endpoint.update_feature_config(
+                request,
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            ),
+            timeout=1,
+        )
+
+        assert entered.is_set()
+
+    @pytest.mark.asyncio
+    async def test_config_updates_are_not_serialized_across_agents(self):
+        """A slow tenant setter must not block an unrelated tenant."""
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        first = _make_feature(config={"mode": "old"})
+        second = _make_feature(config={"mode": "old"})
+
+        async def block_first(_config):
+            first_started.set()
+            await release_first.wait()
+
+        first.set_config.side_effect = block_first
+        first_agent = _lifecycle_agent(features={"TestFeature": first})
+        second_agent = _lifecycle_agent(features={"TestFeature": second})
+        first_agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        second_agent.refresh_feature_context_clauses = MagicMock(return_value=())
+
+        def request_for(agent):
+            return SimpleNamespace(
+                state=SimpleNamespace(agent=agent),
+                app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+            )
+
+        first_update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request_for(first_agent),
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "first"}),
+            )
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second_update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request_for(second_agent),
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "second"}),
+            )
+        )
+        try:
+            done, _pending = await asyncio.wait({second_update}, timeout=0.5)
+            assert second_update in done
+            assert second_update.result()["config"] == {"mode": "old"}
+        finally:
+            release_first.set()
+            await asyncio.gather(first_update, second_update)
 
     @pytest.mark.asyncio
     async def test_cancellation_after_commit_waits_for_context_reconciliation(self):

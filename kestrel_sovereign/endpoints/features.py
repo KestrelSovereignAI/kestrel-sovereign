@@ -7,7 +7,7 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -52,12 +52,6 @@ router = APIRouter(tags=["features"])
 # (`cli_features._install_commands`). Every path still terminates, which is the
 # property a caller with nobody watching needs; the multiple is the price.
 INSTALL_TIMEOUT_SECONDS = 300
-
-# A configuration write and the context-clause refresh it drives are one
-# policy transition.  Serializing that transition prevents overlapping PATCH
-# requests from snapshotting and later restoring across one another when a
-# renderer rejects the newer configuration.
-_FEATURE_CONFIG_UPDATE_LOCK = asyncio.Lock()
 
 
 def _core_requirement_unsatisfied(package_spec: str) -> Optional[str]:
@@ -568,12 +562,12 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     canonical activation used by boot and the disable/enable rails alike.
     """
     agent = get_agent(request)
-    async with _agent_feature_config_transition(agent):
-        return await _settle_feature_transition(
-            _enable_feature_locked(agent, name),
-            feature_name=name,
-            operation="enable",
-        )
+    return await _settle_feature_transition(
+        agent,
+        lambda: _enable_feature_locked(agent, name),
+        feature_name=name,
+        operation="enable",
+    )
 
 
 async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
@@ -656,12 +650,12 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     disable also use.
     """
     agent = get_agent(request)
-    async with _agent_feature_config_transition(agent):
-        return await _settle_feature_transition(
-            _disable_feature_locked(agent, name),
-            feature_name=name,
-            operation="disable",
-        )
+    return await _settle_feature_transition(
+        agent,
+        lambda: _disable_feature_locked(agent, name),
+        feature_name=name,
+        operation="disable",
+    )
 
 
 async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
@@ -766,16 +760,16 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
         )
 
     # Runtime teardown, stored-data cleanup, and package removal are one owned
-    # mutation.  Acquire the turn boundary before creating the owned task so a
-    # request cancelled while QUEUED performs no later removal; once mutation
-    # starts, drive it to a terminal result before cancellation can release the
-    # boundary and expose a half-removed feature generation.
-    async with _agent_feature_config_transition(agent):
-        return await _settle_feature_transition(
-            _remove_feature_locked(agent, pkg_info),
-            feature_name=name,
-            operation="remove",
-        )
+    # mutation.  The owned task acquires the turn boundary itself: hooks it
+    # awaits may enter privacy-governed work without waiting on a lock held by
+    # their HTTP parent.  The settlement helper still cancels a child that was
+    # cancelled while QUEUED, and only shields it after acquisition.
+    return await _settle_feature_transition(
+        agent,
+        lambda: _remove_feature_locked(agent, pkg_info),
+        feature_name=name,
+        operation="remove",
+    )
 
 
 async def _remove_feature_locked(
@@ -928,13 +922,27 @@ async def update_feature_config(
     agent = get_agent(request)
     feature = _get_feature_or_404(agent, name)
 
-    async with _FEATURE_CONFIG_UPDATE_LOCK:
-        async with _agent_feature_config_transition(agent):
-            return await _settle_feature_transition(
-                _update_feature_config_locked(agent, feature, name, body),
-                feature_name=name,
-                operation="configuration reconciliation",
-            )
+    # Snapshot -> setter -> context publication is serialized per tenant. A
+    # host-wide mutex lets one slow out-of-tree setter block every other agent.
+    # This narrow lock prevents same-agent rollback crossing while the owned
+    # task below owns that agent's cognition boundary.
+    async with _feature_config_update_lock(agent):
+        return await _settle_feature_transition(
+            agent,
+            lambda: _update_feature_config_locked(agent, feature, name, body),
+            feature_name=name,
+            operation="configuration reconciliation",
+        )
+
+
+def _feature_config_update_lock(agent: object) -> asyncio.Lock:
+    """Return the agent-scoped config reconciliation mutex."""
+
+    lock = inspect.getattr_static(agent, "_feature_config_update_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        setattr(agent, "_feature_config_update_lock", lock)
+    return lock
 
 
 @asynccontextmanager
@@ -956,7 +964,8 @@ async def _agent_feature_config_transition(agent: object):
 
 
 async def _settle_feature_transition(
-    awaitable,
+    agent: object,
+    operation_factory: Callable[[], Awaitable[Any]],
     *,
     feature_name: str,
     operation: str,
@@ -964,15 +973,51 @@ async def _settle_feature_transition(
     """Finish one feature-state mutation before propagating cancellation.
 
     Feature lifecycle hooks and hosted setters may cross awaited boundaries
-    after changing a context/tool generation.  Shield the whole mutation in a
-    child task: if the HTTP caller disconnects, the child still commits or
-    rolls back before the request's cancellation escapes and releases the
-    CONVERSATION lock.
+    after changing a context/tool generation. The owned child acquires
+    ``CONVERSATION`` itself, so a hook that enters ``privacy_transition`` does
+    not wait on its HTTP parent. Cancellation while the child is still QUEUED
+    cancels it and performs no later mutation; after acquisition, cancellation
+    waits for the child to commit or roll back before escaping.
     """
 
-    outcome = await await_owned_task(asyncio.create_task(awaitable))
+    loop = asyncio.get_running_loop()
+    admitted: asyncio.Future[bool] = loop.create_future()
+
+    async def own_transition():
+        async with _agent_feature_config_transition(agent):
+            # No suspension occurs between acquiring the boundary and this
+            # handoff, so the parent cannot misclassify an acquired child as a
+            # cancellable waiter.
+            if not admitted.done():
+                admitted.set_result(True)
+            return await operation_factory()
+
+    task = asyncio.create_task(own_transition())
+
+    def mark_terminal_before_admission(_task):
+        if not admitted.done():
+            admitted.set_result(False)
+
+    task.add_done_callback(mark_terminal_before_admission)
+    pending_cancellation = None
+    try:
+        await asyncio.shield(admitted)
+    except asyncio.CancelledError as cancellation:
+        pending_cancellation = cancellation
+        if not admitted.done() or not admitted.result():
+            task.cancel()
+
+    outcome = await await_owned_task(
+        task,
+        pending_cancellation=pending_cancellation,
+    )
+    task.remove_done_callback(mark_terminal_before_admission)
     if outcome.cancellation is not None:
-        if outcome.error is not None:
+        if outcome.error is not None and not (
+            isinstance(outcome.error, asyncio.CancelledError)
+            and admitted.done()
+            and not admitted.result()
+        ):
             # Never stringify or chain an out-of-tree renderer/config
             # exception: it may contain secret config bytes.
             logger.error(
