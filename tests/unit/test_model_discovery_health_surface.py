@@ -26,6 +26,19 @@ from kestrel_sovereign.features.health.checks import (
 def _agent(*, failures=None, pinned_vendor=None, providers=None, load_error=None):
     llm = MagicMock()
     llm._discovery_failures = failures if failures is not None else {}
+    # Match the real envelope: the check reads the RECONCILED view via a real
+    # method returning a real dict. Left as a bare MagicMock attribute this is
+    # callable and returns a mock, the isinstance guard rejects it, and every
+    # one of these tests silently reports "pass" — testing the double, not the
+    # code.
+    # The two sources must be DISTINGUISHABLE, or a mutant that reverts the
+    # check to the private copy is invisible — the double would make both
+    # paths return the same value. `_discovery_failures` is left deliberately
+    # empty: only the reconciled view carries the failures, so a check reading
+    # the private map reports "pass" and the test fails.
+    _reconciled = dict(failures or {})
+    llm._discovery_failures = {}
+    llm._effective_discovery_failures = lambda: dict(_reconciled)
     llm._mandate_load_error = load_error
     llm.providers = providers if providers is not None else [
         {"name": "anthropic:plan", "vendor": "anthropic"},

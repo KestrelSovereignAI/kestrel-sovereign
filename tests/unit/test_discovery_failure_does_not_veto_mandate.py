@@ -690,3 +690,175 @@ class TestEmptyCatalogStillRestoresFailures:
 
         assert "anthropic" in svc._discovery_failures
         assert shared.get_failed_vendors() == {"anthropic": "401"}
+
+
+class TestRoundThreeFindings:
+    """Divergence, stale entries, skipped-vs-failed, and the clear path."""
+
+    def test_a_sibling_sees_a_failure_recorded_after_it_was_constructed(self):
+        """Copying once at construction let services diverge (#3190 r3 P1).
+
+        Agent A refreshes discovery and records a new failure; agent B was
+        built earlier and never re-reads. B then validates and reports health
+        from state that is provably out of date.
+        """
+        from kestrel_sovereign.llm.model_cache import SharedModelCache
+
+        shared = SharedModelCache()
+        shared.set_stale(_COLLAPSED_ANTHROPIC_CATALOG)
+        b = _make_service(discovery_failures={})  # constructed before the failure
+
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=shared,
+        ):
+            assert b._effective_discovery_failures() == {}
+            shared.set_failed_vendors({"anthropic": "401"})  # A records it later
+            assert "anthropic" in b._effective_discovery_failures()
+
+    def test_a_recovered_vendor_stops_being_reported(self):
+        """The mirror: B must not keep a failure the process has cleared."""
+        from kestrel_sovereign.llm.model_cache import SharedModelCache
+
+        shared = SharedModelCache()
+        shared.set_stale(_COLLAPSED_ANTHROPIC_CATALOG)
+        b = _make_service(discovery_failures={"anthropic": "401"})
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=shared,
+        ):
+            shared.set_failed_vendors({})  # anthropic recovered
+            assert b._effective_discovery_failures() == {}
+
+    def test_the_VALIDATOR_uses_the_reconciled_view_not_the_private_copy(self):
+        """Mutate the WIRING, not just the helper.
+
+        Testing `_effective_discovery_failures()` in isolation proves the view
+        is correct; it says nothing about whether the veto consults it. The
+        mutant that reverted the validator to `self._discovery_failures`
+        survived until this test existed.
+        """
+        from kestrel_sovereign.llm.model_cache import SharedModelCache
+
+        shared = SharedModelCache()
+        shared.set_stale(_COLLAPSED_ANTHROPIC_CATALOG)
+        shared.set_failed_vendors({"anthropic": "401 recorded by a sibling"})
+
+        # This service's OWN map is empty — only the shared snapshot knows.
+        svc = _make_service(discovery_failures={})
+        cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=shared,
+        ), patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            # Must NOT raise: the veto has to see the sibling's failure.
+            svc._validate_explicit_mandate("claude-opus-5", "anthropic", "plan")
+
+    def test_no_shared_data_falls_back_to_the_services_own_map(self):
+        from kestrel_sovereign.llm.model_cache import SharedModelCache
+
+        svc = _make_service(discovery_failures={"anthropic": "401"})
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=SharedModelCache(),  # cold, has_data() False
+        ):
+            assert svc._effective_discovery_failures() == {"anthropic": "401"}
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_discovery_is_not_recorded_as_a_failure(self):
+        """A helper that never issued a request must not degrade health.
+
+        Introduced by the round-2 fix: making "empty means failure" universal
+        also caught the OpenAI-compatible seam, where the helpers RAISE on a
+        real error, so empty can only mean "not attempted" — no base_url, or
+        the credential lives inline or under a custom env name (#3190 r3 P2).
+        """
+        svc = _make_service()
+
+        async def _skipped():
+            return []  # what the helper returns when it never asked
+
+        out = await svc._record_discovery("runpod", _skipped())
+        assert out == []
+        assert svc._discovery_failures == {}, (
+            "not-attempted must stay distinguishable from failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_but_a_swallowing_adapter_is_still_recorded(self):
+        """The other seam keeps the opposite contract — empty IS suspicious."""
+        svc = _make_service()
+        adapter = MagicMock()
+
+        async def _list(client):
+            return []
+
+        adapter.list_models = _list
+        await svc._safe_list_models("anthropic", adapter, MagicMock())
+        assert "anthropic" in svc._discovery_failures
+
+    @pytest.mark.asyncio
+    async def test_a_deconfigured_vendors_failure_is_pruned(self):
+        """A failure for a vendor no longer configured must not persist (#3190 r3 P2).
+
+        `_adopt_discovery_failures` restores it from disk, but a fresh run only
+        touches vendors `_select_discovery_routes` returns. Without pruning the
+        stale entry is rewritten to disk every run and keeps health degraded
+        forever for a vendor that no longer exists.
+        """
+        svc = _make_service(discovery_failures={"removed_vendor": "401 from an old cache"})
+        svc.providers = []
+        svc._select_discovery_routes = lambda: [("openai", {"name": "openai:api"})]
+
+        async def _fake(vendor, route):
+            return [_mk_model("gpt-5", "openai")]
+
+        svc._discover_for_vendor_route = _fake
+        svc._resolve_auto_providers = lambda models: None
+        svc._snapshot_chat_models_by_route = lambda models: None
+        svc._apply_recency_visibility = lambda *a, **k: None
+        svc._filter_models = lambda models, **k: models
+
+        async def _noop(*a, **k):
+            return None
+
+        svc.reconcile_embedding_capabilities = _noop
+
+        shared = MagicMock()
+        shared.get = MagicMock(return_value=None)
+        shared.get_any = MagicMock(return_value=None)
+        shared.set = MagicMock()
+        shared.set_failed_vendors = MagicMock()
+
+        async def _wait():
+            return False
+
+        shared.wait_for_refresh = _wait
+        catalog = MagicMock()
+        catalog.enrich_models = MagicMock(side_effect=lambda models, **k: models)
+
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=shared,
+        ), patch(
+            "kestrel_sovereign.llm.model_discovery.get_catalog_service",
+            return_value=catalog,
+        ):
+            await svc.discover_all_models(use_cache=False)
+
+        assert "removed_vendor" not in svc._discovery_failures
+
+    def test_clear_model_preference_clears_the_boot_error(self):
+        """Both ends: set cleared it, clear did not — so the flag stuck.
+
+        Returning to automatic routing is a deliberate unpinned state; health
+        must stop reporting that a persisted preference failed (#3190 r3 P2).
+        """
+        svc = _make_service()
+        svc._mandate_load_error = "Cannot set model 'claude-opus-5' ..."
+        svc._preference_persistence_callback = None
+        svc.clear_model_preference()
+        assert svc._mandate_load_error is None

@@ -60,6 +60,33 @@ class ModelDiscoveryMixin:
     then enriches them with catalog data (featured, hidden, display names).
     """
 
+    def _effective_discovery_failures(self) -> Dict[str, str]:
+        """Failures reconciled with the process-wide snapshot (#3190 r3 P1).
+
+        Copying once at construction let services diverge. Agent A refreshing
+        discovery updates A and the shared cache; agent B, constructed earlier,
+        keeps whatever it copied at boot — so B misses newly-failed vendors and
+        retains ones that have since recovered, and its mandate validation and
+        health both answer from stale state.
+
+        The shared snapshot is the newer fact whenever the shared cache holds
+        one, so it wins. A bare service with no shared data falls back to its
+        own map, which is what tests and pre-discovery boot see.
+        """
+        own = dict(getattr(self, "_discovery_failures", None) or {})
+        try:
+            shared = get_shared_model_cache()
+            if shared.has_data():
+                own.update(shared.get_failed_vendors())
+                # A vendor absent from the newer snapshot has recovered.
+                for vendor in [
+                    v for v in own if v not in shared.get_failed_vendors()
+                ]:
+                    del own[vendor]
+        except Exception:  # pragma: no cover - never break validation on this
+            pass
+        return own
+
     def _adopt_discovery_failures(self, failures: Dict[str, str]) -> None:
         """Take on a failure record produced elsewhere (disk, or a sibling).
 
@@ -339,7 +366,17 @@ class ModelDiscoveryMixin:
 
         # Cache results in shared memory cache and on disk
         shared_cache.set(all_models)
-        current_failures = getattr(self, "_discovery_failures", None) or {}
+        # Prune vendors this run did not attempt (#3190 r3 P2). A failure
+        # restored from disk for a vendor since removed from configuration is
+        # never revisited by `_select_discovery_routes`, so without this it is
+        # rewritten to disk every run and keeps health degraded forever for a
+        # vendor that no longer exists.
+        current_failures = getattr(self, "_discovery_failures", None)
+        if current_failures is not None:
+            attempted = set(discovery_vendors)
+            for vendor in [v for v in current_failures if v not in attempted]:
+                del current_failures[vendor]
+        current_failures = current_failures or {}
         catalog.write_cache(all_models, failed_vendors=current_failures)
         # Publish to the process-wide cache as well, so sibling LLMServices
         # that only ever see a cache HIT still learn which vendors are dark.
@@ -1627,6 +1664,19 @@ class ModelDiscoveryMixin:
         except Exception as e:  # noqa: BLE001 - discovery must never break init
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, None, e)
+            return []
+        if not models:
+            # SKIPPED, not failed. On this seam the helpers raise for a real
+            # error, so an empty list means they never issued a request —
+            # no base_url, or the credential env var is unset because the key
+            # was supplied inline or under a custom name. Recording that as a
+            # failure would permanently degrade health and disable mandate
+            # validation for a vendor nothing went wrong with (#3190 r3 P2).
+            #
+            # ``_safe_list_models`` deliberately treats empty as failure: an
+            # adapter there MAY swallow its own error, so empty is ambiguous.
+            # Same value, different contract, because the paths differ.
+            logger.debug("%s: discovery skipped (not attempted)", vendor)
             return []
         self._note_discovery_outcome(vendor, models, None)
         return models

@@ -2002,7 +2002,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # vendor, permit (resolve-time still defends). Only a *populated*
             # vendor catalog can prove a model invalid.
             return
-        if vendor in getattr(self, "_discovery_failures", {}):
+        if vendor in self._effective_discovery_failures():
             # Discovery for THIS vendor failed, so whatever rows we hold for it
             # are a stale or partial remnant — unknown, not disproof (#3190).
             #
@@ -2052,6 +2052,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        # Returning to automatic routing is a DELIBERATE unpinned state, so the
+        # boot-failure notice must go with it (#3190 r3 P2). Only the set path
+        # cleared it, so health went on reporting "a persisted preference
+        # failed to apply; running UNPINNED" about a state the operator chose.
+        # A flag that one door sets and only one other door clears is a flag
+        # that gets stuck.
+        self._mandate_load_error = None
         logger.info("Model preference cleared, using default route order")
 
         if self._preference_persistence_callback:
