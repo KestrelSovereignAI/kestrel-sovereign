@@ -74,13 +74,24 @@ class ModelDiscoveryMixin:
         own map, which is what tests and pre-discovery boot see.
         """
         own = dict(getattr(self, "_discovery_failures", None) or {})
+        firsthand = set(getattr(self, "_discovery_failures_observed", None) or ())
         try:
             shared = get_shared_model_cache()
             if shared.has_data():
-                own.update(shared.get_failed_vendors())
-                # A vendor absent from the newer snapshot has recovered.
+                published = shared.get_failed_vendors()
+                own.update(published)
+                # A vendor absent from the newer snapshot has recovered — but
+                # NOT if this service observed the failure itself and has not
+                # published it yet. The shared map is only written at the end
+                # of a refresh, so between `_safe_list_models` recording a
+                # failure and that publication the shared snapshot is the OLDER
+                # fact. Discarding a first-hand observation there meant a
+                # refresh that raised during enrichment, or was cancelled, left
+                # health and mandate validation trusting a stale healthy
+                # snapshot permanently (#3190 r4 P2).
                 for vendor in [
-                    v for v in own if v not in shared.get_failed_vendors()
+                    v for v in own
+                    if v not in published and v not in firsthand
                 ]:
                     del own[vendor]
         except Exception:  # pragma: no cover - never break validation on this
@@ -134,15 +145,22 @@ class ModelDiscoveryMixin:
         if failures is None:
             # Bare harness / partially-constructed instance — nothing to record.
             return
+        observed = getattr(self, "_discovery_failures_observed", None)
         if error is not None:
             failures[vendor] = f"{type(error).__name__}: {error}"[:300]
+            if observed is not None:
+                observed.add(vendor)
         elif not models:
             failures[vendor] = (
                 "returned no models — no catalog retrieved "
                 "(an adapter may have handled an error internally)"
             )
+            if observed is not None:
+                observed.add(vendor)
         else:
             failures.pop(vendor, None)
+            if observed is not None:
+                observed.discard(vendor)
 
     async def discover_all_models(
         self,

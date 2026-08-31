@@ -424,6 +424,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # real construction — the map it wrote into did not exist yet, and the
         # later assignment then replaced it with an empty one (codex r2 P1).
         self._discovery_failures: Dict[str, str] = {}
+        # Vendors whose failure THIS service observed first-hand, as opposed to
+        # adopting from disk or a sibling. Between observing a failure and
+        # publishing it to the shared cache at the end of a refresh, the shared
+        # snapshot is the older fact — so a first-hand entry must survive
+        # reconciliation against it (#3190 r4 P2).
+        self._discovery_failures_observed: set[str] = set()
         self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
@@ -2002,7 +2008,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # vendor, permit (resolve-time still defends). Only a *populated*
             # vendor catalog can prove a model invalid.
             return
-        if vendor in self._effective_discovery_failures():
+        if not self._vendor_catalog_is_authoritative(vendor):
             # Discovery for THIS vendor failed, so whatever rows we hold for it
             # are a stale or partial remnant — unknown, not disproof (#3190).
             #
@@ -3000,6 +3006,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             else:
                 self._verified_space_pins.pop(pin.name, None)
 
+    def _vendor_catalog_is_authoritative(self, vendor: Optional[str]) -> bool:
+        """May this vendor's catalog be used to DISPROVE a model? (#3190)
+
+        One predicate for every guard that consults the catalog. The setter
+        (``_validate_explicit_mandate``) and the runtime guard
+        (``_model_available_for_route``) were asking the same question in two
+        places, and relaxing only the setter produced a pin that is accepted
+        and persisted and then rejected by every non-explicit generation
+        attempt — and by ``get_audit_response``, so strict ResponseAudit would
+        block otherwise good responses (#3190 r4 P1).
+
+        A vendor with a known discovery failure has no trustworthy catalog, so
+        whatever rows survive for it cannot prove a model unavailable.
+        """
+        if not vendor:
+            return True
+        return vendor not in self._effective_discovery_failures()
+
     def _model_available_for_route(self, provider: Dict[str, Any], model_id: str) -> bool:
         """Return True iff the model is discoverable in this route's vendor catalog.
 
@@ -3019,6 +3043,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         vendor = provider.get("vendor")
         if not vendor:
             return True  # Unknown-shape provider — can't validate, let it through.
+
+        if not self._vendor_catalog_is_authoritative(vendor):
+            # Discovery failed for this vendor, so the rows we hold are a
+            # remnant and cannot prove the model unavailable. Without this the
+            # setter accepts the operator's pin and this guard then rejects it
+            # on every generation attempt (#3190 r4 P1).
+            return True
 
         from .model_cache import get_shared_model_cache
         cache = get_shared_model_cache().get_any()

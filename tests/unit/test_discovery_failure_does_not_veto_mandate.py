@@ -56,6 +56,7 @@ def _make_service(*, discovery_failures=None, providers=None):
     svc._route_catalogs = {}
     svc._ensure_route_catalogs_sync = lambda: None
     svc._discovery_failures = dict(discovery_failures or {})
+    svc._discovery_failures_observed = set()
     svc._mandate_load_error = None
     return svc
 
@@ -862,3 +863,113 @@ class TestRoundThreeFindings:
         svc._preference_persistence_callback = None
         svc.clear_model_preference()
         assert svc._mandate_load_error is None
+
+
+class TestRoundFourFindings:
+    """The setter and the runtime guard must answer the same question."""
+
+    def test_the_runtime_guard_also_honours_a_known_failure(self):
+        """Relaxing only the setter accepts a pin nothing will then serve.
+
+        `_validate_explicit_mandate` accepts it and it is persisted;
+        `_model_available_for_route` then rejects it on every non-explicit
+        generation attempt, and `get_audit_response` rejects it too, so strict
+        ResponseAudit blocks otherwise-good responses (#3190 r4 P1).
+        """
+        svc = _make_service(
+            discovery_failures={"anthropic": "AuthenticationError: 401"}
+        )
+        provider = {"name": "anthropic:plan", "vendor": "anthropic", "model": "auto"}
+        cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            assert svc._model_available_for_route(provider, "claude-opus-5") is True
+
+    def test_the_runtime_guard_still_rejects_when_the_catalog_is_trustworthy(self):
+        """The converse — proves the guard was reconciled, not disabled."""
+        svc = _make_service(discovery_failures={})
+        provider = {"name": "anthropic:plan", "vendor": "anthropic", "model": "auto"}
+        cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ), patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=cache,
+        ):
+            assert svc._model_available_for_route(provider, "claude-opus-5") is False
+
+    def test_setter_and_runtime_guard_agree(self):
+        """Whatever the setter accepts, the runtime guard must serve.
+
+        This is the invariant the P1 broke: two guards, one question, answered
+        differently.
+        """
+        svc = _make_service(
+            discovery_failures={"anthropic": "AuthenticationError: 401"}
+        )
+        provider = {"name": "anthropic:plan", "vendor": "anthropic", "model": "auto"}
+        cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            svc._validate_explicit_mandate("claude-opus-5", "anthropic", "plan")
+            assert svc._model_available_for_route(provider, "claude-opus-5") is True
+
+    def test_a_firsthand_failure_survives_reconciliation(self):
+        """The shared map is published only at the END of a refresh (#3190 r4 P2).
+
+        Between `_safe_list_models` recording a failure and that publication,
+        the shared snapshot is the OLDER fact. Discarding the first-hand
+        observation there meant a refresh that raised during enrichment, or was
+        cancelled, left health and validation trusting a stale healthy snapshot
+        for the life of the process.
+        """
+        from kestrel_sovereign.llm.model_cache import SharedModelCache
+
+        shared = SharedModelCache()
+        shared.set_stale(_COLLAPSED_ANTHROPIC_CATALOG)
+        shared.set_failed_vendors({})  # nothing published yet
+
+        svc = _make_service(discovery_failures={})
+        svc._discovery_failures["anthropic"] = "401 just observed"
+        svc._discovery_failures_observed.add("anthropic")
+
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=shared,
+        ):
+            assert "anthropic" in svc._effective_discovery_failures()
+
+    def test_an_adopted_failure_is_still_dropped_when_the_vendor_recovers(self):
+        """The converse — only FIRST-HAND entries are protected.
+
+        Without this, 'fix' the P2 by never pruning anything and a recovered
+        vendor keeps a stale failure forever, which is this bug's mirror.
+        """
+        from kestrel_sovereign.llm.model_cache import SharedModelCache
+
+        shared = SharedModelCache()
+        shared.set_stale(_COLLAPSED_ANTHROPIC_CATALOG)
+        shared.set_failed_vendors({})
+
+        svc = _make_service(discovery_failures={"anthropic": "adopted from disk"})
+        # NOT marked first-hand — it came from a snapshot, not an observation.
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=shared,
+        ):
+            assert "anthropic" not in svc._effective_discovery_failures()
+
+    @pytest.mark.asyncio
+    async def test_observing_success_clears_the_firsthand_mark(self):
+        svc = _make_service()
+        svc._note_discovery_outcome("anthropic", None, RuntimeError("401"))
+        assert "anthropic" in svc._discovery_failures_observed
+        svc._note_discovery_outcome(
+            "anthropic", [_mk_model("claude-opus-5", "anthropic")], None
+        )
+        assert "anthropic" not in svc._discovery_failures_observed
