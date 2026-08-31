@@ -350,6 +350,29 @@ def test_stop_outcome_rejects_malformed_wire_fields(
 
 
 @pytest.mark.parametrize(
+    ("scope", "requested_target"),
+    (
+        (StopScope.HOST, None),
+        (StopScope.AGENT, "agent-a"),
+        (StopScope.TOOL_CALL, "tool-call-a"),
+    ),
+)
+def test_only_turn_outcomes_preserve_whitespace_resolved_work_address(
+    scope: StopScope,
+    requested_target: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="resolved_target"):
+        StopOutcome(
+            scope=scope,
+            requested_target=requested_target,
+            resolved_target=" ",
+            agent_id="did:test:a",
+            disposition=StopDisposition.STOPPED,
+            correlation_id="stop-blank-resolved-target",
+        )
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         {

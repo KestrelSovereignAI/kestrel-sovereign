@@ -175,7 +175,14 @@ class StopOutcome:
         # address resolves to its private request key. Both are already
         # validated at inventory construction; preserve either exact opaque
         # value here without imposing the work-address length bound on a DID.
-        if not isinstance(self.resolved_target, str) or not self.resolved_target:
+        if (
+            not isinstance(self.resolved_target, str)
+            or not self.resolved_target
+            or (
+                self.scope is not StopScope.TURN
+                and not self.resolved_target.strip()
+            )
+        ):
             raise ValueError("resolved_target must be a non-empty string")
         for field_name, value in (
             ("agent_id", self.agent_id),
