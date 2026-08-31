@@ -263,12 +263,26 @@ class ShellSyntax:
 
 
 def _quote_context(cmd: str):
-    """Yield ``(index, char, context)`` for each character.
+    r"""Yield ``(index, char, context, escaped)`` for each character.
 
-    ``context`` is ``"bare"``, ``"single"`` or ``"double"``. Quote marks
-    that open or close a region are not yielded — they are structure,
-    not content — and a trailing unterminated quote yields nothing after
-    it, which ``shlex`` rejects anyway.
+    ``context`` is ``"bare"``, ``"single"`` or ``"double"``; ``escaped``
+    says a backslash the shell honours precedes this character. Quote
+    marks that open or close a region are not yielded — they are
+    structure, not content — but an ESCAPED quote is, because it is
+    content: bash reads ``foo\\'`` as a literal apostrophe and keeps
+    reading the line unquoted.
+
+    That distinction is not decoration. Dropping it opened a bogus
+    single-quoted region at the escaped quote in
+    ``echo foo\\'; sudo -n true``, which hid the ``;`` from
+    :func:`first_unquoted_shell_control` — so ``BinaryPolicy`` saw an
+    allow-listed ``echo``, the codex bridge auto-accepted, and a real
+    shell ran the deny-listed second command with no approval. The
+    backslash itself is still yielded, so a caller that treats it as
+    significant sees it.
+
+    Single quotes take no escapes in a shell, so a backslash inside one
+    is an ordinary character.
     """
     if not isinstance(cmd, str):
         return
@@ -280,14 +294,20 @@ def _quote_context(cmd: str):
             if c == "'":
                 in_single = False
             else:
-                yield (i, c, "single")
+                yield (i, c, "single", False)
             i += 1
+            continue
+        context = "double" if in_double else "bare"
+        if c == "\\" and i + 1 < len(cmd):
+            yield (i, c, context, False)
+            yield (i + 1, cmd[i + 1], context, True)
+            i += 2
             continue
         if in_double:
             if c == '"':
                 in_double = False
             else:
-                yield (i, c, "double")
+                yield (i, c, "double", False)
             i += 1
             continue
         if c == "'":
@@ -298,7 +318,7 @@ def _quote_context(cmd: str):
             in_double = True
             i += 1
             continue
-        yield (i, c, "bare")
+        yield (i, c, "bare", False)
         i += 1
 
 
@@ -317,8 +337,11 @@ def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
     character a shell could interpret would put the operator in front
     of ``ls -la`` for its hyphen.
     """
-    for index, char, context in _quote_context(cmd):
-        if context == "single":
+    for index, char, context, escaped in _quote_context(cmd):
+        if escaped or context == "single":
+            # A shell reads an escaped character literally, so it
+            # composes nothing — and the backslash that escaped it was
+            # yielded separately, for callers that care.
             continue
         if context == "double" and char not in "$`":
             continue
@@ -363,7 +386,7 @@ def first_shell_significant_character(cmd: str) -> ShellSyntax | None:
     """
     if not isinstance(cmd, str):
         return None
-    for index, char, context in _quote_context(cmd):
+    for index, char, context, _escaped in _quote_context(cmd):
         if context == "single":
             continue
         if context == "double":

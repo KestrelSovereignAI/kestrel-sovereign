@@ -120,6 +120,10 @@ def test_split_command():
         "echo 'cost $5'",
         # Single hyphen in arg name is fine.
         "rg -i pattern",
+        # An escaped control character composes nothing: bash reads
+        # `\;` as a literal semicolon, so there is no second command
+        # for the guard to warn about.
+        r"echo a\; b",
     ],
 )
 def test_compound_guard_clean_commands(cmd):
@@ -138,6 +142,12 @@ def test_compound_guard_clean_commands(cmd):
         ("ls > /etc/foo", ">"),
         ("cat < /etc/passwd", "<"),
         ("git status\nrm -rf /tmp/x", "newline"),
+        # codex review round 6: an ESCAPED quote is a literal to bash,
+        # so the separator after it is live. Reading it as opening a
+        # quoted region hid the `;` and auto-approved the line on the
+        # codex bridge, where a real shell then ran `sudo`.
+        (r"echo foo\'; sudo -n true", "escaped single quote"),
+        (r'echo foo\"; sudo -n true', "escaped double quote"),
         # Double-quoted but with a $ inside — still active (variable
         # expansion is enabled in "..."), so we treat $ as risky.
         ('echo "$HOME"', "$"),
