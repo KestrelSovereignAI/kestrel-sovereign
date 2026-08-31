@@ -917,9 +917,10 @@ class ProcessManager:
             raise RuntimeError(
                 "Could not build the subprocess A2A identity registry"
             ) from exc
-        identity_roots = {resolved_dir}
+        identity_roots = {identity_export_dir or resolved_dir}
         identity_roots.update(
-            peer_config.resolve_data_dir(self.project_dir)
+            peer_config.resolve_identity_export_dir(self.project_dir)
+            or peer_config.resolve_data_dir(self.project_dir)
             for peer_config in roster.get_local_agents().values()
         )
         env[A2A_PEER_IDENTITY_ROOTS_ENV] = json.dumps(

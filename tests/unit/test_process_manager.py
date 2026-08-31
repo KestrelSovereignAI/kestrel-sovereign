@@ -575,6 +575,52 @@ class TestStartAgent:
             (project_dir / "agent_data" / "claw" / "continuity").resolve()
         )
 
+    def test_start_agent_registers_effective_identity_export_roots(
+        self,
+        pm,
+        project_dir,
+    ):
+        """Peer verification follows every configured DID export override."""
+
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            identity_export_dir=Path("continuity"),
+            port=8801,
+        )
+        peer_cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/testbot"),
+            identity_export_dir=Path("identity-material"),
+            port=8802,
+        )
+        roster = MultiAgentConfig(agents={"claw": cfg, "testbot": peer_cfg})
+        mock_process = MagicMock(pid=12345)
+
+        with (
+            patch.object(MultiAgentConfig, "load", return_value=roster),
+            patch("subprocess.Popen", return_value=mock_process) as mock_popen,
+        ):
+            pm.start_agent("claw", cfg)
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert set(json.loads(env[A2A_PEER_IDENTITY_ROOTS_ENV])) == {
+            str(
+                (
+                    project_dir
+                    / "agent_data"
+                    / "claw"
+                    / "continuity"
+                ).resolve()
+            ),
+            str(
+                (
+                    project_dir
+                    / "agent_data"
+                    / "testbot"
+                    / "identity-material"
+                ).resolve()
+            ),
+        }
+
     def test_two_children_do_not_inherit_one_shared_parent_export_root(
         self,
         pm,
