@@ -928,17 +928,28 @@ class ModelCatalogService:
 
     # --- Discovery Cache ---
 
-    def write_cache(self, models: List[ModelInfo]) -> None:
+    def write_cache(
+        self,
+        models: List[ModelInfo],
+        failed_vendors: Optional[Dict[str, str]] = None,
+    ) -> None:
         """Write discovered models to cache file for fast startup.
 
         Args:
             models: List of enriched ModelInfo objects from discovery
+            failed_vendors: vendor -> error for vendors whose discovery failed
+                when this snapshot was taken (#3190). A cached catalog can be
+                REDUCED — missing a vendor's real models — and nothing in the
+                model list itself says so. Persisting the outcome is what lets
+                the next process tell "this vendor serves only these" from
+                "we could not ask this vendor".
         """
         try:
             from datetime import datetime, timezone
             cache_data = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "model_count": len(models),
+                "failed_vendors": dict(failed_vendors or {}),
                 "models": [m.to_dict() for m in models],
             }
             with open(self.cache_path, "w") as f:
@@ -967,6 +978,41 @@ class ModelCatalogService:
         except Exception as e:
             logger.warning(f"Failed to load discovery cache: {e}")
             return None
+
+    def load_failed_vendors(self) -> Dict[str, str]:
+        """Vendors whose discovery had failed when the cache was written (#3190).
+
+        Restored into ``LLMService._discovery_failures`` by
+        ``_load_from_disk_cache`` so a restart does not forget that the
+        catalog on disk is a remnant. Without it the mandate validator treats
+        the reduced catalog as authoritative and vetoes the operator's pinned
+        model exactly as it did before the fix — the in-memory record starts
+        empty in every new process, and the disk cache is loaded BEFORE
+        ``_load_model_preference`` runs.
+
+        Returns an empty dict for an absent, unreadable, or pre-#3190 cache:
+        unknown means "do not excuse the veto", which matches the behaviour
+        before this key existed.
+        """
+        if not self.cache_path.exists():
+            return {}
+        try:
+            with open(self.cache_path, "r") as f:
+                cache_data = json.load(f)
+            failed = cache_data.get("failed_vendors")
+            if not isinstance(failed, dict):
+                return {}
+            # JSON object keys are strings by spec, so only the blank-key
+            # case is reachable here; a blank vendor matches nothing and
+            # would excuse nothing.
+            return {
+                str(k): str(v)[:300]
+                for k, v in failed.items()
+                if k
+            }
+        except Exception as e:  # noqa: BLE001 - never block startup on cache
+            logger.warning(f"Failed to load discovery-cache failure record: {e}")
+            return {}
 
 
 # Global singleton instance

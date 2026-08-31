@@ -306,7 +306,10 @@ class ModelDiscoveryMixin:
 
         # Cache results in shared memory cache and on disk
         shared_cache.set(all_models)
-        catalog.write_cache(all_models)
+        catalog.write_cache(
+            all_models,
+            failed_vendors=getattr(self, "_discovery_failures", None),
+        )
 
         logger.info(f"Discovered {len(all_models)} models total")
 
@@ -1461,6 +1464,14 @@ class ModelDiscoveryMixin:
         catalog = get_catalog_service()
         cached = catalog.load_cache()
         if cached:
+            # Restore the failure record with the catalog it describes (#3190).
+            # This runs BEFORE _load_model_preference, so without it a restart
+            # sees a reduced catalog, an empty failure record, and vetoes the
+            # operator's pinned model exactly as in the original incident.
+            failures = getattr(self, "_discovery_failures", None)
+            if failures is not None:
+                for vendor, reason in catalog.load_failed_vendors().items():
+                    failures.setdefault(vendor, reason)
             shared_cache.set_stale(cached)
             logger.info(f"Pre-populated {len(cached)} models from disk cache")
 
@@ -1547,11 +1558,38 @@ class ModelDiscoveryMixin:
             if vendor == "openai" and not base_url:
                 return await self._safe_list_models(vendor, adapter, client)
             if base_url and is_local:
-                return await self._discover_local_openai_compatible(vendor, route_cfg)
+                return await self._record_discovery(
+                    vendor, self._discover_local_openai_compatible(vendor, route_cfg)
+                )
             if base_url:
-                return await self._discover_openai_compatible_remote(vendor, route_cfg)
+                return await self._record_discovery(
+                    vendor, self._discover_openai_compatible_remote(vendor, route_cfg)
+                )
 
         return await self._safe_list_models(vendor, adapter, client)
+
+    async def _record_discovery(self, vendor: str, coro) -> List[ModelInfo]:
+        """Await an OpenAI-compatible discovery helper, recording its outcome.
+
+        These two paths bypass ``_safe_list_models`` entirely, so before #3190
+        they recorded nothing: an outage on ollama, llama_cpp, xAI, Groq or
+        RunPod stayed absent from health, and their collapsed catalogs could
+        still veto a pinned model. RunPod's ``/models`` was in fact 404ing on
+        the production host while this fix claimed to surface exactly that.
+
+        One recorder wrapping both call sites rather than an edit inside each
+        helper: the helpers raise on a real discovery error and return ``[]``
+        only for absent configuration, so failure and "not attempted" stay
+        distinguishable at a single place.
+        """
+        try:
+            models = await coro
+        except Exception as e:  # noqa: BLE001 - discovery must never break init
+            logger.warning("%s: model discovery failed: %s", vendor, e)
+            self._note_discovery_outcome(vendor, e)
+            return []
+        self._note_discovery_outcome(vendor, None)
+        return models
 
     async def _safe_list_models(self, vendor: str, adapter, client) -> List[ModelInfo]:
         """Call adapter.list_models(client) with full error tolerance.
@@ -1627,8 +1665,13 @@ class ModelDiscoveryMixin:
             )
             return results
         except Exception as e:
-            logger.warning(f"{provider_name}: local model discovery failed ({models_url}): {e}")
-            return []
+            # Raise rather than return [] (#3190): an empty list is also what a
+            # server with no models returns, and the caller cannot tell those
+            # apart. _record_discovery logs and converts this to [] after
+            # recording the vendor as failed.
+            raise RuntimeError(
+                f"local model discovery failed ({models_url}): {e}"
+            ) from e
 
     async def _discover_openai_compatible_remote(
         self, provider_name: str, provider_config: dict
@@ -1682,8 +1725,11 @@ class ModelDiscoveryMixin:
             logger.info(f"{provider_name}: discovered {len(results)} models from {models_url}")
             return results
         except Exception as e:
-            logger.warning(f"{provider_name}: remote model discovery failed ({models_url}): {e}")
-            return []
+            # See _discover_local_openai_compatible: failure must be
+            # distinguishable from "serves nothing" (#3190).
+            raise RuntimeError(
+                f"remote model discovery failed ({models_url}): {e}"
+            ) from e
 
     @staticmethod
     async def _query_local_server_context(base_url: str, httpx_module) -> Optional[int]:

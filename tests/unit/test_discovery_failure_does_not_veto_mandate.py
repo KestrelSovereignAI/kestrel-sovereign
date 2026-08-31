@@ -275,3 +275,255 @@ class TestSafeListModelsRecordsOutcome:
         models = await svc._safe_list_models("anthropic", adapter, MagicMock())
         assert models == []
         assert "anthropic" not in svc._discovery_failures
+
+
+class TestFailureRecordSurvivesRestart:
+    """The record must travel with the catalog it describes (#3190 codex P1).
+
+    ``_discovery_failures`` is per-process. A failed discovery writes a REDUCED
+    catalog to disk; the next process restores it via ``_load_from_disk_cache``
+    — which runs BEFORE ``_load_model_preference`` — with an empty failure
+    record. Without persistence the validator sees stale vendor rows, no
+    recorded failure, and vetoes the pin exactly as in the original incident.
+    A restart is not an edge case here: it is precisely how the outage
+    happened.
+    """
+
+    def test_write_then_load_round_trips_the_failures(self, tmp_path):
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        svc = ModelCatalogService.__new__(ModelCatalogService)
+        svc.cache_path = tmp_path / "cache.json"
+        svc.write_cache(
+            [_mk_model("claude-sonnet-5", "anthropic")],
+            failed_vendors={"anthropic": "AuthenticationError: 401"},
+        )
+        assert svc.load_failed_vendors() == {"anthropic": "AuthenticationError: 401"}
+
+    def test_absent_cache_reports_no_failures(self, tmp_path):
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        svc = ModelCatalogService.__new__(ModelCatalogService)
+        svc.cache_path = tmp_path / "missing.json"
+        assert svc.load_failed_vendors() == {}
+
+    def test_pre_3190_cache_reports_no_failures(self, tmp_path):
+        """A cache written before this key existed must not excuse the veto."""
+        import json
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        path = tmp_path / "cache.json"
+        path.write_text(json.dumps({"generated_at": "x", "model_count": 0, "models": []}))
+        svc = ModelCatalogService.__new__(ModelCatalogService)
+        svc.cache_path = path
+        assert svc.load_failed_vendors() == {}
+
+    def test_blank_vendor_key_is_dropped(self, tmp_path):
+        """An empty key would match nothing and excuse nothing — drop it."""
+        import json
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        path = tmp_path / "cache.json"
+        path.write_text(json.dumps(
+            {"models": [], "failed_vendors": {"": "junk", "runpod": "404"}}
+        ))
+        svc = ModelCatalogService.__new__(ModelCatalogService)
+        svc.cache_path = path
+        assert svc.load_failed_vendors() == {"runpod": "404"}
+
+    def test_loaded_reason_is_bounded(self, tmp_path):
+        """Bound on READ as well as write: the file is not ours to trust.
+
+        The reason reaches an operator-facing health message; a hand-edited or
+        corrupted cache must not be able to put an unbounded string there.
+        """
+        import json
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        path = tmp_path / "cache.json"
+        path.write_text(json.dumps({"models": [], "failed_vendors": {"runpod": "x" * 5000}}))
+        svc = ModelCatalogService.__new__(ModelCatalogService)
+        svc.cache_path = path
+        assert len(svc.load_failed_vendors()["runpod"]) <= 300
+
+    def test_corrupt_failed_vendors_is_ignored(self, tmp_path):
+        import json
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        path = tmp_path / "cache.json"
+        path.write_text(json.dumps({"models": [], "failed_vendors": "not-a-dict"}))
+        svc = ModelCatalogService.__new__(ModelCatalogService)
+        svc.cache_path = path
+        assert svc.load_failed_vendors() == {}
+
+    def test_restored_failure_lets_the_pin_survive_a_restart(self, tmp_path):
+        """End to end: reduced catalog on disk + restored record -> pin survives."""
+        from kestrel_sovereign.llm.model_catalog import ModelCatalogService
+
+        catalog = ModelCatalogService.__new__(ModelCatalogService)
+        catalog.cache_path = tmp_path / "cache.json"
+        catalog.write_cache(
+            _COLLAPSED_ANTHROPIC_CATALOG,
+            failed_vendors={"anthropic": "AuthenticationError: 401"},
+        )
+
+        # Fresh process: empty in-memory record, reduced catalog on disk.
+        # Drive the REAL _load_from_disk_cache — a test that repeats its restore
+        # loop would still pass if the production restore were deleted.
+        svc = _make_service(discovery_failures={})
+        svc._resolve_auto_providers = lambda models: None
+
+        shared = MagicMock()
+        shared.has_data = MagicMock(return_value=False)
+        shared.set_stale = MagicMock()
+        shared.get_any = MagicMock(return_value=None)
+
+        with patch(
+            "kestrel_sovereign.llm.model_discovery.get_shared_model_cache",
+            return_value=shared,
+        ), patch(
+            "kestrel_sovereign.llm.model_discovery.get_catalog_service",
+            return_value=catalog,
+        ):
+            assert svc._load_from_disk_cache() is True
+
+        assert "anthropic" in svc._discovery_failures
+
+        cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            svc._validate_explicit_mandate("claude-opus-5", "anthropic", "plan")
+
+
+class TestOpenAICompatiblePathsRecordOutcomes:
+    """The two helpers that bypass ``_safe_list_models`` (#3190 codex P1).
+
+    ollama, llama_cpp, xAI, Groq and RunPod all route through these. RunPod's
+    ``/models`` was 404ing on the production host at the time this fix claimed
+    to surface exactly that condition — the evidence contradicted the
+    implementation and the first round did not notice.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failure_in_a_bypassing_path_is_recorded(self):
+        svc = _make_service()
+
+        async def _boom():
+            raise RuntimeError("remote model discovery failed (…/models): 404")
+
+        out = await svc._record_discovery("runpod", _boom())
+        assert out == []  # caller still sees the tolerant empty list
+        assert "404" in svc._discovery_failures["runpod"]
+
+    @pytest.mark.asyncio
+    async def test_success_in_a_bypassing_path_clears_a_prior_failure(self):
+        svc = _make_service(discovery_failures={"ollama": "stale"})
+
+        async def _ok():
+            return [_mk_model("llama3.2:1b", "ollama")]
+
+        out = await svc._record_discovery("ollama", _ok())
+        assert len(out) == 1
+        assert "ollama" not in svc._discovery_failures
+
+    @pytest.mark.asyncio
+    async def test_a_recorded_bypassing_failure_stops_the_veto(self):
+        """The whole point: a 404 on RunPod must not veto a RunPod pin."""
+        svc = _make_service(
+            providers=[{"name": "runpod:api", "vendor": "runpod",
+                        "route": "api", "model": "auto"}],
+        )
+
+        async def _boom():
+            raise RuntimeError("404 Not Found")
+
+        await svc._record_discovery("runpod", _boom())
+        cache = _cached([_mk_model("some-stale-model", "runpod")])
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            svc._validate_explicit_mandate("my-real-model", "runpod", "api")
+
+
+class TestHelpersRaiseRatherThanSwallow:
+    """Drive the REAL helpers, not a stand-in coroutine.
+
+    ``_record_discovery`` can only distinguish failure from "serves nothing"
+    if the helper actually raises. A test that feeds ``_record_discovery`` its
+    own failing coroutine proves nothing about the helpers — revert either one
+    to ``return []`` and the recorder sees a normal empty list, records
+    SUCCESS, and the outage becomes invisible again. That mutant survived
+    until this class existed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_remote_helper_raises_on_a_failed_request(self, monkeypatch):
+        import httpx
+
+        svc = _make_service()
+        monkeypatch.setenv("RUNPOD_API_KEY", "k")
+
+        class _Boom:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **k):
+                raise httpx.HTTPError("404 Not Found")
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Boom())
+        with pytest.raises(RuntimeError, match="remote model discovery failed"):
+            await svc._discover_openai_compatible_remote(
+                "runpod", {"base_url": "https://api.runpod.ai/v2/x/openai/v1"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_local_helper_raises_on_a_failed_request(self, monkeypatch):
+        import httpx
+
+        svc = _make_service()
+
+        class _Boom:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **k):
+                raise httpx.HTTPError("connection refused")
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Boom())
+        with pytest.raises(RuntimeError, match="local model discovery failed"):
+            await svc._discover_local_openai_compatible(
+                "ollama", {"base_url": "http://localhost:11434/v1"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_absent_config_still_returns_empty_not_a_failure(self):
+        """Missing base_url is 'not attempted', not an outage — must NOT record."""
+        svc = _make_service()
+        assert await svc._discover_openai_compatible_remote("runpod", {}) == []
+        assert await svc._discover_local_openai_compatible("ollama", {}) == []
+        assert svc._discovery_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_a_failing_helper_records_through_the_seam(self, monkeypatch):
+        """Real helper + real recorder: the seam records the vendor as failed."""
+        import httpx
+
+        svc = _make_service()
+        monkeypatch.setenv("RUNPOD_API_KEY", "k")
+
+        class _Boom:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **k):
+                raise httpx.HTTPError("404 Not Found")
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Boom())
+        out = await svc._record_discovery(
+            "runpod",
+            svc._discover_openai_compatible_remote(
+                "runpod", {"base_url": "https://api.runpod.ai/v2/x/openai/v1"}
+            ),
+        )
+        assert out == []
+        assert "404" in svc._discovery_failures["runpod"]
