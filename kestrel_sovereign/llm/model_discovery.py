@@ -1585,7 +1585,20 @@ class ModelDiscoveryMixin:
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)
             return []
-        self._note_discovery_outcome(vendor, None)
+        if models:
+            # Clear a prior failure only on PROOF of a successful fetch (#3190
+            # r10 P2). These helpers return `[]` when they never issued a
+            # request at all — no base_url, or the credential env var unset
+            # because the key is supplied inline or under a custom name. Taking
+            # that as success meant a RunPod/xAI failure could be cleared by
+            # unsetting its key: health turns green with no catalog fetched.
+            #
+            # Note what this deliberately does NOT do: it never RECORDS a
+            # failure from an empty return. Inferring failure from a returned
+            # catalog is what nine review rounds established cannot work, since
+            # every adapter answers differently. Declining to infer SUCCESS is
+            # a weaker and sound claim — "nothing happened" is not "it worked".
+            self._note_discovery_outcome(vendor, None)
         return models
 
     async def _safe_list_models(self, vendor: str, adapter, client) -> List[ModelInfo]:

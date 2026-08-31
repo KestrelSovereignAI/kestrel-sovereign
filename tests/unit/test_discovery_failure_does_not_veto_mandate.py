@@ -435,3 +435,52 @@ class TestMandateLoadErrorLifecycle:
         svc._mandate_load_error = "Cannot set model 'claude-opus-5' ..."
         svc.clear_model_preference()
         assert svc._mandate_load_error is None
+
+
+class TestSkippedDiscoveryDoesNotClearAFailure:
+    """"Nothing happened" is not "it worked" (#3190 r10 P2).
+
+    The OpenAI-compatible helpers return `[]` when they never issued a request
+    — no base_url, or the credential env var unset because the key is supplied
+    inline or under a custom name. Treating that as success meant a real
+    RunPod/xAI failure could be cleared by unsetting its key: health turns
+    green having fetched nothing.
+
+    The fix declines to infer SUCCESS from an empty return. It still does not
+    infer FAILURE from one — that is the thing nine rounds established cannot
+    work, because every adapter answers differently.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_request_leaves_a_prior_failure_standing(self):
+        svc = _make_service(discovery_failures={"runpod": "404 Not Found"})
+
+        async def _skipped():
+            return []  # never issued a request
+
+        assert await svc._record_discovery("runpod", _skipped()) == []
+        assert svc._discovery_failures.get("runpod") == "404 Not Found", (
+            "a non-attempt must not clear a real failure"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_request_does_not_invent_a_failure_either(self):
+        """The other half: empty is not evidence of failure, only of nothing."""
+        svc = _make_service()
+
+        async def _skipped():
+            return []
+
+        await svc._record_discovery("runpod", _skipped())
+        assert svc._discovery_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_a_real_fetch_still_clears(self):
+        """The converse — proves clearing was gated, not removed."""
+        svc = _make_service(discovery_failures={"ollama": "connection refused"})
+
+        async def _ok():
+            return [_mk_model("llama3.2:1b", "ollama")]
+
+        assert len(await svc._record_discovery("ollama", _ok())) == 1
+        assert "ollama" not in svc._discovery_failures
