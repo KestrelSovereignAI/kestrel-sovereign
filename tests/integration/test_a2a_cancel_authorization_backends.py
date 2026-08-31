@@ -213,15 +213,15 @@ async def test_sqlite_legacy_insert_or_replace_cannot_overwrite_cancellation(tmp
             reason="committed before stale writer",
         )
 
-        rows = await backend.execute(
-            """
-            INSERT OR REPLACE INTO a2a_tasks
-                (id, task_type, status, metadata)
-            VALUES (?, 'generic', 'completed', '{}')
-            """,
-            (task_id,),
-        )
-        assert rows == 0
+        with pytest.raises(Exception, match="requires durable authority"):
+            await backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks
+                    (id, task_type, status, metadata)
+                VALUES (?, 'generic', 'completed', '{}')
+                """,
+                (task_id,),
+            )
 
         canceled = await store.get(task_id)
         assert canceled is not None

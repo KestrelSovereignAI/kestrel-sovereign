@@ -1,6 +1,7 @@
 """Authority and atomicity regressions for A2A task cancellation (#3134)."""
 
 import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1408,15 +1409,29 @@ async def test_idempotent_recipient_decline_keeps_live_execution_exemption(tmp_p
 async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
     """Rows without durable receipt columns cannot retain old metadata claims."""
 
-    manager = await create_task_manager(str(tmp_path / "legacy-forged-receipt.db"))
-    try:
-        await manager.task_store._backend.execute(
+    database = tmp_path / "legacy-forged-receipt.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
             """
-            INSERT INTO a2a_tasks (
-                id, task_type, status, metadata,
-                creator_agent_id, recipient_agent_id,
-                canceled_by, cancel_reason, cancel_previous_status
-            ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)
+            CREATE TABLE a2a_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                user_id TEXT,
+                task_type TEXT NOT NULL,
+                status TEXT DEFAULT 'submitted',
+                message TEXT,
+                artifacts TEXT DEFAULT '[]',
+                history TEXT DEFAULT '[]',
+                metadata TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO a2a_tasks (id, task_type, status, metadata)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 "legacy-forged-receipt",
@@ -1427,6 +1442,8 @@ async def test_legacy_metadata_cannot_supply_a_cancellation_receipt(tmp_path):
             ),
         )
 
+    manager = await create_task_manager(str(database))
+    try:
         legacy = await manager.get_task("legacy-forged-receipt")
         assert "cancellation_receipt" not in (legacy.metadata or {})
         with pytest.raises(ValueError, match="Invalid state transition"):
@@ -2852,14 +2869,16 @@ async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
         call.args[0] for call in backend.execute_script.await_args_list
     )
     assert (
-        "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v3"
+        "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v4"
         in scripts
     )
     assert "OLD.status IN ('completed', 'failed', 'canceled')" in scripts
     assert "terminal A2A task cannot be replaced" in scripts
+    assert "IF TG_OP = 'INSERT'" in scripts
+    assert "A2A task requires durable authority" in scripts
     assert "live A2A task requires durable authority" in scripts
-    assert "CREATE TRIGGER a2a_tasks_authority_fence_v3" in scripts
-    assert "EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v3()" in scripts
+    assert "CREATE TRIGGER a2a_tasks_authority_fence_v4" in scripts
+    assert "EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v4()" in scripts
     statements = "\n".join(
         call.args[0] for call in backend.execute.await_args_list
     )
@@ -2943,18 +2962,18 @@ async def test_postgres_cancellation_schema_waiter_skips_completed_ddl():
 
 
 @pytest.mark.asyncio
-async def test_postgres_legacy_canceled_only_fence_is_not_terminal_schema_ready():
-    """A v2 function/trigger must not suppress the all-terminal upgrade."""
+async def test_postgres_v3_terminal_fence_is_not_authority_schema_ready():
+    """A v3 terminal fence must not suppress the all-insert authority upgrade."""
 
     @asynccontextmanager
     async def transaction():
         yield
 
     async def fetch_one(query, _params=()):
-        # Model an upgraded database that has every #3134 object but only the
-        # canceled-only v2 fence.  The new all-terminal objects do not exist.
-        has_terminal_function = "a2a_tasks_enforce_authority_fence_v3" in query
-        has_terminal_trigger = "a2a_tasks_authority_fence_v3" in query
+        # Model a database with every older object but without the v4 function
+        # and trigger that fence authority-less terminal inserts.
+        has_terminal_function = "a2a_tasks_enforce_authority_fence_v4" in query
+        has_terminal_trigger = "a2a_tasks_authority_fence_v4" in query
         has_terminal_binding = "procedure.oid = trigger.tgfoid" in query
         return (
             not (
@@ -2977,8 +2996,8 @@ async def test_postgres_legacy_canceled_only_fence_is_not_terminal_schema_ready(
     scripts = "\n".join(
         call.args[0] for call in backend.execute_script.await_args_list
     )
-    assert "a2a_tasks_enforce_authority_fence_v3" in scripts
-    assert "a2a_tasks_authority_fence_v3" in scripts
+    assert "a2a_tasks_enforce_authority_fence_v4" in scripts
+    assert "a2a_tasks_authority_fence_v4" in scripts
 
 
 @pytest.mark.asyncio

@@ -227,3 +227,47 @@ async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
     finally:
         await store.delete(task_id)
         await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_authorityless_terminal_replace_cannot_claim_live_task(tmp_path):
+    """A legacy replacement cannot erase authority while claiming completion."""
+
+    backend = SQLiteBackend(str(tmp_path / "recipient-live-replace.db"))
+    await backend.connect()
+    store = TaskStore(backend)
+    task_id = f"authorityless-terminal-replace-{uuid4().hex}"
+    creator = f"did:test:creator:{uuid4().hex}"
+    recipient = f"did:test:recipient:{uuid4().hex}"
+    try:
+        await store.initialize()
+        await store.save(
+            Task(id=task_id, status=TaskStatus(state=TaskState.SUBMITTED)),
+            creator_agent_id=creator,
+            recipient_agent_id=recipient,
+        )
+
+        with pytest.raises(Exception, match="requires durable authority"):
+            await backend.execute(
+                """
+                INSERT OR REPLACE INTO a2a_tasks (id, task_type, status)
+                VALUES (?, 'generic', 'completed')
+                """,
+                (task_id,),
+            )
+
+        persisted = await store.get(task_id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.SUBMITTED
+        authority = await backend.fetch_one(
+            """
+            SELECT creator_agent_id, recipient_agent_id
+            FROM a2a_tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        assert authority == (creator, recipient)
+    finally:
+        await store.delete(task_id)
+        await backend.close()

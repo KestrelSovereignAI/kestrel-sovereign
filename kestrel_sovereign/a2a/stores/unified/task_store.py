@@ -203,11 +203,11 @@ class TaskStore(UnifiedStoreBase):
                       ON procedure_namespace.oid = procedure.pronamespace
                     WHERE namespace.nspname = current_schema()
                       AND relation.relname = 'a2a_tasks'
-                      AND trigger.tgname = 'a2a_tasks_authority_fence_v3'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v4'
                       AND NOT trigger.tgisinternal
                       AND procedure_namespace.nspname = current_schema()
                       AND procedure.proname =
-                          'a2a_tasks_enforce_authority_fence_v3'
+                          'a2a_tasks_enforce_authority_fence_v4'
                       AND pg_get_function_identity_arguments(procedure.oid) = ''
                 )
                 AND (
@@ -279,12 +279,18 @@ class TaskStore(UnifiedStoreBase):
 
         if self.is_postgres:
             await self._backend.execute_script("""
-                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v3()
+                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v4()
                 RETURNS trigger AS $a2a_fence_function$
                 BEGIN
                     IF TG_OP = 'UPDATE'
                        AND OLD.status IN ('completed', 'failed', 'canceled') THEN
                         RAISE EXCEPTION 'terminal A2A task cannot be replaced'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    IF TG_OP = 'INSERT'
+                       AND (NEW.creator_agent_id IS NULL
+                            OR NEW.recipient_agent_id IS NULL) THEN
+                        RAISE EXCEPTION 'A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
                     END IF;
                     IF NEW.status IN ('submitted', 'working', 'input-required')
@@ -301,17 +307,21 @@ class TaskStore(UnifiedStoreBase):
                     ON a2a_tasks;
                 DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v2
                     ON a2a_tasks;
-                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v3
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v4
                     ON a2a_tasks;
-                CREATE TRIGGER a2a_tasks_authority_fence_v3
+                CREATE TRIGGER a2a_tasks_authority_fence_v4
                 BEFORE INSERT OR UPDATE ON a2a_tasks
                 FOR EACH ROW
-                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v3();
+                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v4();
 
-                -- The old canceled-only function is no longer load-bearing.
-                -- Drop it after its trigger so a later old binary must
-                -- explicitly reinstall v2; the v3 trigger remains present and
-                -- continues to fence every terminal state during that rollout.
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v3
+                    ON a2a_tasks;
+
+                -- The old functions are no longer load-bearing. Drop them only
+                -- after their triggers; the v4 trigger is already present and
+                -- continues to fence terminal mutation and authority-less
+                -- inserts throughout a mixed-version rollout.
+                DROP FUNCTION IF EXISTS a2a_tasks_enforce_authority_fence_v3();
                 DROP FUNCTION IF EXISTS a2a_tasks_enforce_authority_fence();
             """)
             return
@@ -346,14 +356,13 @@ class TaskStore(UnifiedStoreBase):
                 SELECT RAISE(IGNORE);
             END;
 
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_authority_insert_v3
             BEFORE INSERT ON a2a_tasks
             FOR EACH ROW
-            WHEN NEW.status IN ('submitted', 'working', 'input-required')
-              AND (NEW.creator_agent_id IS NULL
-                   OR NEW.recipient_agent_id IS NULL)
+            WHEN NEW.creator_agent_id IS NULL
+              OR NEW.recipient_agent_id IS NULL
             BEGIN
-                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
+                SELECT RAISE(ABORT, 'A2A task requires durable authority');
             END;
 
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_update_v2
@@ -370,6 +379,7 @@ class TaskStore(UnifiedStoreBase):
             DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v2;
             DROP TRIGGER IF EXISTS a2a_tasks_canceled_replace_v3;
             DROP TRIGGER IF EXISTS a2a_tasks_terminal_replace_v3;
+            DROP TRIGGER IF EXISTS a2a_tasks_live_authority_v2;
         """)
 
     async def save(
