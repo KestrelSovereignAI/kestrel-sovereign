@@ -1,6 +1,7 @@
 """Recipient-owned A2A response and artifact mutations (#3144)."""
 
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,6 +20,7 @@ from kestrel_sovereign.a2a.task_manager import create_task_manager
 from kestrel_sovereign.a2a.task_worker import TaskWorker
 from kestrel_sovereign.a2a.types import (
     Artifact,
+    DataPart,
     Message,
     Task,
     TaskSendParams,
@@ -504,6 +506,85 @@ async def test_async_terminal_commit_lost_ack_still_emits_completion_wake(tmp_pa
         event = terminal_events.get_nowait()
         assert event["event"] == "status"
         assert event["final"] is True
+        assert terminal_events.empty()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_lost_ack_with_normalized_terminal_payload_still_emits_wake(tmp_path):
+    """Persistence normalization cannot veto a matching terminal attempt token."""
+
+    manager = await create_task_manager(
+        str(tmp_path / "terminal-normalized-lost-ack.db"),
+        host_agent_id=RECIPIENT,
+    )
+
+    class CompletingHandler:
+        async def handle_task(self, task):
+            task.status = TaskStatus(
+                state=TaskState.COMPLETED,
+                message=Message(role="agent", parts=[TextPart(text="done")]),
+            )
+            task.artifacts = [
+                Artifact(
+                    name="normalized-output",
+                    parts=[
+                        DataPart(data={"when": datetime(2020, 1, 1)})
+                    ],
+                )
+            ]
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="worker",
+            description="normalizing uncertain commit worker",
+            url="/agents/worker",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="finish",
+                    name="finish",
+                    description="finish with a normalized artifact payload",
+                )
+            ],
+        ),
+        CompletingHandler(),
+    )
+    completions: list[str] = []
+    manager._on_task_complete = lambda task: completions.append(task.id)
+    canonical_save = manager.task_store.save_recipient_terminal_outcome
+    first_write = True
+
+    async def commit_then_lose_ack(*args, **kwargs):
+        nonlocal first_write
+        committed = await canonical_save(*args, **kwargs)
+        if first_write:
+            first_write = False
+            assert committed is True
+            raise RuntimeError("lost terminal COMMIT acknowledgement")
+        return committed
+
+    manager.task_store.save_recipient_terminal_outcome = commit_then_lose_ack
+    try:
+        submitted = await manager.execute_skill("worker", "finish", {}, sync=False)
+        terminal_events = asyncio.Queue()
+        manager._subscribers[submitted.id] = [terminal_events]
+
+        await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(submitted.id)
+        assert persisted.status.state is TaskState.COMPLETED
+        assert persisted.artifacts[0].parts[0].data == {
+            "when": "2020-01-01 00:00:00"
+        }
+        assert completions == [submitted.id]
+        assert terminal_events.get_nowait()["final"] is True
         assert terminal_events.empty()
     finally:
         await manager.close()

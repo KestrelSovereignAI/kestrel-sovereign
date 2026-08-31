@@ -663,11 +663,12 @@ class TaskManager:
         except Exception as save_error:
             # PostgreSQL can commit and then lose the COMMIT acknowledgement.
             # Reconcile the recipient-scoped canonical row before treating the
-            # exception as a failed write: an exact durable copy proves this
-            # execution still owns the completion wake. A different payload or
-            # terminal state belongs to another writer and must not be narrated
-            # over. Cancellation remains outside this Exception-only recovery so
-            # task cancellation semantics are never swallowed.
+            # exception as a failed write: the private per-attempt token proves
+            # this execution still owns the completion wake without comparing
+            # model values that JSON persistence may normalize. A different
+            # token belongs to another writer and must not be narrated over.
+            # Cancellation remains outside this Exception-only recovery so task
+            # cancellation semantics are never swallowed.
             if terminal_operation_id is None:
                 raise
             try:
@@ -688,7 +689,6 @@ class TaskManager:
             if (
                 committed_operation_id != terminal_operation_id
                 or current is None
-                or not self._same_recipient_execution_outcome(current, task)
             ):
                 raise
             return current, True
@@ -702,19 +702,6 @@ class TaskManager:
             )
             return (current or task), False
         return task, True
-
-    @staticmethod
-    def _same_recipient_execution_outcome(current: Task, attempted: Task) -> bool:
-        """Whether a durable row is the exact terminal payload just attempted."""
-
-        return (
-            current.status.state is attempted.status.state
-            and current.status.message == attempted.status.message
-            and (current.artifacts or []) == (attempted.artifacts or [])
-            and (current.history or []) == (attempted.history or [])
-            and without_reserved_cancellation_receipt(current.metadata)
-            == without_reserved_cancellation_receipt(attempted.metadata)
-        )
 
     async def _save_recipient_execution_result(
         self,
