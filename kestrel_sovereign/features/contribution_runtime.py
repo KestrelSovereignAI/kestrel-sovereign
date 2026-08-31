@@ -1080,6 +1080,7 @@ class FeatureContributionRuntime:
     def _resolve_context_clauses(
         prepared: PreparedFeatureContributions,
     ) -> tuple[ResolvedContextClause, ...]:
+        sanitized_error: FeatureContributionCollectionError | None = None
         try:
             resolved = []
             for registration in prepared.contributions.context_clauses:
@@ -1101,9 +1102,13 @@ class FeatureContributionRuntime:
             # carry user-authored text or credentials in their message.  Do
             # not retain them as a cause: API/startup error boundaries format
             # complete exception chains into production logs.
-            raise FeatureContributionCollectionError(
+            sanitized_error = FeatureContributionCollectionError(
                 prepared.feature, "render_context_clauses"
-            ) from None
+            )
+        # Raising outside the active handler is load-bearing: ``from None``
+        # hides an exception context from formatting but still retains the raw
+        # object (and any secret text) on ``__context__``.
+        raise sanitized_error
 
     @staticmethod
     def _collect(feature: object) -> PreparedFeatureContributions:
@@ -1226,6 +1231,7 @@ class FeatureContributionRuntime:
     ) -> object:
         """Read one SDK getter once and keep all failures at one typed edge."""
 
+        sanitized_error: FeatureContributionCollectionError | None = None
         try:
             method = getattr(feature, getter, None)
             if method is None and optional:
@@ -1238,10 +1244,15 @@ class FeatureContributionRuntime:
                 # getters commonly read secret-bearing feature configuration.
                 # Startup/API logging formats complete exception chains, so the
                 # fixed boundary must not retain arbitrary out-of-tree text.
-                raise FeatureContributionCollectionError(feature, getter) from None
+                sanitized_error = FeatureContributionCollectionError(feature, getter)
             if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise FeatureContributionCollectionError(feature, getter) from exc
+                if sanitized_error is None:
+                    raise
+            elif sanitized_error is None:
+                raise FeatureContributionCollectionError(feature, getter) from exc
+        # Do not raise this while the untrusted exception is being handled:
+        # Python would retain it through ``__context__`` even with ``from None``.
+        raise sanitized_error
 
     @staticmethod
     def _first_owner_conflict(

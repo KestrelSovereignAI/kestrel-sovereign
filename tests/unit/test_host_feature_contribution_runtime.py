@@ -214,6 +214,7 @@ async def test_host_renderer_failure_does_not_leak_feature_repr_or_cause():
     assert error.getter == "render_context_clauses"
     assert secret not in str(error)
     assert error.__cause__ is None
+    assert error.__context__ is None
     assert secret not in "".join(
         traceback.format_exception(type(error), error, error.__traceback__)
     )
@@ -242,6 +243,7 @@ async def test_host_renderer_cancelled_error_is_sanitized_without_cause():
     assert error.getter == "render_context_clauses"
     assert secret not in str(error)
     assert error.__cause__ is None
+    assert error.__context__ is None
     assert secret not in "".join(
         traceback.format_exception(type(error), error, error.__traceback__)
     )

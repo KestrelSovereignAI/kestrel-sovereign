@@ -690,16 +690,14 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
             attempted.append((class_name, feature))
             await agent._unregister_feature_runtime(feature, unload=False)
     except (Exception, asyncio.CancelledError):
-        for class_name, feature in reversed(attempted):
-            try:
-                await agent._activate_feature_runtime(feature)
-            except (Exception, asyncio.CancelledError):
-                logger.exception(
-                    "Disable rollback (re-enable) failed for feature '%s'",
-                    class_name,
-                )
-            else:
-                logger.info("Rolled back disable of feature '%s'", class_name)
+        await _restore_feature_group(
+            agent,
+            tuple(
+                (class_name, feature, True)
+                for class_name, feature in attempted
+            ),
+            operation="Disable",
+        )
         raise
 
     return {
@@ -708,6 +706,67 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
         "status": "disabled",
         "capabilities": compute_feature_capabilities(agent),
     }
+
+
+async def _restore_feature_group(
+    agent: object,
+    attempted: tuple[tuple[str, Any, bool], ...],
+    *,
+    operation: str,
+) -> None:
+    """Best-effort restore of one prevalidated package feature generation."""
+
+    enabled = tuple(
+        feature for _class_name, feature, was_enabled in attempted if was_enabled
+    )
+    prepared_by_feature: Dict[int, Any] = {}
+    if enabled:
+        try:
+            # Cross-feature setup before/after references are valid only as one
+            # prospective set. Collect and preflight the complete rollback
+            # generation once, then retain each exact per-feature item.
+            prepared = agent._prepare_feature_contribution_transition(enabled)
+            prepared_by_feature = {
+                id(feature): item
+                for feature, item in prepared.activatable(enabled)
+            }
+        except (Exception, asyncio.CancelledError):
+            logger.exception(
+                "%s rollback contribution batch preparation failed",
+                operation,
+            )
+
+    # Preserve package activation order. Batch preflight already validated
+    # forward references across the full set; passing each retained item keeps
+    # per-feature activation from revalidating against a partial set.
+    for class_name, feature, was_enabled in attempted:
+        try:
+            if not was_enabled:
+                agent.features[class_name] = feature
+                feature.enabled = False
+            elif id(feature) in prepared_by_feature:
+                await agent._activate_feature_runtime(
+                    feature,
+                    prepared_contributions=prepared_by_feature[id(feature)],
+                )
+            else:
+                logger.error(
+                    "%s rollback could not prepare enabled feature '%s'",
+                    operation,
+                    class_name,
+                )
+        except (Exception, asyncio.CancelledError):
+            logger.exception(
+                "%s rollback (re-activate) failed for feature '%s'",
+                operation,
+                class_name,
+            )
+        else:
+            logger.info(
+                "Rolled back %s of feature '%s'",
+                operation.lower(),
+                class_name,
+            )
 
 
 @router.post("/api/features/{name}/remove")
@@ -802,51 +861,11 @@ async def _remove_feature_locked(
         # Package removal has not crossed its irreversible on_remove/pip
         # boundary yet. Restore the complete group before propagating a hook
         # failure (including an internally-originated CancelledError).
-        enabled = tuple(
-            feature for _class_name, feature, was_enabled in attempted if was_enabled
+        await _restore_feature_group(
+            agent,
+            tuple(attempted),
+            operation="Remove",
         )
-        prepared_by_feature: Dict[int, Any] = {}
-        if enabled:
-            try:
-                # Cross-feature setup before/after references are valid only as
-                # one prospective set. Collect and preflight the complete
-                # rollback generation once, then pass each retained item into
-                # activation so no member revalidates against a partial set.
-                prepared = agent._prepare_feature_contribution_transition(enabled)
-                prepared_by_feature = {
-                    id(feature): item
-                    for feature, item in prepared.activatable(enabled)
-                }
-            except (Exception, asyncio.CancelledError):
-                logger.exception(
-                    "Remove rollback contribution batch preparation failed",
-                )
-        # Preserve package activation order. The retained batch preparation
-        # above has already validated forward references across the full set;
-        # passing its exact per-feature items suppresses invalid partial-set
-        # preflight during each activation.
-        for class_name, feature, was_enabled in attempted:
-            try:
-                if not was_enabled:
-                    agent.features[class_name] = feature
-                    feature.enabled = False
-                elif id(feature) in prepared_by_feature:
-                    await agent._activate_feature_runtime(
-                        feature,
-                        prepared_contributions=prepared_by_feature[id(feature)],
-                    )
-                else:
-                    logger.error(
-                        "Remove rollback could not prepare enabled feature '%s'",
-                        class_name,
-                    )
-            except (Exception, asyncio.CancelledError):
-                logger.exception(
-                    "Remove rollback (re-activate) failed for feature '%s'",
-                    class_name,
-                )
-            else:
-                logger.info("Rolled back removal of feature '%s'", class_name)
         raise
 
     for _class_name, feature, _was_enabled in loaded:

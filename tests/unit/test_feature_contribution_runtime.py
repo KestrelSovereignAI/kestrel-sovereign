@@ -609,6 +609,7 @@ def test_context_clause_getter_failure_discards_secret_exception_chain(
     assert error.getter == "get_context_clause_registrations"
     assert error.stage == "context-clause collection"
     assert error.__cause__ is None
+    assert error.__context__ is None
     assert secret not in "".join(
         traceback.format_exception(type(error), error, error.__traceback__)
     )
@@ -638,6 +639,7 @@ def test_context_clause_getter_cannot_forge_cancellation_with_secret_text(
     error = exc_info.value
     assert error.getter == "get_context_clause_registrations"
     assert error.__cause__ is None
+    assert error.__context__ is None
     assert secret not in "".join(
         traceback.format_exception(type(error), error, error.__traceback__)
     )

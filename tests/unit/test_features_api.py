@@ -739,6 +739,74 @@ class TestDisableFeature:
         assert agent.features[feature.name] is feature
         assert agent.feature_contribution_runtime.active_context_clauses()
 
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_disable_failure_restores_cross_feature_setup_batch(
+        self, mock_registry
+    ):
+        """Disable rollback retains one valid interdependent generation."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstFeature(SDKFixtureFeature):
+            contribution_prefix = "disable-first"
+
+        class SecondFeature(SDKFixtureFeature):
+            contribution_prefix = "disable-second"
+
+        agent = _lifecycle_agent()
+        first = FirstFeature(agent)
+        second = SecondFeature(agent)
+        second.setup_registration = replace(
+            second.setup_registration,
+            after=(first.setup_registration.name,),
+        )
+        transition = agent._prepare_feature_contribution_transition((first, second))
+        for feature, prepared in transition.activatable((first, second)):
+            await agent._activate_feature_runtime(
+                feature,
+                prepared_contributions=prepared,
+            )
+
+        original_shutdown = second.shutdown
+        shutdown_calls = 0
+
+        async def fail_first_shutdown():
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            if shutdown_calls == 1:
+                raise RuntimeError("second disable failed")
+            await original_shutdown()
+
+        second.shutdown = fail_first_shutdown
+        info = FeaturePackageInfo(
+            name="dependent-pkg",
+            package="kestrel-feature-dependent",
+            git="",
+            features=[first.name, second.name],
+            description="cross-feature setup dependency fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="second disable failed"):
+            await features_endpoint.disable_feature(request, info.name)
+
+        assert agent.features[first.name] is first
+        assert agent.features[second.name] is second
+        assert first.enabled is True
+        assert second.enabled is True
+        assert agent.setup_step_registry.get(first.setup_registration.name) is (
+            first.setup_registration
+        )
+        assert agent.setup_step_registry.get(second.setup_registration.name) is (
+            second.setup_registration
+        )
+        assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
+
     @pytest.mark.parametrize(
         "feature_name",
         [
