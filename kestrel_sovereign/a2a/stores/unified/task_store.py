@@ -190,25 +190,23 @@ class TaskStore(UnifiedStoreBase):
                 )
                 AND EXISTS (
                     SELECT 1
-                    FROM pg_proc procedure
-                    JOIN pg_namespace namespace
-                      ON namespace.oid = procedure.pronamespace
-                    WHERE namespace.nspname = current_schema()
-                      AND procedure.proname =
-                          'a2a_tasks_enforce_authority_fence'
-                      AND pg_get_function_identity_arguments(procedure.oid) = ''
-                )
-                AND EXISTS (
-                    SELECT 1
                     FROM pg_trigger trigger
                     JOIN pg_class relation
                       ON relation.oid = trigger.tgrelid
                     JOIN pg_namespace namespace
                       ON namespace.oid = relation.relnamespace
+                    JOIN pg_proc procedure
+                      ON procedure.oid = trigger.tgfoid
+                    JOIN pg_namespace procedure_namespace
+                      ON procedure_namespace.oid = procedure.pronamespace
                     WHERE namespace.nspname = current_schema()
                       AND relation.relname = 'a2a_tasks'
-                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v3'
                       AND NOT trigger.tgisinternal
+                      AND procedure_namespace.nspname = current_schema()
+                      AND procedure.proname =
+                          'a2a_tasks_enforce_authority_fence_v3'
+                      AND pg_get_function_identity_arguments(procedure.oid) = ''
                 )
                 AND (
                     SELECT COUNT(*) = 5
@@ -278,7 +276,7 @@ class TaskStore(UnifiedStoreBase):
 
         if self.is_postgres:
             await self._backend.execute_script("""
-                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence()
+                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v3()
                 RETURNS trigger AS $a2a_fence_function$
                 BEGIN
                     IF TG_OP = 'UPDATE'
@@ -300,10 +298,18 @@ class TaskStore(UnifiedStoreBase):
                     ON a2a_tasks;
                 DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v2
                     ON a2a_tasks;
-                CREATE TRIGGER a2a_tasks_authority_fence_v2
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v3
+                    ON a2a_tasks;
+                CREATE TRIGGER a2a_tasks_authority_fence_v3
                 BEFORE INSERT OR UPDATE ON a2a_tasks
                 FOR EACH ROW
-                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence();
+                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v3();
+
+                -- The old canceled-only function is no longer load-bearing.
+                -- Drop it after its trigger so a later old binary must
+                -- explicitly reinstall v2; the v3 trigger remains present and
+                -- continues to fence every terminal state during that rollout.
+                DROP FUNCTION IF EXISTS a2a_tasks_enforce_authority_fence();
             """)
             return
 

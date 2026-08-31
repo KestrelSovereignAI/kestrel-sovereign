@@ -2804,11 +2804,15 @@ async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
     scripts = "\n".join(
         call.args[0] for call in backend.execute_script.await_args_list
     )
-    assert "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence" in scripts
+    assert (
+        "CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v3"
+        in scripts
+    )
     assert "OLD.status IN ('completed', 'failed', 'canceled')" in scripts
     assert "terminal A2A task cannot be replaced" in scripts
     assert "live A2A task requires durable authority" in scripts
-    assert "CREATE TRIGGER a2a_tasks_authority_fence_v2" in scripts
+    assert "CREATE TRIGGER a2a_tasks_authority_fence_v3" in scripts
+    assert "EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v3()" in scripts
 
 
 @pytest.mark.asyncio
@@ -2881,6 +2885,45 @@ async def test_postgres_cancellation_schema_waiter_skips_completed_ddl():
     )
     assert "pg_advisory_xact_lock" in statements
     assert "CREATE INDEX" not in statements
+
+
+@pytest.mark.asyncio
+async def test_postgres_legacy_canceled_only_fence_is_not_terminal_schema_ready():
+    """A v2 function/trigger must not suppress the all-terminal upgrade."""
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    async def fetch_one(query, _params=()):
+        # Model an upgraded database that has every #3134 object but only the
+        # canceled-only v2 fence.  The new all-terminal objects do not exist.
+        has_terminal_function = "a2a_tasks_enforce_authority_fence_v3" in query
+        has_terminal_trigger = "a2a_tasks_authority_fence_v3" in query
+        has_terminal_binding = "procedure.oid = trigger.tgfoid" in query
+        return (
+            not (
+                has_terminal_function
+                and has_terminal_trigger
+                and has_terminal_binding
+            ),
+        )
+
+    backend = SimpleNamespace(
+        backend_type="postgres",
+        execute_script=AsyncMock(),
+        execute=AsyncMock(return_value=0),
+        fetch_one=AsyncMock(side_effect=fetch_one),
+        transaction=transaction,
+    )
+
+    await TaskStore(backend).initialize()
+
+    scripts = "\n".join(
+        call.args[0] for call in backend.execute_script.await_args_list
+    )
+    assert "a2a_tasks_enforce_authority_fence_v3" in scripts
+    assert "a2a_tasks_authority_fence_v3" in scripts
 
 
 @pytest.mark.asyncio
