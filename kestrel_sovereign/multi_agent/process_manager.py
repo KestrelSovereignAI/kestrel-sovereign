@@ -30,7 +30,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from kestrel_sovereign.a2a.did_registry import A2A_PEER_IDENTITY_ROOTS_ENV
+from kestrel_sovereign.a2a.did_registry import (
+    A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+    A2A_PEER_IDENTITY_ROOTS_ENV,
+    launcher_attested_a2a_verification_document,
+)
 from kestrel_sovereign.a2a.transport_auth import (
     A2A_TRANSPORT_ONLY_ENV,
     ensure_a2a_transport_key,
@@ -830,6 +834,8 @@ class ProcessManager:
         host_bind: str = "0.0.0.0",
         host_port: int = 8888,
         standalone: bool = False,
+        *,
+        roster: Optional[MultiAgentConfig] = None,
     ) -> AgentProcess:
         """Start a single agent process.
 
@@ -839,6 +845,9 @@ class ProcessManager:
             host_bind: Interface to bind to.
             host_port: Host port (for inter-agent communication).
             standalone: If True, agent serves its own UI (solo mode).
+            roster: Active launcher configuration. Bulk starts pass their
+                exact in-memory roster so trust construction cannot reload a
+                different project file.
 
         Returns:
             AgentProcess with pid set on success.
@@ -908,31 +917,67 @@ class ProcessManager:
             # silently resurrect the host credential. An explicit standalone
             # launch is operator-facing and retains its configured API key.
             env["KESTREL_API_KEY"] = ""
-        try:
-            roster = MultiAgentConfig.load(
-                self.project_dir / MULTI_AGENT_CONFIG_FILENAME,
-                auto_discover_fallback=True,
-            )
-        except Exception as exc:
+        if roster is None:
+            try:
+                roster = MultiAgentConfig.load(
+                    self.project_dir / MULTI_AGENT_CONFIG_FILENAME,
+                    auto_discover_fallback=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not build the subprocess A2A identity registry"
+                ) from exc
+        local_roster = dict(roster.get_local_agents())
+        configured_self = local_roster.get(name)
+        if (
+            configured_self is not None
+            and configured_self.resolve_data_dir(self.project_dir) != resolved_dir
+        ):
             raise RuntimeError(
-                "Could not build the subprocess A2A identity registry"
-            ) from exc
-        # Runtime signing documents (``*_did.json`` and ``successions/``) live
-        # in each agent's data directory.  An identity-export override is an
-        # additional public-export destination, not a replacement custody
-        # root, so preserve both when present.
-        identity_roots = {resolved_dir}
-        if identity_export_dir is not None:
-            identity_roots.add(identity_export_dir)
-        for peer_config in roster.get_local_agents().values():
-            identity_roots.add(peer_config.resolve_data_dir(self.project_dir))
-            peer_export_dir = peer_config.resolve_identity_export_dir(
-                self.project_dir
+                f"Agent '{name}' does not match the active launcher roster"
             )
-            if peer_export_dir is not None:
-                identity_roots.add(peer_export_dir)
-        env[A2A_PEER_IDENTITY_ROOTS_ENV] = json.dumps(
-            sorted(str(root) for root in identity_roots)
+        local_roster[name] = config
+
+        # Build immutable public verification documents in the launcher. A
+        # managed child receives no sibling-writable paths: each document must
+        # first bind to that peer's durable anchor and matching private custody.
+        from kestrel_sovereign.identity.local_anchor import (
+            AgentDIDLookupMode,
+            read_anchor_agent_did_sync,
+        )
+        from kestrel_sovereign.paths import spawned_agent_data_key
+
+        identity_documents = []
+        for peer_name, peer_config in local_roster.items():
+            peer_root = peer_config.resolve_data_dir(self.project_dir)
+            has_identity_document = bool(
+                tuple(peer_root.glob("kestrel_0x*.json"))
+                or tuple(peer_root.glob("*_did.json"))
+            )
+            if not has_identity_document:
+                continue
+            try:
+                expected_did = read_anchor_agent_did_sync(
+                    str(peer_root),
+                    mode=AgentDIDLookupMode.INSPECTION,
+                )
+                document = launcher_attested_a2a_verification_document(
+                    peer_root,
+                    expected_agent_did=expected_did,
+                    master_key=spawned_agent_data_key(env, peer_name),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not attest subprocess A2A identity for "
+                    f"agent '{peer_name}' ({type(exc).__name__})"
+                ) from exc
+            if document is not None:
+                identity_documents.append(document)
+        env.pop(A2A_PEER_IDENTITY_ROOTS_ENV, None)
+        env[A2A_PEER_IDENTITY_DOCUMENTS_ENV] = json.dumps(
+            identity_documents,
+            sort_keys=True,
+            separators=(",", ":"),
         )
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
@@ -997,8 +1042,6 @@ class ProcessManager:
         # The resolution lives in ``paths.spawned_agent_data_key`` so an offline
         # tool can ask which key this agent really starts with instead of
         # reading the pre-override value out of the environment (#2892).
-        from kestrel_sovereign.paths import spawned_agent_data_key
-
         agent_key_var = f"KESTREL_DATA_KEY_{name.upper()}"
         effective_key = spawned_agent_data_key(env, name)
         if effective_key and effective_key != env.get("KESTREL_DATA_KEY"):
@@ -1125,7 +1168,13 @@ class ProcessManager:
         started = {}
         for name, agent_cfg in config.get_autostart_agents().items():
             try:
-                ap = self.start_agent(name, agent_cfg, config.host.bind, config.host.port)
+                ap = self.start_agent(
+                    name,
+                    agent_cfg,
+                    config.host.bind,
+                    config.host.port,
+                    roster=config,
+                )
                 started[name] = ap
             except RuntimeError as e:
                 logger.error(f"Failed to start agent '{name}': {e}")

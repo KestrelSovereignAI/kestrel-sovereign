@@ -1314,6 +1314,25 @@ class TaskManager:
                 )
             )
 
+        async def reconciliation_read() -> Optional[Task]:
+            """Read only through the authority predicate used by this route."""
+
+            if recipient_agent_id is not None:
+                if agent_name == recipient_agent_id:
+                    return await self.task_store.get_for_recipient(
+                        task_id,
+                        recipient_agent_id,
+                    )
+                return await self.task_store.get_for_creator(
+                    task_id,
+                    agent_name,
+                    recipient_agent_id=recipient_agent_id,
+                )
+            return await self.task_store.get_for_principal(
+                task_id,
+                agent_name,
+            )
+
         try:
             task = await self.task_store.cancel_if_authorized(
                 task_id,
@@ -1327,10 +1346,7 @@ class TaskManager:
             # original store outcome only after that reconciliation completes.
             store_failure = error
             try:
-                current = await self.task_store.get_for_principal(
-                    task_id,
-                    agent_name,
-                )
+                current = await reconciliation_read()
                 committed_here = (
                     current is not None
                     and await is_this_actor_receipt(current)
@@ -1348,10 +1364,7 @@ class TaskManager:
             task = current
         if task is None:
             try:
-                current = await self.task_store.get_for_principal(
-                    task_id,
-                    agent_name,
-                )
+                current = await reconciliation_read()
             except BaseException:
                 if rollback_local_intent is not None:
                     rollback_local_intent()

@@ -59,7 +59,7 @@ class AnchorAbsent(ValueError):
     """
 
 
-async def read_anchor_agent_did(
+def read_anchor_agent_did_sync(
     storage_dir: str,
     *,
     mode: AgentDIDLookupMode = AgentDIDLookupMode.COLD_READ_ONLY,
@@ -173,4 +173,18 @@ async def read_anchor_agent_did(
             )
         return rows[0][0]
 
-    return await asyncio.to_thread(_lookup)
+    return _lookup()
+
+
+async def read_anchor_agent_did(
+    storage_dir: str,
+    *,
+    mode: AgentDIDLookupMode = AgentDIDLookupMode.COLD_READ_ONLY,
+) -> str:
+    """Read a local anchor without blocking the caller's event loop."""
+
+    return await asyncio.to_thread(
+        read_anchor_agent_did_sync,
+        storage_dir,
+        mode=mode,
+    )

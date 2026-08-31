@@ -25,7 +25,10 @@ from kestrel_sovereign.multi_agent.process_manager import (
     AgentProcess,
     PidStatus,
 )
-from kestrel_sovereign.a2a.did_registry import A2A_PEER_IDENTITY_ROOTS_ENV
+from kestrel_sovereign.a2a.did_registry import (
+    A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+    A2A_PEER_IDENTITY_ROOTS_ENV,
+)
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
@@ -473,10 +476,8 @@ class TestStartAgent:
         assert env["KESTREL_A2A_TRANSPORT_KEY"]
         assert env["KESTREL_API_KEY"] == ""
         assert env["KESTREL_A2A_TRANSPORT_ONLY"] == "true"
-        assert set(json.loads(env[A2A_PEER_IDENTITY_ROOTS_ENV])) == {
-            str((project_dir / "agent_data" / "claw").resolve()),
-            str((project_dir / "agent_data" / "testbot").resolve()),
-        }
+        assert json.loads(env[A2A_PEER_IDENTITY_DOCUMENTS_ENV]) == []
+        assert A2A_PEER_IDENTITY_ROOTS_ENV not in env
         persisted_transport_key = project_dir / ".kestrel-a2a-transport.key"
         assert persisted_transport_key.read_text(encoding="utf-8").strip() == (
             env["KESTREL_A2A_TRANSPORT_KEY"]
@@ -575,12 +576,12 @@ class TestStartAgent:
             (project_dir / "agent_data" / "claw" / "continuity").resolve()
         )
 
-    def test_start_agent_registers_data_and_identity_export_roots(
+    def test_start_agent_never_exports_peer_writable_identity_roots(
         self,
         pm,
         project_dir,
     ):
-        """Peer verification keeps live DID roots alongside export overrides."""
+        """Export overrides remain destinations, never child trust inputs."""
 
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"),
@@ -602,26 +603,69 @@ class TestStartAgent:
             pm.start_agent("claw", cfg)
 
         env = mock_popen.call_args.kwargs["env"]
-        assert set(json.loads(env[A2A_PEER_IDENTITY_ROOTS_ENV])) == {
-            str((project_dir / "agent_data" / "claw").resolve()),
-            str(
-                (
-                    project_dir
-                    / "agent_data"
-                    / "claw"
-                    / "continuity"
-                ).resolve()
+        assert json.loads(env[A2A_PEER_IDENTITY_DOCUMENTS_ENV]) == []
+        assert A2A_PEER_IDENTITY_ROOTS_ENV not in env
+
+    def test_start_agent_exports_only_launcher_attested_documents(
+        self,
+        pm,
+        project_dir,
+    ):
+        configs = {
+            "claw": LocalAgentConfig(
+                data_dir=Path("agent_data/claw"),
+                port=8801,
             ),
-            str((project_dir / "agent_data" / "testbot").resolve()),
-            str(
-                (
-                    project_dir
-                    / "agent_data"
-                    / "testbot"
-                    / "identity-material"
-                ).resolve()
+            "testbot": LocalAgentConfig(
+                data_dir=Path("agent_data/testbot"),
+                port=8802,
             ),
         }
+        roster = MultiAgentConfig(agents=configs)
+        roots = {
+            name: config.resolve_data_dir(project_dir)
+            for name, config in configs.items()
+        }
+        for name, root in roots.items():
+            (root / f"{name}_did.json").write_text("{}", encoding="utf-8")
+        documents = {
+            name: {
+                "id": f"did:web:example.test:{name}",
+                "verificationMethod": [
+                    {
+                        "id": f"did:web:example.test:{name}#key-1",
+                        "controller": f"did:web:example.test:{name}",
+                        "publicKeyMultibase": "zTest",
+                    }
+                ],
+            }
+            for name in configs
+        }
+        anchors = iter(f"did:web:example.test:{name}" for name in configs)
+        mock_process = MagicMock(pid=12345)
+
+        with (
+            patch(
+                "kestrel_sovereign.identity.local_anchor.read_anchor_agent_did_sync",
+                side_effect=anchors,
+            ),
+            patch(
+                "kestrel_sovereign.multi_agent.process_manager."
+                "launcher_attested_a2a_verification_document",
+                side_effect=[documents[name] for name in configs],
+            ) as attest,
+            patch("subprocess.Popen", return_value=mock_process) as mock_popen,
+        ):
+            pm.start_agent("claw", configs["claw"], roster=roster)
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert json.loads(env[A2A_PEER_IDENTITY_DOCUMENTS_ENV]) == [
+            documents[name] for name in configs
+        ]
+        assert A2A_PEER_IDENTITY_ROOTS_ENV not in env
+        assert [call.args[0] for call in attest.call_args_list] == [
+            roots[name] for name in configs
+        ]
 
     def test_two_children_do_not_inherit_one_shared_parent_export_root(
         self,
@@ -929,6 +973,24 @@ class TestStartStopAll:
         # Only "claw" has autostart=True
         assert "claw" in started
         assert "testbot" not in started
+
+    def test_start_autostart_agents_passes_the_active_roster(self, pm, multi_agent_config):
+        """Programmatic rosters remain the one source for child trust registries."""
+
+        started_process = AgentProcess(
+            name="claw",
+            port=8801,
+            data_dir=Path("/tmp/claw"),
+            pid=12345,
+        )
+        with patch.object(
+            pm,
+            "start_agent",
+            return_value=started_process,
+        ) as start_agent:
+            pm.start_autostart_agents(multi_agent_config)
+
+        assert start_agent.call_args.kwargs["roster"] is multi_agent_config
 
     def test_start_autostart_handles_errors(self, pm, project_dir):
         """start_autostart_agents logs errors but continues."""

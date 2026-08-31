@@ -138,6 +138,43 @@ async def test_cancel_task_binds_atomic_transition_to_routed_recipient(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_wrong_route_terminal_cancel_is_indistinguishable_from_unknown(tmp_path):
+    """Cancellation reconciliation must not probe a creator's other route."""
+
+    manager = await create_task_manager(str(tmp_path / "cancel-route-probe.db"))
+    try:
+        await manager.create_task(
+            _params("known-terminal"),
+            agent_name="did:test:actual-recipient",
+            creator_agent_id="did:test:creator",
+        )
+        await manager.update_status(
+            "known-terminal",
+            TaskState.WORKING,
+            recipient_agent_id="did:test:actual-recipient",
+        )
+        await manager.update_status(
+            "known-terminal",
+            TaskState.COMPLETED,
+            recipient_agent_id="did:test:actual-recipient",
+        )
+
+        errors = []
+        for task_id in ("known-terminal", "unknown"):
+            with pytest.raises(TaskCancellationAuthorizationError) as caught:
+                await manager.cancel_task(
+                    task_id,
+                    agent_name="did:test:creator",
+                    recipient_agent_id="did:test:wrong-recipient",
+                )
+            errors.append(str(caught.value).replace(task_id, "<task>"))
+
+        assert errors[0] == errors[1]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_same_actor_cancel_retry_returns_existing_receipt_once(tmp_path):
     manager = await create_task_manager(str(tmp_path / "idempotent-cancel.db"))
     try:

@@ -409,20 +409,13 @@ def test_process_resolver_verifies_signed_http_result_read(
 
     sender_did = "did:web:example.com:process-sender"
     sender_keypair = generate_hybrid_keypair()
-    sender_root = tmp_path / "process-sender"
-    sender_root.mkdir()
-    (sender_root / "sender_did.json").write_text(
-        json.dumps(
-            {
-                "id": sender_did,
-                "verificationMethod": build_verification_methods(
-                    sender_did,
-                    sender_keypair.public_keys(),
-                ),
-            }
+    sender_document = {
+        "id": sender_did,
+        "verificationMethod": build_verification_methods(
+            sender_did,
+            sender_keypair.public_keys(),
         ),
-        encoding="utf-8",
-    )
+    }
     task = SimpleNamespace(
         id="process-read",
         status=SimpleNamespace(state=TaskState.COMPLETED, message=None),
@@ -432,7 +425,7 @@ def test_process_resolver_verifies_signed_http_result_read(
     manager = SimpleNamespace(
         get_task_for_creator=AsyncMock(return_value=task),
     )
-    resolver = ProcessA2ADidResolver((sender_root,))
+    resolver = ProcessA2ADidResolver((sender_document,))
     agent = SimpleNamespace(
         agent_id=RECIPIENT_A,
         did=RECIPIENT_A,
