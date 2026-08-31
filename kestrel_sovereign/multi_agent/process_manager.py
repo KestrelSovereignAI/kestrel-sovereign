@@ -917,12 +917,20 @@ class ProcessManager:
             raise RuntimeError(
                 "Could not build the subprocess A2A identity registry"
             ) from exc
-        identity_roots = {identity_export_dir or resolved_dir}
-        identity_roots.update(
-            peer_config.resolve_identity_export_dir(self.project_dir)
-            or peer_config.resolve_data_dir(self.project_dir)
-            for peer_config in roster.get_local_agents().values()
-        )
+        # Runtime signing documents (``*_did.json`` and ``successions/``) live
+        # in each agent's data directory.  An identity-export override is an
+        # additional public-export destination, not a replacement custody
+        # root, so preserve both when present.
+        identity_roots = {resolved_dir}
+        if identity_export_dir is not None:
+            identity_roots.add(identity_export_dir)
+        for peer_config in roster.get_local_agents().values():
+            identity_roots.add(peer_config.resolve_data_dir(self.project_dir))
+            peer_export_dir = peer_config.resolve_identity_export_dir(
+                self.project_dir
+            )
+            if peer_export_dir is not None:
+                identity_roots.add(peer_export_dir)
         env[A2A_PEER_IDENTITY_ROOTS_ENV] = json.dumps(
             sorted(str(root) for root in identity_roots)
         )

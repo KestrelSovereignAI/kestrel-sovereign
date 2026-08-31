@@ -575,12 +575,12 @@ class TestStartAgent:
             (project_dir / "agent_data" / "claw" / "continuity").resolve()
         )
 
-    def test_start_agent_registers_effective_identity_export_roots(
+    def test_start_agent_registers_data_and_identity_export_roots(
         self,
         pm,
         project_dir,
     ):
-        """Peer verification follows every configured DID export override."""
+        """Peer verification keeps live DID roots alongside export overrides."""
 
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"),
@@ -603,6 +603,7 @@ class TestStartAgent:
 
         env = mock_popen.call_args.kwargs["env"]
         assert set(json.loads(env[A2A_PEER_IDENTITY_ROOTS_ENV])) == {
+            str((project_dir / "agent_data" / "claw").resolve()),
             str(
                 (
                     project_dir
@@ -611,6 +612,7 @@ class TestStartAgent:
                     / "continuity"
                 ).resolve()
             ),
+            str((project_dir / "agent_data" / "testbot").resolve()),
             str(
                 (
                     project_dir
