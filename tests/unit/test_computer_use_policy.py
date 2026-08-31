@@ -550,6 +550,13 @@ _BASH_5_RESERVED_WORDS = set(
     "! [[ ]] { } case coproc do done elif else esac fi for function if "
     "in select then time until while".split()
 )
+# Measured inside alpine:3.19 — the image DockerExecutor uses for a
+# script it calls "bash" and then runs with `sh`, where /bin/sh is
+# BusyBox. `chdir` is the one builtin ash has that bash does not, and it
+# ran successfully under the default backend while the local backend
+# reported command not found (codex round 9).
+_BUSYBOX_ASH_BUILTINS = {"chdir"}
+
 _BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS = set(
     ". : alias bg bind break builtin caller cd command compgen compopt "
     "complete continue declare dirs disown enable eval exec exit export "
@@ -560,14 +567,21 @@ _BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS = set(
 
 
 @pytest.mark.parametrize(
-    "word", sorted(_BASH_5_RESERVED_WORDS | _BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS)
+    "word",
+    sorted(
+        _BASH_5_RESERVED_WORDS
+        | _BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS
+        | _BUSYBOX_ASH_BUILTINS
+    ),
 )
-def test_the_guard_knows_every_word_bash_5_treats_as_grammar(word):
-    """Version-proof: a stored snapshot, not the local shell's answer.
+def test_the_guard_knows_every_word_either_shell_treats_as_grammar(word):
+    """Version-proof AND shell-proof: stored snapshots, not this box.
 
     The live check below still runs and catches anything a newer bash
-    adds. This one catches the opposite skew — a developer shell OLDER
-    than the runner's, which is how `coproc` reached review.
+    adds. This one catches the two skews it cannot: a developer shell
+    OLDER than the runner's (how `coproc` reached review), and a
+    DIFFERENT shell than the one being asked — the default backend runs
+    BusyBox ash inside alpine, not the bash this test can call.
     """
     assert command_word_is_shell_grammar(word) is not None, word
 

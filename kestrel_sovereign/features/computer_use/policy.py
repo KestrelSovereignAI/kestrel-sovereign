@@ -285,6 +285,20 @@ _BUILTINS_THAT_ARE_ALSO_PROGRAMS = frozenset(
 # the Linux CI runner. The live check still runs, and catches anything a
 # newer bash adds; this snapshot is what makes the check version-proof
 # where the developer's shell is older than the runner's.
+#
+# It is a union of the shells the shipped backends can reach, because
+# "which shell" is not a constant here: DockerExecutor writes a script
+# it calls bash and runs it with `sh` inside `alpine:3.19`, where
+# /bin/sh is BusyBox. Measured in that image rather than read from
+# documentation — BusyBox ash has `chdir`, which bash does not, and
+# `shell("chdir /tmp")` therefore succeeded under the default backend
+# while failing "command not found" under the local one (codex round 9).
+#
+# The limit, stated rather than implied: this covers bash and BusyBox
+# ash. `DEFAULT_IMAGES` is configurable, so an operator who points the
+# backend at an image with a different shell gets grammar this does not
+# know. That is not fixable by a longer list — it is #3187, where a
+# backend named `exec(argv)` stops running a shell at all.
 _SHELL_RESERVED_WORDS = frozenset(
     "if then else elif fi case esac for select while until do done in "
     "function time coproc { } ! [[ ]]".split()
@@ -295,7 +309,10 @@ _SHELL_BUILTINS = frozenset(
     "export false fc fg getopts hash help history jobs kill let local "
     "logout mapfile popd printf pushd pwd read readarray readonly return "
     "set shift shopt source suspend test times trap true type typeset "
-    "ulimit umask unalias unset wait".split()
+    "ulimit umask unalias unset wait "
+    # BusyBox ash, measured in alpine:3.19 — `chdir` is the only one it
+    # has that bash does not.
+    "chdir".split()
 )
 
 # An assignment needs a valid shell NAME before the ``=``. bash reports
