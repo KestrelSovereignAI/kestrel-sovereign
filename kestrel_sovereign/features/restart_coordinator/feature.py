@@ -186,7 +186,7 @@ def _tail(raw: Any) -> str:
 
 
 # Background-task name prefixes for *infrastructure* work that must never
-# hold off an idle restart (#1626). Three shapes all wedged
+# hold off an idle restart (#1626). Six shapes all wedged
 # ``idle_agents_only`` forever by being counted as "busy":
 #   - ``durable_signal_log`` — fire-and-forget log writes that complete in
 #     well under a second but are minted continuously by heartbeats/scheduler

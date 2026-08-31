@@ -172,9 +172,12 @@ can occupy at most one worker or queued slot. The pool
 remains a bounded advisory resource: enough distinct tenants with wedged
 observers can saturate it, at which point other tenants degrade to retrying
 telemetry rather than losing lifecycle progress or growing an unbounded queue.
-A forced lifecycle snapshot rejected by a saturated pool or failed during
-snapshot construction is retried with bounded exponential backoff until delivery or terminal
-lifecycle cancellation.
+A forced lifecycle snapshot rejected by Core's saturated observer pool is
+retried with capped exponential backoff until delivery or terminal lifecycle
+cancellation, because an idle or cleanup transition may have no later trigger.
+Failures in host callback code or snapshot construction use a bounded retry
+streak and then return to ordinary rate-limited delivery, preventing a broken
+observer from creating a permanent process-sampling and warning loop.
 Hot-path
 emissions are rate-limited and scheduled through the agent background-task
 registry after traffic admission is released, and an asynchronous observer is

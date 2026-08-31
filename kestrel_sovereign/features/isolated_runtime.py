@@ -6986,7 +6986,9 @@ class ProxyFeature(Feature):
                 self.name,
             )
 
-    def _schedule_forced_runtime_telemetry_retry(self) -> None:
+    def _schedule_forced_runtime_telemetry_retry(
+        self, *, infrastructure_unavailable: bool = False
+    ) -> None:
         """Retry one durable transition snapshot with bounded backoff."""
 
         if (
@@ -6995,7 +6997,10 @@ class ProxyFeature(Feature):
             or self._stopping
         ):
             return
-        if self._telemetry_retry_attempt >= _TELEMETRY_FORCED_RETRY_LIMIT:
+        if (
+            not infrastructure_unavailable
+            and self._telemetry_retry_attempt >= _TELEMETRY_FORCED_RETRY_LIMIT
+        ):
             # Preserve advisory delivery without allowing a permanently
             # broken host callback to create a five-second process-table scan
             # and warning loop for the lifetime of every feature. One final
@@ -7149,10 +7154,12 @@ class ProxyFeature(Feature):
                         self._schedule_runtime_telemetry(force=False)
                     return
                 failed = False
+                infrastructure_unavailable = False
                 try:
                     completed.result()
                 except _TelemetryObserverSubmissionError:
                     failed = True
+                    infrastructure_unavailable = True
                     if not self._telemetry_observer_warning_emitted:
                         self._telemetry_observer_warning_emitted = True
                         logger.warning(
@@ -7175,7 +7182,9 @@ class ProxyFeature(Feature):
                 if failed and (not rate_limited or force_pending):
                     self._telemetry_emit_pending |= pending
                     self._telemetry_emit_force_pending = True
-                    self._schedule_forced_runtime_telemetry_retry()
+                    self._schedule_forced_runtime_telemetry_retry(
+                        infrastructure_unavailable=infrastructure_unavailable
+                    )
                     return
                 if not failed:
                     self._telemetry_retry_attempt = 0
@@ -7272,6 +7281,7 @@ class ProxyFeature(Feature):
                     async with self._telemetry_disk_lock:
                         if reclaim_generation == self._workspace_reclaim_generation:
                             self._environment_bytes = None
+                            self._environment_linked_file_identities = None
                             self._private_writable_bytes = None
                             self._downloaded_bytes = None
                             self._disk_telemetry_status = "unavailable"

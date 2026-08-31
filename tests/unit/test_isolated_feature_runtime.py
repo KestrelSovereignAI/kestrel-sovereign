@@ -1480,7 +1480,7 @@ async def test_slow_observer_coalesces_idle_cleanup_snapshot(monkeypatch, tmp_pa
 
 @pytest.mark.asyncio
 async def test_saturated_observer_executor_retries_forced_idle_snapshot(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
     executor = isolated_runtime._BoundedDaemonExecutor(
         max_workers=1,
@@ -1499,6 +1499,7 @@ async def test_saturated_observer_executor_retries_forced_idle_snapshot(
     monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_EXECUTOR", executor)
     monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_BASE_SECONDS", 0.01)
     monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_MAX_SECONDS", 0.02)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_FORCED_RETRY_LIMIT", 1)
 
     snapshots = []
     agent = Mock(did=_TEST_AGENT_DID, features={})
@@ -1512,11 +1513,24 @@ async def test_saturated_observer_executor_retries_forced_idle_snapshot(
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
     await feature.initialize()
-    for _ in range(100):
-        if feature._telemetry_retry_task is not None:
+    for _ in range(200):
+        if (
+            feature._telemetry_retry_attempt
+            > isolated_runtime._TELEMETRY_FORCED_RETRY_LIMIT
+            and feature._telemetry_retry_task is not None
+        ):
             break
         await asyncio.sleep(0.01)
     assert feature._telemetry_retry_task is not None
+    assert (
+        feature._telemetry_retry_attempt
+        > isolated_runtime._TELEMETRY_FORCED_RETRY_LIMIT
+    )
+    assert caplog.messages.count(
+        "Hosted isolated runtime telemetry observer capacity was unavailable "
+        "for TestFeature"
+    ) == 1
+    assert not any("telemetry observer failed" in line for line in caplog.messages)
 
     feature._last_used_monotonic -= 7200
     assert await feature._retire_idle_generation(
@@ -2894,7 +2908,11 @@ async def test_workspace_byte_telemetry_deduplicates_cross_category_hardlinks(
     snapshot = feature.runtime_telemetry_snapshot()
     assert snapshot.environment_bytes == len(b"shared")
     assert snapshot.downloaded_bytes == 0
-    assert feature._venv_path not in measured_paths
+    assert ".venv" not in measured_paths
+
+    measured_paths.clear()
+    await feature._refresh_disk_telemetry(refresh_environment=True)
+    assert ".venv" in measured_paths
 
 
 @pytest.mark.asyncio
@@ -3739,6 +3757,7 @@ async def test_disk_refresh_failure_still_emits_forced_idle_snapshot(
     async def fail_refresh(**_kwargs):
         raise RuntimeError("private disk failure")
 
+    feature._environment_linked_file_identities = frozenset({(123, 456)})
     monkeypatch.setattr(feature, "_refresh_disk_telemetry", fail_refresh)
     feature._last_used_monotonic -= 7200
     with caplog.at_level("WARNING"):
@@ -3756,6 +3775,7 @@ async def test_disk_refresh_failure_still_emits_forced_idle_snapshot(
     assert snapshots[-1].environment_bytes is None
     assert snapshots[-1].private_writable_bytes is None
     assert snapshots[-1].downloaded_bytes is None
+    assert feature._environment_linked_file_identities is None
     assert any("disk telemetry refresh failed" in line for line in caplog.messages)
     await feature.shutdown()
 
