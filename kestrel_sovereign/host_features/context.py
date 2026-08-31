@@ -355,8 +355,20 @@ async def build_host_context(
                     "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an "
                     "independent rollback domain"
                 )
-            hold_db = await AsyncDatabase.postgres(dsn)
-            hold_evidence_db = await AsyncDatabase.postgres(evidence_dsn)
+            # Hold operations are serialized by their independent evidence
+            # protocol, so wider pools add connection demand without adding
+            # useful concurrency. Keep both pools load-bearingly small: the
+            # ordinary runtime already reserves its own PostgreSQL budget.
+            hold_db = await AsyncDatabase.postgres(
+                dsn,
+                min_pool_size=1,
+                max_pool_size=1,
+            )
+            hold_evidence_db = await AsyncDatabase.postgres(
+                evidence_dsn,
+                min_pool_size=1,
+                max_pool_size=1,
+            )
             hold_location = "configured PostgreSQL database"
             initialization_witness_path = None
             history_anchor_path = None

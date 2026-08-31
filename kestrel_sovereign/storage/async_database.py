@@ -1024,10 +1024,21 @@ class AsyncDatabase:
         return db
     
     @classmethod
-    async def postgres(cls, dsn: str) -> "AsyncDatabase":
-        """Create PostgreSQL database with given DSN."""
+    async def postgres(
+        cls,
+        dsn: str,
+        *,
+        min_pool_size: int = 2,
+        max_pool_size: int = 10,
+    ) -> "AsyncDatabase":
+        """Create a PostgreSQL database with an explicitly bounded pool."""
         from .db.postgres import PostgresBackend
-        backend = PostgresBackend(dsn=dsn)
+
+        backend = PostgresBackend(
+            dsn=dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+        )
         await backend.connect()
         db = cls(backend)
         try:
