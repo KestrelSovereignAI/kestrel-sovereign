@@ -9,12 +9,13 @@ Talon, compute, or training concepts.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar, cast
 
 
 _T = TypeVar("_T")
+_ITERATOR_TERMINAL = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,136 @@ class OwnedTaskOutcome(Generic[_T]):
     result: _T | None
     error: BaseException | None
     cancellation: asyncio.CancelledError | None
+
+
+class OwnedAsyncIterator(Generic[_T]):
+    """Keep every interaction with an async iterator in one owner task.
+
+    Async generators may bind ``ContextVar`` tokens while producing their first
+    item. Resuming or closing such a generator from another task operates in a
+    copied context and makes token reset fail. This adapter owns construction,
+    iteration, and closure in one task while its consumer receives items over a
+    one-item handshake. ``aclose`` remains cancellation-safe by joining that
+    owner with :func:`await_owned_task`.
+    """
+
+    def __init__(
+        self,
+        iterator_factory: Callable[[], AsyncIterator[_T]],
+        *,
+        operation: str,
+    ) -> None:
+        self._iterator_factory = iterator_factory
+        self._operation = operation
+        self._items: asyncio.Queue[tuple[object, _T | None]] = asyncio.Queue()
+        self._continue = asyncio.Event()
+        self._stop = asyncio.Event()
+        self._item_outstanding = False
+        self._closed = False
+        self._cleanup_error: BaseException | None = None
+        self._owner = asyncio.create_task(
+            self._run(),
+            name=f"owned_async_iterator:{operation}",
+        )
+
+    def __aiter__(self) -> "OwnedAsyncIterator[_T]":
+        return self
+
+    @property
+    def terminal_error(self) -> BaseException | None:
+        """Return the source owner's terminal error once it has settled."""
+
+        if not self._owner.done():
+            return None
+        try:
+            return self._owner.exception()
+        except asyncio.CancelledError as error:
+            return error
+
+    @property
+    def cleanup_error(self) -> BaseException | None:
+        """Return an error raised while cancellation/closure unwound the source."""
+
+        return self._cleanup_error
+
+    async def __anext__(self) -> _T:
+        if self._closed:
+            raise StopAsyncIteration
+        if self._item_outstanding:
+            self._item_outstanding = False
+            self._continue.set()
+
+        marker, item = await self._items.get()
+        if marker is _ITERATOR_TERMINAL:
+            self._closed = True
+            outcome = await await_owned_task(self._owner)
+            raise_owned_outcome(outcome, operation=self._operation)
+            raise StopAsyncIteration
+
+        self._item_outstanding = True
+        return cast(_T, item)
+
+    async def _run(self) -> None:
+        iterator: AsyncIterator[_T] | None = None
+        try:
+            iterator = self._iterator_factory()
+            try:
+                async for item in iterator:
+                    if self._stop.is_set():
+                        break
+                    await self._items.put((self, item))
+                    await self._continue.wait()
+                    self._continue.clear()
+                    if self._stop.is_set():
+                        break
+            except BaseException as error:
+                # An exception raised while a requested close interrupts
+                # ``anext`` belongs to generator unwinding, not ordinary
+                # source execution. Preserve that distinction for lifecycle
+                # acknowledgement at the transport boundary.
+                cleanup_requested = self._stop.is_set()
+                if cleanup_requested and not isinstance(
+                    error,
+                    asyncio.CancelledError,
+                ):
+                    self._cleanup_error = error
+                raise
+        finally:
+            try:
+                if iterator is not None:
+                    close_iterator = getattr(iterator, "aclose", None)
+                    if callable(close_iterator):
+                        try:
+                            await close_iterator()
+                        except BaseException as error:
+                            self._cleanup_error = error
+                            raise
+            finally:
+                self._items.put_nowait((_ITERATOR_TERMINAL, None))
+
+    async def aclose(self) -> None:
+        """Stop producing and join the source iterator's owner task."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        self._continue.set()
+        owner_cancelled_by_close = False
+        if not self._owner.done():
+            owner_cancelled_by_close = self._owner.cancel()
+        outcome = await await_owned_task(self._owner)
+        if (
+            owner_cancelled_by_close
+            and isinstance(outcome.error, asyncio.CancelledError)
+            and self._cleanup_error is None
+        ):
+            # Cancellation is the private interrupt used to wake a producer
+            # blocked in ``anext``. Once the owner's finally block has closed
+            # the iterator, it is a successful close, while cancellation of
+            # the caller itself still takes precedence below.
+            outcome = OwnedTaskOutcome(None, None, outcome.cancellation)
+        raise_owned_outcome(outcome, operation=self._operation)
 
 
 async def await_owned_task(
@@ -105,6 +236,7 @@ async def run_blocking_operation(
 
 
 __all__ = [
+    "OwnedAsyncIterator",
     "OwnedTaskOutcome",
     "await_owned_task",
     "raise_owned_outcome",

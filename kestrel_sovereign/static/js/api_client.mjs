@@ -1172,19 +1172,58 @@ export function createApiClient({
         // pane. invokeForAgent pins the URL to the captured dispatch
         // agent so the request always reaches the agent the chat was
         // sent to.
-        invokeForAgent: async (input, model = null, sessionId = null, provider = null, agent) => {
+        invokeForAgent: async (
+            input,
+            model = null,
+            sessionId = null,
+            provider = null,
+            agent,
+            requestId = null,
+        ) => {
+            const clientRequestId = requestId === null ? null : String(requestId);
+            const clientRequestIdLength = clientRequestId === null
+                ? 0
+                : Array.from(clientRequestId).length;
+            if (clientRequestId !== null && (
+                clientRequestIdLength < 1 || clientRequestIdLength > 256
+            )) {
+                throw new Error('invoke request id must be 1-256 characters');
+            }
             const opts = {
                 method: 'POST',
-                body: JSON.stringify({ input, model, session_id: sessionId, provider }),
+                body: JSON.stringify({
+                    input,
+                    model,
+                    session_id: sessionId,
+                    provider,
+                    ...(clientRequestId !== null
+                        ? { request_id: clientRequestId }
+                        : {}),
+                }),
             };
             const dispatchAgent = agent === undefined ? state.selectedHostAgent : agent;
-            const result = agent !== undefined
-                ? await client.requestForAgent('/api/agent/invoke', opts, agent)
-                : await client.request('/api/agent/invoke', opts);
-            if (result && typeof result === 'object' && result.session_id) {
-                state.effectiveSessionIds.set(dispatchAgent, result.session_id);
+            // Publish the exact turn before the first await so Stop cannot
+            // widen a pending non-streaming invoke to agent scope.
+            if (clientRequestId !== null) {
+                state.currentStreamRequestIds.set(dispatchAgent, clientRequestId);
             }
-            return result;
+            try {
+                const result = agent !== undefined
+                    ? await client.requestForAgent('/api/agent/invoke', opts, agent)
+                    : await client.request('/api/agent/invoke', opts);
+                if (result && typeof result === 'object' && result.session_id) {
+                    state.effectiveSessionIds.set(dispatchAgent, result.session_id);
+                }
+                return result;
+            } finally {
+                if (
+                    clientRequestId !== null
+                    && state.currentStreamRequestIds.get(dispatchAgent)
+                        === clientRequestId
+                ) {
+                    state.currentStreamRequestIds.delete(dispatchAgent);
+                }
+            }
         },
         // Two-arg overload: pass `agent` to target a specific agent's
         // /stop endpoint regardless of which agent is currently
@@ -1230,7 +1269,7 @@ export function createApiClient({
             const key = agent === undefined ? state.selectedHostAgent : agent;
             return state.effectiveSessionIds.get(key) || null;
         },
-        async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false, agent, attachments = null) {
+        async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false, agent, attachments = null, requestId = null) {
             // Pin the dispatch agent. The sixth `agent` parameter lets a
             // caller (sendMessage) capture state.selectedHostAgent at
             // its own dispatch boundary and pass it through, so the user
@@ -1241,17 +1280,50 @@ export function createApiClient({
             // after an auth refresh could route Agent A's retry to Agent B.
             const dispatchAgent = agent === undefined ? state.selectedHostAgent : agent;
 
+            const clientRequestId = requestId === null ? null : String(requestId);
+            const clientRequestIdLength = clientRequestId === null
+                ? 0
+                : Array.from(clientRequestId).length;
+            if (clientRequestId !== null && (
+                clientRequestIdLength < 1 || clientRequestIdLength > 256
+            )) {
+                throw new Error('stream request id must be 1-256 characters');
+            }
+            // Invocation IDs are logical Unicode values, while HTTP headers
+            // carry the server's one-pass RFC 3986 wire representation. Keep
+            // those identities separate so opaque IDs survive auth retries
+            // and response-header comparison without double encoding.
+            const wireRequestId = clientRequestId === null
+                ? null
+                : encodeURIComponent(clientRequestId).replace(
+                    /[!'()*]/g,
+                    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+                );
+
+            // Chat allocates its cancellation address before opening the fetch.
+            // Publish that address before the first await so an immediate Stop
+            // cannot widen into an agent-scoped request while auth or response
+            // headers are still pending.
+            let activeRequestId = clientRequestId;
+            if (activeRequestId !== null) {
+                state.currentStreamRequestIds.set(dispatchAgent, activeRequestId);
+            }
+
             // Build auth headers BEFORE installing the abort controller in
             // the per-agent map. If buildHeaders() throws (auth provider
             // failure, bearer-token unavailable, etc.) we must not leave a
             // stale controller behind for the next Stop click to fire on.
-            let headers = await buildHeaders({ 'Content-Type': 'application/json' });
-
             const controller = new AbortCtor();
             const signal = controller.signal;
             state.streamAbortControllers.set(dispatchAgent, controller);
 
             try {
+                let headers = await buildHeaders({
+                    'Content-Type': 'application/json',
+                    ...(wireRequestId !== null
+                        ? { 'X-Request-ID': wireRequestId }
+                        : {}),
+                });
                 const url = applyHostAgentPrefix('/api/agent/stream', dispatchAgent);
                 const body = JSON.stringify({
                     input, model, session_id: sessionId, provider,
@@ -1297,7 +1369,12 @@ export function createApiClient({
                             // not allow a recursive retry to resurrect it.
                             alreadyRetried = true;
                             try {
-                                headers = await buildHeaders({ 'Content-Type': 'application/json' });
+                                headers = await buildHeaders({
+                                    'Content-Type': 'application/json',
+                                    ...(wireRequestId !== null
+                                        ? { 'X-Request-ID': wireRequestId }
+                                        : {}),
+                                });
                                 // applyAuth may complete after Stop aborted the
                                 // request with an arbitrary reason. Do not
                                 // start the refreshed fetch in that state.
@@ -1317,7 +1394,21 @@ export function createApiClient({
                     if (!response.ok) {
                         throw await parseResponseError(response, { signal });
                     }
-                    state.currentStreamRequestIds.set(dispatchAgent, response.headers.get('X-Request-ID'));
+                    const responseRequestId = response.headers.get('X-Request-ID');
+                    if (
+                        clientRequestId !== null
+                        && responseRequestId !== null
+                        && responseRequestId !== wireRequestId
+                    ) {
+                        throw new Error('server changed the client-issued stream request id');
+                    }
+                    activeRequestId = clientRequestId || responseRequestId;
+                    if (activeRequestId !== null) {
+                        state.currentStreamRequestIds.set(
+                            dispatchAgent,
+                            activeRequestId,
+                        );
+                    }
                     // Capture the server-resolved session_id BEFORE the body
                     // streams. sendMessage reads it via getEffectiveSessionId
                     // immediately so pane.sessionId can be set on the very
@@ -1357,7 +1448,13 @@ export function createApiClient({
                 if (state.streamAbortControllers.get(dispatchAgent) === controller) {
                     state.streamAbortControllers.delete(dispatchAgent);
                 }
-                state.currentStreamRequestIds.delete(dispatchAgent);
+                if (
+                    activeRequestId !== null
+                    && state.currentStreamRequestIds.get(dispatchAgent)
+                        === activeRequestId
+                ) {
+                    state.currentStreamRequestIds.delete(dispatchAgent);
+                }
             }
         },
         getApiKey() {
