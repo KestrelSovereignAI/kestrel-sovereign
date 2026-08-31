@@ -51,6 +51,7 @@ def _prepare_app():
         "lifespan": app.router.lifespan_context,
         "agent": getattr(app.state, "agent", None),
         "manager": getattr(app.state, "agent_manager", None),
+        "config": getattr(app.state, "multi_agent_config", None),
     }
     app.router.lifespan_context = noop_lifespan
     return app, original
@@ -60,6 +61,7 @@ def _restore_app(app, original):
     app.router.lifespan_context = original["lifespan"]
     app.state.agent = original["agent"]
     app.state.agent_manager = original["manager"]
+    app.state.multi_agent_config = original["config"]
 
 
 def test_root_html_is_public_when_oauth_not_required():
@@ -133,6 +135,33 @@ def test_managed_peer_process_cannot_bootstrap_or_use_sovereign_key():
                 assert protected.json()["error"]["code"] == (
                     "authentication_required"
                 )
+    finally:
+        _restore_app(app, original)
+
+
+@pytest.mark.parametrize("host_state", ["manager", "config"])
+def test_multi_agent_host_never_bootstraps_sovereign_key_to_local_peer(host_state):
+    """Loopback cannot distinguish a browser from a managed peer process."""
+
+    app, original = _prepare_app()
+    try:
+        app.state.agent = None
+        app.state.agent_manager = (
+            _SessionAgentManager(_make_agent()) if host_state == "manager" else None
+        )
+        app.state.multi_agent_config = object() if host_state == "config" else None
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_API_KEY": "host-sovereign-key",
+                "KESTREL_REQUIRE_OAUTH": "false",
+            },
+        ):
+            with TestClient(app, client=("127.0.0.1", 55000)) as client:
+                response = client.get("/api/auth/key")
+
+        assert response.status_code == 404
+        assert "host-sovereign-key" not in response.text
     finally:
         _restore_app(app, original)
 

@@ -3550,7 +3550,15 @@ if SERVE_UI:
 @limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost / Docker gateway only)."""
-    if not _bootstrap_key_enabled():
+    # A same-host managed peer is indistinguishable from a browser by source
+    # address: both reach this endpoint over loopback. Once this process owns a
+    # fleet, localhost therefore is not an authority boundary and the host key
+    # must be provisioned out of band instead of returned by a public route.
+    multi_agent_host = (
+        getattr(request.app.state, "agent_manager", None) is not None
+        or getattr(request.app.state, "multi_agent_config", None) is not None
+    )
+    if not _bootstrap_key_enabled() or multi_agent_host:
         raise HTTPException(status_code=404, detail="API key bootstrap endpoint is disabled")
 
     # Narrowed from the whole 172.16.0.0/12 bridge range to loopback + the
