@@ -965,6 +965,45 @@ def test_live_endpoint_waits_for_remote_owner_before_reporting_stopped():
     remote.wait_for_stop.assert_awaited_once()
 
 
+def test_public_turn_distributed_stop_preserves_captured_generation():
+    """A public turn snapshot must not widen into every reused request ID."""
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    remote = MagicMock()
+    remote.request_turn = AsyncMock(
+        return_value=DistributedStopTicket(("remote-generation",))
+    )
+    remote.wait_for_stop = AsyncMock(return_value=StopDisposition.STOPPED)
+    app.state.distributed_invocation_registry = remote
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = {"private-request"}
+    agent.active_turn_request_bindings = MagicMock(
+        return_value={"public-turn": ("private-request", 7)}
+    )
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "public-turn"},
+    )
+
+    assert response.status_code == 200, response.text
+    remote.request_turn.assert_awaited_once_with(
+        "did:test:agent",
+        "private-request",
+        request_generation=7,
+    )
+
+
 @pytest.mark.parametrize(
     "correlation_id", ["", "   ", 7, "\ud800", "x" * 257]
 )

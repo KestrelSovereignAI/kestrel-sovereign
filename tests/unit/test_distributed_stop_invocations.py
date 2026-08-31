@@ -1,6 +1,7 @@
 """Cross-replica live-work authority for cooperative Stop (#3152)."""
 
 import asyncio
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -41,6 +42,7 @@ async def test_distributed_protocol_has_sqlite_postgres_parity(db_backend):
         agent_id=agent_id,
         turn_id=turn_id,
         owner_id=owner_id,
+        request_generation=1,
     )
     ticket = await store.mark_turn(agent_id, turn_id)
     assert ticket.generation_ids == (generation_id,)
@@ -53,6 +55,7 @@ async def test_distributed_protocol_has_sqlite_postgres_parity(db_backend):
             agent_id=agent_id,
             turn_id=turn_id,
             owner_id=owner_id,
+            request_generation=2,
         )
         is False
     )
@@ -73,6 +76,7 @@ async def test_owner_lease_expiry_has_sqlite_postgres_parity(db_backend):
         agent_id=f"did:test:agent-{suffix}",
         turn_id=f"turn-{suffix}",
         owner_id=owner_id,
+        request_generation=1,
     )
     stale = "2000-01-01T00:00:00.000+00:00"
     await store._db.execute(
@@ -246,6 +250,7 @@ async def test_expired_crashed_owner_stays_unreachable_until_owner_cleanup(tmp_p
             agent_id="did:test:crashed-agent",
             turn_id="crashed-turn",
             owner_id="crashed-owner",
+            request_generation=1,
         )
         await first_db.execute(
             "UPDATE stop_active_invocations SET heartbeat_at = ? "
@@ -300,6 +305,7 @@ async def test_expired_owner_cannot_revive_its_heartbeat(tmp_path):
             agent_id="did:test:expired-agent",
             turn_id="expired-turn",
             owner_id="expired-owner",
+            request_generation=1,
         )
         stale = "2000-01-01T00:00:00.000+00:00"
         await db.execute(
@@ -439,6 +445,187 @@ async def test_transient_completion_failure_is_retried_until_row_is_removed(
         await replica_b.close()
         await first_db.close()
         await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_after_insert_retries_provisional_generation_cleanup(
+    tmp_path,
+):
+    """A published row remains locally owned until durable deletion succeeds."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "provisional-cleanup.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(store, poll_seconds=0.01)
+    agent = _ReplicaAgent("did:test:provisional-cleanup")
+    original_register = store.register
+    original_complete = store.complete
+    attempts = 0
+
+    async def lose_lease_after_insert(**kwargs):
+        admitted = await original_register(**kwargs)
+        registry._lease_lost = True
+        return admitted
+
+    async def flaky_complete(generation_id, owner_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient database outage")
+        await original_complete(generation_id, owner_id)
+
+    store.register = lose_lease_after_insert
+    store.complete = flaky_complete
+    try:
+        assert await registry.register(agent, "provisional-turn", 1) is False
+        for _ in range(100):
+            rows = await db.fetchall(
+                "SELECT generation_id FROM stop_active_invocations"
+            )
+            if not rows and not registry._active:
+                break
+            await asyncio.sleep(0.01)
+
+        assert attempts == 2
+        assert rows == []
+        assert registry._active == {}
+        assert registry._by_local_generation == {}
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_turn_receipt_does_not_fence_same_named_request_id(tmp_path):
+    """Public turn and private request addresses occupy separate namespaces."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "address-namespaces.db"))
+    try:
+        store = DistributedInvocationStore(db)
+        await store.ensure_schema()
+        request = StopRequest(
+            scope=StopScope.TURN,
+            actor_id="did:test:operator",
+            target="shared-address",
+            target_agent_id="did:test:shared-agent",
+            correlation_id="public-turn-stop",
+            target_is_turn_id=True,
+        )
+        await StopReceiptStore(db).persist(
+            request,
+            (
+                StopOutcome(
+                    scope=StopScope.TURN,
+                    requested_target=request.target,
+                    resolved_target="private-request",
+                    agent_id="did:test:shared-agent",
+                    disposition=StopDisposition.ALREADY_COMPLETE,
+                    correlation_id=request.correlation_id,
+                ),
+            ),
+        )
+
+        assert await store.register(
+            generation_id="direct-request-generation",
+            agent_id="did:test:shared-agent",
+            turn_id="shared-address",
+            owner_id="direct-request-owner",
+            request_generation=1,
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_generation_stop_does_not_cancel_or_fence_reused_request(
+    tmp_path,
+):
+    """A captured public-turn generation stays narrower than its request ID."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "exact-generation.db"))
+    try:
+        store = DistributedInvocationStore(db)
+        await store.ensure_schema()
+        common = {
+            "agent_id": "did:test:reused-request",
+            "turn_id": "reused-request",
+            "owner_id": "request-owner",
+        }
+        assert await store.register(
+            generation_id="generation-one",
+            request_generation=1,
+            **common,
+        )
+        assert await store.register(
+            generation_id="generation-two",
+            request_generation=2,
+            **common,
+        )
+
+        ticket = await store.mark_turn(
+            common["agent_id"],
+            common["turn_id"],
+            request_generation=1,
+        )
+        rows = await db.fetchall(
+            "SELECT generation_id, stop_requested "
+            "FROM stop_active_invocations ORDER BY generation_id"
+        )
+
+        assert ticket.generation_ids == ("generation-one",)
+        assert rows == [
+            ("generation-one", 1),
+            ("generation-two", 0),
+        ]
+        await store.complete("generation-one", common["owner_id"])
+        assert await store.register(
+            generation_id="generation-three",
+            request_generation=3,
+            **common,
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_distributed_relay_cancels_only_ticketed_local_generation(tmp_path):
+    """Relay delivery must retain the generation selected by mark_turn."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "relay-generation.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(store, poll_seconds=0.01)
+    agent = _ReplicaAgent("did:test:relay-generation")
+    agent.cancel_current_request = MagicMock(return_value=True)
+    try:
+        assert await registry.register(agent, "reused-request", 1)
+        assert await registry.register(agent, "reused-request", 2)
+        await store.mark_turn(
+            agent.agent_id,
+            "reused-request",
+            request_generation=1,
+        )
+        registry.start()
+        for _ in range(100):
+            if agent.cancel_current_request.called:
+                break
+            await asyncio.sleep(0.01)
+
+        agent.cancel_current_request.assert_called_once_with(
+            request_id="reused-request",
+            generation=1,
+        )
+    finally:
+        await registry.close()
+        await db.close()
 
 
 @pytest.mark.asyncio

@@ -1215,9 +1215,15 @@ async def stop_agent_request(request: Request):
             distributed_ticket = None
             if distributed_stop is not None:
                 if stop_request.scope is StopScope.TURN:
+                    distributed_kwargs = {}
+                    if stop_request.request_generation is not None:
+                        distributed_kwargs["request_generation"] = (
+                            stop_request.request_generation
+                        )
                     distributed_ticket = await distributed_stop.request_turn(
                         agent_id,
                         stop_request.target,
+                        **distributed_kwargs,
                     )
                 else:
                     distributed_ticket = await distributed_stop.request_agent(

@@ -105,6 +105,12 @@ def _optional_identifier_digest(kind: str, value: str | None) -> str | None:
     return None if value is None else _identifier_digest(kind, value)
 
 
+def _request_target_digest_kind(request: StopRequest) -> str:
+    """Keep public turn handles disjoint from private request addresses."""
+
+    return "public_turn_target" if request.target_is_turn_id else "target"
+
+
 def _stored_outcome_identity(
     value: str,
     request: StopRequest,
@@ -112,7 +118,7 @@ def _stored_outcome_identity(
     field: str,
 ) -> str:
     if request.target is not None and value == request.target:
-        return _identifier_digest("target", value)
+        return _identifier_digest(_request_target_digest_kind(request), value)
     if field == "resolved_target" and request.target_is_turn_id:
         # A public turn address resolves to the process-private request key
         # used to cancel the live operation. That key may be caller supplied;
@@ -123,7 +129,7 @@ def _stored_outcome_identity(
 
 def _public_outcome_identity(value: str, request: StopRequest) -> str:
     if request.target is not None and value == _identifier_digest(
-        "target", request.target
+        _request_target_digest_kind(request), request.target
     ):
         return request.target
     return value
@@ -365,11 +371,17 @@ class StopReceiptStore:
                         fingerprint,
                         request.scope.value,
                         request.actor_id,
-                        _optional_identifier_digest("target", request.target),
+                        _optional_identifier_digest(
+                            _request_target_digest_kind(request),
+                            request.target,
+                        ),
                         request.target_agent_id,
                         request.reason,
                         int(request.cascade),
-                        _optional_identifier_digest("target", request.turn_id),
+                        _optional_identifier_digest(
+                            _request_target_digest_kind(request),
+                            request.turn_id,
+                        ),
                         request.span_id,
                         request.trace_id,
                     ),
@@ -447,10 +459,10 @@ class StopReceiptStore:
             "operation", request.correlation_id
         )
         expected_requested_target = _optional_identifier_digest(
-            "target", request.target
+            _request_target_digest_kind(request), request.target
         )
         expected_turn_id = _optional_identifier_digest(
-            "target", request.turn_id
+            _request_target_digest_kind(request), request.turn_id
         )
         if stored_operation_id != expected_operation_id:
             raise StopReceiptCorruptError(
