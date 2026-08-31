@@ -485,6 +485,24 @@ def test_the_quoting_remedy_is_bounded_by_construction(bash_differential):
         (".", "builtin"),
         ("command", "builtin"),
         ("builtin", "builtin"),
+        # codex round 8: `trap 'dd ...' EXIT` runs its command later,
+        # and naming it one-by-one is what the inversion avoids —
+        # these fall out of "a builtin is not a program" rather than
+        # from a list of the ones that dispatch.
+        ("trap", "builtin"),
+        ("mapfile", "builtin"),
+        ("readarray", "builtin"),
+        ("enable", "builtin"),
+        ("complete", "builtin"),
+        ("coproc", "keyword"),
+        ("FOO+=x", "assignment"),
+        ("arr[0]+=v", "assignment"),
+        # Builtins that are also real binaries behave the same either
+        # way, so refusing them would cost without buying anything.
+        ("test", None),
+        ("[", None),
+        ("true", None),
+        ("kill", None),
         ("if", "keyword"),
         ("time", "keyword"),
         ("{", "keyword"),
@@ -522,24 +540,64 @@ def test_command_position_grammar_is_named(word, expected):
         assert result is not None and expected in result, (word, result)
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_the_reserved_word_list_is_bash_s_own():
-    """Asked of bash, not copied from memory.
+# Taken from bash 5.2, which is what the Linux CI runner has. Stored
+# rather than asked, because macOS ships bash 3.2: its `compgen -k`
+# omits `coproc` and its `compgen -b` omits mapfile/readarray/compopt,
+# so a differential that only asked the LOCAL shell passed on a
+# developer machine and would have failed on CI. Codex round 8 caught
+# exactly that.
+_BASH_5_RESERVED_WORDS = set(
+    "! [[ ]] { } case coproc do done elif else esac fi for function if "
+    "in select then time until while".split()
+)
+_BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS = set(
+    ". : alias bg bind break builtin caller cd command compgen compopt "
+    "complete continue declare dirs disown enable eval exec exit export "
+    "fc fg getopts hash help history jobs let local logout mapfile popd "
+    "pushd read readarray readonly return set shift shopt source suspend "
+    "times trap type typeset ulimit umask unalias unset wait".split()
+)
 
-    A hard-coded list of shell grammar is exactly the shape this ticket
-    spent five rounds learning to distrust. This one is finite and bash
-    will tell us what is in it, so the list is checked rather than
-    asserted — if a bash version adds a reserved word, this fails
-    instead of the guard silently missing it.
+
+@pytest.mark.parametrize(
+    "word", sorted(_BASH_5_RESERVED_WORDS | _BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS)
+)
+def test_the_guard_knows_every_word_bash_5_treats_as_grammar(word):
+    """Version-proof: a stored snapshot, not the local shell's answer.
+
+    The live check below still runs and catches anything a newer bash
+    adds. This one catches the opposite skew — a developer shell OLDER
+    than the runner's, which is how `coproc` reached review.
     """
-    reported = subprocess.run(
-        ["bash", "-c", "compgen -k"], capture_output=True, text=True
-    )
-    words = set(reported.stdout.split())
-    assert words, "bash reported no reserved words; the probe is broken"
-    missing = {w for w in words if command_word_is_shell_grammar(w) is None}
+    assert command_word_is_shell_grammar(word) is not None, word
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_guard_knows_what_the_local_bash_reports():
+    """And whatever this machine's bash adds on top.
+
+    A hard-coded list of shell grammar is the shape this ticket spent
+    six rounds learning to distrust, so it is checked from two
+    directions rather than trusted from none.
+    """
+    version = subprocess.run(
+        ["bash", "-c", "echo $BASH_VERSION"], capture_output=True, text=True
+    ).stdout.strip()
+    words = set()
+    for probe in ("compgen -k", "compgen -b"):
+        reported = subprocess.run(
+            ["bash", "-c", probe], capture_output=True, text=True
+        )
+        words |= set(reported.stdout.split())
+    assert words, "bash reported nothing; the probe is broken"
+
+    programs = {"echo", "printf", "test", "[", "true", "false", "pwd", "kill"}
+    missing = {
+        w for w in words - programs if command_word_is_shell_grammar(w) is None
+    }
     assert missing == set(), (
-        f"bash reserves these and the guard does not know them: {missing}"
+        f"bash {version} treats these as grammar and the guard does not "
+        f"know them: {missing}"
     )
 
 

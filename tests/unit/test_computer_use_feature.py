@@ -580,10 +580,17 @@ async def test_command_position_grammar_is_refused(workspace: Path):
     await feature.initialize()
 
     for command, fragment in (
-        ("eval 'printf HACKED'", "runs a command of its own"),
-        ("exec printf HACKED", "runs a command of its own"),
+        ("eval 'printf HACKED'", "a shell builtin, not a program"),
+        ("exec printf HACKED", "a shell builtin, not a program"),
+        # codex round 8: `trap` dispatches its command later. Naming
+        # the dispatching builtins one at a time is what round 7 did
+        # and round 8 answered; the rule is now "a builtin is not a
+        # program", so this falls out rather than being listed.
+        ("trap 'printf HACKED' EXIT", "a shell builtin, not a program"),
         ("FOO=x printf pwned", "sets a variable for another command"),
+        ("FOO+=x printf pwned", "sets a variable for another command"),
         ("if true", "introduces a compound command"),
+        ("coproc printf x", "introduces a compound command"),
     ):
         envelope = await feature.shell(command=command, timeout=5)
         assert envelope.status is not ToolResultStatus.OK, command
@@ -594,12 +601,13 @@ async def test_command_position_grammar_is_refused(workspace: Path):
         "grammar is refused before the operator is asked to approve it"
     )
 
-    # The positive control: an ordinary program with the same shape of
-    # arguments still runs, so the guard is not simply refusing
-    # everything.
-    ran = await feature.shell(command="printf ok", timeout=5)
-    assert ran.status is ToolResultStatus.OK, ran.error
-    assert ran.data["stdout"] == "ok"
+    # The positive control: ordinary programs still run, including the
+    # builtins that are ALSO real binaries — refusing those would cost
+    # without buying anything, since they behave the same either way.
+    for command, expected in (("printf ok", "ok"), ("echo hi", "hi\n")):
+        ran = await feature.shell(command=command, timeout=5)
+        assert ran.status is ToolResultStatus.OK, (command, ran.error)
+        assert ran.data["stdout"] == expected, command
 
 
 @pytest.mark.asyncio

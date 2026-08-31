@@ -260,28 +260,50 @@ _INERT_CHARACTERS = frozenset(
 # The character allow-list above is not enough on its own, because one
 # backend does not exec the argv it is handed: DockerSandboxBackend
 # rebuilds a bash script from it (``" ".join(shlex.quote(a))``) and runs
-# that. Quoting neutralises every metacharacter there — but a bare word
-# needs no quoting, so ``eval 'dd ...'``, ``FOO=x dd ...`` and
-# ``exec dd ...`` survive intact and run a second binary that
-# ``BinaryPolicy`` never saw, having vetted ``eval`` or ``FOO=x``.
+# that (#3187). Quoting neutralises every metacharacter there — but a
+# bare word needs no quoting, so ``eval 'dd ...'``, ``FOO=x dd ...`` and
+# ``trap 'dd ...' EXIT`` survive intact and run a binary
+# ``BinaryPolicy`` never saw, having vetted ``eval``, ``FOO=x`` or
+# ``trap``.
 #
-# Reserved words are bash's own list (``compgen -k``), pinned by a test
-# that asks bash rather than trusting this comment. The builtins are the
-# ones that execute something other than themselves; the rest —
-# ``echo``, ``printf``, ``test`` — are also real binaries and behave the
-# same either way, so refusing them would cost without buying anything.
+# Listing the builtins that dispatch a command is the enumeration this
+# ticket has been burned by six times: round 7 named `eval`, `exec`,
+# `source`, `.`, `command`, `builtin`, and round 8 answered with
+# `trap` — with `mapfile -C`, `enable -f` and `complete -C` behind it.
+# So the rule is inverted, like the character rule before it: a BUILTIN
+# IS NOT A PROGRAM. Every builtin is refused except the few that are
+# also real binaries behaving identically, which is a short list that
+# closes.
+_BUILTINS_THAT_ARE_ALSO_PROGRAMS = frozenset(
+    {"echo", "printf", "test", "[", "true", "false", "pwd", "kill"}
+)
+
+# Snapshot of bash 5.2, NOT of whatever bash is on this machine. macOS
+# ships bash 3.2, whose `compgen -k` omits `coproc` and whose
+# `compgen -b` omits `mapfile`/`readarray`/`compopt` — so a differential
+# that only asked the local shell passed here and would have failed on
+# the Linux CI runner. The live check still runs, and catches anything a
+# newer bash adds; this snapshot is what makes the check version-proof
+# where the developer's shell is older than the runner's.
 _SHELL_RESERVED_WORDS = frozenset(
     "if then else elif fi case esac for select while until do done in "
-    "function time { } ! [[ ]]".split()
+    "function time coproc { } ! [[ ]]".split()
 )
-_COMMAND_SUBSTITUTING_BUILTINS = frozenset(
-    {"eval", "exec", "source", ".", "command", "builtin"}
+_SHELL_BUILTINS = frozenset(
+    ". : [ alias bg bind break builtin caller cd command compgen compopt "
+    "complete continue declare dirs disown echo enable eval exec exit "
+    "export false fc fg getopts hash help history jobs kill let local "
+    "logout mapfile popd printf pushd pwd read readarray readonly return "
+    "set shift shopt source suspend test times trap true type typeset "
+    "ulimit umask unalias unset wait".split()
 )
+
 # An assignment needs a valid shell NAME before the ``=``. bash reports
 # "command not found" for ``--foo=bar`` and ``a-b=x``, so those are
 # ordinary command names and refusing them would be a false refusal —
-# the same class codex flagged in round 4.
-_ASSIGNMENT_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?=")
+# the class codex flagged in round 4. The append form ``FOO+=x`` is an
+# assignment too, and the allow-list lets ``+`` through (round 8).
+_ASSIGNMENT_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 
 
 @dataclass(frozen=True)
@@ -304,8 +326,8 @@ def command_word_is_shell_grammar(word: str) -> str | None:
         return "an assignment, which sets a variable for another command"
     if word in _SHELL_RESERVED_WORDS:
         return "a shell keyword, which introduces a compound command"
-    if word in _COMMAND_SUBSTITUTING_BUILTINS:
-        return "a shell builtin that runs a command of its own"
+    if word in _SHELL_BUILTINS and word not in _BUILTINS_THAT_ARE_ALSO_PROGRAMS:
+        return "a shell builtin, not a program this tool can run"
     return None
 
 
