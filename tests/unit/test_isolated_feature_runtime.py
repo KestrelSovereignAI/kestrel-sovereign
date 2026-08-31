@@ -2081,7 +2081,7 @@ async def test_terminal_latch_cancels_queued_observer_before_host_invocation(
 
 @pytest.mark.asyncio
 async def test_queued_observer_future_becomes_terminal_at_delivery_deadline(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
     executor = isolated_runtime._BoundedDaemonExecutor(
         max_workers=1,
@@ -2098,34 +2098,60 @@ async def test_queued_observer_future_becomes_terminal_at_delivery_deadline(
     assert running.wait(timeout=1)
     monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_EXECUTOR", executor)
     monkeypatch.setattr(isolated_runtime, "_TELEMETRY_OBSERVER_TIMEOUT", 0.01)
-    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_BASE_SECONDS", 1.0)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_BASE_SECONDS", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_MAX_SECONDS", 0.02)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_FORCED_RETRY_LIMIT", 1)
 
+    snapshots = []
     agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     _configure_idle_lifecycle(
         agent,
         tmp_path,
         idle_timeout_seconds=3600,
-        telemetry_observer=lambda _snapshot: None,
+        telemetry_observer=snapshots.append,
     )
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
     await feature.initialize()
-    for _ in range(200):
-        if not feature._telemetry_observer_tasks and feature._telemetry_retry_task:
+    for _ in range(300):
+        if (
+            feature._telemetry_retry_attempt
+            > isolated_runtime._TELEMETRY_FORCED_RETRY_LIMIT
+            and not feature._telemetry_observer_tasks
+            and feature._telemetry_retry_task is not None
+        ):
             break
         await asyncio.sleep(0.01)
 
-    with executor._work.mutex:
-        queued_items = list(executor._work.queue)
-    assert len(queued_items) == 1
-    queued_future = queued_items[0][0]
-    assert queued_future.cancelled()
+    assert (
+        feature._telemetry_retry_attempt
+        > isolated_runtime._TELEMETRY_FORCED_RETRY_LIMIT
+    )
     assert feature._telemetry_retry_task is not None
+    assert caplog.messages.count(
+        "Hosted isolated runtime telemetry observer capacity was unavailable "
+        "for TestFeature"
+    ) == 1
+    assert not any("telemetry observer failed" in line for line in caplog.messages)
 
-    await feature.shutdown()
+    feature._last_used_monotonic -= 7200
+    assert await feature._retire_idle_generation(
+        expected_activity_generation=feature._activity_generation,
+        expected_last_used=feature._last_used_monotonic,
+    )
+    assert snapshots == []
+
     release.set()
     active.result(timeout=1)
+    for _ in range(300):
+        if snapshots and snapshots[-1].cleanup_eligible:
+            break
+        await asyncio.sleep(0.01)
+
+    assert snapshots[-1].state == "idle"
+    assert snapshots[-1].cleanup_eligible is True
+    await feature.shutdown()
     executor.shutdown()
 
 

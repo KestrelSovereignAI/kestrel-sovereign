@@ -7116,14 +7116,19 @@ class ProxyFeature(Feature):
                         # observer after the proxy has shut down.
                         callback.cancel()
                         raise
-                    except asyncio.TimeoutError:
+                    except asyncio.TimeoutError as exc:
                         if callback.cancel():
                             # A callback queued behind hostile workers must
                             # become terminal at its delivery deadline. This
                             # releases the per-agent lock so forced telemetry
                             # can retry instead of coalescing forever behind a
-                            # Future that no worker can reach.
-                            raise
+                            # Future that no worker can reach. Classify this as
+                            # Core observer-capacity unavailability rather than
+                            # blaming callback code which never ran.
+                            raise _TelemetryObserverSubmissionError(
+                                "telemetry observer worker unavailable before "
+                                "the delivery deadline"
+                            ) from exc
                         # A callback which already entered user code cannot be
                         # killed safely. Retain its task and per-agent lock so
                         # one tenant cannot occupy every global worker.
