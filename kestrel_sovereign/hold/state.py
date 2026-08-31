@@ -1696,6 +1696,12 @@ class HoldStore:
                 "Hold operation witness refers to a missing receipt"
             )
 
+    async def _assert_global_history_intact(self) -> None:
+        """Validate database-wide receipt evidence once per stable snapshot."""
+
+        await self._assert_no_orphaned_operation_witnesses()
+        await self._assert_history_anchor_intact()
+
     async def read_boot_state(self) -> tuple[HoldState, ...]:
         """Validate and return every active latch before work producers start."""
 
@@ -1733,7 +1739,11 @@ class HoldStore:
                 key=lambda item: (item[0].value, item[1]),
             ):
                 try:
-                    state = await self._get_hold(scope, target_id)
+                    state = await self._get_hold(
+                        scope,
+                        target_id,
+                        validate_global_history=False,
+                    )
                 except Exception as exc:
                     domain_error = _domain_error_from_chain(exc)
                     if domain_error is not None:
@@ -1741,6 +1751,20 @@ class HoldStore:
                     raise
                 if state is not None:
                     active.append(state)
+            # The evidence protocol excludes every legitimate Hold writer for
+            # this entire boot read. Validate the database-wide tombstones and
+            # receipt anchor once after the target-local walks. Repeating these
+            # global scans from ``_get_hold`` for every target makes boot
+            # O(targets * total receipts).
+            try:
+                async with self._db.transaction():
+                    await self._lock_read_history()
+                    await self._assert_global_history_intact()
+            except Exception as exc:
+                domain_error = _domain_error_from_chain(exc)
+                if domain_error is not None:
+                    raise domain_error from exc
+                raise
             return tuple(active)
 
     async def _lock_operation_and_target(
@@ -1903,6 +1927,8 @@ class HoldStore:
         latch: Optional[HoldState],
         scope: HoldScope,
         target_id: str,
+        *,
+        validate_global_history: bool = True,
     ) -> None:
         """Prove the append-only authority graph agrees with its latch.
 
@@ -2038,8 +2064,8 @@ class HoldStore:
                 # metadata an orphan cannot safely be attributed to this target
                 # or ruled out, so a successful read must fail closed until the
                 # database is repaired.
-                await self._assert_no_orphaned_operation_witnesses()
-                await self._assert_history_anchor_intact()
+                if validate_global_history:
+                    await self._assert_global_history_intact()
                 return
             raise HoldCorruptStateError(
                 "unheld projection retains active Hold authority"
@@ -2082,16 +2108,23 @@ class HoldStore:
             raise HoldCorruptStateError(
                 "Hold receipt content witness does not match receipt history"
             )
-        await self._assert_no_orphaned_operation_witnesses()
-        await self._assert_history_anchor_intact()
+        if validate_global_history:
+            await self._assert_global_history_intact()
 
     async def _validate_latch_projection(
         self,
         latch: Optional[HoldState],
         scope: HoldScope,
         target_id: str,
+        *,
+        validate_global_history: bool = True,
     ) -> None:
-        await self._validate_receipt_authority_graph(latch, scope, target_id)
+        await self._validate_receipt_authority_graph(
+            latch,
+            scope,
+            target_id,
+            validate_global_history=validate_global_history,
+        )
 
     @staticmethod
     def _assert_replay(
@@ -2446,7 +2479,11 @@ class HoldStore:
             raise
 
     async def _get_hold(
-        self, scope: HoldScope | str, target_id: Optional[str] = None
+        self,
+        scope: HoldScope | str,
+        target_id: Optional[str] = None,
+        *,
+        validate_global_history: bool = True,
     ) -> Optional[HoldState]:
         resolved_scope = _coerce_scope(scope)
         resolved_target = _target(resolved_scope, target_id)
@@ -2457,9 +2494,19 @@ class HoldStore:
             latch = _latch_from_row(
                 await self._read_latch_row(resolved_scope, resolved_target)
             )
-            await self._validate_latch_projection(
-                latch, resolved_scope, resolved_target
-            )
+            if validate_global_history:
+                await self._validate_latch_projection(
+                    latch,
+                    resolved_scope,
+                    resolved_target,
+                )
+            else:
+                await self._validate_latch_projection(
+                    latch,
+                    resolved_scope,
+                    resolved_target,
+                    validate_global_history=False,
+                )
             return latch
 
     async def get_effective(self, agent_id: str) -> EffectiveHoldState:
