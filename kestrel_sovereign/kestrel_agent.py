@@ -1383,6 +1383,14 @@ class KestrelAgent(
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
         self._background_tasks: set[asyncio.Task] = set()
+        # Server-owned agents transfer the ready-phase publication boundary to
+        # their host before ``initialize()``.  This is deliberately separate
+        # from the host-context gate: a dynamically loaded agent can begin
+        # initialization after that one-time startup gate is already open, but
+        # must still wait until the manager publishes and onboards it.
+        self._agent_readiness_host_owned = False
+        self._agent_ready_hooks_deferred = False
+        self._agent_ready_hooks_completed = False
         # If the bounded durable tail cannot wait for dispatcher release, this
         # task owns the only safe successor: dispatcher drain followed by the
         # matching storage close.  It deliberately does not live in
@@ -3468,10 +3476,11 @@ class KestrelAgent(
 
         # All subsystems are now up (memory system, context manager, dispatcher,
         # LLM). On direct-agent boots, notify features now. Server-owned agents
-        # defer while the host policy gate is closed: an on_agent_ready hook is
-        # allowed to await cognition, and awaiting that turn here while the
-        # server awaits initialize() is a circular gate wait. The server binds
-        # host context, opens the gate, then completes this same hook pass.
+        # defer while the host owns the publication boundary or its host policy
+        # gate is closed: an on_agent_ready hook is allowed to await cognition,
+        # and awaiting that turn here while the server awaits initialize() is a
+        # circular gate wait. The server binds host context, publishes/onboards
+        # the agent, opens the gate, then completes this same hook pass.
         await self._run_or_defer_agent_ready_hooks()
 
     async def _notify_agent_ready_hooks(self) -> None:
@@ -3493,12 +3502,32 @@ class KestrelAgent(
         """Run ready hooks now, or defer them behind host policy publication."""
 
         async with self._agent_readiness_lock():
+            if self._agent_ready_hooks_completed:
+                return
             gate = getattr(self, "_host_context_publication_gate", None)
-            if gate is not None and not gate.is_set():
+            if self._agent_readiness_host_owned or (
+                gate is not None and not gate.is_set()
+            ):
                 self._agent_ready_hooks_deferred = True
                 return
             await self._notify_agent_ready_hooks()
             self._agent_ready_hooks_deferred = False
+            self._agent_ready_hooks_completed = True
+
+    def defer_agent_readiness_to_host(self) -> None:
+        """Transfer the initial ready-hook pass to a publishing host.
+
+        The host must claim this boundary before :meth:`initialize`.  Its
+        post-onboarding path later calls
+        :meth:`complete_deferred_agent_readiness`; an already-open context gate
+        does not weaken that registration boundary.
+        """
+
+        if self._agent_ready_hooks_completed:
+            raise RuntimeError(
+                "cannot transfer agent readiness after ready hooks completed"
+            )
+        self._agent_readiness_host_owned = True
 
     async def complete_deferred_agent_readiness(self) -> None:
         """Complete the server-deferred ready hooks after host publication."""
@@ -3513,6 +3542,8 @@ class KestrelAgent(
                 )
             await self._notify_agent_ready_hooks()
             self._agent_ready_hooks_deferred = False
+            self._agent_ready_hooks_completed = True
+            self._agent_readiness_host_owned = False
 
     def _agent_readiness_lock(self) -> asyncio.Lock:
         """Return the per-agent exactly-once ready-hook completion mutex."""

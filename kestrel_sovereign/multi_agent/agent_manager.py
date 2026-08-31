@@ -1689,6 +1689,12 @@ class AgentManager:
                 self._host_context_publication_state
             )
             agent._host_context_publication_generation = None
+            if self._host_context_publication_gate is not None:
+                # Host ownership is independent of whether the one-time gate
+                # is already open.  A cold/dynamic agent must not publish
+                # ready hooks until registration and app-owned onboarding have
+                # committed under the A2A lifecycle writer.
+                agent.defer_agent_readiness_to_host()
             if scheduler_registration is not None:
                 agent._dynamic_scheduler_tenant_registration = (
                     scheduler_registration

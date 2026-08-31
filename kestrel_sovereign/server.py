@@ -2476,6 +2476,7 @@ async def _lifespan_startup(app: FastAPI):
             app.state.agent._host_context_publication_gate = (
                 host_context_publication_gate
             )
+            app.state.agent.defer_agent_readiness_to_host()
 
             # Lifecycle hardening: provider availability (#377) is verified
             # inside KestrelAgent.initialize so every boot path — including

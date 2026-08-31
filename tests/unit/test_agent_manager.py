@@ -4258,6 +4258,7 @@ class TestLoadFromConfig:
             is registry
         )
         assert future_agent._host_context_publication_gate is publication_gate
+        future_agent.defer_agent_readiness_to_host.assert_called_once_with()
 
     @pytest.mark.asyncio
     @patch(
@@ -4293,6 +4294,9 @@ class TestLoadFromConfig:
 
             def bind_host_context_clause_registry(self, registry):
                 self._host_context_clause_registry = registry
+
+            def defer_agent_readiness_to_host(self):
+                self.readiness_owned_by_host = True
 
             async def initialize(self):
                 initialize_started.set()
@@ -4330,6 +4334,80 @@ class TestLoadFromConfig:
         assert agent.observed_registry is current_registry
         assert agent._host_context_publication_generation == 2
         assert manager.list_agents() == {}
+
+    @pytest.mark.asyncio
+    async def test_open_gate_cold_agent_readiness_waits_for_onboarding(
+        self,
+        tmp_path,
+    ):
+        """A real cold-agent ready pass cannot outrun dynamic registration."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()  # Startup publication/sweep already completed.
+        onboarding_done = False
+        observations: list[tuple[bool, bool]] = []
+
+        async def onboard(_name, _agent):
+            nonlocal onboarding_done
+            onboarding_done = True
+
+        manager.set_agent_registration_hook(onboard)
+        agent = KestrelAgent(
+            "did:open-gate-cold",
+            storage_path=str(tmp_path / "cold.db"),
+            llm_service=MagicMock(),
+        )
+
+        async def ready_hook(_agent):
+            async with manager.a2a_execution_lease():
+                observations.append(
+                    (
+                        manager.get_agent("open-gate-cold") is agent,
+                        onboarding_done,
+                    )
+                )
+
+        agent.features["readiness-probe"] = SimpleNamespace(
+            name="readiness-probe",
+            on_agent_ready=ready_hook,
+        )
+
+        async def initialize_through_real_readiness_path():
+            await agent._run_or_defer_agent_ready_hooks()
+
+        agent.initialize = initialize_through_real_readiness_path
+        agent.shutdown = AsyncMock()
+
+        with (
+            patch(
+                "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+                new=AsyncMock(return_value=agent.did),
+            ),
+            patch(
+                "kestrel_sovereign.multi_agent.agent_manager.KestrelAgent",
+                return_value=agent,
+            ),
+            patch("kestrel_sovereign.multi_agent.agent_manager.LLMService"),
+            patch.object(LocalAgentConfig, "validate_runtime", return_value=[]),
+        ):
+            loaded = await asyncio.wait_for(
+                manager.load_agent(
+                    "open-gate-cold",
+                    LocalAgentConfig(
+                        data_dir=Path("open-gate-cold"),
+                        port=8801,
+                    ),
+                ),
+                timeout=1,
+            )
+
+        assert loaded is agent
+        assert observations == [(True, True)]
+        assert agent._agent_ready_hooks_completed is True
+        assert agent._agent_readiness_host_owned is False
+        assert agent._agent_ready_hooks_deferred is False
 
     @pytest.mark.asyncio
     async def test_late_registration_consumes_deferred_readiness_after_snapshot(self):

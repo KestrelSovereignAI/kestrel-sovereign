@@ -790,7 +790,7 @@ async def test_deferred_readiness_completion_is_exactly_once(tmp_path):
     gate = asyncio.Event()
     gate.set()
     agent._host_context_publication_gate = gate
-    agent._agent_ready_hooks_deferred = True
+    agent.defer_agent_readiness_to_host()
     started = asyncio.Event()
     release = asyncio.Event()
     calls = 0
@@ -804,6 +804,9 @@ async def test_deferred_readiness_completion_is_exactly_once(tmp_path):
 
     feature = BlockingReadyFeature(agent)
     agent.features[feature.name] = feature
+    await agent._run_or_defer_agent_ready_hooks()
+    assert agent._agent_ready_hooks_deferred is True
+    assert agent._agent_readiness_host_owned is True
 
     first = asyncio.create_task(agent.complete_deferred_agent_readiness())
     await asyncio.wait_for(started.wait(), timeout=1)
@@ -816,6 +819,8 @@ async def test_deferred_readiness_completion_is_exactly_once(tmp_path):
 
     assert calls == 1
     assert agent._agent_ready_hooks_deferred is False
+    assert agent._agent_ready_hooks_completed is True
+    assert agent._agent_readiness_host_owned is False
 
 
 @pytest.mark.asyncio
