@@ -32,7 +32,7 @@ case "$PERSISTENCE_MODE" in
             echo "FATAL: durable_sovereign requires PostgreSQL; refusing disposable local state." >&2
             exit 1
         fi
-        if [ -z "${KESTREL_DATABASE_URL:-}" ] || [ -z "${KESTREL_DATA_KEY:-}" ] || [ -z "${KESTREL_EXPECTED_DID:-}" ] || [ -z "${KESTREL_IDENTITY_BUNDLE:-}" ]; then
+        if [ -z "${KESTREL_DATABASE_URL:-}" ] || [ -z "${KESTREL_HOLD_EVIDENCE_DATABASE_URL:-}" ] || [ -z "${KESTREL_DATA_KEY:-}" ] || [ -z "${KESTREL_EXPECTED_DID:-}" ] || [ -z "${KESTREL_IDENTITY_BUNDLE:-}" ]; then
             echo "FATAL: durable sovereign custody or database binding is unavailable; refusing to re-incept." >&2
             exit 1
         fi

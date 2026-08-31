@@ -96,6 +96,7 @@ runtime.
 
 ```bash
 export KESTREL_DATABASE_URL='postgresql://...'
+export KESTREL_HOLD_EVIDENCE_DATABASE_URL='postgresql://...'
 export KESTREL_DATA_KEY='...'
 export KESTREL_DID_WEB_DOMAIN='agents.kestrelsovereign.com'
 export KESTREL_CEREMONY_DIR="$(mktemp -d)"
@@ -132,7 +133,12 @@ uv run python -m kestrel_sovereign.identity.custody_bundle create \
   --output "$KESTREL_CEREMONY_DIR/custody.json"
 ```
 
-Upload the database URL, data key, and `custody.json` as separate Secret
+The Hold evidence URL must name a different PostgreSQL database in an
+independent backup/restore domain. Its history head and pending-publication
+journal are deliberately excluded from restores of `KESTREL_DATABASE_URL`, so
+rolling the primary database back cannot silently erase a later Hold.
+
+Upload both database URLs, the data key, and `custody.json` as separate Secret
 Manager secrets. Grant the Cloud Run runtime service account
 `roles/secretmanager.secretAccessor` only on those required secrets. Secret
 Manager access is visible in Cloud Audit Logs; never print the bundle/data key

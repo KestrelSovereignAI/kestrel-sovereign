@@ -555,6 +555,7 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
 
     fake_host_db = _DB("sqlite")
     fake_hold_db = _DB("postgres")
+    fake_evidence_db = _DB("postgres")
 
     async def _sqlite(_cls, path):
         events.append(("sqlite", path))
@@ -562,6 +563,8 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
 
     async def _postgres(_cls, dsn):
         events.append(("postgres", dsn))
+        if dsn.endswith("/evidence"):
+            return fake_evidence_db
         return fake_hold_db
 
     async def _ensure_schema(self):
@@ -573,6 +576,10 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setenv(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "postgresql://independent/evidence",
+    )
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
     monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
     monkeypatch.setattr(
@@ -586,12 +593,15 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
 
     assert ctx.db is fake_host_db
     assert ctx.hold_db is fake_hold_db
+    assert ctx.hold_evidence_db is fake_evidence_db
     assert ctx.hold_store._db is fake_hold_db
+    assert ctx.hold_store._evidence_db is fake_evidence_db
     assert ctx.hold_store._initialization_witness_path is None
     assert ctx.hold_store._history_anchor_path is None
-    assert events[:4] == [
+    assert events[:5] == [
         ("sqlite", str(host_path)),
         ("postgres", "postgresql://durable/host"),
+        ("postgres", "postgresql://independent/evidence"),
         ("hold-schema", fake_hold_db),
         ("hold-boot-read", fake_hold_db),
     ]
@@ -659,29 +669,86 @@ async def test_postgres_without_dsn_uses_runtime_sqlite_fallback(
 
 
 @pytest.mark.asyncio
+async def test_postgres_hold_without_independent_evidence_fails_closed_at_boot(
+    monkeypatch,
+    tmp_path,
+):
+    """A missing rollback witness is named and no host store is handed off."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[str] = []
+
+    class _DB:
+        backend_type = "sqlite"
+
+        async def close(self):
+            events.append("db-close")
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close")
+
+    async def _sqlite(_cls, _path):
+        return _DB()
+
+    async def _postgres(_cls, _dsn):
+        raise AssertionError("missing evidence config must fail before PG opens")
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.delenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", raising=False)
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module,
+        "make_session_factory",
+        lambda _db: _InnerFactory(),
+    )
+
+    context = await build_host_context(db_path=str(tmp_path / "host.db"))
+
+    assert context.db is None
+    assert context.hold_store is None
+    assert "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required" in context.backend_error
+    assert events == ["factory-close", "db-close"]
+
+
+@pytest.mark.asyncio
 async def test_postgres_initialization_witness_uses_durable_runtime_metadata(
     tmp_path,
 ):
-    """A fresh Cloud Run instance reads the witness from PostgreSQL state."""
+    """A fresh Cloud Run instance reads a separately-custodied PG witness."""
 
-    db = await AsyncDatabase.sqlite(str(tmp_path / "postgres-witness-facade.db"))
+    db = await AsyncDatabase.sqlite(str(tmp_path / "postgres-primary-facade.db"))
+    evidence = await AsyncDatabase.sqlite(
+        str(tmp_path / "postgres-evidence-facade.db")
+    )
 
     class _PostgresWitnessFacade:
         backend_type = "postgres"
 
+        def __init__(self, inner):
+            self._inner = inner
+
         async def fetchall(self, query, params=()):
-            return await db.fetchall(query, params)
+            return await self._inner.fetchall(query, params)
 
         async def execute(self, query, params=()):
-            return await db.execute(query, params)
+            return await self._inner.execute(query, params)
 
     try:
-        first = HoldStore(_PostgresWitnessFacade())
+        primary = _PostgresWitnessFacade(db)
+        evidence_store = _PostgresWitnessFacade(evidence)
+        first = HoldStore(primary, evidence_db=evidence_store)
         assert first._initialization_witness_path is None
         assert await first._read_initialization_witness() is False
         await first._write_initialization_witness()
 
-        restarted = HoldStore(_PostgresWitnessFacade())
+        restarted = HoldStore(primary, evidence_db=evidence_store)
         assert await restarted._read_initialization_witness() is True
         await _create_legacy_hold_tables(db)
         await first._write_history_anchor()
@@ -690,6 +757,14 @@ async def test_postgres_initialization_witness_uses_durable_runtime_metadata(
         )
     finally:
         await db.close()
+        await evidence.close()
+
+
+def test_postgres_hold_refuses_evidence_in_the_primary_rollback_domain() -> None:
+    """The database being protected cannot also supply its rollback witness."""
+
+    with pytest.raises(HoldStateError, match="independent.*evidence"):
+        HoldStore(SimpleNamespace(backend_type="postgres"))
 
 
 @pytest.mark.asyncio
@@ -790,11 +865,14 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
 
     fake_host_db = _DB("sqlite")
     fake_hold_db = _DB("postgres")
+    fake_evidence_db = _DB("postgres")
 
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _postgres(_cls, _dsn):
+    async def _postgres(_cls, dsn):
+        if dsn.endswith("/evidence"):
+            return fake_evidence_db
         return fake_hold_db
 
     async def _ensure_schema(_self):
@@ -803,6 +881,10 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setenv(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "postgresql://independent/evidence",
+    )
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
     monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
     monkeypatch.setattr(
@@ -825,6 +907,7 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
     assert events == [
         "factory-close-started",
         "factory-close-finished",
+        ("db-close", "postgres"),
         ("db-close", "postgres"),
         ("db-close", "sqlite"),
     ]
@@ -861,11 +944,14 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
 
     fake_host_db = _DB("sqlite")
     fake_hold_db = _DB("postgres")
+    fake_evidence_db = _DB("postgres")
 
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _postgres(_cls, _dsn):
+    async def _postgres(_cls, dsn):
+        if dsn.endswith("/evidence"):
+            return fake_evidence_db
         return fake_hold_db
 
     async def _fail_schema(_self):
@@ -873,6 +959,10 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setenv(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "postgresql://independent/evidence",
+    )
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
     monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
     monkeypatch.setattr(
@@ -895,6 +985,7 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
     assert events == [
         "factory-close-started",
         "factory-close-finished",
+        ("db-close", "postgres"),
         ("db-close", "postgres"),
         ("db-close", "sqlite"),
     ]
@@ -1715,6 +1806,87 @@ async def test_committed_sqlite_mutation_recovers_interrupted_anchor_promotion(
 
 
 @pytest.mark.asyncio
+async def test_postgres_external_candidate_recovers_committed_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    """The external candidate bridges a crash after the primary PG commit."""
+
+    primary = await AsyncDatabase.sqlite(str(tmp_path / "pg-primary-facade.db"))
+    evidence = await AsyncDatabase.sqlite(str(tmp_path / "pg-evidence-facade.db"))
+    store = HoldStore(primary)
+    await store.ensure_schema()
+
+    class _EvidenceFacade:
+        backend_type = "postgres"
+
+        async def fetchall(self, query, params=()):
+            return await evidence.fetchall(query, params)
+
+        async def execute(self, query, params=()):
+            return await evidence.execute(query, params)
+
+    @asynccontextmanager
+    async def evidence_lock():
+        yield
+
+    # Keep the real SQLite primary so the mutation is a measured transaction,
+    # but route its publication protocol through the same independent-DB code
+    # used by PostgreSQL. This makes the crash boundary deterministic in unit
+    # tests without requiring a second PostgreSQL service.
+    store._history_anchor_path = None
+    store._history_candidate_path = None
+    store._bootstrap_intent_path = None
+    store._evidence_lock_path = None
+    store._evidence_db = _EvidenceFacade()
+    monkeypatch.setattr(store, "_postgres_evidence_lock", evidence_lock)
+
+    async def read_external_anchor():
+        payload = await store._read_postgres_evidence(
+            "hold_history_anchor_v1",
+            label="history anchor",
+        )
+        if payload is None:
+            return None
+        return store._validate_history_anchor_payload(payload)
+
+    monkeypatch.setattr(store, "_read_history_anchor", read_external_anchor)
+    await store._write_postgres_evidence(
+        "hold_history_anchor_v1",
+        await store._current_history_anchor_payload(),
+    )
+
+    complete = store._complete_history_publication
+
+    async def interrupt_promotion(_payload):
+        raise RuntimeError("injected interruption after primary commit")
+
+    monkeypatch.setattr(store, "_complete_history_publication", interrupt_promotion)
+    with pytest.raises(RuntimeError, match="after primary commit"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:pg-publication",
+            actor_id="did:sovereign:operator",
+            reason="recover external candidate",
+            operation_id="pg-external-candidate",
+        )
+
+    assert await store._read_external_history_candidate() is not None
+    monkeypatch.setattr(store, "_complete_history_publication", complete)
+    try:
+        recovered = await store.get_hold("agent", "did:agent:pg-publication")
+        assert recovered is not None
+        assert recovered.reason == "recover external candidate"
+        assert await store._read_external_history_candidate() is None
+        assert await store._read_history_anchor() == (
+            await store._current_history_anchor_payload()
+        )
+    finally:
+        await primary.close()
+        await evidence.close()
+
+
+@pytest.mark.asyncio
 async def test_sqlite_reader_waits_for_database_and_anchor_publication(
     tmp_path,
     monkeypatch,
@@ -1924,7 +2096,10 @@ async def test_state_read_validates_projection_inside_one_locked_snapshot(
 @pytest.mark.asyncio
 async def test_postgres_read_targets_take_shared_locks_in_global_order():
     execute = AsyncMock()
-    store = HoldStore(SimpleNamespace(backend_type="postgres", execute=execute))
+    store = HoldStore(
+        SimpleNamespace(backend_type="postgres", execute=execute),
+        evidence_db=SimpleNamespace(backend_type="postgres"),
+    )
 
     await store._lock_read_targets(
         (
@@ -1951,6 +2126,161 @@ async def test_postgres_read_targets_take_shared_locks_in_global_order():
 
 
 @pytest.mark.asyncio
+async def test_postgres_evidence_lock_rejects_same_database_identity():
+    """Two pools do not become independent merely by being distinct objects."""
+
+    class _DB:
+        backend_type = "postgres"
+
+        def __init__(self, identity, *, backend=None):
+            self._identity = identity
+            self.backend = backend
+
+        async def fetchall(self, _query, _params=()):
+            return [(self._identity,)]
+
+        async def execute(self, _query, _params=()):
+            return None
+
+    @asynccontextmanager
+    async def advisory_locks(_keys):
+        raise AssertionError("a same-domain store must be rejected before locking")
+        yield
+
+    identity = (
+        "kestrel-hold-rollback-domain-v1:"
+        "00000000-0000-0000-0000-000000000001"
+    )
+    primary = _DB(identity)
+    evidence = _DB(
+        identity,
+        backend=SimpleNamespace(advisory_locks=advisory_locks),
+    )
+    store = HoldStore(primary, evidence_db=evidence)
+
+    with pytest.raises(HoldStateError, match="independent rollback domain"):
+        async with store._postgres_evidence_lock():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_postgres_evidence_lock_uses_independent_service_session():
+    """The external session lock spans the caller's whole evidence boundary."""
+
+    events: list[object] = []
+
+    class _DB:
+        backend_type = "postgres"
+
+        def __init__(self, identity, *, backend=None):
+            self._identity = identity
+            self.backend = backend
+
+        async def fetchall(self, _query, _params=()):
+            return [(self._identity,)]
+
+        async def execute(self, _query, _params=()):
+            return None
+
+    @asynccontextmanager
+    async def advisory_locks(keys):
+        events.append(("lock", keys))
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    primary = _DB(
+        "kestrel-hold-rollback-domain-v1:"
+        "00000000-0000-0000-0000-000000000001"
+    )
+    evidence = _DB(
+        "kestrel-hold-rollback-domain-v1:"
+        "00000000-0000-0000-0000-000000000002",
+        backend=SimpleNamespace(advisory_locks=advisory_locks),
+    )
+    store = HoldStore(primary, evidence_db=evidence)
+
+    async with store._postgres_evidence_lock():
+        events.append("body")
+
+    assert events == [
+        ("lock", ((0x004B4553, 0x484F4C44),)),
+        "body",
+        "unlock",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_evidence_lock_founds_distinct_domain_markers():
+    """Fresh databases get durable identities before their first protocol lock."""
+
+    class _DB:
+        backend_type = "postgres"
+
+        def __init__(self, *, backend=None):
+            self.value = None
+            self.backend = backend
+
+        async def fetchall(self, _query, _params=()):
+            return [] if self.value is None else [(self.value,)]
+
+        async def execute(self, _query, params=()):
+            if self.value is None:
+                self.value = params[2]
+
+    @asynccontextmanager
+    async def advisory_locks(_keys):
+        yield
+
+    primary = _DB()
+    evidence = _DB(
+        backend=SimpleNamespace(advisory_locks=advisory_locks),
+    )
+    store = HoldStore(primary, evidence_db=evidence)
+
+    async with store._postgres_evidence_lock():
+        pass
+
+    assert primary.value is not None
+    assert evidence.value is not None
+    assert primary.value != evidence.value
+
+
+@pytest.mark.asyncio
+async def test_postgres_public_read_uses_external_evidence_protocol(monkeypatch):
+    """A live read cannot bypass recovery or the cross-service session lock."""
+
+    events: list[str] = []
+    store = HoldStore(
+        SimpleNamespace(backend_type="postgres"),
+        evidence_db=SimpleNamespace(backend_type="postgres"),
+    )
+
+    @asynccontextmanager
+    async def evidence_lock():
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    async def recover():
+        events.append("recover")
+
+    async def read(_scope, _target_id):
+        events.append("read")
+        return None
+
+    monkeypatch.setattr(store, "_postgres_evidence_lock", evidence_lock)
+    monkeypatch.setattr(store, "_recover_history_publication", recover)
+    monkeypatch.setattr(store, "_get_hold", read)
+
+    assert await store.get_hold("agent", "did:agent:protocol") is None
+    assert events == ["lock", "recover", "read", "unlock"]
+
+
+@pytest.mark.asyncio
 async def test_postgres_missing_receipt_locks_history_before_validation(monkeypatch):
     """An absent operation is proved only inside the global history lock."""
 
@@ -1961,7 +2291,8 @@ async def test_postgres_missing_receipt_locks_history_before_validation(monkeypa
         yield
 
     store = HoldStore(
-        SimpleNamespace(backend_type="postgres", transaction=transaction)
+        SimpleNamespace(backend_type="postgres", transaction=transaction),
+        evidence_db=SimpleNamespace(backend_type="postgres"),
     )
 
     async def lock_history():
@@ -1978,7 +2309,7 @@ async def test_postgres_missing_receipt_locks_history_before_validation(monkeypa
     monkeypatch.setattr(store, "_validate_operation_witness", validate)
     monkeypatch.setattr(store, "_assert_history_anchor_intact", validate_anchor)
 
-    assert await store.get_receipt("missing-operation") is None
+    assert await store._get_receipt("missing-operation") is None
     assert events == ["history-lock", "validate-operation", "validate-anchor"]
 
 
@@ -1987,7 +2318,10 @@ async def test_postgres_writers_serialize_global_history_before_local_keys():
     """Cross-target writers cannot publish lost-update history heads."""
 
     execute = AsyncMock()
-    store = HoldStore(SimpleNamespace(backend_type="postgres", execute=execute))
+    store = HoldStore(
+        SimpleNamespace(backend_type="postgres", execute=execute),
+        evidence_db=SimpleNamespace(backend_type="postgres"),
+    )
 
     await store._lock_operation_and_target(
         "operation-one",
@@ -2163,6 +2497,82 @@ async def test_external_history_anchor_rejects_empty_initialized_backup_restore(
 
 
 @pytest.mark.asyncio
+async def test_postgres_external_anchor_rejects_primary_snapshot_rollback(
+    tmp_path,
+):
+    """A primary restore cannot restore the independent evidence head with it."""
+
+    primary_path = tmp_path / "postgres-primary-facade.db"
+    backup_path = tmp_path / "postgres-primary-empty-backup.db"
+    evidence = await AsyncDatabase.sqlite(
+        str(tmp_path / "postgres-independent-evidence-facade.db")
+    )
+
+    class _PostgresFacade:
+        backend_type = "postgres"
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def fetchall(self, query, params=()):
+            return await self._inner.fetchall(query, params)
+
+        async def execute(self, query, params=()):
+            return await self._inner.execute(query, params)
+
+    evidence_facade = _PostgresFacade(evidence)
+    primary = await AsyncDatabase.sqlite(str(primary_path))
+    await _create_legacy_hold_tables(primary)
+    empty = HoldStore(_PostgresFacade(primary), evidence_db=evidence_facade)
+    await empty._write_history_anchor()
+    await empty._write_initialization_witness()
+    await primary.close()
+    shutil.copyfile(primary_path, backup_path)
+
+    held_primary = await AsyncDatabase.sqlite(str(primary_path))
+    held = HoldStore(
+        _PostgresFacade(held_primary),
+        evidence_db=evidence_facade,
+    )
+    await held_primary.execute(
+        "INSERT INTO hold_receipts ("
+        "receipt_id, operation_id, action, disposition, scope, target_id, "
+        "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+        "prior_hold_receipt_id, resulting_hold_receipt_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "postgres-rollback-receipt",
+            "postgres-rollback-operation",
+            "hold",
+            "applied",
+            "agent",
+            "did:agent:postgres-rollback",
+            "must remain held",
+            "did:sovereign:operator",
+            "2026-08-31T00:00:00+00:00",
+            "",
+            "",
+            "postgres-rollback-receipt",
+        ),
+    )
+    await held._write_history_anchor()
+    await held_primary.close()
+
+    shutil.copyfile(backup_path, primary_path)
+    restored_primary = await AsyncDatabase.sqlite(str(primary_path))
+    restored = HoldStore(
+        _PostgresFacade(restored_primary),
+        evidence_db=evidence_facade,
+    )
+    try:
+        with pytest.raises(HoldCorruptStateError, match="history anchor"):
+            await restored._assert_history_anchor_intact()
+    finally:
+        await restored_primary.close()
+        await evidence.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["missing", "malformed"])
 async def test_initialized_store_rejects_missing_or_malformed_history_anchor(
     tmp_path,
@@ -2213,6 +2623,39 @@ async def test_initialization_witness_is_not_visible_until_payload_is_complete(
 
     assert observed_final_path
     assert not any(observed_final_path)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_evidence_protocol_uses_windows_byte_range_lock(
+    tmp_path,
+    monkeypatch,
+):
+    """Durable Hold remains available on the advertised Windows platform."""
+
+    from kestrel_sovereign.hold import state as hold_state_module
+
+    events: list[tuple[int, int]] = []
+
+    class _FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(descriptor, mode, length):
+            assert os.lseek(descriptor, 0, os.SEEK_CUR) == 0
+            assert os.fstat(descriptor).st_size >= 1
+            events.append((mode, length))
+
+    monkeypatch.setattr(hold_state_module, "fcntl", None)
+    monkeypatch.setattr(hold_state_module, "msvcrt", _FakeMsvcrt, raising=False)
+    path = tmp_path / "windows-lock.db"
+    db = await AsyncDatabase.sqlite(str(path))
+    try:
+        await HoldStore(db).ensure_schema()
+    finally:
+        await db.close()
+
+    assert events == [(_FakeMsvcrt.LK_NBLCK, 1), (_FakeMsvcrt.LK_UNLCK, 1)]
 
 
 @pytest.mark.asyncio

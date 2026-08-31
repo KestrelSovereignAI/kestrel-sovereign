@@ -170,6 +170,7 @@ def test_prod_profile_has_bash_parity_secrets(live_config):
         "OPENAI_API_KEY",
         "KESTREL_API_KEY",
         "KESTREL_DATABASE_URL",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
         "KESTREL_DATA_KEY",
         "KESTREL_IDENTITY_BUNDLE",
         "GOOGLE_CLIENT_ID",
@@ -295,6 +296,7 @@ def test_cloudrun_profiles_declare_honest_persistence(live_config):
     assert not prod.is_multi_agent
     for key in (
         "KESTREL_DATABASE_URL",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
         "KESTREL_DATA_KEY",
         "KESTREL_IDENTITY_BUNDLE",
     ):
