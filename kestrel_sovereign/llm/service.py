@@ -4340,24 +4340,6 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 else:
                     target_selector = pref_model
 
-        # Explicitness comes from the CANONICAL routing logic, computed for the
-        # selector actually dispatched (#3190 r7 P1, r8 P1).
-        #
-        # Two mistakes were made here in successive rounds, and they are worth
-        # distinguishing. First I hand-rolled the predicate, which disagreed
-        # with `_compute_route_authorization` about bare models and multi-route
-        # vendor selectors. Then I called the canonical function but passed it
-        # NOTHING, so it answered about `_mandate_preference` while the audit
-        # may actually dispatch `[llm.mandate.defaults].preferred` — the right
-        # question asked about the wrong subject. A bare or vendor-wide default
-        # would be classified explicit here and skip a guard generation keeps,
-        # letting that model reach the first non-local route unchecked.
-        #
-        # Computed after `target_selector` is final, so the two cannot drift.
-        audit_selection_is_explicit = self._compute_route_authorization(
-            model_override=target_selector,
-        ).explicit_selection
-
         available_providers = self._available_providers()
         target_model = None
         if target_selector:
@@ -4393,15 +4375,27 @@ No other text or formatting.
             errors = {}
             for provider in available_providers:
                 logger.info(f"Auditing with provider: {provider['name']}")
-                skip_catalog = (
-                    audit_selection_is_explicit
-                    and provider.get("vendor") not in _MODEL_IGNORING_VENDORS
-                )
-                if (
-                    target_model
-                    and not skip_catalog
-                    and not self._model_available_for_route(provider, target_model)
-                ):
+                # The audit keeps this guard UNCONDITIONALLY, unlike the
+                # generation path which skips it for an explicit selection
+                # (#3190 r9 P1).
+                #
+                # Three rounds were spent trying to make the audit mirror
+                # generation, because during a discovery outage a pinned route
+                # generates fine and then fails its own audit. That is a real
+                # annoyance and the fix for it was wrong: this guard is what
+                # makes the audit FAIL CLOSED at risk 3 when no route can serve
+                # the mandated model, and
+                # `test_get_audit_response_failclosed_when_no_route_serves_mandate`
+                # is that contract. Skipping it on explicitness returned risk 1
+                # for a genuinely unservable model.
+                #
+                # Explicitness cannot tell a transiently incomplete catalog from
+                # a model that truly is not there — the same thing this whole
+                # change concluded is unknowable from the catalog alone. Given
+                # that, an auditor that refuses to vouch for a route it cannot
+                # verify is behaving correctly. Degrading a fail-closed security
+                # check to make an outage more comfortable is the wrong trade.
+                if target_model and not self._model_available_for_route(provider, target_model):
                     # Record the skip so that if EVERY route rejects the
                     # mandated model, the loop fails closed (risk=3) instead of
                     # falling through to the benign "no providers" risk=1.
