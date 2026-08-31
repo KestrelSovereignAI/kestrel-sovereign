@@ -32,7 +32,10 @@ import secrets
 import shutil
 import stat
 import subprocess
+import threading
+import time
 import weakref
+from concurrent.futures import Executor, Future
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -40,13 +43,16 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from types import TracebackType
-from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
+from queue import Empty, Full, Queue
+from types import MappingProxyType, TracebackType
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, NoReturn, Optional
 from uuid import uuid4
 
+import psutil
 from kestrel_sdk.channels import ChannelAdapter
 from kestrel_sdk.isolated_feature import (
     CONFIG_TRANSITION_APPLIED,
+    INBOUND_PRODUCER_CAPABILITY,
     MAX_HOST_INGRESS_PAYLOAD_BYTES,
     ConfigTransitionResult,
     HostIngressCapabilities,
@@ -69,6 +75,89 @@ from kestrel_sovereign.features.channels.route_ownership import (
 
 logger = logging.getLogger(__name__)
 _CORE_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True, slots=True)
+class IsolatedRuntimeTelemetrySnapshot:
+    """Sanitized lifecycle telemetry for one agent-bound isolated feature."""
+
+    feature: str
+    distribution: str
+    state: str
+    lifecycle_generation: int
+    active_processes: int
+    restart_count: int
+    idle_wake_count: int
+    last_used_at: datetime | None
+    cold_start_seconds: float | None
+    warm_start_seconds: float | None
+    rss_bytes: int | None
+    cpu_seconds: float | None
+    open_fds: int | None
+    process_count: int | None
+    environment_bytes: int | None = None
+    private_writable_bytes: int | None = None
+    downloaded_bytes: int | None = None
+    provision_seconds: float | None = None
+    cache_hit: bool | None = None
+    cleanup_eligible: bool = False
+    disk_telemetry_status: str | None = None
+
+
+def configure_hosted_isolated_runtime_lifecycle(
+    agent: Any,
+    *,
+    idle_timeout_seconds: float | None = None,
+    idle_timeouts: Mapping[str, float | None] | None = None,
+    telemetry_observer: Callable[[IsolatedRuntimeTelemetrySnapshot], Any] | None = None,
+) -> None:
+    """Install per-agent hosted lifecycle policy before feature discovery."""
+
+    if _agent_runtime_scope(agent) is None:
+        raise ValueError(
+            "isolated runtime lifecycle policy requires an explicit hosted scope"
+        )
+    _agent_runtime_owner(agent)
+    agent_attributes = getattr(agent, "__dict__", {})
+    if (
+        isinstance(agent_attributes, dict)
+        and agent_attributes.get("_isolated_runtime_features_constructed") is True
+    ):
+        raise RuntimeError(
+            "isolated runtime lifecycle policy must be configured before feature discovery"
+        )
+
+    def validate_timeout(value: object) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("isolated runtime idle timeout must be a number or None")
+        if not math.isfinite(float(value)) or value <= 0:
+            raise ValueError("isolated runtime idle timeout must be finite and positive")
+        return float(value)
+
+    idle_timeout_seconds = validate_timeout(idle_timeout_seconds)
+    resolved_timeouts: dict[str, float | None] = {}
+    if idle_timeouts is not None:
+        if not isinstance(idle_timeouts, Mapping):
+            raise TypeError("isolated runtime feature idle timeouts must be a mapping")
+        for feature, timeout in idle_timeouts.items():
+            if type(feature) is not str or _ISOLATED_FEATURE_CLASS_NAME.fullmatch(feature) is None:
+                raise ValueError("isolated runtime feature idle timeout key is invalid")
+            resolved_timeouts[feature] = validate_timeout(timeout)
+    if telemetry_observer is not None and not callable(telemetry_observer):
+        raise TypeError("isolated runtime telemetry observer must be callable")
+    agent.isolated_runtime_idle_timeout_seconds = idle_timeout_seconds
+    agent.isolated_runtime_idle_timeouts = MappingProxyType(resolved_timeouts)
+    agent.isolated_runtime_telemetry_observer = telemetry_observer
+    # Serialize submissions per loaded agent before they enter the bounded
+    # process-wide worker pool. One tenant with wedged synchronous callbacks
+    # can therefore occupy at most one worker/queue slot rather than starving
+    # every other agent in the host.
+    observer_lock = agent_attributes.get("_isolated_runtime_telemetry_observer_lock")
+    if not isinstance(observer_lock, asyncio.Lock):
+        observer_lock = asyncio.Lock()
+        agent._isolated_runtime_telemetry_observer_lock = observer_lock
 
 
 def canonical_telegram_bot_id(value: object) -> str:
@@ -123,6 +212,308 @@ def set_hosted_telegram_route_attestation_resolver(
 # answers health() must not silently kill supervision forever (F013) — treat a
 # probe that exceeds this as unhealthy and fall through to the restart path.
 _HEALTH_PROBE_TIMEOUT = 5.0
+# Host telemetry is advisory. An async observer that wedges must never acquire
+# ownership of child startup, retirement, reload, or shutdown progress.
+_TELEMETRY_OBSERVER_TIMEOUT = 1.0
+_TELEMETRY_EMIT_MIN_INTERVAL = 5.0
+_TELEMETRY_RETRY_BASE_SECONDS = 0.05
+_TELEMETRY_RETRY_MAX_SECONDS = 5.0
+_TELEMETRY_FORCED_RETRY_LIMIT = 5
+_DISK_TELEMETRY_ENTRY_BUDGET = 250_000
+_DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
+_DISK_TELEMETRY_DEPTH_BUDGET = 64
+
+
+class _TelemetryObserverSubmissionError(RuntimeError):
+    """The bounded observer infrastructure could not admit a callback."""
+
+
+class _BoundedDaemonExecutor(Executor):
+    """Small daemon pool reserved for advisory host callbacks.
+
+    Standard ``ThreadPoolExecutor`` workers are non-daemon and can let a
+    hostile synchronous observer acquire interpreter-exit ownership. These
+    workers deliberately cannot do that, and the bounded queue prevents an
+    unbounded retained-snapshot backlog when every observer slot is wedged.
+    """
+
+    _STOP = object()
+
+    def __init__(self, *, max_workers: int, queue_capacity: int) -> None:
+        self._max_workers = max_workers
+        self._work: Queue[object] = Queue(maxsize=queue_capacity)
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._shutdown = False
+
+    def _start_workers(self) -> None:
+        with self._lock:
+            if self._threads or self._shutdown:
+                return
+            started: list[threading.Thread] = []
+            try:
+                for index in range(self._max_workers):
+                    thread = threading.Thread(
+                        target=self._worker,
+                        name=f"kestrel-telemetry-observer-{index}",
+                        daemon=True,
+                    )
+                    thread.start()
+                    started.append(thread)
+            except BaseException:
+                # No callback has been queued before the first successful
+                # startup, so every partially started worker is under our
+                # control and can be synchronously retired.  Do not poison the
+                # process-global executor after a transient thread-pressure
+                # failure: a later submission must be able to retry startup.
+                for _thread in started:
+                    # The queue may be narrower than the worker count. These
+                    # workers have never received user work, so waiting for
+                    # each controlled sentinel to be consumed is bounded by
+                    # this module's own worker loop rather than host code.
+                    self._work.put(self._STOP)
+                for thread in started:
+                    thread.join()
+                raise
+            self._threads.extend(started)
+
+    def _worker(self) -> None:
+        while True:
+            item = self._work.get()
+            try:
+                if item is self._STOP:
+                    return
+                future, fn, args, kwargs = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - Future owns outcome
+                    future.set_exception(exc)
+            finally:
+                self._work.task_done()
+
+    def _discard_cancelled_work_locked(self) -> None:
+        """Physically reclaim queue slots whose Futures were cancelled.
+
+        ``Future.cancel()`` does not remove the corresponding tuple from a
+        ``Queue``.  Delivery-deadline retries would otherwise let one agent
+        retain a fresh dead slot on every attempt while all workers are busy.
+        Submitters are serialized by ``_lock``; workers may concurrently drain
+        retained items, which only creates additional capacity.
+        """
+
+        retained: list[object] = []
+        while True:
+            try:
+                item = self._work.get_nowait()
+            except Empty:
+                break
+            try:
+                if item is self._STOP:
+                    retained.append(item)
+                    continue
+                future, _fn, _args, _kwargs = item
+                if not future.cancelled():
+                    retained.append(item)
+            finally:
+                self._work.task_done()
+        for item in retained:
+            self._work.put_nowait(item)
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        future: Future[Any] = Future()
+        try:
+            self._start_workers()
+        except BaseException as exc:  # noqa: BLE001 - Future owns startup outcome
+            future.set_exception(
+                _TelemetryObserverSubmissionError(
+                    f"telemetry observer executor could not start: {exc}"
+                )
+            )
+            return future
+        with self._lock:
+            if self._shutdown:
+                future.set_exception(
+                    _TelemetryObserverSubmissionError(
+                        "telemetry observer executor stopped"
+                    )
+                )
+                return future
+            self._discard_cancelled_work_locked()
+            try:
+                self._work.put_nowait((future, fn, args, kwargs))
+            except Full:
+                future.set_exception(
+                    _TelemetryObserverSubmissionError(
+                        "telemetry observer executor saturated"
+                    )
+                )
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        """Reject new callbacks and abandon queued advisory work.
+
+        ``wait`` is intentionally ignored: a hostile observer must not regain
+        process-lifecycle ownership through explicit executor shutdown. Running
+        callbacks remain isolated on daemon threads and queued callbacks are
+        always cancelled so sentinel delivery cannot block on a full queue.
+        """
+
+        queued_futures: list[Future[Any]] = []
+        with self._lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            threads = tuple(self._threads)
+            while True:
+                try:
+                    item = self._work.get_nowait()
+                except Empty:
+                    break
+                try:
+                    if item is not self._STOP:
+                        future, _fn, _args, _kwargs = item
+                        queued_futures.append(future)
+                finally:
+                    self._work.task_done()
+            for _thread in threads:
+                try:
+                    self._work.put_nowait(self._STOP)
+                except Full:
+                    # A bounded queue may be smaller than the worker count.
+                    # Unsignalled workers are daemon-only and will remain
+                    # harmlessly parked after the signalled workers exit.
+                    break
+        for future in queued_futures:
+            future.cancel()
+
+
+class _AgentTelemetryObserverAdmission:
+    """Keep one agent's synchronous observer submission tied to settlement."""
+
+    def __init__(self) -> None:
+        # Executor submission can return an already-settled Future; its done
+        # callback then runs synchronously from ``add_done_callback`` below.
+        self._lock = threading.RLock()
+        self._active: Future[Any] | None = None
+
+    def submit(
+        self,
+        executor: _BoundedDaemonExecutor,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        with self._lock:
+            active = self._active
+            if active is not None and not active.done():
+                refused: Future[Any] = Future()
+                refused.set_exception(
+                    _TelemetryObserverSubmissionError(
+                        "telemetry observer agent submission already active"
+                    )
+                )
+                return refused
+            callback = executor.submit(fn, *args, **kwargs)
+            self._active = callback
+
+            def release(completed: Future[Any]) -> None:
+                with self._lock:
+                    if self._active is completed:
+                        self._active = None
+
+            callback.add_done_callback(release)
+            return callback
+
+
+_TELEMETRY_OBSERVER_EXECUTOR = _BoundedDaemonExecutor(
+    max_workers=4,
+    queue_capacity=8,
+)
+
+
+def _measure_directory_tree_bytes(
+    path: str | Path,
+    *,
+    parent_fd: int | None = None,
+    deadline: float | None = None,
+    seen_linked_files: set[tuple[int, int]] | None = None,
+) -> tuple[int | None, str]:
+    """Measure one no-follow tree and preserve why measurement degraded.
+
+    A caller measuring sibling trees may share ``seen_linked_files`` so one
+    hard-linked payload is charged only once across the complete sample.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if (
+        nofollow is None
+        or directory is None
+        or os.open not in os.supports_dir_fd
+        or os.scandir not in os.supports_fd
+    ):
+        return None, "unavailable"
+    flags = os.O_RDONLY | nofollow | directory
+    stack: list[tuple[int, Any]] = []
+    total = 0
+    entries_seen = 0
+    if deadline is None:
+        deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
+    try:
+        root_fd = os.open(path, flags, dir_fd=parent_fd)
+        try:
+            root_entries = os.scandir(root_fd)
+        except BaseException:
+            os.close(root_fd)
+            raise
+        stack.append((root_fd, root_entries))
+        while stack:
+            current_fd, entries = stack[-1]
+            try:
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                os.close(current_fd)
+                stack.pop()
+                continue
+            entries_seen += 1
+            if (
+                entries_seen > _DISK_TELEMETRY_ENTRY_BUDGET
+                or time.monotonic() >= deadline
+            ):
+                return None, "budget-exceeded"
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                if len(stack) >= _DISK_TELEMETRY_DEPTH_BUDGET:
+                    return None, "budget-exceeded"
+                child_fd = os.open(entry.name, flags, dir_fd=current_fd)
+                try:
+                    child_entries = os.scandir(child_fd)
+                except BaseException:
+                    os.close(child_fd)
+                    raise
+                stack.append((child_fd, child_entries))
+            elif stat.S_ISREG(metadata.st_mode):
+                if seen_linked_files is not None and metadata.st_nlink > 1:
+                    identity = (int(metadata.st_dev), int(metadata.st_ino))
+                    if identity in seen_linked_files:
+                        continue
+                    seen_linked_files.add(identity)
+                total += int(metadata.st_size)
+        return total, "complete"
+    except OSError:
+        return None, "unavailable"
+    finally:
+        for descriptor, entries in reversed(stack):
+            entries.close()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
 
 # ``ToolExecutionTrigger`` validates identifiers by UTF-8 byte length, not
 # Python character count.  Schedule IDs normally fit unchanged, but legacy
@@ -151,7 +542,6 @@ _PENDING_LEASE_EXPIRES_AT_KEY = "_isolated_pending_lease_expires_at"
 _EXTERNAL_INGRESS_QUIESCE = "external-ingress-quiesce"
 _EXTERNAL_INGRESS_RESUME = "external-ingress-resume"
 _EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
-
 # A service-to-host event is a JSON-RPC notification and therefore has no
 # response channel. An opted-in producer may wrap a channel inbound payload in
 # this private descriptor; after the host has completed the inbound handler it
@@ -200,9 +590,6 @@ _HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY = "telegram-hosted-ingress-owner-v1"
 # worker owns one other item; the SDK notification reader naturally applies
 # backpressure to the producer before a third item can allocate host memory.
 _MAX_PENDING_NON_CURSOR_INGRESS_EVENTS = 1
-_event_source_client: ContextVar[Any | None] = ContextVar(
-    "isolated_event_source_client", default=None
-)
 # This value is set only around a host-validated Telegram polling callback.
 # It is task-local rather than part of the child's JSON payload so an isolated
 # service cannot promote an arbitrary notification into the cursor-owning
@@ -1211,6 +1598,17 @@ class _TrafficGate:
             if self._sealed:
                 raise _TrafficGateTerminalError()
             self._closed = True
+
+    async def close_if_idle(self) -> bool:
+        """Atomically close admission only when no work is already admitted."""
+
+        async with self._condition:
+            if self._sealed:
+                raise _TrafficGateTerminalError()
+            if self._active:
+                return False
+            self._closed = True
+            return True
 
     async def seal(self) -> None:
         """Make admission terminal without waiting for admitted calls.
@@ -2470,6 +2868,7 @@ _RUNTIME_OWNER_TEMP_PREFIX = ".kestrel-runtime-owner.tmp-"
 _VENV_RELOCATION_REPAIR_MARKER = ".kestrel-venv-relocation-pending"
 _VENV_RELOCATION_REPAIR_TEMP_PREFIX = ".kestrel-venv-relocation-pending.tmp-"
 _VENV_RELOCATION_REPAIR_PAYLOAD = b"kestrel-venv-relocation-v1\n"
+_VENV_RECLAIM_REPAIR_PAYLOAD = b"kestrel-venv-reclaim-v1\n"
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _ISOLATED_FEATURE_CLASS_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
@@ -3003,7 +3402,7 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
+def _read_venv_relocation_repair_marker_at(directory_fd: int) -> str | None:
     """Validate a durable relocation marker without following path entries."""
 
     marker_fd: Optional[int] = None
@@ -3015,7 +3414,7 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            return False
+            return None
         if (
             not stat.S_ISREG(metadata.st_mode)
             or (os.name == "posix" and metadata.st_uid != os.geteuid())
@@ -3050,7 +3449,7 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                return False
+                return None
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_nlink != 1
@@ -3073,13 +3472,23 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
                 "Hosted isolated feature relocation repair marker changed during "
                 "validation."
             )
-        payload = os.read(marker_fd, len(_VENV_RELOCATION_REPAIR_PAYLOAD) + 1)
-        if payload != _VENV_RELOCATION_REPAIR_PAYLOAD:
+        payload = os.read(
+            marker_fd,
+            max(
+                len(_VENV_RELOCATION_REPAIR_PAYLOAD),
+                len(_VENV_RECLAIM_REPAIR_PAYLOAD),
+            )
+            + 1,
+        )
+        if payload == _VENV_RELOCATION_REPAIR_PAYLOAD:
+            return "relocation"
+        if payload == _VENV_RECLAIM_REPAIR_PAYLOAD:
+            return "reclaim"
+        else:
             raise IsolatedRuntimePreparationError(
                 "Hosted isolated feature relocation repair state is corrupt; "
                 "tenant state was retained."
             )
-        return True
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -3091,10 +3500,18 @@ def _read_venv_relocation_repair_marker_at(directory_fd: int) -> bool:
             os.close(marker_fd)
 
 
-def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
+def _ensure_venv_relocation_repair_marker_at(
+    directory_fd: int,
+    *,
+    payload: bytes = _VENV_RELOCATION_REPAIR_PAYLOAD,
+) -> None:
     """Publish repair intent before a feature-directory rename can commit."""
 
-    if _read_venv_relocation_repair_marker_at(directory_fd):
+    expected_kind = "reclaim" if payload == _VENV_RECLAIM_REPAIR_PAYLOAD else "relocation"
+    existing_kind = _read_venv_relocation_repair_marker_at(directory_fd)
+    if existing_kind == expected_kind or (
+        existing_kind == "reclaim" and expected_kind == "relocation"
+    ):
         return
     temporary = (
         f"{_VENV_RELOCATION_REPAIR_TEMP_PREFIX}{os.getpid()}-{uuid4().hex}"
@@ -3111,26 +3528,34 @@ def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
             _PRIVATE_FILE_MODE,
             dir_fd=directory_fd,
         )
-        _write_all(temporary_fd, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        _write_all(temporary_fd, payload)
         os.fsync(temporary_fd)
         os.close(temporary_fd)
         temporary_fd = None
-        try:
-            os.link(
+        if existing_kind is None:
+            try:
+                os.link(
+                    temporary,
+                    _VENV_RELOCATION_REPAIR_MARKER,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+        else:
+            os.rename(
                 temporary,
                 _VENV_RELOCATION_REPAIR_MARKER,
                 src_dir_fd=directory_fd,
                 dst_dir_fd=directory_fd,
-                follow_symlinks=False,
             )
-        except FileExistsError:
-            pass
         try:
             os.unlink(temporary, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
         os.fsync(directory_fd)
-        if not _read_venv_relocation_repair_marker_at(directory_fd):
+        if _read_venv_relocation_repair_marker_at(directory_fd) != expected_kind:
             raise IsolatedRuntimePreparationError(
                 "Hosted isolated feature relocation repair state could not be "
                 "recorded."
@@ -3144,14 +3569,14 @@ def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
             pass
 
 
-def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
+def _read_venv_relocation_repair_marker_portable(directory: Path) -> str | None:
     """Portable fallback for validating relocation repair intent."""
 
     marker = directory / _VENV_RELOCATION_REPAIR_MARKER
     try:
         metadata = marker.stat(follow_symlinks=False)
     except FileNotFoundError:
-        return False
+        return None
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
@@ -3184,7 +3609,7 @@ def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
         try:
             metadata = marker.stat(follow_symlinks=False)
         except FileNotFoundError:
-            return False
+            return None
         if (
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
@@ -3201,18 +3626,30 @@ def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
                 "Hosted isolated feature relocation repair marker has an unsafe "
                 "external hard link."
             )
-    if marker.read_bytes() != _VENV_RELOCATION_REPAIR_PAYLOAD:
+    payload = marker.read_bytes()
+    if payload == _VENV_RELOCATION_REPAIR_PAYLOAD:
+        return "relocation"
+    if payload == _VENV_RECLAIM_REPAIR_PAYLOAD:
+        return "reclaim"
+    else:
         raise IsolatedRuntimePreparationError(
             "Hosted isolated feature relocation repair state is corrupt; tenant "
             "state was retained."
         )
-    return True
 
 
-def _ensure_venv_relocation_repair_marker_portable(directory: Path) -> None:
+def _ensure_venv_relocation_repair_marker_portable(
+    directory: Path,
+    *,
+    payload: bytes = _VENV_RELOCATION_REPAIR_PAYLOAD,
+) -> None:
     """Portable fallback for publishing relocation repair intent."""
 
-    if _read_venv_relocation_repair_marker_portable(directory):
+    expected_kind = "reclaim" if payload == _VENV_RECLAIM_REPAIR_PAYLOAD else "relocation"
+    existing_kind = _read_venv_relocation_repair_marker_portable(directory)
+    if existing_kind == expected_kind or (
+        existing_kind == "reclaim" and expected_kind == "relocation"
+    ):
         return
     marker = directory / _VENV_RELOCATION_REPAIR_MARKER
     temporary = directory / (
@@ -3225,19 +3662,22 @@ def _ensure_venv_relocation_repair_marker_portable(directory: Path) -> None:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             _PRIVATE_FILE_MODE,
         )
-        _write_all(descriptor, _VENV_RELOCATION_REPAIR_PAYLOAD)
+        _write_all(descriptor, payload)
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        try:
-            os.link(temporary, marker, follow_symlinks=False)
-        except FileExistsError:
-            pass
+        if existing_kind is None:
+            try:
+                os.link(temporary, marker, follow_symlinks=False)
+            except FileExistsError:
+                pass
+        else:
+            os.replace(temporary, marker)
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
-        if not _read_venv_relocation_repair_marker_portable(directory):
+        if _read_venv_relocation_repair_marker_portable(directory) != expected_kind:
             raise IsolatedRuntimePreparationError(
                 "Hosted isolated feature relocation repair state could not be "
                 "recorded."
@@ -4265,6 +4705,94 @@ def prepare_isolated_runtime_namespace(
         os.close(root_fd)
 
 
+def _cleanup_directory_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _open_cleanup_child_at(
+    parent_fd: int,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> int:
+    """Open one previously observed child without following a replaced entry."""
+
+    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or _cleanup_directory_identity(metadata) != expected_identity
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup target changed during "
+            "validation."
+        )
+    child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    try:
+        if _cleanup_directory_identity(os.fstat(child_fd)) != expected_identity:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup target changed during "
+                "validation."
+            )
+        return child_fd
+    except BaseException:
+        os.close(child_fd)
+        raise
+
+
+def _open_cleanup_parent_at(
+    child_fd: int,
+    expected_identity: tuple[int, int],
+) -> int:
+    """Ascend one verified inode edge without retaining an unbounded fd stack."""
+
+    metadata = os.stat("..", dir_fd=child_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or _cleanup_directory_identity(metadata) != expected_identity
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime cleanup parent changed during "
+            "validation."
+        )
+    parent_fd = os.open("..", _directory_open_flags(), dir_fd=child_fd)
+    try:
+        if _cleanup_directory_identity(os.fstat(parent_fd)) != expected_identity:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature runtime cleanup parent changed during "
+                "validation."
+            )
+        return parent_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _cleanup_child_directories_at(
+    directory_fd: int,
+    *,
+    allow_owner_marker: bool,
+) -> list[tuple[str, tuple[int, int]]]:
+    """Snapshot child-directory identities after checking namespace custody."""
+
+    children: list[tuple[str, tuple[int, int]]] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            name = entry.name
+            if not allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature runtime cleanup found a nested "
+                    "ownership marker; allocated namespaces must not contain "
+                    "one another."
+                )
+            metadata = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(metadata.st_mode):
+                children.append((name, _cleanup_directory_identity(metadata)))
+    return children
+
+
 def _assert_no_nested_runtime_owners_at(
     directory_fd: int,
     *,
@@ -4275,76 +4803,334 @@ def _assert_no_nested_runtime_owners_at(
     Multi-component namespaces are valid, but allocated namespace leaves must
     remain prefix-free. This descriptor-relative preflight prevents deleting
     any sibling content before discovering that a descendant is independently
-    bound to an agent. The deletion walk repeats the check to fail closed if a
-    marker appears between preflight and mutation.
+    bound to an agent. The iterative walk ascends through verified ``..`` inode
+    edges, retaining only names/identities for ancestors. Tenant-controlled
+    depth is therefore linear in time and memory without retaining an
+    unbounded descriptor stack or using Python recursion.
     """
 
-    with os.scandir(directory_fd) as entries:
-        names = [entry.name for entry in entries]
-    if not allow_owner_marker and _RUNTIME_OWNER_MARKER in names:
-        raise IsolatedRuntimeNamespaceError(
-            "Hosted isolated feature runtime cleanup found a nested ownership "
-            "marker; allocated namespaces must not contain one another."
+    current_fd = os.dup(directory_fd)
+    try:
+        current_identity = _cleanup_directory_identity(os.fstat(current_fd))
+        current_name: str | None = None
+        children = _cleanup_child_directories_at(
+            current_fd,
+            allow_owner_marker=allow_owner_marker,
         )
-    for name in names:
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(metadata.st_mode):
-            continue
-        child_fd = os.open(name, _directory_open_flags(), dir_fd=directory_fd)
-        try:
-            if not _same_file_identity(metadata, os.fstat(child_fd)):
-                raise IsolatedRuntimeNamespaceError(
-                    "Hosted isolated feature runtime cleanup target changed "
-                    "during nested-owner validation."
+        ancestors: list[
+            tuple[tuple[int, int], str | None, list[tuple[str, tuple[int, int]]]]
+        ] = []
+        while True:
+            if children:
+                child_name, child_identity = children.pop()
+                child_fd = _open_cleanup_child_at(
+                    current_fd,
+                    child_name,
+                    child_identity,
                 )
-            _assert_no_nested_runtime_owners_at(
-                child_fd,
-                allow_owner_marker=False,
-            )
-        finally:
-            os.close(child_fd)
+                ancestors.append((current_identity, current_name, children))
+                os.close(current_fd)
+                current_fd = child_fd
+                current_identity = child_identity
+                current_name = child_name
+                children = _cleanup_child_directories_at(
+                    current_fd,
+                    allow_owner_marker=False,
+                )
+                continue
+            if not ancestors:
+                return
+            parent_identity, parent_name, remaining_children = ancestors.pop()
+            parent_fd = _open_cleanup_parent_at(current_fd, parent_identity)
+            try:
+                assert current_name is not None
+                metadata = os.stat(
+                    current_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if _cleanup_directory_identity(metadata) != current_identity:
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature runtime cleanup target changed "
+                        "during nested-owner validation."
+                    )
+            except BaseException:
+                os.close(parent_fd)
+                raise
+            os.close(current_fd)
+            current_fd = parent_fd
+            current_identity = parent_identity
+            current_name = parent_name
+            children = remaining_children
+    finally:
+        os.close(current_fd)
 
 
 def _remove_directory_contents_at(
     directory_fd: int,
     *,
     allow_owner_marker: bool,
+    preserve_names: frozenset[str] = frozenset(),
 ) -> None:
-    """Delete one already-open tree without following any directory symlink."""
+    """Delete one already-open tree without recursion or following symlinks."""
 
-    with os.scandir(directory_fd) as entries:
-        names = [entry.name for entry in entries]
-    if not allow_owner_marker and _RUNTIME_OWNER_MARKER in names:
-        raise IsolatedRuntimeNamespaceError(
-            "Hosted isolated feature runtime cleanup found a nested ownership "
-            "marker; allocated namespaces must not contain one another."
-        )
-    for name in names:
-        # The top-level marker is the custody proof needed to retry a partial
-        # cleanup. Preserve it throughout the sweep regardless of filesystem
-        # enumeration order. Nested markers remain a hard failure above.
-        if allow_owner_marker and name == _RUNTIME_OWNER_MARKER:
-            continue
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(metadata.st_mode):
-            child_fd = os.open(name, _directory_open_flags(), dir_fd=directory_fd)
+    current_fd = os.dup(directory_fd)
+    try:
+        current_identity = _cleanup_directory_identity(os.fstat(current_fd))
+        current_name: str | None = None
+        ancestors: list[tuple[tuple[int, int], str | None]] = []
+        custody_checked: set[tuple[int, int]] = set()
+        while True:
+            permits_owner_marker = allow_owner_marker and not ancestors
+            if current_identity not in custody_checked:
+                _cleanup_child_directories_at(
+                    current_fd,
+                    allow_owner_marker=permits_owner_marker,
+                )
+                custody_checked.add(current_identity)
+
+            child: tuple[str, tuple[int, int]] | None = None
+            with os.scandir(current_fd) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if permits_owner_marker and name == _RUNTIME_OWNER_MARKER:
+                        continue
+                    if not permits_owner_marker and name == _RUNTIME_OWNER_MARKER:
+                        raise IsolatedRuntimeNamespaceError(
+                            "Hosted isolated feature runtime cleanup found a "
+                            "nested ownership marker; allocated namespaces must "
+                            "not contain one another."
+                        )
+                    if not ancestors and name in preserve_names:
+                        continue
+                    metadata = os.stat(
+                        name,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        child = (name, _cleanup_directory_identity(metadata))
+                        break
+                    # Symlinks and special files are removed as entries; they
+                    # are never opened or traversed.
+                    os.unlink(name, dir_fd=current_fd)
+
+            if child is not None:
+                child_name, child_identity = child
+                child_fd = _open_cleanup_child_at(
+                    current_fd,
+                    child_name,
+                    child_identity,
+                )
+                ancestors.append((current_identity, current_name))
+                os.close(current_fd)
+                current_fd = child_fd
+                current_identity = child_identity
+                current_name = child_name
+                continue
+
+            if not ancestors:
+                return
+            parent_identity, parent_name = ancestors.pop()
+            parent_fd = _open_cleanup_parent_at(current_fd, parent_identity)
             try:
-                if not _same_file_identity(metadata, os.fstat(child_fd)):
+                assert current_name is not None
+                metadata = os.stat(
+                    current_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or _cleanup_directory_identity(metadata) != current_identity
+                ):
                     raise IsolatedRuntimeNamespaceError(
                         "Hosted isolated feature runtime cleanup target changed "
-                        "during validation."
+                        "during removal."
                     )
-                _remove_directory_contents_at(
-                    child_fd,
-                    allow_owner_marker=False,
+                os.rmdir(current_name, dir_fd=parent_fd)
+            except BaseException:
+                os.close(parent_fd)
+                raise
+            os.close(current_fd)
+            current_fd = parent_fd
+            current_identity = parent_identity
+            current_name = parent_name
+    finally:
+        os.close(current_fd)
+
+
+def _open_existing_hosted_feature_runtime(
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+    feature_component: str,
+) -> int:
+    """Open one existing feature directory through its verified owner scope.
+
+    The returned descriptor is independent of the custody chain and must be
+    closed by the caller. No component is created and no symlink is followed.
+    """
+
+    if type(owner) is not str or not owner:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature access requires an agent identity."
+        )
+    if _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(feature_component) is None:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature access component is invalid."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - non-POSIX policy
+        raise IsolatedRuntimePreparationError(
+            "Secure hosted feature access is unavailable on this platform."
+        )
+
+    descriptors: list[int] = []
+    try:
+        current_fd = os.open(scope.root, _directory_open_flags())
+        descriptors.append(current_fd)
+        lexical_root = os.stat(scope.root, follow_symlinks=False)
+        if not _same_file_identity(lexical_root, os.fstat(current_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature access root changed during validation."
+            )
+        _validate_operator_root_metadata(os.fstat(current_fd))
+        for component in scope.namespace.parts:
+            current_fd = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=current_fd,
+            )
+            descriptors.append(current_fd)
+        _read_existing_runtime_owner(current_fd, owner)
+        current_fd = os.open(
+            "feature_venvs",
+            _directory_open_flags(),
+            dir_fd=current_fd,
+        )
+        descriptors.append(current_fd)
+        current_fd = os.open(
+            feature_component,
+            _directory_open_flags(),
+            dir_fd=current_fd,
+        )
+        descriptors.append(current_fd)
+        return os.dup(current_fd)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _remove_isolated_feature_runtime(
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+    feature_component: str,
+) -> RuntimeNamespaceCleanupOutcome:
+    """Securely remove one idle feature tree while retaining its agent scope."""
+
+    if type(owner) is not str or not owner:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature cleanup requires an agent identity."
+        )
+    if _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(feature_component) is None:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature cleanup component is invalid."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - non-POSIX policy
+        raise IsolatedRuntimePreparationError(
+            "Secure hosted feature cleanup is unavailable on this platform; "
+            "runtime state was retained."
+        )
+
+    descriptors: list[int] = []
+    try:
+        current_fd = os.open(scope.root, _directory_open_flags())
+        descriptors.append(current_fd)
+        lexical_root = os.stat(scope.root, follow_symlinks=False)
+        if not _same_file_identity(lexical_root, os.fstat(current_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature cleanup root changed during validation."
+            )
+        _validate_operator_root_metadata(os.fstat(current_fd))
+        for component in scope.namespace.parts:
+            try:
+                current_fd = os.open(
+                    component, _directory_open_flags(), dir_fd=current_fd
                 )
-            finally:
-                os.close(child_fd)
-            os.rmdir(name, dir_fd=directory_fd)
-        else:
-            # Symlinks and special files are removed as directory entries; they
-            # are never opened or traversed.
-            os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+            descriptors.append(current_fd)
+        _read_existing_runtime_owner(current_fd, owner)
+        try:
+            feature_parent_fd = os.open(
+                "feature_venvs", _directory_open_flags(), dir_fd=current_fd
+            )
+        except FileNotFoundError:
+            return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+        descriptors.append(feature_parent_fd)
+        try:
+            feature_fd = os.open(
+                feature_component,
+                _directory_open_flags(),
+                dir_fd=feature_parent_fd,
+            )
+        except FileNotFoundError:
+            return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+        descriptors.append(feature_fd)
+        lexical_feature = os.stat(
+            scope.path / "feature_venvs" / feature_component,
+            follow_symlinks=False,
+        )
+        if not _same_file_identity(lexical_feature, os.fstat(feature_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature cleanup target changed during validation."
+            )
+        _assert_no_nested_runtime_owners_at(feature_fd, allow_owner_marker=False)
+        # Publish durable repair intent before the first destructive mutation.
+        # Keep it until the whole sweep succeeds so a partial reclaim can never
+        # be adopted as a healthy unstamped venv on the next cold wake.
+        _ensure_venv_relocation_repair_marker_at(
+            feature_fd,
+            payload=_VENV_RECLAIM_REPAIR_PAYLOAD,
+        )
+        _remove_directory_contents_at(
+            feature_fd,
+            allow_owner_marker=False,
+            preserve_names=frozenset({_VENV_RELOCATION_REPAIR_MARKER}),
+        )
+        os.unlink(_VENV_RELOCATION_REPAIR_MARKER, dir_fd=feature_fd)
+        os.fsync(feature_fd)
+        try:
+            os.rmdir(feature_component, dir_fd=feature_parent_fd)
+        except OSError:
+            # The directory is still linked, so restore durable repair intent
+            # before reporting a failed final commit. A later cold wake must
+            # never adopt the partially swept runtime as healthy.
+            _ensure_venv_relocation_repair_marker_at(
+                feature_fd,
+                payload=_VENV_RECLAIM_REPAIR_PAYLOAD,
+            )
+            raise
+        os.fsync(feature_parent_fd)
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+    except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+        raise
+    except (RecursionError, MemoryError) as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature cleanup could not complete; runtime state "
+            "was retained."
+        ) from exc
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature cleanup encountered an unsafe path entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature cleanup could not complete; runtime state "
+            "was retained."
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def remove_isolated_runtime_namespace(
@@ -4480,6 +5266,11 @@ def remove_isolated_runtime_namespace(
         return RuntimeNamespaceCleanupOutcome.REMOVED
     except IsolatedRuntimeNamespaceError:
         raise
+    except (RecursionError, MemoryError) as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature runtime cleanup could not complete; tenant "
+            "state was retained."
+        ) from exc
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -4671,6 +5462,11 @@ def remove_released_legacy_runtime_root(
         return RuntimeNamespaceCleanupOutcome.REMOVED
     except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
         raise
+    except (RecursionError, MemoryError) as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted released runtime cleanup could not complete; tenant state "
+            "was retained."
+        ) from exc
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise IsolatedRuntimeNamespaceError(
@@ -5104,6 +5900,7 @@ class _ValidatedHostedPrebuiltOverrides:
 
     venv_path: Optional[Path]
     venv_bin_path: Optional[Path]
+    venv_setting: Optional[str]
     bin_path: Optional[Path]
 
 
@@ -5147,6 +5944,11 @@ def _validate_hosted_process_prebuilt_overrides(
     selected_venv_bin_path = (
         selected_venv.bin_path if selected_venv is not None else None
     )
+    selected_venv_setting: Optional[str] = None
+    if validated_process_venv is not None:
+        selected_venv_setting = venv_key
+    elif validated_runtime_venv is not None:
+        selected_venv_setting = _HOSTED_RUNTIME_VENV_SETTING
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
@@ -5154,11 +5956,13 @@ def _validate_hosted_process_prebuilt_overrides(
         return _ValidatedHostedPrebuiltOverrides(
             venv_path=selected_venv_path,
             venv_bin_path=selected_venv_bin_path,
+            venv_setting=selected_venv_setting,
             bin_path=_validate_hosted_prebuilt_bin(bin_value, setting=bin_key),
         )
     return _ValidatedHostedPrebuiltOverrides(
         venv_path=selected_venv_path,
         venv_bin_path=selected_venv_bin_path,
+        venv_setting=selected_venv_setting,
         bin_path=None,
     )
 
@@ -5559,6 +6363,9 @@ class ProxyFeature(Feature):
         client_factory: Optional[Callable[..., Any]] = None,
     ):
         super().__init__(agent)
+        agent_attributes = getattr(agent, "__dict__", None)
+        if isinstance(agent_attributes, dict):
+            agent_attributes["_isolated_runtime_features_constructed"] = True
         self.runtime = runtime
         self.name = runtime.class_name
         # Resolve hosted containment before classifying optional feature
@@ -5598,6 +6405,11 @@ class ProxyFeature(Feature):
         self._client_factory = client_factory
         self._client: Any = None
         self._tools: List[AgentTool] = []
+        # UI capabilities are initialize-handshake metadata, not live child
+        # traffic. Preserve the last parsed contribution while an idle child is
+        # deliberately absent so the console manifest does not flap off even
+        # though registry-derived feature capabilities remain enabled.
+        self._idle_ui_contributions: Optional[UIContributions] = None
         self._supervision_task: Optional[asyncio.Task] = None
         # A terminal cleanup owns sealing, lifecycle serialization, and child
         # retirement as one transaction.  Keep one shared task so repeated
@@ -5692,6 +6504,101 @@ class ProxyFeature(Feature):
                 self.runtime.service
             )
         self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
+        agent_attributes = getattr(agent, "__dict__", {})
+        default_idle_timeout: float | None = (
+            agent_attributes.get("isolated_runtime_idle_timeout_seconds")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        feature_idle_timeouts = (
+            agent_attributes.get("isolated_runtime_idle_timeouts", {})
+            if isinstance(agent_attributes, dict)
+            else {}
+        )
+        self._idle_timeout_explicit_override = self.name in feature_idle_timeouts
+        self._idle_timeout_seconds = feature_idle_timeouts.get(
+            self.name, default_idle_timeout
+        )
+        self._telemetry_observer = (
+            agent_attributes.get("isolated_runtime_telemetry_observer")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        self._telemetry_observer_agent_lock = (
+            agent_attributes.get("_isolated_runtime_telemetry_observer_lock")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        if self._telemetry_observer is not None and not isinstance(
+            self._telemetry_observer_agent_lock, asyncio.Lock
+        ):
+            # Preserve the historical direct-attribute construction seam while
+            # still binding every proxy for this exact agent to one lock.
+            self._telemetry_observer_agent_lock = asyncio.Lock()
+            if isinstance(agent_attributes, dict):
+                agent_attributes["_isolated_runtime_telemetry_observer_lock"] = (
+                    self._telemetry_observer_agent_lock
+                )
+        self._telemetry_observer_agent_admission = (
+            agent_attributes.get("_isolated_runtime_telemetry_observer_admission")
+            if isinstance(agent_attributes, dict)
+            else None
+        )
+        if self._telemetry_observer is not None and not isinstance(
+            self._telemetry_observer_agent_admission,
+            _AgentTelemetryObserverAdmission,
+        ):
+            self._telemetry_observer_agent_admission = (
+                _AgentTelemetryObserverAdmission()
+            )
+            if isinstance(agent_attributes, dict):
+                agent_attributes["_isolated_runtime_telemetry_observer_admission"] = (
+                    self._telemetry_observer_agent_admission
+                )
+        self._idle_monitor_task: asyncio.Task[None] | None = None
+        self._idle_retired = False
+        self._activity_generation = 0
+        self._last_used_monotonic: float | None = None
+        self._last_used_at: datetime | None = None
+        self._health_restart_count = 0
+        self._idle_wake_count = 0
+        self._last_cold_start_seconds: float | None = None
+        self._last_warm_start_seconds: float | None = None
+        self._last_provision_seconds: float | None = None
+        self._last_cache_hit: bool | None = None
+        self._process_identity: tuple[int, float] | None = None
+        self._last_process_telemetry: tuple[
+            tuple[int, float], int | None, float | None, int | None, int | None
+        ] | None = None
+        self._environment_bytes: int | None = None
+        # A state-only disk refresh deliberately reuses the last venv byte
+        # count. Retain the matching hard-link identities too, otherwise the
+        # sibling uv cache would charge the same physical payload a second
+        # time while still reporting a complete sample.
+        self._environment_linked_file_identities: (
+            frozenset[tuple[int, int]] | None
+        ) = None
+        self._private_writable_bytes: int | None = None
+        self._downloaded_bytes: int | None = None
+        self._disk_telemetry_status: str | None = None
+        self._disk_budget_warning_emitted = False
+        self._workspace_reclaim_generation = 0
+        self._workspace_reclaimed = False
+        self._last_telemetry_emit_monotonic: float | None = None
+        self._telemetry_observer_tasks: set[asyncio.Future[Any]] = set()
+        self._telemetry_emit_tasks: set[asyncio.Task[None]] = set()
+        self._telemetry_emit_pending = False
+        self._telemetry_emit_force_pending = False
+        self._telemetry_observer_emit_pending = False
+        self._telemetry_observer_force_pending = False
+        self._telemetry_retry_task: asyncio.Task[None] | None = None
+        self._telemetry_retry_attempt = 0
+        self._telemetry_observer_warning_emitted = False
+        self._telemetry_disk_refresh_pending = False
+        self._telemetry_environment_refresh_pending = False
+        self._telemetry_disk_lock = asyncio.Lock()
+        self._idle_resume_event = asyncio.Event()
+        self._observed_inbound_producer = False
         # Event acknowledgement requests are intentionally detached from the
         # SDK read loop (which cannot await a response it must itself read).
         # Keep exact task ownership so terminal cleanup can cancel them rather
@@ -5714,6 +6621,11 @@ class ProxyFeature(Feature):
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
+        # BIN deliberately makes _venv_path name the unused Core default.
+        # Retain the separately validated immutable VENV for custody checks.
+        self._validated_hosted_immutable_venv_path: Optional[Path] = None
+        self._validated_hosted_immutable_venv_setting: Optional[str] = None
+        self._hosted_immutable_venv_custody_unproven = False
         # Hosted immutable console wrappers may themselves be operator-facing
         # symlinks. Preparation resolves and validates one exact regular target;
         # child construction must execute that target rather than re-following
@@ -5783,6 +6695,671 @@ class ProxyFeature(Feature):
         if self.runtime.description:
             return self.runtime.description
         return f"Isolated feature service for {self.name}"
+
+    def _runtime_telemetry_snapshot_inputs(
+        self,
+    ) -> tuple[dict[str, Any], Any, tuple[int, float] | None]:
+        """Freeze event-loop-owned lifecycle state before process sampling."""
+
+        retirement_clients = tuple(self._terminal_retirement_clients)
+        uncertain_retirement = self._retirement_is_uncertain()
+        client = self._client
+        if client is None and retirement_clients:
+            client = retirement_clients[0]
+        idle = self._idle_retired and client is None
+        if uncertain_retirement:
+            state = "retirement-uncertain"
+        elif self._terminal_lifecycle_latched or self._stopping:
+            state = "stopping" if client is not None else "stopped"
+        elif idle:
+            state = "idle"
+        elif client is not None:
+            state = "running"
+        else:
+            state = "starting"
+        values = {
+            "feature": self.name,
+            "distribution": self.runtime.distribution,
+            "state": state,
+            "lifecycle_generation": self._reload_gen,
+            "active_processes": int(client is not None or uncertain_retirement),
+            "restart_count": self._health_restart_count,
+            "idle_wake_count": self._idle_wake_count,
+            "last_used_at": self._last_used_at,
+            "cold_start_seconds": self._last_cold_start_seconds,
+            "warm_start_seconds": self._last_warm_start_seconds,
+            "environment_bytes": self._environment_bytes,
+            "private_writable_bytes": self._private_writable_bytes,
+            "downloaded_bytes": self._downloaded_bytes,
+            "provision_seconds": self._last_provision_seconds,
+            "cache_hit": self._last_cache_hit,
+            "cleanup_eligible": (
+                idle
+                and not uncertain_retirement
+                and not self._terminal_lifecycle_latched
+                and not self._stopping
+                and not self._immutable_venv_custody_is_unproven()
+                and not self._immutable_venv_override_is_inside_workspace()
+            ),
+            "disk_telemetry_status": self._disk_telemetry_status,
+        }
+        return values, client, self._process_identity
+
+    def _retirement_is_uncertain(self) -> bool:
+        """Return the predicate shared by telemetry and workspace reclaim."""
+
+        live_evidence = bool(
+            self._terminal_retirement_clients
+            or self._terminal_lifecycle_tasks
+        )
+        # A terminal cleanup can lose its last concrete facade handle while
+        # still being unable to prove completion. Non-terminal recovery does
+        # not inherit that sticky terminal meaning: once all exact evidence is
+        # gone, a republished/cleanly-idle child must report its current truth.
+        return live_evidence or bool(
+            self._terminal_cleanup_uncertain
+            and (self._terminal_lifecycle_latched or self._stopping)
+        )
+
+    @staticmethod
+    def _build_runtime_telemetry_snapshot(
+        values: dict[str, Any],
+        client: Any,
+        process_identity: tuple[int, float] | None,
+    ) -> IsolatedRuntimeTelemetrySnapshot:
+        """Perform only OS process sampling after lifecycle state is frozen."""
+
+        rss_bytes: int | None = None
+        cpu_seconds: float | None = None
+        open_fds: int | None = None
+        process_count: int | None = None
+        process = getattr(client, "process", None) if client is not None else None
+        pid = getattr(process, "pid", None)
+        if type(pid) is int and getattr(process, "returncode", None) is None:
+            try:
+                observed = psutil.Process(pid)
+                if process_identity != (pid, observed.create_time()):
+                    raise psutil.NoSuchProcess(pid)
+                children = observed.children(recursive=True)
+                memory = observed.memory_info().rss
+                cpu = observed.cpu_times()
+                rss_bytes = int(memory) + sum(
+                    int(child.memory_info().rss) for child in children
+                )
+                cpu_seconds = float(cpu.user + cpu.system) + sum(
+                    float(times.user + times.system)
+                    for times in (child.cpu_times() for child in children)
+                )
+                num_fds = getattr(observed, "num_fds", None)
+                open_fds = int(num_fds()) if callable(num_fds) else None
+                process_count = 1 + len(children)
+            except (OSError, RuntimeError, psutil.Error):
+                pass
+        return IsolatedRuntimeTelemetrySnapshot(
+            **values,
+            rss_bytes=rss_bytes,
+            cpu_seconds=cpu_seconds,
+            open_fds=open_fds,
+            process_count=process_count,
+        )
+
+    def runtime_telemetry_snapshot(self) -> IsolatedRuntimeTelemetrySnapshot:
+        """Return lifecycle state plus the last off-loop OS process sample.
+
+        This synchronous pull seam never traverses the host process table. Use
+        :meth:`sample_runtime_telemetry` when a caller requires a fresh sample.
+        """
+
+        values, client, process_identity = self._runtime_telemetry_snapshot_inputs()
+        cached = self._last_process_telemetry
+        if client is not None and cached is not None and cached[0] == process_identity:
+            _identity, rss_bytes, cpu_seconds, open_fds, process_count = cached
+        else:
+            rss_bytes = cpu_seconds = open_fds = process_count = None
+        return IsolatedRuntimeTelemetrySnapshot(
+            **values,
+            rss_bytes=rss_bytes,
+            cpu_seconds=cpu_seconds,
+            open_fds=open_fds,
+            process_count=process_count,
+        )
+
+    async def sample_runtime_telemetry(
+        self, *, refresh_disk: bool = False
+    ) -> IsolatedRuntimeTelemetrySnapshot:
+        """Return a fresh path-free snapshot with expensive sampling off-loop.
+
+        Disk traversal remains opt-in for pull-only hosts. Observer-driven
+        telemetry refreshes it separately on its bounded cadence.
+        """
+
+        if refresh_disk:
+            expected_reclaim_generation = self._workspace_reclaim_generation
+            await self._refresh_disk_telemetry(
+                refresh_environment=True,
+                expected_reclaim_generation=expected_reclaim_generation,
+                require_observer=False,
+            )
+
+        inputs = self._runtime_telemetry_snapshot_inputs()
+        snapshot = await asyncio.to_thread(
+            self._build_runtime_telemetry_snapshot, *inputs
+        )
+        process_identity = inputs[2]
+        if process_identity is not None and self._process_identity == process_identity:
+            self._last_process_telemetry = (
+                process_identity,
+                snapshot.rss_bytes,
+                snapshot.cpu_seconds,
+                snapshot.open_fds,
+                snapshot.process_count,
+            )
+        return snapshot
+
+    async def _refresh_disk_telemetry(
+        self,
+        *,
+        refresh_environment: bool = False,
+        expected_reclaim_generation: int | None = None,
+        require_observer: bool = True,
+    ) -> None:
+        """Refresh owned workspace byte counters outside the event loop."""
+
+        if require_observer and self._telemetry_observer is None:
+            return
+
+        runtime_dir = self._feature_runtime_dir()
+        hosted_scope = self._isolated_runtime_scope
+        runtime_owner = (
+            _agent_runtime_owner(self.agent) if hosted_scope is not None else None
+        )
+
+        def measure() -> tuple[
+            int | None,
+            int | None,
+            int | None,
+            str,
+            frozenset[tuple[int, int]] | None,
+        ]:
+            deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
+            cached_environment_links = self._environment_linked_file_identities
+            seen_linked_files: set[tuple[int, int]] = (
+                set(cached_environment_links)
+                if not refresh_environment and cached_environment_links is not None
+                else set()
+            )
+            environment_links = cached_environment_links
+            statuses: list[str] = []
+            runtime_fd: int | None = None
+            if hosted_scope is not None:
+                assert runtime_owner is not None
+                try:
+                    runtime_fd = _open_existing_hosted_feature_runtime(
+                        hosted_scope,
+                        runtime_owner,
+                        self._runtime_directory_name,
+                    )
+                except (
+                    OSError,
+                    IsolatedRuntimeNamespaceError,
+                    IsolatedRuntimePreparationError,
+                ):
+                    return None, None, None, "unavailable", environment_links
+
+            def measure_component(component: str) -> tuple[int | None, str]:
+                return _measure_directory_tree_bytes(
+                    component if runtime_fd is not None else runtime_dir / component,
+                    parent_fd=runtime_fd,
+                    deadline=deadline,
+                    seen_linked_files=seen_linked_files,
+                )
+
+            managed_venv = self._runtime_venv_is_core_managed(
+                runtime_dir=runtime_dir
+            )
+            try:
+                if managed_venv and refresh_environment:
+                    measured_environment, environment_status = measure_component(
+                        ".venv"
+                    )
+                    statuses.append(environment_status)
+                    environment = measured_environment
+                    environment_links = (
+                        frozenset(seen_linked_files)
+                        if environment_status == "complete"
+                        else None
+                    )
+                else:
+                    environment = self._environment_bytes
+                private_measurements = [
+                    measure_component(component)
+                    for component in (
+                        "work",
+                        "home",
+                        "tmp",
+                        "config",
+                        "data",
+                        "cache",
+                    )
+                ]
+                private_sizes = [size for size, _status in private_measurements]
+                statuses.extend(status for _size, status in private_measurements)
+                private = (
+                    sum(size for size in private_sizes if size is not None)
+                    if all(size is not None for size in private_sizes)
+                    else None
+                )
+                if hosted_scope is None:
+                    # Standalone workspaces have no provisioning cache. Its
+                    # truthful owned size is zero, not an unavailable path.
+                    downloaded = 0
+                else:
+                    downloaded, downloaded_status = measure_component(
+                        "provisioning_cache"
+                    )
+                    statuses.append(downloaded_status)
+                status = (
+                    "budget-exceeded"
+                    if "budget-exceeded" in statuses
+                    else "unavailable"
+                    if "unavailable" in statuses
+                    else "complete"
+                )
+                return environment, private, downloaded, status, environment_links
+            finally:
+                if runtime_fd is not None:
+                    os.close(runtime_fd)
+
+        async with self._telemetry_disk_lock:
+            if (
+                expected_reclaim_generation is not None
+                and expected_reclaim_generation != self._workspace_reclaim_generation
+            ):
+                return
+            if self._workspace_reclaimed:
+                # Successful reclaim has authoritative zero accounting. A
+                # pull sample must not reinterpret the intentionally absent
+                # directories as an unavailable measurement.
+                return
+            (
+                self._environment_bytes,
+                self._private_writable_bytes,
+                self._downloaded_bytes,
+                self._disk_telemetry_status,
+                environment_links,
+            ) = await asyncio.to_thread(measure)
+            if refresh_environment:
+                self._environment_linked_file_identities = environment_links
+        if (
+            self._disk_telemetry_status == "budget-exceeded"
+            and not self._disk_budget_warning_emitted
+        ):
+            self._disk_budget_warning_emitted = True
+            logger.warning(
+                "Hosted isolated runtime disk telemetry exceeded its shared "
+                "measurement budget for %s",
+                self.name,
+            )
+
+    def _schedule_forced_runtime_telemetry_retry(
+        self, *, infrastructure_unavailable: bool = False
+    ) -> None:
+        """Retry one durable transition snapshot with bounded backoff."""
+
+        if (
+            self._telemetry_observer is None
+            or self._terminal_lifecycle_latched
+            or self._stopping
+        ):
+            return
+        if (
+            not infrastructure_unavailable
+            and self._telemetry_retry_attempt >= _TELEMETRY_FORCED_RETRY_LIMIT
+        ):
+            # Preserve advisory delivery without allowing a permanently
+            # broken host callback to create a five-second process-table scan
+            # and warning loop for the lifetime of every feature. One final
+            # ordinary attempt observes the normal emission rate limit; later
+            # lifecycle/activity publications may begin a fresh streak only
+            # after an observer succeeds.
+            self._telemetry_emit_force_pending = False
+            self._telemetry_emit_pending = False
+            self._schedule_runtime_telemetry(force=False)
+            return
+        current = self._telemetry_retry_task
+        if current is not None and not current.done():
+            self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending = True
+            return
+        exponent = min(self._telemetry_retry_attempt, 10)
+        delay = min(
+            _TELEMETRY_RETRY_BASE_SECONDS * (2**exponent),
+            _TELEMETRY_RETRY_MAX_SECONDS,
+        )
+        self._telemetry_retry_attempt += 1
+
+        async def retry() -> None:
+            await asyncio.sleep(delay)
+            if self._telemetry_retry_task is asyncio.current_task():
+                self._telemetry_retry_task = None
+            if not self._terminal_lifecycle_latched and not self._stopping:
+                self._schedule_runtime_telemetry(force=True)
+
+        task = asyncio.create_task(
+            retry(),
+            name=f"isolated-runtime-telemetry-retry:{self.name}",
+        )
+        self._telemetry_retry_task = task
+
+        def consume_retry(completed: asyncio.Task[None]) -> None:
+            if self._telemetry_retry_task is completed:
+                self._telemetry_retry_task = None
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except BaseException:  # noqa: BLE001 - advisory retry cannot own lifecycle
+                logger.warning(
+                    "Hosted isolated runtime telemetry retry failed for %s",
+                    self.name,
+                )
+
+        task.add_done_callback(consume_retry)
+
+    async def _emit_runtime_telemetry(self, *, rate_limited: bool = False) -> None:
+        observer = self._telemetry_observer
+        if observer is None:
+            return
+        if any(not task.done() for task in self._telemetry_observer_tasks):
+            # Coalesce behind the one retained observer rather than dropping a
+            # terminal idle/capacity transition that may have no later trigger.
+            self._telemetry_observer_emit_pending = True
+            self._telemetry_observer_force_pending |= not rate_limited
+            return
+        loop = asyncio.get_running_loop()
+        if (
+            rate_limited
+            and self._last_telemetry_emit_monotonic is not None
+            and loop.time() - self._last_telemetry_emit_monotonic
+            < _TELEMETRY_EMIT_MIN_INTERVAL
+        ):
+            return
+        self._last_telemetry_emit_monotonic = loop.time()
+        try:
+            # Snapshot loop-owned lifecycle references before crossing into the
+            # worker.  The synchronous builder is deliberately non-mutating,
+            # so telemetry can never consume or clear lifecycle task state.
+            snapshot = await self.sample_runtime_telemetry()
+            async def invoke_observer() -> None:
+                # A host may supply a normal callable or an async callable. Run
+                # the call itself in a dedicated bounded pool so a slow
+                # synchronous observer cannot freeze the event loop or occupy
+                # the default executor needed by venv/lifecycle work. The
+                # agent-scoped lock keeps one tenant from occupying every
+                # process-global worker or queue slot.
+                assert isinstance(self._telemetry_observer_agent_lock, asyncio.Lock)
+                async with self._telemetry_observer_agent_lock:
+                    assert isinstance(
+                        self._telemetry_observer_agent_admission,
+                        _AgentTelemetryObserverAdmission,
+                    )
+                    callback = self._telemetry_observer_agent_admission.submit(
+                        _TELEMETRY_OBSERVER_EXECUTOR,
+                        observer,
+                        snapshot,
+                    )
+                    wrapped = asyncio.wrap_future(callback)
+
+                    def consume_wrapped(completed: asyncio.Future[Any]) -> None:
+                        if completed.cancelled():
+                            return
+                        try:
+                            completed.exception()
+                        except BaseException:  # noqa: BLE001 - advisory outcome
+                            pass
+
+                    wrapped.add_done_callback(consume_wrapped)
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.shield(wrapped),
+                            timeout=_TELEMETRY_OBSERVER_TIMEOUT,
+                        )
+                    except asyncio.CancelledError:
+                        # Terminal cleanup owns this asyncio task. Cancel a
+                        # callback that has not entered host code so the
+                        # bounded executor discards it instead of invoking an
+                        # observer after the proxy has shut down.
+                        callback.cancel()
+                        raise
+                    except asyncio.TimeoutError as exc:
+                        if callback.cancel():
+                            # A callback queued behind hostile workers must
+                            # become terminal at its delivery deadline. This
+                            # releases the per-agent lock so forced telemetry
+                            # can retry instead of coalescing forever behind a
+                            # Future that no worker can reach. Classify this as
+                            # Core observer-capacity unavailability rather than
+                            # blaming callback code which never ran.
+                            raise _TelemetryObserverSubmissionError(
+                                "telemetry observer worker unavailable before "
+                                "the delivery deadline"
+                            ) from exc
+                        # A callback which already entered user code cannot be
+                        # killed safely. Retain its task and per-agent lock so
+                        # one tenant cannot occupy every global worker.
+                        result = await asyncio.shield(wrapped)
+                    if inspect.isawaitable(result):
+                        await result
+
+            task = asyncio.create_task(
+                invoke_observer(),
+                name=f"isolated-runtime-observer:{self.name}",
+            )
+            self._telemetry_observer_tasks.add(task)
+
+            def consume_observer(completed: asyncio.Future[Any]) -> None:
+                self._telemetry_observer_tasks.discard(completed)
+                if completed.cancelled():
+                    pending = self._telemetry_observer_emit_pending
+                    force_pending = self._telemetry_observer_force_pending
+                    self._telemetry_observer_emit_pending = False
+                    self._telemetry_observer_force_pending = False
+                    if self._terminal_lifecycle_latched or self._stopping:
+                        return
+                    if not rate_limited or force_pending:
+                        self._telemetry_emit_pending |= pending
+                        self._telemetry_emit_force_pending = True
+                        self._schedule_forced_runtime_telemetry_retry()
+                    elif pending:
+                        self._schedule_runtime_telemetry(force=False)
+                    return
+                failed = False
+                infrastructure_unavailable = False
+                try:
+                    completed.result()
+                except _TelemetryObserverSubmissionError:
+                    failed = True
+                    infrastructure_unavailable = True
+                    if not self._telemetry_observer_warning_emitted:
+                        self._telemetry_observer_warning_emitted = True
+                        logger.warning(
+                            "Hosted isolated runtime telemetry observer capacity "
+                            "was unavailable for %s",
+                            self.name,
+                        )
+                except BaseException:  # noqa: BLE001 - advisory host callback
+                    failed = True
+                    if not self._telemetry_observer_warning_emitted:
+                        self._telemetry_observer_warning_emitted = True
+                        logger.warning(
+                            "Hosted isolated runtime telemetry observer failed for %s",
+                            self.name,
+                        )
+                pending = self._telemetry_observer_emit_pending
+                force_pending = self._telemetry_observer_force_pending
+                self._telemetry_observer_emit_pending = False
+                self._telemetry_observer_force_pending = False
+                if failed and (not rate_limited or force_pending):
+                    self._telemetry_emit_pending |= pending
+                    self._telemetry_emit_force_pending = True
+                    self._schedule_forced_runtime_telemetry_retry(
+                        infrastructure_unavailable=infrastructure_unavailable
+                    )
+                    return
+                if not failed:
+                    self._telemetry_retry_attempt = 0
+                    self._telemetry_observer_warning_emitted = False
+                if (
+                    pending
+                    and not self._terminal_lifecycle_latched
+                    and not self._stopping
+                ):
+                    self._schedule_runtime_telemetry(force=force_pending)
+
+            task.add_done_callback(consume_observer)
+            done, _pending = await asyncio.wait(
+                (task,), timeout=_TELEMETRY_OBSERVER_TIMEOUT
+            )
+            if task not in done:
+                logger.warning(
+                    "Hosted isolated runtime telemetry observer exceeded its "
+                    "delivery budget for %s",
+                    self.name,
+                )
+        except asyncio.CancelledError:
+            if (
+                not rate_limited
+                and not self._terminal_lifecycle_latched
+                and not self._stopping
+            ):
+                self._schedule_forced_runtime_telemetry_retry()
+            if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                raise
+            logger.warning(
+                "Hosted isolated runtime telemetry observer cancelled for %s", self.name
+            )
+        except BaseException:  # noqa: BLE001 - host observer cannot own child lifecycle
+            logger.warning(
+                "Hosted isolated runtime telemetry observer failed for %s", self.name
+            )
+            if not rate_limited:
+                self._schedule_forced_runtime_telemetry_retry()
+
+    def _schedule_runtime_telemetry(
+        self,
+        *,
+        force: bool = False,
+        refresh_disk: bool = False,
+        refresh_environment: bool = False,
+    ) -> None:
+        """Emit hot-path telemetry without retaining traffic admission."""
+
+        if (
+            self._telemetry_observer is None
+            or self._terminal_lifecycle_latched
+            or self._stopping
+        ):
+            return
+        self._telemetry_disk_refresh_pending |= refresh_disk
+        self._telemetry_environment_refresh_pending |= refresh_environment
+        retry_task = self._telemetry_retry_task
+        if retry_task is not None and not retry_task.done():
+            self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending |= force
+            return
+        if any(not task.done() for task in self._telemetry_observer_tasks):
+            self._telemetry_observer_emit_pending = True
+            self._telemetry_observer_force_pending |= force
+            return
+        if any(not task.done() for task in self._telemetry_emit_tasks):
+            self._telemetry_emit_pending = True
+            self._telemetry_emit_force_pending |= force
+            return
+        refresh_disk = self._telemetry_disk_refresh_pending
+        refresh_environment = self._telemetry_environment_refresh_pending
+        reclaim_generation = self._workspace_reclaim_generation
+        force |= self._telemetry_emit_force_pending
+        self._telemetry_emit_pending = False
+        self._telemetry_emit_force_pending = False
+        self._telemetry_disk_refresh_pending = False
+        self._telemetry_environment_refresh_pending = False
+
+        async def deliver() -> None:
+            if refresh_disk:
+                try:
+                    await self._refresh_disk_telemetry(
+                        refresh_environment=refresh_environment,
+                        expected_reclaim_generation=reclaim_generation,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:  # noqa: BLE001 - telemetry stays advisory
+                    logger.warning(
+                        "Hosted isolated runtime disk telemetry refresh failed for %s",
+                        self.name,
+                    )
+                    async with self._telemetry_disk_lock:
+                        if reclaim_generation == self._workspace_reclaim_generation:
+                            self._environment_bytes = None
+                            self._environment_linked_file_identities = None
+                            self._private_writable_bytes = None
+                            self._downloaded_bytes = None
+                            self._disk_telemetry_status = "unavailable"
+            await self._emit_runtime_telemetry(rate_limited=not force)
+
+        coro = deliver()
+        name = f"isolated-runtime-telemetry:{self.name}"
+        tracker = getattr(self.agent, "_track_background_task", None)
+        task = None
+        if callable(tracker):
+            try:
+                tracked = tracker(coro, name=name)
+                if isinstance(tracked, asyncio.Task):
+                    task = tracked
+            except Exception:  # noqa: BLE001 - test doubles may reject tracking
+                task = None
+        if task is None:
+            task = asyncio.create_task(coro, name=name)
+        self._telemetry_emit_tasks.add(task)
+
+        def consume(completed: asyncio.Task[None]) -> None:
+            self._telemetry_emit_tasks.discard(completed)
+            if completed.cancelled():
+                self._telemetry_emit_pending = False
+                self._telemetry_emit_force_pending = False
+                return
+            try:
+                completed.result()
+            except BaseException:
+                pass
+            pending = self._telemetry_emit_pending
+            force_pending = self._telemetry_emit_force_pending
+            if (
+                pending
+                and not self._terminal_lifecycle_latched
+                and not self._stopping
+            ):
+                self._schedule_runtime_telemetry(force=force_pending)
+
+        task.add_done_callback(consume)
+
+    def _record_runtime_activity(self) -> None:
+        self._activity_generation += 1
+        self._last_used_monotonic = asyncio.get_running_loop().time()
+        self._last_used_at = datetime.now(timezone.utc)
+
+    def _capture_process_identity(self, client: Any) -> None:
+        """Pin PID telemetry to the exact process generation just started."""
+
+        self._process_identity = None
+        process = getattr(client, "process", None)
+        pid = getattr(process, "pid", None)
+        if type(pid) is not int or getattr(process, "returncode", None) is not None:
+            return
+        try:
+            self._process_identity = (pid, psutil.Process(pid).create_time())
+        except (OSError, psutil.Error):
+            pass
 
     def _is_telegram_runtime(self) -> bool:
         return (
@@ -6290,6 +7867,8 @@ class ProxyFeature(Feature):
             # service with no health supervisor (kestrel-sovereign#2522 P2).
             self._terminal_lifecycle_latched = False
             self._stopping = False
+            self._idle_retired = False
+            self._process_identity = None
             # A previous enable cycle may have left an intentional empty config (or
             # a stopped client) on this same object. A fresh initialize must never
             # let that in-memory state stand in for the durable read below.
@@ -6313,6 +7892,17 @@ class ProxyFeature(Feature):
             await self._reset_traffic_gate_after_initialize()
             self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
+            self._last_used_monotonic = asyncio.get_running_loop().time()
+            self._start_idle_monitor()
+        # Advisory disk/process telemetry never extends lifecycle-lock custody.
+        # Capacity telemetry is advisory. Initial publication must not await a
+        # disk walk or a host callback, and all emissions must pass through the
+        # same serialization/coalescing owner.
+        self._schedule_runtime_telemetry(
+            force=True,
+            refresh_disk=True,
+            refresh_environment=True,
+        )
 
     async def _ensure_venv_without_blocking_event_loop(self) -> None:
         """Own synchronous preparation in a worker without orphaning it.
@@ -6324,11 +7914,16 @@ class ProxyFeature(Feature):
         venv mutation cannot continue after lifecycle ownership is released.
         """
 
+        started = asyncio.get_running_loop().time()
         task = asyncio.create_task(
             asyncio.to_thread(self.ensure_venv),
             name=f"isolated-venv-prepare:{self.name}",
         )
-        await _await_task_until_complete(task, preserve_cancellation=False)
+        environment_mutated = await _await_task_until_complete(
+            task, preserve_cancellation=False
+        )
+        self._last_provision_seconds = asyncio.get_running_loop().time() - started
+        self._last_cache_hit = not environment_mutated
 
     def _latch_terminal_lifecycle(self) -> int:
         """Record one terminal intent and revoke queued initialization permits.
@@ -6343,12 +7938,35 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_generation += 1
         self._terminal_lifecycle_latched = True
         self._stopping = True
+        self._idle_retired = False
+        self._idle_ui_contributions = None
+        self._idle_resume_event.set()
         for task in tuple(self._event_ack_tasks):
             task.cancel()
         for task in tuple(self._event_ingress_tasks):
             task.cancel()
         for task in tuple(self._deferred_acknowledged_event_tasks):
             task.cancel()
+        for task in tuple(self._telemetry_emit_tasks):
+            task.cancel()
+        for task in tuple(self._telemetry_observer_tasks):
+            task.cancel()
+        retry_task = self._telemetry_retry_task
+        if retry_task is not None:
+            retry_task.cancel()
+        self._telemetry_retry_task = None
+        self._telemetry_retry_attempt = 0
+        self._telemetry_observer_warning_emitted = False
+        self._telemetry_emit_pending = False
+        self._telemetry_emit_force_pending = False
+        self._telemetry_observer_emit_pending = False
+        self._telemetry_observer_force_pending = False
+        self._telemetry_disk_refresh_pending = False
+        self._telemetry_environment_refresh_pending = False
+        idle_monitor = self._idle_monitor_task
+        if idle_monitor is not None and idle_monitor is not asyncio.current_task():
+            idle_monitor.cancel()
+        self._idle_monitor_task = None
         return self._terminal_lifecycle_generation
 
     async def _run_traffic_gate_operation(
@@ -6461,6 +8079,15 @@ class ProxyFeature(Feature):
             register_channel_bridge=register_channel_bridge,
             channel_config=effective_config,
         )
+        # Publishing a new generation is the construction boundary for
+        # initialize, reload, replacement recovery, and idle wake. An in-place
+        # health restart reuses the existing facade and re-arms separately.
+        self._idle_retired = False
+        self._idle_resume_event.set()
+        # A replacement publication is the recovery boundary for an idle
+        # monitor that terminated unexpectedly in the prior generation. The
+        # helper is idempotent while the existing monitor remains live.
+        self._start_idle_monitor()
         try:
             await self._register_event_handler(client)
         except BaseException as exc:
@@ -6544,8 +8171,11 @@ class ProxyFeature(Feature):
                 "Isolated feature child process could not be prepared."
             ) from exc
         try:
+            started = asyncio.get_running_loop().time()
             await _maybe_await(client.start())
+            self._capture_process_identity(client)
             advertised_tools = await _maybe_await(client.list_tools())
+            self._last_cold_start_seconds = asyncio.get_running_loop().time() - started
         except BaseException as exc:
             await self._retire_detached_client(client)
             if isinstance(
@@ -6588,6 +8218,11 @@ class ProxyFeature(Feature):
 
         self._client = client
         self._tools = tools
+        self._idle_ui_contributions = self._ui_contributions_from_capabilities(
+            self._client_capabilities()
+        )
+        if not self._terminal_lifecycle_latched and not self._stopping:
+            self._terminal_cleanup_uncertain = False
         if register_channel_bridge:
             self._register_channel_bridge(channel_config)
 
@@ -7430,7 +9065,20 @@ class ProxyFeature(Feature):
         as in-process features, so isolated-venv features can contribute UI
         without the host proxying every static request.
         """
-        caps = self._client_capabilities()
+        if self._client is None:
+            return self._idle_ui_contributions if self._idle_retired else None
+        contribution = self._ui_contributions_from_capabilities(
+            self._client_capabilities()
+        )
+        self._idle_ui_contributions = contribution
+        return contribution
+
+    @staticmethod
+    def _ui_contributions_from_capabilities(
+        caps: Dict[str, Any],
+    ) -> Optional[UIContributions]:
+        """Parse one immutable host-owned view of child UI metadata."""
+
         ui = caps.get("ui_contributions") or caps.get("ui")
         if not isinstance(ui, dict):
             return None
@@ -7524,6 +9172,20 @@ class ProxyFeature(Feature):
         durable active configuration.
         """
         cfg = dict(config) if isinstance(config, dict) else {}
+        # Idle retirement removes only the process, not the feature's lifecycle
+        # contract. Recreate that child before staging so a negotiated
+        # transition validator cannot be bypassed by ``_client is None``.
+        idle_wake_failed = False
+        if self._idle_retired and not self._terminal_lifecycle_latched:
+            try:
+                await self._wake_idle_runtime()
+            except (IsolatedRuntimePreparationError, _TerminalLifecyclePermitRevoked):
+                # An unstartable child may be unstartable *because* its active
+                # config is bad. Re-evaluate under the lifecycle lock: terminal
+                # repair remains permitted, and a still-clientless idle feature
+                # can use the existing staged repair path without bypassing a
+                # live negotiated hook.
+                idle_wake_failed = True
         async with self._reload_lock:
             if self._terminal_lifecycle_latched:
                 return await self._persist_terminal_config(
@@ -7531,6 +9193,13 @@ class ProxyFeature(Feature):
                     preserve_secret_fields=_preserve_secret_fields,
                     validate_effective_config=_validate_effective_config,
                     expected_commit=_expected_commit,
+                )
+            if self._idle_retired and not idle_wake_failed:
+                # A very short idle deadline can retire again between the wake
+                # and this lock acquisition. Refuse this attempt rather than
+                # promoting without the child-owned transition hook.
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature became idle before config transition."
                 )
             self._begin_reload()
             # The gate closes only after an opt-in external producer has
@@ -9079,8 +10748,8 @@ class ProxyFeature(Feature):
     def _assert_child_start_allowed(self) -> None:
         """Refuse normal child-lifecycle work after terminal cleanup starts."""
 
-        if self._terminal_lifecycle_latched:
-            raise RuntimeError(
+        if self._terminal_lifecycle_latched or self._stopping:
+            raise _TerminalLifecyclePermitRevoked(
                 f"Cannot continue isolated feature {self.name}: terminal lifecycle "
                 "is latched; explicit initialize is required"
             )
@@ -9204,18 +10873,23 @@ class ProxyFeature(Feature):
         """
 
         client = self._client
-        if client is None:
-            return None
-        capabilities = self._host_ingress_capabilities()
-        if capabilities is None or not {
-            _EXTERNAL_INGRESS_QUIESCE,
-            _EXTERNAL_INGRESS_RESUME,
-        }.issubset(capabilities.names):
+        if client is None or not self._has_negotiated_external_ingress_lifecycle():
             return None
         return _ExternalIngressQuiesce(
             client=client,
             transition_id=secrets.token_urlsafe(_EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES),
         )
+
+    def _has_negotiated_external_ingress_lifecycle(self) -> bool:
+        """Return capability support without minting transition state."""
+
+        if self._client is None:
+            return False
+        capabilities = self._host_ingress_capabilities()
+        return capabilities is not None and {
+            _EXTERNAL_INGRESS_QUIESCE,
+            _EXTERNAL_INGRESS_RESUME,
+        }.issubset(capabilities.names)
 
     @staticmethod
     def _is_external_ingress_lifecycle_ack(value: Any, *, state: str) -> bool:
@@ -9508,46 +11182,73 @@ class ProxyFeature(Feature):
         """Perform an already-snapshotted ingress call inside traffic admission."""
 
         try:
-            async with self._traffic_gate.admit():
-                client = self._client
-                if client is None:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
-                    return
+            while True:
+                wake_idle = False
+                completed_call = False
+                async with self._traffic_gate.admit():
+                    client = self._client
+                    if client is None and self._idle_retired:
+                        wake_idle = True
+                    elif client is None:
+                        outcome_slot.outcome = _HostIngressOutcome(
+                            _HOST_INGRESS_UNSUPPORTED
+                        )
+                        return
+                    else:
+                        try:
+                            capabilities = self._host_ingress_capabilities()
+                        except asyncio.CancelledError:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_CANCELLED
+                            )
+                            return
+                        except BaseException:  # noqa: BLE001 - untrusted capability facade
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_GENERIC_FAILURE
+                            )
+                            return
+                        if capabilities is None:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_UNSUPPORTED
+                            )
+                            return
+                        if request.name not in capabilities.names:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_UNKNOWN_NAME
+                            )
+                            return
 
-                try:
-                    capabilities = self._host_ingress_capabilities()
-                except asyncio.CancelledError:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+                        try:
+                            call = getattr(client, "call_host_ingress", None)
+                        except asyncio.CancelledError:
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_CANCELLED
+                            )
+                            return
+                        except BaseException:  # noqa: BLE001 - untrusted descriptor boundary
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_GENERIC_FAILURE
+                            )
+                            return
+                        if not callable(call):
+                            outcome_slot.outcome = _HostIngressOutcome(
+                                _HOST_INGRESS_UNSUPPORTED
+                            )
+                            return
+                        self._record_runtime_activity()
+                        try:
+                            await self._call_host_ingress_rpc(
+                                call, request, outcome_slot
+                            )
+                        finally:
+                            self._record_runtime_activity()
+                        completed_call = True
+                if completed_call:
+                    self._schedule_runtime_telemetry()
                     return
-                except BaseException:  # noqa: BLE001 - untrusted capability facade
-                    outcome_slot.outcome = _HostIngressOutcome(
-                        _HOST_INGRESS_GENERIC_FAILURE
-                    )
-                    return
-                if capabilities is None:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
-                    return
-                if request.name not in capabilities.names:
-                    outcome_slot.outcome = _HostIngressOutcome(
-                        _HOST_INGRESS_UNKNOWN_NAME
-                    )
-                    return
-
-                try:
-                    call = getattr(client, "call_host_ingress", None)
-                except asyncio.CancelledError:
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
-                    return
-                except BaseException:  # noqa: BLE001 - untrusted descriptor boundary
-                    outcome_slot.outcome = _HostIngressOutcome(
-                        _HOST_INGRESS_GENERIC_FAILURE
-                    )
-                    return
-                if not callable(call):
-                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
-                    return
-                await self._call_host_ingress_rpc(call, request, outcome_slot)
-        except _TrafficGateTerminalError:
+                if wake_idle:
+                    await self._wake_idle_runtime()
+        except (_TrafficGateTerminalError, _TerminalLifecyclePermitRevoked):
             outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_TERMINAL)
         except asyncio.CancelledError:
             # The public caller shields this worker, so a cancellation here is
@@ -9691,22 +11392,47 @@ class ProxyFeature(Feature):
 
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         context = _scheduled_tool_execution_context()
+        requested_at = asyncio.get_running_loop().time()
+        experienced_wake = False
         # The gate keeps a selected client alive through the complete RPC.  It
         # is shared (not a reload mutex), so unrelated calls remain concurrent
         # whenever no config transition is active.
         try:
-            async with self._traffic_gate.admit():
-                # This preflight belongs *inside* admission. Otherwise a
-                # terminal shutdown with no published client would leak a
-                # scheduler-specific error instead of the stable fail-closed
-                # result used by every other new tool/channel call.
-                if context is not None and not self._supports_tool_execution_context(context):
-                    raise SchedulerExecutionContextUnavailable(
-                        "scheduled isolated tool calls require a service that advertises "
-                        "ToolExecutionContext support"
-                    )
-                return await self._call_isolated_tool_admitted(name, args, context)
-        except _TrafficGateTerminalError:
+            while True:
+                wake_idle = False
+                async with self._traffic_gate.admit():
+                    if self._client is None and self._idle_retired:
+                        wake_idle = True
+                    else:
+                        # This preflight belongs *inside* admission. Otherwise a
+                        # terminal shutdown with no published client would leak a
+                        # scheduler-specific error instead of the stable fail-closed
+                        # result used by every other new tool/channel call.
+                        if context is not None and not self._supports_tool_execution_context(context):
+                            raise SchedulerExecutionContextUnavailable(
+                                "scheduled isolated tool calls require a service that advertises "
+                                "ToolExecutionContext support"
+                            )
+                        if not experienced_wake:
+                            self._last_warm_start_seconds = (
+                                asyncio.get_running_loop().time() - requested_at
+                            )
+                        self._record_runtime_activity()
+                        try:
+                            result = await self._call_isolated_tool_admitted(
+                                name, args, context
+                            )
+                        finally:
+                            self._record_runtime_activity()
+                if not wake_idle:
+                    # Admission has been released before this background task
+                    # can begin any observer or disk work.
+                    self._schedule_runtime_telemetry()
+                    return result
+                if wake_idle:
+                    experienced_wake = True
+                    await self._wake_idle_runtime()
+        except (_TrafficGateTerminalError, _TerminalLifecyclePermitRevoked):
             if context is not None:
                 # Scheduled work must surface terminal admission as an
                 # exception so SchedulerRunner records a failed occurrence.
@@ -9719,6 +11445,15 @@ class ProxyFeature(Feature):
             return {
                 "status": "error",
                 "error": _TERMINAL_TRAFFIC_ERROR,
+                "tool": name,
+                "success": False,
+            }
+        except IsolatedRuntimePreparationError:
+            if context is not None:
+                raise
+            return {
+                "status": "error",
+                "error": "isolated feature could not start",
                 "tool": name,
                 "success": False,
             }
@@ -9869,63 +11604,105 @@ class ProxyFeature(Feature):
             logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
-        # A new resolution invalidates any prior enable cycle's console pin.
-        self._validated_hosted_console_path = None
+        hosted = self._runtime_is_hosted()
+        selected_setting = (
+            self._hosted_immutable_venv_setting() if hosted else None
+        )
         validated_hosted_overrides: Optional[
             _ValidatedHostedPrebuiltOverrides
         ] = None
-        if self._runtime_is_hosted():
-            # Revalidate here as well as at construction: tests, embedders, and
-            # long-lived hosts can mutate ``os.environ`` between discovery and
-            # enable.  A late process-wide path must never acquire provisioning
-            # authority merely because the ProxyFeature already exists.
-            validated_hosted_overrides = _validate_hosted_process_prebuilt_overrides(
-                self.name,
-                runtime_venv=self.runtime.venv,
-            )
-        bin_override = os.environ.get(_env_key(self.name, "BIN"))
-        if bin_override:
-            # BIN is authoritative for this launch attempt. Do not reflect or
-            # forward unused service metadata to the child factory.
-            self._service_target = None
-            if (
-                validated_hosted_overrides is not None
-                and validated_hosted_overrides.bin_path is not None
-            ):
-                return (
-                    self._default_venv_path(),
-                    validated_hosted_overrides.bin_path,
+        try:
+            if hosted:
+                # Revalidate here as well as at construction: tests, embedders,
+                # and long-lived hosts can mutate ``os.environ`` between
+                # discovery and enable. A late process-wide path must never
+                # acquire provisioning authority merely because the
+                # ProxyFeature already exists.
+                validated_hosted_overrides = (
+                    _validate_hosted_process_prebuilt_overrides(
+                        self.name,
+                        runtime_venv=self.runtime.venv,
+                    )
                 )
-            return (
-                self._default_venv_path(),
-                Path(bin_override).expanduser().resolve(),
-            )
 
-        # Revalidate at the launch-path mutation boundary. In particular, a
-        # BIN override removed after discovery must not expose missing or
-        # malformed service metadata to `_service_command`.
-        self._service_target = _validated_isolated_service_target(
-            self.runtime.service
+            bin_override = os.environ.get(_env_key(self.name, "BIN"))
+            if bin_override:
+                # BIN is authoritative for this launch attempt. Do not reflect
+                # or forward unused service metadata to the child factory.
+                service_target = None
+                resolved_venv = self._default_venv_path()
+                resolved_bin = (
+                    validated_hosted_overrides.bin_path
+                    if validated_hosted_overrides is not None
+                    and validated_hosted_overrides.bin_path is not None
+                    else Path(bin_override).expanduser().resolve()
+                )
+            else:
+                # A BIN override removed after discovery must not expose
+                # missing or malformed service metadata to `_service_command`.
+                service_target = _validated_isolated_service_target(
+                    self.runtime.service
+                )
+                venv_override = os.environ.get(_env_key(self.name, "VENV"))
+                if venv_override:
+                    resolved_venv = (
+                        validated_hosted_overrides.venv_path
+                        if validated_hosted_overrides is not None
+                        and validated_hosted_overrides.venv_path is not None
+                        else Path(venv_override).expanduser().resolve()
+                    )
+                elif self.runtime.venv:
+                    resolved_venv = (
+                        validated_hosted_overrides.venv_path
+                        if validated_hosted_overrides is not None
+                        and validated_hosted_overrides.venv_path is not None
+                        else Path(self.runtime.venv).expanduser().resolve()
+                    )
+                else:
+                    resolved_venv = self._default_venv_path()
+                resolved_bin = None
+        except Exception:
+            if selected_setting is not None:
+                # A failed cold re-resolution proves nothing about custody.
+                # Retain the last validated artifact but fail closed even when
+                # there was no prior successful resolution.
+                (
+                    self._validated_hosted_immutable_venv_setting,
+                    self._hosted_immutable_venv_custody_unproven,
+                ) = (selected_setting, True)
+            raise
+
+        validated_venv_path = (
+            validated_hosted_overrides.venv_path
+            if validated_hosted_overrides is not None
+            else None
         )
-
-        venv_override = os.environ.get(_env_key(self.name, "VENV"))
-        if venv_override:
-            if (
-                validated_hosted_overrides is not None
-                and validated_hosted_overrides.venv_path is not None
-            ):
-                return validated_hosted_overrides.venv_path, None
-            return Path(venv_override).expanduser().resolve(), None
-
-        if self.runtime.venv:
-            if (
-                validated_hosted_overrides is not None
-                and validated_hosted_overrides.venv_path is not None
-            ):
-                return validated_hosted_overrides.venv_path, None
-            return Path(self.runtime.venv).expanduser().resolve(), None
-
-        return self._default_venv_path(), None
+        validated_venv_setting = (
+            validated_hosted_overrides.venv_setting
+            if validated_hosted_overrides is not None
+            else None
+        )
+        # Publish only after every validation and computation succeeds. There
+        # is no await between these stores, and production callers hold the
+        # reload lock, so reclaim cannot observe a mixed launch/custody state.
+        (
+            self._service_target,
+            self._venv_path,
+            self._bin_path,
+            self._validated_hosted_immutable_venv_path,
+            self._validated_hosted_immutable_venv_setting,
+            self._hosted_immutable_venv_custody_unproven,
+            self._validated_hosted_console_path,
+        ) = (
+            service_target,
+            resolved_venv,
+            resolved_bin,
+            validated_venv_path,
+            validated_venv_setting,
+            False,
+            None,
+        )
+        return resolved_venv, resolved_bin
 
     def _runtime_is_hosted(self) -> bool:
         return (
@@ -9971,6 +11748,38 @@ class ProxyFeature(Feature):
             os.environ.get(_env_key(self.name, "VENV"))
             or self.runtime.venv
         )
+
+    def _runtime_venv_is_core_managed(
+        self,
+        *,
+        runtime_dir: Path | None = None,
+    ) -> bool:
+        """Return whether Core owns provisioning and removal of this venv."""
+
+        selected_runtime = (
+            self._feature_runtime_dir() if runtime_dir is None else runtime_dir
+        )
+        return (
+            self._venv_path is not None
+            and self._venv_path == selected_runtime / ".venv"
+            and self._bin_path is None
+            and not self._venv_is_overridden()
+        )
+
+    def _immutable_venv_override_is_inside_workspace(self) -> bool:
+        """Refuse to advertise deletion of an operator-owned contained venv."""
+
+        selected_override = self._validated_hosted_immutable_venv_path
+        if selected_override is None:
+            return False
+        runtime_dir = Path(os.path.abspath(self._feature_runtime_dir()))
+        selected_venv = Path(os.path.abspath(selected_override))
+        return selected_venv == runtime_dir or runtime_dir in selected_venv.parents
+
+    def _immutable_venv_custody_is_unproven(self) -> bool:
+        """Whether failed hosted resolution makes workspace custody unknown."""
+
+        return self._hosted_immutable_venv_custody_unproven
 
     def _process_venv_is_overridden(self) -> bool:
         """Whether this host selected a process-wide immutable venv artifact."""
@@ -10052,6 +11861,7 @@ class ProxyFeature(Feature):
                     prefix + ("provisioning_cache",),
                 ),
             )
+            self._workspace_reclaimed = False
             return runtime_dir
         # The storage parent belongs to the standalone operator and may be the
         # process CWD. Never chmod it when it already exists. Core's dedicated
@@ -10094,6 +11904,7 @@ class ProxyFeature(Feature):
                     "Standalone isolated feature runtime workspace could not be "
                     "prepared."
                 ) from exc
+        self._workspace_reclaimed = False
         return runtime_dir
 
     def _hosted_provisioning_cache_dir(self) -> Path:
@@ -10143,11 +11954,11 @@ class ProxyFeature(Feature):
         assert self._venv_path is not None
         return self._venv_path / ".kestrel_provision.json"
 
-    def _venv_relocation_repair_pending(self) -> bool:
-        """Read durable migration intent from the feature directory."""
+    def _venv_repair_reason(self) -> str | None:
+        """Read durable migration or interrupted-reclaim repair intent."""
 
         if self._isolated_runtime_scope is None:
-            return False
+            return None
         runtime_dir = self._feature_runtime_dir()
         if not _secure_dirfd_supported():  # pragma: no cover - portable policy
             try:
@@ -10182,6 +11993,11 @@ class ProxyFeature(Feature):
         finally:
             if directory_fd is not None:
                 os.close(directory_fd)
+
+    def _venv_relocation_repair_pending(self) -> bool:
+        """Return whether any durable venv repair intent remains pending."""
+
+        return self._venv_repair_reason() is not None
 
     def _clear_venv_relocation_repair_marker(self) -> None:
         """Clear migration intent only after launch verification and stamping."""
@@ -10433,11 +12249,16 @@ class ProxyFeature(Feature):
             and stamped_path != current_path
         )
         location_state = self._console_script_location_state()
+        # An interrupted reclaim is durable proof that any kind of service
+        # target needs repair. Callable targets have no wrapper to inspect, so
+        # the marker must take precedence over their not-applicable state.
+        if self._venv_repair_reason() == "reclaim":
+            return True
         relocation_proven = (
             self._venv_relocated_this_startup
-            or self._venv_relocation_repair_pending()
             or stamped_relocation
             or location_state == "relocated"
+            or self._venv_relocation_repair_pending()
         )
         # A missing or unclassifiable console wrapper is never fresh, even when
         # every manifest field is current. Only ``--reinstall`` is sufficient
@@ -10742,7 +12563,8 @@ class ProxyFeature(Feature):
                 "an unverifiable override venv"
             )
 
-    def ensure_venv(self) -> None:
+    def ensure_venv(self) -> bool:
+        """Ensure the runtime environment and report whether Core mutated it."""
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
 
@@ -10809,7 +12631,7 @@ class ProxyFeature(Feature):
                     hosted_immutable_setting
                 ) from exc
             self._validated_hosted_console_path = validated_console_path
-            return
+            return False
 
         exists = python_path.exists()
 
@@ -10831,7 +12653,7 @@ class ProxyFeature(Feature):
             self._verify_launch_artifact()
             self._verify_prebuilt_feature_distribution(python_path, install_target)
             self._warn_on_sdk_mismatch(python_path)
-            return
+            return False
 
         # An operator-supplied (override) venv that already exists is NOT ours to
         # mutate: running `uv pip install --upgrade` into it would rewrite a
@@ -10855,13 +12677,13 @@ class ProxyFeature(Feature):
             if not stale:
                 self._verify_launch_artifact()
                 self._clear_venv_relocation_repair_marker()
-                return
+                return False
             if not force_reinstall and self._adopt_verified_unstamped_venv(
                 install_target,
                 manifest,
             ):
                 self._clear_venv_relocation_repair_marker()
-                return
+                return False
 
         # Fresh venv, changed install target, or host SDK upgraded since the
         # venv was provisioned. A moved/unstamped venv requires ``--reinstall``
@@ -10912,6 +12734,7 @@ class ProxyFeature(Feature):
             child_feature_distribution,
         )
         self._clear_venv_relocation_repair_marker()
+        return True
 
     def _warn_on_sdk_mismatch(
         self, python_path: Path, *, host_sdk: str = None, child_sdk: str = None
@@ -11180,6 +13003,427 @@ class ProxyFeature(Feature):
                 return task
         return asyncio.create_task(coro, name=name)
 
+    def _start_idle_monitor(self) -> None:
+        if self._idle_timeout_seconds is None:
+            return
+        if self._owns_inbound_producer():
+            if self._inbound_producer_role_is_ambiguous():
+                logger.warning(
+                    "Hosted isolated runtime %s remains resident because its "
+                    "inbound-producer declaration is missing or malformed; "
+                    "declare it with IsolatedFeatureService."
+                    "advertise_inbound_producer(False), or set a named "
+                    "isolated_runtime_idle_timeouts override",
+                    self.name,
+                )
+            else:
+                logger.warning(
+                    "Hosted isolated runtime %s remains resident because it owns "
+                    "an inbound producer",
+                    self.name,
+                )
+            return
+        task = self._idle_monitor_task
+        if task is not None:
+            if not task.done():
+                return
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except BaseException:  # noqa: BLE001 - failure logged at monitor boundary
+                pass
+            self._idle_monitor_task = None
+        coro = self._monitor_idle_runtime()
+        name = f"isolated-feature-idle:{self.name}"
+        tracker = getattr(self.agent, "_track_background_task", None)
+        tracked = None
+        if callable(tracker):
+            try:
+                tracked = tracker(coro, name=name)
+            except Exception:  # noqa: BLE001 - test doubles may reject tracking
+                tracked = None
+        if isinstance(tracked, asyncio.Task):
+            self._idle_monitor_task = tracked
+        else:
+            self._idle_monitor_task = asyncio.create_task(coro, name=name)
+
+    def _owns_inbound_producer(self) -> bool:
+        """Return whether retiring this child would remove its only wake source."""
+
+        if self._client is None:
+            return False
+        if self._hosted_telegram_startup_attested or self._observed_inbound_producer:
+            return True
+        try:
+            capabilities = self._client_capabilities()
+            if "channel" in capabilities:
+                return True
+            if self._has_negotiated_external_ingress_lifecycle():
+                return True
+            declaration = self._inbound_producer_declaration(capabilities)
+            if declaration is False:
+                return False
+            if declaration is True:
+                # A positive child declaration is definitive producer
+                # evidence. A named timeout may resolve ambiguous metadata,
+                # but it must never override the child's own assertion.
+                return True
+            # A named override is an explicit host decision for this feature;
+            # the default policy may retire only a child that positively
+            # declares it has no unmanaged inbound producer.
+            return not self._idle_timeout_explicit_override
+        except BaseException:  # noqa: BLE001 - ambiguous producer state fails resident
+            return True
+
+    def _inbound_producer_declaration(
+        self, capabilities: Mapping[str, Any] | None = None
+    ) -> bool | None:
+        """Read the SDK-normalized declaration, with a test-double fallback."""
+
+        for target in (self._client, getattr(self._client, "client", None)):
+            if target is None:
+                continue
+            declaration = getattr(target, "inbound_producer_declaration", None)
+            if declaration is True or declaration is False:
+                return declaration
+        raw = (
+            self._client_capabilities() if capabilities is None else capabilities
+        ).get(INBOUND_PRODUCER_CAPABILITY)
+        return raw if raw is True or raw is False else None
+
+    def _inbound_producer_role_is_ambiguous(self) -> bool:
+        """Return whether fail-resident policy, rather than evidence, blocked idle."""
+
+        if self._hosted_telegram_startup_attested or self._observed_inbound_producer:
+            return False
+        try:
+            capabilities = self._client_capabilities()
+            if "channel" in capabilities:
+                return False
+            if self._has_negotiated_external_ingress_lifecycle():
+                return False
+            return self._inbound_producer_declaration(capabilities) is None
+        except BaseException:  # noqa: BLE001 - diagnostic uncertainty is ambiguity
+            return True
+
+    async def _monitor_idle_runtime(self) -> None:
+        """Retire an inactive child through the existing lifecycle owners."""
+
+        assert self._idle_timeout_seconds is not None
+        try:
+            while not self._stopping:
+                try:
+                    baseline = self._last_used_monotonic
+                    baseline_generation = self._activity_generation
+                    if baseline is None or self._idle_retired:
+                        await asyncio.sleep(self._idle_timeout_seconds)
+                        continue
+                    remaining = (
+                        baseline
+                        + self._idle_timeout_seconds
+                        - asyncio.get_running_loop().time()
+                    )
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                        continue
+                    retired = await self._retire_idle_generation(
+                        expected_activity_generation=baseline_generation,
+                        expected_last_used=baseline,
+                    )
+                    if not retired:
+                        if self._terminal_lifecycle_latched or self._stopping:
+                            logger.error(
+                                "Hosted isolated runtime %s stopped idle monitoring "
+                                "because retirement entered terminal cleanup",
+                                self.name,
+                            )
+                            return
+                        if self._owns_inbound_producer():
+                            logger.warning(
+                                "Hosted isolated runtime %s stopped idle monitoring "
+                                "because it now owns an inbound producer",
+                                self.name,
+                            )
+                            return
+                        await asyncio.sleep(min(self._idle_timeout_seconds, 1.0))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - monitor must remain observable/alive
+                    logger.warning(
+                        "Hosted isolated runtime idle monitor failed for %s; retrying",
+                        self.name,
+                    )
+                    await asyncio.sleep(min(self._idle_timeout_seconds, 1.0))
+        except asyncio.CancelledError:
+            raise
+        except BaseException:  # noqa: BLE001 - infrastructure death is observable
+            logger.exception(
+                "Hosted isolated runtime idle monitor terminated for %s; "
+                "a later child publication will re-arm it",
+                self.name,
+            )
+            raise
+        finally:
+            if self._idle_monitor_task is asyncio.current_task():
+                self._idle_monitor_task = None
+
+    async def _retire_idle_generation(
+        self, *, expected_activity_generation: int, expected_last_used: float
+    ) -> bool:
+        """Atomically close admission, recheck the deadline, and retire."""
+
+        assert self._idle_timeout_seconds is not None
+        refresh_after_retirement = False
+        async with self._reload_lock:
+            if self._stopping or self._idle_retired or self._client is None:
+                return False
+            if self._owns_inbound_producer():
+                return False
+            self._reloading = True
+            reopened = False
+            try:
+                if not await self._traffic_gate.close_if_idle():
+                    return False
+                current_last_used = self._last_used_monotonic
+                expired = (
+                    self._activity_generation == expected_activity_generation
+                    and current_last_used == expected_last_used
+                    and asyncio.get_running_loop().time()
+                    >= expected_last_used + self._idle_timeout_seconds
+                )
+                if not expired:
+                    await self._reopen_traffic_gate()
+                    reopened = True
+                    return False
+                client = self._client
+                self._client = None
+                retired = await self._retire_detached_client(client)
+                if not retired:
+                    self._latch_terminal_lifecycle()
+                    await self._seal_traffic_gate()
+                    # Re-derive uncertainty in terminal cleanup from the exact
+                    # retained clients/lifecycle tasks. A failed retirement can
+                    # include a still-running bounded facade operation.
+                    self._terminal_cleanup_uncertain = False
+                    await self._complete_terminal_cleanup(
+                        best_effort=True,
+                        lifecycle_lock_held=True,
+                    )
+                    return False
+                self._idle_retired = True
+                self._idle_resume_event.clear()
+                self._terminal_cleanup_uncertain = False
+                self._reload_gen += 1
+                await self._reopen_traffic_gate()
+                reopened = True
+                refresh_after_retirement = True
+            finally:
+                self._reloading = False
+                if (
+                    not reopened
+                    and not self._terminal_lifecycle_latched
+                    and self._traffic_gate.closed
+                ):
+                    await self._reopen_traffic_gate()
+        if refresh_after_retirement:
+            self._schedule_runtime_telemetry(
+                force=True,
+                refresh_disk=True,
+            )
+            return True
+        return False
+
+    async def _wake_idle_runtime(self) -> None:
+        """Cold-start exactly one generation after idle retirement."""
+
+        task = asyncio.create_task(
+            self._wake_idle_runtime_uninterrupted(),
+            name=f"isolated-idle-wake:{self.name}",
+        )
+        try:
+            await _await_task_until_complete(task, preserve_cancellation=False)
+        except asyncio.CancelledError:
+            raise
+        except _TerminalLifecyclePermitRevoked:
+            # Callers map terminal permit revocation to their own stable public
+            # boundary.  Do not erase it into a retryable preparation failure.
+            raise
+        except BaseException as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature could not be prepared after idle retirement."
+            ) from exc
+
+    async def reclaim_idle_workspace(self) -> RuntimeNamespaceCleanupOutcome:
+        """Securely reclaim this exact idle feature tree under the wake lock.
+
+        Hosts must use this seam rather than deleting a path after observing a
+        telemetry snapshot. The reload lock turns the eligibility check,
+        deletion, and a racing cold wake into one serial transaction.
+        """
+
+        if self._isolated_runtime_scope is None:
+            return RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+        task = asyncio.create_task(
+            self._reclaim_idle_workspace_uninterrupted(),
+            name=f"isolated-idle-reclaim:{self.name}",
+        )
+        return await _await_task_until_complete(
+            task,
+            preserve_cancellation=False,
+        )
+
+    async def _reclaim_idle_workspace_uninterrupted(
+        self,
+    ) -> RuntimeNamespaceCleanupOutcome:
+        """Finish deletion and accounting before releasing lifecycle ownership."""
+
+        assert self._isolated_runtime_scope is not None
+        # Disk sampling never acquires the lifecycle lock. Taking its lock first
+        # prevents deletion beneath a no-follow walk without holding reload
+        # ownership while a slow measurement completes.
+        async with self._telemetry_disk_lock:
+            async with self._reload_lock:
+                if (
+                    self._terminal_lifecycle_latched
+                    or self._stopping
+                    or not self._idle_retired
+                    or self._client is not None
+                    or self._retirement_is_uncertain()
+                ):
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature workspace is not idle and reclaimable."
+                    )
+                if self._immutable_venv_custody_is_unproven():
+                    setting = self._validated_hosted_immutable_venv_setting
+                    assert setting is not None
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature immutable venv custody selected by "
+                        f"{setting} could not be proven; the workspace cannot be "
+                        "reclaimed."
+                    )
+                if self._immutable_venv_override_is_inside_workspace():
+                    setting = self._validated_hosted_immutable_venv_setting
+                    assert setting is not None
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature workspace contains the immutable "
+                        f"venv selected by {setting} and cannot be reclaimed."
+                    )
+                # Stop advertising assets and completed byte counts before the
+                # no-follow deletion begins. The event loop remains available
+                # while the worker removes a potentially large venv, so
+                # lock-free manifest and telemetry readers must observe the
+                # conservative state throughout that window. Keep this state
+                # on failure too: removal may have partially changed the tree.
+                self._idle_ui_contributions = None
+                self._environment_bytes = None
+                self._environment_linked_file_identities = None
+                self._private_writable_bytes = None
+                self._downloaded_bytes = None
+                self._disk_telemetry_status = "unavailable"
+                outcome = await asyncio.to_thread(
+                    _remove_isolated_feature_runtime,
+                    self._isolated_runtime_scope,
+                    _agent_runtime_owner(self.agent),
+                    self._runtime_directory_name,
+                )
+                self._workspace_reclaim_generation += 1
+                self._workspace_reclaimed = True
+                self._telemetry_disk_refresh_pending = False
+                self._telemetry_environment_refresh_pending = False
+                self._environment_bytes = (
+                    0 if self._runtime_venv_is_core_managed() else None
+                )
+                self._environment_linked_file_identities = frozenset()
+                self._private_writable_bytes = 0
+                self._downloaded_bytes = 0
+                self._disk_telemetry_status = "complete"
+        self._schedule_runtime_telemetry(force=True)
+        return outcome
+
+    async def _wake_idle_runtime_uninterrupted(self) -> None:
+        """Finish one wake transaction even if its initiating caller cancels."""
+
+        refresh_after_wake = False
+        refresh_environment_after_wake = False
+        async with self._reload_lock:
+            if self._client is not None:
+                return
+            if not self._idle_retired:
+                self._assert_child_start_allowed()
+                raise RuntimeError("isolated feature client is unavailable")
+            self._assert_child_start_allowed()
+            self._reloading = True
+            reopened = False
+            try:
+                await self._close_traffic_gate()
+                if self._client is None:
+                    self._prepare_runtime_workspace()
+                    self._venv_path, self._bin_path = self.resolve_runtime_paths()
+                    if self._bin_path is None:
+                        await self._ensure_venv_without_blocking_event_loop()
+                    # A newly constructed child must read the current durable
+                    # generation. Another replica may have changed config while
+                    # this process was idle; the memoized prior child config is
+                    # never authority for a cold wake.
+                    self._host_config = {}
+                    self._host_config_loaded = False
+                    await self._ensure_host_config_loaded()
+                    if self._is_telegram_runtime():
+                        await self._resolve_hosted_telegram_startup_attestation()
+                    await self._connect_client()
+                    self._reload_gen += 1
+                    self._idle_wake_count += 1
+                    self._last_used_monotonic = asyncio.get_running_loop().time()
+                await self._reopen_traffic_gate()
+                reopened = True
+                refresh_after_wake = True
+                refresh_environment_after_wake = (
+                    not self._last_cache_hit
+                    or self._environment_bytes is None
+                )
+            except BaseException:
+                uncertain = bool(
+                    self._terminal_retirement_clients
+                    or self._terminal_lifecycle_tasks
+                    or self._terminal_cleanup_uncertain
+                )
+                if self._terminal_lifecycle_latched or self._stopping:
+                    self._idle_retired = False
+                    self._idle_ui_contributions = None
+                elif uncertain:
+                    self._latch_terminal_lifecycle()
+                    await self._seal_traffic_gate()
+                elif self._client is None:
+                    self._idle_retired = True
+                    self._idle_resume_event.clear()
+                    if self._traffic_gate.closed:
+                        await self._reopen_traffic_gate()
+                        reopened = True
+                else:
+                    # The child was published before ancillary telemetry failed.
+                    # Keep it running and supervised; never advertise a live
+                    # process as idle or safe for workspace reclamation.
+                    self._idle_retired = False
+                    if self._traffic_gate.closed:
+                        await self._reopen_traffic_gate()
+                        reopened = True
+                raise
+            finally:
+                self._reloading = False
+                if (
+                    not reopened
+                    and not self._terminal_lifecycle_latched
+                    and self._traffic_gate.closed
+                ):
+                    await self._reopen_traffic_gate()
+        if refresh_after_wake:
+            self._schedule_runtime_telemetry(
+                force=True,
+                refresh_disk=True,
+                refresh_environment=refresh_environment_after_wake,
+            )
+
     async def _supervise(self) -> None:
         terminal_unwind = False
         try:
@@ -11189,6 +13433,12 @@ class ProxyFeature(Feature):
                 # A ``set_config`` reload intentionally stops/starts the client;
                 # don't probe (and "restart") a service that is mid-reload.
                 if self._reloading:
+                    backoff = 1.0
+                    continue
+                if self._idle_retired:
+                    # Remain quiescent for the whole idle period. Publishing a
+                    # fresh child (or terminal shutdown) sets this event.
+                    await self._idle_resume_event.wait()
                     backoff = 1.0
                     continue
                 # Snapshot the reload generation BEFORE probing: if a reload cycles
@@ -11355,6 +13605,7 @@ class ProxyFeature(Feature):
                             # it reports failure, so the prior exact-stop
                             # completion may no longer prove terminal safety.
                             self._forget_terminal_stop_completion(client)
+                            started = asyncio.get_running_loop().time()
                             await _await_owned_facade_lifecycle_operation(
                                 client.start(),
                                 name=f"isolated-supervisor-start:{self.name}",
@@ -11365,6 +13616,19 @@ class ProxyFeature(Feature):
                                     task, client
                                 ),
                             )
+                            self._capture_process_identity(client)
+                            self._last_cold_start_seconds = (
+                                asyncio.get_running_loop().time() - started
+                            )
+                            self._health_restart_count += 1
+                            self._reload_gen += 1
+                            # A fatal monitor failure clears its task reference
+                            # in ``finally``. Health recovery restarts this same
+                            # facade in place, so it must explicitly restore
+                            # retirement monitoring without waiting for a new
+                            # client publication.
+                            self._start_idle_monitor()
+                            self._schedule_runtime_telemetry(force=True)
                             backoff = 1.0
                         except _FacadeLifecycleOperationTimedOut:
                             # A timed-out start can have spawned a child before
@@ -11499,6 +13763,16 @@ class ProxyFeature(Feature):
         # that could reach cognition; otherwise cognition calling channels_send
         # can deadlock the reader against its own response stream.
         if self._is_inbound_event(event):
+            if source_client is self._client:
+                # Event names are part of Core's inbound contract even when a
+                # legacy producer omits capability metadata. Once observed,
+                # fail resident: this child has no out-of-process wake source.
+                self._observed_inbound_producer = True
+                # Record admission intent before the detached routing task can
+                # lose a retirement race. There is no await between this write
+                # and the retirement generation/deadline recheck, so a first
+                # inbound event cannot be made stale by closing the idle gate.
+                self._record_runtime_activity()
             await self._schedule_event_ingress_routing(event, source_client)
             return
         try:
@@ -11509,7 +13783,7 @@ class ProxyFeature(Feature):
                 # replacement has been published.
                 if source_client is not self._client:
                     return
-                await self._handle_event_admitted_from_source(event, source_client)
+                await self._handle_event_admitted(event)
         except _TrafficGateClosedError:
             # A newly published replacement can begin polling while its parent
             # transition's gate is still closed. Its canonical acknowledged
@@ -11677,6 +13951,7 @@ class ProxyFeature(Feature):
                         self._schedule_event_ingress_acknowledgement(
                             source_client, acknowledgement
                         )
+                        self._schedule_runtime_telemetry()
                 elif retry is not None:
                     self._schedule_event_ingress_retry(source_client, retry)
             except asyncio.CancelledError:
@@ -11851,17 +14126,6 @@ class ProxyFeature(Feature):
                     queue_entry.retired.set()
                     return
 
-    async def _handle_event_admitted_from_source(
-        self, event: Any, source_client: Any
-    ) -> None:
-        """Run one admitted event with its exact client available to the ack path."""
-
-        token = _event_source_client.set(source_client)
-        try:
-            await self._handle_event_admitted(event)
-        finally:
-            _event_source_client.reset(token)
-
     async def _handle_event_admitted(self, event: Any) -> None:
         kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
         payload = _meta_get(event, "payload", event)
@@ -11872,34 +14136,7 @@ class ProxyFeature(Feature):
             event_name = kind
             data = payload
 
-        if event_name in {"channel.inbound", "inbound", "message.inbound"}:
-            inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
-            retry = self._inbound_event_retry_completion(data)
-            cursor_owned_protocol = (
-                acknowledgement is not None
-                and retry is not None
-                and self._authoritative_inbound_channel_type() == "telegram"
-            )
-            admission = await self._route_validated_inbound(
-                inbound,
-                cursor_owned_protocol=cursor_owned_protocol,
-                telegram_terminal_disposition=self._telegram_terminal_disposition(
-                    data, cursor_owned_protocol=cursor_owned_protocol
-                ),
-            )
-            source_client = _event_source_client.get()
-            if (
-                self._inbound_admission_is_durable(admission)
-                and acknowledgement is not None
-                and source_client is not None
-            ):
-                self._schedule_event_ingress_acknowledgement(
-                    source_client,
-                    acknowledgement,
-                )
-            elif retry is not None and source_client is not None:
-                self._schedule_event_ingress_retry(source_client, retry)
-        elif event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
+        if event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
             await self._route_link_qr(data)
         elif event_name in {"channel.link_cleared", "link_cleared"}:
             await self._route_link_cleared(data)
@@ -12234,6 +14471,7 @@ class ProxyFeature(Feature):
 
         async def deliver_after_reopen() -> None:
             try:
+                emit_telemetry = False
                 async with self._traffic_gate.admit():
                     # A second transition can replace this child before the
                     # first gate reopens. Its event must remain unacknowledged
@@ -12252,14 +14490,18 @@ class ProxyFeature(Feature):
                         ),
                     )
                     if self._inbound_admission_is_durable(admission):
+                        self._record_runtime_activity()
                         self._schedule_event_ingress_acknowledgement(
                             deferred.source_client,
                             deferred.acknowledgement,
                         )
+                        emit_telemetry = True
                     elif deferred.retry is not None:
                         self._schedule_event_ingress_retry(
                             deferred.source_client, deferred.retry
                         )
+                if emit_telemetry:
+                    self._schedule_runtime_telemetry()
             except (_TrafficGateClosedError, _TrafficGateTerminalError):
                 return
             except asyncio.CancelledError:

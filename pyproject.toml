@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.53.8"
+version = "0.53.9"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -89,7 +89,9 @@ dependencies = [
     # 0.35.0 floor: owner-scoped idle renewal plus the absolute lease-lifetime
     # ceiling used to reject provider acquisition/touch results that outlive
     # the request's readiness deadline and expected session.
-    # 0.36.0 floor: public lifecycle-owned operator service, workflow,
+    # 0.37.0 floor: isolated services can negotiate inbound-producer ownership
+    # so hosted Core may safely apply default idle retirement.
+    # 0.36.0 also added the public lifecycle-owned operator service, workflow,
     # execution-target, authorization-context, and contribution contracts.
     # 0.37.1 floor: lifecycle-owned context-clause contributions with
     # synchronous rendering and per-agent activation.
