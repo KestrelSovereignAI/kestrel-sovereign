@@ -218,9 +218,14 @@ _TELEMETRY_OBSERVER_TIMEOUT = 1.0
 _TELEMETRY_EMIT_MIN_INTERVAL = 5.0
 _TELEMETRY_RETRY_BASE_SECONDS = 0.05
 _TELEMETRY_RETRY_MAX_SECONDS = 5.0
+_TELEMETRY_FORCED_RETRY_LIMIT = 5
 _DISK_TELEMETRY_ENTRY_BUDGET = 250_000
 _DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
 _DISK_TELEMETRY_DEPTH_BUDGET = 64
+
+
+class _TelemetryObserverSubmissionError(RuntimeError):
+    """The bounded observer infrastructure could not admit a callback."""
 
 
 class _BoundedDaemonExecutor(Executor):
@@ -321,17 +326,29 @@ class _BoundedDaemonExecutor(Executor):
         try:
             self._start_workers()
         except BaseException as exc:  # noqa: BLE001 - Future owns startup outcome
-            future.set_exception(exc)
+            future.set_exception(
+                _TelemetryObserverSubmissionError(
+                    f"telemetry observer executor could not start: {exc}"
+                )
+            )
             return future
         with self._lock:
             if self._shutdown:
-                future.set_exception(RuntimeError("telemetry observer executor stopped"))
+                future.set_exception(
+                    _TelemetryObserverSubmissionError(
+                        "telemetry observer executor stopped"
+                    )
+                )
                 return future
             self._discard_cancelled_work_locked()
             try:
                 self._work.put_nowait((future, fn, args, kwargs))
             except Full:
-                future.set_exception(RuntimeError("telemetry observer executor saturated"))
+                future.set_exception(
+                    _TelemetryObserverSubmissionError(
+                        "telemetry observer executor saturated"
+                    )
+                )
         return future
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
@@ -394,7 +411,9 @@ class _AgentTelemetryObserverAdmission:
             if active is not None and not active.done():
                 refused: Future[Any] = Future()
                 refused.set_exception(
-                    RuntimeError("telemetry observer agent submission already active")
+                    _TelemetryObserverSubmissionError(
+                        "telemetry observer agent submission already active"
+                    )
                 )
                 return refused
             callback = executor.submit(fn, *args, **kwargs)
@@ -6537,6 +6556,13 @@ class ProxyFeature(Feature):
             tuple[int, float], int | None, float | None, int | None, int | None
         ] | None = None
         self._environment_bytes: int | None = None
+        # A state-only disk refresh deliberately reuses the last venv byte
+        # count. Retain the matching hard-link identities too, otherwise the
+        # sibling uv cache would charge the same physical payload a second
+        # time while still reporting a complete sample.
+        self._environment_linked_file_identities: (
+            frozenset[tuple[int, int]] | None
+        ) = None
         self._private_writable_bytes: int | None = None
         self._downloaded_bytes: int | None = None
         self._disk_telemetry_status: str | None = None
@@ -6552,6 +6578,7 @@ class ProxyFeature(Feature):
         self._telemetry_observer_force_pending = False
         self._telemetry_retry_task: asyncio.Task[None] | None = None
         self._telemetry_retry_attempt = 0
+        self._telemetry_observer_warning_emitted = False
         self._telemetry_disk_refresh_pending = False
         self._telemetry_environment_refresh_pending = False
         self._telemetry_disk_lock = asyncio.Lock()
@@ -6832,9 +6859,21 @@ class ProxyFeature(Feature):
             _agent_runtime_owner(self.agent) if hosted_scope is not None else None
         )
 
-        def measure() -> tuple[int | None, int | None, int | None, str]:
+        def measure() -> tuple[
+            int | None,
+            int | None,
+            int | None,
+            str,
+            frozenset[tuple[int, int]] | None,
+        ]:
             deadline = time.monotonic() + _DISK_TELEMETRY_TIME_BUDGET_SECONDS
-            seen_linked_files: set[tuple[int, int]] = set()
+            cached_environment_links = self._environment_linked_file_identities
+            seen_linked_files: set[tuple[int, int]] = (
+                set(cached_environment_links)
+                if not refresh_environment and cached_environment_links is not None
+                else set()
+            )
+            environment_links = cached_environment_links
             statuses: list[str] = []
             runtime_fd: int | None = None
             if hosted_scope is not None:
@@ -6850,7 +6889,7 @@ class ProxyFeature(Feature):
                     IsolatedRuntimeNamespaceError,
                     IsolatedRuntimePreparationError,
                 ):
-                    return None, None, None, "unavailable"
+                    return None, None, None, "unavailable", environment_links
 
             def measure_component(component: str) -> tuple[int | None, str]:
                 return _measure_directory_tree_bytes(
@@ -6870,6 +6909,11 @@ class ProxyFeature(Feature):
                     )
                     statuses.append(environment_status)
                     environment = measured_environment
+                    environment_links = (
+                        frozenset(seen_linked_files)
+                        if environment_status == "complete"
+                        else None
+                    )
                 else:
                     environment = self._environment_bytes
                 private_measurements = [
@@ -6906,7 +6950,7 @@ class ProxyFeature(Feature):
                     if "unavailable" in statuses
                     else "complete"
                 )
-                return environment, private, downloaded, status
+                return environment, private, downloaded, status, environment_links
             finally:
                 if runtime_fd is not None:
                     os.close(runtime_fd)
@@ -6927,7 +6971,10 @@ class ProxyFeature(Feature):
                 self._private_writable_bytes,
                 self._downloaded_bytes,
                 self._disk_telemetry_status,
+                environment_links,
             ) = await asyncio.to_thread(measure)
+            if refresh_environment:
+                self._environment_linked_file_identities = environment_links
         if (
             self._disk_telemetry_status == "budget-exceeded"
             and not self._disk_budget_warning_emitted
@@ -6947,6 +6994,17 @@ class ProxyFeature(Feature):
             or self._terminal_lifecycle_latched
             or self._stopping
         ):
+            return
+        if self._telemetry_retry_attempt >= _TELEMETRY_FORCED_RETRY_LIMIT:
+            # Preserve advisory delivery without allowing a permanently
+            # broken host callback to create a five-second process-table scan
+            # and warning loop for the lifetime of every feature. One final
+            # ordinary attempt observes the normal emission rate limit; later
+            # lifecycle/activity publications may begin a fresh streak only
+            # after an observer succeeds.
+            self._telemetry_emit_force_pending = False
+            self._telemetry_emit_pending = False
+            self._schedule_runtime_telemetry(force=False)
             return
         current = self._telemetry_retry_task
         if current is not None and not current.done():
@@ -7093,12 +7151,23 @@ class ProxyFeature(Feature):
                 failed = False
                 try:
                     completed.result()
+                except _TelemetryObserverSubmissionError:
+                    failed = True
+                    if not self._telemetry_observer_warning_emitted:
+                        self._telemetry_observer_warning_emitted = True
+                        logger.warning(
+                            "Hosted isolated runtime telemetry observer capacity "
+                            "was unavailable for %s",
+                            self.name,
+                        )
                 except BaseException:  # noqa: BLE001 - advisory host callback
                     failed = True
-                    logger.warning(
-                        "Hosted isolated runtime telemetry observer failed for %s",
-                        self.name,
-                    )
+                    if not self._telemetry_observer_warning_emitted:
+                        self._telemetry_observer_warning_emitted = True
+                        logger.warning(
+                            "Hosted isolated runtime telemetry observer failed for %s",
+                            self.name,
+                        )
                 pending = self._telemetry_observer_emit_pending
                 force_pending = self._telemetry_observer_force_pending
                 self._telemetry_observer_emit_pending = False
@@ -7110,6 +7179,7 @@ class ProxyFeature(Feature):
                     return
                 if not failed:
                     self._telemetry_retry_attempt = 0
+                    self._telemetry_observer_warning_emitted = False
                 if (
                     pending
                     and not self._terminal_lifecycle_latched
@@ -7856,6 +7926,7 @@ class ProxyFeature(Feature):
             retry_task.cancel()
         self._telemetry_retry_task = None
         self._telemetry_retry_attempt = 0
+        self._telemetry_observer_warning_emitted = False
         self._telemetry_emit_pending = False
         self._telemetry_emit_force_pending = False
         self._telemetry_observer_emit_pending = False
@@ -13149,6 +13220,7 @@ class ProxyFeature(Feature):
                 # on failure too: removal may have partially changed the tree.
                 self._idle_ui_contributions = None
                 self._environment_bytes = None
+                self._environment_linked_file_identities = None
                 self._private_writable_bytes = None
                 self._downloaded_bytes = None
                 self._disk_telemetry_status = "unavailable"
@@ -13165,6 +13237,7 @@ class ProxyFeature(Feature):
                 self._environment_bytes = (
                     0 if self._runtime_venv_is_core_managed() else None
                 )
+                self._environment_linked_file_identities = frozenset()
                 self._private_writable_bytes = 0
                 self._downloaded_bytes = 0
                 self._disk_telemetry_status = "complete"

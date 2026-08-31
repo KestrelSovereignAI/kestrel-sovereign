@@ -2893,8 +2893,58 @@ async def test_workspace_byte_telemetry_deduplicates_cross_category_hardlinks(
     await feature._refresh_disk_telemetry(refresh_environment=False)
     snapshot = feature.runtime_telemetry_snapshot()
     assert snapshot.environment_bytes == len(b"shared")
-    assert snapshot.downloaded_bytes == len(b"shared")
+    assert snapshot.downloaded_bytes == 0
     assert feature._venv_path not in measured_paths
+
+
+@pytest.mark.asyncio
+async def test_persistently_failing_observer_has_bounded_forced_retries(
+    monkeypatch, tmp_path, caplog
+):
+    calls = 0
+
+    def observe(_snapshot):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("persistent private observer failure")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    _configure_idle_lifecycle(
+        agent,
+        tmp_path,
+        idle_timeout_seconds=3600,
+        telemetry_observer=observe,
+    )
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_BASE_SECONDS", 0.001)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_RETRY_MAX_SECONDS", 0.001)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_EMIT_MIN_INTERVAL", 0.001)
+    monkeypatch.setattr(isolated_runtime, "_TELEMETRY_FORCED_RETRY_LIMIT", 3)
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _idle_test_runtime(), client_factory=FakeIsolatedClient)
+
+    with caplog.at_level("WARNING"):
+        await feature.initialize()
+        for _ in range(200):
+            if (
+                calls >= 4
+                and feature._telemetry_retry_task is None
+                and not feature._telemetry_emit_tasks
+                and not feature._telemetry_observer_tasks
+            ):
+                break
+            await asyncio.sleep(0.005)
+        settled_calls = calls
+        await asyncio.sleep(0.03)
+
+    # Initial delivery plus three forced retries. A final ordinary attempt may
+    # run if the emission interval has elapsed, but it cannot reschedule itself.
+    assert 4 <= settled_calls <= 5
+    assert calls == settled_calls
+    assert caplog.messages.count(
+        "Hosted isolated runtime telemetry observer failed for TestFeature"
+    ) == 1
+    await feature.shutdown()
 
 
 @pytest.mark.asyncio

@@ -117,8 +117,8 @@ ineligible, and reclamation returns a distinct setting-only custody diagnostic,
 until a later successful runtime-path resolution republishes the complete
 launch and custody state.
 
-Core 0.53.5 introduces a distinct interrupted-reclaim marker payload. A host
-must finish or retry any pending reclaim with Core 0.53.5 or newer before
+Core 0.53.8 introduces a distinct interrupted-reclaim marker payload. A host
+must finish or retry any pending reclaim with Core 0.53.8 or newer before
 downgrading: older Core releases do not recognize that payload and will retain
 the affected feature directory rather than start from potentially partial
 state. This fail-closed version-skew behavior does not affect directories whose

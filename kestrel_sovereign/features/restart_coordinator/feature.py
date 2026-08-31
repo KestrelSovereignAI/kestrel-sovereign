@@ -215,6 +215,17 @@ def _tail(raw: Any) -> str:
 #     supervisor is deadline-bounded (it exits at ``timeout_seconds`` and
 #     replay expires past-deadline rows); do not exclude any peer wait that
 #     lacks that guarantee.
+#   - ``isolated-feature:`` — the pre-existing child-process supervisor. It is
+#     a permanent lifecycle daemon, not agent cognition. Excluding it changes
+#     prior ``idle_agents_only`` behavior intentionally: merely hosting an
+#     isolated child no longer pins a requested restart forever; shutdown owns
+#     and terminates the supervisor before restart.
+#   - ``isolated-feature-idle:`` — the permanent idle-retirement monitor. Its
+#     only work is observing the already-recorded activity generation and
+#     retiring an eligible child, so it must not make that agent appear busy.
+#   - ``isolated-runtime-telemetry:`` — advisory, coalesced telemetry delivery.
+#     It neither admits user work nor owns lifecycle progress, and shutdown
+#     cancels the exact tracked task before restart.
 # None is user/signal work; real work (``signal_dispatch:*``) still
 # defers a restart. The name is already stamped on the task at creation —
 # it was just never read here. New long-lived/bookkeeping daemons must be
