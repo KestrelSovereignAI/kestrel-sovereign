@@ -610,6 +610,35 @@ async def test_ephemeral_mandatory_floor_plus_tools_fail_closed():
 
 
 @pytest.mark.asyncio
+async def test_ephemeral_optional_legacy_bootstrap_is_evicted_before_degrading():
+    storage = MagicMock()
+    builder = ContextBuilder(storage)
+    builder._bootstrap_loader._cache = OrderedDict(
+        [
+            ("SOUL.md", "mandatory identity"),
+            ("TOOLS.md", "optional tools " * 100_000),
+        ]
+    )
+    builder._bootstrap_loader._loaded = True
+    manager = ContextManager(storage=storage, context_builder=builder)
+
+    plan = await manager.build_context_plan(
+        query="",
+        constitution="C",
+        include_briefing=False,
+        privacy_mode="EPHEMERAL",
+        tools=[],
+    )
+
+    assert plan.degraded_mode is False
+    assert plan.total_tokens <= plan.total_budget
+    assert "mandatory identity" in plan.assembly.system_prompt
+    assert "EPHEMERAL MODE ACTIVE" in plan.assembly.system_prompt
+    assert "optional tools" not in plan.assembly.system_prompt
+    assert "TOOLS.md" in (plan.assembly.dropped_clauses or [])
+
+
+@pytest.mark.asyncio
 async def test_ephemeral_turn_tracks_and_bounds_contributed_clauses():
     registry = _ClauseRegistry(
         _clause("small", 10, "small ephemeral clause"),

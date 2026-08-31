@@ -4567,11 +4567,56 @@ class TestLoadFromConfig:
         assert load.done() is False
 
         release_readiness.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(load, timeout=1)
+        assert await asyncio.wait_for(load, timeout=1) is agent
 
         assert readiness_done is True
         assert manager.get_agent("dynamic-cancel") is agent
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
+    async def test_create_cancellation_during_readiness_preserves_config_handoff(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A published create remains persistable after caller cancellation."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        agent = _make_mock_agent("did:dynamic-create-cancel")
+        readiness_started = asyncio.Event()
+        release_readiness = asyncio.Event()
+
+        async def complete_readiness():
+            readiness_started.set()
+            await release_readiness.wait()
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+        manager._data_key_custody_conflict = lambda: None
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        monkeypatch.setattr(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            AsyncMock(),
+        )
+
+        create = asyncio.create_task(manager.create_agent("DynamicCreate"))
+        await asyncio.wait_for(readiness_started.wait(), timeout=1)
+        create.cancel()
+        await asyncio.sleep(0)
+        assert create.done() is False
+
+        release_readiness.set()
+        assert await asyncio.wait_for(create, timeout=1) is agent
+        assert manager.get_agent("DynamicCreate") is agent
+        assert manager._created_configs["DynamicCreate"] == LocalAgentConfig(
+            data_dir=Path("agent_data") / "DynamicCreate",
+            port=8801,
+            autostart=True,
+        )
         assert manager._agent_operations == {}
 
     @pytest.mark.asyncio

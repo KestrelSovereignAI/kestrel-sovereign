@@ -1436,7 +1436,7 @@ class AgentManager:
     async def _complete_registered_agent_readiness(
         self,
         agent: KestrelAgent,
-    ) -> None:
+    ) -> bool:
         """Finish deferred hooks after onboarding releases the topology writer.
 
         A ready hook may start a cognition turn whose tools acquire a shared
@@ -1444,7 +1444,10 @@ class AgentManager:
         retaining the exclusive lifecycle writer used for publication and
         app-owned onboarding.  Drive the hook task to settlement so caller
         cancellation cannot strand a successfully published agent forever in
-        its deferred-ready state.
+        its deferred-ready state. Return whether the caller was cancelled while
+        the manager-owned hook task settled. Once publication has committed,
+        that cancellation cannot turn the load into a reported failure: callers
+        such as ``create_agent`` still have a persistence handoff to finish.
         """
 
         gate = self._host_context_publication_gate
@@ -1464,8 +1467,8 @@ class AgentManager:
             cancelled, failure = await await_lifecycle_task_completion(task)
             if failure is not None:
                 raise failure
-            if cancelled:
-                raise asyncio.CancelledError()
+            return cancelled
+        return False
 
     async def complete_deferred_agent_readiness(self) -> None:
         """Complete startup readiness behind the registration writer boundary.
@@ -1489,7 +1492,8 @@ class AgentManager:
             if id(agent) in seen:
                 continue
             seen.add(id(agent))
-            await self._complete_registered_agent_readiness(agent)
+            if await self._complete_registered_agent_readiness(agent):
+                raise asyncio.CancelledError()
 
     async def _initialize_agent(
         self,
@@ -2426,7 +2430,15 @@ class AgentManager:
                         raise
                     committed = True
                     admission.published = True
-                await self._complete_registered_agent_readiness(agent)
+                readiness_cancelled = (
+                    await self._complete_registered_agent_readiness(agent)
+                )
+                if readiness_cancelled:
+                    logger.info(
+                        "Agent %r finished deferred readiness after caller "
+                        "cancellation; preserving the committed load result",
+                        name,
+                    )
                 return agent
             except BaseException:
                 if not committed:
@@ -2614,7 +2626,8 @@ class AgentManager:
                             admission.published = True
                         unpublished.pop(name, None)
                         loaded += 1
-                        await self._complete_registered_agent_readiness(result)
+                        if await self._complete_registered_agent_readiness(result):
+                            raise asyncio.CancelledError()
                     except BaseException as onboarding_failure:
                         # Claim before the first cleanup await.  If that cleanup
                         # fails, the outer batch handler must not discover and

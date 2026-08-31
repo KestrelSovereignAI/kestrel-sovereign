@@ -2082,11 +2082,27 @@ class ContextManager:
         ephemeral_tracking = None
         injected_clauses_for_audit: Optional[List[str]] = None
         dropped_clauses_for_audit: Optional[List[str]] = None
-        if (
+        use_tracking = bool(
             system_prompt_budget_bytes is not None
             or anchored_doctrine
             or has_context_clauses
-        ):
+        )
+        if not use_tracking:
+            system_prompt = self.context_builder.build_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=None,
+                system_prompt_addendum=system_prompt_addendum,
+            )
+            system_prompt = f"{system_prompt}\n\n{ephemeral_notice}"
+            # Preserve byte-identical legacy prompt/cache behavior when it fits.
+            # If optional bootstrap or briefing text overflows the real
+            # tool-aware route ceiling, switch to the priority assembler so
+            # optional clauses can yield before the turn is declared degraded.
+            use_tracking = self.counter.count(system_prompt) > system_token_budget
+
+        if use_tracking:
             try:
                 ephemeral_tracking = (
                     self.context_builder.build_system_prompt_with_tracking(
@@ -2124,15 +2140,6 @@ class ContextManager:
                     if system_prompt
                     else required_suffix
                 )
-        else:
-            system_prompt = self.context_builder.build_system_prompt(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                system_prompt_addendum=system_prompt_addendum,
-            )
-            system_prompt = f"{system_prompt}\n\n{ephemeral_notice}"
 
         tokens = self.counter.count(system_prompt)
 
