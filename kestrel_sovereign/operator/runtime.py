@@ -202,6 +202,49 @@ class OperatorRuntimeRegistry:
                 ]
             del self._active_sets[id(active)]
 
+    def quarantine_registration_set(
+        self, registration_set: OperatorRegistrationSet
+    ) -> bool:
+        """Withdraw exact survivors from one drifted active registration set.
+
+        Ordinary :meth:`unregister` is an atomic exact inverse and therefore
+        refuses a partially missing set. Lifecycle recovery has a different
+        job: remove each retained object that is still exactly resident,
+        tolerate an already-absent object, preserve any replacement, and retire
+        the original set capability so a complete generation can be prepared.
+        """
+
+        if not isinstance(registration_set, OperatorRegistrationSet):
+            raise TypeError("registration_set must be an OperatorRegistrationSet")
+        with self._lock:
+            active = self._active_sets.get(id(registration_set))
+            if active is not registration_set:
+                return False
+            for registration in active.services:
+                resident = self._services.get(registration.reference)
+                if (
+                    resident is registration
+                    and resident.service is registration.service
+                ):
+                    del self._services[registration.reference]
+            for registration in active.workflows:
+                resident = self._workflows.get(registration.name)
+                if resident is registration and resident.actor is registration.actor:
+                    del self._workflows[registration.name]
+            for registration in active.execution_targets:
+                key = (
+                    registration.descriptor.tenant_id,
+                    registration.descriptor.target_id,
+                )
+                resident = self._targets.get(key)
+                if (
+                    resident is registration
+                    and resident.handle is registration.handle
+                ):
+                    del self._targets[key]
+            del self._active_sets[id(active)]
+            return True
+
     def validate_registration_set(
         self, registration_set: OperatorRegistrationSet
     ) -> None:

@@ -254,6 +254,42 @@ def test_teardown_requires_exact_set_registration_and_implementation_identity() 
         registry.unregister(active)
 
 
+def test_quarantine_removes_exact_survivors_from_a_drifted_set() -> None:
+    registry = _registry()
+    service = _service("owner", "1.0.0", object())
+    workflow = WorkflowRegistration("owner", "workflow", lambda: None)
+    active = registry.register(
+        "owner",
+        services=(service,),
+        workflows=(workflow,),
+    )
+    del registry._services[service.reference]
+
+    assert registry.quarantine_registration_set(active) is True
+    assert registry.resolve_service(service.reference) is None
+    assert registry.resolve_workflow_actor(workflow.name) is None
+    assert registry.quarantine_registration_set(active) is False
+
+
+def test_quarantine_preserves_foreign_operator_replacements() -> None:
+    registry = _registry()
+    service = _service("owner", "1.0.0", object())
+    workflow = WorkflowRegistration("owner", "workflow", lambda: None)
+    active = registry.register(
+        "owner",
+        services=(service,),
+        workflows=(workflow,),
+    )
+    foreign_actor = lambda: "foreign"
+    registry._workflows[workflow.name] = WorkflowRegistration(
+        "foreign-owner", workflow.name, foreign_actor
+    )
+
+    assert registry.quarantine_registration_set(active) is True
+    assert registry.resolve_service(service.reference) is None
+    assert registry.resolve_workflow_actor(workflow.name) is foreign_actor
+
+
 def test_removing_middle_version_does_not_disturb_or_resurrect_other_sets() -> None:
     registry = _registry()
     first = _service("first", "1.0.0", object())

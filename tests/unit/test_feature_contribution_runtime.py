@@ -1312,3 +1312,38 @@ def test_quarantine_refuses_foreign_context_before_any_mutation(tmp_path):
     assert runtime.is_active(feature)
     assert runtime.context_clause_registry._clauses[original.identity] is replacement
     _assert_live(agent, feature, True)
+
+
+def test_quarantine_preserves_a_foreign_signal_source_replacement(tmp_path):
+    """Releasing the stale claim must not delete another generation's source."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    replacement = _rival_source(feature.source)
+    runtime.source_registry._sources[feature.source.name] = replacement
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.source_registry.get(feature.source.name) is replacement
+    assert runtime.source_registry.owners_of(feature.source.name) == ()
+
+
+def test_quarantine_removes_operator_survivors_after_partial_drift(tmp_path):
+    """One absent service cannot leave the exact workflow callable."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    del runtime.operator_registry._services[feature.service_registration.reference]
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is None
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is None

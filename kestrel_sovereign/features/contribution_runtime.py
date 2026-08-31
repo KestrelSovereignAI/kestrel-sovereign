@@ -1029,10 +1029,14 @@ class FeatureContributionRuntime:
 
         for registration_set in reversed(active.execution_target_registrations):
             attempt(
-                lambda item=registration_set: self.operator_registry.unregister(item)
+                lambda item=registration_set: (
+                    self.operator_registry.quarantine_registration_set(item)
+                )
             )
         attempt(
-            lambda: self.operator_registry.unregister(active.operator_registrations)
+            lambda: self.operator_registry.quarantine_registration_set(
+                active.operator_registrations
+            )
         )
 
         for registration in active.prepared.contributions.wait_providers:
@@ -1069,7 +1073,12 @@ class FeatureContributionRuntime:
         ):
             failed = True
 
-        attempt(lambda: self.source_registry.release_all(feature))
+        sources = tuple(
+            source
+            for workflow in active.prepared.contributions.workflows
+            for source in workflow.sources
+        )
+        attempt(lambda: self.source_registry.quarantine_claims(feature, sources))
         if failed:
             raise FeatureContributionRuntimeError(
                 "feature contributions could not be quarantined"
