@@ -678,20 +678,35 @@ class TaskManager:
                         authority_agent_id,
                     )
                 )
+            except asyncio.CancelledError:
+                raise
+            except Exception as reconciliation_error:
+                raise save_error from reconciliation_error
+            if committed_operation_id != terminal_operation_id:
+                raise
+
+            # The private token is the single durable proof that this attempt
+            # committed and therefore owns exactly one completion wake. Prefer
+            # the canonical payload (persistence may normalize it), but a
+            # transient full-row read outage cannot revoke ownership after the
+            # token has matched or divert execution into a losing FAILED CAS.
+            try:
                 current = await self.task_store.get_for_recipient(
                     task.id,
                     authority_agent_id,
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as reconciliation_error:
-                raise save_error from reconciliation_error
-            if (
-                committed_operation_id != terminal_operation_id
-                or current is None
-            ):
-                raise
-            return current, True
+            except Exception:
+                logger.warning(
+                    "Task %s terminal commit was proven by operation token but "
+                    "its canonical payload could not be reread; emitting the "
+                    "attempted terminal notification",
+                    task.id,
+                    exc_info=True,
+                )
+                current = None
+            return (current or task), True
         if saved is False:
             # Another terminal writer won the live-set CAS and owns the
             # corresponding completion signal. Returning its durable state

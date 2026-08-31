@@ -570,6 +570,95 @@ async def test_async_terminal_commit_lost_ack_still_emits_completion_wake(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_matching_terminal_token_retains_wake_when_canonical_reread_fails(
+    tmp_path,
+):
+    """A proven terminal commit keeps its wake through a transient row outage."""
+
+    manager = await create_task_manager(
+        str(tmp_path / "terminal-lost-ack-read-outage.db"),
+        host_agent_id=RECIPIENT,
+    )
+
+    class CompletingHandler:
+        async def handle_task(self, task):
+            task.status = TaskStatus(
+                state=TaskState.COMPLETED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="committed through read outage")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="worker",
+            description="uncertain commit read-outage worker",
+            url="/agents/worker",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="finish",
+                    name="finish",
+                    description="finish while canonical reread is unavailable",
+                )
+            ],
+        ),
+        CompletingHandler(),
+    )
+    completions: list[str] = []
+    manager._on_task_complete = lambda task: completions.append(task.id)
+    canonical_save = manager.task_store.save_recipient_terminal_outcome
+    canonical_read = manager.task_store.get_for_recipient
+    first_write = True
+    first_read = True
+
+    async def commit_then_lose_ack(*args, **kwargs):
+        nonlocal first_write
+        committed = await canonical_save(*args, **kwargs)
+        assert committed is True
+        if first_write:
+            first_write = False
+            raise RuntimeError("lost terminal COMMIT acknowledgement")
+        return committed
+
+    async def lose_first_canonical_reread(*args, **kwargs):
+        nonlocal first_read
+        if first_read:
+            first_read = False
+            raise RuntimeError("transient canonical row read outage")
+        return await canonical_read(*args, **kwargs)
+
+    manager.task_store.save_recipient_terminal_outcome = commit_then_lose_ack
+    manager.task_store.get_for_recipient = lose_first_canonical_reread
+    try:
+        submitted = await manager.execute_skill("worker", "finish", {}, sync=False)
+        terminal_events = asyncio.Queue()
+        manager._subscribers[submitted.id] = [terminal_events]
+
+        await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(submitted.id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.COMPLETED
+        assert persisted.status.message.parts[0].text == (
+            "committed through read outage"
+        )
+        assert completions == [submitted.id]
+        event = terminal_events.get_nowait()
+        assert event["event"] == "status"
+        assert event["final"] is True
+        assert terminal_events.empty()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_lost_ack_with_normalized_terminal_payload_still_emits_wake(tmp_path):
     """Persistence normalization cannot veto a matching terminal attempt token."""
 
@@ -821,7 +910,7 @@ async def test_terminal_commit_reconciliation_propagates_cancellation(tmp_path):
     manager._save_recipient_execution_result = AsyncMock(
         side_effect=RuntimeError("terminal write failed")
     )
-    manager.task_store.get_for_recipient = AsyncMock(
+    manager.task_store.get_recipient_terminal_operation_id = AsyncMock(
         side_effect=asyncio.CancelledError()
     )
     try:
