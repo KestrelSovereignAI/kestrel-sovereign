@@ -39,6 +39,8 @@ from kestrel_sovereign.features.bridge.protocol import (
 )
 from kestrel_sovereign.features.bridge.router import _build_context_note
 
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
+
 
 # ============================================================================
 # Helpers

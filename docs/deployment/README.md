@@ -348,7 +348,7 @@ install (`uv sync` or `pip install kestrel-sovereign`); do not solve a missing
 timezone by adding an unrelated optional feature extra.
 
 Durable isolated scheduler execution and private host ingress also require
-`kestrel-sovereign-sdk[tracing]>=0.36.0,<0.37`. Before releasing Core, publish
+`kestrel-sovereign-sdk[tracing]>=0.37.0,<0.38`. Before releasing Core, publish
 and test compatible constraints in Frinz and the observability fleet; Core does
 not relax this safety floor for an older downstream resolver. The Core
 dependency-contract test checks the Core base/observability declarations and
