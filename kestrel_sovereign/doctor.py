@@ -309,6 +309,13 @@ def _anchor_is_the_runtime_database(env: dict) -> bool:
 _POSTGRES_CLUSTER_ID_SQL = (
     "SELECT system_identifier::text FROM pg_catalog.pg_control_system()"
 )
+_POSTGRES_HOLD_METADATA_TABLE_SQL = (
+    "SELECT to_regclass('agent_metadata')::text"
+)
+_POSTGRES_HOLD_CUSTODY_SQL = (
+    "SELECT key, value FROM agent_metadata "
+    "WHERE agent_id = $1 AND key IN ($2, $3, $4)"
+)
 
 
 def _postgres_cluster_probe_source(
@@ -389,6 +396,70 @@ def _runtime_postgres_connection_failed(readings: list[_AgentGovernance]) -> boo
     )
 
 
+def _read_postgres_hold_custody_snapshot(
+    dsn: str,
+    *,
+    cluster_identity: str,
+    label: str,
+    env: dict[str, str],
+    project_dir: Path,
+    report: DoctorReport,
+):
+    """Read existing durable custody roles without initializing a schema."""
+
+    from kestrel_sovereign.hold.state import (
+        _POSTGRES_EVIDENCE_BINDING_KEY,
+        _POSTGRES_PRIMARY_BINDING_KEY,
+        _POSTGRES_ROLLBACK_DOMAIN_KEY,
+        _POSTGRES_WITNESS_AGENT_ID,
+        postgres_hold_custody_snapshot_from_rows,
+    )
+
+    source = _postgres_cluster_probe_source(dsn, env, project_dir)
+    try:
+        table_rows = _fetch_postgres_rows_isolated(
+            dsn,
+            _POSTGRES_HOLD_METADATA_TABLE_SQL,
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+        )
+        if len(table_rows) != 1 or len(table_rows[0]) != 1:
+            raise ValueError("metadata-table probe returned invalid data")
+        table_name = table_rows[0][0]
+        if table_name is None:
+            metadata_rows = []
+        else:
+            if not isinstance(table_name, str) or not table_name.strip():
+                raise ValueError("metadata-table probe returned invalid data")
+            metadata_rows = _fetch_postgres_rows_isolated(
+                dsn,
+                _POSTGRES_HOLD_CUSTODY_SQL,
+                (
+                    _POSTGRES_WITNESS_AGENT_ID,
+                    _POSTGRES_ROLLBACK_DOMAIN_KEY,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                ),
+                postgres_home=source.postgres_home,
+                postgres_env=source.postgres_env,
+                postgres_cwd=source.postgres_cwd,
+                dsn_identity=source.dsn_identity,
+            )
+        return postgres_hold_custody_snapshot_from_rows(
+            cluster_identity,
+            metadata_rows,
+            label=label,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must fail closed
+        report.fail.append(
+            f"PostgreSQL Hold {label} custody roles NOT verified: "
+            f"{_safe(exc, source)}"
+        )
+        return None
+
+
 def _check_postgres_hold_readiness(
     env: dict[str, str],
     project_dir: Path,
@@ -443,7 +514,36 @@ def _check_postgres_hold_readiness(
             "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
         )
         return
-    report.ok.append("PostgreSQL Hold evidence: independent clusters verified")
+    primary_snapshot = _read_postgres_hold_custody_snapshot(
+        primary_dsn,
+        cluster_identity=primary_identity,
+        label="primary",
+        env=env,
+        project_dir=project_dir,
+        report=report,
+    )
+    evidence_snapshot = _read_postgres_hold_custody_snapshot(
+        evidence_dsn,
+        cluster_identity=evidence_identity,
+        label="evidence",
+        env=env,
+        project_dir=project_dir,
+        report=report,
+    )
+    if primary_snapshot is None or evidence_snapshot is None:
+        return
+    try:
+        from kestrel_sovereign.hold.state import validate_postgres_hold_custody
+
+        validate_postgres_hold_custody(primary_snapshot, evidence_snapshot)
+    except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
+        report.fail.append(
+            f"PostgreSQL Hold custody NOT verified: {exc}"
+        )
+        return
+    report.ok.append(
+        "PostgreSQL Hold evidence: independent clusters and custody roles verified"
+    )
 
 
 @dataclass(frozen=True)

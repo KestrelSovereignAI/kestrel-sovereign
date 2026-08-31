@@ -22,11 +22,15 @@ from kestrel_sovereign.hold import (
 )
 from kestrel_sovereign.hold.state import (
     HoldCorruptStateError,
+    PostgresHoldCustodySnapshot,
     _latch_from_row,
     _receipt_from_row,
     _terminal_authority_ids,
     hold_history_anchor_path,
     hold_initialization_witness_path,
+    preflight_postgres_hold_custody,
+    postgres_hold_custody_binding_payload,
+    validate_postgres_hold_custody,
 )
 from kestrel_sovereign.host_features.context import build_host_context
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -703,6 +707,9 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         events.append(("hold-boot-read", self._db))
         return ()
 
+    async def _preflight(primary_dsn, evidence_dsn):
+        events.append(("custody-preflight", primary_dsn, evidence_dsn))
+
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
     monkeypatch.setenv(
@@ -716,6 +723,10 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     )
     monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
     monkeypatch.setattr(HoldStore, "read_boot_state", _read_boot_state)
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
+        _preflight,
+    )
 
     host_path = tmp_path / "existing-host-features.db"
     ctx = await build_host_context(db_path=str(host_path))
@@ -727,8 +738,13 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     assert ctx.hold_store._evidence_db is fake_evidence_db
     assert ctx.hold_store._initialization_witness_path is None
     assert ctx.hold_store._history_anchor_path is None
-    assert events[:5] == [
+    assert events[:6] == [
         ("sqlite", str(host_path)),
+        (
+            "custody-preflight",
+            "postgresql://durable/host",
+            "postgresql://independent/evidence",
+        ),
         (
             "postgres",
             "postgresql://durable/host",
@@ -852,6 +868,64 @@ async def test_postgres_hold_without_independent_evidence_fails_closed_at_boot(
     assert context.hold_store is None
     assert "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required" in context.backend_error
     assert events == ["factory-close", "db-close"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_custody_preflight_failure_precedes_schema_initialization(
+    monkeypatch,
+    tmp_path,
+):
+    """A wrong-role database is never handed to the schema-writing factory."""
+
+    from kestrel_sovereign.storage.sqla import session as session_module
+
+    events: list[str] = []
+
+    class _DB:
+        backend_type = "sqlite"
+
+        async def close(self):
+            events.append("db-close")
+
+    class _InnerFactory:
+        engine = object()
+
+        async def close(self):
+            events.append("factory-close")
+
+    async def _sqlite(_cls, _path):
+        return _DB()
+
+    async def _postgres(_cls, _dsn, **_pool_sizes):
+        pytest.fail("schema-initializing PostgreSQL factory ran before custody passed")
+
+    async def _reject_custody(_primary_dsn, _evidence_dsn):
+        events.append("custody-preflight")
+        raise HoldStateError("wrong durable custody role")
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
+    monkeypatch.setenv(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "postgresql://independent/evidence",
+    )
+    monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
+    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        session_module,
+        "make_session_factory",
+        lambda _db: _InnerFactory(),
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
+        _reject_custody,
+    )
+
+    context = await build_host_context(db_path=str(tmp_path / "host.db"))
+
+    assert context.hold_store is None
+    assert "wrong durable custody role" in context.backend_error
+    assert events == ["custody-preflight", "factory-close", "db-close"]
 
 
 @pytest.mark.asyncio
@@ -1078,6 +1152,10 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
         session_module, "make_session_factory", lambda _db: _InnerFactory()
     )
     monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
+        AsyncMock(),
+    )
 
     bootstrap = asyncio.create_task(
         build_host_context(db_path=str(tmp_path / "host.db"))
@@ -1158,6 +1236,10 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
         lambda _db: _InnerFactory(),
     )
     monkeypatch.setattr(HoldStore, "ensure_schema", _fail_schema)
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
+        AsyncMock(),
+    )
 
     bootstrap = asyncio.create_task(
         build_host_context(db_path=str(tmp_path / "host.db"))
@@ -2573,6 +2655,157 @@ async def test_postgres_evidence_lock_rejects_swapped_custody_roles():
     with pytest.raises(HoldStateError, match="custody role|binding"):
         async with HoldStore(evidence, evidence_db=primary)._postgres_evidence_lock():
             pass
+
+
+def _custody_domain(number: int) -> str:
+    return (
+        "kestrel-hold-rollback-domain-v1:"
+        f"00000000-0000-0000-0000-{number:012d}"
+    )
+
+
+def test_postgres_custody_preflight_accepts_fresh_independent_pair():
+    validate_postgres_hold_custody(
+        PostgresHoldCustodySnapshot("cluster-primary"),
+        PostgresHoldCustodySnapshot("cluster-evidence"),
+    )
+
+
+def test_postgres_custody_preflight_rejects_wrong_durable_role():
+    with pytest.raises(HoldStateError, match="wrong durable custody role"):
+        validate_postgres_hold_custody(
+            PostgresHoldCustodySnapshot(
+                "cluster-primary",
+                evidence_binding="old-evidence-role",
+            ),
+            PostgresHoldCustodySnapshot("cluster-evidence"),
+        )
+
+
+def test_postgres_custody_preflight_rejects_binding_without_domains():
+    with pytest.raises(HoldStateError, match="lacks a durable rollback domain"):
+        validate_postgres_hold_custody(
+            PostgresHoldCustodySnapshot(
+                "cluster-primary",
+                primary_binding="persisted-binding",
+            ),
+            PostgresHoldCustodySnapshot("cluster-evidence"),
+        )
+
+
+def test_postgres_custody_preflight_accepts_valid_partial_publication():
+    primary_domain = _custody_domain(1)
+    evidence_domain = _custody_domain(2)
+    binding = postgres_hold_custody_binding_payload(
+        uuid4(),
+        primary_domain,
+        evidence_domain,
+    )
+
+    validate_postgres_hold_custody(
+        PostgresHoldCustodySnapshot(
+            "cluster-primary",
+            domain_identity=primary_domain,
+            primary_binding=binding,
+        ),
+        PostgresHoldCustodySnapshot(
+            "cluster-evidence",
+            domain_identity=evidence_domain,
+        ),
+    )
+
+
+def test_postgres_custody_preflight_rejects_binding_for_another_pair():
+    primary_domain = _custody_domain(1)
+    evidence_domain = _custody_domain(2)
+    binding = postgres_hold_custody_binding_payload(
+        uuid4(),
+        primary_domain,
+        _custody_domain(3),
+    )
+
+    with pytest.raises(HoldStateError, match="does not match the configured pair"):
+        validate_postgres_hold_custody(
+            PostgresHoldCustodySnapshot(
+                "cluster-primary",
+                domain_identity=primary_domain,
+                primary_binding=binding,
+            ),
+            PostgresHoldCustodySnapshot(
+                "cluster-evidence",
+                domain_identity=evidence_domain,
+            ),
+        )
+
+
+def test_postgres_custody_preflight_rejects_disagreeing_bindings():
+    primary_domain = _custody_domain(1)
+    evidence_domain = _custody_domain(2)
+    primary_binding = postgres_hold_custody_binding_payload(
+        uuid4(), primary_domain, evidence_domain
+    )
+    evidence_binding = postgres_hold_custody_binding_payload(
+        uuid4(), primary_domain, evidence_domain
+    )
+
+    with pytest.raises(HoldStateError, match="disagrees between databases"):
+        validate_postgres_hold_custody(
+            PostgresHoldCustodySnapshot(
+                "cluster-primary",
+                domain_identity=primary_domain,
+                primary_binding=primary_binding,
+            ),
+            PostgresHoldCustodySnapshot(
+                "cluster-evidence",
+                domain_identity=evidence_domain,
+                evidence_binding=evidence_binding,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_postgres_custody_preflight_is_read_only_and_closes_raw_pools(
+    monkeypatch,
+):
+    """The guard runs before schema init and owns both temporary pools."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    backends = []
+
+    class _Backend:
+        def __init__(self, *, dsn, min_pool_size, max_pool_size):
+            self.dsn = dsn
+            self.closed = False
+            self.queries = []
+            assert (min_pool_size, max_pool_size) == (1, 1)
+            backends.append(self)
+
+        async def connect(self):
+            return None
+
+        async def fetch_all(self, query, params=()):
+            self.queries.append((query, params))
+            assert query.lstrip().startswith("SELECT")
+            if "pg_control_system" in query:
+                return [(self.dsn,)]
+            if "to_regclass" in query:
+                return [(None,)]
+            raise AssertionError(f"unexpected preflight query: {query}")
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
+
+    await preflight_postgres_hold_custody(
+        "postgresql://primary/db",
+        "postgresql://evidence/db",
+    )
+
+    assert len(backends) == 2
+    assert all(backend.closed for backend in backends)
+    assert all(len(backend.queries) == 2 for backend in backends)
 
 
 @pytest.mark.asyncio

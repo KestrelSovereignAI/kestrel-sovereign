@@ -35,6 +35,12 @@ def test_single_agent_dockerfiles_use_agent_data_dir_for_db_path():
         assert "ENV KESTREL_DB_PATH=/app/kestrel_prime.db" not in text
 
 
+def test_multi_agent_image_persists_host_control_database_on_agent_volume():
+    text = _read("docker/Dockerfile.multi_agent")
+
+    assert f"ENV KESTREL_HOST_DB_PATH={CANONICAL_HOST_DB_PATH}" in text
+
+
 def test_compose_mount_and_env_point_to_same_agent_data_dir():
     text = _read("docker-compose.yml")
 
