@@ -2860,11 +2860,16 @@ async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
     assert "live A2A task requires durable authority" in scripts
     assert "CREATE TRIGGER a2a_tasks_authority_fence_v3" in scripts
     assert "EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v3()" in scripts
+    statements = "\n".join(
+        call.args[0] for call in backend.execute.await_args_list
+    )
+    assert "ADD COLUMN IF NOT EXISTS terminal_operation_id TEXT" in statements
 
 
 @pytest.mark.asyncio
 async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
     events: list[str] = []
+    schema_probes: list[str] = []
 
     @asynccontextmanager
     async def transaction():
@@ -2882,8 +2887,9 @@ async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
             events.append("index-ddl")
         return 0
 
-    async def fetch_one(_query, _params=()):
+    async def fetch_one(query, _params=()):
         events.append("schema-reprobe")
+        schema_probes.append(query)
         return (False,)
 
     async def execute_script(script):
@@ -2905,6 +2911,8 @@ async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
     fence_index = events.index("fence-ddl")
     assert events.index("transaction-enter") < lock_index < probe_index
     assert probe_index < fence_index < events.index("transaction-exit")
+    assert "terminal_operation_id" in schema_probes[0]
+    assert "COUNT(*) = 7" in schema_probes[0]
 
 
 @pytest.mark.asyncio

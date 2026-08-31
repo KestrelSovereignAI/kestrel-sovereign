@@ -426,6 +426,11 @@ class TaskManager:
                     authority_agent_id=authority_agent_id,
                 )
             else:
+                terminal_operation_id = (
+                    uuid4().hex
+                    if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}
+                    else None
+                )
                 saved: Optional[bool] = None
                 try:
                     async with self.task_store._backend.transaction():
@@ -433,6 +438,7 @@ class TaskManager:
                             task,
                             authority_agent_id=authority_agent_id,
                             expected_state=expected_state,
+                            terminal_operation_id=terminal_operation_id,
                         )
                 except Exception as save_err:
                     logger.error(
@@ -444,6 +450,7 @@ class TaskManager:
                             task,
                             authority_agent_id=authority_agent_id,
                             expected_state=expected_state,
+                            terminal_operation_id=terminal_operation_id,
                         )
                     except Exception as retry_err:
                         logger.critical(
@@ -641,11 +648,17 @@ class TaskManager:
                 False,
             )
 
+        terminal_operation_id = (
+            uuid4().hex
+            if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}
+            else None
+        )
         try:
             saved = await self._save_recipient_execution_result(
                 task,
                 authority_agent_id=authority_agent_id,
                 expected_state=expected_state,
+                terminal_operation_id=terminal_operation_id,
             )
         except Exception as save_error:
             # PostgreSQL can commit and then lose the COMMIT acknowledgement.
@@ -655,16 +668,27 @@ class TaskManager:
             # terminal state belongs to another writer and must not be narrated
             # over. Cancellation remains outside this Exception-only recovery so
             # task cancellation semantics are never swallowed.
+            if terminal_operation_id is None:
+                raise
             try:
+                committed_operation_id = (
+                    await self.task_store.get_recipient_terminal_operation_id(
+                        task.id,
+                        authority_agent_id,
+                    )
+                )
                 current = await self.task_store.get_for_recipient(
                     task.id,
                     authority_agent_id,
                 )
-            except BaseException as reconciliation_error:
+            except asyncio.CancelledError:
+                raise
+            except Exception as reconciliation_error:
                 raise save_error from reconciliation_error
-            if current is None or not self._same_recipient_execution_outcome(
-                current,
-                task,
+            if (
+                committed_operation_id != terminal_operation_id
+                or current is None
+                or not self._same_recipient_execution_outcome(current, task)
             ):
                 raise
             return current, True
@@ -698,13 +722,17 @@ class TaskManager:
         *,
         authority_agent_id: str,
         expected_state: TaskState,
+        terminal_operation_id: Optional[str],
     ) -> bool:
         """Persist a handler result without mistaking live progress for a winner."""
 
         if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}:
+            if terminal_operation_id is None:
+                raise ValueError("Terminal execution outcome requires an operation ID")
             return await self.task_store.save_recipient_terminal_outcome(
                 task,
                 recipient_agent_id=authority_agent_id,
+                operation_id=terminal_operation_id,
             )
         return await self.task_store.save_recipient_lifecycle(
             task,

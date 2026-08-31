@@ -96,7 +96,8 @@ class TaskStore(UnifiedStoreBase):
                 canceled_by TEXT,
                 cancel_reason TEXT,
                 cancel_previous_status TEXT,
-                cancel_operation_id TEXT
+                cancel_operation_id TEXT,
+                terminal_operation_id TEXT
             )
         """)
 
@@ -175,7 +176,7 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 6
+                    SELECT COUNT(*) = 7
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -185,7 +186,8 @@ class TaskStore(UnifiedStoreBase):
                           'canceled_by',
                           'cancel_reason',
                           'cancel_previous_status',
-                          'cancel_operation_id'
+                          'cancel_operation_id',
+                          'terminal_operation_id'
                       )
                 )
                 AND EXISTS (
@@ -239,6 +241,7 @@ class TaskStore(UnifiedStoreBase):
             "cancel_reason",
             "cancel_previous_status",
             "cancel_operation_id",
+            "terminal_operation_id",
         )
         for column in authority_columns:
             await self.add_column_if_missing("a2a_tasks", column, "TEXT")
@@ -430,6 +433,7 @@ class TaskStore(UnifiedStoreBase):
         task: Task,
         *,
         recipient_agent_id: str,
+        operation_id: str,
     ) -> bool:
         """Commit a handler's terminal result from whichever live state remains.
 
@@ -444,6 +448,10 @@ class TaskStore(UnifiedStoreBase):
             raise ValueError(
                 "Recipient execution outcomes must be completed or failed"
             )
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError(
+                "Recipient terminal operation ID must be a concrete string"
+            )
         return await self._save_recipient_lifecycle_from_states(
             task,
             recipient_agent_id=recipient_agent_id,
@@ -452,6 +460,7 @@ class TaskStore(UnifiedStoreBase):
                 TaskState.WORKING,
                 TaskState.INPUT_REQUIRED,
             ),
+            terminal_operation_id=operation_id,
         )
 
     async def _save_recipient_lifecycle_from_states(
@@ -460,6 +469,7 @@ class TaskStore(UnifiedStoreBase):
         *,
         recipient_agent_id: str,
         expected_states: tuple[TaskState, ...],
+        terminal_operation_id: Optional[str] = None,
     ) -> bool:
         """CAS one recipient-owned payload from an explicit state set."""
 
@@ -483,6 +493,7 @@ class TaskStore(UnifiedStoreBase):
                 artifacts = ?,
                 history = ?,
                 metadata = ?,
+                terminal_operation_id = ?,
                 updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
@@ -494,6 +505,7 @@ class TaskStore(UnifiedStoreBase):
                 artifacts_json,
                 history_json,
                 metadata_json,
+                terminal_operation_id,
                 task.id,
                 recipient_agent_id,
                 *(state.value for state in expected_states),
@@ -606,6 +618,22 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one(
             "SELECT cancel_operation_id FROM a2a_tasks WHERE id = ?",
             (task_id,),
+        )
+        return row[0] if row else None
+
+    async def get_recipient_terminal_operation_id(
+        self,
+        task_id: str,
+        recipient_agent_id: str,
+    ) -> Optional[str]:
+        """Return the private token proving which recipient terminal write won."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task recipient lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT terminal_operation_id FROM a2a_tasks "
+            "WHERE id = ? AND recipient_agent_id = ?",
+            (task_id, recipient_agent_id),
         )
         return row[0] if row else None
 
@@ -1028,7 +1056,8 @@ class TaskStore(UnifiedStoreBase):
         5: message, 6: artifacts, 7: history, 8: metadata,
         9: created_at, 10: updated_at, 11: creator_agent_id,
         12: recipient_agent_id, 13: canceled_by, 14: cancel_reason,
-        15: cancel_previous_status, 16: cancel_operation_id
+        15: cancel_previous_status, 16: cancel_operation_id,
+        17: terminal_operation_id
         """
         artifacts_data = json_loads(row[6]) if row[6] else []
         history_data = json_loads(row[7]) if row[7] else []

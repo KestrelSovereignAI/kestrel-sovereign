@@ -20,6 +20,7 @@ from kestrel_sovereign.a2a.task_worker import TaskWorker
 from kestrel_sovereign.a2a.types import (
     Artifact,
     Message,
+    Task,
     TaskSendParams,
     TaskState,
     TaskStatus,
@@ -554,12 +555,18 @@ async def test_uncertain_terminal_write_does_not_claim_different_payload(tmp_pat
         nonlocal first_write
         if first_write:
             first_write = False
+            attempted_operation_id = kwargs.pop("operation_id", None)
             winner = task.model_copy(deep=True)
             winner.status.message = Message(
                 role="agent",
                 parts=[TextPart(text="competing result")],
             )
-            assert await canonical_save(winner, **kwargs) is True
+            winner_kwargs = dict(kwargs)
+            if attempted_operation_id is not None:
+                winner_kwargs["operation_id"] = (
+                    f"competing-{attempted_operation_id}"
+                )
+            assert await canonical_save(winner, **winner_kwargs) is True
             raise RuntimeError("write outcome was uncertain")
         return await canonical_save(task, **kwargs)
 
@@ -576,6 +583,115 @@ async def test_uncertain_terminal_write_does_not_claim_different_payload(tmp_pat
         assert persisted.status.message.parts[0].text == "competing result"
         assert completions == []
         assert terminal_events.empty()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_terminal_write_does_not_claim_identical_competing_payload(
+    tmp_path,
+):
+    """Byte-identical output does not prove which terminal attempt committed."""
+
+    manager = await create_task_manager(
+        str(tmp_path / "terminal-identical-winner.db"),
+        host_agent_id=RECIPIENT,
+    )
+
+    class CompletingHandler:
+        async def handle_task(self, task):
+            task.status = TaskStatus(
+                state=TaskState.COMPLETED,
+                message=Message(role="agent", parts=[TextPart(text="same result")]),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="worker",
+            description="identical competing terminal writer",
+            url="/agents/worker",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="finish",
+                    name="finish",
+                    description="lose to an identical terminal payload",
+                )
+            ],
+        ),
+        CompletingHandler(),
+    )
+    completions: list[str] = []
+    manager._on_task_complete = lambda task: completions.append(task.id)
+    canonical_save = manager.task_store.save_recipient_terminal_outcome
+    first_write = True
+
+    async def competing_identical_commit_then_error(task, **kwargs):
+        nonlocal first_write
+        if first_write:
+            first_write = False
+            attempted_operation_id = kwargs.pop("operation_id", None)
+            winner_kwargs = dict(kwargs)
+            if attempted_operation_id is not None:
+                winner_kwargs["operation_id"] = (
+                    f"competing-{attempted_operation_id}"
+                )
+            assert await canonical_save(
+                task.model_copy(deep=True),
+                **winner_kwargs,
+            ) is True
+            raise RuntimeError("our write failed before commit")
+        return await canonical_save(task, **kwargs)
+
+    manager.task_store.save_recipient_terminal_outcome = (
+        competing_identical_commit_then_error
+    )
+    try:
+        submitted = await manager.execute_skill("worker", "finish", {}, sync=False)
+        terminal_events = asyncio.Queue()
+        manager._subscribers[submitted.id] = [terminal_events]
+
+        await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(submitted.id)
+        assert persisted.status.state is TaskState.COMPLETED
+        assert persisted.status.message.parts[0].text == "same result"
+        assert completions == []
+        assert terminal_events.empty()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_commit_reconciliation_propagates_cancellation(tmp_path):
+    """Stop during reconciliation must not become a generic execution failure."""
+
+    manager = await create_task_manager(
+        str(tmp_path / "terminal-reconcile-cancel.db"),
+        host_agent_id=RECIPIENT,
+    )
+    attempted = Task(
+        id="terminal-reconcile-cancel",
+        status=TaskStatus(state=TaskState.COMPLETED),
+    )
+    manager._save_recipient_execution_result = AsyncMock(
+        side_effect=RuntimeError("terminal write failed")
+    )
+    manager.task_store.get_for_recipient = AsyncMock(
+        side_effect=asyncio.CancelledError()
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await manager._persist_execution_outcome(
+                attempted,
+                authority_agent_id=RECIPIENT,
+                expected_state=TaskState.SUBMITTED,
+            )
     finally:
         await manager.close()
 
