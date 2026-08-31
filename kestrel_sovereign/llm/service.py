@@ -4312,6 +4312,16 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         target_selector = self._get_default_mandate_selector()
+        # An operator-pinned route is an EXPLICIT selection, exactly as the
+        # generation path treats it (#3190 r6 P1). Recorded here because the
+        # catalog guard below must apply the same rule: generation skips it for
+        # an explicit pin, so an audit that does not would reject a target the
+        # very same request just generated with — warn mode annotating every
+        # response, strict mode denying every one.
+        audit_selection_is_explicit = bool(target_selector) or bool(
+            self._mandate_preference.get("vendor")
+            or self._mandate_preference.get("route")
+        )
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
             pref_vendor = self._mandate_preference.get("vendor")
@@ -4359,7 +4369,15 @@ No other text or formatting.
             errors = {}
             for provider in available_providers:
                 logger.info(f"Auditing with provider: {provider['name']}")
-                if target_model and not self._model_available_for_route(provider, target_model):
+                skip_catalog = (
+                    audit_selection_is_explicit
+                    and provider.get("vendor") not in _MODEL_IGNORING_VENDORS
+                )
+                if (
+                    target_model
+                    and not skip_catalog
+                    and not self._model_available_for_route(provider, target_model)
+                ):
                     # Record the skip so that if EVERY route rejects the
                     # mandated model, the loop fails closed (risk=3) instead of
                     # falling through to the benign "no providers" risk=1.

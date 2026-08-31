@@ -382,3 +382,143 @@ class TestMandateLoadErrorLifecycle:
         svc._mandate_load_error = "Cannot set model 'claude-opus-5' ..."
         svc.clear_model_preference()
         assert svc._mandate_load_error is None
+
+
+class TestAuditPathAgreesWithGeneration:
+    """Generation and its own audit must reach the same verdict (#3190 r6 P1).
+
+    The generation path skips the catalog guard for an EXPLICIT selection
+    (`skip_catalog = explicit_selection and vendor not in _MODEL_IGNORING_VENDORS`).
+    `get_audit_response` applied the guard unconditionally, so during the
+    collapsed-catalog outage a pinned route would generate successfully and
+    then fail its own audit: every route recorded as "target model not
+    available", the loop failing closed at risk 3. With ResponseAudit in warn
+    mode that annotates every response; in strict mode it denies every one.
+
+    Same shape as the setter/runtime-guard split: one seam learned a rule and
+    its sibling did not. The comment explaining WHY an explicit selection is
+    trusted lived on the generation path the whole time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_route_is_not_rejected_by_its_own_audit(self):
+        """Drives the real `get_audit_response` against the collapsed catalog."""
+        adapter = MagicMock()
+        adapter.provider_capabilities.return_value = MagicMock(
+            supports_structured_output=True
+        )
+        provider = {
+            "name": "anthropic:plan",
+            "vendor": "anthropic",
+            "route": "plan",
+            "model": "auto",
+            "adapter": adapter,
+            "client": MagicMock(),
+        }
+        svc = _make_service(providers=[provider])
+        svc._mandate_preference = {
+            "vendor": "anthropic", "model": "claude-opus-5", "route": "plan",
+        }
+        svc._check_policy = lambda: None
+        svc._resolve_invocation_context = lambda ctx: ctx
+        svc._get_default_mandate_selector = lambda: None
+        svc._available_providers = lambda: [provider]
+        svc._resolve_model_selector = lambda sel, providers=None: {
+            "provider": "anthropic:plan", "model": "claude-opus-5",
+        }
+        svc._resolve_concrete_model = lambda target, prov: "claude-opus-5"
+
+        attempted = {"ran": False}
+
+        async def _attempt(*a, **k):
+            attempted["ran"] = True
+            return '{"risk_level": 1, "reasoning": "fine"}'
+
+        svc._run_provider_attempt = _attempt
+
+        cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            result = await svc.get_audit_response("some response text")
+
+        assert attempted["ran"], (
+            "the audit never attempted the route — an explicitly pinned target "
+            "was rejected by the catalog guard that generation skips"
+        )
+        assert result.get("risk_level") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_NON_explicit_target_is_still_guarded(self):
+        """The converse: with no pin, the collapsed catalog must still bite.
+
+        Without this, 'fix' the P1 by deleting the guard from the audit path
+        entirely and the test above still passes.
+        """
+        adapter = MagicMock()
+        adapter.provider_capabilities.return_value = MagicMock(
+            supports_structured_output=True
+        )
+        provider = {
+            "name": "anthropic:plan",
+            "vendor": "anthropic",
+            "route": "plan",
+            "model": "auto",
+            "adapter": adapter,
+            "client": MagicMock(),
+        }
+        svc = _make_service(providers=[provider])
+        # No vendor/route pin at all -> not an explicit selection.
+        svc._mandate_preference = {"vendor": None, "model": None, "route": None}
+        svc._check_policy = lambda: None
+        svc._resolve_invocation_context = lambda ctx: ctx
+        svc._get_default_mandate_selector = lambda: None
+        svc._available_providers = lambda: [provider]
+        svc._resolve_model_selector = lambda sel, providers=None: {
+            "provider": "anthropic:plan", "model": "claude-opus-5",
+        }
+        svc._resolve_concrete_model = lambda target, prov: "claude-opus-5"
+
+        attempted = {"ran": False}
+
+        async def _attempt(*a, **k):
+            attempted["ran"] = True
+            return '{"risk_level": 1, "reasoning": "fine"}'
+
+        svc._run_provider_attempt = _attempt
+        # Force a target_model without an explicit mandate.
+        svc._mandate_preference = {"vendor": None, "model": "claude-opus-5", "route": None}
+
+        cache = _cached(_COLLAPSED_ANTHROPIC_CATALOG)
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=cache,
+        ):
+            result = await svc.get_audit_response("some response text")
+
+        assert not attempted["ran"], (
+            "a non-explicit target absent from a trustworthy catalog must "
+            "still be skipped — the guard was removed, not gated"
+        )
+        assert result.get("risk_level") == 3
+
+    def test_generation_and_audit_read_the_same_rule(self):
+        """Both sites must gate on explicitness, not just one.
+
+        Pins the invariant rather than the implementation: if a future edit
+        removes the condition from either site, this fails.
+        """
+        import inspect
+
+        gen = inspect.getsource(LLMService._get_provider_for_embeddings) \
+            if hasattr(LLMService, "_get_provider_for_embeddings") else ""
+        audit = inspect.getsource(LLMService.get_audit_response)
+        assert "skip_catalog" in audit, (
+            "get_audit_response must gate the catalog guard on whether the "
+            "selection is explicit, as the generation path does"
+        )
+        assert "_MODEL_IGNORING_VENDORS" in audit, (
+            "and must honour the same vendor exemption, or local routes "
+            "diverge between generation and audit"
+        )
