@@ -59,18 +59,20 @@ from .policy import (
     Decision,
     PathPolicy,
     evaluate_argv_paths,
-    first_shell_syntax_exec_ignores,
+    first_shell_significant_character,
+    quote_words_containing_shell_syntax,
     split_command,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# What a shell would have done, phrased so the refusal names the
-# behaviour the caller was counting on rather than the character they
-# typed: "the '|' cannot pipe one command's output into the next" tells
-# them what they lost, where "invalid character" does not.
-_SHELL_CONTROL_MEANINGS = {
+# What a shell would have done with the characters callers most often
+# reach for, so the refusal names the behaviour they were counting on
+# rather than the character they typed. Anything absent gets the
+# general phrasing — the rule is an allow-list of inert characters, so
+# this map does not have to be complete to be correct.
+_SHELL_CHARACTER_MEANINGS = {
     "|": "pipe one command's output into the next",
     "&": "background this command, or join it to another",
     ";": "run a second command after this one",
@@ -80,22 +82,19 @@ _SHELL_CONTROL_MEANINGS = {
     "$": "expand a variable, or substitute another command's output",
     "(": "group commands in a subshell",
     ")": "group commands in a subshell",
+    "*": "expand to the filenames it matches",
+    "?": "expand to the filenames it matches",
+    "[": "expand to the filenames it matches",
+    "{": "expand into several arguments",
+    "~": "expand to a home directory",
+    "#": "start a comment hiding the rest of the line",
+    "\\": "escape the next character",
     "\n": "run a second command on the next line",
-    "\r": "keep this character inside the word",
+    "\r": "stay inside the word rather than separating it",
 }
 
-# ...and for the constructs where the character alone would mislead. An
-# escaped ``$`` is the opposite of an expansion: bash removes the
-# backslash, this does not, so "cannot expand a variable" would be a
-# false explanation of the caller's own line.
-_SHELL_SYNTAX_MEANINGS = {
-    "comment": "start a comment hiding the rest of the line",
-    "tilde": "expand to a home directory",
-    "glob": "expand to the filenames it matches",
-}
-
-# A control character that has no printable form still has to be
-# nameable in an audit row and readable in a refusal.
+# A control character with no printable form still has to be nameable
+# in an audit row and readable in a refusal.
 _UNPRINTABLE_NAMES = {"\n": "newline", "\r": "carriage-return", "\t": "tab"}
 
 
@@ -118,63 +117,40 @@ def shell_syntax_refusal(
     command than the one written. Routing the string through ``bash
     -lc`` here instead would make the deny-list's unit (``argv[0]``)
     stop describing what runs, since only ``bash`` would be vetted for
-    a line that can invoke anything.
+    a line that can invoke anything — and the vetting that would have
+    to make up the difference reads ``shlex`` tokens, which is #3130.
 
-    **No shell form is offered back, deliberately.** Two review rounds
-    were spent trying to bound one — suppress it when a token names a
-    deny-listed binary, suppress it when an expansion hides what runs —
-    and each round found another spelling that slipped through, because
-    every one of those checks reads ``shlex`` tokens and ``shlex`` is
-    not a shell. ``cat </home/me/.ssh/id_rsa | head`` hands the path
-    policy the literal token ``</home/...``, which resolves to nothing;
-    ``echo hi;sudo -n true`` hands the deny-list ``hi;sudo``, which is
-    not ``sudo``. Deciding what bash would run needs a shell parser,
-    not a token scan, so this says what it cannot do instead of
-    composing a command no gate could vet.
-
-    Those same two blind spots are live on the paths that DO hand a raw
-    string to a real shell — the codex bridge, and ``bash -lc`` called
-    directly. That is #3130, and it is why this refusal declines to add
-    traffic to them.
+    The remedy offered is quoting, and quoting only. It is bounded by
+    construction: single-quoted text is inert to bash and to ``shlex``
+    alike, so the rewrite's argv is its words, and those words are what
+    the gates that ran before this one already vetted.
     """
-    found = first_shell_syntax_exec_ignores(command)
+    found = first_shell_significant_character(command)
     if found is None:
         return None
-    index, char = found.index, found.char
+    char = found.char
     named = _UNPRINTABLE_NAMES.get(char) or repr(char)
-    preamble = (
-        "shell does not run a shell: the command is tokenized and executed "
-        "directly, so"
+    meaning = _SHELL_CHARACTER_MEANINGS.get(char)
+    would = f" cannot {meaning}" if meaning else " is not interpreted"
+    # When the character IS the first token there is no binary it would
+    # have been handed to, so that clause would name the character as
+    # its own recipient.
+    handed_to = (
+        f", and reaches {Path(argv[0]).name!r} as a literal argument"
+        if argv and argv[0] != char
+        else ""
     )
-    if found.kind == "escape":
-        # Naming the escaped character here would say the opposite of
-        # what happens: the backslash is what a shell removes.
-        what = (
-            f"{preamble} the backslash before the {named} at position "
-            f"{index} stays in the argument, where a shell would drop it"
-        )
-    else:
-        meaning = _SHELL_SYNTAX_MEANINGS.get(
-            found.kind
-        ) or _SHELL_CONTROL_MEANINGS.get(char, "change how the command is run")
-        # When the character IS the first token there is no binary it
-        # would have been handed to, so that clause would name the
-        # character as its own recipient.
-        handed_to = (
-            f" — it would be passed to {Path(argv[0]).name!r} as a literal "
-            f"argument"
-            if argv and argv[0] != char
-            else ""
-        )
-        what = (
-            f"{preamble} the {named} at position {index} cannot {meaning}"
-            f"{handed_to}"
-        )
+    quoted = quote_words_containing_shell_syntax(command)
+    remedy = (
+        f" If you meant it literally, quote it: {quoted}"
+        if quoted and quoted != command
+        else ""
+    )
     return (
-        f"shell_syntax:{found.kind}:{_UNPRINTABLE_NAMES.get(char, char)}",
-        f"{what}. Nothing ran. This tool runs one program with arguments; "
-        f"it cannot check what a shell would make of this line, so it will "
-        f"not turn it into one. Send a command that needs no shell syntax.",
+        f"shell_syntax:{_UNPRINTABLE_NAMES.get(char, char)}",
+        f"shell does not run a shell: the command is tokenized and executed "
+        f"directly, so the {named} at position {found.index}{would}"
+        f"{handed_to}. Nothing ran.{remedy}",
     )
 
 
@@ -1075,13 +1051,13 @@ class ComputerUseFeature(Feature):
         name="shell",
         description=(
             "Run a command. The command is tokenized and executed "
-            "directly — there is NO shell, so `|`, `>`, `<`, `&`, `;`, "
-            "`$VAR` and backticks are not interpreted and a command "
-            "containing them is refused rather than run without them. "
-            "Send a command that needs no shell syntax. "
-            "Deny-listed binaries hard-refuse; auto-approved binaries "
-            "run without a prompt; everything else routes through the "
-            "ApprovalQueue."
+            "directly — there is NO shell, so a bare character a shell "
+            "would interpret (`|`, `;`, `>`, `$`, `*`, `~`, `#`, `{`, "
+            "backtick, backslash) is refused rather than passed through "
+            "as a literal. Quote it if you meant it literally: "
+            "`echo 'price$'`. Deny-listed binaries hard-refuse; "
+            "auto-approved binaries run without a prompt; everything "
+            "else routes through the ApprovalQueue."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
@@ -1112,10 +1088,14 @@ class ComputerUseFeature(Feature):
         with ``shlex`` and the argv vector is executed directly, so a
         pipe, redirect or command separator would arrive at the binary
         as a literal argument. Rather than run a command the caller did
-        not write, one containing an unquoted control character is
-        refused. No shell form is offered back: deciding what a shell
-        would run needs a shell parser, and the gates here read
-        ``shlex`` tokens.
+        not write, one carrying any bare character a shell would read
+        is refused — an allow-list of inert characters, because
+        enumerating what a shell DOES is writing a shell.
+
+        No shell form is offered back: deciding what bash would run
+        needs a shell parser, and the gates here read ``shlex`` tokens
+        (#3130). Quoting is offered instead, because a quoted word is
+        inert to bash and to ``shlex`` alike.
 
         Args:
             command: The command to run; tokenized with shlex and

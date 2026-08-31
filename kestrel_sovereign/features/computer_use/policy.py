@@ -235,68 +235,44 @@ def evaluate_argv_paths(
 _SHELL_CONTROL_CHARS = frozenset(";&|`$()<>\n\r")
 
 
-# A ``$`` only begins an expansion when the next character can start a
-# parameter, command or arithmetic substitution. Measured against bash,
-# not assumed: ``foo$:bar``, ``foo$,bar``, ``foo$.bar``, ``foo$/bar``,
-# ``price$`` and ``echo "$"`` all reach the program with the ``$``
-# intact, so ``shlex`` and a real shell build the same argument vector
-# for them.
+# Characters that reach a program unchanged: a shell gives them no
+# meaning in a bare word, and ``shlex`` treats them as ordinary too. The
+# rule below is an ALLOW-list of these rather than a deny-list of shell
+# constructs, and that direction is the whole point.
 #
-# Quotes are in the set but only apply outside a quoted region: bare
-# ``$"..."`` is bash's localization form and ``$'...'`` is ANSI-C
-# quoting, both of which change the word — while inside double quotes a
-# ``$`` before the closing ``"`` is the literal in ``echo "$"``. The
-# caller passes ``dollar_may_open_quote`` to say which it is looking at.
-_DOLLAR_EXPANSION_STARTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_{[(@*#?-$!"
+# Five rounds of review on #3129 each found another construct a
+# deny-list had missed — ``$[1+1]``, a comment, ``$"..."``, brace
+# expansion, a tilde after an assignment, a nested brace — or another
+# command it refused that bash and ``shlex`` agreed on. Enumerating what
+# a shell does is writing a shell; the list never closes. Enumerating
+# what a shell ignores closes immediately, and errs toward refusing.
+_INERT_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "-_./:=,+@%^"
 )
-
-# Pathname expansion. Whether these change the word depends on what is
-# on disk, so the string alone does not determine the argv — which is
-# reason enough to refuse rather than guess (``echo *`` prints the
-# directory or a literal ``*``, both with status 0).
-_GLOB_CHARS = frozenset("*?[")
 
 
 @dataclass(frozen=True)
 class ShellSyntax:
-    r"""A construct a shell would act on that ``exec`` will not.
-
-    ``kind`` exists because the character alone does not explain the
-    divergence. A bare ``$`` expands; a ``\$`` inside double quotes does
-    the opposite — bash removes the backslash and ``shlex`` keeps it —
-    and a refusal that said "cannot expand a variable" for the second
-    would be telling the caller something untrue about their own line.
-    """
+    """A character whose shell meaning this tool cannot honour."""
 
     index: int
     char: str
-    kind: str  # control | expansion | comment | tilde | glob | escape
 
 
 def _quote_context(cmd: str):
-    """Yield ``(index, char, context, escaped, word)`` for each character.
+    """Yield ``(index, char, context)`` for each character.
 
-    ``context`` is ``"bare"``, ``"single"`` or ``"double"``; ``escaped``
-    says a backslash the shell honours precedes this character; ``word``
-    numbers the shell word this character belongs to. Quote marks that
-    open or close a region are not yielded — they are structure, not
-    content.
-
-    Word identity is lexical, not textual. ``echo \\ #x`` is two words,
-    not three: the escaped blank is part of the second one, so the ``#``
-    does not begin a word and does not begin a comment. Reading the raw
-    preceding character instead called it a boundary and refused a
-    command bash and ``shlex`` agree on (codex review round 4).
-
-    The two questions this module asks both need to know where they are
-    in a string, and they disagree about what to do when they get
-    there, so the walk is shared and the judgement is not.
+    ``context`` is ``"bare"``, ``"single"`` or ``"double"``. Quote marks
+    that open or close a region are not yielded — they are structure,
+    not content — and a trailing unterminated quote yields nothing after
+    it, which ``shlex`` rejects anyway.
     """
     if not isinstance(cmd, str):
         return
     in_single = in_double = False
-    word = 0
     i = 0
     while i < len(cmd):
         c = cmd[i]
@@ -304,34 +280,14 @@ def _quote_context(cmd: str):
             if c == "'":
                 in_single = False
             else:
-                yield (i, c, "single", False, word)
+                yield (i, c, "single")
             i += 1
             continue
         if in_double:
-            if c == "\\" and i + 1 < len(cmd):
-                yield (i + 1, cmd[i + 1], "double", True, word)
-                i += 2
-                continue
             if c == '"':
                 in_double = False
             else:
-                yield (i, c, "double", False, word)
-            i += 1
-            continue
-        if c in " \t\n\r" :
-            # An unescaped, unquoted blank ends the word. Runs of blanks
-            # may leave a word number unused, which costs nothing: the
-            # numbering exists to group characters, not to count words.
-            # Suppressing that was a guard no behaviour depended on —
-            # it survived mutation, and a 3079-case differential against
-            # bash found no input that could tell the difference.
-            #
-            # A carriage return is a word character to bash, so it does
-            # not split here; the divergence it causes is reported on
-            # its own.
-            if c in " \t\n":
-                word += 1
-            yield (i, c, "bare", False, word)
+                yield (i, c, "double")
             i += 1
             continue
         if c == "'":
@@ -342,22 +298,8 @@ def _quote_context(cmd: str):
             in_double = True
             i += 1
             continue
-        if c == "\\" and i + 1 < len(cmd):
-            yield (i + 1, cmd[i + 1], "bare", True, word)
-            i += 2
-            continue
-        yield (i, c, "bare", False, word)
+        yield (i, c, "bare")
         i += 1
-
-
-def _dollar_expands(cmd: str, index: int, *, may_open_quote: bool) -> bool:
-    """True iff the ``$`` at *index* begins a shell expansion."""
-    nxt = cmd[index + 1 : index + 2]
-    if not nxt:
-        return False
-    if nxt in "\"'":
-        return may_open_quote
-    return nxt in _DOLLAR_EXPANSION_STARTERS
 
 
 def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
@@ -369,12 +311,14 @@ def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
     approval prompt even when it would have been literal. Reading too
     much here is free — the answer only routes a command to the queue.
 
-    Deliberately NOT widened alongside :func:`first_shell_syntax_exec_ignores`.
-    Globs and tilde compose no second command, and adding them would
-    put the codex bridge in front of the operator for ``ls *.py``.
+    Deliberately NOT the same reading as
+    :func:`first_shell_significant_character`. This one gates the codex
+    bridge, where a real shell runs the line; widening it to every
+    character a shell could interpret would put the operator in front
+    of ``ls -la`` for its hyphen.
     """
-    for index, char, context, escaped, _word in _quote_context(cmd):
-        if escaped or context == "single":
+    for index, char, context in _quote_context(cmd):
+        if context == "single":
             continue
         if context == "double" and char not in "$`":
             continue
@@ -390,139 +334,67 @@ def command_contains_unquoted_shell_control(cmd: str) -> bool:
     return first_unquoted_shell_control(cmd) is not None
 
 
-def first_shell_syntax_exec_ignores(cmd: str) -> ShellSyntax | None:
-    r"""First construct a shell would act on that ``exec`` will not.
+def first_shell_significant_character(cmd: str) -> ShellSyntax | None:
+    r"""First character a shell would read that ``exec`` will not.
 
     The tool tokenizes with ``shlex`` and executes the argv vector, so
-    this is the question that decides whether the command that runs is
-    the command that was written (#3129).
+    the question is whether the command that runs is the command that
+    was written (#3129). This answers it soundly rather than exactly:
+    a command it allows provably reaches the program as bash would have
+    built it, and some commands it refuses would in fact have been
+    identical.
 
-    Every rule was measured against bash rather than reasoned about, by
-    sweeping punctuation characters and known constructs through a
-    corpus of templates and comparing ``shlex.split`` to the word
-    vector bash builds. That sweep is a test — four rounds of review on
-    this ticket each found a construct an enumeration had missed, so
-    the boundary is checked rather than asserted.
+    That trade is deliberate. The exact answer requires modelling every
+    expansion bash performs, which five rounds of review demonstrated is
+    a shell rather than a predicate. The sound answer needs only the set
+    of characters a shell leaves alone, which is short and closed.
 
-    Refused, because the argv differs:
+    - Single-quoted text is inert to both, so anything may appear in it.
+    - Double-quoted text still expands ``$`` and backticks, and bash
+      drops a backslash where ``shlex`` keeps it, so those three are
+      refused there while ordinary characters are not.
+    - Bare text may hold only inert characters. Spaces and tabs
+      separate words for both; a newline does not — it separates
+      commands for bash.
 
-    - the control characters that compose or redirect commands;
-    - a ``$`` that expands, including bash's ``$[...]`` and the
-      quote-opening ``$"..."`` / ``$'...'`` forms;
-    - a ``#`` beginning a word — the rest of the line is a comment;
-    - a ``~`` where bash expands one: beginning a word, after an ``=``,
-      or after a ``:`` in a word that already carries an ``=``;
-    - ``*`` and ``?``, and a ``[`` that closes as a bracket expression
-      — pathname expansion, where the argv depends on the directory;
-    - a ``{`` that closes as a brace expansion with a ``,`` or ``..``
-      inside it, which multiplies one word into several;
-    - a backslash that bash removes and ``shlex`` keeps: ``\$`` and
-      ``\```` inside double quotes, and a line continuation anywhere;
-    - a trailing carriage return, which bash keeps inside the last word
-      and ``shlex`` discards as whitespace.
-
-    Trailing spaces, tabs and newlines are not constructs — bash and
-    ``shlex`` both discard them — but a trailing BACKSLASH-newline is,
-    and trimming the line before scanning hid it (codex round 4).
+    A refused character is not a verdict on the caller's intent: if
+    they meant it literally, quoting it makes bash and ``exec`` agree by
+    construction, which is what the refusal offers back.
     """
     if not isinstance(cmd, str):
         return None
-    entries = list(_quote_context(cmd))
-    words: dict[int, str] = {}
-    for index, char, context, _escaped, word in entries:
-        if context != "bare" or char not in " \t\n\r":
-            words[word] = words.get(word, "") + char
-    seen_in_word: dict[int, str] = {}
-    for position, (index, char, context, escaped, word) in enumerate(entries):
+    for index, char, context in _quote_context(cmd):
         if context == "single":
-            seen_in_word[word] = seen_in_word.get(word, "") + char
-            continue
-
-        if escaped:
-            # bash drops the backslash; shlex keeps it for these, so the
-            # word that reaches the program differs. A backslash before
-            # a carriage return is not a continuation — both keep it.
-            if (context == "double" and char in "$`") or char == "\n":
-                return ShellSyntax(index, char, "escape")
-            seen_in_word[word] = seen_in_word.get(word, "") + char
-            continue
-        starts_word = not seen_in_word.get(word)
-        preceding = seen_in_word.get(word, "")
-        if context != "bare" or char not in " \t\n\r":
-            # Blanks are separators, not word content — recording them
-            # would make the next character look like it followed
-            # something, and no character would ever start a word.
-            seen_in_word[word] = preceding + char
-        if char == "$":
-            if _dollar_expands(cmd, index, may_open_quote=context == "bare"):
-                return ShellSyntax(index, char, "expansion")
             continue
         if context == "double":
-            if char == "`":
-                return ShellSyntax(index, char, "expansion")
+            # bash expands these inside double quotes, and removes a
+            # backslash that shlex keeps.
+            if char in "$`\\":
+                return ShellSyntax(index, char)
             continue
-        if char == "`":
-            return ShellSyntax(index, char, "expansion")
-        if char in " \t\n":
-            # Trailing blanks are not a construct: bash and shlex both
-            # discard them. Anything further in is (a bare newline
-            # separates commands).
-            if char == "\n" and cmd[index:].strip(" \t\n") == "":
-                continue
-            if char == "\n":
-                return ShellSyntax(index, char, "control")
+        if char in " \t":
             continue
-        if char in _SHELL_CONTROL_CHARS:
-            return ShellSyntax(index, char, "control")
-        if char in "*?":
-            return ShellSyntax(index, char, "glob")
-        if char == "[" and _closes_bracket_expression(words.get(word, ""), preceding):
-            return ShellSyntax(index, char, "glob")
-        if char == "{" and _closes_brace_expansion(words.get(word, ""), preceding):
-            return ShellSyntax(index, char, "brace")
-        if char == "#" and starts_word:
-            return ShellSyntax(index, char, "comment")
-        if char == "~" and _tilde_expands(words.get(word, ""), preceding, starts_word):
-            return ShellSyntax(index, char, "tilde")
+        if char not in _INERT_CHARACTERS:
+            return ShellSyntax(index, char)
     return None
 
 
-def _closes_bracket_expression(word: str, preceding: str) -> bool:
-    """True iff the ``[`` after *preceding* closes as a glob bracket.
+def quote_words_containing_shell_syntax(cmd: str) -> str | None:
+    """Rewrite *cmd* so every shell-significant character is literal.
 
-    A bare ``[`` is only pathname expansion when the word later closes
-    it around at least one character: bash passes ``a[b`` and ``[]``
-    through untouched, so refusing them would break commands that
-    already worked (codex review round 4).
+    The refusal can offer this because it is bounded by construction:
+    single-quoted text is inert to bash and to ``shlex`` alike, so the
+    rewrite's argv is the words themselves — and those words are what
+    the path and binary policies already vetted. That is the property
+    the ``bash -lc`` wrapper this once suggested could not have (#3130).
+
+    Returns ``None`` when the command cannot be tokenized, which is the
+    one case where there are no words to quote.
     """
-    rest = word[len(preceding) + 1 :]
-    return "]" in rest[1:]
-
-
-def _closes_brace_expansion(word: str, preceding: str) -> bool:
-    """True iff the ``{`` after *preceding* closes as a brace expansion.
-
-    bash needs a ``,`` or a ``..`` inside the braces to expand: ``{a}``
-    and ``{}`` are literal, ``{a,}`` and ``{a..b}`` are not.
-    """
-    rest = word[len(preceding) + 1 :]
-    close = rest.find("}")
-    if close < 0:
-        return False
-    inside = rest[:close]
-    return "," in inside or ".." in inside
-
-
-def _tilde_expands(word: str, preceding: str, starts_word: bool) -> bool:
-    """True iff bash expands the ``~`` after *preceding* in *word*.
-
-    Measured: a word-initial ``~`` expands, so does one after an ``=``,
-    and so does one after a ``:`` in a word that already carries an
-    ``=`` (``PATH=foo:~``). A ``:`` alone does not — ``foo:~`` is
-    literal — and neither does ``x~``.
-    """
-    if starts_word:
-        return True
-    if preceding.endswith("="):
-        return True
-    return preceding.endswith(":") and "=" in preceding
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return None
+    if not words:
+        return None
+    return " ".join(shlex.quote(word) for word in words)

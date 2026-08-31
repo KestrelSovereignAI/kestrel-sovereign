@@ -366,8 +366,8 @@ async def test_shell_refuses_a_pipe_rather_than_running_it_unfiltered(workspace:
     # back — and pytest's tmp_path carries this test's own name, so a
     # loose ``"cat" in error`` passes on the path alone. Both of these
     # survived a mutant that deleted what they were meant to pin.
-    explanation, _, _ = envelope.error.partition(" To use shell syntax,")
-    assert "passed to \'cat\' as a literal argument" in explanation, envelope.error
+    explanation, _, _ = envelope.error.partition(" Nothing ran.")
+    assert "reaches \'cat\' as a literal argument" in explanation, envelope.error
     assert "cannot pipe one command\'s output into the next" in explanation, (
         "naming the character is not enough — the refusal has to say what "
         "the caller was counting on it to do"
@@ -376,22 +376,26 @@ async def test_shell_refuses_a_pipe_rather_than_running_it_unfiltered(workspace:
 
 
 @pytest.mark.asyncio
-async def test_the_refusal_offers_no_command_that_would_run(workspace: Path):
-    """codex review rounds 1 and 2 — the remedy kept leaking.
+async def test_the_refusal_offers_only_an_inert_rewrite(workspace: Path):
+    """What may be handed back, and what may not.
 
-    The refusal used to print a ``bash -lc`` form of the caller's line.
-    Two rounds were spent bounding it: suppress it when a token names a
-    deny-listed binary, suppress it when an expansion hides what runs.
-    Each round found another spelling that slipped through, because
-    every one of those checks reads ``shlex`` tokens and ``shlex`` is
-    not a shell. ``cat </deny_paths/file | head`` hands the path policy
-    the literal token ``</deny_paths/file``, which resolves to nothing.
+    Rounds 1 and 2 were spent trying to bound a ``bash -lc`` wrapper by
+    inspecting shlex tokens. Each round found another spelling that
+    walked through the bound — ``cat </deny_paths/file`` hands the path
+    policy the literal token ``</deny_paths/file``, which resolves to
+    nothing — so the wrapper was removed. That is still true: no shell
+    invocation is ever composed.
 
-    So the refusal offers nothing runnable at all. The mechanism was
-    the bug, not the individual holes — and the same blind spots on the
-    paths that do reach a real shell are filed as #3130.
+    Quoting is different in kind, not in degree. A single-quoted word
+    is inert to bash and to shlex alike, so the rewrite's argv is its
+    own words — the words the gates already vetted — and it cannot
+    invoke anything the original did not name.
     """
     import shlex
+
+    from kestrel_sovereign.features.computer_use.policy import (
+        first_shell_significant_character,
+    )
 
     queue = FakeApprovalQueue(decision=(True, "once"))
     agent = FakeAgent(
@@ -413,11 +417,21 @@ async def test_the_refusal_offers_no_command_that_would_run(workspace: Path):
         assert envelope.status is not ToolResultStatus.OK, command
         error = envelope.error
         assert "bash" not in error and "-lc" not in error, error
-        assert shlex.quote(command) not in error, (
-            "the caller's line must not come back in a runnable form"
+        assert command not in error, (
+            "the caller's line must not come back in a form that would run"
         )
-        assert command not in error, error
+        _, _, suggested = error.partition("quote it: ")
+        if suggested:
+            # Whatever is offered must be inert: every word literal, so
+            # the argv is the words themselves.
+            assert shlex.split(suggested) == shlex.split(command), (
+                "the rewrite must carry the same words, only literally"
+            )
+            assert (
+                first_shell_significant_character(suggested) is None
+            ), f"the rewrite is itself refused: {suggested!r}"
     assert queue.calls == []
+
 
 
 @pytest.mark.asyncio
@@ -455,15 +469,19 @@ async def test_a_denied_path_in_a_compound_is_still_reported_as_the_denial(works
 
 
 @pytest.mark.asyncio
-async def test_a_literal_dollar_is_not_shell_syntax(workspace: Path):
-    """codex review round 1, P2 — the refusal over-reached.
+async def test_a_literal_dollar_is_refused_and_the_remedy_runs_it(workspace: Path):
+    """The rule is sound, not exact — and this is what that costs.
 
-    A ``$`` only expands when the next character can begin one.
-    Measured against bash: ``price$``, ``foo$:bar`` and ``echo "$"``
-    all reach the program with the ``$`` intact, so ``shlex`` and a
-    real shell build the same argument vector and there is nothing to
-    refuse. #1694's compound guard still flags every ``$`` — over-
-    reporting there only routes a command to the queue, which is free.
+    ``echo price$`` reaches the program identically under bash and
+    under direct exec, so refusing it is a false refusal. It is the
+    price of a rule that cannot silently miss: five review rounds of
+    modelling bash's expansions each left another spelling running with
+    the wrong argv, and each near-miss was the defect this ticket
+    exists to close.
+
+    The cost is bounded because the refusal converges. Quoting makes
+    bash and exec agree by construction, and the quoted form runs and
+    prints exactly what the caller wanted.
     """
     queue = FakeApprovalQueue(decision=(True, "once"))
     agent = FakeAgent(
@@ -474,7 +492,12 @@ async def test_a_literal_dollar_is_not_shell_syntax(workspace: Path):
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
 
-    envelope = await feature.shell(command="echo price$", timeout=5)
+    refusal = await feature.shell(command="echo price$", timeout=5)
+    assert refusal.status is not ToolResultStatus.OK
+    _, _, suggested = refusal.error.partition("quote it: ")
+    assert suggested == "echo 'price$'", refusal.error
+
+    envelope = await feature.shell(command=suggested, timeout=5)
     assert envelope.status is ToolResultStatus.OK, envelope.error
     assert envelope.data["stdout"].strip() == "price$"
 
@@ -483,19 +506,17 @@ async def test_a_literal_dollar_is_not_shell_syntax(workspace: Path):
     )
 
     assert command_contains_unquoted_shell_control("echo price$") is True, (
-        "the compound guard must keep its wider reading"
+        "the compound guard keeps its own wider reading"
     )
 
 
 @pytest.mark.asyncio
-async def test_the_refusal_explains_each_kind_in_its_own_terms(workspace: Path):
-    """codex review round 3: one phrasing cannot cover every construct.
+async def test_the_refusal_names_what_the_character_would_have_done(workspace: Path):
+    """A caller told only "no" cannot tell which part was the problem.
 
-    An escaped ``$`` inside double quotes is the *opposite* of an
-    expansion — bash removes the backslash and this does not — so
-    "cannot expand a variable" would tell the caller something untrue
-    about their own line. Each kind gets its own sentence, and the
-    audit rule carries the kind so the log can be counted by cause.
+    The audit rule carries the character too, so refusals can be
+    counted by cause on the log that found this defect in the first
+    place.
     """
     queue = FakeApprovalQueue(decision=(True, "once"))
     agent = FakeAgent(
@@ -511,7 +532,7 @@ async def test_the_refusal_explains_each_kind_in_its_own_terms(workspace: Path):
         "echo hi # note": "start a comment hiding the rest of the line",
         "echo ~": "expand to a home directory",
         "echo *.py": "expand to the filenames it matches",
-        'echo "a\\$HOME"': "the backslash before the \'$\' at position 8 stays",
+        "echo {a,b}": "expand into several arguments",
     }
     for command, phrase in cases.items():
         envelope = await feature.shell(command=command, timeout=5)
@@ -522,14 +543,15 @@ async def test_the_refusal_explains_each_kind_in_its_own_terms(workspace: Path):
         json.loads(line)
         for line in (workspace / "audit.jsonl").read_text().splitlines()
     ]
-    kinds = [r["args"]["rule"] for r in rows if r["outcome"] == "denied"]
-    assert kinds == [
-        "shell_syntax:control:|",
-        "shell_syntax:comment:#",
-        "shell_syntax:tilde:~",
-        "shell_syntax:glob:*",
-        "shell_syntax:escape:$",
-    ], kinds
+    rules = [r["args"]["rule"] for r in rows if r["outcome"] == "denied"]
+    assert rules == [
+        "shell_syntax:|",
+        "shell_syntax:#",
+        "shell_syntax:~",
+        "shell_syntax:*",
+        "shell_syntax:{",
+    ], rules
+
 
 
 @pytest.mark.asyncio
@@ -557,7 +579,7 @@ async def test_a_refused_command_is_audited(workspace: Path):
     ]
     refusals = [r for r in rows if r["outcome"] == "denied"]
     assert len(refusals) == 1, rows
-    assert refusals[0]["args"]["rule"] == "shell_syntax:control:|"
+    assert refusals[0]["args"]["rule"] == "shell_syntax:|"
     assert refusals[0]["allowed_by"][-1] == "denied:shell_syntax"
 
 

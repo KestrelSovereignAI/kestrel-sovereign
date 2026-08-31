@@ -16,8 +16,9 @@ from kestrel_sovereign.features.computer_use.policy import (
     Decision,
     PathPolicy,
     command_contains_unquoted_shell_control,
-    first_shell_syntax_exec_ignores,
+    first_shell_significant_character,
     first_unquoted_shell_control,
+    quote_words_containing_shell_syntax,
     split_command,
 )
 
@@ -197,81 +198,93 @@ def test_the_boolean_guard_is_exactly_the_scanner(cmd):
 
 
 @pytest.mark.parametrize(
-    "cmd,diverges",
+    "cmd",
     [
-        # shlex and bash build the SAME vector for these — measured, not
-        # assumed: `printf "%s\\0" <cmd>` against shlex.split.
-        ("rg foo$ file", False),
-        ('echo "$"', False),
-        ("echo price$", False),
-        ("echo $:x", False),
-        ("grep -E \'a|b\' f", False),
-        # ...and different vectors for these.
-        ("cat a.txt | tr a-z A-Z", True),
-        ("echo $HOME", True),
-        ('echo "$HOME"', True),
-        ("echo `whoami`", True),
-        ("cat ${X}", True),
-        ("echo hi; true", True),
-        ("ls > /tmp/x", True),
-        # shlex splits on a bare CR; bash keeps it inside the word.
-        ("echo a\rb", True),
-        # bash's legacy arithmetic form: `echo $[1+1]` prints 2. Found by
-        # codex review round 2 — the starter set had `{` and `(` but not
-        # `[`, so this divergence was silent, which is the exact defect.
-        ("echo $[1+1]", True),
-        # ...and inside double quotes, where the glob rule does not
-        # apply and only the dollar starter set can catch it. Without
-        # this case, dropping `[` from that set changes nothing any
-        # test can see.
-        ('echo "$[1+1]"', True),
-        # Codex review round 3, named rather than left to the sweep:
-        # each of these ran and reported success with a different argv.
-        ("echo hi # ignored", True),          # the rest is a comment
-        ("echo a#b", False),                  # ...but only at word start
-        ('echo "a\\$HOME"', True),            # bash drops the backslash
-        ('echo "a\\`x"', True),
-        ('echo $"hello"', True),              # localization opens a quote
-        ("echo a\\\nb", True),                # line continuation
-        ("echo a\\\rb", False),               # ...but a CR is not one
-        ("echo hi\n", False),                 # trailing newline is nothing
-        ("echo hi\r", True),                  # a trailing CR is a word char
-        ("echo ~", True),                      # home expansion
-        ("echo a~b", False),                   # ...only at word start
-        ("ls *.py", True),                     # pathname expansion
-        ("echo hi", False),
-        # Codex review round 4. Every one of these needs two characters
-        # to exist, so the single-character sweep could not produce them
-        # — which is why the corpus now sweeps pairs too.
-        ("echo {a,b}", True),                  # brace expansion
-        ("echo {1..3}", True),                 # ...and its range form
-        ("echo {a}", False),                   # ...but a brace alone is literal
-        ("echo HOME=~", True),                 # tilde after an assignment
-        ("echo PATH=foo:~", True),             # ...and after its colon
-        ("echo foo:~", False),                 # ...but not without the `=`
-        ("echo [a]", True),                    # a bracket glob that closes
-        ("echo a[b", False),                   # ...but an unclosed `[` is literal
-        ("echo []", False),                    # ...and an empty one never globs
-        ("echo \\ #x", False),                 # an escaped blank keeps the word
-        ("echo hi\\\n", True),                # a trailing line continuation
-        # A newline INSIDE the line is a command separator: bash runs
-        # `b` as its own command, shlex hands `b` to echo as an
-        # argument. The bash differential cannot see this one — bash
-        # exits non-zero running `b`, so the case is skipped there — and
-        # a mutant that stopped refusing it survived until this case
-        # existed.
-        ("echo a\nb", True),
+        "echo hi",
+        "git diff -U2 -- kestrel_sovereign/policy.py",
+        "ls -la /tmp",
+        "python -m pytest -q",
+        "grep -E 'a|b' file.txt",
+        'echo "plain text"',
+        "curl -sS https://example.com/a,b+c@d",
+        "echo 'anything at all: | ; $x `y` *'",
     ],
 )
-def test_exec_ignores_exactly_what_a_shell_would_have_acted_on(cmd, diverges):
-    """#3129 asks one question: will exec build a different argument
-    vector than a shell would?
+def test_an_inert_command_runs(cmd):
+    """The allow-list has to leave ordinary commands alone.
 
-    Answering it with #1694's guard refused ``rg foo$ file`` and
-    ``echo "$"``, which were never broken (codex review round 1, P2).
-    A ``$`` only counts when the next character can begin an expansion.
+    A sound rule that refused everything would also never run a command
+    whose argv differed, so this half is what makes the other half mean
+    something.
     """
-    assert (first_shell_syntax_exec_ignores(cmd) is not None) is diverges
+    assert first_shell_significant_character(cmd) is None
+
+
+@pytest.mark.parametrize(
+    "cmd,char",
+    [
+        # Composition and redirection.
+        ("cat a.txt | tr a-z A-Z", "|"),
+        ("echo hi; true", ";"),
+        ("ls > /tmp/x", ">"),
+        ("echo a && b", "&"),
+        # Expansion, in all the spellings five review rounds turned up.
+        ("echo $HOME", "$"),
+        ('echo "$HOME"', "$"),
+        ("echo `whoami`", "`"),
+        ("echo $[1+1]", "$"),
+        ('echo $"hello"', "$"),
+        ("ls *.py", "*"),
+        ("echo {a,b}", "{"),
+        ("echo {a{b}c,d}", "{"),
+        ("echo ~", "~"),
+        ("echo HOME=~", "~"),
+        ("echo hi # note", "#"),
+        (r'echo "a\$HOME"', "\\"),
+        # Word structure the tokenizer and the shell disagree about.
+        ("echo a\nb", "\n"),
+        ("echo hi\r", "\r"),
+        ("echo a\\\nb", "\\"),
+    ],
+)
+def test_a_shell_significant_character_is_refused(cmd, char):
+    """Each of these ran and reported success with a different argv.
+
+    The list is the accumulated output of five review rounds. Under the
+    deny-list it took five rounds to cover them; under the allow-list
+    every one falls out of the same rule, and so does the next spelling
+    nobody has thought of.
+    """
+    found = first_shell_significant_character(cmd)
+    assert found is not None, cmd
+    assert found.char == char, (cmd, found)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo price$",
+        "rg foo$ file",
+        'echo "$"',
+        "echo a[b",
+        "echo {a}",
+        "echo --foo=~",
+        'echo ""#x',
+    ],
+)
+def test_the_rule_is_sound_rather_than_exact(cmd):
+    """These reach the program identically either way, and are refused.
+
+    Stated as a test rather than hidden in a docstring, because it is
+    the cost of the design and someone may want to argue with it. The
+    exact answer means modelling every expansion bash performs — five
+    rounds of review each found another one, and each near-miss was a
+    command running with the wrong argv. The refusal offers quoting,
+    which makes these run unchanged.
+    """
+    assert first_shell_significant_character(cmd) is not None
+    rewritten = quote_words_containing_shell_syntax(cmd)
+    assert first_shell_significant_character(rewritten) is None, rewritten
 
 
 @pytest.mark.parametrize(
@@ -282,43 +295,31 @@ def test_exec_ignores_exactly_what_a_shell_would_have_acted_on(cmd, diverges):
         ("cat a.txt | tr a-z A-Z", True, True),
         ("echo $HOME", True, True),
         # Refusal only: these change the argv but compose nothing. The
-        # guard is deliberately not widened to them — it gates the codex
-        # bridge, where a real shell runs the line, and flagging `ls
-        # *.py` there would put the operator in front of every glob.
+        # guard gates the codex bridge, where a real shell runs the
+        # line, and widening it to every interpretable character would
+        # put the operator in front of `ls -la` for its hyphen.
         ("ls *.py", True, False),
         ("echo hi # note", True, False),
         ("echo ~", True, False),
-        # Guard only: a literal `$` composes nothing and changes nothing,
-        # but reading it as suspicious costs only an approval prompt,
-        # while refusing it would break a command that worked.
-        ("rg foo$ file", False, True),
-        ('echo "$"', False, True),
-        # Neither.
+        # Guard only: a literal `$` composes nothing, but reading it as
+        # suspicious costs only an approval prompt.
+        ('echo "$"', True, True),
         ("echo hi", False, False),
         ('echo "; rm -rf /"', False, False),
     ],
 )
 def test_the_two_predicates_answer_two_questions(cmd, refused, flagged):
-    """They overlap on control characters and diverge on purpose.
+    """They overlap and diverge on purpose.
 
-    An earlier version of this test asserted containment — anything
-    refused is also flagged — and it passed only because its cases
-    happened to contain no counterexample. Globs, comments and tilde
-    broke it the moment they were added, and a mutation run is what
-    surfaced the stale claim. The real relationship is that each
-    predicate reads what its own consequence justifies: over-reading
-    costs an approval prompt on one side and a broken command on the
-    other.
+    An earlier version asserted containment — anything refused is also
+    flagged — and it passed only because its cases happened to hold no
+    counterexample. Each predicate reads what its own consequence
+    justifies: over-reading costs an approval prompt on one side and a
+    refused command on the other.
     """
-    assert (first_shell_syntax_exec_ignores(cmd) is not None) is refused
+    assert (first_shell_significant_character(cmd) is not None) is refused
     assert command_contains_unquoted_shell_control(cmd) is flagged
-# Pathname and tilde expansion turn on what is on disk and who the user
-# is, so a string alone does not determine the argv. The refusal covers
-# them deliberately, and the differential below cannot judge them: in an
-# empty directory bash leaves them literal and agrees with shlex, which
-# would read as a false positive. Named here rather than silently
-# skipped, so the exclusion is a decision someone can argue with.
-_EXPANSION_DEPENDS_ON_ENVIRONMENT = set("*?[~")
+
 
 _SWEEP_TEMPLATES = [
     "echo a{c}b",
@@ -333,23 +334,21 @@ _SWEEP_TEMPLATES = [
     'echo "${c}x"',
 ]
 
-# Single characters are not enough. Round 4 of review found five gaps
-# the single-character sweep structurally could not produce — brace
-# expansion, tilde after an assignment, a bracket glob that closes, an
-# escaped blank before a `#`, a trailing backslash-newline — because
-# every one of them needs two characters to exist. Pairs cost about
-# three seconds of bash and would have produced all five.
+# Single characters are not enough: brace expansion, a tilde after an
+# assignment, a bracket glob that closes and an escaped blank before a
+# `#` all need two characters to exist, and round 4 of review found
+# every one of them in the gap that left.
 _SWEEP_PAIR_TEMPLATES = ["echo x{a}y{b}z", "echo {a}{b}", "echo {a}x {b}y"]
 
-# Constructs worth naming even though the sweeps generate them, so a
-# reader can see what the boundary covers without running it.
+# Constructs worth naming even though the sweeps generate most of them.
 _NAMED_CONSTRUCTS = [
-    "echo {a,b}", "echo {1..3}", "echo x{a,b}y", "echo {a}", "echo {}",
-    "echo {a,}", "echo a{b}c", "echo HOME=~", "echo PATH=foo:~",
+    "echo {a,b}", "echo {1..3}", "echo {a{b}c,d}", "echo x{a,b}y", "echo {a}",
+    "echo {}", "echo {a,}", "echo a{b}c", "echo HOME=~", "echo PATH=foo:~",
     "echo a=~/x", "echo ~/x", "echo x~", "echo foo:~", "echo ~x",
-    "echo \\ #x", "echo \\ ~", "echo a\\ #b", "echo hi\\\n",
-    "echo [", "echo a[b", "echo [ab", "echo [a]", "echo a[bc]d",
-    "echo []", "echo a]b", "echo hi \\\n there",
+    "echo --foo=~", "echo a-b=~", "echo \\ #x", "echo \\ ~", "echo a\\ #b",
+    "echo hi\\\n", "echo [", "echo a[b", "echo [ab", "echo [a]", "echo a[bc]d",
+    "echo []", "echo a]b", "echo [a\\]", "echo {a\\,b}", 'echo ""#x',
+    'echo ""~', "echo hi \\\n there", "git diff -U2 -- a.py", "ls -la /tmp",
 ]
 
 
@@ -364,30 +363,6 @@ def _sweep_corpus():
     yield from _NAMED_CONSTRUCTS
 
 
-@pytest.fixture(scope="module")
-def bash_differential():
-    """(cmd, bash_argv, shlex_argv) for the whole corpus, computed once.
-
-    Both the differential and its positive control need it, and running
-    bash over the corpus twice doubled the file's runtime for no extra
-    coverage.
-    """
-    rows = []
-    with tempfile.TemporaryDirectory() as empty:
-        for cmd in _sweep_corpus():
-            if set(cmd) & _EXPANSION_DEPENDS_ON_ENVIRONMENT:
-                continue
-            expected = _bash_word_vector(cmd, empty)
-            if expected is None:
-                continue
-            try:
-                actual = shlex.split(cmd)
-            except ValueError:
-                continue
-            rows.append((cmd, expected, actual))
-    return rows
-
-
 def _bash_word_vector(cmd: str, cwd: str):
     """The argv bash would build for *cmd*, or None if bash refuses it."""
     result = subprocess.run(
@@ -400,35 +375,45 @@ def _bash_word_vector(cmd: str, cwd: str):
     return result.stdout.decode(errors="replace").split("\0")[:-1]
 
 
+@pytest.fixture(scope="module")
+def bash_differential():
+    """(cmd, bash_argv, shlex_argv) for the whole corpus, computed once."""
+    rows = []
+    with tempfile.TemporaryDirectory() as empty:
+        for cmd in _sweep_corpus():
+            expected = _bash_word_vector(cmd, empty)
+            if expected is None:
+                continue
+            try:
+                actual = shlex.split(cmd)
+            except ValueError:
+                continue
+            rows.append((cmd, expected, actual))
+    return rows
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_the_refusal_agrees_with_bash_across_every_punctuation_character(
-    bash_differential,
-):
-    """#3129: the boundary is measured, not enumerated.
+def test_nothing_the_rule_allows_runs_differently_under_bash(bash_differential):
+    """The guarantee, checked against the thing it is about.
 
-    Three consecutive review rounds each found a construct an
-    enumeration had missed — `$[1+1]`, a shell comment, `$"..."`, an
-    escaped `\$` inside double quotes, a line continuation — and every
-    one of them was the ticket's own defect in a narrower spelling: a
-    command that runs as a different argv and reports success.
+    One-directional on purpose. "Refuses exactly when bash differs"
+    would need a model of every expansion bash performs, and five
+    rounds of review showed that model is a shell. "Never allows a
+    command bash would build differently" is what actually protects the
+    caller, and an allow-list of inert characters can satisfy it.
 
-    So the predicate is checked against the thing it models. Every
-    ASCII punctuation character is swept through ten positions, and
-    `shlex.split` is compared to the word vector bash actually builds.
-    The predicate must say "this diverges" exactly when it does.
-
-    Commands bash itself rejects are skipped: there is no argv to
-    compare, and a caller who writes an unparseable line is not the
-    silent-divergence case this guards.
+    The corpus sweeps every punctuation character through ten
+    positions, every ordered pair through three more, and the named
+    constructs the review rounds turned up.
     """
-    disagreements = [
-        f"{cmd!r}: bash={expected!r} shlex={actual!r} "
-        f"{'refused' if first_shell_syntax_exec_ignores(cmd) else 'allowed'}"
+    unsound = [
+        f"{cmd!r}: bash={expected!r} shlex={actual!r}"
         for cmd, expected, actual in bash_differential
-        if (actual != expected) != (first_shell_syntax_exec_ignores(cmd) is not None)
+        if first_shell_significant_character(cmd) is None and actual != expected
     ]
-    assert disagreements == [], (
-        "the refusal disagrees with bash:\n  " + "\n  ".join(disagreements)
+    assert unsound == [], (
+        "these were allowed but bash builds a different argv:\n  "
+        + "\n  ".join(unsound)
     )
 
 
@@ -436,37 +421,48 @@ def test_the_refusal_agrees_with_bash_across_every_punctuation_character(
 def test_the_sweep_would_notice_a_gap(bash_differential):
     """A positive control for the differential above.
 
-    A sweep that compares two things can pass by comparing nothing —
-    if the templates stopped producing divergent commands, or bash
-    rejected all of them, the assertion would be empty and green. This
-    pins that the corpus does contain both answers.
+    A one-directional assertion passes trivially if the rule allows
+    nothing, or if the corpus holds no divergent command. Both halves
+    have to be present for the check above to mean anything.
     """
-    outcomes = {actual != expected for _cmd, expected, actual in bash_differential}
-    assert outcomes == {True, False}, (
-        f"the sweep no longer exercises both answers: {outcomes}"
-    )
-    # A collapse detector, not an exact count: the corpus is filtered
-    # (bash rejects some generated lines, and glob/tilde cases are
-    # excluded by name), so the number moves when templates change. It
-    # should never fall to a handful.
+    allowed = [c for c, _e, _a in bash_differential
+               if first_shell_significant_character(c) is None]
+    divergent = [c for c, e, a in bash_differential if e != a]
+    assert allowed, "the rule allows nothing, so soundness is vacuous"
+    assert divergent, "the corpus holds no divergent command to catch"
+    # A collapse detector, not an exact count: the number moves when
+    # templates change, but should never fall to a handful.
     assert len(bash_differential) > 1000, (
         f"the corpus shrank to {len(bash_differential)} commands"
     )
 
 
-@pytest.mark.parametrize(
-    "cmd",
-    ["ls *.py", "cat ~/notes.txt", "ls a?b", "ls [ab]c"],
-)
-def test_expansion_that_depends_on_the_directory_is_refused(cmd):
-    """The differential cannot judge these, so they are pinned directly.
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_quoting_remedy_is_bounded_by_construction(bash_differential):
+    """What the refusal hands back must be safe AND must work.
 
-    Whether ``ls *.py`` reaches ``ls`` as one word or forty depends on
-    the directory, not the string. "It might be the same" is not a
-    reason to run it — the whole defect is a command whose argv is not
-    the one that was written.
+    Round 2 removed a `bash -lc` suggestion because no check could
+    bound what it would run. Quoting is different in kind: the rewrite
+    is inert to bash and to shlex alike, so its argv is its words —
+    and this asserts exactly that, over every refused command in the
+    corpus, rather than trusting the argument.
     """
-    assert first_shell_syntax_exec_ignores(cmd) is not None
+    with tempfile.TemporaryDirectory() as empty:
+        broken = []
+        for cmd, _expected, _actual in bash_differential:
+            if first_shell_significant_character(cmd) is None:
+                continue
+            rewritten = quote_words_containing_shell_syntax(cmd)
+            if rewritten is None:
+                continue
+            if first_shell_significant_character(rewritten) is not None:
+                broken.append(f"{cmd!r} -> {rewritten!r} is still refused")
+                continue
+            bash_argv = _bash_word_vector(rewritten, empty)
+            if bash_argv is not None and bash_argv != shlex.split(rewritten):
+                broken.append(f"{cmd!r} -> {rewritten!r} still diverges")
+        assert broken == [], "\n  ".join(broken)
+
 
 
 def test_compound_guard_handles_non_string():
