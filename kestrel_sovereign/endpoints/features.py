@@ -1009,19 +1009,11 @@ async def _update_feature_config_locked(
     atomic_secret_update = getattr(feature, "set_config_with_secret_preservation", None)
     has_atomic_secret_update = inspect.iscoroutinefunction(atomic_secret_update)
     commit_receipt = None
-    if secret_fields and has_atomic_secret_update:
-        # Isolated hosted features preserve omitted write-only fields from the
-        # same durable snapshot used by their transition CAS.  Reading here and
-        # reinjecting later would let a stale replica overwrite a concurrent
-        # credential rotation.
-        commit_receipt = await atomic_secret_update(
-            incoming,
-            secret_fields,
-            lambda effective: _validate_config(effective, schema)
-            if schema is not None
-            else None,
-        )
-    else:
+    refresh_context = getattr(agent, "refresh_feature_context_clauses", None)
+    should_refresh = bool(getattr(feature, "enabled", True)) and callable(
+        refresh_context
+    )
+    if not (secret_fields and has_atomic_secret_update):
         if secret_fields:
             current = await feature.get_config()
             if isinstance(current, dict):
@@ -1032,13 +1024,44 @@ async def _update_feature_config_locked(
         if schema is not None:
             _validate_config(incoming, schema)
 
-        commit_receipt = await feature.set_config(incoming)
+    try:
+        if secret_fields and has_atomic_secret_update:
+            # Isolated hosted features preserve omitted write-only fields from the
+            # same durable snapshot used by their transition CAS.  Reading here and
+            # reinjecting later would let a stale replica overwrite a concurrent
+            # credential rotation.
+            commit_receipt = await atomic_secret_update(
+                incoming,
+                secret_fields,
+                lambda effective: _validate_config(effective, schema)
+                if schema is not None
+                else None,
+            )
+        else:
+            commit_receipt = await feature.set_config(incoming)
+    except (Exception, asyncio.CancelledError):
+        # A setter can durably mutate and then surface an internally-originated
+        # CancelledError (or another late error). With no returned receipt its
+        # commit status is ambiguous, so do not issue a blind rollback that may
+        # overwrite a newer hosted generation. Republish from the authoritative
+        # current config before the error leaves the turn boundary instead.
+        if should_refresh:
+            try:
+                await _refresh_feature_context(refresh_context, feature)
+            except (Exception, asyncio.CancelledError):
+                await _disable_feature_after_config_reconciliation_failure(
+                    agent, feature, name
+                )
+                raise RuntimeError(
+                    "feature configuration state could not be reconciled with "
+                    "context; the feature was disabled"
+                ) from None
+        raise
 
-    refresh_context = getattr(agent, "refresh_feature_context_clauses", None)
-    if bool(getattr(feature, "enabled", True)) and callable(refresh_context):
+    if should_refresh:
         try:
             await _refresh_feature_context(refresh_context, feature)
-        except BaseException as refresh_exc:
+        except (Exception, asyncio.CancelledError):
             try:
                 rollback_descriptor = inspect.getattr_static(
                     feature, "rollback_config_transition", None
@@ -1049,28 +1072,18 @@ async def _update_feature_config_locked(
                 else:
                     await feature.set_config(previous)
                 await _refresh_feature_context(refresh_context, feature)
-            except BaseException:
+            except (Exception, asyncio.CancelledError):
                 # The old prompt bytes cannot safely coexist with a config we
                 # failed to restore.  Canonical teardown removes both the
                 # cached clauses and the feature's live tools before the error
                 # leaves this request.
-                teardown = getattr(agent, "_unregister_feature_runtime", None)
-                if callable(teardown):
-                    try:
-                        deactivated = teardown(feature, unload=False)
-                        if inspect.isawaitable(deactivated):
-                            await deactivated
-                    except BaseException:  # noqa: BLE001 - teardown is exhaustive
-                        logger.exception(
-                            "Feature '%s' teardown reported an error after "
-                            "configuration rollback failed",
-                            name,
-                        )
-                feature.enabled = False
+                await _disable_feature_after_config_reconciliation_failure(
+                    agent, feature, name
+                )
                 raise RuntimeError(
                     "feature configuration and context refresh could not be "
                     "reconciled; the feature was disabled"
-                ) from refresh_exc
+                ) from None
             raise
 
     updated = await feature.get_config()
@@ -1092,6 +1105,31 @@ async def _refresh_feature_context(refresh_context, feature: object) -> None:
     refreshed = refresh_context(feature)
     if inspect.isawaitable(refreshed):
         await refreshed
+
+
+async def _disable_feature_after_config_reconciliation_failure(
+    agent: object,
+    feature: object,
+    name: str,
+) -> None:
+    """Fail closed when live config and cached context cannot be reconciled."""
+
+    teardown = getattr(agent, "_unregister_feature_runtime", None)
+    if callable(teardown):
+        try:
+            deactivated = teardown(feature, unload=False)
+            if inspect.isawaitable(deactivated):
+                await deactivated
+        except (Exception, asyncio.CancelledError) as teardown_exc:
+            # Out-of-tree teardown errors may contain private config bytes. Log
+            # only their type while preserving the fail-closed disabled state.
+            logger.error(
+                "Feature '%s' teardown reported %s after configuration "
+                "reconciliation failed",
+                name,
+                type(teardown_exc).__name__,
+            )
+    feature.enabled = False
 
 
 def _validate_config(config: Dict[str, Any], schema: Dict[str, Any]) -> None:

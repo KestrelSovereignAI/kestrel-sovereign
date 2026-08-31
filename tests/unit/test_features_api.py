@@ -1551,6 +1551,96 @@ class TestUpdateFeatureConfig:
         assert state == {"mode": "new"}
         assert refreshed.is_set()
 
+    @pytest.mark.asyncio
+    async def test_setter_owned_cancellation_reconciles_committed_context(self):
+        """A setter's cancelled child cannot split live config from clauses."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        state = {"mode": "old"}
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.context_text = "context:old"
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            feature.context_text = f"context:{state['mode']}"
+            await _propagate_cancelled_child()
+
+        feature.get_config = get_config
+        feature.set_config = set_config
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+
+        assert state == {"mode": "new"}
+        assert feature.enabled is True
+        clauses = agent.feature_contribution_runtime.active_context_clauses()
+        assert [(clause.name, clause.body) for clause in clauses] == [
+            ("agent-fixture-context", "context:new")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_setter_owned_cancellation_disables_when_reconcile_fails(self):
+        """Ambiguous commit plus failed republish removes tools and clauses."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        state = {"mode": "old"}
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.context_text = "context:old"
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            feature.context_text = f"context:{state['mode']}"
+            await _propagate_cancelled_child()
+
+        feature.get_config = get_config
+        feature.set_config = set_config
+        agent.refresh_feature_context_clauses = MagicMock(
+            side_effect=RuntimeError("private renderer detail")
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="feature was disabled") as error:
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+
+        assert error.value.__cause__ is None
+        assert state == {"mode": "new"}
+        assert feature.enabled is False
+        assert agent.features[feature.name] is feature
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
     def test_failed_refresh_and_rollback_disables_feature_runtime(self):
         """A doubly-failed transition is quarantined instead of split-brain."""
 
@@ -1744,6 +1834,46 @@ SECRET_SCHEMA = {
 
 
 class TestSecretMasking:
+    @pytest.mark.asyncio
+    async def test_atomic_secret_setter_cancellation_reconciles_context(self):
+        """The hosted atomic setter shares the ambiguous-commit boundary."""
+
+        state = {"api_key": "stored-key", "enabled": True}
+        feature = _make_feature(config_schema=SECRET_SCHEMA, config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def atomic_update(incoming, secret_fields, validate):
+            assert secret_fields == {"api_key"}
+            effective = {**state, **incoming}
+            validate(effective)
+            state.clear()
+            state.update(effective)
+            await _propagate_cancelled_child()
+
+        feature.get_config.side_effect = get_config
+        feature.set_config_with_secret_preservation = AsyncMock(
+            side_effect=atomic_update
+        )
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.update_feature_config(
+                request,
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"enabled": False}),
+            )
+
+        assert state == {"api_key": "stored-key", "enabled": False}
+        agent.refresh_feature_context_clauses.assert_called_once_with(feature)
+        feature.set_config.assert_not_awaited()
+
     def test_get_config_strips_secret_and_reports_presence(self):
         feature = _make_feature(
             config_schema=SECRET_SCHEMA,
