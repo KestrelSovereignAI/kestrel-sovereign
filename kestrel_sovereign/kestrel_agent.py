@@ -5006,14 +5006,14 @@ class KestrelAgent(
             self.features[feature.name] = feature
             feature.enabled = True
             self._cached_features_prompt = self._build_features_prompt_section()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # Atomic activation: undo whatever partially registered so a failed
             # enable can't strand hooks / sources / tools. Soft teardown keeps
             # the instance loaded (re-enable-able); its own errors are logged so
             # the ORIGINAL activation error is what surfaces.
             try:
                 await self._unregister_feature_runtime(feature, unload=False)
-            except Exception as cleanup_exc:  # noqa: BLE001 - best-effort undo
+            except (Exception, asyncio.CancelledError) as cleanup_exc:
                 logging.warning(
                     "Cleanup after failed activation of feature '%s' failed: %s",
                     getattr(feature, "name", type(feature).__name__),
@@ -5030,7 +5030,7 @@ class KestrelAgent(
         if ready_hook is not None:
             try:
                 await ready_hook(self)
-            except Exception as exc:  # noqa: BLE001 - readiness is non-fatal
+            except (Exception, asyncio.CancelledError) as exc:
                 logging.warning(
                     "on_agent_ready failed for %s during re-enable: %s",
                     getattr(feature, "name", type(feature).__name__),
@@ -5078,14 +5078,14 @@ class KestrelAgent(
             getattr(feature, "name", None),
         )
         feature_tool_name = getattr(feature, "tool_name", feature_key)
-        errors: List[Exception] = []
+        errors: List[BaseException] = []
 
         # Declarative contributions are exact lifecycle capabilities. Remove
         # them independently even when the feature's imperative hooks fail.
         try:
             runtime = self._ensure_feature_contribution_runtime()
             runtime.deactivate(feature)
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' SDK contribution teardown failed; "
@@ -5097,7 +5097,7 @@ class KestrelAgent(
         # every teardown step below, so its failure must not skip them.
         try:
             await feature.on_disable()
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' on_disable() failed during teardown; "
@@ -5108,7 +5108,7 @@ class KestrelAgent(
         # The feature's own resource teardown (signal sources + wait providers).
         try:
             await feature.shutdown()
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' shutdown() failed during teardown; "
@@ -5125,7 +5125,7 @@ class KestrelAgent(
                         f"Auto-unregistered hook '{hook.name}' from feature "
                         f"'{feature_key}'"
                     )
-            except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            except (Exception, asyncio.CancelledError) as exc:
                 errors.append(exc)
                 logging.exception(
                     "Feature '%s' hook unregistration failed during teardown; "
@@ -5136,7 +5136,7 @@ class KestrelAgent(
         if self.task_manager:
             try:
                 self.task_manager.unregister_agent(feature.get_agent_card().name)
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 logging.warning(
                     "Failed to unregister feature '%s' from task manager: %s",
                     feature_key,
@@ -5158,7 +5158,7 @@ class KestrelAgent(
                 self._tool_context_hidden_features.discard(feature.__class__.__name__)
             if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
                 self._tool_context_hidden_tools.difference_update(to_remove)
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' dynamic-tool teardown failed; "
@@ -5167,11 +5167,10 @@ class KestrelAgent(
             )
 
         # Full unload drops the instance; soft-toggle keeps it re-enable-able.
+        feature.enabled = False
         if unload:
             if feature_key is not None:
                 self.features.pop(feature_key, None)
-        else:
-            feature.enabled = False
         self._cached_features_prompt = self._build_features_prompt_section()
 
         # Surface the failure only AFTER every independent cleanup step ran.

@@ -113,6 +113,14 @@ def _lifecycle_agent(features=None):
     return agent
 
 
+async def _propagate_cancelled_child(*_args):
+    """Raise cancellation created inside feature-owned async work."""
+
+    child = asyncio.create_task(asyncio.sleep(0))
+    child.cancel()
+    await child
+
+
 FAKE_REGISTRY = {
     "test-pkg": FeaturePackageInfo(
         name="test-pkg",
@@ -358,6 +366,92 @@ class TestEnableFeature:
         assert agent.features[feature.name] is feature
         assert agent.feature_contribution_runtime.active_context_clauses()
 
+    @pytest.mark.asyncio
+    async def test_hook_cancelled_error_rolls_back_enable_generation(self):
+        """Feature-owned cancellation is a failed activation, not a disconnect."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.on_enable = _propagate_cancelled_child
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.enable_feature(request, feature.name)
+
+        assert feature.enabled is False
+        assert agent.features[feature.name] is feature
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_package_hook_cancellation_rolls_back_prior_enabled_member(
+        self, mock_registry
+    ):
+        """A later member's cancellation cannot strand an earlier member live."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class CancellingFeature(SDKFixtureFeature):
+            contribution_prefix = "cancelling-agent-fixture"
+
+        agent = _lifecycle_agent()
+        first = SDKFixtureFeature(agent)
+        second = CancellingFeature(agent)
+        first.enabled = False
+        second.enabled = False
+        second.on_enable = _propagate_cancelled_child
+        agent.features = {first.name: first, second.name: second}
+        mock_registry.return_value = {
+            "fixture-pkg": FeaturePackageInfo(
+                name="fixture-pkg",
+                package="kestrel-feature-fixture",
+                git="",
+                features=[first.name, second.name],
+                description="fixture",
+            )
+        }
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.enable_feature(request, "fixture-pkg")
+
+        assert first.enabled is False
+        assert second.enabled is False
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    async def test_ready_hook_cancelled_error_remains_best_effort(self):
+        """The committed generation survives optional ready-hook cancellation."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.on_agent_ready = _propagate_cancelled_child
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await features_endpoint.enable_feature(request, feature.name)
+
+        assert response["status"] == "enabled"
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
+
     def test_enable_calls_on_enable(self):
         feature = _make_feature(enabled=False)
         agent = _lifecycle_agent(features={"TestFeature": feature})
@@ -532,6 +626,30 @@ class TestDisableFeature:
         assert feature.enabled is False
         assert agent.features[feature.name] is feature
         assert not agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    async def test_hook_cancelled_error_rolls_back_disable_generation(self):
+        """Feature-owned cancellation cannot leave teardown half-published."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        feature.on_disable = _propagate_cancelled_child
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.disable_feature(request, feature.name)
+
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
 
     @pytest.mark.parametrize(
         "feature_name",
@@ -914,6 +1032,42 @@ class TestInstallFeature:
 
 
 class TestRemoveFeature:
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_hook_cancelled_error_rolls_back_remove_generation(
+        self, mock_pkg, mock_run
+    ):
+        """Removal rolls back before its irreversible data/package boundary."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        feature.on_disable = _propagate_cancelled_child
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=[feature.name],
+            description="fixture",
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.remove_feature(request, feature.name)
+
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
+        mock_run.assert_not_called()
+
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.endpoints.features.subprocess.run")
     @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")

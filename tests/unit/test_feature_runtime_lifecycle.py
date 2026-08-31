@@ -329,6 +329,37 @@ async def test_unregister_runtime_cleans_everything_when_on_disable_raises(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_unregister_runtime_cleans_everything_when_on_disable_cancels(tmp_path):
+    """A hook-owned cancelled child is an operation failure, so canonical
+    teardown still drains every independent registration before it propagates."""
+    agent = _agent(tmp_path)
+    feature = _FullFeature(agent)
+    await _boot_feature(agent, feature)
+    assert all(_live_registrations(agent, feature).values())
+
+    async def cancel_from_child():
+        child = asyncio.create_task(asyncio.sleep(3600))
+        child.cancel()
+        await child
+
+    feature.on_disable = cancel_from_child
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent._unregister_feature_runtime(feature)
+
+    assert _FullFeature.SOURCE not in agent.signal_registry
+    assert agent.wait_registry.get("lifecycle") is None
+    assert feature._hook not in agent.hooks_manager.get_hooks(
+        HookEvent.SESSION_START
+    )
+    assert feature.tool_name not in agent.task_manager.agents
+    assert not any(
+        owner == feature.tool_name for owner in agent._tool_to_feature.values()
+    )
+    assert feature.name not in agent.features
+
+
+@pytest.mark.asyncio
 async def test_soft_disable_cleans_everything_when_on_disable_raises(tmp_path):
     """Same guarantee on the soft-toggle path: the instance stays loaded but
     every OTHER registration is still detached, then the error surfaces."""

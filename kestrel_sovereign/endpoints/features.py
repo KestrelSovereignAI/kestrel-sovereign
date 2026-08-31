@@ -613,14 +613,14 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
                 prepared_contributions=prepared_by_feature[id(feature)],
             )
             activated.append((class_name, feature))
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         # Group transaction: roll the already-activated members back to the
         # disabled state (soft-toggle) so a partial package-enable never leaves
         # a mix of live and dead members.
         for class_name, feature in reversed(activated):
             try:
                 await agent._unregister_feature_runtime(feature, unload=False)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 logger.exception(
                     "Enable rollback (re-disable) failed for feature '%s'",
                     class_name,
@@ -695,11 +695,11 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
                 continue
             attempted.append((class_name, feature))
             await agent._unregister_feature_runtime(feature, unload=False)
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         for class_name, feature in reversed(attempted):
             try:
                 await agent._activate_feature_runtime(feature)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 logger.exception(
                     "Disable rollback (re-enable) failed for feature '%s'",
                     class_name,
@@ -787,16 +787,44 @@ async def _remove_feature_locked(
     # Check if feature is loaded — drain its full runtime, then on_remove.
     features = getattr(agent, "features", {}) or {}
     loaded = [
-        (class_name, features[class_name])
+        (
+            class_name,
+            features[class_name],
+            bool(getattr(features[class_name], "enabled", True)),
+        )
         for class_name in pkg_info.features
         if class_name in features
     ]
-    for class_name, feature in loaded:
-        # Full canonical runtime teardown BEFORE uninstall — the SAME inverse
-        # boot rollback and /disable use, not a hooks-only subset. ``unload=True``
-        # drops the instance from ``agent.features`` once every registration is
-        # drained (kestrel-sovereign#2522 P1).
-        await agent._unregister_feature_runtime(feature, unload=True)
+    attempted: List[tuple[str, Any, bool]] = []
+    try:
+        for class_name, feature, was_enabled in loaded:
+            # Full canonical runtime teardown BEFORE uninstall — the SAME inverse
+            # boot rollback and /disable use, not a hooks-only subset. ``unload=True``
+            # drops the instance from ``agent.features`` once every registration is
+            # drained (kestrel-sovereign#2522 P1).
+            attempted.append((class_name, feature, was_enabled))
+            await agent._unregister_feature_runtime(feature, unload=True)
+    except (Exception, asyncio.CancelledError):
+        # Package removal has not crossed its irreversible on_remove/pip
+        # boundary yet. Restore the complete group before propagating a hook
+        # failure (including an internally-originated CancelledError).
+        for class_name, feature, was_enabled in reversed(attempted):
+            try:
+                if was_enabled:
+                    await agent._activate_feature_runtime(feature)
+                else:
+                    agent.features[class_name] = feature
+                    feature.enabled = False
+            except (Exception, asyncio.CancelledError):
+                logger.exception(
+                    "Remove rollback (re-activate) failed for feature '%s'",
+                    class_name,
+                )
+            else:
+                logger.info("Rolled back removal of feature '%s'", class_name)
+        raise
+
+    for _class_name, feature, _was_enabled in loaded:
         # ``on_remove`` (stored-data cleanup) runs AFTER the runtime is fully
         # quiesced, but on the SAME still-referenced instance whose ``agent`` /
         # storage / config the teardown never touched — so unloading loses it no
@@ -822,7 +850,7 @@ async def _remove_feature_locked(
     return {
         "status": "removed",
         "package": package_spec,
-        "features": [class_name for class_name, _ in loaded],
+        "features": [class_name for class_name, _feature, _enabled in loaded],
         "message": f"Package '{package_spec}' uninstalled. Restart the agent to fully unload.",
     }
 
