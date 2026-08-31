@@ -348,11 +348,32 @@ class TestHelpersRaiseRatherThanSwallow:
             )
 
     @pytest.mark.asyncio
-    async def test_absent_config_returns_empty_without_raising(self):
-        """Missing base_url is 'not attempted', not an outage."""
+    async def test_absent_config_signals_not_attempted_without_raising(self):
+        """Missing base_url is 'not attempted' — now said explicitly.
+
+        It used to return `[]`, which made it indistinguishable from a
+        successful fetch of an empty catalog. `None` says which.
+        """
         svc = _make_service()
-        assert await svc._discover_openai_compatible_remote("runpod", {}) == []
-        assert await svc._discover_local_openai_compatible("ollama", {}) == []
+        # Both not-attempted paths in the remote helper: no base_url, and a
+        # base_url whose credential env var is unset. Only the first was
+        # covered at first, and the mutant for the second survived.
+        assert await svc._discover_openai_compatible_remote("runpod", {}) is None
+        assert await svc._discover_local_openai_compatible("ollama", {}) is None
+        assert svc._discovery_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_a_missing_credential_also_signals_not_attempted(self, monkeypatch):
+        """The second not-attempted path — a base_url with no key set."""
+        svc = _make_service()
+        monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+        out = await svc._discover_openai_compatible_remote(
+            "runpod", {"base_url": "https://api.runpod.ai/v2/x/openai/v1"}
+        )
+        assert out is None, (
+            "an unset credential means the request was never issued, which "
+            "must not be reported as a successful empty fetch"
+        )
         assert svc._discovery_failures == {}
 
 
@@ -456,7 +477,7 @@ class TestSkippedDiscoveryDoesNotClearAFailure:
         svc = _make_service(discovery_failures={"runpod": "404 Not Found"})
 
         async def _skipped():
-            return []  # never issued a request
+            return None  # NOT ATTEMPTED — the helper never issued a request
 
         assert await svc._record_discovery("runpod", _skipped()) == []
         assert svc._discovery_failures.get("runpod") == "404 Not Found", (
@@ -465,11 +486,11 @@ class TestSkippedDiscoveryDoesNotClearAFailure:
 
     @pytest.mark.asyncio
     async def test_a_skipped_request_does_not_invent_a_failure_either(self):
-        """The other half: empty is not evidence of failure, only of nothing."""
+        """The other half: not-attempted is not evidence of failure."""
         svc = _make_service()
 
         async def _skipped():
-            return []
+            return None
 
         await svc._record_discovery("runpod", _skipped())
         assert svc._discovery_failures == {}
@@ -484,3 +505,37 @@ class TestSkippedDiscoveryDoesNotClearAFailure:
 
         assert len(await svc._record_discovery("ollama", _ok())) == 1
         assert "ollama" not in svc._discovery_failures
+
+
+class TestSuccessfulEmptyFetchClearsAFailure:
+    """Rounds 10 and 11 are one finding from opposite sides, both correct.
+
+    Round 10: a SKIPPED request must not clear a standing failure.
+    Round 11: a SUCCESSFUL but empty fetch must clear it — a fresh local server
+    with no models loaded completed its request, and leaving the record set
+    reports a stale auth error until the provider happens to expose a model.
+
+    List length cannot separate those two, which is the conflation this entire
+    change is about, reached one last time in my own code. `None` now means
+    not attempted and a list means fetched.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_empty_but_successful_fetch_clears(self):
+        svc = _make_service(discovery_failures={"ollama": "connection refused"})
+
+        async def _empty_but_fetched():
+            return []  # the server answered; it just has nothing loaded
+
+        assert await svc._record_discovery("ollama", _empty_but_fetched()) == []
+        assert "ollama" not in svc._discovery_failures, (
+            "a completed request that found no models is still a successful "
+            "fetch and must clear a stale failure"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_helpers_signal_not_attempted_with_None(self):
+        """Wiring: the contract only works if the helpers actually use it."""
+        svc = _make_service()
+        assert await svc._discover_openai_compatible_remote("runpod", {}) is None
+        assert await svc._discover_local_openai_compatible("ollama", {}) is None

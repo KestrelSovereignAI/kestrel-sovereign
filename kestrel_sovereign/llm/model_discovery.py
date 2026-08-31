@@ -1585,20 +1585,26 @@ class ModelDiscoveryMixin:
             logger.warning("%s: model discovery failed: %s", vendor, e)
             self._note_discovery_outcome(vendor, e)
             return []
-        if models:
-            # Clear a prior failure only on PROOF of a successful fetch (#3190
-            # r10 P2). These helpers return `[]` when they never issued a
-            # request at all — no base_url, or the credential env var unset
-            # because the key is supplied inline or under a custom name. Taking
-            # that as success meant a RunPod/xAI failure could be cleared by
-            # unsetting its key: health turns green with no catalog fetched.
-            #
-            # Note what this deliberately does NOT do: it never RECORDS a
-            # failure from an empty return. Inferring failure from a returned
-            # catalog is what nine review rounds established cannot work, since
-            # every adapter answers differently. Declining to infer SUCCESS is
-            # a weaker and sound claim — "nothing happened" is not "it worked".
-            self._note_discovery_outcome(vendor, None)
+        if models is None:
+            # NOT ATTEMPTED. Leave the record exactly as it was: do not clear a
+            # standing failure (#3190 r10 P2 — unsetting a key would otherwise
+            # turn health green having fetched nothing) and do not invent one.
+            logger.debug("%s: discovery not attempted", vendor)
+            return []
+
+        # A request completed. Clear any prior failure even if the catalog came
+        # back EMPTY — a fresh local server with no models loaded is a
+        # successful fetch, and leaving it degraded reports a stale auth error
+        # until the provider happens to expose a model (#3190 r11 P2).
+        #
+        # Rounds 10 and 11 are the same finding from opposite sides, and both
+        # were right: list length cannot distinguish "no request" from "a
+        # request that found nothing". That is the conflation this entire
+        # change is about, reached one final time in my own code. The fix is
+        # the thing the ticket concluded was needed — an explicit outcome —
+        # scoped to the two helpers where both ends are under my control:
+        # ``None`` means not attempted, a list means fetched.
+        self._note_discovery_outcome(vendor, None)
         return models
 
     async def _safe_list_models(self, vendor: str, adapter, client) -> List[ModelInfo]:
@@ -1632,7 +1638,7 @@ class ModelDiscoveryMixin:
         """Discover models from a local OpenAI-compatible server (llama.cpp, etc.)."""
         base_url = provider_config.get("base_url", "")
         if not base_url:
-            return []
+            return None  # NOT ATTEMPTED — see _record_discovery
 
         # Config-level context_limit override (most reliable for local servers)
         config_context_limit = provider_config.get("context_limit")
@@ -1695,14 +1701,14 @@ class ModelDiscoveryMixin:
         base_url = provider_config.get("base_url", "")
         if not base_url:
             logger.debug(f"{provider_name}: no base_url configured, skipping discovery")
-            return []
+            return None  # NOT ATTEMPTED — see _record_discovery
 
         # Resolve API key from config or convention
         api_key_env = provider_config.get("api_key_env", f"{provider_name.upper()}_API_KEY")
         api_key = os.environ.get(api_key_env, "")
         if not api_key:
             logger.debug(f"{provider_name}: {api_key_env} not set, skipping discovery")
-            return []
+            return None  # NOT ATTEMPTED — see _record_discovery
 
         import httpx
         models_url = f"{base_url.rstrip('/')}/models"
