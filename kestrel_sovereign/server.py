@@ -2508,21 +2508,30 @@ async def _lifespan_startup(app: FastAPI):
         app.state.agent_manager = None
         llm_service = None
         try:
-            await _build_host_control_context(app, None)
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
+            storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
+            db_path = os.path.join(storage_dir, "kestrel_prime.db")
 
             if db_backend.lower() == "postgres" and database_url:
                 logger.info("Using PostgreSQL backend for Kestrel")
-                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-                db_path = os.path.join(storage_dir, "kestrel_prime.db")
                 agent_did = await get_agent_did_async(
                     storage_dir,
                     db_backend="postgres",
                     database_url=database_url,
                 )
-                verify_identity_isolation(agent_did)
-                llm_service = LLMService()
+            else:
+                agent_did = await get_agent_did_async(storage_dir)
+
+            # Identity/database verification must precede the first Hold schema
+            # or custody write. A misconfigured single-agent process must not
+            # bind another deployment's pre-Hold database to this host's
+            # evidence service before refusing the DID mismatch.
+            verify_identity_isolation(agent_did)
+            await _build_host_control_context(app, None)
+
+            llm_service = LLMService()
+            if db_backend.lower() == "postgres" and database_url:
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
@@ -2531,11 +2540,6 @@ async def _lifespan_startup(app: FastAPI):
                     db_backend="postgres",
                 )
             else:
-                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-                db_path = os.path.join(storage_dir, "kestrel_prime.db")
-                agent_did = await get_agent_did_async(storage_dir)
-                verify_identity_isolation(agent_did)
-                llm_service = LLMService()
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
