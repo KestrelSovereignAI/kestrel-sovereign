@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
 from kestrel_sovereign.features.config_validation import (
     FeatureConfigInvalid,
@@ -567,6 +568,13 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     canonical activation used by boot and the disable/enable rails alike.
     """
     agent = get_agent(request)
+    async with _agent_feature_config_transition(agent):
+        return await _enable_feature_locked(agent, name)
+
+
+async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
+    """Enable a feature group while the agent's turn boundary is held."""
+
     loaded = _get_loaded_features_or_404(agent, name)
 
     to_activate = tuple(
@@ -644,6 +652,13 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     disable also use.
     """
     agent = get_agent(request)
+    async with _agent_feature_config_transition(agent):
+        return await _disable_feature_locked(agent, name)
+
+
+async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
+    """Disable a feature group while the agent's turn boundary is held."""
+
     loaded = _get_loaded_features_or_404(agent, name)
     mandatory = sorted(
         class_name
@@ -860,7 +875,10 @@ async def update_feature_config(
 
     async with _FEATURE_CONFIG_UPDATE_LOCK:
         async with _agent_feature_config_transition(agent):
-            return await _update_feature_config_locked(agent, feature, name, body)
+            return await _settle_feature_config_transition(
+                _update_feature_config_locked(agent, feature, name, body),
+                feature_name=name,
+            )
 
 
 @asynccontextmanager
@@ -879,6 +897,34 @@ async def _agent_feature_config_transition(agent: object):
     transition = getattr(agent, "feature_config_transition")
     async with transition():
         yield
+
+
+async def _settle_feature_config_transition(awaitable, *, feature_name: str):
+    """Finish config/context reconciliation before propagating cancellation.
+
+    A hosted setter may durably commit and then preserve caller cancellation
+    while its promotion task settles.  Shield the *whole* config -> context
+    transaction in a child task: if the HTTP caller disconnects, the child
+    still refreshes the clause snapshot, rolls the config back, or tears the
+    feature down before the request's cancellation escapes and releases the
+    CONVERSATION lock.
+    """
+
+    outcome = await await_owned_task(asyncio.create_task(awaitable))
+    if outcome.cancellation is not None:
+        if outcome.error is not None:
+            # Never stringify or chain an out-of-tree renderer/config
+            # exception: it may contain secret config bytes.
+            logger.error(
+                "Feature '%s' configuration reconciliation failed after "
+                "request cancellation (%s)",
+                feature_name,
+                type(outcome.error).__name__,
+            )
+        raise outcome.cancellation from None
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.result
 
 
 async def _update_feature_config_locked(

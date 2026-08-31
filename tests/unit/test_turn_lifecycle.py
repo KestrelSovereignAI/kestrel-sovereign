@@ -26,6 +26,7 @@ from kestrel_sovereign.agent.turn_lifecycle import (
     capture_turn_session_binding,
 )
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 
 
 class _StubAgent(TurnLifecycleMixin):
@@ -35,6 +36,10 @@ class _StubAgent(TurnLifecycleMixin):
 
     def __init__(self) -> None:
         self._lock_manager = OrderedLockManager()
+        self._privacy_transition_lock = ReentrantTransitionLock()
+
+    def _get_privacy_transition_lock(self):
+        return self._privacy_transition_lock
 
 
 class _PrivateAccessorOnlyAgent(_StubAgent):
@@ -152,6 +157,78 @@ async def test_feature_config_transition_serializes_with_turns():
 
     await asyncio.wait_for(task, timeout=1)
     assert config_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_external_privacy_transition_waits_for_complete_turn():
+    """A restrictive transition cannot overtake an old-policy prompt."""
+
+    agent = _StubAgent()
+    transition_entered = asyncio.Event()
+
+    async def transition() -> None:
+        async with agent.privacy_transition():
+            transition_entered.set()
+
+    async with agent._turn_lifecycle():
+        task = asyncio.create_task(transition())
+        await asyncio.sleep(0)
+        assert not transition_entered.is_set()
+
+    await asyncio.wait_for(task, timeout=1)
+    assert transition_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_set_privacy_mode_uses_turn_serialized_transition():
+    """Production privacy-mode wiring cannot bypass CONVERSATION."""
+
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.privacy import PrivacyMode
+
+    agent = KestrelAgent(did="did:test:privacy-turn", storage_path=":memory:")
+    applied = asyncio.Event()
+
+    async def apply(_mode):
+        applied.set()
+        return object()
+
+    agent._set_privacy_mode_with_effects_locked = apply
+    async with agent._turn_lifecycle():
+        transition = asyncio.create_task(
+            agent.set_privacy_mode_with_effects(PrivacyMode.EPHEMERAL)
+        )
+        await asyncio.sleep(0)
+        assert not applied.is_set()
+
+    await asyncio.wait_for(transition, timeout=1)
+    assert applied.is_set()
+
+
+@pytest.mark.asyncio
+async def test_in_turn_privacy_transition_reenters_without_deadlock():
+    """The !privacy command keeps CONVERSATION -> privacy lock order."""
+
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        async with agent.privacy_transition():
+            assert agent._privacy_transition_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_explicit_provider_callback_can_reenter_privacy_transition():
+    """A bound cross-task tool belongs to the turn; an ambient child does not."""
+
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        binding = capture_turn_session_binding(agent)
+
+        async def provider_callback() -> None:
+            with bind_turn_session(binding):
+                async with agent.privacy_transition():
+                    assert agent._privacy_transition_lock.locked()
+
+        await asyncio.wait_for(asyncio.create_task(provider_callback()), timeout=1)
 
 
 # ---------------------------------------------------------------------------

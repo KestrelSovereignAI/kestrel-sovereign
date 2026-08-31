@@ -17,6 +17,7 @@ The dispatcher does NOT pre-acquire `CONVERSATION` for COGNITION sources
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import time
@@ -399,6 +400,51 @@ class TurnLifecycleMixin:
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
             yield
 
+    def _caller_belongs_to_live_turn(self) -> bool:
+        """Whether this task is executing as part of this agent's live turn.
+
+        The turn owner is authoritative.  A provider callback that runs on a
+        reader-spawned task is also admitted only when it carries the explicit
+        binding captured by :func:`capture_turn_session_binding`; a detached
+        task that merely inherited ``_CURRENT_TURN_ID`` is not allowed to
+        bypass the conversation lock.
+        """
+
+        if asyncio.current_task() is getattr(self, "_live_turn_task", None):
+            return True
+        propagated = _BOUND_TURN_SESSION.get()
+        return bool(
+            propagated is not None
+            and propagated.agent is self
+            and propagated.turn_id
+            and propagated.turn_id == getattr(self, "_live_turn_id", None)
+        )
+
+    @asynccontextmanager
+    async def privacy_transition(self) -> AsyncIterator[None]:
+        """Serialize a privacy transition with complete cognition turns.
+
+        External callers acquire ``CONVERSATION`` before the privacy mutex, so
+        a prompt assembled under the old privacy policy cannot remain in flight
+        after a restrictive transition reports success.  An in-turn command or
+        explicitly-bound provider tool already belongs to the live turn and
+        therefore acquires only the task-reentrant privacy mutex, avoiding a
+        recursive ``CONVERSATION`` deadlock.  The global lock order remains
+        CONVERSATION -> privacy everywhere.
+        """
+
+        transition_lock = self._get_privacy_transition_lock()
+        if self._caller_belongs_to_live_turn():
+            async with transition_lock:
+                yield
+            return
+
+        mgr = self._get_lock_manager()
+        label = f"{getattr(self, 'agent_name', None) or 'agent'} privacy-transition"
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
+            async with transition_lock:
+                yield
+
     @asynccontextmanager
     async def _turn_lifecycle(self) -> AsyncIterator[str]:
         """Enter a turn: acquire CONVERSATION, yield a fresh turn_id,
@@ -432,6 +478,7 @@ class TurnLifecycleMixin:
             # against the task-local id to tell a caller that owns the turn
             # from one that merely inherited its ContextVar (#2877).
             self._live_turn_id = turn_id
+            self._live_turn_task = asyncio.current_task()
             # A background task created inside an explicitly-bound callback
             # inherits that binding. If it later enters its own cognition turn
             # (the signal-dispatch wake path), turn entry is the unambiguous
@@ -471,6 +518,7 @@ class TurnLifecycleMixin:
                     _BOUND_TURN_SESSION.reset(bound_token)
                     _CURRENT_TURN_ID.reset(token)
                     self._live_turn_id = None
+                    self._live_turn_task = None
                     # Clear the per-turn active session on exit so an out-of-turn
                     # caller (e.g. a CLI/system-filed request_restart after a chat
                     # turn) cannot read a stale session and misroute its wake into

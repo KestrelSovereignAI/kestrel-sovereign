@@ -1352,6 +1352,10 @@ class KestrelAgent(
         # detached task from reading a concurrent turn's `_active_session_id`
         # (#2877). Read via `get_turn_bound_session_id`, not directly.
         self._live_turn_id: Optional[str] = None
+        # Concrete owner of the live CONVERSATION span.  ContextVars are copied
+        # into detached children, so task identity is required when deciding
+        # whether a privacy transition may re-enter from inside the turn.
+        self._live_turn_task: Optional[asyncio.Task] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
@@ -3674,7 +3678,7 @@ class KestrelAgent(
         This updates both the storage wrapper and the privacy agent.
         Note: Changing to a more restrictive mode does NOT delete existing data.
         """
-        async with self._get_privacy_transition_lock():
+        async with self.privacy_transition():
             return await self._set_privacy_mode_with_effects_locked(mode)
 
     async def confirm_privacy_transition(self) -> PrivacyTransitionResult:
@@ -3687,7 +3691,7 @@ class KestrelAgent(
         across all three state holders. A no-op (with an explanatory message) if
         nothing is pending.
         """
-        async with self._get_privacy_transition_lock():
+        async with self.privacy_transition():
             mode = getattr(self, "_pending_privacy_transition", None)
             if mode is None:
                 return PrivacyTransitionResult(
@@ -3713,7 +3717,7 @@ class KestrelAgent(
         declined. A no-op (with an explanatory message) if nothing is pending.
         Nothing else is mutated; the agent stays in its current mode.
         """
-        async with self._get_privacy_transition_lock():
+        async with self.privacy_transition():
             had_pending = getattr(self, "_pending_privacy_transition", None) is not None
             self._pending_privacy_transition = None
             return PrivacyTransitionResult(

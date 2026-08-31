@@ -1094,10 +1094,14 @@ class FeatureContributionRuntime:
                     )
                 )
             return tuple(resolved)
-        except Exception as exc:
+        except Exception:
+            # Renderer exceptions are arbitrary out-of-tree objects and may
+            # carry user-authored text or credentials in their message.  Do
+            # not retain them as a cause: API/startup error boundaries format
+            # complete exception chains into production logs.
             raise FeatureContributionCollectionError(
                 prepared.feature, "render_context_clauses"
-            ) from exc
+            ) from None
 
     @staticmethod
     def _collect(feature: object) -> PreparedFeatureContributions:

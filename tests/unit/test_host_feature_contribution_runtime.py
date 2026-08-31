@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 from unittest.mock import MagicMock
 
 import pytest
@@ -211,7 +212,10 @@ async def test_host_renderer_failure_does_not_leak_feature_repr_or_cause():
     assert error.feature is feature
     assert error.getter == "render_context_clauses"
     assert secret not in str(error)
-    assert error.__cause__ is original
+    assert error.__cause__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
     assert ctx.feature_contribution_runtime.active_owners() == ()
     assert not feature.started
 

@@ -292,6 +292,30 @@ class TestGetFeatureDetail:
 
 
 class TestEnableFeature:
+    @pytest.mark.asyncio
+    async def test_enable_waits_for_active_turn_before_publication(self):
+        """No contribution can become prompt-visible mid-turn."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            enable = asyncio.create_task(
+                features_endpoint.enable_feature(request, "TestFeature")
+            )
+            await asyncio.sleep(0)
+            feature.initialize.assert_not_awaited()
+            assert feature.enabled is False
+
+        response = await asyncio.wait_for(enable, timeout=1)
+        assert response["status"] == "enabled"
+        feature.initialize.assert_awaited_once()
+        assert feature.enabled is True
+
     def test_enable_calls_on_enable(self):
         feature = _make_feature(enabled=False)
         agent = _lifecycle_agent(features={"TestFeature": feature})
@@ -400,6 +424,30 @@ class TestEnableFeature:
 
 
 class TestDisableFeature:
+    @pytest.mark.asyncio
+    async def test_disable_waits_for_active_turn_before_teardown(self):
+        """A live turn retains one stable feature/context generation."""
+
+        feature = _make_feature()
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            disable = asyncio.create_task(
+                features_endpoint.disable_feature(request, "TestFeature")
+            )
+            await asyncio.sleep(0)
+            feature.on_disable.assert_not_awaited()
+            assert feature.enabled is True
+
+        response = await asyncio.wait_for(disable, timeout=1)
+        assert response["status"] == "disabled"
+        feature.on_disable.assert_awaited_once()
+        assert feature.enabled is False
+
     @pytest.mark.parametrize(
         "feature_name",
         [
@@ -1055,6 +1103,60 @@ class TestUpdateFeatureConfig:
         response = await asyncio.wait_for(update, timeout=1)
         assert response["config"] == {"mode": "old"}
         assert applied.is_set()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_after_commit_waits_for_context_reconciliation(self):
+        """A disconnected PATCH cannot strand new config with old clauses."""
+
+        state = {"mode": "old"}
+        committed = asyncio.Event()
+        release_setter = asyncio.Event()
+        refreshed = asyncio.Event()
+        feature = _make_feature(config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            committed.set()
+            await release_setter.wait()
+
+        def refresh(_feature):
+            refreshed.set()
+
+        feature.get_config.side_effect = get_config
+        feature.set_config.side_effect = set_config
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = refresh
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request,
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+        )
+        await asyncio.wait_for(committed.wait(), timeout=1)
+        update.cancel()
+        await asyncio.sleep(0)
+        assert not update.done()
+        assert not refreshed.is_set()
+        update.cancel()
+        await asyncio.sleep(0)
+        assert not update.done()
+
+        release_setter.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(update, timeout=1)
+
+        assert state == {"mode": "new"}
+        assert refreshed.is_set()
 
     def test_failed_refresh_and_rollback_disables_feature_runtime(self):
         """A doubly-failed transition is quarantined instead of split-brain."""
