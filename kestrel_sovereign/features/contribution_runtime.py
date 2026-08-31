@@ -7,6 +7,7 @@ enable (or host-feature start) transition until its matching teardown.
 
 from __future__ import annotations
 
+import asyncio
 import weakref
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable
@@ -54,7 +55,8 @@ class FeatureContributionCollectionError(FeatureContributionRuntimeError):
 
     The exact feature and fixed boundary remain inspectable, while the public
     message omits both the feature representation and original exception text.
-    The original failure is retained as ``__cause__``.
+    The original failure is deliberately discarded rather than retained as an
+    exception cause that production traceback logging could reveal.
     """
 
     _STAGES_BY_GETTER = {
@@ -1094,7 +1096,7 @@ class FeatureContributionRuntime:
                     )
                 )
             return tuple(resolved)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # Renderer exceptions are arbitrary out-of-tree objects and may
             # carry user-authored text or credentials in their message.  Do
             # not retain them as a cause: API/startup error boundaries format

@@ -569,7 +569,11 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     agent = get_agent(request)
     async with _agent_feature_config_transition(agent):
-        return await _enable_feature_locked(agent, name)
+        return await _settle_feature_transition(
+            _enable_feature_locked(agent, name),
+            feature_name=name,
+            operation="enable",
+        )
 
 
 async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
@@ -653,7 +657,11 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     agent = get_agent(request)
     async with _agent_feature_config_transition(agent):
-        return await _disable_feature_locked(agent, name)
+        return await _settle_feature_transition(
+            _disable_feature_locked(agent, name),
+            feature_name=name,
+            operation="disable",
+        )
 
 
 async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
@@ -756,6 +764,25 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
                 + ", ".join(mandatory)
             ),
         )
+
+    # Runtime teardown, stored-data cleanup, and package removal are one owned
+    # mutation.  Acquire the turn boundary before creating the owned task so a
+    # request cancelled while QUEUED performs no later removal; once mutation
+    # starts, drive it to a terminal result before cancellation can release the
+    # boundary and expose a half-removed feature generation.
+    async with _agent_feature_config_transition(agent):
+        return await _settle_feature_transition(
+            _remove_feature_locked(agent, pkg_info),
+            feature_name=name,
+            operation="remove",
+        )
+
+
+async def _remove_feature_locked(
+    agent: object,
+    pkg_info: FeaturePackageInfo,
+) -> Dict[str, Any]:
+    """Remove one package while the agent's turn boundary remains held."""
 
     # Check if feature is loaded — drain its full runtime, then on_remove.
     features = getattr(agent, "features", {}) or {}
@@ -875,9 +902,10 @@ async def update_feature_config(
 
     async with _FEATURE_CONFIG_UPDATE_LOCK:
         async with _agent_feature_config_transition(agent):
-            return await _settle_feature_config_transition(
+            return await _settle_feature_transition(
                 _update_feature_config_locked(agent, feature, name, body),
                 feature_name=name,
+                operation="configuration reconciliation",
             )
 
 
@@ -899,14 +927,18 @@ async def _agent_feature_config_transition(agent: object):
         yield
 
 
-async def _settle_feature_config_transition(awaitable, *, feature_name: str):
-    """Finish config/context reconciliation before propagating cancellation.
+async def _settle_feature_transition(
+    awaitable,
+    *,
+    feature_name: str,
+    operation: str,
+):
+    """Finish one feature-state mutation before propagating cancellation.
 
-    A hosted setter may durably commit and then preserve caller cancellation
-    while its promotion task settles.  Shield the *whole* config -> context
-    transaction in a child task: if the HTTP caller disconnects, the child
-    still refreshes the clause snapshot, rolls the config back, or tears the
-    feature down before the request's cancellation escapes and releases the
+    Feature lifecycle hooks and hosted setters may cross awaited boundaries
+    after changing a context/tool generation.  Shield the whole mutation in a
+    child task: if the HTTP caller disconnects, the child still commits or
+    rolls back before the request's cancellation escapes and releases the
     CONVERSATION lock.
     """
 
@@ -916,9 +948,9 @@ async def _settle_feature_config_transition(awaitable, *, feature_name: str):
             # Never stringify or chain an out-of-tree renderer/config
             # exception: it may contain secret config bytes.
             logger.error(
-                "Feature '%s' configuration reconciliation failed after "
-                "request cancellation (%s)",
+                "Feature '%s' %s failed after request cancellation (%s)",
                 feature_name,
+                operation,
                 type(outcome.error).__name__,
             )
         raise outcome.cancellation from None

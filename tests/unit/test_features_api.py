@@ -316,6 +316,48 @@ class TestEnableFeature:
         feature.initialize.assert_awaited_once()
         assert feature.enabled is True
 
+    @pytest.mark.asyncio
+    async def test_cancelled_enable_settles_published_generation_before_unlock(self):
+        """A disconnect after publication cannot expose a half-enabled feature."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_enable():
+            entered.set()
+            await release.wait()
+
+        feature.on_enable = slow_enable
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        enable = asyncio.create_task(
+            features_endpoint.enable_feature(request, feature.name)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert feature.enabled is False
+        assert agent.feature_contribution_runtime.active_context_clauses()
+
+        enable.cancel()
+        await asyncio.sleep(0)
+        assert not enable.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(enable, timeout=1)
+
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
+
     def test_enable_calls_on_enable(self):
         feature = _make_feature(enabled=False)
         agent = _lifecycle_agent(features={"TestFeature": feature})
@@ -447,6 +489,49 @@ class TestDisableFeature:
         assert response["status"] == "disabled"
         feature.on_disable.assert_awaited_once()
         assert feature.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_disable_settles_removed_generation_before_unlock(self):
+        """A disconnect after depublication cannot expose a half-disabled feature."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_disable():
+            entered.set()
+            await release.wait()
+
+        feature.on_disable = slow_disable
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        disable = asyncio.create_task(
+            features_endpoint.disable_feature(request, feature.name)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert feature.enabled is True
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
+        disable.cancel()
+        await asyncio.sleep(0)
+        assert not disable.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(disable, timeout=1)
+
+        assert feature.enabled is False
+        assert agent.features[feature.name] is feature
+        assert not agent.feature_contribution_runtime.active_context_clauses()
 
     @pytest.mark.parametrize(
         "feature_name",
@@ -829,6 +914,160 @@ class TestInstallFeature:
 
 
 class TestRemoveFeature:
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_cancelled_queued_remove_performs_no_later_mutation(
+        self, mock_pkg, mock_run
+    ):
+        """Cancellation before the turn boundary means removal never starts."""
+
+        feature = _make_feature()
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=["TestFeature"],
+            description="fixture",
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            removal = asyncio.create_task(
+                features_endpoint.remove_feature(request, "TestFeature")
+            )
+            await asyncio.sleep(0)
+            removal.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(removal, timeout=1)
+
+        # There is no orphaned owned task waiting to mutate after the old turn
+        # releases its lock.
+        await asyncio.sleep(0.05)
+        feature.on_disable.assert_not_awaited()
+        feature.on_remove.assert_not_awaited()
+        assert agent.features["TestFeature"] is feature
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_remove_waits_for_active_turn_before_teardown(
+        self, mock_pkg, mock_run
+    ):
+        """Removal preserves the complete runtime generation for a live turn."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        teardown_entered = asyncio.Event()
+
+        async def record_disable():
+            teardown_entered.set()
+
+        feature.on_disable = record_disable
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=[feature.name],
+            description="fixture",
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            removal = asyncio.create_task(
+                features_endpoint.remove_feature(request, feature.name)
+            )
+            # Give an incorrectly unserialized teardown ample time to enter;
+            # the correct path is still queued on the active turn boundary.
+            await asyncio.sleep(0.05)
+            assert not teardown_entered.is_set()
+            assert feature.name in agent.features
+            assert agent.feature_contribution_runtime.active_context_clauses()
+            assert not feature.disabled
+
+        response = await asyncio.wait_for(removal, timeout=1)
+        assert response["status"] == "removed"
+        assert feature.name not in agent.features
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+        mock_run.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_cancelled_remove_finishes_before_releasing_turn_boundary(
+        self, mock_pkg, mock_run
+    ):
+        """Once removal starts, disconnect cannot expose its partial state."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        turn_entered = asyncio.Event()
+
+        async def slow_remove():
+            entered.set()
+            await release.wait()
+
+        async def enter_turn():
+            async with agent._turn_lifecycle():
+                turn_entered.set()
+
+        feature.on_remove = slow_remove
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=[feature.name],
+            description="fixture",
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        removal = asyncio.create_task(
+            features_endpoint.remove_feature(request, feature.name)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        removal.cancel()
+        await asyncio.sleep(0)
+        assert not removal.done()
+
+        contender = asyncio.create_task(enter_turn())
+        await asyncio.sleep(0)
+        assert not turn_entered.is_set()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(removal, timeout=1)
+        await asyncio.wait_for(contender, timeout=1)
+
+        assert feature.name not in agent.features
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+        assert turn_entered.is_set()
+        mock_run.assert_called_once()
+
     @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_remove_core_returns_400(self, mock_pkg):
         mock_pkg.return_value = FeaturePackageInfo(

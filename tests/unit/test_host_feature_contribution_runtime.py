@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import traceback
 from unittest.mock import MagicMock
 
@@ -203,6 +204,34 @@ async def test_host_renderer_failure_does_not_leak_feature_repr_or_cause():
         raise original
 
     object.__setattr__(feature.context_registration, "renderer", fail_renderer)
+    ctx = SovereignHostContext()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        await start_host_features([feature], ctx)
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.getter == "render_context_clauses"
+    assert secret not in str(error)
+    assert error.__cause__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert ctx.feature_contribution_runtime.active_owners() == ()
+    assert not feature.started
+
+
+@pytest.mark.asyncio
+async def test_host_renderer_cancelled_error_is_sanitized_without_cause():
+    """A synchronous renderer cannot forge task cancellation with secret text."""
+
+    secret = "api-key=renderer-cancel-must-stay-private"
+    feature = SDKFixtureHostFeature()
+
+    def cancel_renderer():
+        raise asyncio.CancelledError(secret)
+
+    object.__setattr__(feature.context_registration, "renderer", cancel_renderer)
     ctx = SovereignHostContext()
 
     with pytest.raises(FeatureContributionCollectionError) as exc_info:
