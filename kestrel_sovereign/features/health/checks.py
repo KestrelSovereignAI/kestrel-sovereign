@@ -965,10 +965,16 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     pinned_at_risk = pinned_vendor in failures if pinned_vendor else False
 
     if pinned_at_risk:
+        # Say what is true: the catalog needed to VALIDATE the pin is missing.
+        # Whether the pin would actually be dropped on restart depends on
+        # whether the model still appears in the partial catalog or is the
+        # route's configured default — and the fix in this same change is
+        # designed to preserve it. Asserting a guaranteed outage would be
+        # crying wolf about the case we now handle (codex r2 P2).
         message = (
             f"Model discovery failed for '{pinned_vendor}', the vendor this "
-            f"agent's model is pinned to — the pin cannot be validated and "
-            f"will be discarded on the next restart. "
+            f"agent's model is pinned to — the pin cannot be validated "
+            f"against a live catalog while this persists. "
             f"{failures[pinned_vendor]}"
         )
     else:

@@ -413,6 +413,17 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Model discovery uses process-wide SharedModelCache (see model_cache.py).
         # Pre-populate from disk if this is the first LLMService instance.
+        # vendor -> last model-discovery error (#3190). Records the fact that a
+        # vendor's catalog could NOT be retrieved, which ``len(catalog) > 0``
+        # cannot express: a failed ``list_models`` and a vendor that genuinely
+        # serves nothing both yield an empty list.
+        #
+        # MUST be created before ``_load_from_disk_cache()`` on the next line.
+        # That call restores a persisted catalog AND its failure record, so
+        # initialising this afterwards made the restoration dead code on every
+        # real construction — the map it wrote into did not exist yet, and the
+        # later assignment then replaced it with an empty one (codex r2 P1).
+        self._discovery_failures: Dict[str, str] = {}
         self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
@@ -455,20 +466,6 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
 
-        # vendor -> last model-discovery error (#3190). Records the fact that a
-        # vendor's catalog could NOT be retrieved, which ``len(catalog) > 0``
-        # cannot express: a failed ``list_models`` and a vendor that genuinely
-        # serves nothing both yield an empty list.
-        #
-        # Load-bearing twice over. When the Anthropic key was disabled on
-        # 2026-08-31, ``GET /v1/models`` 401ed and that vendor's catalog
-        # collapsed to a single stale entry; non-empty was read as complete, so
-        # ``_validate_explicit_mandate`` "proved" claude-opus-5 unservable and
-        # every agent's persisted pin was discarded at boot, dropping the fleet
-        # onto a 1B local model. It also drives the ``model_discovery`` health
-        # check — an operator-actionable condition (dead key, network) must not
-        # live only in a log line.
-        self._discovery_failures: Dict[str, str] = {}
         # Set when a PERSISTED mandate failed to apply at boot (#3190) — the
         # operator set a model and it is not in effect. Cleared by a successful
         # set_model_preference.

@@ -66,7 +66,13 @@ class TestModelDiscoveryCheck:
         )
         assert result["status"] == "fail"
         assert result["details"]["pinned_vendor_at_risk"] is True
-        assert "discarded on the next restart" in result["message"]
+        assert "cannot be validated" in result["message"]
+        # The fix in this same change is designed to PRESERVE the pin, so the
+        # message must not promise an outage it prevents. Asserting the
+        # accurate wording is present is not enough — the overclaim was
+        # appended elsewhere in the string and survived that check.
+        assert "discarded" not in result["message"]
+        assert "will be discarded on the next restart" not in result["message"]
 
     @pytest.mark.asyncio
     async def test_a_failure_in_an_unpinned_vendor_is_only_a_warning(self):
