@@ -1200,6 +1200,15 @@ class RestartCoordinatorFeature(Feature):
                         expected_authority_signature=req.authority_signature,
                     )
                     if not moved:
+                        await self._recover_failed_restart_dispatch(
+                            req.id,
+                            reason=(
+                                "update succeeded but post-update safety "
+                                "deferral could not be committed"
+                            ),
+                            active_status="updating",
+                            authority_context="post-update safety deferral",
+                        )
                         deferred.append({
                             "request_id": req.id,
                             "reason": "lost race after update safety check",

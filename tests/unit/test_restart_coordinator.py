@@ -2210,6 +2210,61 @@ async def test_executor_rejects_rotated_authority_before_post_update_safety_writ
 
 
 @pytest.mark.asyncio
+async def test_post_update_deferral_recovers_when_authority_rotates_during_safety(
+    tmp_path,
+    monkeypatch,
+):
+    """A failed deferral CAS must not strand an update request as active."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="rotate during post-update safety",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=_git_checkout(tmp_path),
+    )
+    request_id = created.data["request"]["id"]
+
+    async def successful_update(_req, _profile):
+        return {
+            "ok": True,
+            "failed_step": None,
+            "steps": [],
+            "resolved_ref": "deadbeef",
+            "migration": {"ran": False},
+        }
+
+    safety_checks = 0
+
+    async def rotate_during_post_update_safety(req):
+        nonlocal safety_checks
+        safety_checks += 1
+        if safety_checks == 1:
+            return req, {"safe": True, "reason": "fleet initially idle"}
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-post-update-safety")
+        return req, {
+            "safe": False,
+            "reason": "agent became busy",
+            "deferable": True,
+        }
+
+    feat._run_update = successful_update
+    feat._evaluate_and_track_safety = rotate_during_post_update_safety
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "authority revoked" in row.status_reason
+    assert "post-update safety deferral" in row.status_reason
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_executor_never_runs_manual_only_policy(tmp_path):
     feat, backend = await _make_feature(tmp_path)
     await feat.request_restart(reason="r", policy="manual_only")
