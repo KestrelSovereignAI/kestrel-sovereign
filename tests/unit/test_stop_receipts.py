@@ -210,6 +210,44 @@ async def test_opaque_stop_identities_are_blinded_in_claims_and_receipts(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_public_turn_receipt_blinds_remapped_private_request_id(tmp_path):
+    """A public turn address must not persist its private execution address."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-remapped-id.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        private_request_id = "private request: patient@example.test"
+        request = replace(
+            _request(correlation_id="public-turn-remap"),
+            target="public-turn",
+            target_is_turn_id=True,
+            turn_id="public-turn",
+        )
+        outcome = replace(
+            _outcomes(request)[0],
+            requested_target=request.target,
+            resolved_target=private_request_id,
+        )
+
+        receipt = await store.persist(request, (outcome,))
+        rows = await db.fetchall(
+            "SELECT resolved_target, agent_id FROM stop_receipt_outcomes "
+            "WHERE receipt_id = ?",
+            (receipt.receipt_id,),
+        )
+
+        assert private_request_id not in json.dumps(rows)
+        assert receipt.outcomes[0].resolved_target != private_request_id
+        assert receipt.outcomes[0].resolved_target.startswith("sha256:")
+        assert await store.load(request) == receipt
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_receipt_survives_sqlite_connection_restart(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 

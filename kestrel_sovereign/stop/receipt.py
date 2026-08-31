@@ -105,9 +105,19 @@ def _optional_identifier_digest(kind: str, value: str | None) -> str | None:
     return None if value is None else _identifier_digest(kind, value)
 
 
-def _stored_outcome_identity(value: str, request: StopRequest) -> str:
+def _stored_outcome_identity(
+    value: str,
+    request: StopRequest,
+    *,
+    field: str,
+) -> str:
     if request.target is not None and value == request.target:
         return _identifier_digest("target", value)
+    if field == "resolved_target" and request.target_is_turn_id:
+        # A public turn address resolves to the process-private request key
+        # used to cancel the live operation. That key may be caller supplied;
+        # it is necessary in memory but is not durable receipt content.
+        return _identifier_digest("resolved_target", value)
     return value
 
 
@@ -373,9 +383,15 @@ class StopReceiptStore:
                             receipt_id,
                             ordinal,
                             _stored_outcome_identity(
-                                outcome.resolved_target, request
+                                outcome.resolved_target,
+                                request,
+                                field="resolved_target",
                             ),
-                            _stored_outcome_identity(outcome.agent_id, request),
+                            _stored_outcome_identity(
+                                outcome.agent_id,
+                                request,
+                                field="agent_id",
+                            ),
                             outcome.disposition.value,
                             outcome.detail,
                         ),
