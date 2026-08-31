@@ -481,6 +481,25 @@ class TestStartAgent:
             env["KESTREL_A2A_TRANSPORT_KEY"]
         )
 
+    def test_standalone_agent_preserves_configured_operator_api_key(
+        self,
+        pm,
+        project_dir,
+    ):
+        """The explicit solo launch remains operator-facing, not a host peer."""
+
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"), port=8801,
+        )
+        mock_process = MagicMock(pid=12345)
+
+        with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+            pm.start_agent("claw", cfg, standalone=True)
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert env["KESTREL_API_KEY"] == "test-key"
+        assert env["KESTREL_SERVE_UI"] == "true"
+
     def test_start_agent_passes_per_agent_semantic_inference_profile(
         self,
         pm,

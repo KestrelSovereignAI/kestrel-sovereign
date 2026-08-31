@@ -634,14 +634,19 @@ class TaskStore(UnifiedStoreBase):
         self,
         task_id: str,
         creator_agent_id: str,
+        *,
+        recipient_agent_id: str,
     ) -> Optional[Task]:
-        """Retrieve a sender-owned result through its durable creator."""
+        """Retrieve a sender-owned result through its exact routed peer."""
 
         if not isinstance(creator_agent_id, str) or not creator_agent_id.strip():
             raise ValueError("Task creator lookup requires a concrete identity")
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task creator lookup requires a concrete recipient")
         row = await self._backend.fetch_one(
-            "SELECT * FROM a2a_tasks WHERE id = ? AND creator_agent_id = ?",
-            (task_id, creator_agent_id),
+            "SELECT * FROM a2a_tasks WHERE id = ? AND creator_agent_id = ? "
+            "AND recipient_agent_id = ?",
+            (task_id, creator_agent_id, recipient_agent_id),
         )
         if not row:
             return None

@@ -3230,11 +3230,13 @@ async def _authenticate_a2a_creator_action(
         expected_verb=expected_verb,
     )
     authorized_sender: dict[str, str] = {}
+    recipient_agent_id = _task_recipient_principal(agent)
 
     async def _read(sender_agent_id: str):
         task = await agent.task_manager.get_task_for_creator(
             task_id,
             sender_agent_id,
+            recipient_agent_id=recipient_agent_id,
         )
         if task is None:
             # Unknown and cross-principal ids deliberately share one result.
@@ -3478,11 +3480,16 @@ async def _task_subscription_response(
         )
         subscribe_kwargs = {"recipient_agent_id": recipient_agent_id}
     else:
+        recipient_agent_id = _task_recipient_principal(agent)
         task = await agent.task_manager.get_task_for_creator(
             task_id,
             creator_agent_id,
+            recipient_agent_id=recipient_agent_id,
         )
-        subscribe_kwargs = {"creator_agent_id": creator_agent_id}
+        subscribe_kwargs = {
+            "creator_agent_id": creator_agent_id,
+            "recipient_agent_id": recipient_agent_id,
+        }
     if task is None:
         raise HTTPException(
             status_code=404, detail="Task not found",

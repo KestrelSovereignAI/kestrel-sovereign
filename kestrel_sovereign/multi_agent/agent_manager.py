@@ -1150,7 +1150,14 @@ class AgentManager:
             task_manager = getattr(recipient, "task_manager", None)
             if task_manager is None:
                 raise PeerNotFoundError("Local A2A task does not exist")
-            task = await task_manager.get_task_for_creator(task_id, sender_id)
+            recipient_id = _loaded_agent_did(recipient)
+            if recipient_id is None:
+                raise PeerNotFoundError("Local A2A task does not exist")
+            task = await task_manager.get_task_for_creator(
+                task_id,
+                sender_id,
+                recipient_agent_id=recipient_id,
+            )
             if task is None:
                 # Unknown and cross-principal ids share one public result.
                 raise PeerNotFoundError("Local A2A task does not exist")
@@ -1182,14 +1189,19 @@ class AgentManager:
                 peer=peer,
             )
             task_manager = getattr(recipient, "task_manager", None)
+            recipient_id = _loaded_agent_did(recipient)
+            if recipient_id is None:
+                raise PeerNotFoundError("Local A2A task does not exist")
             if task_manager is None or await task_manager.get_task_for_creator(
                 task_id,
                 sender_id,
+                recipient_agent_id=recipient_id,
             ) is None:
                 raise PeerNotFoundError("Local A2A task does not exist")
             subscription = task_manager.subscribe(
                 task_id,
                 creator_agent_id=sender_id,
+                recipient_agent_id=recipient_id,
             )
             try:
                 first = await anext(subscription)
@@ -1258,7 +1270,14 @@ class AgentManager:
             task_manager = getattr(recipient, "task_manager", None)
             if task_manager is None:
                 raise PeerNotFoundError("Local cancellation recipient is unavailable")
-            current = await task_manager.get_task_for_creator(task_id, sender_id)
+            recipient_id = _loaded_agent_did(recipient)
+            if recipient_id is None:
+                raise PeerNotFoundError("Local cancellation recipient is unavailable")
+            current = await task_manager.get_task_for_creator(
+                task_id,
+                sender_id,
+                recipient_agent_id=recipient_id,
+            )
             if current is None:
                 raise PeerNotFoundError("Local cancellation task does not exist")
             try:

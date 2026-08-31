@@ -102,8 +102,12 @@ async def test_point_and_list_reads_are_scoped_by_durable_role(tmp_path):
             creator_agent_id=CREATOR_B,
         )
 
-        assert await manager.get_task_for_creator("task-a", CREATOR_A) is not None
-        assert await manager.get_task_for_creator("task-a", CREATOR_B) is None
+        assert await manager.get_task_for_creator(
+            "task-a", CREATOR_A, recipient_agent_id=RECIPIENT_A
+        ) is not None
+        assert await manager.get_task_for_creator(
+            "task-a", CREATOR_B, recipient_agent_id=RECIPIENT_A
+        ) is None
         assert await manager.get_task_for_recipient("task-a", RECIPIENT_A) is not None
         assert await manager.get_task_for_recipient("task-a", RECIPIENT_B) is None
 
@@ -113,6 +117,32 @@ async def test_point_and_list_reads_are_scoped_by_durable_role(tmp_path):
         )
         assert [task.id for task in inbox_a] == ["task-a"]
         assert [task.id for task in pending_b] == ["task-b"]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_creator_read_is_also_bound_to_routed_recipient(tmp_path):
+    """A creator cannot reuse another recipient route in a shared store."""
+
+    manager = await create_task_manager(str(tmp_path / "recipient-route.db"))
+    try:
+        await manager.create_task(
+            _params("recipient-bound"),
+            agent_name=RECIPIENT_A,
+            creator_agent_id=CREATOR_A,
+        )
+
+        assert await manager.get_task_for_creator(
+            "recipient-bound",
+            CREATOR_A,
+            recipient_agent_id=RECIPIENT_A,
+        ) is not None
+        assert await manager.get_task_for_creator(
+            "recipient-bound",
+            CREATOR_A,
+            recipient_agent_id=RECIPIENT_B,
+        ) is None
     finally:
         await manager.close()
 
@@ -157,13 +187,23 @@ async def test_subscription_admission_is_creator_scoped(tmp_path):
         denied = manager.subscribe(
             "creator-stream",
             creator_agent_id=CREATOR_B,
+            recipient_agent_id=RECIPIENT_A,
         )
         with pytest.raises(StopAsyncIteration):
             await anext(denied)
 
+        wrong_route = manager.subscribe(
+            "creator-stream",
+            creator_agent_id=CREATOR_A,
+            recipient_agent_id=RECIPIENT_B,
+        )
+        with pytest.raises(StopAsyncIteration):
+            await anext(wrong_route)
+
         allowed = manager.subscribe(
             "creator-stream",
             creator_agent_id=CREATOR_A,
+            recipient_agent_id=RECIPIENT_A,
         )
         first = await anext(allowed)
         assert first["event"] == "status"
@@ -192,6 +232,7 @@ async def test_subscription_rereads_after_registration_to_close_terminal_race(
         stream = manager.subscribe(
             "fast-terminal",
             creator_agent_id=CREATOR_A,
+            recipient_agent_id=RECIPIENT_A,
         )
         event = await anext(stream)
 
@@ -222,13 +263,23 @@ async def test_host_attested_result_read_binds_live_sender_and_recipient(tmp_pat
         agent_id=RECIPIENT_A,
         task_manager=task_manager,
     )
+    wrong_recipient = SimpleNamespace(
+        did=RECIPIENT_B,
+        agent_id=RECIPIENT_B,
+        task_manager=task_manager,
+    )
     host._register_agent("sender", sender)
     host._register_agent("intruder", intruder)
     host._register_agent("recipient", recipient)
+    host._register_agent("wrong-recipient", wrong_recipient)
     recipient_router = SimpleNamespace(
         authorize_inbound_sender=AsyncMock(return_value=True)
     )
     recipient_requester = PeerRequester(RECIPIENT_A, object())
+    wrong_recipient_router = SimpleNamespace(
+        authorize_inbound_sender=AsyncMock(return_value=True)
+    )
+    wrong_recipient_requester = PeerRequester(RECIPIENT_B, object())
 
     def install(agent):
         requester = PeerRequester(agent.did, object())
@@ -250,10 +301,22 @@ async def test_host_attested_result_read_binds_live_sender_and_recipient(tmp_pat
         router=recipient_router,
         requester=recipient_requester,
     )
+    host.install_a2a_hosted_policy(
+        wrong_recipient,
+        resolver=object(),
+        authorizer=object(),
+        router=wrong_recipient_router,
+        requester=wrong_recipient_requester,
+    )
     peer = PeerIdentity(
         agent_id=RECIPIENT_A,
         slug="recipient",
         routing_key="recipient",
+    )
+    wrong_peer = PeerIdentity(
+        agent_id=RECIPIENT_B,
+        slug="wrong-recipient",
+        routing_key="wrong-recipient",
     )
     try:
         await task_manager.create_task(
@@ -269,6 +332,14 @@ async def test_host_attested_result_read_binds_live_sender_and_recipient(tmp_pat
             task_id="host-private",
         )
         assert result["id"] == "host-private"
+
+        with pytest.raises(PeerNotFoundError):
+            await host.get_host_attested_local_a2a_task(
+                sender=sender,
+                requester=sender_requester,
+                peer=wrong_peer,
+                task_id="host-private",
+            )
 
         with pytest.raises(PeerNotFoundError):
             await host.get_host_attested_local_a2a_task(
@@ -316,6 +387,7 @@ def test_signed_http_read_uses_verified_creator_principal(monkeypatch):
     manager.get_task_for_creator.assert_awaited_once_with(
         "wire-read",
         CREATOR_A,
+        recipient_agent_id=RECIPIENT_A,
     )
 
 
@@ -390,6 +462,7 @@ def test_process_resolver_verifies_signed_http_result_read(
     manager.get_task_for_creator.assert_awaited_once_with(
         "process-read",
         sender_did,
+        recipient_agent_id=RECIPIENT_A,
     )
 
 
@@ -580,5 +653,11 @@ def test_signed_http_subscription_uses_verified_creator_principal(monkeypatch):
     assert response.status_code == 200
     assert "wire-subscribe" in body
     assert subscribe_calls == [
-        ("wire-subscribe", {"creator_agent_id": CREATOR_A})
+        (
+            "wire-subscribe",
+            {
+                "creator_agent_id": CREATOR_A,
+                "recipient_agent_id": RECIPIENT_A,
+            },
+        )
     ]

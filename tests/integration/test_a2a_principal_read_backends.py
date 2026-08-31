@@ -40,8 +40,21 @@ async def _exercise_principal_reads(store: TaskStore) -> None:
             recipient_agent_id=recipient_b,
         )
 
-        assert await store.get_for_creator(task_a, creator_a) is not None
-        assert await store.get_for_creator(task_a, creator_b) is None
+        assert await store.get_for_creator(
+            task_a,
+            creator_a,
+            recipient_agent_id=recipient_a,
+        ) is not None
+        assert await store.get_for_creator(
+            task_a,
+            creator_a,
+            recipient_agent_id=recipient_b,
+        ) is None
+        assert await store.get_for_creator(
+            task_a,
+            creator_b,
+            recipient_agent_id=recipient_a,
+        ) is None
         assert await store.get_for_recipient(task_a, recipient_a) is not None
         assert await store.get_for_recipient(task_a, recipient_b) is None
         assert [task.id for task in await store.list_tasks(

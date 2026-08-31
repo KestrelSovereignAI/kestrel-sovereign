@@ -896,11 +896,14 @@ class ProcessManager:
         # sovereign operator key. The selected key is shared by this host's
         # child processes and is route-scoped again by server auth.
         ensure_a2a_transport_key(env, project_root=self.project_dir)
-        # The child's server imports ``.env`` with override=False. Keep an
-        # explicit blank sentinel after collision validation rather than
-        # deleting this key: deletion would let import-time dotenv loading
-        # silently resurrect the host's sovereign credential in the child.
-        env["KESTREL_API_KEY"] = ""
+        if not standalone:
+            # A host-managed peer must not inherit sovereign authority. The
+            # child's server imports ``.env`` with override=False, so keep an
+            # explicit blank sentinel after collision validation rather than
+            # deleting this key: deletion would let import-time dotenv loading
+            # silently resurrect the host credential. An explicit standalone
+            # launch is operator-facing and retains its configured API key.
+            env["KESTREL_API_KEY"] = ""
         try:
             roster = MultiAgentConfig.load(
                 self.project_dir / MULTI_AGENT_CONFIG_FILENAME,

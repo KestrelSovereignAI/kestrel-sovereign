@@ -1160,9 +1160,15 @@ class TaskManager:
         self,
         task_id: str,
         creator_agent_id: str,
+        *,
+        recipient_agent_id: str,
     ) -> Optional[Task]:
-        """Get one outbound result through its durable creator principal."""
-        return await self.task_store.get_for_creator(task_id, creator_agent_id)
+        """Get one outbound result through its creator and routed recipient."""
+        return await self.task_store.get_for_creator(
+            task_id,
+            creator_agent_id,
+            recipient_agent_id=recipient_agent_id,
+        )
 
     async def get_task_cancellation_snapshot(
         self,
@@ -1627,14 +1633,15 @@ class TaskManager:
         Yields:
             SSE event dictionaries with 'event' and 'data' keys
         """
-        if (creator_agent_id is None) == (recipient_agent_id is None):
+        if recipient_agent_id is None:
             raise ValueError(
-                "Task subscription requires exactly one durable principal role"
+                "Task subscription requires the routed recipient identity"
             )
         if creator_agent_id is not None:
             authorized_task = await self.task_store.get_for_creator(
                 task_id,
                 creator_agent_id,
+                recipient_agent_id=recipient_agent_id,
             )
         else:
             authorized_task = await self.task_store.get_for_recipient(
@@ -1661,6 +1668,7 @@ class TaskManager:
                 authorized_task = await self.task_store.get_for_creator(
                     task_id,
                     creator_agent_id,
+                    recipient_agent_id=recipient_agent_id,
                 )
             else:
                 authorized_task = await self.task_store.get_for_recipient(

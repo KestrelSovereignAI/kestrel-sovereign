@@ -354,7 +354,9 @@ async def test_ambiguous_cancel_commit_reconciles_projections_before_rethrow(
             )
 
         persisted = await manager.get_task_for_creator(
-            "ambiguous-commit", "did:test:creator"
+            "ambiguous-commit",
+            "did:test:creator",
+            recipient_agent_id="did:test:recipient",
         )
         assert persisted.status.state is TaskState.CANCELED
         assert canceled_callbacks == ["ambiguous-commit"]
@@ -481,7 +483,9 @@ async def test_create_task_returns_accepted_snapshot_when_final_readback_fails(
         manager._notify_status_update.assert_not_awaited()
         manager.task_store._get_unscoped = original_get
         persisted = await manager.get_task_for_creator(
-            created.id, "did:test:creator"
+            created.id,
+            "did:test:creator",
+            recipient_agent_id="did:test:recipient",
         )
         assert persisted is not None
         assert persisted.status.state is TaskState.SUBMITTED
@@ -531,7 +535,9 @@ async def test_cancel_commit_does_not_depend_on_a_post_commit_read(
         assert completions == [submitted.id]
         manager.task_store._get_unscoped = original_get
         persisted = await manager.get_task_for_creator(
-            submitted.id, "did:test:creator"
+            submitted.id,
+            "did:test:creator",
+            recipient_agent_id="did:test:recipient",
         )
         assert persisted.status.state is TaskState.CANCELED
         if with_payload:
@@ -2777,7 +2783,9 @@ async def test_database_fence_blocks_legacy_writer_resurrecting_canceled_task(
 
         assert (
             await manager.get_task_for_creator(
-                "terminal-cancel", "did:test:creator"
+                "terminal-cancel",
+                "did:test:creator",
+                recipient_agent_id="did:test:recipient",
             )
         ).status.state is TaskState.CANCELED
     finally:
@@ -2818,6 +2826,7 @@ async def test_database_fence_blocks_legacy_replace_of_canceled_task(tmp_path):
         canceled = await manager.get_task_for_creator(
             "terminal-replace",
             "did:test:creator",
+            recipient_agent_id="did:test:recipient",
         )
         assert canceled is not None
         assert canceled.status.state is TaskState.CANCELED
@@ -2850,7 +2859,9 @@ async def test_database_fence_blocks_all_mutation_of_canceled_task(tmp_path):
         assert "legacy" not in (
             (
                 await manager.get_task_for_creator(
-                    "immutable-cancel", "did:test:creator"
+                    "immutable-cancel",
+                    "did:test:creator",
+                    recipient_agent_id="did:test:recipient",
                 )
             ).metadata
             or {}
@@ -2878,7 +2889,9 @@ async def test_database_fence_rejects_legacy_live_insert_without_authority(
 
         assert (
             await manager.get_task_for_creator(
-                "late-legacy-live", "did:test:creator"
+                "late-legacy-live",
+                "did:test:creator",
+                recipient_agent_id="did:test:recipient",
             )
             is None
         )
@@ -2926,6 +2939,7 @@ async def test_database_fence_rejects_legacy_terminal_replace_without_authority(
         assert await manager.get_task_for_creator(
             "late-legacy-terminal",
             "did:test:creator",
+            recipient_agent_id="did:test:recipient",
         ) is not None
     finally:
         await manager.close()
