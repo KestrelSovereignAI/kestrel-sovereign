@@ -94,6 +94,17 @@ PostgreSQL database. Keep the output directory and bundle outside the source
 tree. The same `KESTREL_DATA_KEY` must protect the identity at ceremony and at
 runtime.
 
+Before using the runtime URLs, connect to each database as its owner or a
+PostgreSQL administrator and grant the role named by that URL only the probe
+Kestrel uses to prove that the two databases live on different clusters.
+Replace `kestrel_runtime` with that URL's role; repeat this in the other database
+and for its role when the two URLs use different roles.
+
+```sql
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system()
+  TO kestrel_runtime;
+```
+
 ```bash
 export KESTREL_DATABASE_URL='postgresql://...'
 export KESTREL_HOLD_EVIDENCE_DATABASE_URL='postgresql://...'
@@ -141,6 +152,16 @@ journal are deliberately excluded from restores of `KESTREL_DATABASE_URL`, so
 rolling the primary database back cannot silently erase a later Hold. Kestrel
 also binds both databases to their original primary/evidence roles; swapping
 the two URLs fails closed rather than bootstrapping empty state.
+
+Run the `GRANT EXECUTE` above in both databases for both PostgreSQL runtime roles
+before the first boot. PostgreSQL restricts `pg_control_system()` to superusers
+and `pg_monitor` by default, but permits granting this one function directly;
+the narrow function grant is sufficient, so do not grant the broader
+`pg_monitor` role. The function reports cluster-wide control data, including the
+`system_identifier` Kestrel compares. See PostgreSQL's
+[control-data function](https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-INFO-CONTROL-DATA)
+and [function privilege](https://www.postgresql.org/docs/current/ddl-priv.html)
+documentation.
 
 Upload both database URLs, the data key, and `custody.json` as separate Secret
 Manager secrets. Grant the Cloud Run runtime service account

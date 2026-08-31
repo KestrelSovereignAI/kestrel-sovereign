@@ -587,6 +587,28 @@ async def test_boot_validates_global_history_once_for_all_targets(
 
 
 @pytest.mark.asyncio
+async def test_boot_rejects_null_target_before_addressing_the_latch(hold_db):
+    """A malformed persisted target cannot disappear behind ``str(None)``."""
+
+    db, store = hold_db
+    await db.execute("ALTER TABLE hold_latches RENAME TO hold_latches_valid")
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT, target_id TEXT, active INTEGER, hold_receipt_id TEXT, "
+        "reason TEXT, actor_id TEXT, set_at TEXT, revision INTEGER)"
+    )
+    await db.execute(
+        "INSERT INTO hold_latches VALUES "
+        "('agent', NULL, 1, 'missing-authority', 'investigate', "
+        "'did:sovereign:operator', '2026-08-31T00:00:00+00:00', 1)"
+    )
+    await db.execute("DROP TABLE hold_latches_valid")
+
+    with pytest.raises(HoldCorruptStateError, match="missing its identity"):
+        await store.read_boot_state()
+
+
+@pytest.mark.asyncio
 async def test_host_context_uses_configured_postgres_for_durable_hold(
     monkeypatch,
     tmp_path,
