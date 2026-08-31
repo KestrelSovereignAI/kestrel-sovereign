@@ -2125,9 +2125,9 @@ async def _shutdown_host_features(app: FastAPI) -> None:
     except Exception as exc:  # noqa: BLE001 - preserve the existing best effort
         logger.warning("Host feature shutdown failed: %s", exc)
     finally:
-        # Router/UI state must not outlive a failed feature shutdown.  Each
+        # Router/UI state must not outlive a failed feature shutdown. Each
         # following cleanup is in a ``finally`` so one bad unmount cannot leave
-        # the host session factory or database live.
+        # the host context's independently-owned resources live.
         try:
             _hf.unmount_host_features(app)
         finally:

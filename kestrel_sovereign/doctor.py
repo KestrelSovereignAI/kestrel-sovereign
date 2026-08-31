@@ -23,6 +23,10 @@ Checks performed:
     fail-closed integrity audit safe-modes an agent on either at boot;
     doctor surfaces them pre-upgrade so operators can reanchor first
     (#2616) — see ``_check_anchor_consistency``.
+  - PostgreSQL hosts provide a reachable
+    ``KESTREL_HOLD_EVIDENCE_DATABASE_URL`` on an independent cluster, and
+    both runtime roles can read ``pg_catalog.pg_control_system()`` so that
+    independence is proved before setup reports ready.
   - Legacy local identity exports are inspected by metadata only. Unsafe
     directory/file modes, links, and non-regular entries are reported without
     opening or parsing package contents.
@@ -113,6 +117,7 @@ def diagnose(project_dir: Path) -> DoctorReport:
 
     _check_constitution_drift(readings, report)
     _check_anchor_consistency(readings, report)
+    _check_postgres_hold_readiness(resolved, project_dir, readings, report)
     _check_legacy_identity_exports(project_dir, report)
     _check_semantic_registry(report)
 
@@ -299,6 +304,146 @@ def _anchor_is_the_runtime_database(env: dict) -> bool:
     """
     backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
     return not (backend == "postgres" and env.get("KESTREL_DATABASE_URL"))
+
+
+_POSTGRES_CLUSTER_ID_SQL = (
+    "SELECT system_identifier::text FROM pg_catalog.pg_control_system()"
+)
+
+
+def _postgres_cluster_probe_source(
+    dsn: str,
+    env: dict[str, str],
+    project_dir: Path,
+) -> _GovernanceSource:
+    """Build the existing redaction/launch context for a cluster probe."""
+
+    return _GovernanceSource(
+        anchor_path=Path("."),
+        agent_did="",
+        dsn=dsn,
+        dsn_identity=_postgres_redaction_identity(dsn, env),
+        postgres_home=env.get("HOME") or env.get("USERPROFILE"),
+        postgres_env=dict(env),
+        postgres_cwd=str(project_dir.resolve()),
+    )
+
+
+def _read_postgres_cluster_identity(
+    dsn: str,
+    *,
+    label: str,
+    env: dict[str, str],
+    project_dir: Path,
+    report: DoctorReport,
+) -> str | None:
+    """Read the same privileged cluster identity Hold requires at boot."""
+
+    source = _postgres_cluster_probe_source(dsn, env, project_dir)
+    try:
+        rows = _fetch_postgres_rows_isolated(
+            dsn,
+            _POSTGRES_CLUSTER_ID_SQL,
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - asyncpg has its own exception tree
+        failure = _postgres_probe_failure_kind(exc)
+        if failure == "connection":
+            report.fail.append(
+                f"PostgreSQL Hold {label} database is unreachable: "
+                f"{_safe(exc, source)}"
+            )
+        else:
+            report.fail.append(
+                f"PostgreSQL Hold {label} cluster identity NOT verified: "
+                "the runtime role requires EXECUTE on "
+                f"pg_catalog.pg_control_system() ({_safe(exc, source)})"
+            )
+        return None
+
+    if (
+        len(rows) != 1
+        or len(rows[0]) != 1
+        or not isinstance(rows[0][0], str)
+        or not rows[0][0].strip()
+    ):
+        report.fail.append(
+            f"PostgreSQL Hold {label} cluster identity NOT verified: "
+            "pg_catalog.pg_control_system() returned invalid data"
+        )
+        return None
+    return rows[0][0]
+
+
+def _runtime_postgres_connection_failed(readings: list[_AgentGovernance]) -> bool:
+    """Reuse an already-observed runtime outage instead of reconnecting."""
+
+    return any(
+        isinstance(reading.source, _UnreadableDB)
+        and reading.source.postgres_failure
+        in {"connection", "diagnostic_timeout", "diagnostic_tooling"}
+        for reading in readings
+    )
+
+
+def _check_postgres_hold_readiness(
+    env: dict[str, str],
+    project_dir: Path,
+    readings: list[_AgentGovernance],
+    report: DoctorReport,
+) -> None:
+    """Verify the mandatory independent PostgreSQL Hold custody service."""
+
+    backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
+    primary_dsn = env.get("KESTREL_DATABASE_URL")
+    if backend != "postgres" or not primary_dsn:
+        return
+
+    evidence_dsn = env.get("KESTREL_HOLD_EVIDENCE_DATABASE_URL")
+    if not evidence_dsn:
+        report.fail.append(
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required for PostgreSQL "
+            "Hold rollback evidence"
+        )
+        return
+    if evidence_dsn == primary_dsn:
+        report.fail.append(
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an independent "
+            "PostgreSQL cluster"
+        )
+        return
+    primary_identity = None
+    if _runtime_postgres_connection_failed(readings):
+        report.fail.append(
+            "PostgreSQL Hold primary cluster identity NOT verified because "
+            "runtime database reachability was not established"
+        )
+    else:
+        primary_identity = _read_postgres_cluster_identity(
+            primary_dsn,
+            label="primary",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+    evidence_identity = _read_postgres_cluster_identity(
+        evidence_dsn,
+        label="evidence",
+        env=env,
+        project_dir=project_dir,
+        report=report,
+    )
+    if primary_identity is None or evidence_identity is None:
+        return
+    if primary_identity == evidence_identity:
+        report.fail.append(
+            "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+        )
+        return
+    report.ok.append("PostgreSQL Hold evidence: independent clusters verified")
 
 
 @dataclass(frozen=True)

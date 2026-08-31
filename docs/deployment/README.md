@@ -166,6 +166,11 @@ the narrow function grant is sufficient, so do not grant the broader
 and [function privilege](https://www.postgresql.org/docs/current/ddl-priv.html)
 documentation.
 
+Run `uv run kestrel doctor` (or `uv run kestrel setup --check`) from the
+deployment environment before boot. Readiness now connects to both URLs,
+executes the control-data probe with each runtime role, and refuses two URLs
+whose `system_identifier` values place them on the same PostgreSQL cluster.
+
 Upload both database URLs, the data key, and `custody.json` as separate Secret
 Manager secrets. Grant the Cloud Run runtime service account
 `roles/secretmanager.secretAccessor` only on those required secrets. Secret

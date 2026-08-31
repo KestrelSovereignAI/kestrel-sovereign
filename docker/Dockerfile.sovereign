@@ -92,6 +92,7 @@ RUN groupadd -g $GID kestrel && \
 # Environment
 ENV PYTHONUNBUFFERED=1
 ENV KESTREL_DB_PATH=/data
+ENV KESTREL_HOST_DB_PATH=/data/host-data/kestrel_host.db
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Switch to non-root user
