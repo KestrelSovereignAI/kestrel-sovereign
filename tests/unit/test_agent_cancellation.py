@@ -1783,6 +1783,7 @@ class TestAgentCancellation:
             def __init__(self, *_args, **_kwargs):
                 self._yielded = False
                 self.cleanup_error = None
+                self.owner_task = asyncio.create_task(asyncio.sleep(0))
 
             def __aiter__(self):
                 return self
@@ -1873,6 +1874,7 @@ class TestAgentCancellation:
         class StopAtEof:
             def __init__(self, *_args, **_kwargs):
                 self.cleanup_error = None
+                self.owner_task = asyncio.create_task(asyncio.sleep(0))
 
             def __aiter__(self):
                 return self
