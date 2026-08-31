@@ -4312,16 +4312,23 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         target_selector = self._get_default_mandate_selector()
-        # An operator-pinned route is an EXPLICIT selection, exactly as the
-        # generation path treats it (#3190 r6 P1). Recorded here because the
-        # catalog guard below must apply the same rule: generation skips it for
-        # an explicit pin, so an audit that does not would reject a target the
-        # very same request just generated with — warn mode annotating every
-        # response, strict mode denying every one.
-        audit_selection_is_explicit = bool(target_selector) or bool(
-            self._mandate_preference.get("vendor")
-            or self._mandate_preference.get("route")
-        )
+        # Whether this is an EXPLICIT selection comes from the CANONICAL
+        # routing metadata, not a second opinion computed here (#3190 r7 P1).
+        #
+        # The catalog guard below must apply the same rule generation applies —
+        # it skips the guard for an explicit pin, and an audit that does not
+        # would reject a target the very same request just generated with
+        # (warn mode annotating every response, strict mode denying every one,
+        # r6 P1). But "explicit" is a question `_compute_route_authorization`
+        # already answers, and the hand-rolled version disagreed with it: a
+        # bare model, or a vendor selector matching several routes, is NOT
+        # explicit there, and treating it as explicit here would let a stale or
+        # cross-vendor model broadcast across routes past a guard generation
+        # still enforces.
+        #
+        # Re-deriving a predicate that exists is how the two ends drift apart
+        # in the first place. One question, one implementation.
+        audit_selection_is_explicit = self._compute_route_authorization().explicit_selection
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
             pref_vendor = self._mandate_preference.get("vendor")
