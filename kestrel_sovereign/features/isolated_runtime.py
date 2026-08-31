@@ -9661,7 +9661,7 @@ class ProxyFeature(Feature):
                     self._host_config = dict(state.config)
                     self._host_config_loaded = True
                     return
-                await self._reconcile_client_to_authoritative_config(
+                await self._reconcile_client_to_authoritative_config_with_ingress_fence(
                     state.config,
                     force=True,
                 )
@@ -9965,7 +9965,7 @@ class ProxyFeature(Feature):
                     != expected_commit.generation
                     or state.config != expected_commit.config
                 ):
-                    await self._reconcile_client_to_authoritative_config(
+                    await self._reconcile_client_to_authoritative_config_with_ingress_fence(
                         state.config,
                         force=False,
                     )
@@ -9975,7 +9975,7 @@ class ProxyFeature(Feature):
                     )
                 if state.has_pending:
                     if not self._pending_lease_is_expired(state):
-                        await self._reconcile_client_to_authoritative_config(
+                        await self._reconcile_client_to_authoritative_config_with_ingress_fence(
                             state.config,
                             force=False,
                         )
@@ -10103,7 +10103,7 @@ class ProxyFeature(Feature):
                     # have no newer readable predicate and must fail closed.
                     continue
 
-                await self._reconcile_client_to_authoritative_config(
+                await self._reconcile_client_to_authoritative_config_with_ingress_fence(
                     observed.config,
                     force=False,
                 )
@@ -10744,6 +10744,68 @@ class ProxyFeature(Feature):
             raise
         self._host_config = authoritative_config
         self._host_config_loaded = True
+
+    async def _reconcile_client_to_authoritative_config_with_ingress_fence(
+        self,
+        config: Dict[str, Any],
+        *,
+        force: bool,
+    ) -> None:
+        """Fence external producers and Core admission around reconciliation.
+
+        A fresh durable read can discover a winner before this replica stages
+        anything (for example, a superseded rollback receipt or another live
+        pending generation).  Replacing the stale child directly from that
+        read would bypass the normal config-transition boundary and let an
+        external producer emit through a child while it is being retired.
+
+        This helper owns the same producer-quiesce -> admission-close -> drain
+        ordering as the ordinary transition body.  The whole boundary runs in
+        a shielded task so caller cancellation cannot release ``_reload_lock``
+        with a paused producer or half-mutated gate left behind.
+        """
+
+        async def reconcile() -> None:
+            external_ingress_quiesce = self._new_external_ingress_quiesce()
+            gate_closed = False
+            body_error: BaseException | None = None
+            try:
+                if external_ingress_quiesce is not None:
+                    await self._quiesce_external_ingress(external_ingress_quiesce)
+                gate_closed = True
+                await self._close_traffic_gate_admission()
+                await self._drain_traffic_gate()
+                await self._reconcile_client_to_authoritative_config(
+                    config,
+                    force=force,
+                )
+            except BaseException as exc:  # noqa: BLE001 - body outcome wins below
+                body_error = exc
+                raise
+            finally:
+                finalizer_error: BaseException | None = None
+                try:
+                    # A lifecycle cancellation/error can arrive after the
+                    # producer paused but before the normal gate close. Finish
+                    # the same boundary before resuming or quarantining it.
+                    if external_ingress_quiesce is not None and not gate_closed:
+                        gate_closed = True
+                        await self._close_traffic_gate_admission()
+                        await self._drain_traffic_gate()
+                    if gate_closed:
+                        await self._finalize_external_ingress_transition(
+                            external_ingress_quiesce
+                        )
+                except BaseException as exc:  # noqa: BLE001 - body outcome wins above
+                    finalizer_error = exc
+                if finalizer_error is not None and body_error is None:
+                    raise finalizer_error
+
+        task = asyncio.create_task(
+            reconcile(),
+            name=f"isolated-config-reconcile-fence:{self.name}",
+        )
+        await _await_task_until_complete(task, preserve_cancellation=False)
 
     def _assert_child_start_allowed(self) -> None:
         """Refuse normal child-lifecycle work after terminal cleanup starts."""

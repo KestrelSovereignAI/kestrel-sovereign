@@ -14234,6 +14234,115 @@ async def test_context_refresh_rollback_cannot_overwrite_newer_replica_generatio
 
 
 @pytest.mark.asyncio
+async def test_superseded_rollback_fences_external_ingress_before_reconciliation(
+    monkeypatch, tmp_path
+):
+    """A rollback loser pauses ingress and closes admission before replacement."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    failed_context_config = {"enabled": True, "revision": "bad-context"}
+    winner_config = {"enabled": True, "revision": "newer-winner"}
+    storage = _CASStorage()
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+    quiesce_called = asyncio.Event()
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    stale_agent = Mock(did=_TEST_AGENT_DID, features={})
+    stale_agent.storage = storage
+    stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
+    winner_agent = Mock(did=_TEST_AGENT_DID, features={})
+    winner_agent.storage = storage
+    winner_agent.storage_path = str(tmp_path / "winner" / "kestrel_prime.db")
+    stale_clients = []
+
+    class FencedRollbackClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=(
+                    "telegram-webhook",
+                    "external-ingress-quiesce",
+                    "external-ingress-resume",
+                )
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "telegram-webhook":
+                active_started.set()
+                await release_active.wait()
+                return {"status": "ok"}
+            assert name == "external-ingress-quiesce"
+            assert stale._traffic_gate.closed is False
+            self.quiesced = True
+            quiesce_called.set()
+            return {"status": "ok", "http_status": 200, "state": "quiesced"}
+
+        async def stop(self):
+            if not stale._stopping:
+                assert self.quiesced is True
+                assert stale._traffic_gate.closed is True
+            await super().stop()
+
+    def stale_factory(**kwargs):
+        client = FencedRollbackClient(**kwargs)
+        stale_clients.append(client)
+        return client
+
+    stale = ProxyFeature(stale_agent, _cfg_runtime(), client_factory=stale_factory)
+    winner = ProxyFeature(
+        winner_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    try:
+        await stale.persist_config(old_config)
+        await stale.initialize()
+        await winner.initialize()
+
+        failed_commit = await stale.set_config(failed_context_config)
+        stale_failed_child = stale._client
+        await winner.set_config(winner_config)
+
+        active = asyncio.create_task(
+            stale.call_host_ingress("telegram-webhook", {"sequence": 1})
+        )
+        await asyncio.wait_for(active_started.wait(), timeout=1)
+        rollback = asyncio.create_task(stale.rollback_config_transition(failed_commit))
+        await asyncio.wait_for(quiesce_called.wait(), timeout=1)
+        for _ in range(100):
+            if stale._traffic_gate.closed:
+                break
+            await asyncio.sleep(0)
+        assert stale._traffic_gate.closed is True
+        assert rollback.done() is False
+        assert stale_failed_child.stopped is False
+
+        release_active.set()
+        assert await active == {"status": "ok"}
+        with pytest.raises(
+            isolated_runtime._ConfigRevisionSuperseded,
+            match="newer durable config transition",
+        ):
+            await rollback
+
+        assert stale_failed_child.stopped is True
+        assert [
+            call[0]
+            for call in stale_failed_child.ingress_calls
+            if call[0].startswith("external-ingress-")
+        ] == ["external-ingress-quiesce"]
+        assert stale._client is stale_clients[-1]
+        assert stale._client.kwargs["config"] == winner_config
+        assert stale._traffic_gate.closed is False
+    finally:
+        release_active.set()
+        await winner.shutdown()
+        await stale.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_context_refresh_rollback_restores_transition_snapshot_not_stale_get(
     monkeypatch, tmp_path
 ):
