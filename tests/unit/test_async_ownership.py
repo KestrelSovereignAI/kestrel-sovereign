@@ -187,8 +187,8 @@ async def test_cancelling_unstarted_iterator_owner_interrupts_source():
 
 
 @pytest.mark.asyncio
-async def test_natural_unwind_failure_is_cleanup_when_stop_was_requested():
-    """A Stop between the final item and terminal anext preserves cleanup failure."""
+async def test_stop_marker_does_not_relabel_natural_unwind_as_cleanup():
+    """A Stop marker cannot claim an independent terminal source failure."""
 
     stop_requested = False
 
@@ -209,7 +209,7 @@ async def test_natural_unwind_failure_is_cleanup_when_stop_was_requested():
     with pytest.raises(RuntimeError, match="natural unwind cleanup failed"):
         await anext(owned)
 
-    assert isinstance(owned.cleanup_error, RuntimeError)
+    assert owned.cleanup_error is None
 
 
 @pytest.mark.asyncio

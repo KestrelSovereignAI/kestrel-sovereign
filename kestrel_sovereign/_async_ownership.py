@@ -210,20 +210,31 @@ class OwnedAsyncIterator(Generic[_T]):
                 # ``anext`` belongs to generator unwinding, not ordinary
                 # source execution. Preserve that distinction for lifecycle
                 # acknowledgement at the transport boundary.
-                cleanup_requested = self._stop.is_set()
-                if not cleanup_requested and self._cleanup_requested is not None:
+                close_requested = self._stop.is_set()
+                cancellation_requested = close_requested
+                if (
+                    not cancellation_requested
+                    and self._cleanup_requested is not None
+                ):
                     try:
-                        cleanup_requested = self._cleanup_requested() is True
+                        cancellation_requested = self._cleanup_requested() is True
                     except Exception:
                         # An observability predicate must not replace the
                         # iterator's actual terminal failure.
-                        cleanup_requested = False
-                if cleanup_requested and not isinstance(
+                        cancellation_requested = False
+                # A Stop marker can race a source's independent terminal
+                # failure after its final item. Only an initiated close owns a
+                # non-cancellation unwind as cleanup debt; the marker extends
+                # ownership solely to cancellation that interrupted the source.
+                if close_requested and not isinstance(
                     error,
                     asyncio.CancelledError,
                 ):
                     self._cleanup_error = error
-                if cleanup_requested and isinstance(error, asyncio.CancelledError):
+                if cancellation_requested and isinstance(
+                    error,
+                    asyncio.CancelledError,
+                ):
                     self._interrupted_by_cleanup = True
                     self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
                     return
