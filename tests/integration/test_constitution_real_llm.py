@@ -62,7 +62,9 @@ async def client(monkeypatch):
         with TestClient(app) as client:
             # Skip bootstrap for test agents - mark as complete
             if hasattr(app.state, 'agent') and app.state.agent:
-                await complete_bootstrap(app.state.agent)
+                # The app and its database locks belong to TestClient's portal
+                # loop, not the pytest fixture loop.
+                client.portal.call(complete_bootstrap, app.state.agent)
 
             yield client
 

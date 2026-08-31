@@ -35,7 +35,7 @@ from kestrel_sovereign.config import (
     TRUSTED_AGENTS_DIR,
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
@@ -586,6 +586,9 @@ class KestrelAgent(
         isolated_runtime_namespace: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_legacy_root: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_hosted: bool = False,
+        isolated_runtime_idle_timeout_seconds: Optional[float] = None,
+        isolated_runtime_idle_timeouts: Optional[Mapping[str, Optional[float]]] = None,
+        isolated_runtime_telemetry_observer: Optional[Callable[[Any], Any]] = None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
@@ -661,6 +664,12 @@ class KestrelAgent(
             isolated_runtime_hosted: Declares that this agent shares a host
                        runtime. Discovery of an isolated feature fails closed
                        unless an explicit root and namespace were supplied.
+            isolated_runtime_idle_timeout_seconds: Optional positive per-feature
+                       inactivity deadline for hosted isolated children.
+            isolated_runtime_idle_timeouts: Optional feature-class overrides;
+                       a None value disables retirement for that feature.
+            isolated_runtime_telemetry_observer: Optional host callback receiving
+                       sanitized snapshots for this exact agent only.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -753,6 +762,25 @@ class KestrelAgent(
             raise ValueError(
                 "isolated_runtime_legacy_root requires the hosted isolated "
                 "runtime root/namespace contract"
+            )
+        if (
+            isolated_runtime_idle_timeout_seconds is not None
+            or isolated_runtime_idle_timeouts is not None
+            or isolated_runtime_telemetry_observer is not None
+        ):
+            from kestrel_sovereign.features.isolated_runtime import (
+                configure_hosted_isolated_runtime_lifecycle,
+            )
+
+            if self.isolated_runtime_scope is None:
+                raise ValueError(
+                    "isolated runtime lifecycle policy requires an explicit hosted scope"
+                )
+            configure_hosted_isolated_runtime_lifecycle(
+                self,
+                idle_timeout_seconds=isolated_runtime_idle_timeout_seconds,
+                idle_timeouts=isolated_runtime_idle_timeouts,
+                telemetry_observer=isolated_runtime_telemetry_observer,
             )
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
@@ -2884,6 +2912,22 @@ class KestrelAgent(
                 "birth_record", cause_type="BirthRecordIdentityMissing"
             )
 
+    def _warn_unmatched_isolated_runtime_idle_timeouts(
+        self, discovered_features: tuple[Any, ...] | list[Any]
+    ) -> None:
+        """Make typoed pre-discovery lifecycle overrides operator-visible."""
+
+        idle_timeouts = self.__dict__.get("isolated_runtime_idle_timeouts", {})
+        if not isinstance(idle_timeouts, Mapping):
+            return
+        discovered_names = {feature.name for feature in discovered_features}
+        for unmatched_name in sorted(set(idle_timeouts) - discovered_names):
+            logging.warning(
+                "Ignoring isolated runtime idle timeout override for undiscovered "
+                "feature %s",
+                unmatched_name,
+            )
+
     async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
         """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""
         # Resolve agent name BEFORE features so features can use it
@@ -2963,6 +3007,7 @@ class KestrelAgent(
         discovered_features = discover_features(
             self, allowed_features=effective_features
         )
+        self._warn_unmatched_isolated_runtime_idle_timeouts(discovered_features)
         # Register the feature teardown BEFORE the loop so a failure partway
         # through registration (or in post_all_features_loaded below) rolls back
         # every feature already initialized — each feature.initialize() may have

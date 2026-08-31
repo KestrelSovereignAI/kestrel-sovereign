@@ -38,6 +38,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
+    HostedIsolatedRuntimeLifecyclePolicy,
     _parse_runtime_offboard_timeout,
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
@@ -4614,6 +4615,51 @@ class TestLoadFromConfig:
             derive_isolated_runtime_namespace("did:tenant-b")
         )
         assert first["isolated_runtime_namespace"] != second["isolated_runtime_namespace"]
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_postgres_host_factory_binds_per_agent_lifecycle_policy(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        monkeypatch,
+        tmp_path,
+    ):
+        mock_get_did.return_value = "did:tenant-policy"
+        mock_agent_cls.return_value = _make_mock_agent("did:tenant-policy")
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+        observer = MagicMock()
+        policy = HostedIsolatedRuntimeLifecyclePolicy(
+            idle_timeout_seconds=900,
+            idle_timeouts={"TelegramFeature": None},
+            telemetry_observer=observer,
+        )
+        policy_factory = MagicMock(return_value=policy)
+        manager = AgentManager(
+            base_data_dir=tmp_path,
+            hosted_isolated_runtime_lifecycle_policy_factory=policy_factory,
+        )
+        config = LocalAgentConfig(data_dir=Path("agent_data/policy"), port=8801)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("Policy Agent", config)
+
+        policy_factory.assert_called_once_with(
+            "Policy Agent", "did:tenant-policy", config
+        )
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["isolated_runtime_idle_timeout_seconds"] == 900
+        assert kwargs["isolated_runtime_idle_timeouts"] == {
+            "TelegramFeature": None
+        }
+        assert kwargs["isolated_runtime_telemetry_observer"] is observer
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
