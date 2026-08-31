@@ -1658,6 +1658,112 @@ async def test_receipt_and_latch_roll_back_as_one_unit(hold_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_failed_sqlite_mutation_does_not_publish_rolled_back_anchor(
+    hold_db, monkeypatch
+):
+    """External evidence may not advance ahead of a failed DB transaction."""
+
+    _db, store = hold_db
+    stage = store._stage_history_candidate
+
+    def fail_after_staging(payload):
+        stage(payload)
+        raise RuntimeError("injected failure after anchor staging")
+
+    monkeypatch.setattr(store, "_stage_history_candidate", fail_after_staging)
+    with pytest.raises(Exception, match="after anchor staging"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:rolled-back-anchor",
+            actor_id="did:sovereign:operator",
+            reason="must roll back together",
+            operation_id="rolled-back-anchor",
+        )
+
+    monkeypatch.setattr(store, "_stage_history_candidate", stage)
+    assert await store.get_hold("agent", "did:agent:rolled-back-anchor") is None
+    assert await store.get_receipt("rolled-back-anchor") is None
+
+
+@pytest.mark.asyncio
+async def test_committed_sqlite_mutation_recovers_interrupted_anchor_promotion(
+    hold_db, monkeypatch
+):
+    """A committed candidate can finish publication on the next live path."""
+
+    _db, store = hold_db
+    finish = store._finish_history_publication
+
+    def interrupt_promotion(_payload):
+        raise RuntimeError("injected interruption before anchor promotion")
+
+    monkeypatch.setattr(store, "_finish_history_publication", interrupt_promotion)
+    with pytest.raises(RuntimeError, match="before anchor promotion"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:committed-candidate",
+            actor_id="did:sovereign:operator",
+            reason="recover committed publication",
+            operation_id="committed-candidate",
+        )
+
+    monkeypatch.setattr(store, "_finish_history_publication", finish)
+    recovered = await store.get_hold("agent", "did:agent:committed-candidate")
+    assert recovered is not None
+    assert recovered.reason == "recover committed publication"
+    assert await store.get_receipt("committed-candidate") is not None
+
+
+@pytest.mark.asyncio
+async def test_sqlite_reader_waits_for_database_and_anchor_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """A peer reader cannot observe either half of an evidence transition."""
+
+    path = tmp_path / "serialized-publication.db"
+    writer_db = await AsyncDatabase.sqlite(str(path))
+    reader_db = await AsyncDatabase.sqlite(str(path))
+    writer = HoldStore(writer_db)
+    reader = HoldStore(reader_db)
+    await writer.ensure_schema()
+    candidate_staged = asyncio.Event()
+    allow_commit = asyncio.Event()
+    prepare = writer._prepare_history_publication
+
+    async def pause_after_staging():
+        payload = await prepare()
+        candidate_staged.set()
+        await allow_commit.wait()
+        return payload
+
+    monkeypatch.setattr(writer, "_prepare_history_publication", pause_after_staging)
+    mutation = asyncio.create_task(
+        writer.set_hold(
+            scope="agent",
+            target_id="did:agent:serialized-reader",
+            actor_id="did:sovereign:operator",
+            reason="publish as one protocol",
+            operation_id="serialized-reader-hold",
+        )
+    )
+    await candidate_staged.wait()
+    read = asyncio.create_task(
+        reader.get_hold("agent", "did:agent:serialized-reader")
+    )
+    await asyncio.sleep(0.05)
+    reader_waited = not read.done()
+    allow_commit.set()
+    try:
+        result, observed = await asyncio.gather(mutation, read)
+        assert reader_waited
+        assert observed == result.current
+    finally:
+        await writer_db.close()
+        await reader_db.close()
+
+
+@pytest.mark.asyncio
 async def test_corrupt_active_latch_fails_closed(hold_db, monkeypatch):
     _db, store = hold_db
     monkeypatch.setattr(
@@ -1842,6 +1948,38 @@ async def test_postgres_read_targets_take_shared_locks_in_global_order():
             ("kestrel:hold:target:host:host",),
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_missing_receipt_locks_history_before_validation(monkeypatch):
+    """An absent operation is proved only inside the global history lock."""
+
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    store = HoldStore(
+        SimpleNamespace(backend_type="postgres", transaction=transaction)
+    )
+
+    async def lock_history():
+        events.append("history-lock")
+
+    async def validate(_operation_id):
+        events.append("validate-operation")
+        return None
+
+    async def validate_anchor():
+        events.append("validate-anchor")
+
+    monkeypatch.setattr(store, "_lock_read_history", lock_history, raising=False)
+    monkeypatch.setattr(store, "_validate_operation_witness", validate)
+    monkeypatch.setattr(store, "_assert_history_anchor_intact", validate_anchor)
+
+    assert await store.get_receipt("missing-operation") is None
+    assert events == ["history-lock", "validate-operation", "validate-anchor"]
 
 
 @pytest.mark.asyncio
@@ -2075,6 +2213,72 @@ async def test_initialization_witness_is_not_visible_until_payload_is_complete(
 
     assert observed_final_path
     assert not any(observed_final_path)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sqlite_initializers_share_one_evidence_protocol(
+    tmp_path,
+    monkeypatch,
+):
+    """A peer boot waits while the first boot publishes durable evidence."""
+
+    path = tmp_path / "concurrent-initialization.db"
+    first_db = await AsyncDatabase.sqlite(str(path))
+    second_db = await AsyncDatabase.sqlite(str(path))
+    first = HoldStore(first_db)
+    second = HoldStore(second_db)
+    publication_entered = asyncio.Event()
+    allow_publication = asyncio.Event()
+    publish = first._write_history_anchor
+
+    async def paused_publication():
+        publication_entered.set()
+        await allow_publication.wait()
+        await publish()
+
+    monkeypatch.setattr(first, "_write_history_anchor", paused_publication)
+    first_boot = asyncio.create_task(first.ensure_schema())
+    await publication_entered.wait()
+    second_boot = asyncio.create_task(second.ensure_schema())
+    await asyncio.sleep(0.05)
+    second_waited = not second_boot.done()
+    allow_publication.set()
+    results = await asyncio.gather(first_boot, second_boot, return_exceptions=True)
+    try:
+        assert second_waited
+        assert results == [None, None]
+    finally:
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_bootstrap_intent_recovers_after_schema_commit(
+    tmp_path,
+    monkeypatch,
+):
+    """Committed schema without final evidence resumes only from prior intent."""
+
+    path = tmp_path / "interrupted-bootstrap.db"
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    publish = store._write_history_anchor
+
+    async def interrupt_publication():
+        raise RuntimeError("injected interruption after schema commit")
+
+    monkeypatch.setattr(store, "_write_history_anchor", interrupt_publication)
+    with pytest.raises(RuntimeError, match="after schema commit"):
+        await store.ensure_schema()
+
+    monkeypatch.setattr(store, "_write_history_anchor", publish)
+    try:
+        await store.ensure_schema()
+        assert await store.get_hold("host") is None
+        assert store._bootstrap_intent_path is not None
+        assert not store._bootstrap_intent_path.exists()
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
