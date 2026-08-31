@@ -5080,6 +5080,7 @@ class KestrelAgent(
         feature: "Feature",
         *,
         prepared_contributions=None,
+        notify_ready: bool = True,
     ) -> None:
         """Bring an already-loaded feature fully live — the inverse of
         :meth:`_unregister_feature_runtime` (kestrel-sovereign#2522 P1).
@@ -5098,10 +5099,11 @@ class KestrelAgent(
           :meth:`_promote_startup_feature_tools`);
         * ``post_all_features_loaded()`` — re-registers the feature's owned
           **wait providers**;
-        * ``on_agent_ready()`` — the ready-phase hook boot fires only after all
-          services are live (RestartCoordinator's post-restart wake sweep runs
-          here, #1809). Runtime re-enable must fire it too or a re-enabled
-          feature silently skips its ready work.
+        * ``on_agent_ready()`` — by default, the ready-phase hook boot fires only
+          after all services are live (RestartCoordinator's post-restart wake
+          sweep runs here, #1809). Package transactions pass
+          ``notify_ready=False`` and notify the complete committed generation in
+          one later phase, so a hook can never enter cognition between members.
 
         Precondition: ``feature.initialize()`` must be idempotent — it is re-run
         to restore signal sources a disable detached. Atomic: on any failure
@@ -5154,11 +5156,18 @@ class KestrelAgent(
                 )
             raise
 
-        # Ready-phase lifecycle — fire ONLY after activation committed, so a
-        # re-enabled feature gets the same ``on_agent_ready`` signal boot gives
-        # it once services are live (#1809). Best-effort per the boot policy: an
-        # optional hook, and a failure here logs but never rolls back the
-        # now-live feature (kestrel-sovereign#2522 P2).
+        if notify_ready:
+            await self._notify_feature_runtime_ready(feature)
+
+    async def _notify_feature_runtime_ready(self, feature: "Feature") -> None:
+        """Notify one already-committed runtime feature that the agent is ready.
+
+        Kept separate from activation so a package transaction can commit every
+        member before any ready hook is permitted to enter cognition. The hook
+        remains best-effort, matching boot: failure never tears down the live
+        feature generation.
+        """
+
         ready_hook = getattr(feature, "on_agent_ready", None)
         if ready_hook is not None:
             try:

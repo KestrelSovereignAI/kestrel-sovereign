@@ -605,6 +605,7 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
             await agent._activate_feature_runtime(
                 feature,
                 prepared_contributions=prepared_by_feature[id(feature)],
+                notify_ready=False,
             )
             activated.append((class_name, feature))
     except (Exception, asyncio.CancelledError):
@@ -622,6 +623,12 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
             else:
                 logger.info("Rolled back enable of feature '%s'", class_name)
         raise
+
+    # A ready hook may explicitly enter cognition. Keep that seam closed until
+    # every package member has committed, otherwise the first hook can observe a
+    # partially-enabled package generation while later members are still dead.
+    for _class_name, feature in activated:
+        await agent._notify_feature_runtime_ready(feature)
 
     return {
         "name": name,
@@ -736,6 +743,9 @@ async def _restore_feature_group(
                 operation,
             )
 
+    restored: List[tuple[str, Any]] = []
+    restore_complete = len(prepared_by_feature) == len(enabled)
+
     # Preserve package activation order. Batch preflight already validated
     # forward references across the full set; passing each retained item keeps
     # per-feature activation from revalidating against a partial set.
@@ -748,14 +758,18 @@ async def _restore_feature_group(
                 await agent._activate_feature_runtime(
                     feature,
                     prepared_contributions=prepared_by_feature[id(feature)],
+                    notify_ready=False,
                 )
+                restored.append((class_name, feature))
             else:
+                restore_complete = False
                 logger.error(
                     "%s rollback could not prepare enabled feature '%s'",
                     operation,
                     class_name,
                 )
         except (Exception, asyncio.CancelledError):
+            restore_complete = False
             logger.exception(
                 "%s rollback (re-activate) failed for feature '%s'",
                 operation,
@@ -767,6 +781,13 @@ async def _restore_feature_group(
                 operation.lower(),
                 class_name,
             )
+
+    # Rollback is best-effort. Only open the cognition-capable ready seam when
+    # the complete formerly-enabled generation is live again; a partial restore
+    # must never advertise itself to hooks as an atomic package generation.
+    if restore_complete and len(restored) == len(enabled):
+        for _class_name, feature in restored:
+            await agent._notify_feature_runtime_ready(feature)
 
 
 @router.post("/api/features/{name}/remove")

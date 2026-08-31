@@ -389,6 +389,63 @@ class TestEnableFeature:
         assert observed == [True]
 
     @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_package_ready_hook_observes_complete_enabled_generation(
+        self, mock_registry
+    ):
+        """No package ready hook can enter cognition between member commits."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstReadyFeature(SDKFixtureFeature):
+            contribution_prefix = "ready-first"
+
+        class SecondReadyFeature(SDKFixtureFeature):
+            contribution_prefix = "ready-second"
+
+        agent = _lifecycle_agent()
+        first = FirstReadyFeature(agent)
+        second = SecondReadyFeature(agent)
+        first.enabled = False
+        second.enabled = False
+        observations = []
+
+        async def observe_complete_generation(_agent):
+            async with agent._turn_lifecycle():
+                observations.append(
+                    (
+                        first.enabled,
+                        second.enabled,
+                        len(
+                            agent.feature_contribution_runtime.active_context_clauses()
+                        ),
+                    )
+                )
+
+        first.on_agent_ready = observe_complete_generation
+        agent.features = {first.name: first, second.name: second}
+        info = FeaturePackageInfo(
+            name="ready-pkg",
+            package="kestrel-feature-ready",
+            git="",
+            features=[first.name, second.name],
+            description="ready generation fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await asyncio.wait_for(
+            features_endpoint.enable_feature(request, info.name),
+            timeout=1,
+        )
+
+        assert response["status"] == "enabled"
+        assert observations == [(True, True, 2)]
+
+    @pytest.mark.asyncio
     async def test_enable_waits_for_active_turn_before_publication(self):
         """No contribution can become prompt-visible mid-turn."""
 
@@ -779,6 +836,21 @@ class TestDisableFeature:
             await original_shutdown()
 
         second.shutdown = fail_first_shutdown
+        observations = []
+
+        async def observe_complete_rollback(_agent):
+            async with agent._turn_lifecycle():
+                observations.append(
+                    (
+                        first.enabled,
+                        second.enabled,
+                        len(
+                            agent.feature_contribution_runtime.active_context_clauses()
+                        ),
+                    )
+                )
+
+        first.on_agent_ready = observe_complete_rollback
         info = FeaturePackageInfo(
             name="dependent-pkg",
             package="kestrel-feature-dependent",
@@ -806,6 +878,7 @@ class TestDisableFeature:
             second.setup_registration
         )
         assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
+        assert observations == [(True, True, 2)]
 
     @pytest.mark.parametrize(
         "feature_name",
