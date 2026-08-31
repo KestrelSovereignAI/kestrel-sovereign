@@ -429,9 +429,9 @@ class TaskManager:
                 saved: Optional[bool] = None
                 try:
                     async with self.task_store._backend.transaction():
-                        saved = await self.task_store.save_recipient_lifecycle(
+                        saved = await self._save_recipient_execution_result(
                             task,
-                            recipient_agent_id=authority_agent_id,
+                            authority_agent_id=authority_agent_id,
                             expected_state=expected_state,
                         )
                 except Exception as save_err:
@@ -440,9 +440,9 @@ class TaskManager:
                         "Retrying outside transaction..."
                     )
                     try:
-                        saved = await self.task_store.save_recipient_lifecycle(
+                        saved = await self._save_recipient_execution_result(
                             task,
-                            recipient_agent_id=authority_agent_id,
+                            authority_agent_id=authority_agent_id,
                             expected_state=expected_state,
                         )
                     except Exception as retry_err:
@@ -451,7 +451,13 @@ class TaskManager:
                             f"Result lost for skill={skill_id}, agent={agent_id}"
                         )
                 if saved is False:
-                    task = await self.task_store.get(task.id) or task
+                    task = (
+                        await self.task_store.get_for_recipient(
+                            task.id,
+                            authority_agent_id,
+                        )
+                        or task
+                    )
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
@@ -635,17 +641,41 @@ class TaskManager:
                 False,
             )
 
-        saved = await self.task_store.save_recipient_lifecycle(
+        saved = await self._save_recipient_execution_result(
+            task,
+            authority_agent_id=authority_agent_id,
+            expected_state=expected_state,
+        )
+        if saved is False:
+            # Another terminal writer won the live-set CAS and owns the
+            # corresponding completion signal. Returning its durable state
+            # must not emit the same terminal event a second time.
+            current = await self.task_store.get_for_recipient(
+                task.id,
+                authority_agent_id,
+            )
+            return (current or task), False
+        return task, True
+
+    async def _save_recipient_execution_result(
+        self,
+        task: Task,
+        *,
+        authority_agent_id: str,
+        expected_state: TaskState,
+    ) -> bool:
+        """Persist a handler result without mistaking live progress for a winner."""
+
+        if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}:
+            return await self.task_store.save_recipient_terminal_outcome(
+                task,
+                recipient_agent_id=authority_agent_id,
+            )
+        return await self.task_store.save_recipient_lifecycle(
             task,
             recipient_agent_id=authority_agent_id,
             expected_state=expected_state,
         )
-        if saved is False:
-            # Another terminal writer won its CAS and owns the corresponding
-            # completion signal. Returning its durable state must not emit the
-            # same terminal event a second time.
-            return (await self.task_store.get(task.id) or task), False
-        return task, True
 
     async def execute_command(self, user_input: str) -> Optional[dict]:
         """

@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.a2a.agent_card import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+)
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskMutationAuthorizationError,
 )
@@ -17,6 +22,7 @@ from kestrel_sovereign.a2a.types import (
     Message,
     TaskSendParams,
     TaskState,
+    TaskStatus,
     TextPart,
 )
 from kestrel_sovereign.features.tasks.feature import TaskFeature
@@ -223,6 +229,125 @@ async def test_unauthorized_status_race_cannot_win_or_change_payload(tmp_path):
         assert task.status.state is TaskState.WORKING
         assert task.status.message is None
     finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    ("concurrent_state", "expected_state"),
+    [
+        (TaskState.WORKING, TaskState.COMPLETED),
+        (TaskState.INPUT_REQUIRED, TaskState.COMPLETED),
+        (TaskState.CANCELED, TaskState.CANCELED),
+    ],
+    ids=["working-progress", "input-progress", "terminal-winner"],
+)
+async def test_handler_terminal_outcome_reconciles_live_cas_without_replacing_winner(
+    tmp_path,
+    sync,
+    concurrent_state,
+    expected_state,
+):
+    """A live CAS miss is retryable, but an existing terminal result is final."""
+
+    manager = await create_task_manager(
+        str(tmp_path / f"handler-cas-{sync}-{concurrent_state.value}.db"),
+        host_agent_id=RECIPIENT,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class CompletingHandler:
+        task = None
+
+        async def handle_task(self, task):
+            self.task = task
+            entered.set()
+            await release.wait()
+            task.status = TaskStatus(
+                state=TaskState.COMPLETED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="handler result")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    handler = CompletingHandler()
+    manager.register_agent(
+        AgentCard(
+            name="worker",
+            description="concurrent lifecycle worker",
+            url="/agents/worker",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="finish",
+                    name="finish",
+                    description="finish after a concurrent lifecycle write",
+                )
+            ],
+        ),
+        handler,
+    )
+    execution = None
+    try:
+        if sync:
+            execution = asyncio.create_task(
+                manager.execute_skill("worker", "finish", {}, sync=True)
+            )
+        else:
+            await manager.execute_skill("worker", "finish", {}, sync=False)
+
+        await entered.wait()
+        assert handler.task is not None
+        if concurrent_state in {TaskState.WORKING, TaskState.INPUT_REQUIRED}:
+            await manager.update_status(
+                handler.task.id,
+                TaskState.WORKING,
+                agent_name=RECIPIENT,
+                recipient_agent_id=RECIPIENT,
+            )
+            if concurrent_state is TaskState.INPUT_REQUIRED:
+                await manager.update_status(
+                    handler.task.id,
+                    TaskState.INPUT_REQUIRED,
+                    agent_name=RECIPIENT,
+                    recipient_agent_id=RECIPIENT,
+                )
+        else:
+            await manager.cancel_task(
+                handler.task.id,
+                reason="terminal writer won",
+                agent_name=RECIPIENT,
+            )
+
+        release.set()
+        if execution is not None:
+            returned = await execution
+            assert returned.status.state is expected_state
+        else:
+            await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(handler.task.id)
+        assert persisted is not None
+        assert persisted.status.state is expected_state
+        if expected_state is TaskState.COMPLETED:
+            assert persisted.status.message.parts[0].text == "handler result"
+        else:
+            assert persisted.metadata["cancellation_receipt"]["reason"] == (
+                "terminal writer won"
+            )
+    finally:
+        release.set()
+        if execution is not None and not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
         await manager.close()
 
 

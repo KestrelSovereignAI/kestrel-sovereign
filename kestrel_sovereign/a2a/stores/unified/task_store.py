@@ -314,10 +314,10 @@ class TaskStore(UnifiedStoreBase):
             return
 
         await self._backend.execute_script("""
-            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
-            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v2;
-            DROP TRIGGER IF EXISTS a2a_tasks_canceled_replace_v3;
-            DROP TRIGGER IF EXISTS a2a_tasks_terminal_replace_v3;
+            -- SQLite executes each executescript statement visibly unless the
+            -- script opens its own transaction. Install every replacement
+            -- before retiring its predecessor so another connection never
+            -- observes a terminal row without an update/replace fence.
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_update_v3
             BEFORE UPDATE ON a2a_tasks
             FOR EACH ROW
@@ -362,6 +362,11 @@ class TaskStore(UnifiedStoreBase):
             BEGIN
                 SELECT RAISE(ABORT, 'live A2A task requires durable authority');
             END;
+
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v2;
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_replace_v3;
+            DROP TRIGGER IF EXISTS a2a_tasks_terminal_replace_v3;
         """)
 
     async def save(
@@ -414,6 +419,55 @@ class TaskStore(UnifiedStoreBase):
         }:
             raise ValueError("A terminal A2A lifecycle cannot be replaced")
 
+        return await self._save_recipient_lifecycle_from_states(
+            task,
+            recipient_agent_id=recipient_agent_id,
+            expected_states=(expected_state,),
+        )
+
+    async def save_recipient_terminal_outcome(
+        self,
+        task: Task,
+        *,
+        recipient_agent_id: str,
+    ) -> bool:
+        """Commit a handler's terminal result from whichever live state remains.
+
+        A recipient may legitimately publish WORKING while its handler is still
+        running. The handler result must therefore CAS against the live-state
+        set rather than the stale state in its in-memory snapshot. Terminal
+        states are deliberately absent from the predicate, so a cancellation
+        or competing completion remains immutable.
+        """
+
+        if task.status.state not in {TaskState.COMPLETED, TaskState.FAILED}:
+            raise ValueError(
+                "Recipient execution outcomes must be completed or failed"
+            )
+        return await self._save_recipient_lifecycle_from_states(
+            task,
+            recipient_agent_id=recipient_agent_id,
+            expected_states=(
+                TaskState.SUBMITTED,
+                TaskState.WORKING,
+                TaskState.INPUT_REQUIRED,
+            ),
+        )
+
+    async def _save_recipient_lifecycle_from_states(
+        self,
+        task: Task,
+        *,
+        recipient_agent_id: str,
+        expected_states: tuple[TaskState, ...],
+    ) -> bool:
+        """CAS one recipient-owned payload from an explicit state set."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task lifecycle recipient must be a concrete identity")
+        if not expected_states:
+            raise ValueError("Task lifecycle CAS requires an expected state")
+
         message_json = task.status.message.model_dump_json() if task.status.message else None
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
         history_json = json_dumps([m.model_dump() for m in (task.history or [])])
@@ -432,7 +486,7 @@ class TaskStore(UnifiedStoreBase):
                 updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
-              AND status = ?
+              AND status IN ({", ".join("?" for _ in expected_states)})
             """,
             (
                 task.status.state.value,
@@ -442,7 +496,7 @@ class TaskStore(UnifiedStoreBase):
                 metadata_json,
                 task.id,
                 recipient_agent_id,
-                expected_state.value,
+                *(state.value for state in expected_states),
             ),
         )
         return rows_affected == 1
