@@ -72,6 +72,12 @@ class _TurnSessionBinding:
 _BOUND_TURN_SESSION: contextvars.ContextVar[Optional[_TurnSessionBinding]] = (
     contextvars.ContextVar("kestrel_agent_bound_turn_session", default=None)
 )
+_COMMITTED_FEATURE_TRANSITION_AGENT: contextvars.ContextVar[object | None] = (
+    contextvars.ContextVar(
+        "kestrel_committed_feature_transition_agent",
+        default=None,
+    )
+)
 
 
 def _normalize_session_id(session_id: object) -> Optional[str]:
@@ -438,6 +444,23 @@ class TurnLifecycleMixin:
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
             yield
 
+    @contextmanager
+    def committed_feature_transition_cognition(self) -> Iterator[None]:
+        """Admit same-task cognition after a feature generation commits.
+
+        Feature mutation hooks run while their owner holds ``CONVERSATION``.
+        Re-entering cognition from an arbitrary hook would expose whichever
+        subset of config, clauses, tools, and enablement that hook has already
+        changed.  Only a lifecycle seam that has completed the whole commit may
+        opt in here; currently that is runtime ``on_agent_ready``.
+        """
+
+        token = _COMMITTED_FEATURE_TRANSITION_AGENT.set(self)
+        try:
+            yield
+        finally:
+            _COMMITTED_FEATURE_TRANSITION_AGENT.reset(token)
+
     def _caller_belongs_to_live_turn(self) -> bool:
         """Whether this task is executing as part of this agent's live turn.
 
@@ -515,12 +538,15 @@ class TurnLifecycleMixin:
             and holder.owner_task is current_task
             and current_task is not getattr(self, "_live_turn_task", None)
         ):
-            # Feature mutations own CONVERSATION in the same task that runs
-            # their hooks. A hook may synchronously drive cognition; reuse that
-            # exact boundary instead of recursively acquiring the non-reentrant
-            # lock. A genuine live turn is excluded so accidental recursive
-            # process_input calls still fail by waiting rather than replacing
-            # the outer turn's session/causation authority.
+            if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self:
+                raise RuntimeError(
+                    "cognition cannot start before the feature transition "
+                    "generation is fully committed"
+                )
+            # The committed ready phase still owns CONVERSATION in this task.
+            # Reuse that exact boundary; an arbitrary mid-transition hook is
+            # rejected above, and a genuine live turn is excluded so recursive
+            # process_input cannot replace the outer turn's authority.
             async with self._active_turn_scope(turn_id, label, started):
                 yield turn_id
             return

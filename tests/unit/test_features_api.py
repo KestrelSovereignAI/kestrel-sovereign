@@ -332,18 +332,48 @@ class TestEnableFeature:
         assert entered.is_set()
 
     @pytest.mark.asyncio
-    async def test_enable_hook_can_await_cognition_without_deadlock(self):
-        """A lifecycle hook may synchronously drive a cognition turn."""
+    async def test_enable_hook_cognition_is_rejected_before_partial_publication(self):
+        """A pre-commit hook cannot inspect a half-published generation."""
 
         feature = _make_feature(enabled=False)
         agent = _lifecycle_agent(features={"TestFeature": feature})
-        entered = asyncio.Event()
+        observed = []
 
         async def enable_with_cognition():
             async with agent._turn_lifecycle():
-                entered.set()
+                observed.append(feature.enabled)
 
         feature.on_enable.side_effect = enable_with_cognition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="feature transition generation is fully committed",
+        ):
+            await asyncio.wait_for(
+                features_endpoint.enable_feature(request, "TestFeature"),
+                timeout=1,
+            )
+
+        assert observed == []
+        assert feature.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_committed_enable_ready_hook_can_await_cognition(self):
+        """The explicit post-commit ready seam remains cognition-capable."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        observed = []
+
+        async def ready_with_cognition(_agent):
+            async with agent._turn_lifecycle():
+                observed.append(feature.enabled)
+
+        feature.on_agent_ready = AsyncMock(side_effect=ready_with_cognition)
         request = SimpleNamespace(
             state=SimpleNamespace(agent=agent),
             app=SimpleNamespace(state=SimpleNamespace(agent=None)),
@@ -355,7 +385,7 @@ class TestEnableFeature:
         )
 
         assert response["status"] == "enabled"
-        assert entered.is_set()
+        assert observed == [True]
 
     @pytest.mark.asyncio
     async def test_enable_waits_for_active_turn_before_publication(self):
@@ -1583,6 +1613,48 @@ class TestUpdateFeatureConfig:
         )
 
         assert entered.is_set()
+
+    @pytest.mark.asyncio
+    async def test_config_setter_cognition_is_rejected_before_context_refresh(self):
+        """A setter cannot expose new live config beside old cached context."""
+
+        state = {"mode": "old"}
+        feature = _make_feature(config=state)
+        feature.get_config.side_effect = lambda: dict(state)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        observed = []
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            async with agent._turn_lifecycle():
+                observed.append(dict(state))
+
+        feature.set_config.side_effect = set_config
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="feature transition generation is fully committed",
+        ):
+            await asyncio.wait_for(
+                features_endpoint.update_feature_config(
+                    request,
+                    "TestFeature",
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                ),
+                timeout=1,
+            )
+
+        assert observed == []
+        assert state == {"mode": "new"}
+        agent.refresh_feature_context_clauses.assert_called_once_with(feature)
 
     @pytest.mark.asyncio
     async def test_config_updates_are_not_serialized_across_agents(self):

@@ -4332,6 +4332,24 @@ class TestLoadFromConfig:
         assert manager.list_agents() == {}
 
     @pytest.mark.asyncio
+    async def test_late_registration_consumes_deferred_readiness_after_snapshot(self):
+        """A cold agent cannot miss the server's one-time readiness sweep."""
+
+        manager = AgentManager()
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()  # The server snapshot has already completed.
+
+        agent = _make_mock_agent("did:late-ready")
+        agent.complete_deferred_agent_readiness = AsyncMock()
+        manager._register_agent("late-ready", agent)
+
+        await manager._on_agent_registered("late-ready", agent)
+
+        assert manager.get_agent("late-ready") is agent
+        agent.complete_deferred_agent_readiness.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
     async def test_load_from_config_initializes_concurrently_and_registers_in_order(self):
         """Slow agents overlap without making fleet/UI order nondeterministic."""
         config = MultiAgentConfig(

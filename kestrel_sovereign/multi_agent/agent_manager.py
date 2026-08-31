@@ -1433,6 +1433,21 @@ class AgentManager:
         if hook is not None:
             await hook(name, agent)
 
+        # The server opens the host-context gate and snapshots the registered
+        # fleet once. An agent that deferred readiness while initializing can
+        # miss that snapshot and publish immediately afterward. Registration
+        # is the complementary side of the race: once the gate is open, consume
+        # deferred readiness before this onboarding transaction commits. The
+        # agent serializes this with the snapshot path for exactly-once hooks.
+        gate = self._host_context_publication_gate
+        complete_readiness = getattr(
+            agent,
+            "complete_deferred_agent_readiness",
+            None,
+        )
+        if gate is not None and gate.is_set() and callable(complete_readiness):
+            await complete_readiness()
+
     async def _initialize_agent(
         self,
         name: str,

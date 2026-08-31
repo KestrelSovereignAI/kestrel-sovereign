@@ -3492,25 +3492,38 @@ class KestrelAgent(
     async def _run_or_defer_agent_ready_hooks(self) -> None:
         """Run ready hooks now, or defer them behind host policy publication."""
 
-        gate = getattr(self, "_host_context_publication_gate", None)
-        if gate is not None and not gate.is_set():
-            self._agent_ready_hooks_deferred = True
-            return
-        await self._notify_agent_ready_hooks()
-        self._agent_ready_hooks_deferred = False
+        async with self._agent_readiness_lock():
+            gate = getattr(self, "_host_context_publication_gate", None)
+            if gate is not None and not gate.is_set():
+                self._agent_ready_hooks_deferred = True
+                return
+            await self._notify_agent_ready_hooks()
+            self._agent_ready_hooks_deferred = False
 
     async def complete_deferred_agent_readiness(self) -> None:
         """Complete the server-deferred ready hooks after host publication."""
 
-        if not bool(getattr(self, "_agent_ready_hooks_deferred", False)):
-            return
-        gate = getattr(self, "_host_context_publication_gate", None)
-        if gate is not None and not gate.is_set():
-            raise RuntimeError(
-                "cannot complete agent readiness before host context publication"
-            )
-        await self._notify_agent_ready_hooks()
-        self._agent_ready_hooks_deferred = False
+        async with self._agent_readiness_lock():
+            if not bool(getattr(self, "_agent_ready_hooks_deferred", False)):
+                return
+            gate = getattr(self, "_host_context_publication_gate", None)
+            if gate is not None and not gate.is_set():
+                raise RuntimeError(
+                    "cannot complete agent readiness before host context publication"
+                )
+            await self._notify_agent_ready_hooks()
+            self._agent_ready_hooks_deferred = False
+
+    def _agent_readiness_lock(self) -> asyncio.Lock:
+        """Return the per-agent exactly-once ready-hook completion mutex."""
+
+        lock = getattr(self, "_deferred_agent_readiness_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._deferred_agent_readiness_lock = lock
+        if not isinstance(lock, asyncio.Lock):
+            raise TypeError("deferred agent readiness lock has an invalid type")
+        return lock
 
     # ------------------------------------------------------------------
     # Boot rollback teardown helpers (#2522)
@@ -5059,7 +5072,13 @@ class KestrelAgent(
         ready_hook = getattr(feature, "on_agent_ready", None)
         if ready_hook is not None:
             try:
-                await ready_hook(self)
+                # Runtime enable is still inside the endpoint's conversation
+                # transaction, but every contribution/tool/config surface is
+                # committed at this point. Admit cognition only across this
+                # explicit post-commit seam; earlier lifecycle hooks must fail
+                # closed instead of observing a half-published generation.
+                with self.committed_feature_transition_cognition():
+                    await ready_hook(self)
             except (Exception, asyncio.CancelledError) as exc:
                 logging.warning(
                     "on_agent_ready failed for %s during re-enable: %s",

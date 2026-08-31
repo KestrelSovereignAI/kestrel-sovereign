@@ -783,6 +783,42 @@ async def test_boot_ready_hook_waits_until_host_context_is_published(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_deferred_readiness_completion_is_exactly_once(tmp_path):
+    """Registration and the server snapshot may race the same ready pass."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    gate.set()
+    agent._host_context_publication_gate = gate
+    agent._agent_ready_hooks_deferred = True
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class BlockingReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+
+    feature = BlockingReadyFeature(agent)
+    agent.features[feature.name] = feature
+
+    first = asyncio.create_task(agent.complete_deferred_agent_readiness())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    second = asyncio.create_task(agent.complete_deferred_agent_readiness())
+    await asyncio.sleep(0)
+    assert calls == 1
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+
+    assert calls == 1
+    assert agent._agent_ready_hooks_deferred is False
+
+
+@pytest.mark.asyncio
 async def test_runtime_enable_registers_contributed_hard_permission_immediately(
     tmp_path,
 ):
