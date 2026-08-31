@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from kestrel_sovereign.hold.state import (
     _latch_from_row,
     _receipt_from_row,
     _terminal_authority_ids,
+    hold_history_anchor_path,
     hold_initialization_witness_path,
 )
 from kestrel_sovereign.host_features.context import build_host_context
@@ -497,6 +499,7 @@ async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_p
     first = await build_host_context(db_path=path)
     try:
         assert first.hold_store is not None
+        assert first.hold_store._history_anchor_path == hold_history_anchor_path(path)
         held = await first.hold_store.set_hold(
             scope="agent",
             target_id="did:agent:boot-held",
@@ -585,6 +588,7 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     assert ctx.hold_db is fake_hold_db
     assert ctx.hold_store._db is fake_hold_db
     assert ctx.hold_store._initialization_witness_path is None
+    assert ctx.hold_store._history_anchor_path is None
     assert events[:4] == [
         ("sqlite", str(host_path)),
         ("postgres", "postgresql://durable/host"),
@@ -679,6 +683,11 @@ async def test_postgres_initialization_witness_uses_durable_runtime_metadata(
 
         restarted = HoldStore(_PostgresWitnessFacade())
         assert await restarted._read_initialization_witness() is True
+        await _create_legacy_hold_tables(db)
+        await first._write_history_anchor()
+        assert await restarted._read_history_anchor() == (
+            await first._current_history_anchor_payload()
+        )
     finally:
         await db.close()
 
@@ -1401,6 +1410,92 @@ async def test_completed_witness_migration_never_reblesses_missing_evidence(
 
 
 @pytest.mark.asyncio
+async def test_initialized_store_rejects_deleted_witness_migration_marker(hold_db):
+    """An initialized v1 store may not reclassify current rows as legacy."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:deleted-migration-marker",
+        actor_id="did:sovereign:operator",
+        reason="original evidence",
+        operation_id="deleted-migration-marker-hold",
+    )
+    await db.execute(
+        "UPDATE hold_receipts SET reason = ? WHERE receipt_id = ?",
+        ("tampered evidence", held.receipt.receipt_id),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+    await db.execute(
+        "DELETE FROM hold_schema_migrations WHERE name = ?",
+        ("hold_state_witness_ledgers_v1",),
+    )
+
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="initialized Hold schema is missing.*migration",
+    ):
+        await store.ensure_schema()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["ensure", "boot", "effective", "set"])
+async def test_external_history_anchor_rejects_wholesale_active_target_erasure(
+    hold_db,
+    operation,
+):
+    """Deleting one target and all its in-database witnesses cannot release it."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:wholesale-erasure",
+        actor_id="did:sovereign:operator",
+        reason="must remain held",
+        operation_id="wholesale-erasure-hold",
+    )
+    await db.execute(
+        "DELETE FROM hold_operation_witnesses WHERE operation_id = ?",
+        (held.receipt.operation_id,),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipt_witnesses WHERE scope = ? AND target_id = ?",
+        (held.receipt.scope.value, held.receipt.target_id),
+    )
+    await db.execute(
+        "DELETE FROM hold_receipts WHERE receipt_id = ?",
+        (held.receipt.receipt_id,),
+    )
+    await db.execute(
+        "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
+        (held.receipt.scope.value, held.receipt.target_id),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="history anchor"):
+        if operation == "ensure":
+            await store.ensure_schema()
+        elif operation == "boot":
+            await store.read_boot_state()
+        elif operation == "effective":
+            await store.get_effective(held.receipt.target_id)
+        else:
+            await store.set_hold(
+                scope="agent",
+                target_id=held.receipt.target_id,
+                actor_id="did:sovereign:operator",
+                reason="must not recreate erased authority",
+                operation_id="hold-after-wholesale-erasure",
+            )
+
+
+@pytest.mark.asyncio
 async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
@@ -1462,7 +1557,13 @@ async def test_release_rejects_latch_with_missing_authority_receipt(hold_db):
         ("agent", "did:agent:kite"),
     )
     assert row == (1, held.receipt.receipt_id)
-    assert await store.get_receipt("release-without-authority") is None
+    assert (
+        await db.fetchone(
+            "SELECT receipt_id FROM hold_receipts WHERE operation_id = ?",
+            ("release-without-authority",),
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -1730,11 +1831,44 @@ async def test_postgres_read_targets_take_shared_locks_in_global_order():
     assert [call.args for call in execute.await_args_list] == [
         (
             "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
+            ("kestrel:hold:history-anchor",),
+        ),
+        (
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
             ("kestrel:hold:target:agent:did:agent:snapshot",),
         ),
         (
             "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
             ("kestrel:hold:target:host:host",),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_writers_serialize_global_history_before_local_keys():
+    """Cross-target writers cannot publish lost-update history heads."""
+
+    execute = AsyncMock()
+    store = HoldStore(SimpleNamespace(backend_type="postgres", execute=execute))
+
+    await store._lock_operation_and_target(
+        "operation-one",
+        HoldScope.AGENT,
+        "did:agent:snapshot",
+    )
+
+    assert [call.args for call in execute.await_args_list] == [
+        (
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            ("kestrel:hold:history-anchor",),
+        ),
+        (
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            ("kestrel:hold:operation:operation-one",),
+        ),
+        (
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            ("kestrel:hold:target:agent:did:agent:snapshot",),
         ),
     ]
 
@@ -1853,6 +1987,65 @@ async def test_external_initialization_witness_rejects_total_hold_schema_loss(
             await HoldStore(second_db).ensure_schema()
     finally:
         await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_external_history_anchor_rejects_empty_initialized_backup_restore(
+    tmp_path,
+):
+    """Rolling back only the database cannot erase a later durable Hold."""
+
+    path = tmp_path / "rollback-hold.db"
+    backup = tmp_path / "empty-initialized-hold.db"
+    first_db = await AsyncDatabase.sqlite(str(path))
+    first = HoldStore(first_db)
+    await first.ensure_schema()
+    await first_db.close()
+    shutil.copyfile(path, backup)
+
+    held_db = await AsyncDatabase.sqlite(str(path))
+    held_store = HoldStore(held_db)
+    await held_store.ensure_schema()
+    await held_store.set_hold(
+        scope="agent",
+        target_id="did:agent:rolled-back",
+        actor_id="did:sovereign:operator",
+        reason="must survive rollback",
+        operation_id="hold-before-empty-restore",
+    )
+    await held_db.close()
+
+    shutil.copyfile(backup, path)
+    restored_db = await AsyncDatabase.sqlite(str(path))
+    try:
+        with pytest.raises(HoldCorruptStateError, match="history anchor"):
+            await HoldStore(restored_db).ensure_schema()
+    finally:
+        await restored_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing", "malformed"])
+async def test_initialized_store_rejects_missing_or_malformed_history_anchor(
+    tmp_path,
+    damage,
+):
+    path = tmp_path / f"damaged-anchor-{damage}.db"
+    db = await AsyncDatabase.sqlite(str(path))
+    try:
+        store = HoldStore(db)
+        await store.ensure_schema()
+        anchor_path = store._history_anchor_path
+        assert anchor_path is not None
+        if damage == "missing":
+            anchor_path.unlink()
+        else:
+            anchor_path.write_bytes(b"not a valid history anchor\n")
+
+        with pytest.raises(HoldCorruptStateError, match="history anchor"):
+            await store.ensure_schema()
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -2209,5 +2402,8 @@ async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
         )
 
     # A reusable PostgreSQL test database must not retain append-only witness
-    # rows after the generated receipt history is removed.
+    # rows after the generated receipt history is removed. Production has no
+    # history-destruction API; this fixture-only cleanup must deliberately
+    # advance the independent anchor to the empty test state.
+    await store._write_history_anchor()
     await store.ensure_schema()

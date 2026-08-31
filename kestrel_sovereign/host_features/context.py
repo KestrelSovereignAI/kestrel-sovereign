@@ -298,7 +298,10 @@ async def build_host_context(
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
         from kestrel_sovereign.hold import HoldStore
-        from kestrel_sovereign.hold.state import hold_initialization_witness_path
+        from kestrel_sovereign.hold.state import (
+            hold_history_anchor_path,
+            hold_initialization_witness_path,
+        )
 
         resolved = prepare_host_database(db_path)
         db = await AsyncDatabase.sqlite(str(resolved))
@@ -312,15 +315,18 @@ async def build_host_context(
             hold_db = await AsyncDatabase.postgres(dsn)
             hold_location = "configured PostgreSQL database"
             initialization_witness_path = None
+            history_anchor_path = None
         else:
             hold_db = db
             hold_location = str(resolved)
             initialization_witness_path = hold_initialization_witness_path(
                 resolved
             )
+            history_anchor_path = hold_history_anchor_path(resolved)
         hold_store = HoldStore(
             hold_db,
             initialization_witness_path=initialization_witness_path,
+            history_anchor_path=history_anchor_path,
         )
         await hold_store.ensure_schema()
         hold_boot_state = await hold_store.read_boot_state()
