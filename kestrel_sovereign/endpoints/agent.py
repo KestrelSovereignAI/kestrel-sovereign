@@ -425,15 +425,72 @@ async def invoke_agent(request: Request, http_response: Response):
         if isinstance(kite_evidence_request, dict):
             if user_input not in (None, ""):
                 raise _kite_evidence_error("Kite evidence requests cannot include input.")
+            owner_task = asyncio.current_task()
+            owner_cancellation_baseline = (
+                owner_task.cancelling() if owner_task is not None else 0
+            )
             try:
-                operation, observation = await _kite_runtime_observation(
-                    agent,
-                    request_id=request_id,
-                    provenance=request_invocation_provenance(
-                        request, source_locator="POST:/api/agent/invoke#kite-release-evidence",
+                evidence_task = asyncio.create_task(
+                    _kite_runtime_observation(
+                        agent,
+                        request_id=request_id,
+                        provenance=request_invocation_provenance(
+                            request,
+                            source_locator=(
+                                "POST:/api/agent/invoke#kite-release-evidence"
+                            ),
+                        ),
+                        request=kite_evidence_request,
                     ),
-                    request=kite_evidence_request,
+                    name=(
+                        "kite-evidence:"
+                        f"{invocation_log_correlation(request_id)}"
+                    ),
                 )
+                bind_operation = getattr(
+                    type(agent), "bind_request_operation", None
+                )
+                if callable(bind_operation):
+                    bind_operation(agent, request_id, evidence_task)
+                try:
+                    operation, observation = await evidence_task
+                except asyncio.CancelledError:
+                    if (
+                        owner_task is not None
+                        and owner_task.cancelling()
+                        > owner_cancellation_baseline
+                    ):
+                        raise
+                    if not (
+                        callable(request_cancelled)
+                        and request_cancelled(request_id) is True
+                    ):
+                        raise
+                    http_response.headers["X-Request-ID"] = (
+                        invocation_id_response_header(request_id)
+                    )
+                    return {
+                        "response": "Request stopped during execution.",
+                        "session_id": session_id,
+                        "model": None,
+                        "provider": None,
+                    }
+                # Stop can linearize after the evidence task has produced its
+                # observation but before this owner publishes signed success.
+                # Re-read the exact generation with no following await.
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    http_response.headers["X-Request-ID"] = (
+                        invocation_id_response_header(request_id)
+                    )
+                    return {
+                        "response": "Request stopped during execution.",
+                        "session_id": session_id,
+                        "model": None,
+                        "provider": None,
+                    }
             finally:
                 agent._cleanup_cancelled_request(request_id)
             nonce = kite_evidence_request.get("nonce")
