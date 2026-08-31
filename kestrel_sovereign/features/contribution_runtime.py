@@ -977,6 +977,107 @@ class FeatureContributionRuntime:
         del self._active[id(feature)]
         return True
 
+    def quarantine(self, feature: object) -> bool:
+        """Fail closed after drift prevents the ordinary exact inverse.
+
+        ``deactivate`` deliberately validates the complete inverse before it
+        mutates anything. If an operator or external component has already
+        removed one retained capability, that atomic inverse refuses to run.
+        Runtime rollback still needs a repair seam: remove every surviving
+        capability only when its exact retained identity is present, tolerate
+        capabilities that are already absent, and never remove a replacement
+        object. Context clauses are checked and withdrawn first so a failed
+        quarantine cannot leave feature-owned prompt bytes published while a
+        caller reports the feature disabled.
+        """
+
+        active = self._active.get(id(feature))
+        if active is None:
+            return False
+        if active.prepared.feature is not feature:
+            raise FeatureContributionRuntimeError(
+                "active feature contribution identity does not match"
+            )
+
+        # A different object at the same context identity is not ours to erase.
+        # Refuse before any quarantine mutation rather than risk deleting a
+        # replacement clause published by another lifecycle generation.
+        for clause in active.context_clauses:
+            resident = self.context_clause_registry._clauses.get(clause.identity)
+            if resident is not None and resident is not clause:
+                raise FeatureContributionRuntimeError(
+                    "feature context clauses could not be quarantined"
+                )
+        exact_context = tuple(
+            clause
+            for clause in active.context_clauses
+            if self.context_clause_registry._clauses.get(clause.identity) is clause
+        )
+        if exact_context:
+            self.context_clause_registry.unregister_batch(exact_context)
+
+        failed = False
+
+        def attempt(operation) -> None:
+            nonlocal failed
+            try:
+                operation()
+            except Exception:
+                # The public error below is deliberately fixed text. Registry
+                # exceptions can include third-party names or representations.
+                failed = True
+
+        for registration_set in reversed(active.execution_target_registrations):
+            attempt(
+                lambda item=registration_set: self.operator_registry.unregister(item)
+            )
+        attempt(
+            lambda: self.operator_registry.unregister(active.operator_registrations)
+        )
+
+        for registration in active.prepared.contributions.wait_providers:
+            if self.wait_registry.contains(registration.name, registration.provider):
+                attempt(
+                    lambda item=registration: self.wait_registry.deregister(
+                        item.name, item.provider
+                    )
+                )
+
+        permission = active.permission_registration
+        if permission is not None:
+            resident_permission = self.permission_defaults_registry.registration(
+                permission.feature_name
+            )
+            if resident_permission is permission:
+                attempt(
+                    lambda: self.permission_defaults_registry.unregister(permission)
+                )
+            elif resident_permission is not None:
+                failed = True
+
+        exact_setup = tuple(
+            registration
+            for registration in active.prepared.contributions.setup_steps
+            if self.setup_step_registry.get(registration.name) is registration
+        )
+        if exact_setup:
+            attempt(lambda: self.setup_step_registry.unregister_batch(exact_setup))
+        if any(
+            (resident := self.setup_step_registry.get(registration.name)) is not None
+            and resident is not registration
+            for registration in active.prepared.contributions.setup_steps
+        ):
+            failed = True
+
+        attempt(lambda: self.source_registry.release_all(feature))
+        if failed:
+            raise FeatureContributionRuntimeError(
+                "feature contributions could not be quarantined"
+            ) from None
+
+        del self._active[id(feature)]
+        return True
+
     def is_active(self, feature: object) -> bool:
         active = self._active.get(id(feature))
         return active is not None and active.prepared.feature is feature

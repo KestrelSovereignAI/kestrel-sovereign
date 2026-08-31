@@ -4514,6 +4514,11 @@ class KestrelAgent(
             feature
         )
 
+    def _quarantine_feature_contributions(self, feature: object) -> bool:
+        """Withdraw exact surviving contributions after a drifted teardown."""
+
+        return self._ensure_feature_contribution_runtime().quarantine(feature)
+
     def refresh_all_feature_context_clauses(self, *, fail_closed: bool = False):
         """Republish clauses after a host-owned configuration transition."""
 

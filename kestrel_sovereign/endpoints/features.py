@@ -726,6 +726,26 @@ async def _restore_feature_group(
     enabled = tuple(
         feature for _class_name, feature, was_enabled in attempted if was_enabled
     )
+    quarantine_descriptor = inspect.getattr_static(
+        agent, "_quarantine_feature_contributions", None
+    )
+    if quarantine_descriptor is not None:
+        for class_name, feature, was_enabled in attempted:
+            if not was_enabled:
+                continue
+            try:
+                # A failed exact inverse leaves the retained declarative
+                # generation active while the canonical teardown continues with
+                # imperative cleanup. Withdraw those exact survivors before the
+                # complete package generation is prepared again.
+                agent._quarantine_feature_contributions(feature)
+            except Exception:
+                logger.exception(
+                    "%s rollback contribution quarantine failed for feature '%s'",
+                    operation,
+                    class_name,
+                )
+
     prepared_by_feature: Dict[int, Any] = {}
     if enabled:
         try:
@@ -1231,6 +1251,7 @@ async def _disable_feature_after_config_reconciliation_failure(
     """Fail closed when live config and cached context cannot be reconciled."""
 
     teardown = getattr(agent, "_unregister_feature_runtime", None)
+    quarantine_error = None
     if callable(teardown):
         try:
             deactivated = teardown(feature, unload=False)
@@ -1245,6 +1266,24 @@ async def _disable_feature_after_config_reconciliation_failure(
                 name,
                 type(teardown_exc).__name__,
             )
+            quarantine_descriptor = inspect.getattr_static(
+                agent, "_quarantine_feature_contributions", None
+            )
+            if quarantine_descriptor is None:
+                quarantine_error = RuntimeError(
+                    "feature contribution quarantine is unavailable"
+                )
+            else:
+                try:
+                    agent._quarantine_feature_contributions(feature)
+                except Exception:
+                    quarantine_error = RuntimeError(
+                        "feature contributions could not be quarantined"
+                    )
+    if quarantine_error is not None:
+        # Raise after leaving the teardown handler so a third-party exception
+        # cannot survive in __context__ and leak private configuration bytes.
+        raise quarantine_error
     feature.enabled = False
 
 

@@ -119,6 +119,7 @@ def _make_agent(features=None):
     agent._notify_feature_runtime_ready = AsyncMock(
         side_effect=_notify_feature_runtime_ready
     )
+    agent._quarantine_feature_contributions = MagicMock(return_value=False)
     return agent
 
 

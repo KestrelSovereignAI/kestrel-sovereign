@@ -880,6 +880,61 @@ class TestDisableFeature:
         assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
         assert observations == [(True, True, 2)]
 
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_disable_rollback_repairs_drifted_active_member(
+        self, mock_registry
+    ):
+        """One failed exact inverse cannot block restoration of its package."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstDriftFeature(SDKFixtureFeature):
+            contribution_prefix = "drift-first"
+
+        class SecondDriftFeature(SDKFixtureFeature):
+            contribution_prefix = "drift-second"
+
+        agent = _lifecycle_agent()
+        first = FirstDriftFeature(agent)
+        second = SecondDriftFeature(agent)
+        first.enabled = False
+        second.enabled = False
+        transition = agent._prepare_feature_contribution_transition((first, second))
+        for feature, prepared in transition.activatable((first, second)):
+            await agent._activate_feature_runtime(
+                feature,
+                prepared_contributions=prepared,
+                notify_ready=False,
+            )
+        agent.wait_registry.deregister(
+            second.wait_provider.kind, second.wait_provider
+        )
+        info = FeaturePackageInfo(
+            name="drift-pkg",
+            package="kestrel-feature-drift",
+            git="",
+            features=[first.name, second.name],
+            description="drifted teardown fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="wait-provider"):
+            await features_endpoint.disable_feature(request, info.name)
+
+        assert first.enabled is True
+        assert second.enabled is True
+        assert agent.feature_contribution_runtime.is_active(first)
+        assert agent.feature_contribution_runtime.is_active(second)
+        assert agent.wait_registry.contains(
+            second.wait_provider.kind, second.wait_provider
+        )
+        assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
+
     @pytest.mark.parametrize(
         "feature_name",
         [
@@ -2041,6 +2096,9 @@ class TestUpdateFeatureConfig:
         agent.refresh_feature_context_clauses = MagicMock(
             side_effect=RuntimeError("private renderer detail")
         )
+        agent.wait_registry.deregister(
+            feature.wait_provider.kind, feature.wait_provider
+        )
         request = SimpleNamespace(
             state=SimpleNamespace(agent=agent),
             app=SimpleNamespace(state=SimpleNamespace(agent=None)),
@@ -2057,6 +2115,7 @@ class TestUpdateFeatureConfig:
         assert state == {"mode": "new"}
         assert feature.enabled is False
         assert agent.features[feature.name] is feature
+        assert not agent.feature_contribution_runtime.is_active(feature)
         assert not agent.feature_contribution_runtime.active_context_clauses()
 
     def test_failed_refresh_and_rollback_disables_feature_runtime(self):

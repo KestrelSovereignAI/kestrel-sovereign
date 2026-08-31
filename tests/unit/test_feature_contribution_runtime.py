@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1273,3 +1274,41 @@ def test_a_failed_declarative_teardown_keeps_its_source(tmp_path):
     # The contribution is still active, so its source is still there.
     assert runtime.is_active(feature)
     assert runtime.source_registry.get(name) is feature.source
+
+
+def test_quarantine_withdraws_exact_survivors_after_teardown_drift(tmp_path):
+    """Emergency cleanup tolerates an already-absent exact contribution."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+
+    runtime.wait_registry.unregister(feature.wait_provider.kind)
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.active_context_clauses() == ()
+    _assert_live(agent, feature, False)
+
+
+def test_quarantine_refuses_foreign_context_before_any_mutation(tmp_path):
+    """A replacement at the same identity belongs to another generation."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    original = runtime.active_context_clauses()[0]
+    replacement = replace(original, body="foreign replacement")
+    runtime.context_clause_registry._clauses[original.identity] = replacement
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="context clauses could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    assert runtime.is_active(feature)
+    assert runtime.context_clause_registry._clauses[original.identity] is replacement
+    _assert_live(agent, feature, True)
