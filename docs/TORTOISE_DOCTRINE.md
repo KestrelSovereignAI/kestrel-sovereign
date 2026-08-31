@@ -97,6 +97,42 @@ The bar is: a future engineer reading the diff or the issue tracker should
 be able to act on what you saw, even if you didn't fix it yourself. Silent
 bystanders are how rot spreads.
 
+### 7. Keep Causation and Authority on Separate Axes
+
+**Causation never confers authority.** Kestrel has exactly two relationship
+axes, and code must name which one it is consulting:
+
+- **Causation** is the runtime `CausationFrame` chain: who caused this work.
+  It crosses peers and supports attribution, loop control, and observability.
+  It is never a permission.
+- **Authority** is intended to be a verified, parent-signed durable lineage
+  receipt: who may govern a descendant. It flows downward only and is never
+  inferred from runtime context. Today the signed spawn mandate is ephemeral
+  and the durable `spawned_by` graph edge is unsigned attribution. Until the
+  signed receipt is durably persisted and re-verified, the graph is evidence
+  for routing and discovery—not sufficient authority for descendant governance.
+
+Consequently, `CausationFrame`, the display-derived `kestrel.orchestrator`
+projection, and A2A task metadata may explain or render a relationship but may
+not authorize an action. The target invariant is that descendant governance
+verifies the parent's signed durable lineage receipt and its consistency with
+the durable `spawned_by` graph. A path that cannot do so must fail closed rather
+than trust the graph edge alone, a display edge, cached ancestry, or a
+caller-supplied claim.
+
+A capability available to every agent is not a third axis. Peer Stop, for
+example, requires no relationship at all; its universality creates no
+hierarchy. Durable Hold does require authority and therefore remains scoped to
+the signed creation axis.
+
+### 8. Stop Work; Terminate Processes
+
+**Stop** is cooperative cancellation of in-flight work. Its scopes are host,
+agent, turn, and tool call. Operating-system process termination is a separate
+runtime lifecycle operation and must be named **terminate**, never wired as a
+Stop implementation. Stop is an event; it does not grant or imply the durable
+authority to Hold an agent.
+
 ---
 
 ## Anti-Patterns to Avoid

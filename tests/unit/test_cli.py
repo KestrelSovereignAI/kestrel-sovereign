@@ -15,7 +15,7 @@ from kestrel_sovereign.cli import (
     build_parser,
     main,
     cmd_start,
-    cmd_stop,
+    cmd_terminate,
     cmd_status,
     cmd_logs,
     cmd_list,
@@ -160,18 +160,18 @@ class TestArgumentParsing:
         with pytest.raises(SystemExit):
             build_parser().parse_args(["start", "claw", "--startup-timeout", value])
 
-    def test_stop_no_name(self):
-        """'stop' with no name should parse successfully."""
+    def test_terminate_no_name(self):
+        """'terminate' with no name should parse successfully."""
         parser = build_parser()
-        args = parser.parse_args(["stop"])
-        assert args.command == "stop"
+        args = parser.parse_args(["terminate"])
+        assert args.command == "terminate"
         assert args.name is None
 
-    def test_stop_with_name(self):
-        """'stop <name>' should parse agent name."""
+    def test_terminate_with_name(self):
+        """'terminate <name>' should parse agent name."""
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
-        assert args.command == "stop"
+        args = parser.parse_args(["terminate", "claw"])
+        assert args.command == "terminate"
         assert args.name == "claw"
 
     def test_status(self):
@@ -347,12 +347,26 @@ class TestCommandDispatch:
             main()
             mock.assert_called_once()
 
-    def test_dispatch_stop(self):
-        """'stop' should dispatch to cmd_stop."""
-        with patch("sys.argv", ["kestrel", "stop"]), \
-             patch("kestrel_sovereign.cli.cmd_stop", return_value=0) as mock:
+    def test_dispatch_terminate(self):
+        """'terminate' should dispatch to cmd_terminate."""
+        with patch("sys.argv", ["kestrel", "terminate"]), \
+             patch("kestrel_sovereign.cli.cmd_terminate", return_value=0) as mock:
             main()
             mock.assert_called_once()
+
+    def test_process_termination_uses_reserved_terminate_command(self):
+        """Process signals may not remain reachable through `kestrel stop`."""
+
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["stop"])
+        with patch("sys.argv", ["kestrel", "terminate"]), patch(
+            "kestrel_sovereign.cli.cmd_terminate",
+            return_value=0,
+            create=True,
+        ) as terminate:
+            main()
+        terminate.assert_called_once()
 
     def test_dispatch_status(self):
         """'status' should dispatch to cmd_status."""
@@ -561,19 +575,19 @@ class TestCmdStorage:
 
 
 # -----------------------------------------------------------------------
-# cmd_stop tests
+# cmd_terminate tests
 # -----------------------------------------------------------------------
 
-class TestCmdStop:
-    """Tests for the 'stop' command."""
+class TestCmdTerminate:
+    """Tests for the 'terminate' command."""
 
     def test_stop_single_agent_not_found(self, multi_agent_env, capsys):
         """Stop should return 1 if agent name not found."""
         parser = build_parser()
-        args = parser.parse_args(["stop", "nonexistent"])
+        args = parser.parse_args(["terminate", "nonexistent"])
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_terminate(args)
 
         assert rc == 1
         output = capsys.readouterr().out
@@ -582,28 +596,28 @@ class TestCmdStop:
     def test_stop_single_not_running(self, multi_agent_env, capsys):
         """Stop should succeed even if agent is not running."""
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["terminate", "claw"])
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_terminate(args)
 
         assert rc == 0
 
     def test_stop_all(self, multi_agent_env, capsys):
         """Stop all should stop agents and host."""
         parser = build_parser()
-        args = parser.parse_args(["stop"])
+        args = parser.parse_args(["terminate"])
 
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_terminate(args)
 
         assert rc == 0
         output = capsys.readouterr().out
-        assert "MultiAgent stopped" in output
+        assert "MultiAgent terminated" in output
 
 
 # -----------------------------------------------------------------------
-# cmd_stop postcondition tests (#2990)
+# cmd_terminate postcondition tests (#2990)
 #
 # The verdict in every test below is decided by a REAL listening socket, so
 # ``is_port_in_use`` does the same connect() it does in production. Only the
@@ -683,8 +697,8 @@ def _repoint_ports(env, **ports: int) -> None:
         toml.dump(cfg, fh)
 
 
-class TestCmdStopReportsOnlyVerifiedStops:
-    """`stop` may report stopped only when the port was actually released."""
+class TestCmdTerminateReportsOnlyVerifiedTermination:
+    """`terminate` succeeds only when the port was actually released."""
 
     def test_a_held_port_reads_as_held_however_full_its_backlog(self):
         """The probe must answer "can this be bound", not "is it accepting".
@@ -692,7 +706,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
         A listener with a full accept backlog refuses new connections while
         still owning the port. The old ``connect_ex`` probe therefore reported
         a held port as free after a single unaccepted connection — which let
-        `stop` report success over exactly the listener it was checking for.
+        `terminate` report success over exactly the listener it was checking.
         """
         with _listener_on() as port:
             assert [
@@ -707,8 +721,8 @@ class TestCmdStopReportsOnlyVerifiedStops:
         uvicorn's asyncio server sets SO_REUSEADDR (verified on a live loop),
         so Kestrel can rebind a TIME_WAIT port immediately. A probe without
         that option calls it occupied — and since `restart` and `update` both
-        abort on a failed stop, they would stop the service and then refuse to
-        start it again.
+        abort on a failed termination, they would terminate the service and
+        then refuse to start it again.
         """
         import socket as _socket
 
@@ -864,19 +878,19 @@ class TestCmdStopReportsOnlyVerifiedStops:
     def test_stop_all_fails_when_host_port_stays_held(self, multi_agent_env, capsys):
         """A host port nobody could free must not read as a clean shutdown."""
         parser = build_parser()
-        args = parser.parse_args(["stop"])
+        args = parser.parse_args(["terminate"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
                            testbot=_free_port())
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env):
-                rc = cmd_stop(args)
+                rc = cmd_terminate(args)
 
         output = capsys.readouterr().out
         assert rc == 1
-        assert "MultiAgent stopped" not in output
-        assert "stop incomplete" in output
+        assert "MultiAgent terminated" not in output
+        assert "termination incomplete" in output
         assert "host" in output
         assert f"port :{port}" in output
 
@@ -884,17 +898,17 @@ class TestCmdStopReportsOnlyVerifiedStops:
         self, multi_agent_env, capsys
     ):
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["terminate", "claw"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, claw=port)
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env):
-                rc = cmd_stop(args)
+                rc = cmd_terminate(args)
 
         output = capsys.readouterr().out
         assert rc == 1
-        assert "claw stopped" not in output
+        assert "claw terminated" not in output
         assert "still in use" in output
 
     def test_stop_single_agent_reports_orphan_stop_when_port_is_released(
@@ -902,16 +916,16 @@ class TestCmdStopReportsOnlyVerifiedStops:
     ):
         """The success path still succeeds — nothing is bound to claw's port."""
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["terminate", "claw"])
         _repoint_ports(multi_agent_env, claw=_free_port())
 
         with _unkillable_orphan(), \
              patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+            rc = cmd_terminate(args)
 
         output = capsys.readouterr().out
         assert rc == 0
-        assert "claw stopped (orphan)" in output
+        assert "claw terminated (orphan)" in output
 
     def test_tracked_agent_with_a_still_bound_port_is_not_reported_stopped(
         self, multi_agent_env, capsys
@@ -922,16 +936,16 @@ class TestCmdStopReportsOnlyVerifiedStops:
         `kestrel start` fails on a port this command called free.
         """
         parser = build_parser()
-        args = parser.parse_args(["stop", "claw"])
+        args = parser.parse_args(["terminate", "claw"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, claw=port)
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env), \
-                 patch.object(ProcessManager, "stop_agent", return_value=True), \
+                 patch.object(ProcessManager, "terminate_agent", return_value=True), \
                  patch.object(ProcessManager, "read_pid", return_value=4242), \
                  patch.object(ProcessManager, "is_process_running", return_value=True):
-                rc = cmd_stop(args)
+                rc = cmd_terminate(args)
 
         output = capsys.readouterr().out
         assert rc == 1, output
@@ -964,18 +978,18 @@ class TestCmdStopReportsOnlyVerifiedStops:
         assert ProcessManager.read_pid_record(pid_file).status is PidStatus.STALE
 
         parser = build_parser()
-        args = parser.parse_args(["stop"])
+        args = parser.parse_args(["terminate"])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
                            testbot=_free_port())
             with patch("kestrel_sovereign.cli._get_project_dir",
                        return_value=multi_agent_env):
-                rc = cmd_stop(args)
+                rc = cmd_terminate(args)
 
         output = capsys.readouterr().out
         assert rc == 1, output
-        assert "stop incomplete" in output
+        assert "termination incomplete" in output
         assert not pid_file.exists(), (
             "a dead host's PID file was kept because the port was still held; "
             "the number can be reused and signalled by the next command"
@@ -1430,8 +1444,6 @@ class TestCmdCreate:
         """Create should assign the next available port."""
         parser = build_parser()
         args = parser.parse_args(["create", "newagent"])
-
-        agent_dir = multi_agent_env / "agent_data" / "newagent"
 
         async def fake_inception(*, output_dir, agent_name, **_kwargs):
             out = Path(output_dir)

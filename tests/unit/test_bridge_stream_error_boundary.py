@@ -84,6 +84,24 @@ def _post_stream(process_input_streaming):
         restore()
 
 
+def _post_stream_with_agent(process_input_streaming):
+    """Drive the real bridge route and retain its test agent for assertions."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    app, restore = _boot(process_input_streaming)
+    agent = app.state.agent
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/bridge/stream",
+                json={"message": "hi", "channel_type": "api"},
+                headers={"X-API-Key": API_KEY},
+            )
+        return response, agent
+    finally:
+        restore()
+
+
 def _error_events(text: str):
     """Parse the SSE ``data:`` lines and return the decoded ``error`` events."""
     events = []
@@ -119,6 +137,20 @@ def test_bridge_stream_generic_exception_emits_safe_constant_not_str_e():
     assert len(errors) == 1
     assert marker not in errors[0]["message"]
     assert "could not be completed" in errors[0]["message"]
+
+
+def test_bridge_source_failure_is_not_recorded_as_abandoned_cleanup():
+    """The bridge must reserve ABANDONED for an actual close failure."""
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("provider failed")
+        yield  # pragma: no cover
+
+    response, agent = _post_stream_with_agent(_boom)
+
+    assert response.status_code == 200
+    agent._cleanup_cancelled_request.assert_called_once()
+    assert agent._cleanup_cancelled_request.call_args.kwargs == {}
 
 
 def test_bridge_stream_llm_streaming_error_provider_marker_never_surfaces():

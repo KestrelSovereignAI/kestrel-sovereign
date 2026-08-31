@@ -207,7 +207,7 @@ All commands work on Windows, macOS, and Linux. Pass the agent directory as an a
 kestrel doctor                       # Check prerequisites and readiness
 kestrel create MyAgent               # Create a new agent
 kestrel start MyAgent                # Start an agent
-kestrel stop MyAgent                 # Stop an agent
+kestrel terminate MyAgent            # Terminate an agent process
 kestrel restart MyAgent              # Restart (stop then start)
 kestrel update [MyAgent]             # Pull + install + feature sync + restart (see below)
 kestrel status                       # Show all running agents

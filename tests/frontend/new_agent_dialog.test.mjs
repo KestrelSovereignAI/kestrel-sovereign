@@ -20,7 +20,11 @@ globalThis.window.kicon = (name) => `<span class="ki ki-${name}" aria-hidden="tr
 globalThis.kicon = globalThis.window.kicon;
 
 const { Modal, setOverlayRoot } = await import('../../kestrel_sovereign/static/js/ui.js');
-const { openCreateAgentDialog } = await import('../../kestrel_sovereign/static/js/new_agent_dialog.js');
+const { openCreateAgentDialog: openCreateAgentDialogRaw } = await import('../../kestrel_sovereign/static/js/new_agent_dialog.js');
+const openCreateAgentDialog = (options) => openCreateAgentDialogRaw({
+    canCreate: () => true,
+    ...options,
+});
 
 function tick() { return new Promise((r) => setTimeout(r, 0)); }
 
@@ -132,6 +136,34 @@ test('a client-invalid name is rejected before any POST', async () => {
 
     assert.equal(posted, false, 'no POST for a client-invalid name');
     assert.match(errorText(), /must start with a letter/, 'inline validation message shown');
+});
+
+test('authority revoked after opening blocks submission before POST', async () => {
+    Modal.hide();
+    let allowed = true;
+    const posted = [];
+    openCreateAgentDialog({
+        modal: Modal,
+        api: {
+            createAgent: async (name) => {
+                posted.push(name);
+                return { success: true };
+            },
+        },
+        canCreate: () => allowed,
+        onCreated: async () => {},
+    });
+    await tick();
+    typeName('Kestrel');
+    allowed = false;
+
+    clickCreate();
+    await tick();
+
+    assert.deepEqual(posted, [], 'revoked authority prevents POST /api/agents');
+    assert.match(errorText(), /authority is no longer available/i);
+    assert.ok(document.getElementById('modal-overlay'), 'dialog remains for recovery');
+    Modal.hide();
 });
 
 test('closed-shadow Create Agent validates and submits through its modal handle', async () => {
@@ -296,7 +328,7 @@ test('demo-classified servers refuse the Create flow entirely — the #868 rail 
     const { readFileSync } = await import('node:fs');
     const src = readFileSync(new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
     const start = src.indexOf('function openNewAgentFlow()');
-    const block = src.slice(start, start + 2600);
+    const block = src.slice(start, start + 3600);
     assert.match(block, /serverDemoMode[\s\S]{0,200}?return;/,
         'creation refused on demo-mode servers before the dialog opens');
     const created = block.indexOf('onCreated');
@@ -322,7 +354,7 @@ test('the create flow FAILS CLOSED before server classification loads (codex P1 
         'unclassified server refuses the create flow (fail closed)');
 });
 
-test('creation is gated on the server-advertised can_create_agents capability (codex P2 round 2 + P1 round 3)', async () => {
+test('creation is gated on resettable caller-scoped lifecycle authority', async () => {
     const { readFileSync } = await import('node:fs');
     const adapterSrc = readFileSync(new URL('../../kestrel_sovereign/static/js/agent_list.js', import.meta.url), 'utf8');
     assert.match(adapterSrc, /canCreateAgents:\s*false/,
@@ -331,8 +363,11 @@ test('creation is gated on the server-advertised can_create_agents capability (c
         'flag mirrored strictly from the payload');
     const identitySrc = readFileSync(new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
     const start = identitySrc.indexOf('function openNewAgentFlow()');
-    const block = identitySrc.slice(start, start + 1600);
-    assert.match(block, /canCreateAgents/, 'openNewAgentFlow gates on the capability');
+    const block = identitySrc.slice(start, start + 3600);
+    assert.match(block, /canManageHostAgentLifecycle\('create'\)/,
+        'openNewAgentFlow gates on resettable caller authority');
+    assert.match(block, /canCreate:\s*\(\)\s*=>\s*API\.canManageHostAgentLifecycle\('create'\)/,
+        'dialog submission receives a live caller-authority predicate');
     assert.doesNotMatch(block, /mode === 'standalone'/,
         'mode-only inference replaced by the explicit capability');
 });

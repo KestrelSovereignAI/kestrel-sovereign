@@ -140,7 +140,9 @@ class TestTaskStore:
                 id="new-task",
                 status=TaskStatus(state=TaskState.SUBMITTED),
                 metadata={"user_id": "user-123"},
-            )
+            ),
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
         )
         row = await backend.fetch_one(
             "SELECT user_id FROM a2a_tasks WHERE id = ?", ("new-task",)
@@ -165,7 +167,11 @@ class TestTaskStore:
             metadata={"key": "value"},
         )
 
-        await store.save(task)
+        await store.save(
+            task,
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
         retrieved = await store.get("task-001")
 
         assert retrieved is not None
@@ -198,7 +204,11 @@ class TestTaskStore:
             id="task-002",
             status=TaskStatus(state=TaskState.SUBMITTED),
         )
-        await store.save(task)
+        await store.save(
+            task,
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
 
         new_status = TaskStatus(state=TaskState.WORKING)
         await store.update_status("task-002", new_status)
@@ -218,7 +228,11 @@ class TestTaskStore:
             id="task-003",
             status=TaskStatus(state=TaskState.WORKING),
         )
-        await store.save(task)
+        await store.save(
+            task,
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
 
         artifact = Artifact(
             name="result.txt",
@@ -246,7 +260,11 @@ class TestTaskStore:
                 id=f"task-{i}",
                 status=TaskStatus(state=state),
             )
-            await store.save(task)
+            await store.save(
+                task,
+                creator_agent_id="did:test:creator",
+                recipient_agent_id="did:test:recipient",
+            )
 
         pending = await store.get_pending_tasks()
         assert len(pending) == 2
@@ -277,12 +295,25 @@ class TestTaskStore:
         ]
         # One task per state so each filter must select exactly its own row.
         for state in five_states:
+            initial_state = (
+                TaskState.SUBMITTED
+                if state is TaskState.CANCELED
+                else state
+            )
             await store.save(
                 Task(
                     id=f"task-{state.value}",
-                    status=TaskStatus(state=state),
-                )
+                    status=TaskStatus(state=initial_state),
+                ),
+                creator_agent_id="did:test:creator",
+                recipient_agent_id="did:test:recipient",
             )
+            if state is TaskState.CANCELED:
+                canceled = await store.cancel_if_authorized(
+                    f"task-{state.value}",
+                    actor_agent_id="did:test:creator",
+                )
+                assert canceled is not None
 
         for state in five_states:
             rows = await store.list_tasks(status=state)
@@ -311,7 +342,11 @@ class TestTaskStore:
                 sessionId="session-a",
                 status=TaskStatus(state=TaskState.COMPLETED),
             )
-            await store.save(task)
+            await store.save(
+                task,
+                creator_agent_id="did:test:creator",
+                recipient_agent_id="did:test:recipient",
+            )
 
         for i in range(2):
             task = Task(
@@ -319,7 +354,11 @@ class TestTaskStore:
                 sessionId="session-b",
                 status=TaskStatus(state=TaskState.COMPLETED),
             )
-            await store.save(task)
+            await store.save(
+                task,
+                creator_agent_id="did:test:creator",
+                recipient_agent_id="did:test:recipient",
+            )
 
         session_a_tasks = await store.list_tasks(session_id="session-a")
         assert len(session_a_tasks) == 3
@@ -339,7 +378,11 @@ class TestTaskStore:
             id="task-delete",
             status=TaskStatus(state=TaskState.COMPLETED),
         )
-        await store.save(task)
+        await store.save(
+            task,
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
 
         result = await store.delete("task-delete")
         assert result is True

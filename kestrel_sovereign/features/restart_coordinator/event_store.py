@@ -217,37 +217,36 @@ async def list_events_for_request(
 
 
 async def list_recent_events_for_history(
-    db, *, limit: int = 100, since: Optional[str] = None,
+    db,
+    *,
+    agent_id: str,
+    limit: int = 100,
+    since: Optional[str] = None,
 ) -> List[RestartStatusEvent]:
-    """Most-recent events across all requests, newest-first.
+    """Most-recent events for one required durable agent principal.
 
     Used by chat-history reload to repaint the visible bubble trail.
     ``since`` is an ISO timestamp; rows newer than that are returned
     (lets the frontend page lazily through history).
     """
-    if since is None:
-        rows = await db.fetchall(
-            """
-            SELECT id, request_id, state, agent_id, operation, urgency,
-                   policy, dedupe_signature, payload_json, created_at
-            FROM restart_status_events
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (int(limit),),
-        )
-    else:
-        rows = await db.fetchall(
-            """
-            SELECT id, request_id, state, agent_id, operation, urgency,
-                   policy, dedupe_signature, payload_json, created_at
-            FROM restart_status_events
-            WHERE created_at > ?
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (str(since), int(limit)),
-        )
+    principal = str(agent_id).strip()
+    if not principal:
+        raise ValueError("agent_id must identify a durable agent principal")
+
+    where = ["agent_id = ?"]
+    params: list[Any] = [principal]
+    if since is not None:
+        where.append("created_at > ?")
+        params.append(str(since))
+    sql = (
+        "SELECT id, request_id, state, agent_id, operation, urgency, "
+        "policy, dedupe_signature, payload_json, created_at "
+        "FROM restart_status_events"
+    )
+    sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(int(limit))
+    rows = await db.fetchall(sql, tuple(params))
     return [RestartStatusEvent.from_row(r) for r in rows]
 
 

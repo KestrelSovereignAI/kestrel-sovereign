@@ -955,7 +955,7 @@ class AgentManager:
         recipient: object,
         claimed_sender: str,
         policy: A2AHostedPolicy,
-    ) -> bool:
+    ) -> Optional[str]:
         """Authorize the sole hosted unsigned compatibility path.
 
         A pre-ceremony sender has no cryptographic signing DID, so accepting
@@ -975,7 +975,7 @@ class AgentManager:
             or not claimed_sender
             or self.a2a_hosted_policy_for(recipient) is not policy
         ):
-            return False
+            return None
         matches: list[tuple[str, KestrelAgent, str]] = []
         for routing_name, candidate in self._agents.items():
             sender_id = _loaded_agent_did(candidate)
@@ -992,13 +992,13 @@ class AgentManager:
         # unsigned compatibility sender may be accepted only when the current
         # hosted fleet has exactly one matching published display identity.
         if len(matches) != 1:
-            return False
+            return None
         routing_name, sender, sender_id = matches[0]
         if sender is recipient or (
             self._agent_names.get(sender_id) != routing_name
             or self._agents.get(routing_name) is not sender
         ):
-            return False
+            return None
 
         identity = getattr(sender, "identity", None)
         # A loaded hybrid identity must never deliberately downgrade to the
@@ -1009,7 +1009,7 @@ class AgentManager:
             or getattr(identity, "hybrid_keypair", None) is not None
             or bool(getattr(identity, "new_verification_methods", None))
         ):
-            return False
+            return None
 
         authorize = getattr(
             policy.authorizer,
@@ -1017,7 +1017,7 @@ class AgentManager:
             None,
         )
         if not callable(authorize):
-            return False
+            return None
         try:
             result = authorize(
                 sender_id,
@@ -1031,8 +1031,137 @@ class AgentManager:
                 "Hosted legacy A2A sender authorization failed",
                 exc_info=True,
             )
-            return False
-        return result is True
+            return None
+        return sender_id if result is True else None
+
+    async def cancel_host_attested_local_a2a_task(
+        self,
+        *,
+        sender: object,
+        requester: object,
+        peer: object,
+        task_id: str,
+        payload: object,
+    ) -> dict[str, object]:
+        """Cancel same-host work through a non-serializable authority seam.
+
+        Pre-ceremony agents cannot sign a cancellation envelope. The local
+        router capability is bound to the exact published sender during host
+        onboarding; this method revalidates both endpoints and the recipient's
+        live directory policy under one lifecycle lease before the recipient
+        store applies its atomic creator/recipient predicate.
+        """
+
+        from collections.abc import Mapping
+
+        from kestrel_sovereign.a2a.task_manager import (
+            TaskCancellationAuthorizationError,
+        )
+        from kestrel_sovereign.features.peers.directory import (
+            PeerAccessDeniedError,
+            PeerIdentity,
+            PeerNotFoundError,
+            PeerProtocolError,
+            PeerRequester,
+            PeerTaskConflictError,
+        )
+
+        if (
+            not isinstance(requester, PeerRequester)
+            or not isinstance(peer, PeerIdentity)
+            or not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(payload, Mapping)
+        ):
+            raise PeerProtocolError("Local cancellation request is malformed")
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 4096:
+            raise PeerProtocolError("Local cancellation reason is invalid")
+
+        async with self.a2a_execution_lease():
+            sender_policy = self.a2a_hosted_policy_for(sender)
+            sender_id = _loaded_agent_did(sender)
+            if (
+                sender_policy is None
+                or sender_policy.requester is not requester
+                or requester.identity != sender_id
+            ):
+                raise PeerAccessDeniedError(
+                    "Local cancellation sender is no longer published"
+                )
+
+            recipient_name = self._agent_names.get(peer.agent_id)
+            recipient = (
+                self._agents.get(recipient_name)
+                if isinstance(recipient_name, str)
+                else None
+            )
+            recipient_policy = (
+                self.a2a_hosted_policy_for(recipient)
+                if recipient is not None
+                else None
+            )
+            if (
+                recipient is None
+                or recipient_policy is None
+                or recipient_policy.recipient_id != peer.agent_id
+                or recipient_name != peer.routing_key
+            ):
+                raise PeerNotFoundError(
+                    "Local cancellation recipient is no longer published"
+                )
+
+            authorize = getattr(
+                recipient_policy.router,
+                "authorize_inbound_sender",
+                None,
+            )
+            if not callable(authorize):
+                raise PeerAccessDeniedError(
+                    "Local cancellation recipient policy is unavailable"
+                )
+            authorized = authorize(recipient_policy.requester, sender_id)
+            if inspect.isawaitable(authorized):
+                authorized = await authorized
+            if (
+                authorized is not True
+                or self.a2a_hosted_policy_for(sender) is not sender_policy
+                or self.a2a_hosted_policy_for(recipient) is not recipient_policy
+            ):
+                raise PeerAccessDeniedError(
+                    "Local cancellation sender is not authorized"
+                )
+
+            task_manager = getattr(recipient, "task_manager", None)
+            if task_manager is None:
+                raise PeerNotFoundError("Local cancellation recipient is unavailable")
+            current = await task_manager.get_task(task_id)
+            if current is None:
+                raise PeerNotFoundError("Local cancellation task does not exist")
+            try:
+                task = await task_manager.cancel_task(
+                    task_id,
+                    reason=reason,
+                    agent_name=sender_id,
+                    recipient_agent_id=peer.agent_id,
+                )
+            except TaskCancellationAuthorizationError as exc:
+                raise PeerAccessDeniedError(
+                    "Local cancellation actor is not authorized"
+                ) from exc
+            except ValueError as exc:
+                raise PeerTaskConflictError(
+                    "Local cancellation conflicts with task state"
+                ) from exc
+
+            state = getattr(getattr(task, "status", None), "state", None)
+            return {
+                "id": getattr(task, "id", task_id),
+                "status": getattr(state, "value", state),
+                "cancellation_receipt": (
+                    getattr(task, "metadata", None) or {}
+                ).get("cancellation_receipt"),
+            }
 
     @staticmethod
     def _published_a2a_display_identity(agent: object) -> Optional[str]:

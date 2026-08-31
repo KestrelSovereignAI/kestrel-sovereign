@@ -122,7 +122,8 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # The COGNITION wake comes from that downstream signal, not from the
     # watch task itself. Built-in handler:
     # SchedulerFeature._run_github_pr_watch. Per-watch config (repo, pr,
-    # triggers, notify) travels in the scheduled task's args_json.
+    # triggers) travels in the scheduled task's args_json. A legacy ``notify``
+    # value is ignored because this local dispatcher can only wake its owner.
     ("github_pr_watch", SignalMode.ACTION, frozenset()),
     # Ecosystem discovery watcher (#2281). ACTION — no LLM cost in the
     # scheduler handler itself beyond the delegated discovery tool. It

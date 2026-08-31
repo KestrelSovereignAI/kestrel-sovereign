@@ -85,7 +85,10 @@ from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin,
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
-from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
+)
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.signals import OrderedLockManager
@@ -1413,10 +1416,26 @@ class KestrelAgent(
         # running. Keep lifecycle registration ownership per delivery so one
         # completion cannot unregister the other.
         self._active_request_counts: dict[str, int] = {}
+        self._active_request_generations: dict[str, int] = {}
+        self._next_request_generation = 0
+        self._abandoned_request_generations: dict[str, set[int]] = {}
+        self._abandoned_request_dispositions: dict[
+            tuple[str, int], RequestCompletionDisposition
+        ] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
+        self._cancelled_request_generations: set[tuple[str, int]] = set()
+        # An exact Stop can race ahead of the matching HTTP request's lifecycle
+        # registration. The short-lived entry is consumed by that first
+        # generation so an acknowledged Stop cannot be followed by late work.
+        self._pending_request_cancellations: dict[str, float] = {}
+        # Stop is acknowledged only after endpoint cleanup has observed the
+        # request leave execution. RequestLifecycleMixin owns these waiters.
+        self._request_completion_events: dict[
+            tuple[str, int], asyncio.Future[object]
+        ] = {}
         # Task-reentrant so a durable-identity write (rename / description /
         # discovery / user-name / SOUL) invoked as a TOOL inside a streamed turn
         # — which already holds this lock across the whole turn — re-enters
@@ -2192,6 +2211,11 @@ class KestrelAgent(
             # — the missing piece behind every "I sent it, did you
             # get it?" thread (#645 / Emma↔Meridian).
             on_task_submitted=self._on_task_submitted,
+            # Cancellation is durable before this callback fires.  The agent
+            # uses it to suppress the matching queued cognition delivery so a
+            # withdrawn task cannot execute from its inline signal payload.
+            on_task_cancelled=self._on_task_cancelled,
+            on_task_cancellation_started=self._on_task_cancellation_started,
             # Provider returns the in-flight cognition turn's
             # causation chain (serialized) so outbound A2A tasks
             # carry the lineage. The dispatcher sets the chain on
@@ -2200,6 +2224,7 @@ class KestrelAgent(
             # See #905 review P1 — without this, A→B→A loops would
             # restart at depth 1 every iteration.
             causation_chain_provider=self._provide_causation_chain,
+            host_agent_id=self.did,
         )
         # Register teardown BEFORE initialize: ``TaskManager.initialize()`` opens
         # its A2A store connections (task/session/observability/memory/feedback)
@@ -5426,7 +5451,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    @bind_async_invocation("invocation_id")
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
@@ -7044,6 +7069,7 @@ Expected Duration: {expected_duration}
     # - register_active_request
     # - cancel_current_request
     # - is_request_cancelled
+    # - wait_for_request_completion
     # - _cleanup_cancelled_request
 
     def resolve_effective_name(

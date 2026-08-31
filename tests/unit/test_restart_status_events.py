@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.restart_coordinator import (
@@ -39,6 +40,22 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 
+_test_databases: list[AsyncDatabase] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_test_databases():
+    """Close each test-owned worker before pytest tears down its event loop."""
+
+    _test_databases.clear()
+    try:
+        yield
+    finally:
+        for db in reversed(_test_databases):
+            await db.close()
+        _test_databases.clear()
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -48,6 +65,7 @@ async def _backend(tmp_path):
     raw = SQLiteBackend(str(tmp_path / "restart-events.db"))
     await raw.connect()
     db = AsyncDatabase(raw)
+    _test_databases.append(db)
     await ensure_restart_requests_table(db)
     await ensure_restart_status_events_table(db)
     return db
@@ -213,10 +231,20 @@ async def test_list_recent_events_for_history_returns_newest_first(tmp_path):
             db, request_id="r1", state=state,
             agent_id="a", payload={"state": state},
         )
-    rows = await list_recent_events_for_history(db, limit=10)
+    rows = await list_recent_events_for_history(db, agent_id="a", limit=10)
     assert [r.state for r in rows] == [
         "completed", "executing", "deferred", "pending",
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_recent_events_for_history_requires_concrete_principal(
+    tmp_path,
+):
+    db = await _backend(tmp_path)
+
+    with pytest.raises(ValueError, match="durable agent principal"):
+        await list_recent_events_for_history(db, agent_id=" ", limit=10)
 
 
 @pytest.mark.asyncio
@@ -232,7 +260,7 @@ async def test_list_recent_events_since_paging(tmp_path):
     )
     # Page newer than ``first.created_at`` should only return ``second``.
     rows = await list_recent_events_for_history(
-        db, limit=10, since=first.created_at,
+        db, agent_id="a", limit=10, since=first.created_at,
     )
     assert len(rows) == 1
     assert rows[0].id == second.id
@@ -358,6 +386,14 @@ async def test_emit_persists_even_when_sse_listener_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_list_restart_status_events_description_is_principal_scoped():
+    desc = RestartCoordinatorFeature.list_restart_status_events._tool_schema[
+        "description"
+    ]
+    assert "this agent's" in desc
+    assert "Other agents' events are never visible" in desc
+
+
 @pytest.mark.asyncio
 async def test_list_restart_status_events_tool(tmp_path):
     db = await _backend(tmp_path)
@@ -393,6 +429,31 @@ async def test_list_restart_status_events_tool_clamps_limit(tmp_path):
     # Garbage → defaults to 100, no crash.
     res = await feat.list_restart_status_events(limit="not-an-int")
     assert res.status is ToolResultStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_restart_status_event_history_is_scoped_to_requesting_agent(tmp_path):
+    db = await _backend(tmp_path)
+    owner = RestartCoordinatorFeature(_make_agent(db, did="did:test:owner"))
+    await owner.initialize()
+    own_request = await insert_request(
+        db,
+        requested_by_agent="did:test:owner",
+        reason="owner detail",
+    )
+    other_request = await insert_request(
+        db,
+        requested_by_agent="did:test:other",
+        reason="other private detail",
+    )
+    await owner._emit_status_event(own_request, state="pending")
+    await owner._emit_status_event(other_request, state="pending")
+
+    result = await owner.list_restart_status_events()
+
+    assert result.data["count"] == 1
+    assert result.data["events"][0]["request_id"] == own_request.id
+    assert "other private detail" not in str(result.data)
 
 
 # ---------------------------------------------------------------------------

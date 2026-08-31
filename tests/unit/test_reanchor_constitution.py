@@ -1,12 +1,16 @@
 """Unit tests for !reanchor-constitution command."""
+import ast
+import inspect
 import json
 import pytest
 import hashlib
+import textwrap
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
+from kestrel_sovereign.setup.constitution_reanchor import _write_reanchor
 from kestrel_sovereign.constitution.amendment_artifact import (
     MAX_REANCHOR_ARTIFACT_BYTES,
     build_legacy_signed_reanchor_artifact,
@@ -34,6 +38,56 @@ AGENT_DID_DOCUMENT = did_document_from_legacy_public_key(
     AGENT_DID,
     AGENT_KEYPAIR.public_key,
 )
+
+
+def _graph_write_calls(function):
+    """Return graph lock/add call sites in source order for one workflow."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"lock_nodes_for_update", "add_node"}:
+                calls.append((node.lineno, node.func.attr, node))
+    return sorted(calls)
+
+
+def test_both_reanchor_writers_prelock_the_complete_shared_node_set():
+    """Opposite semantic write order must not become opposite lock order."""
+
+    expected_names = {
+        ConstitutionMixin.reanchor_constitution: {
+            "artifact_hash",
+            "stored_hash",
+            "self.agent_id",
+        },
+        _write_reanchor: {"agent_did", "artifact_hash", "new_hash"},
+    }
+    for function, expected in expected_names.items():
+        calls = _graph_write_calls(function)
+        lock_calls = [entry for entry in calls if entry[1] == "lock_nodes_for_update"]
+        add_calls = [entry for entry in calls if entry[1] == "add_node"]
+        assert len(lock_calls) == 1
+        assert add_calls
+        assert lock_calls[0][0] < add_calls[0][0]
+        locked_names = {
+            ast.unparse(element) for element in lock_calls[0][2].args[0].elts
+        }
+        assert locked_names == expected
+
+
+def test_governance_helper_prelocks_both_endpoints_before_writing():
+    """Every caller of the composed helper gets one canonical outer lock set."""
+
+    calls = _graph_write_calls(ConstitutionMixin._anchor_constitution_governance)
+    lock_calls = [entry for entry in calls if entry[1] == "lock_nodes_for_update"]
+    add_calls = [entry for entry in calls if entry[1] == "add_node"]
+    assert len(lock_calls) == 1
+    assert add_calls
+    assert lock_calls[0][0] < add_calls[0][0]
+    assert {
+        ast.unparse(element) for element in lock_calls[0][2].args[0].elts
+    } == {"self.agent_id", "constitution_hash"}
 
 
 @pytest.fixture(autouse=True)
@@ -112,6 +166,7 @@ def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTI
         return_value=None if anchored is UNREADABLE else anchored
     )
     agent.storage.add_node = AsyncMock()
+    agent.storage.lock_nodes_for_update = AsyncMock()
     agent._raw_storage = SimpleNamespace(db=_FakeFileRows(stored_hash, anchored))
     # transaction() is an async context manager, not a coroutine — a plain
     # MagicMock provides __aenter__/__aexit__ on its return value.
