@@ -31,23 +31,15 @@ def _model(id_: str, vendor: str) -> ModelInfo:
     )
 
 
-def _guard_subject(LLMService, *, discovery_failures=None):
+def _guard_subject(LLMService):
     """Build the guard's subject with every attribute it actually reads.
 
     There were two places constructing this double, and only one was updated
-    when `_model_available_for_route` gained a dependency — so the fixture
-    tests passed while the inline one failed with an AttributeError. One
-    builder, so the next dependency cannot be added to only half of them.
+    when the guard's dependencies changed — so the fixture tests passed while
+    the inline one raised AttributeError. One builder, so the next dependency
+    cannot be added to only half of them.
     """
     svc = SimpleNamespace()
-    svc._discovery_failures = dict(discovery_failures or {})
-    svc._discovery_failures_observed = set()
-    svc._effective_discovery_failures = (
-        LLMService._effective_discovery_failures.__get__(svc)
-    )
-    svc._vendor_catalog_is_authoritative = (
-        LLMService._vendor_catalog_is_authoritative.__get__(svc)
-    )
     svc._model_available_for_route = (
         LLMService._model_available_for_route.__get__(svc)
     )
@@ -61,12 +53,7 @@ def svc_with_catalog():
 
     # Populate the shared cache with a controlled catalog so the guard has
     # something to validate against. We don't need a full LLMService — the
-    # helper reads `provider.vendor`, `provider.model`, the cache, and (since
-    # #3190) `_vendor_catalog_is_authoritative`, which decides whether this
-    # vendor's catalog may be used to DISPROVE a model at all. That predicate
-    # is bound here rather than stubbed True: stubbing it would assert the
-    # thing under test, and leaving it off makes these tests fail with an
-    # AttributeError instead of exercising the guard.
+    # helper only reads `provider.vendor`, `provider.model`, and the cache.
     cache_contents = [
         _model("gpt-5", "openai"),
         _model("gpt-5-mini", "openai"),
@@ -81,8 +68,6 @@ def svc_with_catalog():
         "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
         return_value=fake_cache,
     ):
-        # No known discovery failures: the catalog above is trustworthy, which
-        # is the precondition every assertion in this module depends on.
         yield _guard_subject(LLMService)
 
 

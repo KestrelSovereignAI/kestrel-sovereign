@@ -60,107 +60,37 @@ class ModelDiscoveryMixin:
     then enriches them with catalog data (featured, hidden, display names).
     """
 
-    def _effective_discovery_failures(self) -> Dict[str, str]:
-        """Failures reconciled with the process-wide snapshot (#3190 r3 P1).
-
-        Copying once at construction let services diverge. Agent A refreshing
-        discovery updates A and the shared cache; agent B, constructed earlier,
-        keeps whatever it copied at boot — so B misses newly-failed vendors and
-        retains ones that have since recovered, and its mandate validation and
-        health both answer from stale state.
-
-        The shared snapshot is the newer fact whenever the shared cache holds
-        one, so it wins. A bare service with no shared data falls back to its
-        own map, which is what tests and pre-discovery boot see.
-        """
-        own = dict(getattr(self, "_discovery_failures", None) or {})
-        firsthand = set(getattr(self, "_discovery_failures_observed", None) or ())
-        try:
-            shared = get_shared_model_cache()
-            if shared.has_data():
-                published = shared.get_failed_vendors()
-                own.update(published)
-                # A vendor absent from the newer snapshot has recovered — but
-                # NOT if this service observed the failure itself and has not
-                # published it yet. The shared map is only written at the end
-                # of a refresh, so between `_safe_list_models` recording a
-                # failure and that publication the shared snapshot is the OLDER
-                # fact. Discarding a first-hand observation there meant a
-                # refresh that raised during enrichment, or was cancelled, left
-                # health and mandate validation trusting a stale healthy
-                # snapshot permanently (#3190 r4 P2).
-                for vendor in [
-                    v for v in own
-                    if v not in published and v not in firsthand
-                ]:
-                    del own[vendor]
-        except Exception:  # pragma: no cover - never break validation on this
-            pass
-        return own
-
-    def _adopt_discovery_failures(self, failures: Dict[str, str]) -> None:
-        """Take on a failure record produced elsewhere (disk, or a sibling).
-
-        ``setdefault`` so anything this instance learned first-hand wins over a
-        restored snapshot: our own observation is newer than the file's.
-        """
-        own = getattr(self, "_discovery_failures", None)
-        if own is None:
-            return
-        for vendor, reason in (failures or {}).items():
-            own.setdefault(vendor, reason)
-
     def _note_discovery_outcome(
-        self,
-        vendor: str,
-        models: Optional[List[ModelInfo]],
-        error: Optional[BaseException],
+        self, vendor: str, error: Optional[BaseException]
     ) -> None:
-        """Record what we actually learned about ``vendor``'s catalog (#3190).
+        """Record that ``vendor``'s discovery raised, for the health surface.
 
-        Three outcomes, not two. An exception is a failure; a NON-EMPTY list is
-        a success that clears any prior failure; an **empty list is neither** —
-        it means we came away with no catalog, and it must not be recorded as
-        success.
+        Deliberately records ONLY an observed exception. Earlier revisions also
+        tried to infer failure from the RETURNED VALUE — an empty list, or a
+        catalog that looked reduced — and that cannot work: every adapter
+        handles its own errors differently. ``AnthropicAdapter`` swallows a 401
+        and returns ``[]``; ``VertexAIAdapter`` swallows and returns a
+        non-empty STALE disk catalog; the OpenAI-compatible helpers raise. Five
+        review rounds each found one more convention, because the return value
+        does not carry the fact being inferred.
 
-        That third case is the one that matters. Adapters routinely handle
-        their own errors: ``AnthropicAdapter.list_models`` catches the 401 from
-        a revoked key and returns ``[]``. Treating every normal return as
-        successful retrieval therefore recorded SUCCESS for the exact outage
-        this fix exists for, cleared any prior failure, and left the collapsed
-        catalog free to veto the operator's pin — the first cut of this patch
-        did precisely that, and was only caught because a review asked what an
-        adapter does with its own exceptions (codex r2 P1).
+        So this records the one thing it actually observes. A vendor that
+        swallows its own error is invisible here, and that is stated rather
+        than papered over: fixing THAT needs an explicit outcome contract from
+        the adapters, which is a larger change than this one.
 
-        A vendor with a configured route that returns zero models is anomalous
-        whether or not an exception escaped, and in both cases the honest
-        statement is the same: we hold no catalog for it, so its rows cannot
-        disprove a model.
-
-        Success clears a prior failure so the veto resumes once the catalog is
-        retrievable again; otherwise one transient outage would disable the
-        guard for the life of the process.
+        Nothing gates routing on this. It drives the ``model_discovery`` health
+        check, so a dead credential is visible instead of living only in a log
+        line — which is the operator-facing gap #3190 was filed for.
         """
         failures = getattr(self, "_discovery_failures", None)
         if failures is None:
             # Bare harness / partially-constructed instance — nothing to record.
             return
-        observed = getattr(self, "_discovery_failures_observed", None)
-        if error is not None:
-            failures[vendor] = f"{type(error).__name__}: {error}"[:300]
-            if observed is not None:
-                observed.add(vendor)
-        elif not models:
-            failures[vendor] = (
-                "returned no models — no catalog retrieved "
-                "(an adapter may have handled an error internally)"
-            )
-            if observed is not None:
-                observed.add(vendor)
-        else:
+        if error is None:
             failures.pop(vendor, None)
-            if observed is not None:
-                observed.discard(vendor)
+        else:
+            failures[vendor] = f"{type(error).__name__}: {error}"[:300]
 
     async def discover_all_models(
         self,
@@ -271,7 +201,7 @@ class ModelDiscoveryMixin:
         for vendor, result in zip(discovery_vendors, results):
             if isinstance(result, BaseException):
                 logger.warning("%s: vendor discovery failed: %s", vendor, result)
-                self._note_discovery_outcome(vendor, None, result)
+                self._note_discovery_outcome(vendor, result)
             elif isinstance(result, list):
                 all_models.extend(result)
 
@@ -384,21 +314,7 @@ class ModelDiscoveryMixin:
 
         # Cache results in shared memory cache and on disk
         shared_cache.set(all_models)
-        # Prune vendors this run did not attempt (#3190 r3 P2). A failure
-        # restored from disk for a vendor since removed from configuration is
-        # never revisited by `_select_discovery_routes`, so without this it is
-        # rewritten to disk every run and keeps health degraded forever for a
-        # vendor that no longer exists.
-        current_failures = getattr(self, "_discovery_failures", None)
-        if current_failures is not None:
-            attempted = set(discovery_vendors)
-            for vendor in [v for v in current_failures if v not in attempted]:
-                del current_failures[vendor]
-        current_failures = current_failures or {}
-        catalog.write_cache(all_models, failed_vendors=current_failures)
-        # Publish to the process-wide cache as well, so sibling LLMServices
-        # that only ever see a cache HIT still learn which vendors are dark.
-        shared_cache.set_failed_vendors(current_failures)
+        catalog.write_cache(all_models)
 
         logger.info(f"Discovered {len(all_models)} models total")
 
@@ -1544,11 +1460,6 @@ class ModelDiscoveryMixin:
         shared_cache = get_shared_model_cache()
         if shared_cache.has_data():
             # Another LLMService instance already populated the shared cache.
-            # Adopt ITS failure record too (#3190 codex r2 P1): the catalog is
-            # process-wide but each agent owns an LLMService, so without this a
-            # sibling trusts the same reduced catalog while believing discovery
-            # was healthy, and can reject its own pin.
-            self._adopt_discovery_failures(shared_cache.get_failed_vendors())
             # Still resolve auto providers for THIS instance's provider list.
             cached = shared_cache.get_any()
             if cached:
@@ -1557,15 +1468,6 @@ class ModelDiscoveryMixin:
 
         catalog = get_catalog_service()
         cached = catalog.load_cache()
-        # Restore the failure record with the catalog it describes (#3190),
-        # BEFORE the `if cached` branch. A valid snapshot may legitimately hold
-        # zero models alongside a failure record — one auto-configured vendor
-        # whose discovery failed — and skipping restoration there let health
-        # report success on a catalog we know is empty because it broke
-        # (codex r2 P2).
-        persisted_failures = catalog.load_failed_vendors()
-        self._adopt_discovery_failures(persisted_failures)
-        shared_cache.set_failed_vendors(persisted_failures)
         if cached:
             shared_cache.set_stale(cached)
             logger.info(f"Pre-populated {len(cached)} models from disk cache")
@@ -1681,22 +1583,9 @@ class ModelDiscoveryMixin:
             models = await coro
         except Exception as e:  # noqa: BLE001 - discovery must never break init
             logger.warning("%s: model discovery failed: %s", vendor, e)
-            self._note_discovery_outcome(vendor, None, e)
+            self._note_discovery_outcome(vendor, e)
             return []
-        if not models:
-            # SKIPPED, not failed. On this seam the helpers raise for a real
-            # error, so an empty list means they never issued a request —
-            # no base_url, or the credential env var is unset because the key
-            # was supplied inline or under a custom name. Recording that as a
-            # failure would permanently degrade health and disable mandate
-            # validation for a vendor nothing went wrong with (#3190 r3 P2).
-            #
-            # ``_safe_list_models`` deliberately treats empty as failure: an
-            # adapter there MAY swallow its own error, so empty is ambiguous.
-            # Same value, different contract, because the paths differ.
-            logger.debug("%s: discovery skipped (not attempted)", vendor)
-            return []
-        self._note_discovery_outcome(vendor, models, None)
+        self._note_discovery_outcome(vendor, None)
         return models
 
     async def _safe_list_models(self, vendor: str, adapter, client) -> List[ModelInfo]:
@@ -1711,7 +1600,7 @@ class ModelDiscoveryMixin:
             if hasattr(adapter, 'list_models'):
                 models = await adapter.list_models(client)
                 logger.debug("%s: discovered %d models", vendor, len(models))
-                self._note_discovery_outcome(vendor, models, None)
+                self._note_discovery_outcome(vendor, None)
                 return models
         except NotImplementedError:
             # Not a failure: the adapter simply publishes no catalog. Recording
@@ -1721,7 +1610,7 @@ class ModelDiscoveryMixin:
             logger.debug("%s: adapter.list_models not implemented", vendor)
         except Exception as e:
             logger.warning("%s: model discovery failed: %s", vendor, e)
-            self._note_discovery_outcome(vendor, None, e)
+            self._note_discovery_outcome(vendor, e)
         return []
 
     async def _discover_local_openai_compatible(

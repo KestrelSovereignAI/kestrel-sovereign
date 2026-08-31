@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 import threading
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 from .model_metadata import ModelInfo
 
@@ -32,13 +32,6 @@ class SharedModelCache:
 
     def __init__(self, cache_ttl: int = DEFAULT_CACHE_TTL_SECONDS):
         self._models: Optional[List[ModelInfo]] = None
-        # vendor -> discovery error, travelling WITH the snapshot it describes
-        # (#3190). The catalog is process-wide but each agent owns its own
-        # LLMService, so a per-service record reached only the one instance
-        # that performed the discovery or the disk load. Every sibling then
-        # trusted the same reduced catalog, reported healthy discovery, and
-        # could reject its own pin (codex r2 P1).
-        self._failed_vendors: Dict[str, str] = {}
         self._timestamp: Optional[float] = None
         self._ttl = cache_ttl
         self._lock = threading.Lock()
@@ -83,21 +76,6 @@ class SharedModelCache:
             self._models = models
             self._timestamp = 0.0
             logger.debug(f"Shared model cache pre-populated (stale): {len(models)} models")
-
-    def get_failed_vendors(self) -> Dict[str, str]:
-        """Vendors whose discovery failed for the CURRENT snapshot (#3190)."""
-        with self._lock:
-            return dict(self._failed_vendors)
-
-    def set_failed_vendors(self, failed: Optional[Dict[str, str]]) -> None:
-        """Replace the failure record attached to the current snapshot.
-
-        Replaces rather than merges: the record describes one snapshot, and a
-        vendor that has since succeeded must not keep a stale failure that
-        would suppress its veto forever.
-        """
-        with self._lock:
-            self._failed_vendors = dict(failed or {})
 
     def has_data(self) -> bool:
         """Check if any data exists (fresh or stale)."""
@@ -187,7 +165,6 @@ class SharedModelCache:
         """Invalidate cache to force rediscovery."""
         with self._lock:
             self._models = None
-            self._failed_vendors = {}
             self._timestamp = None
             refresh_task = self._refresh_task
             refresh_loop = self._refresh_loop

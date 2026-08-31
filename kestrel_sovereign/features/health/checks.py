@@ -943,17 +943,7 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
             "duration_ms": _elapsed(start),
         }
 
-    # Reconciled with the process-wide snapshot, not this service's private
-    # copy (#3190 r3 P1) — otherwise a sibling agent reports healthy discovery
-    # while the vendor is dark for the whole process.
-    reader = getattr(llm_service, "_effective_discovery_failures", None)
-    if callable(reader):
-        try:
-            failures = reader()
-        except Exception:  # pragma: no cover - a health check must not raise
-            failures = getattr(llm_service, "_discovery_failures", None)
-    else:
-        failures = getattr(llm_service, "_discovery_failures", None)
+    failures = getattr(llm_service, "_discovery_failures", None)
     if not isinstance(failures, dict) or not failures:
         return {
             "name": "model_discovery",

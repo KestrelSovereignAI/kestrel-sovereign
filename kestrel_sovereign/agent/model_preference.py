@@ -98,7 +98,30 @@ class ModelPreferenceMixin:
                 )
                 return
             if model and model != "auto":
-                self.llm_service.set_model_preference(model, vendor, route)
+                # Re-applying our OWN persisted decision, so do not re-validate
+                # it against the live catalog (#3190).
+                #
+                # Validation belongs at the boundary where NEW information
+                # enters — `set_model_preference` from an operator or a tool,
+                # where #1927/#1946 guard against a hallucinated triple being
+                # written. Replaying a triple this agent already accepted is a
+                # different boundary, and gating it on a catalog fetched
+                # seconds earlier means a transient discovery problem silently
+                # revokes a deliberate choice.
+                #
+                # That is exactly the 2026-08-31 outage: the Anthropic key was
+                # disabled, `GET /v1/models` 401ed, the collapsed catalog
+                # "proved" claude-opus-5 unservable, this call raised, the
+                # except below swallowed it, and all four agents booted
+                # unpinned onto a 1B local model. The route itself was fine
+                # throughout — only discovery was broken.
+                #
+                # If the pin really is unservable, `resolve_provider_routing`
+                # raises `LLMProviderUnavailableError` at use time. Loud at the
+                # point of use beats silent at boot.
+                self.llm_service.set_model_preference(
+                    model, vendor, route, validate=False
+                )
                 if vendor and route:
                     logging.info("Loaded persisted model preference: %s:%s/%s", vendor, route, model)
                 elif vendor:
