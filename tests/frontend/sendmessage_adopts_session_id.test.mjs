@@ -171,10 +171,14 @@ test('non-streaming fallback also adopts session_id from response.session_id', a
     const origInvokeForAgent = apiModule.default.invokeForAgent;
     const origUseStreaming = state.useStreaming;
     state.useStreaming = false;  // force non-streaming path
-    apiModule.default.invokeForAgent = async () => ({
-        response: 'plain reply',
-        session_id: 'json-sess-7',
-    });
+    let invokeArgs;
+    apiModule.default.invokeForAgent = async (...args) => {
+        invokeArgs = args;
+        return {
+            response: 'plain reply',
+            session_id: 'json-sess-7',
+        };
+    };
 
     messageInput.value = 'hi';
     await sendMessage();
@@ -184,4 +188,7 @@ test('non-streaming fallback also adopts session_id from response.session_id', a
 
     assert.equal(pane.sessionId, 'json-sess-7',
         'non-streaming path must adopt pane.sessionId from response.session_id');
+    assert.equal(typeof invokeArgs[5], 'string');
+    assert.ok(invokeArgs[5].length > 0,
+        'non-streaming chat must carry an exact Stop request id');
 });
