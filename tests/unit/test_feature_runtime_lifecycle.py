@@ -852,6 +852,42 @@ async def test_deferred_best_effort_hook_child_cancellation_settles_readiness(tm
 
 
 @pytest.mark.asyncio
+async def test_direct_readiness_caller_cancellation_propagates(tmp_path):
+    """Cancelling the readiness caller must not be mistaken for a hook failure."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    gate.set()
+    agent._host_context_publication_gate = gate
+    agent.defer_agent_readiness_to_host()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            started.set()
+            await release.wait()
+
+    feature = BlockingReadyFeature(agent)
+    agent.features[feature.name] = feature
+    await agent._run_or_defer_agent_ready_hooks()
+    assert agent._agent_ready_hooks_deferred is True
+
+    readiness = asyncio.create_task(agent.complete_deferred_agent_readiness())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    readiness.cancel("direct readiness caller cancelled")
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await readiness
+    finally:
+        release.set()
+
+    assert agent._agent_ready_hooks_deferred is True
+    assert agent._agent_ready_hooks_completed is False
+    assert agent._agent_readiness_host_owned is True
+
+
+@pytest.mark.asyncio
 async def test_runtime_enable_registers_contributed_hard_permission_immediately(
     tmp_path,
 ):

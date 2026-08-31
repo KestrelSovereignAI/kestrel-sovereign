@@ -3542,10 +3542,16 @@ class KestrelAgent(
                 # child task that was independently cancelled; on modern
                 # Python that outcome is a BaseException and used to cancel
                 # the entire deferred-readiness task after host publication.
-                # Manager-owned caller cancellation never cancels this task
-                # (it is joined through a shield), so treating the hook-local
-                # outcome like every other optional hook failure preserves the
-                # committed agent lifecycle.
+                # That case leaves this task's cancellation count at zero.
+                # Cancellation of the readiness task itself must still
+                # propagate so direct-agent initialization remains cancellable.
+                readiness_task = asyncio.current_task()
+                if (
+                    isinstance(e, asyncio.CancelledError)
+                    and readiness_task is not None
+                    and readiness_task.cancelling()
+                ):
+                    raise
                 logging.warning(
                     "on_agent_ready failed for %s: %s",
                     getattr(feature, "name", type(feature).__name__), e,
