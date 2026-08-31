@@ -804,8 +804,43 @@ class SchedulerFeature(Feature):
                     ),
                 )
 
+        # Resolve the task's mode BEFORE either direct-tool fallback below.
+        # Both fallbacks exist to run a tool, and a COGNITION row has none by
+        # construction — its whole point is to produce a turn. Sending one down
+        # a tool path cannot succeed, and it does not fail loudly either:
+        # `_lookup_and_run_tool` finds no tool, sees the name IS in CRON_TASKS,
+        # and returns the benign "skipped: owning feature not loaded yet"
+        # string meant for the startup-order race (#1796). The runner records
+        # that as SUCCESS and terminalizes the one-shot, so the agent's
+        # follow-up intention is consumed without a turn ever happening and
+        # nothing anywhere reports a problem (#3112 gate-5 P2).
+        #
+        # That guard keys on "name is in CRON_TASKS" as a proxy for "this task
+        # has a tool that will exist on a later tick". True for every member of
+        # that table until this feature added the first one whose tool will
+        # never exist. Deciding on the MODE — the property that actually makes
+        # it different — is one guard on the real question rather than one per
+        # door.
+        mode_by_name = {name: mode for name, mode, _ in CRON_TASKS}
+        mode = mode_by_name.get(task_name)
+
         dispatcher = getattr(self.agent, "dispatcher", None)
         if dispatcher is None:
+            if mode is SignalMode.COGNITION:
+                logger.error(
+                    "SchedulerFeature: %r is a COGNITION task and there is no "
+                    "dispatcher to deliver it; reporting a missed turn rather "
+                    "than consuming the row via the direct-tool fallback.",
+                    task_name,
+                )
+                return ScheduledTaskOutcome(
+                    status="failed",
+                    result_text=(
+                        f"missed: {task_name} is a COGNITION task and requires "
+                        "a dispatcher to produce a turn; none was available, so "
+                        "no turn was delivered"
+                    ),
+                )
             # Fallback for partially-initialized agents (e.g. legacy
             # test fixtures): execute the tool directly without going
             # through the signal pipeline. Production agents always
@@ -816,13 +851,10 @@ class SchedulerFeature(Feature):
             )
             return await self._lookup_and_run_tool(task_name, args)
 
-        # Look up the task's mode from the classification table. If a
-        # task fires that isn't in CRON_TASKS, it has no source
-        # registration — fall back to direct tool execution rather than
-        # rejecting (preserves backward compat for ad-hoc tools added
-        # via `!schedule add <cron> <custom_tool>`).
-        mode_by_name = {name: mode for name, mode, _ in CRON_TASKS}
-        mode = mode_by_name.get(task_name)
+        # A task that isn't in CRON_TASKS has no source registration — fall
+        # back to direct tool execution rather than rejecting (preserves
+        # backward compat for ad-hoc tools added via
+        # `!schedule add <cron> <custom_tool>`).
         if mode is None:
             logger.info(
                 "SchedulerFeature: %r has no source registration, "
@@ -1223,6 +1255,48 @@ class SchedulerFeature(Feature):
             )
 
         raise ValueError(f"Unknown task: {task_name}")
+
+    #: Keys inside a persisted ``args_json`` that hold conversation-derived
+    #: text. A volatile privacy mode promises this content does not outlive
+    #: the session, so it must not be read back out of durable storage.
+    CONVERSATION_DERIVED_ARG_KEYS: frozenset = frozenset({"intent"})
+
+    def _redact_conversation_derived_args(
+        self, task_name: str, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Strip conversation-derived fields when privacy forbids reading them.
+
+        Creating a follow-up and firing one are both refused under EPHEMERAL /
+        ISOLATED / DEIDENTIFIED. Reading one back was not, so the exact text
+        those two guards protect came straight back out of ``args_json``
+        (#3112 gate-5 P1).
+
+        Redaction lives at the READ of the row rather than in each caller on
+        purpose. ``schedule_list`` predates this feature and reads the same
+        column with no privacy check on ``origin/main``; it became a
+        disclosure path the moment its rows began carrying conversation
+        content. Guarding only the new reader would leave the older, less
+        obvious one open — and reader N+1 after that. This is the same
+        reasoning already written into ``READ_ONLY_SCHEDULER_TOOLS`` about
+        tool N+1 becoming a bypass wrapper.
+
+        Returns the args unchanged outside a volatile mode, so the normal path
+        pays a single boolean.
+        """
+        if task_name != SELF_FOLLOWUP_TASK_NAME or not args:
+            return args
+        from kestrel_sovereign.features.storage_access import (
+            hides_persisted_user_content,
+        )
+
+        if not hides_persisted_user_content(self.agent):
+            return args
+        redacted = dict(args)
+        for key in self.CONVERSATION_DERIVED_ARG_KEYS:
+            if key in redacted:
+                redacted[key] = ""
+                redacted.setdefault("redacted_keys", []).append(key)
+        return redacted
 
     #: Scheduler tools that only READ schedule state.  Everything this
     #: feature declares that is not listed here is treated as
@@ -2312,6 +2386,9 @@ class SchedulerFeature(Feature):
                 try:
                     parsed = json.loads(raw_args)
                     args = parsed if isinstance(parsed, dict) else {}
+                    # Same redaction as schedule_self_followups: this reader
+                    # is older and returns the same column (#3112 gate-5 P1).
+                    args = self._redact_conversation_derived_args(row[1], args)
                     if not isinstance(parsed, dict):
                         load_errors.append({
                             "task_id": row[0],
@@ -2839,7 +2916,33 @@ class SchedulerFeature(Feature):
             "scheduled_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    async def _create_schedule(
+    async def _create_schedule(self, **kwargs: Any) -> ToolResult:
+        """Persist a schedule, serialised against privacy transitions.
+
+        A ``self_followup`` row carries conversation-derived text, and
+        ``_prepare_self_followup_args`` refuses to build one under a volatile
+        privacy mode. That check is synchronous and returns; the INSERT happens
+        several awaits later (``_scheduled_task_denied``,
+        ``_lock_active_scheduler_rollout``, ``scheduler_database_clock``). The
+        scheduler feature referenced ``privacy_transition_lock`` nowhere, so a
+        transition to EPHEMERAL / ISOLATED / DEIDENTIFIED could land in that
+        gap and the intent would reach raw ``args_json`` after the mode that
+        forbids it was already active (#3112 gate-5 P1).
+
+        Holding the agent's own transition lock across check-and-persist is
+        what makes the check mean anything at the moment of the write. Taken
+        only for the follow-up path: every other schedule kind carries tool
+        arguments, not conversation content, and does not need to contend for
+        a lock a privacy transition also wants.
+        """
+        if kwargs.get("task_name") == SELF_FOLLOWUP_TASK_NAME:
+            lock_getter = getattr(self.agent, "_get_privacy_transition_lock", None)
+            if callable(lock_getter):
+                async with lock_getter():
+                    return await self._create_schedule_locked(**kwargs)
+        return await self._create_schedule_locked(**kwargs)
+
+    async def _create_schedule_locked(
         self,
         *,
         task_name: str,
@@ -4143,6 +4246,9 @@ class SchedulerFeature(Feature):
             try:
                 parsed = json.loads(row[1]) if row[1] else {}
                 if isinstance(parsed, dict):
+                    parsed = self._redact_conversation_derived_args(
+                        SELF_FOLLOWUP_TASK_NAME, parsed
+                    )
                     intent = str(parsed.get("intent") or "")
                     session_bound = bool(parsed.get("origin_session_id"))
                     scheduled_at = parsed.get("scheduled_at")
