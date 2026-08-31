@@ -170,11 +170,13 @@ class StopOutcome:
                 raise ValueError(
                     "requested_target must be a non-empty string when supplied"
                 )
-        if (
-            not isinstance(self.resolved_target, str)
-            or not self.resolved_target.strip()
-        ):
-            raise ValueError("resolved_target must be a concrete string")
+        # ``resolved_target`` is deliberately polymorphic: a direct work
+        # address resolves to the owning target identity, while a public turn
+        # address resolves to its private request key. Both are already
+        # validated at inventory construction; preserve either exact opaque
+        # value here without imposing the work-address length bound on a DID.
+        if not isinstance(self.resolved_target, str) or not self.resolved_target:
+            raise ValueError("resolved_target must be a non-empty string")
         for field_name, value in (
             ("agent_id", self.agent_id),
             ("correlation_id", self.correlation_id),
