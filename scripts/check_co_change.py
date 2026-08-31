@@ -191,6 +191,21 @@ def changed_line_map(
     return dict(new_map), dict(old_map)
 
 
+def _paths(output: str) -> set[str]:
+    """Split NUL-delimited git output into paths.
+
+    Under the default ``core.quotePath``, every git command that prints a
+    PATHNAME C-quotes non-ASCII — ``git grep -l`` returns ``"caf\303\251.py"``,
+    and so does ``ls-files``. A quoted name is not a real path: ``_tree_for``
+    skips it and the occurrence in that file silently vanishes. ``-z`` emits the
+    bytes verbatim, so there is nothing to decode and nothing to get wrong.
+
+    Round 8 fixed exactly this for the diff header and left the file-list
+    commands alone — the same boundary, the other end.
+    """
+    return {part for part in output.split("\0") if part}
+
+
 def _patch_path(raw: str) -> str | None:
     """Decode a path out of a ``git diff`` header line.
 
@@ -238,10 +253,12 @@ def _candidate_files(pattern: str, *, fixed: bool) -> set[str]:
     # files and left this half behind: a new file entered the changed map but
     # was never searched, so its occurrence could not be counted as touched and
     # the gate reported clean. A boundary has two ends.
-    output = _git(
-        "grep", "-l", "--untracked", "-F" if fixed else "-E", "--", pattern, "*.py"
+    return _paths(
+        _git(
+            "grep", "-lz", "--untracked", "-F" if fixed else "-E",
+            "--", pattern, "*.py",
+        )
     )
-    return {line for line in output.splitlines() if line}
 
 
 _TREES: dict[tuple[str, str], ast.AST | None] = {}
@@ -376,17 +393,15 @@ def index_for(path: str, ref: str = "") -> FileIndex | None:
 
 def untracked_python_files() -> set[str]:
     """Python files git does not track yet — invisible to ``git diff``."""
-    output = _git("ls-files", "--others", "--exclude-standard", "--", "*.py")
-    return {line for line in output.splitlines() if line}
+    return _paths(_git("ls-files", "-z", "--others", "--exclude-standard", "--", "*.py"))
 
 
 def _files_matching_all(*patterns: str) -> set[str]:
     """Files matching EVERY pattern — a cheap conjunction the AST then judges."""
-    args = ["grep", "-l", "--untracked", "--all-match", "-E"]
+    args = ["grep", "-lz", "--untracked", "--all-match", "-E"]
     for pattern in patterns:
         args += ["-e", pattern]
-    output = _git(*args, "--", "*.py")
-    return {line for line in output.splitlines() if line}
+    return _paths(_git(*args, "--", "*.py"))
 
 
 def _word_pattern(word: str) -> str:
