@@ -107,6 +107,15 @@ class ModelPreferenceMixin:
                     logging.info("Loaded persisted model preference: %s", model)
         except Exception as e:
             logging.warning(f"Failed to load model preference: {e}")
+            # Record the drop for the health surface (#3190). A persisted pin
+            # that fails to apply is an operator-visible degradation: the agent
+            # then runs unpinned and routing falls through to route_priority,
+            # which with allow_paid_fallback=false can land on a 1B local model.
+            # A WARNING line in a multi-million-line host log is not a surface.
+            try:
+                self.llm_service._mandate_load_error = str(e)[:300]
+            except Exception:  # pragma: no cover - never fail boot on reporting
+                pass
 
     async def _persist_model_preference(
         self,

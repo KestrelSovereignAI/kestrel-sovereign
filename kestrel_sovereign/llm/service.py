@@ -455,6 +455,27 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
 
+        # Per-vendor model-discovery outcome (#3190). A vendor is listed here
+        # ONLY after ``list_models`` returned successfully for it, so the set
+        # answers "do we hold a catalog for this vendor that is complete enough
+        # to disprove a model?" — a question ``len(catalog) > 0`` cannot answer.
+        #
+        # This distinction is load-bearing: when the Anthropic key was disabled
+        # on 2026-08-31, ``GET /v1/models`` 401ed and the vendor catalog
+        # collapsed to a single stale entry. Non-empty was read as complete, so
+        # ``_validate_explicit_mandate`` "proved" claude-opus-5 unservable and
+        # every agent's persisted pin was discarded at boot — dropping the
+        # fleet onto a 1B local model. Only a *successful* discovery may veto.
+        self._discovery_ok: set[str] = set()
+        # vendor -> last discovery error string, for the health surface. An
+        # operator-actionable condition (dead key, network) must not live only
+        # in a log line.
+        self._discovery_failures: Dict[str, str] = {}
+        # Set when a PERSISTED mandate failed to apply at boot (#3190) — the
+        # operator set a model and it is not in effect. Cleared by a successful
+        # set_model_preference.
+        self._mandate_load_error: Optional[str] = None
+
         # Top-level embedding-route knob (#2263). ``[llm] embedding_route =
         # "<vendor>:<route>"`` selects the embedding channel independently of
         # the chat route — one setting instead of repeating ``embedding_sibling``
@@ -1865,6 +1886,10 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             self._validate_explicit_mandate(model, vendor, route)
 
         self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
+        # A mandate is in effect again — clear any recorded boot-time drop so
+        # the health surface stops reporting a condition the operator fixed
+        # (#3190). Without this the warning is sticky for the process lifetime.
+        self._mandate_load_error = None
         if route:
             logger.info("Model preference set: %s:%s/%s", vendor, route, model)
         else:
@@ -1981,6 +2006,19 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # Discovery has no catalog for THIS vendor yet → unknown for this
             # vendor, permit (resolve-time still defends). Only a *populated*
             # vendor catalog can prove a model invalid.
+            return
+        if vendor not in getattr(self, "_discovery_ok", set()):
+            # We hold rows for this vendor but never completed a successful
+            # discovery for it, so those rows are a stale or partial remnant —
+            # unknown, not disproof (#3190).
+            #
+            # "Non-empty" is not "complete". On 2026-08-31 the Anthropic key was
+            # disabled, GET /v1/models 401ed, and this vendor's catalog
+            # collapsed to one stale entry. The old code read that as proof and
+            # rejected claude-opus-5 — a model with 3,631 successful calls on
+            # that very route. The rejection propagated to every agent's boot
+            # load, which discards a failed mandate on a WARNING line, leaving
+            # the whole fleet unpinned and routed to a 1B local model.
             return
         if model in vendor_models:
             return

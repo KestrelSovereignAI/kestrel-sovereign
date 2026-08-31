@@ -84,6 +84,25 @@ def derive_overall_status(checks: List[Dict[str, Any]]) -> str:
     return "healthy"
 
 
+def worst_status(*statuses: str) -> str:
+    """Combine severities within a SINGLE check, keeping the worst.
+
+    A check whose status is written by more than one condition must never let a
+    later, milder condition overwrite an earlier severe one — two facts sharing
+    one variable means the last write silently downgrades the stronger. Callers
+    use this instead of a bare assignment so the ordering of conditions cannot
+    change the verdict.
+
+    Unknown statuses sort as ``pass`` so a typo cannot manufacture a failure.
+    """
+    rank = {"pass": 0, "warn": 1, "fail": 2}
+    worst = "pass"
+    for status in statuses:
+        if rank.get(status, 0) > rank[worst]:
+            worst = status
+    return worst
+
+
 async def check_database(db) -> Dict[str, Any]:
     """Check database connectivity with a simple query.
 
@@ -228,15 +247,37 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             reachability = getattr(llm_service, "reachability", None)
             if not isinstance(reachability, list):
                 reachability = None
+
+            # Severity is written by more than one condition below, so each
+            # verdict is combined through worst_status() rather than assigned —
+            # a plain assignment lets a later, milder condition downgrade an
+            # earlier severe one.
             status = "pass"
+
+            details: Dict[str, Any] = {}
             if reachability:
+                details["reachability"] = reachability
                 if any(r.get("status") == "unreachable" for r in reachability):
-                    status = "warn"
+                    status = worst_status(status, "warn")
+
+            # A persisted mandate that failed to apply (#3190): the operator set
+            # a model and it is NOT in effect, so this agent is running on
+            # whatever route_priority picks. Previously this state existed only
+            # as one WARNING line at boot.
+            mandate_load_error = getattr(llm_service, "_mandate_load_error", None)
+            if mandate_load_error:
+                status = worst_status(status, "warn")
+                details["mandate_load_error"] = mandate_load_error
+                msg += (
+                    " — a persisted model preference failed to apply; this "
+                    f"agent is running UNPINNED ({mandate_load_error})"
+                )
+
             return {
                 "name": "llm_service",
                 "status": status,
                 "message": msg,
-                "details": {"reachability": reachability} if reachability else {},
+                "details": details,
                 "duration_ms": _elapsed(start),
             }
 
@@ -865,6 +906,86 @@ async def check_birth_record(agent) -> Dict[str, Any]:
     }
 
 
+async def check_model_discovery(agent) -> Dict[str, Any]:
+    """Surface vendors whose model discovery failed (#3190).
+
+    A revoked or disabled API key makes ``GET /v1/models`` fail while chat calls
+    on the same vendor keep working — they use a different credential and a
+    different endpoint. That asymmetry is why the condition needs its own
+    surface: nothing else notices.
+
+    It matters because a vendor with no retrievable catalog cannot validate a
+    pinned model. On 2026-08-31 the Anthropic key was disabled, discovery
+    401ed, and the resulting empty catalog caused every agent's persisted
+    ``anthropic:plan/claude-opus-5`` pin to be rejected at boot and discarded on
+    a WARNING line — dropping the whole fleet onto a 1B local model with no
+    health signal anywhere.
+
+    ``warn`` when any vendor's discovery failed. ``fail`` when the failing
+    vendor is the one THIS agent's mandate points at, since that is the pin
+    actually at risk. Neither is critical in
+    :func:`derive_overall_status`, so this reports ``degraded`` rather than
+    taking the host to ``unhealthy`` for a catalog problem.
+    """
+    start = time.monotonic()
+
+    llm_service = getattr(agent, "llm_service", None)
+    if llm_service is None:
+        return {
+            "name": "model_discovery",
+            "status": "pass",
+            "message": "No LLM service configured",
+            "duration_ms": _elapsed(start),
+        }
+
+    failures = getattr(llm_service, "_discovery_failures", None)
+    if not isinstance(failures, dict) or not failures:
+        return {
+            "name": "model_discovery",
+            "status": "pass",
+            "message": "Model discovery healthy for all configured vendors",
+            "duration_ms": _elapsed(start),
+        }
+
+    # Is the agent's own pinned vendor among the failures? That is the case
+    # that silently unpins this agent on its next restart.
+    pinned_vendor = None
+    try:
+        if hasattr(llm_service, "get_model_preference"):
+            pinned_vendor = (llm_service.get_model_preference() or {}).get("vendor")
+    except Exception:  # pragma: no cover - never let a health check raise
+        pinned_vendor = None
+
+    vendors = sorted(failures)
+    pinned_at_risk = pinned_vendor in failures if pinned_vendor else False
+
+    if pinned_at_risk:
+        message = (
+            f"Model discovery failed for '{pinned_vendor}', the vendor this "
+            f"agent's model is pinned to — the pin cannot be validated and "
+            f"will be discarded on the next restart. "
+            f"{failures[pinned_vendor]}"
+        )
+    else:
+        message = (
+            f"Model discovery failed for {len(vendors)} vendor(s): "
+            f"{', '.join(vendors)}. Pinned models for these vendors cannot be "
+            f"validated. Check the vendor API credentials."
+        )
+
+    return {
+        "name": "model_discovery",
+        "status": "fail" if pinned_at_risk else "warn",
+        "message": message,
+        "details": {
+            "failed_vendors": {v: failures[v] for v in vendors},
+            "pinned_vendor": pinned_vendor,
+            "pinned_vendor_at_risk": pinned_at_risk,
+        },
+        "duration_ms": _elapsed(start),
+    }
+
+
 async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
     """The checks every health surface runs, in one place.
 
@@ -900,6 +1021,7 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
         ),
         await check_signal_audit_log(agent),
         await check_birth_record(agent),
+        await check_model_discovery(agent),
     ]
 
 

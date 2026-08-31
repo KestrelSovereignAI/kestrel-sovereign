@@ -60,6 +60,34 @@ class ModelDiscoveryMixin:
     then enriches them with catalog data (featured, hidden, display names).
     """
 
+    def _note_discovery_outcome(
+        self, vendor: str, error: Optional[BaseException]
+    ) -> None:
+        """Record whether ``vendor``'s catalog was actually retrieved (#3190).
+
+        Success and failure are recorded as two separate facts rather than
+        inferred from the returned list's length. A failed ``list_models`` and
+        a vendor that genuinely serves nothing both yield ``[]``, and only the
+        first must be barred from vetoing an operator's pinned model in
+        ``_validate_explicit_mandate``.
+
+        A vendor that succeeded earlier and fails now LOSES its trusted status:
+        the catalog we hold for it may be a stale remnant, and the safe
+        direction for a convenience guard is to permit (resolve-time still
+        defends).
+        """
+        ok = getattr(self, "_discovery_ok", None)
+        failures = getattr(self, "_discovery_failures", None)
+        if ok is None or failures is None:
+            # Bare harness / partially-constructed instance — nothing to record.
+            return
+        if error is None:
+            ok.add(vendor)
+            failures.pop(vendor, None)
+        else:
+            ok.discard(vendor)
+            failures[vendor] = f"{type(error).__name__}: {error}"[:300]
+
     async def discover_all_models(
         self,
         use_cache: bool = True,
@@ -153,17 +181,23 @@ class ModelDiscoveryMixin:
         # Discovery runs PER VENDOR, not per route. A vendor may have multiple
         # routes (anthropic:api + anthropic:plan); they share the catalog, so
         # we pick the first route per vendor whose adapter can list models.
+        discovery_vendors: List[str] = []
         discovery_tasks = []
         for vendor, route in self._select_discovery_routes():
+            discovery_vendors.append(vendor)
             discovery_tasks.append(
                 self._discover_for_vendor_route(vendor, route)
             )
 
         results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
 
-        for result in results:
-            if isinstance(result, Exception):
-                logger.warning(f"Vendor discovery failed: {result}")
+        # Zip vendors back onto results (#3190): ``gather`` returns a bare list,
+        # so the previous loop could neither name the failing vendor in its
+        # warning nor record the outcome against it.
+        for vendor, result in zip(discovery_vendors, results):
+            if isinstance(result, BaseException):
+                logger.warning("%s: vendor discovery failed: %s", vendor, result)
+                self._note_discovery_outcome(vendor, result)
             elif isinstance(result, list):
                 all_models.extend(result)
 
@@ -1535,11 +1569,16 @@ class ModelDiscoveryMixin:
             if hasattr(adapter, 'list_models'):
                 models = await adapter.list_models(client)
                 logger.debug("%s: discovered %d models", vendor, len(models))
+                self._note_discovery_outcome(vendor, None)
                 return models
         except NotImplementedError:
+            # Not a failure and not a success: the adapter publishes no catalog
+            # at all, so we still hold no trustworthy list for this vendor and
+            # must not let whatever rows exist disprove a model.
             logger.debug("%s: adapter.list_models not implemented", vendor)
         except Exception as e:
             logger.warning("%s: model discovery failed: %s", vendor, e)
+            self._note_discovery_outcome(vendor, e)
         return []
 
     async def _discover_local_openai_compatible(
