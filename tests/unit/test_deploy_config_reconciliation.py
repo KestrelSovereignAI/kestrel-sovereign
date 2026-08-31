@@ -312,6 +312,19 @@ def test_cloudrun_profiles_declare_honest_persistence(live_config):
         validate_cloudrun_persistence(multi_prod)
 
 
+def test_production_ceremony_provisions_only_the_cluster_probe_privilege():
+    """Least-privilege runtime roles can read the Hold cluster identity."""
+
+    deployment_guide = (REPO_ROOT / "docs/deployment/README.md").read_text()
+
+    assert (
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system()"
+        in deployment_guide
+    )
+    assert "both PostgreSQL runtime roles" in deployment_guide
+    assert "GRANT pg_monitor" not in deployment_guide
+
+
 def test_prod_instance_cap_matches_provisioned_database(live_config):
     """``prod``'s scaling numbers must match the substrate behind them.
 

@@ -639,11 +639,14 @@ class HoldStore:
 
         try:
             rows = await db.fetchall(
-                "SELECT system_identifier::text FROM pg_control_system()"
+                "SELECT system_identifier::text "
+                "FROM pg_catalog.pg_control_system()"
             )
         except Exception as exc:
             raise HoldStateError(
-                f"could not verify PostgreSQL Hold {label} cluster identity"
+                f"could not verify PostgreSQL Hold {label} cluster identity; "
+                "the runtime role requires EXECUTE on "
+                "pg_catalog.pg_control_system()"
             ) from exc
         if (
             len(rows) != 1
@@ -1726,8 +1729,8 @@ class HoldStore:
                     raise HoldCorruptStateError(
                         "Hold boot-state target has an invalid scope"
                     ) from exc
-                target_id = str(row[1])
-                if not target_id.strip():
+                target_id = row[1]
+                if not isinstance(target_id, str) or not target_id.strip():
                     raise HoldCorruptStateError(
                         "Hold boot-state target is missing its identity"
                     )
