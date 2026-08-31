@@ -280,6 +280,18 @@ def _require_successful_task_result(
             task_name,
             detail or "tool returned an error result",
         )
+        # The prose above stays out of the exception on purpose (see the note
+        # above: the dispatcher persists exception text outside the bounded
+        # result-summary channel). A tool's `reason_code` is not prose — it is
+        # a short controlled token the tool chose — so it can cross that
+        # boundary safely and is the difference between a diagnosable failure
+        # and five identical days of "scheduled tool signal_dispatch failed"
+        # in signal_log with no cause attached.
+        reason_code = _failure_reason_code(evaluated_result)
+        if reason_code:
+            raise RuntimeError(
+                f"scheduled tool {task_name} failed ({reason_code})"
+            )
         raise RuntimeError(f"scheduled tool {task_name} failed")
     return result
 
@@ -431,3 +443,30 @@ def build_cron_registrations(
         )
 
     return registrations
+
+
+_REASON_CODE_MAX_LEN = 64
+
+
+def _failure_reason_code(result: Any) -> str:
+    """Return a tool's short ``reason_code``, or "" when it did not set one.
+
+    Bounded deliberately: only a token-shaped value crosses into the exception
+    text, never free-form error prose, so the redaction rationale above is
+    preserved. Anything unexpectedly long or non-token is dropped rather than
+    truncated, because a half-token is worse than none.
+    """
+    data = None
+    if isinstance(result, ToolResult):
+        data = result.data
+    elif isinstance(result, dict):
+        data = result.get("data") if isinstance(result.get("data"), dict) else result
+    if not isinstance(data, dict):
+        return ""
+    code = data.get("reason_code")
+    if not isinstance(code, str):
+        return ""
+    code = code.strip()
+    if not code or len(code) > _REASON_CODE_MAX_LEN:
+        return ""
+    return code if code.replace("_", "").isalnum() else ""
