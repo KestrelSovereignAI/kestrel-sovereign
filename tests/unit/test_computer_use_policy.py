@@ -16,6 +16,7 @@ from kestrel_sovereign.features.computer_use.policy import (
     Decision,
     PathPolicy,
     command_contains_unquoted_shell_control,
+    command_word_is_shell_grammar,
     first_shell_significant_character,
     first_unquoted_shell_control,
     quote_words_containing_shell_syntax,
@@ -473,6 +474,73 @@ def test_the_quoting_remedy_is_bounded_by_construction(bash_differential):
                 broken.append(f"{cmd!r} -> {rewritten!r} still diverges")
         assert broken == [], "\n  ".join(broken)
 
+
+
+@pytest.mark.parametrize(
+    "word,expected",
+    [
+        ("eval", "builtin"),
+        ("exec", "builtin"),
+        ("source", "builtin"),
+        (".", "builtin"),
+        ("command", "builtin"),
+        ("builtin", "builtin"),
+        ("if", "keyword"),
+        ("time", "keyword"),
+        ("{", "keyword"),
+        ("FOO=x", "assignment"),
+        ("foo_1=y", "assignment"),
+        ("arr[0]=v", "assignment"),
+        # Not assignments: bash reports "command not found" for these,
+        # so treating them as grammar would be a false refusal — the
+        # class codex flagged in round 4 with `--foo=~`.
+        ("--foo=bar", None),
+        ("a-b=x", None),
+        ("=x", None),
+        # Ordinary programs, including builtins that are also real
+        # binaries and behave the same either way.
+        ("ls", None),
+        ("echo", None),
+        ("printf", None),
+        ("./script.sh", None),
+    ],
+)
+def test_command_position_grammar_is_named(word, expected):
+    """#3187, reached through #3129: a word in command position may be
+    grammar rather than a program.
+
+    The character allow-list cannot see this — every character in
+    ``eval`` and ``FOO=x`` is inert. It matters because one backend does
+    not exec the argv it is given: DockerSandboxBackend rebuilds a bash
+    script, where a bare word is read as grammar and ``BinaryPolicy``
+    has vetted ``eval`` rather than what eval runs.
+    """
+    result = command_word_is_shell_grammar(word)
+    if expected is None:
+        assert result is None, (word, result)
+    else:
+        assert result is not None and expected in result, (word, result)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_reserved_word_list_is_bash_s_own():
+    """Asked of bash, not copied from memory.
+
+    A hard-coded list of shell grammar is exactly the shape this ticket
+    spent five rounds learning to distrust. This one is finite and bash
+    will tell us what is in it, so the list is checked rather than
+    asserted — if a bash version adds a reserved word, this fails
+    instead of the guard silently missing it.
+    """
+    reported = subprocess.run(
+        ["bash", "-c", "compgen -k"], capture_output=True, text=True
+    )
+    words = set(reported.stdout.split())
+    assert words, "bash reported no reserved words; the probe is broken"
+    missing = {w for w in words if command_word_is_shell_grammar(w) is None}
+    assert missing == set(), (
+        f"bash reserves these and the guard does not know them: {missing}"
+    )
 
 
 def test_compound_guard_handles_non_string():

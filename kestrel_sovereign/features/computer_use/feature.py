@@ -58,6 +58,7 @@ from .policy import (
     BinaryPolicy,
     Decision,
     PathPolicy,
+    command_word_is_shell_grammar,
     evaluate_argv_paths,
     first_shell_significant_character,
     quote_words_containing_shell_syntax,
@@ -106,12 +107,19 @@ def shell_syntax_refusal(
 
     Returns ``(audit_rule, message)``.
 
-    ``shell`` tokenizes with ``shlex`` and execs the argv vector — there
-    is no shell in the path, so a control character is not a control
-    character, it is an ordinary argument. ``ls | head -20`` runs ``ls``
-    with three extra arguments, prints everything, and exits 0: the
-    bound the caller asked for is discarded and nothing says so (#3129,
-    measured at 128 live calls).
+    ``shell`` tokenizes with ``shlex`` and hands the argv vector to a
+    backend — no shell interprets the string, so a control character is
+    not a control character, it is an ordinary argument. ``ls | head
+    -20`` runs ``ls`` with three extra arguments, prints everything,
+    and exits 0: the bound the caller asked for is discarded and
+    nothing says so (#3129, measured at 128 live calls).
+
+    "No shell interprets the string" is the tool's contract, not a
+    property of every backend. The local backend execs the vector; the
+    Docker backend rebuilds a bash script from it and runs that, so
+    quoting is what neutralises metacharacters there and command-position
+    grammar is what escapes quoting. Both halves of the refusal exist
+    for that reason. The backend's own claim to exec argv is #3187.
 
     Refusing is the only option that does not execute a different
     command than the one written. Routing the string through ``bash
@@ -125,6 +133,21 @@ def shell_syntax_refusal(
     alike, so the rewrite's argv is its words, and those words are what
     the gates that ran before this one already vetted.
     """
+    # Command position first: a word there may be grammar rather than a
+    # program, and every character in it can be inert. One backend does
+    # not exec the argv it is handed — DockerSandboxBackend rebuilds a
+    # bash script from it — so `eval 'dd ...'` and `FOO=x dd ...` reach
+    # a shell with only `eval` or `FOO=x` vetted (#3187).
+    if argv:
+        grammar = command_word_is_shell_grammar(argv[0])
+        if grammar is not None:
+            return (
+                f"shell_grammar:{argv[0]}",
+                f"shell runs one program with arguments, and {argv[0]!r} is "
+                f"not a program — it is {grammar}. Nothing ran. Name the "
+                f"program you want to run.",
+            )
+
     found = first_shell_significant_character(command)
     if found is None:
         return None

@@ -555,6 +555,54 @@ async def test_the_refusal_names_what_the_character_would_have_done(workspace: P
 
 
 @pytest.mark.asyncio
+async def test_command_position_grammar_is_refused(workspace: Path):
+    """codex review round 7, P1 — the allow-list cannot see this.
+
+    Every character in ``eval`` and ``FOO=x`` is inert, so the
+    character rule passes them. They matter because the DEFAULT backend
+    does not exec the argv it is handed: DockerSandboxBackend rebuilds
+    a bash script from it, where a bare word in command position is
+    grammar. ``eval 'dd ...'`` then runs ``dd`` with only ``eval``
+    vetted — and ``eval`` is not a binary at all.
+
+    Measured before fixing: the script the backend builds for
+    ``eval 'printf HACKED'`` prints HACKED under bash, while the local
+    backend raises FileNotFoundError. The backend's own claim to exec
+    argv is #3187.
+    """
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+
+    for command, fragment in (
+        ("eval 'printf HACKED'", "runs a command of its own"),
+        ("exec printf HACKED", "runs a command of its own"),
+        ("FOO=x printf pwned", "sets a variable for another command"),
+        ("if true", "introduces a compound command"),
+    ):
+        envelope = await feature.shell(command=command, timeout=5)
+        assert envelope.status is not ToolResultStatus.OK, command
+        assert fragment in envelope.error, (command, envelope.error)
+        assert "Nothing ran." in envelope.error
+
+    assert queue.calls == [], (
+        "grammar is refused before the operator is asked to approve it"
+    )
+
+    # The positive control: an ordinary program with the same shape of
+    # arguments still runs, so the guard is not simply refusing
+    # everything.
+    ran = await feature.shell(command="printf ok", timeout=5)
+    assert ran.status is ToolResultStatus.OK, ran.error
+    assert ran.data["stdout"] == "ok"
+
+
+@pytest.mark.asyncio
 async def test_a_refused_command_is_audited(workspace: Path):
     """Every refusal in this gate sequence writes an audit row.
 

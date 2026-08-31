@@ -21,6 +21,7 @@ Glob patterns are honored via ``fnmatch`` (delegated to
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from enum import Enum
@@ -254,12 +255,58 @@ _INERT_CHARACTERS = frozenset(
 )
 
 
+# Words a shell reads as GRAMMAR rather than as the name of a program.
+#
+# The character allow-list above is not enough on its own, because one
+# backend does not exec the argv it is handed: DockerSandboxBackend
+# rebuilds a bash script from it (``" ".join(shlex.quote(a))``) and runs
+# that. Quoting neutralises every metacharacter there — but a bare word
+# needs no quoting, so ``eval 'dd ...'``, ``FOO=x dd ...`` and
+# ``exec dd ...`` survive intact and run a second binary that
+# ``BinaryPolicy`` never saw, having vetted ``eval`` or ``FOO=x``.
+#
+# Reserved words are bash's own list (``compgen -k``), pinned by a test
+# that asks bash rather than trusting this comment. The builtins are the
+# ones that execute something other than themselves; the rest —
+# ``echo``, ``printf``, ``test`` — are also real binaries and behave the
+# same either way, so refusing them would cost without buying anything.
+_SHELL_RESERVED_WORDS = frozenset(
+    "if then else elif fi case esac for select while until do done in "
+    "function time { } ! [[ ]]".split()
+)
+_COMMAND_SUBSTITUTING_BUILTINS = frozenset(
+    {"eval", "exec", "source", ".", "command", "builtin"}
+)
+# An assignment needs a valid shell NAME before the ``=``. bash reports
+# "command not found" for ``--foo=bar`` and ``a-b=x``, so those are
+# ordinary command names and refusing them would be a false refusal —
+# the same class codex flagged in round 4.
+_ASSIGNMENT_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?=")
+
+
 @dataclass(frozen=True)
 class ShellSyntax:
     """A character whose shell meaning this tool cannot honour."""
 
     index: int
     char: str
+
+
+def command_word_is_shell_grammar(word: str) -> str | None:
+    """Describe how *word* is grammar rather than a program, or None.
+
+    Only meaningful in command position — ``FOO=x`` is an ordinary
+    argument anywhere else, and ``if`` is just a word.
+    """
+    if not word:
+        return None
+    if _ASSIGNMENT_PREFIX.match(word):
+        return "an assignment, which sets a variable for another command"
+    if word in _SHELL_RESERVED_WORDS:
+        return "a shell keyword, which introduces a compound command"
+    if word in _COMMAND_SUBSTITUTING_BUILTINS:
+        return "a shell builtin that runs a command of its own"
+    return None
 
 
 def _quote_context(cmd: str):
