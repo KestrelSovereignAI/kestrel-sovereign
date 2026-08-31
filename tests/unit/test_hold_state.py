@@ -132,6 +132,30 @@ async def test_host_and_agent_holds_compose_and_release_independently(hold_db):
 
 
 @pytest.mark.asyncio
+async def test_effective_read_validates_global_history_once(hold_db, monkeypatch):
+    """One effective snapshot pays for one complete history validation."""
+
+    _db, store = hold_db
+    validate_history = store._assert_global_history_intact
+    history_validations = 0
+
+    async def _count_history_validation() -> None:
+        nonlocal history_validations
+        history_validations += 1
+        await validate_history()
+
+    monkeypatch.setattr(
+        store,
+        "_assert_global_history_intact",
+        _count_history_validation,
+    )
+
+    await store.get_effective("did:agent:kite")
+
+    assert history_validations == 1
+
+
+@pytest.mark.asyncio
 async def test_state_and_receipts_survive_database_restart(tmp_path):
     path = tmp_path / "host.db"
     first_db = await AsyncDatabase.sqlite(str(path))
@@ -2352,9 +2376,20 @@ async def test_state_read_validates_projection_inside_one_locked_snapshot(
             finally:
                 active = False
 
-    async def inspect_projection(latch, scope, target_id):
+    async def inspect_projection(
+        latch,
+        scope,
+        target_id,
+        *,
+        validate_global_history=True,
+    ):
         assert active, "latch and receipt graph escaped their read snapshot"
-        return await original_validate(latch, scope, target_id)
+        return await original_validate(
+            latch,
+            scope,
+            target_id,
+            validate_global_history=validate_global_history,
+        )
 
     async def inspect_locks(targets):
         locked_targets.append(tuple(targets))

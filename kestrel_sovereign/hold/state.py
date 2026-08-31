@@ -2626,11 +2626,18 @@ class HoldStore:
                         "effective hold query returned a foreign agent"
                     )
             await self._validate_latch_projection(
-                host, HoldScope.HOST, HOST_HOLD_TARGET
+                host,
+                HoldScope.HOST,
+                HOST_HOLD_TARGET,
+                validate_global_history=False,
             )
             await self._validate_latch_projection(
-                agent_state, HoldScope.AGENT, agent
+                agent_state,
+                HoldScope.AGENT,
+                agent,
+                validate_global_history=False,
             )
+            await self._assert_global_history_intact()
             return EffectiveHoldState(host=host, agent=agent_state)
 
     async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
