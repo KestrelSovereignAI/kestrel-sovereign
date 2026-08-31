@@ -55,6 +55,9 @@ _POSTGRES_HISTORY_CANDIDATE_KEY = "hold_history_candidate_v1"
 _POSTGRES_BOOTSTRAP_INTENT_KEY = "hold_bootstrap_pending_v1"
 _POSTGRES_ROLLBACK_DOMAIN_KEY = "hold_rollback_domain_id_v1"
 _POSTGRES_ROLLBACK_DOMAIN_PREFIX = "kestrel-hold-rollback-domain-v1:"
+_POSTGRES_PRIMARY_BINDING_KEY = "hold_primary_custody_binding_v1"
+_POSTGRES_EVIDENCE_BINDING_KEY = "hold_evidence_custody_binding_v1"
+_POSTGRES_CUSTODY_BINDING_PREFIX = "kestrel-hold-custody-binding-v1:"
 # Two signed int32 values spelling ``KES`` / ``HOLD``. The lock lives on the
 # independent evidence service and spans both primary commit and publication.
 _POSTGRES_EVIDENCE_LOCK = (0x004B4553, 0x484F4C44)
@@ -631,8 +634,143 @@ class HoldStore:
             )
         return identity
 
+    async def _postgres_cluster_identity(self, db: Any, *, label: str) -> str:
+        """Return PostgreSQL's cluster-wide initdb identity."""
+
+        try:
+            rows = await db.fetchall(
+                "SELECT system_identifier::text FROM pg_control_system()"
+            )
+        except Exception as exc:
+            raise HoldStateError(
+                f"could not verify PostgreSQL Hold {label} cluster identity"
+            ) from exc
+        if (
+            len(rows) != 1
+            or len(rows[0]) != 1
+            or not isinstance(rows[0][0], str)
+            or not rows[0][0].strip()
+        ):
+            raise HoldStateError(
+                f"could not verify PostgreSQL Hold {label} cluster identity"
+            )
+        return rows[0][0]
+
+    async def _assert_postgres_clusters_independent(self) -> None:
+        """Reject databases sharing one cluster-level backup/restore unit."""
+
+        evidence_db = self._evidence_db
+        if evidence_db is None:
+            return
+        primary, evidence = await asyncio.gather(
+            self._postgres_cluster_identity(self._db, label="primary"),
+            self._postgres_cluster_identity(evidence_db, label="evidence"),
+        )
+        if primary == evidence:
+            raise HoldStateError(
+                "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+            )
+
+    async def _read_postgres_binding(
+        self,
+        db: Any,
+        key: str,
+        *,
+        label: str,
+    ) -> str | None:
+        rows = await db.fetchall(
+            "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+            (_POSTGRES_WITNESS_AGENT_ID, key),
+        )
+        if not rows:
+            return None
+        if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(rows[0][0], str):
+            raise HoldStateError(
+                f"PostgreSQL Hold {label} custody binding is invalid"
+            )
+        return rows[0][0]
+
+    async def _write_postgres_binding(self, db: Any, key: str, payload: str) -> None:
+        await db.execute(
+            "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT (agent_id, key) DO NOTHING",
+            (_POSTGRES_WITNESS_AGENT_ID, key, payload),
+        )
+
+    async def _read_postgres_custody_roles(
+        self,
+        evidence_db: Any,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        """Read the expected and forbidden role records from both databases."""
+
+        return tuple(
+            await asyncio.gather(
+                self._read_postgres_binding(
+                    self._db,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    label="primary",
+                ),
+                self._read_postgres_binding(
+                    evidence_db,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                    label="evidence",
+                ),
+                self._read_postgres_binding(
+                    self._db,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                    label="primary",
+                ),
+                self._read_postgres_binding(
+                    evidence_db,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    label="evidence",
+                ),
+            )
+        )
+
+    @staticmethod
+    def _custody_binding_payload(
+        pair_id: UUID,
+        primary_identity: str,
+        evidence_identity: str,
+    ) -> str:
+        return (
+            _POSTGRES_CUSTODY_BINDING_PREFIX
+            + str(pair_id)
+            + "|"
+            + primary_identity
+            + "|"
+            + evidence_identity
+        )
+
+    @staticmethod
+    def _validate_custody_binding(
+        payload: str,
+        *,
+        primary_identity: str,
+        evidence_identity: str,
+    ) -> UUID:
+        if not payload.startswith(_POSTGRES_CUSTODY_BINDING_PREFIX):
+            raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+        parts = payload.removeprefix(_POSTGRES_CUSTODY_BINDING_PREFIX).split("|")
+        if len(parts) != 3:
+            raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+        pair, bound_primary, bound_evidence = parts
+        try:
+            pair_id = UUID(pair)
+        except ValueError as exc:
+            raise HoldStateError("PostgreSQL Hold custody binding is invalid") from exc
+        if str(pair_id) != pair or (
+            bound_primary != primary_identity
+            or bound_evidence != evidence_identity
+        ):
+            raise HoldStateError(
+                "PostgreSQL Hold custody binding does not match the configured pair"
+            )
+        return pair_id
+
     async def _assert_postgres_evidence_domain_independent(self) -> None:
-        """Reject two pools that resolve to the same protected database."""
+        """Bind each database permanently to one side of this custody pair."""
 
         evidence_db = self._evidence_db
         if evidence_db is None:
@@ -646,6 +784,67 @@ class HoldStore:
                 "PostgreSQL Hold evidence must use an independent rollback domain"
             )
 
+        primary_binding, evidence_binding, primary_foreign, evidence_foreign = (
+            await self._read_postgres_custody_roles(evidence_db)
+        )
+        if primary_foreign is not None or evidence_foreign is not None:
+            raise HoldStateError(
+                "PostgreSQL Hold database has the wrong durable custody role"
+            )
+
+        if primary_binding is None and evidence_binding is None:
+            binding = self._custody_binding_payload(uuid4(), primary, evidence)
+        else:
+            binding = primary_binding or evidence_binding
+            assert binding is not None
+            self._validate_custody_binding(
+                binding,
+                primary_identity=primary,
+                evidence_identity=evidence,
+            )
+            if (
+                primary_binding is not None
+                and evidence_binding is not None
+                and primary_binding != evidence_binding
+            ):
+                raise HoldStateError(
+                    "PostgreSQL Hold custody binding disagrees between databases"
+                )
+
+        if primary_binding is None:
+            await self._write_postgres_binding(
+                self._db,
+                _POSTGRES_PRIMARY_BINDING_KEY,
+                binding,
+            )
+        if evidence_binding is None:
+            await self._write_postgres_binding(
+                evidence_db,
+                _POSTGRES_EVIDENCE_BINDING_KEY,
+                binding,
+            )
+
+        primary_binding, evidence_binding, primary_foreign, evidence_foreign = (
+            await self._read_postgres_custody_roles(evidence_db)
+        )
+        if primary_foreign is not None or evidence_foreign is not None:
+            raise HoldStateError(
+                "PostgreSQL Hold database has the wrong durable custody role"
+            )
+        if (
+            primary_binding is None
+            or evidence_binding is None
+            or primary_binding != evidence_binding
+        ):
+            raise HoldStateError(
+                "PostgreSQL Hold custody binding was not durably published"
+            )
+        self._validate_custody_binding(
+            primary_binding,
+            primary_identity=primary,
+            evidence_identity=evidence,
+        )
+
     @asynccontextmanager
     async def _postgres_evidence_lock(self):
         """Serialize a primary snapshot with external PostgreSQL evidence."""
@@ -654,7 +853,7 @@ class HoldStore:
         if evidence_db is None:
             yield
             return
-        await self._assert_postgres_evidence_domain_independent()
+        await self._assert_postgres_clusters_independent()
         lock_owner = getattr(evidence_db, "backend", evidence_db)
         locks = getattr(lock_owner, "advisory_locks", None)
         if not callable(locks):
@@ -662,6 +861,7 @@ class HoldStore:
                 "PostgreSQL Hold evidence database cannot provide advisory locks"
             )
         async with locks((_POSTGRES_EVIDENCE_LOCK,)):
+            await self._assert_postgres_evidence_domain_independent()
             yield
 
     async def _read_postgres_evidence(self, key: str, *, label: str) -> bytes | None:

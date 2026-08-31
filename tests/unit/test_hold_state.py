@@ -67,6 +67,31 @@ async def _create_legacy_hold_tables(db) -> None:
     )
 
 
+class _PostgresCustodyFacade:
+    """Minimal two-domain PostgreSQL metadata/cluster double."""
+
+    backend_type = "postgres"
+
+    def __init__(self, cluster, *, domain_identity=None, backend=None):
+        self.cluster = cluster
+        self.metadata = {}
+        if domain_identity is not None:
+            self.metadata["hold_rollback_domain_id_v1"] = domain_identity
+        self.backend = backend
+
+    async def fetchall(self, query, params=()):
+        if "pg_control_system" in query:
+            return [(self.cluster,)]
+        value = self.metadata.get(params[1])
+        return [] if value is None else [(value,)]
+
+    async def execute(self, query, params=()):
+        if query.startswith("INSERT"):
+            self.metadata.setdefault(params[1], params[2])
+        elif query.startswith("DELETE"):
+            self.metadata.pop(params[1], None)
+
+
 @pytest.mark.asyncio
 async def test_host_and_agent_holds_compose_and_release_independently(hold_db):
     _db, store = hold_db
@@ -2129,31 +2154,21 @@ async def test_postgres_read_targets_take_shared_locks_in_global_order():
 async def test_postgres_evidence_lock_rejects_same_database_identity():
     """Two pools do not become independent merely by being distinct objects."""
 
-    class _DB:
-        backend_type = "postgres"
-
-        def __init__(self, identity, *, backend=None):
-            self._identity = identity
-            self.backend = backend
-
-        async def fetchall(self, _query, _params=()):
-            return [(self._identity,)]
-
-        async def execute(self, _query, _params=()):
-            return None
-
     @asynccontextmanager
     async def advisory_locks(_keys):
-        raise AssertionError("a same-domain store must be rejected before locking")
         yield
 
     identity = (
         "kestrel-hold-rollback-domain-v1:"
         "00000000-0000-0000-0000-000000000001"
     )
-    primary = _DB(identity)
-    evidence = _DB(
-        identity,
+    primary = _PostgresCustodyFacade(
+        "cluster-primary",
+        domain_identity=identity,
+    )
+    evidence = _PostgresCustodyFacade(
+        "cluster-evidence",
+        domain_identity=identity,
         backend=SimpleNamespace(advisory_locks=advisory_locks),
     )
     store = HoldStore(primary, evidence_db=evidence)
@@ -2169,19 +2184,6 @@ async def test_postgres_evidence_lock_uses_independent_service_session():
 
     events: list[object] = []
 
-    class _DB:
-        backend_type = "postgres"
-
-        def __init__(self, identity, *, backend=None):
-            self._identity = identity
-            self.backend = backend
-
-        async def fetchall(self, _query, _params=()):
-            return [(self._identity,)]
-
-        async def execute(self, _query, _params=()):
-            return None
-
     @asynccontextmanager
     async def advisory_locks(keys):
         events.append(("lock", keys))
@@ -2190,13 +2192,19 @@ async def test_postgres_evidence_lock_uses_independent_service_session():
         finally:
             events.append("unlock")
 
-    primary = _DB(
-        "kestrel-hold-rollback-domain-v1:"
-        "00000000-0000-0000-0000-000000000001"
+    primary = _PostgresCustodyFacade(
+        "cluster-primary",
+        domain_identity=(
+            "kestrel-hold-rollback-domain-v1:"
+            "00000000-0000-0000-0000-000000000001"
+        ),
     )
-    evidence = _DB(
-        "kestrel-hold-rollback-domain-v1:"
-        "00000000-0000-0000-0000-000000000002",
+    evidence = _PostgresCustodyFacade(
+        "cluster-evidence",
+        domain_identity=(
+            "kestrel-hold-rollback-domain-v1:"
+            "00000000-0000-0000-0000-000000000002"
+        ),
         backend=SimpleNamespace(advisory_locks=advisory_locks),
     )
     store = HoldStore(primary, evidence_db=evidence)
@@ -2215,26 +2223,13 @@ async def test_postgres_evidence_lock_uses_independent_service_session():
 async def test_postgres_evidence_lock_founds_distinct_domain_markers():
     """Fresh databases get durable identities before their first protocol lock."""
 
-    class _DB:
-        backend_type = "postgres"
-
-        def __init__(self, *, backend=None):
-            self.value = None
-            self.backend = backend
-
-        async def fetchall(self, _query, _params=()):
-            return [] if self.value is None else [(self.value,)]
-
-        async def execute(self, _query, params=()):
-            if self.value is None:
-                self.value = params[2]
-
     @asynccontextmanager
     async def advisory_locks(_keys):
         yield
 
-    primary = _DB()
-    evidence = _DB(
+    primary = _PostgresCustodyFacade("cluster-primary")
+    evidence = _PostgresCustodyFacade(
+        "cluster-evidence",
         backend=SimpleNamespace(advisory_locks=advisory_locks),
     )
     store = HoldStore(primary, evidence_db=evidence)
@@ -2242,9 +2237,86 @@ async def test_postgres_evidence_lock_founds_distinct_domain_markers():
     async with store._postgres_evidence_lock():
         pass
 
-    assert primary.value is not None
-    assert evidence.value is not None
-    assert primary.value != evidence.value
+    primary_domain = primary.metadata["hold_rollback_domain_id_v1"]
+    evidence_domain = evidence.metadata["hold_rollback_domain_id_v1"]
+    assert primary_domain != evidence_domain
+
+
+@pytest.mark.asyncio
+async def test_postgres_evidence_lock_rejects_two_databases_in_one_cluster():
+    """Different database markers do not prove an independent restore domain."""
+
+    @asynccontextmanager
+    async def advisory_locks(_keys):
+        yield
+
+    primary = _PostgresCustodyFacade("cluster-one")
+    evidence = _PostgresCustodyFacade(
+        "cluster-one",
+        backend=SimpleNamespace(advisory_locks=advisory_locks),
+    )
+
+    with pytest.raises(HoldStateError, match="independent.*cluster"):
+        async with HoldStore(primary, evidence_db=evidence)._postgres_evidence_lock():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_postgres_evidence_lock_rejects_swapped_custody_roles():
+    """A configured evidence service can never become the protected primary."""
+
+    @asynccontextmanager
+    async def advisory_locks(_keys):
+        yield
+
+    backend = SimpleNamespace(advisory_locks=advisory_locks)
+    primary = _PostgresCustodyFacade("cluster-primary", backend=backend)
+    evidence = _PostgresCustodyFacade("cluster-evidence", backend=backend)
+    async with HoldStore(primary, evidence_db=evidence)._postgres_evidence_lock():
+        pass
+
+    with pytest.raises(HoldStateError, match="custody role|binding"):
+        async with HoldStore(evidence, evidence_db=primary)._postgres_evidence_lock():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_postgres_evidence_lock_recovers_partial_pair_binding(monkeypatch):
+    """A crash between role writes resumes only the already-declared pair."""
+
+    @asynccontextmanager
+    async def advisory_locks(_keys):
+        yield
+
+    backend = SimpleNamespace(advisory_locks=advisory_locks)
+    primary = _PostgresCustodyFacade("cluster-primary", backend=backend)
+    evidence = _PostgresCustodyFacade("cluster-evidence", backend=backend)
+    interrupted = HoldStore(primary, evidence_db=evidence)
+    write = interrupted._write_postgres_binding
+
+    async def crash_before_evidence_binding(db, key, payload):
+        if db is evidence:
+            raise RuntimeError("injected crash before evidence role binding")
+        await write(db, key, payload)
+
+    monkeypatch.setattr(
+        interrupted,
+        "_write_postgres_binding",
+        crash_before_evidence_binding,
+    )
+    with pytest.raises(RuntimeError, match="before evidence role binding"):
+        async with interrupted._postgres_evidence_lock():
+            pass
+
+    assert "hold_primary_custody_binding_v1" in primary.metadata
+    assert "hold_evidence_custody_binding_v1" not in evidence.metadata
+
+    async with HoldStore(primary, evidence_db=evidence)._postgres_evidence_lock():
+        pass
+    assert (
+        primary.metadata["hold_primary_custody_binding_v1"]
+        == evidence.metadata["hold_evidence_custody_binding_v1"]
+    )
 
 
 @pytest.mark.asyncio
