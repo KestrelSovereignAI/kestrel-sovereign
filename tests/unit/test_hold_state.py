@@ -1857,6 +1857,44 @@ async def test_failed_sqlite_mutation_does_not_publish_rolled_back_anchor(
 
 
 @pytest.mark.asyncio
+async def test_failed_sqlite_release_removes_known_rolled_back_candidate(
+    hold_db, monkeypatch
+):
+    """A live release failure cleans its candidate before primary rollback."""
+
+    _db, store = hold_db
+    applied = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:failed-release",
+        actor_id="did:sovereign:operator",
+        reason="hold remains active",
+        operation_id="hold-before-failed-release",
+    )
+    stage = store._stage_history_candidate
+
+    def fail_after_staging(payload):
+        stage(payload)
+        raise RuntimeError("injected release failure after anchor staging")
+
+    monkeypatch.setattr(store, "_stage_history_candidate", fail_after_staging)
+    with pytest.raises(Exception, match="release failure after anchor staging"):
+        await store.release_hold(
+            scope="agent",
+            target_id="did:agent:failed-release",
+            actor_id="did:sovereign:operator",
+            reason="must roll back release",
+            operation_id="rolled-back-release",
+            expected_hold_receipt_id=applied.receipt.receipt_id,
+        )
+
+    monkeypatch.setattr(store, "_stage_history_candidate", stage)
+    restored = await store.get_hold("agent", "did:agent:failed-release")
+    assert restored is not None
+    assert restored.hold_receipt_id == applied.receipt.receipt_id
+    assert await store.get_receipt("rolled-back-release") is None
+
+
+@pytest.mark.asyncio
 async def test_committed_sqlite_mutation_recovers_interrupted_anchor_promotion(
     hold_db, monkeypatch
 ):
@@ -1883,6 +1921,50 @@ async def test_committed_sqlite_mutation_recovers_interrupted_anchor_promotion(
     assert recovered is not None
     assert recovered.reason == "recover committed publication"
     assert await store.get_receipt("committed-candidate") is not None
+
+
+@pytest.mark.asyncio
+async def test_sqlite_staged_evidence_rejects_ambiguous_primary_restore(
+    tmp_path, monkeypatch
+):
+    """A staged candidate cannot be discarded after an ambiguous DB restore."""
+
+    path = tmp_path / "ambiguous-publication.db"
+    backup = tmp_path / "before-committed-hold.db"
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await db.close()
+    shutil.copyfile(path, backup)
+
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+
+    def interrupt_promotion(_payload):
+        raise RuntimeError("injected interruption after primary commit")
+
+    monkeypatch.setattr(store, "_finish_history_publication", interrupt_promotion)
+    with pytest.raises(RuntimeError, match="after primary commit"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:ambiguous-publication",
+            actor_id="did:sovereign:operator",
+            reason="must not disappear after restore",
+            operation_id="ambiguous-publication",
+        )
+    await db.close()
+
+    shutil.copyfile(backup, path)
+    restored = await AsyncDatabase.sqlite(str(path))
+    try:
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="ambiguous staged Hold history publication",
+        ):
+            await HoldStore(restored).ensure_schema()
+    finally:
+        await restored.close()
 
 
 @pytest.mark.asyncio

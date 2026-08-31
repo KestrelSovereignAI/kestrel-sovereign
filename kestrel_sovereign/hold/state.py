@@ -1249,10 +1249,13 @@ class HoldStore:
         """Resolve an interrupted primary commit from old/new durable evidence.
 
         The stable anchor is never changed before the database commit. A
-        candidate written inside the transaction survives only as a recovery
-        hint: after interruption the committed database must match either the
-        old stable anchor (rollback) or the candidate (commit). Any third state
-        remains corrupt and is never re-anchored.
+        candidate written inside the transaction is the durable evidence of an
+        intended new head. If the committed database matches it, publication
+        can finish. If the database still matches the stable anchor, recovery
+        cannot distinguish an interrupted rollback from a committed mutation
+        followed by a primary restore, so it must fail closed. An ordinary
+        in-process transaction failure removes its own candidate before the
+        primary rollback through ``_primary_mutation_transaction``.
         """
 
         candidate = await self._read_external_history_candidate()
@@ -1275,8 +1278,10 @@ class HoldStore:
             await self._remove_external_history_candidate()
             return
         if stable is not None and current == stable:
-            await self._remove_external_history_candidate()
-            return
+            raise HoldCorruptStateError(
+                "ambiguous staged Hold history publication matches the stable "
+                "anchor; refusing to discard possible committed evidence"
+            )
         raise HoldCorruptStateError(
             "interrupted Hold history publication matches neither durable state"
         )
@@ -1308,6 +1313,23 @@ class HoldStore:
         payload = await self._current_history_anchor_payload()
         await self._stage_external_history_candidate(payload)
         return payload
+
+    @asynccontextmanager
+    async def _primary_mutation_transaction(self):
+        """Rollback a known-failed mutation without leaving ambiguous evidence.
+
+        The exception handler deliberately lives *inside* the database context:
+        transaction-body failures are known not to have committed and may erase
+        their candidate, while a commit/exit failure remains ambiguous and must
+        leave the candidate for fail-closed recovery.
+        """
+
+        async with self._db.transaction(immediate=True):
+            try:
+                yield
+            except BaseException:
+                await self._remove_external_history_candidate()
+                raise
 
     def _finish_history_publication(self, payload: bytes | None) -> None:
         """Promote a staged SQLite candidate only after the DB commit returns."""
@@ -2269,7 +2291,7 @@ class HoldStore:
         operation = _required_text(operation_id, "operation_id")
 
         publication: bytes | None = None
-        async with self._db.transaction(immediate=True):
+        async with self._primary_mutation_transaction():
             await self._assert_host_latch_shape(
                 for_update=resolved_scope is HoldScope.HOST
             )
@@ -2399,7 +2421,7 @@ class HoldStore:
         )
 
         publication: bytes | None = None
-        async with self._db.transaction(immediate=True):
+        async with self._primary_mutation_transaction():
             await self._assert_host_latch_shape(
                 for_update=resolved_scope is HoldScope.HOST
             )
