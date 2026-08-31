@@ -168,6 +168,35 @@ def test_child_transport_key_cannot_alias_child_sovereign_key(
         )
 
 
+@pytest.mark.parametrize(
+    "configured_host_key",
+    [
+        "host-sovereign-key",
+        "'host-sovereign-key'",
+        '"host-sovereign-key"',
+    ],
+)
+def test_child_transport_key_cannot_alias_host_sovereign_key(
+    monkeypatch,
+    tmp_path,
+    configured_host_key,
+):
+    monkeypatch.setenv("KESTREL_API_KEY", configured_host_key)
+    environment = {
+        "KESTREL_API_KEY": "different-child-sovereign-key",
+        transport_auth.A2A_TRANSPORT_KEY_ENV: "host-sovereign-key",
+    }
+
+    with pytest.raises(
+        transport_auth.A2ATransportKeyError,
+        match="distinct from the sovereign API key",
+    ):
+        transport_auth.ensure_a2a_transport_key(
+            environment,
+            project_root=tmp_path,
+        )
+
+
 def test_durable_transport_key_cannot_alias_sovereign_key(
     monkeypatch,
     tmp_path,

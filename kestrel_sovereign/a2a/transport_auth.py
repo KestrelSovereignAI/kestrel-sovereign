@@ -53,18 +53,28 @@ def _validate_transport_key(value: str, *, source: str) -> str:
     return selected
 
 
-def _configured_sovereign_api_key(
+def _configured_sovereign_api_keys(
     environment: MutableMapping[str, str] | None,
-) -> str | None:
-    """Return the operator credential exactly as server auth compares it."""
+) -> tuple[str, ...]:
+    """Return every operator credential relevant to a child launch.
 
-    if environment is not None and _SOVEREIGN_API_KEY_ENV in environment:
-        configured = environment.get(_SOVEREIGN_API_KEY_ENV)
-    else:
-        configured = os.environ.get(_SOVEREIGN_API_KEY_ENV)
-    if not isinstance(configured, str) or not configured:
-        return None
-    return normalize_api_key(configured)
+    The project environment may override the host's exported key for the child,
+    but the host keeps serving with its own key. A transport credential must
+    therefore be distinct from both authority domains.
+    """
+
+    configured_values = [os.environ.get(_SOVEREIGN_API_KEY_ENV)]
+    if environment is not None:
+        configured_values.append(environment.get(_SOVEREIGN_API_KEY_ENV))
+
+    normalized: list[str] = []
+    for configured in configured_values:
+        if not isinstance(configured, str) or not configured:
+            continue
+        candidate = normalize_api_key(configured)
+        if candidate is not None and candidate not in normalized:
+            normalized.append(candidate)
+    return tuple(normalized)
 
 
 def _read_transport_key(path: Path) -> str:
@@ -199,11 +209,12 @@ def ensure_a2a_transport_key(
             project_root = project_dir()
         selected = _load_or_create_transport_key(Path(project_root).resolve())
 
-    sovereign_key = _configured_sovereign_api_key(environment)
-    if sovereign_key is not None and secrets.compare_digest(
-        selected.encode("utf-8"),
-        sovereign_key.encode("utf-8"),
-    ):
+    selected_bytes = selected.encode("utf-8")
+    aliases_sovereign_key = any(
+        secrets.compare_digest(selected_bytes, sovereign_key.encode("utf-8"))
+        for sovereign_key in _configured_sovereign_api_keys(environment)
+    )
+    if aliases_sovereign_key:
         raise A2ATransportKeyError(
             "A2A transport key must be distinct from the sovereign API key"
         )
