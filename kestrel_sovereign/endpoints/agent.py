@@ -1049,13 +1049,18 @@ async def stop_agent_request(request: Request):
             for indexed_turn_id, binding in raw_turn_bindings.items():
                 if (
                     not isinstance(indexed_turn_id, str)
-                    or not indexed_turn_id.strip()
                     or not isinstance(binding, tuple)
                     or len(binding) != 2
                     or not isinstance(binding[0], str)
-                    or not binding[0].strip()
                 ):
                     raise TypeError("agent turn binding inventory is malformed")
+                try:
+                    validate_invocation_id(indexed_turn_id)
+                    validate_invocation_id(binding[0])
+                except ValueError as error:
+                    raise TypeError(
+                        "agent turn binding inventory is malformed"
+                    ) from error
                 turn_request_ids[indexed_turn_id] = binding[0]
                 if binding[1] is not None:
                     if (

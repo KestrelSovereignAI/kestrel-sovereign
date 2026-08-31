@@ -175,6 +175,17 @@ async def test_turn_lifecycle_indexes_task_local_request_until_exit():
 
 
 @pytest.mark.asyncio
+async def test_turn_lifecycle_preserves_opaque_whitespace_request_id():
+    agent = _StubAgent()
+
+    with invocation_scope(" "):
+        async with agent._turn_lifecycle() as turn_id:
+            assert agent.resolve_turn_request_id(turn_id) == " "
+
+    assert agent.resolve_turn_request_id(turn_id) is None
+
+
+@pytest.mark.asyncio
 async def test_turn_index_carries_the_exact_request_generation():
     agent = _RequestTurnAgent()
 

@@ -28,7 +28,10 @@ from uuid import uuid4
 
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
-from kestrel_sovereign.agent.invocation import current_invocation_id
+from kestrel_sovereign.agent.invocation import (
+    current_invocation_id,
+    validate_invocation_id,
+)
 from kestrel_sovereign.signals import OrderedLockManager
 
 logger = logging.getLogger(__name__)
@@ -201,8 +204,12 @@ class TurnLifecycleMixin:
         """Bind one freshly-created observable turn to its cancellation key."""
 
         for field_name, value in (("turn_id", turn_id), ("request_id", request_id)):
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{field_name} must be a concrete string")
+            try:
+                validate_invocation_id(value)
+            except ValueError as error:
+                raise ValueError(
+                    f"{field_name} must be a concrete string"
+                ) from error
         if generation is not None and (
             not isinstance(generation, int)
             or isinstance(generation, bool)
@@ -226,7 +233,7 @@ class TurnLifecycleMixin:
             not isinstance(binding, tuple)
             or len(binding) != 2
             or not isinstance(binding[0], str)
-            or not binding[0].strip()
+            or not binding[0]
         ):
             raise TypeError("turn request index contains an invalid request identity")
         return binding[0]

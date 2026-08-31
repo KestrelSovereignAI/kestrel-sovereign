@@ -554,6 +554,37 @@ async def test_request_address_collision_is_not_remapped_as_public_turn() -> Non
     assert outcome[0].resolved_target == "agent-a"
 
 
+@pytest.mark.asyncio
+async def test_unknown_public_turn_collision_cannot_cancel_legacy_request() -> None:
+    """A typed public-turn address never falls through to a request address."""
+
+    cancel = AsyncMock(return_value=StopDisposition.STOPPED)
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget(
+                "agent-a",
+                "did:test:a",
+                cancel,
+                turn_ids=frozenset({"collision"}),
+                turn_request_ids={},
+            )
+        ]
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(
+            StopScope.TURN,
+            "did:test:operator",
+            "collision",
+            target_agent_id="did:test:a",
+            target_is_turn_id=True,
+        )
+    )
+
+    assert outcomes[0].disposition is StopDisposition.UNREACHABLE
+    cancel.assert_not_awaited()
+
+
 def test_turn_stop_preserves_accepted_opaque_whitespace_request_id() -> None:
     request = StopRequest(
         StopScope.TURN,
@@ -697,6 +728,41 @@ def test_stop_endpoint_preserves_whitespace_only_opaque_turn_id() -> None:
     routed_request = authority_stop.await_args.args[0]
     assert routed_request.scope is StopScope.TURN
     assert routed_request.target == " "
+
+
+def test_stop_endpoint_resolves_public_turn_to_whitespace_request_id() -> None:
+    """Public turn resolution preserves every accepted opaque request ID."""
+
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+    )
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:opaque-turn-binding"
+    agent._active_request_ids = {" "}
+    agent.active_turn_request_bindings = MagicMock(
+        return_value={"turn-public": (" ", 1)}
+    )
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(
+        return_value=RequestCompletionDisposition.COMPLETED
+    )
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "turn-public"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cancelled"] is True
+    agent.cancel_current_request.assert_called_once_with(
+        request_id=" ",
+        generation=1,
+    )
 
 
 def test_stop_types_preserve_whitespace_only_opaque_turn_addresses() -> None:
