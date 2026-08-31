@@ -1701,6 +1701,11 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                             "Host feature session-factory shutdown failed: %s", exc
                         )
                     finally:
+                        hold_evidence_db = (
+                            getattr(host_context, "hold_evidence_db", None)
+                            if host_context is not None
+                            else None
+                        )
                         hold_db = (
                             getattr(host_context, "hold_db", None)
                             if host_context is not None
@@ -1711,6 +1716,19 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                             if host_context is not None
                             else None
                         )
+                        if (
+                            hold_evidence_db is not None
+                            and hold_evidence_db is not hold_db
+                            and hold_evidence_db is not host_db
+                            and hasattr(hold_evidence_db, "close")
+                        ):
+                            try:
+                                await hold_evidence_db.close()
+                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
+                                logger.warning(
+                                    "Hold evidence database shutdown failed: %s",
+                                    exc,
+                                )
                         if (
                             hold_db is not None
                             and hold_db is not host_db

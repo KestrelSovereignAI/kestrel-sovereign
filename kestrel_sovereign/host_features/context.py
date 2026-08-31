@@ -131,6 +131,7 @@ class SovereignHostContext:
         session_factory: Optional[FleetSessionFactory] = None,
         hold_store: Any = None,
         hold_db: Any = None,
+        hold_evidence_db: Any = None,
         hold_boot_state: tuple[Any, ...] = (),
         backend_error: str = "",
     ) -> None:
@@ -140,6 +141,7 @@ class SovereignHostContext:
         self._session_factory = session_factory
         self._hold_store = hold_store
         self._hold_db = hold_db
+        self._hold_evidence_db = hold_evidence_db
         self._hold_boot_state = tuple(hold_boot_state)
         self._backend_error = str(backend_error or "")
 
@@ -173,6 +175,12 @@ class SovereignHostContext:
         return self._hold_db
 
     @property
+    def hold_evidence_db(self) -> Any:
+        """Independent PostgreSQL rollback witness backend, when configured."""
+
+        return self._hold_evidence_db
+
+    @property
     def hold_boot_state(self) -> tuple[Any, ...]:
         """Validated active latches observed before work admission opens."""
 
@@ -201,6 +209,7 @@ class SovereignHostContext:
 
 async def _close_partial_host_resources(
     session_factory: Optional[FleetSessionFactory],
+    hold_evidence_db: Any,
     hold_db: Any,
     db: Any,
 ) -> None:
@@ -214,6 +223,20 @@ async def _close_partial_host_resources(
             cancelled = True
         except Exception as close_exc:  # noqa: BLE001 - finish later resources
             logger.warning("Could not close partial host session factory: %s", close_exc)
+    if (
+        hold_evidence_db is not None
+        and hold_evidence_db is not hold_db
+        and hold_evidence_db is not db
+        and hasattr(hold_evidence_db, "close")
+    ):
+        try:
+            await hold_evidence_db.close()
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as close_exc:  # noqa: BLE001 - finish later resources
+            logger.warning(
+                "Could not close partial Hold evidence backend: %s", close_exc
+            )
     if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
         try:
             await hold_db.close()
@@ -234,13 +257,19 @@ async def _close_partial_host_resources(
 
 async def _finish_partial_host_cleanup(
     session_factory: Optional[FleetSessionFactory],
+    hold_evidence_db: Any,
     hold_db: Any,
     db: Any,
 ) -> None:
     """Own partial bootstrap cleanup through repeated caller cancellation."""
 
     cleanup = asyncio.create_task(
-        _close_partial_host_resources(session_factory, hold_db, db),
+        _close_partial_host_resources(
+            session_factory,
+            hold_evidence_db,
+            hold_db,
+            db,
+        ),
         name="partial-host-bootstrap-cleanup",
     )
     cancelled = False
@@ -264,6 +293,7 @@ async def close_host_context_resources(context: Any) -> None:
         return
     await _finish_partial_host_cleanup(
         getattr(context, "session_factory", None),
+        getattr(context, "hold_evidence_db", None),
         getattr(context, "hold_db", None),
         getattr(context, "db", None),
     )
@@ -279,7 +309,8 @@ async def build_host_context(
     The established host-feature backend remains the dedicated SQLite file so
     an upgrade cannot make existing workflow/feature rows disappear. Hold is
     the cross-worker control plane exception: PostgreSQL deployments give it a
-    separate ``KESTREL_DATABASE_URL`` backend. ``db_path`` overrides the host
+    separate ``KESTREL_DATABASE_URL`` backend plus an independently restored
+    ``KESTREL_HOLD_EVIDENCE_DATABASE_URL``. ``db_path`` overrides the host
     SQLite location (``$KESTREL_HOST_DB_PATH`` or the private host-data root).
     Failure to secure or open either backend degrades gracefully to a context
     with no store; production Hold enforcement then fails closed at boot.
@@ -288,6 +319,7 @@ async def build_host_context(
     session_factory: Optional[FleetSessionFactory] = None
     hold_store = None
     hold_db = None
+    hold_evidence_db = None
     hold_boot_state: tuple[Any, ...] = ()
     backend_error = ""
     try:
@@ -312,7 +344,19 @@ async def build_host_context(
         backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
         dsn = os.environ.get("KESTREL_DATABASE_URL")
         if backend == "postgres" and dsn:
+            evidence_dsn = os.environ.get("KESTREL_HOLD_EVIDENCE_DATABASE_URL")
+            if not evidence_dsn:
+                raise RuntimeError(
+                    "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required for "
+                    "PostgreSQL Hold rollback evidence"
+                )
+            if evidence_dsn == dsn:
+                raise RuntimeError(
+                    "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an "
+                    "independent rollback domain"
+                )
             hold_db = await AsyncDatabase.postgres(dsn)
+            hold_evidence_db = await AsyncDatabase.postgres(evidence_dsn)
             hold_location = "configured PostgreSQL database"
             initialization_witness_path = None
             history_anchor_path = None
@@ -327,6 +371,7 @@ async def build_host_context(
             hold_db,
             initialization_witness_path=initialization_witness_path,
             history_anchor_path=history_anchor_path,
+            evidence_db=hold_evidence_db,
         )
         await hold_store.ensure_schema()
         hold_boot_state = await hold_store.read_boot_state()
@@ -337,15 +382,26 @@ async def build_host_context(
             hold_location,
         )
     except asyncio.CancelledError as cancellation:
-        await _finish_partial_host_cleanup(session_factory, hold_db, db)
+        await _finish_partial_host_cleanup(
+            session_factory,
+            hold_evidence_db,
+            hold_db,
+            db,
+        )
         raise cancellation
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
         # Cleanup owns its task independently so cancellation arriving after
         # the opening failure closes every acquired backend and then
         # propagates instead of returning a degraded context during shutdown.
-        await _finish_partial_host_cleanup(session_factory, hold_db, db)
+        await _finish_partial_host_cleanup(
+            session_factory,
+            hold_evidence_db,
+            hold_db,
+            db,
+        )
         session_factory = None
         hold_store = None
+        hold_evidence_db = None
         hold_db = None
         db = None
         backend_error = f"{type(exc).__name__}: {exc}"
@@ -361,6 +417,7 @@ async def build_host_context(
         session_factory=session_factory,
         hold_store=hold_store,
         hold_db=hold_db,
+        hold_evidence_db=hold_evidence_db,
         hold_boot_state=hold_boot_state,
         backend_error=backend_error,
     )
