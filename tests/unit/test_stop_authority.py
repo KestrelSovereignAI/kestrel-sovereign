@@ -910,6 +910,7 @@ def test_stop_endpoint_resolves_public_turn_to_whitespace_request_id() -> None:
         return_value=RequestCompletionDisposition.COMPLETED
     )
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1132,6 +1133,7 @@ def test_live_stop_endpoint_accepts_turn_id_and_resolves_inside_authority() -> N
         return_value=RequestCompletionDisposition.COMPLETED
     )
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1181,6 +1183,7 @@ def test_turn_stop_cannot_cancel_a_reused_request_generation() -> None:
     app = FastAPI()
     app.include_router(router)
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1217,6 +1220,7 @@ def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:
         return_value=RequestCompletionDisposition.COMPLETED
     )
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1240,6 +1244,7 @@ def test_unknown_turn_does_not_fall_back_to_agent_wide_stop() -> None:
     agent.active_turn_request_ids = MagicMock(return_value={})
     agent.cancel_current_request = MagicMock(return_value=True)
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
