@@ -608,6 +608,53 @@ async def test_cancel_task_unauthorized_peer_lineage_and_causation_is_refused(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("actor", "expected_recipient", "terminal"),
+    [
+        ("did:test:peer", None, False),
+        ("did:test:creator", "did:test:wrong-recipient", False),
+        ("did:test:creator", None, True),
+    ],
+)
+async def test_cancel_predicate_rejects_before_loading_unavailable_payload(
+    tmp_path,
+    actor,
+    expected_recipient,
+    terminal,
+):
+    """A predicate miss must not lock and deserialize the victim payload."""
+
+    manager = await create_task_manager(
+        str(tmp_path / f"early-cancel-rejection-{terminal}.db")
+    )
+    try:
+        await manager.create_task(
+            _params("protected-payload"),
+            agent_name="did:test:recipient",
+            creator_agent_id="did:test:creator",
+        )
+        status_assignment = ", status = 'completed'" if terminal else ""
+        await manager.task_store.backend.execute(
+            f"""
+            UPDATE a2a_tasks
+            SET artifacts = ?{status_assignment}
+            WHERE id = ?
+            """,
+            ("payload-must-not-be-decoded", "protected-payload"),
+        )
+
+        refused = await manager.task_store.cancel_if_authorized(
+            "protected-payload",
+            actor_agent_id=actor,
+            expected_recipient_agent_id=expected_recipient,
+        )
+
+        assert refused is None
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_cancel_task_does_not_trust_stale_or_spoofed_sender_metadata(tmp_path):
     """Only the verified creator parameter may mint creator authority."""
 
@@ -2765,7 +2812,7 @@ async def test_cancel_readback_failure_rolls_back_transition_on_available_backen
         fetch_one = db_backend.fetch_one
 
         async def fail_canonical_read(sql, params=()):
-            if "SELECT * FROM a2a_tasks WHERE id" in sql:
+            if "SELECT * FROM a2a_tasks" in sql:
                 raise RuntimeError("injected in-transaction readback failure")
             return await fetch_one(sql, params)
 

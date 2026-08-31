@@ -700,7 +700,7 @@ class TaskStore(UnifiedStoreBase):
             else self._backend.transaction()
         )
         recipient_predicate = (
-            " AND recipient_agent_id = ?"
+            "AND recipient_agent_id = ?"
             if expected_recipient_agent_id is not None
             else ""
         )
@@ -709,6 +709,19 @@ class TaskStore(UnifiedStoreBase):
             if expected_recipient_agent_id is not None
             else ()
         )
+        live_authority_predicate = f"""
+            id = ?
+            AND status IN ('submitted', 'working', 'input-required')
+            AND (creator_agent_id = ? OR recipient_agent_id = ?)
+            {recipient_predicate}
+        """
+        authority_values = (
+            task_id,
+            actor_agent_id,
+            actor_agent_id,
+            *recipient_values,
+        )
+
         def decode_json(value, default):
             if value is None:
                 return default
@@ -726,8 +739,12 @@ class TaskStore(UnifiedStoreBase):
         async with transaction:
             lock_suffix = " FOR UPDATE" if self.is_postgres else ""
             current = await self._backend.fetch_one(
-                f"SELECT * FROM a2a_tasks WHERE id = ?{lock_suffix}",
-                (task_id,),
+                f"""
+                SELECT * FROM a2a_tasks
+                WHERE {live_authority_predicate}
+                {lock_suffix}
+                """,
+                authority_values,
             )
             if current is None:
                 return None
@@ -772,10 +789,7 @@ class TaskStore(UnifiedStoreBase):
                     cancel_reason = ?,
                     cancel_operation_id = ?,
                     updated_at = {self.now_sql()}
-                WHERE id = ?
-                  AND status IN ('submitted', 'working', 'input-required')
-                  AND (creator_agent_id = ? OR recipient_agent_id = ?)
-                  {recipient_predicate}
+                WHERE {live_authority_predicate}
                 """,
                 (
                     message_json,
@@ -785,10 +799,7 @@ class TaskStore(UnifiedStoreBase):
                     actor_agent_id,
                     reason,
                     operation_id,
-                    task_id,
-                    actor_agent_id,
-                    actor_agent_id,
-                    *recipient_values,
+                    *authority_values,
                 ),
             )
             if rows_affected != 1:
