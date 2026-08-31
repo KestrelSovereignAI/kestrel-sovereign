@@ -444,8 +444,14 @@ class TestStartAgent:
         assert "--port" in cmd
         assert "8801" in cmd
 
-    def test_start_agent_sets_agent_bound_env_vars(self, pm, project_dir):
+    def test_start_agent_sets_agent_bound_env_vars(
+        self,
+        pm,
+        project_dir,
+        monkeypatch,
+    ):
         """Child storage and export roots both bind to this agent."""
+        monkeypatch.delenv("KESTREL_A2A_TRANSPORT_KEY", raising=False)
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -463,6 +469,12 @@ class TestStartAgent:
         assert "KESTREL_DATA_DIR" not in env
         assert env["PORT"] == "8801"
         assert env["KESTREL_SERVE_UI"] == "false"
+        assert env["KESTREL_A2A_TRANSPORT_KEY"]
+        assert env["KESTREL_A2A_TRANSPORT_KEY"] != env["KESTREL_API_KEY"]
+        persisted_transport_key = project_dir / ".kestrel-a2a-transport.key"
+        assert persisted_transport_key.read_text(encoding="utf-8").strip() == (
+            env["KESTREL_A2A_TRANSPORT_KEY"]
+        )
 
     def test_start_agent_passes_per_agent_semantic_inference_profile(
         self,

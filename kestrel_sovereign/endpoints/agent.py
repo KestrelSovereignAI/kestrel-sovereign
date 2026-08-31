@@ -1,5 +1,6 @@
 """Agent invoke and streaming endpoints."""
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
@@ -3147,12 +3148,31 @@ async def _parse_a2a_principal_action(
             status_code=400,
             detail="A2A principal actions cannot carry artifacts",
         )
-    message_data = body.get("message") or {}
-    parts_data = message_data.get("parts") or []
+    message_data = body.get("message", {})
+    if message_data is None:
+        message_data = {}
+    if not isinstance(message_data, Mapping):
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action message must be an object",
+        )
+    parts_data = message_data.get("parts", [])
+    if parts_data is None:
+        parts_data = []
+    if not isinstance(parts_data, list):
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action message.parts must be a list",
+        )
+    if any(not isinstance(part, Mapping) for part in parts_data):
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action message.parts entries must be objects",
+        )
     parts = [
         TextPart(text=str(part.get("text", "")))
         for part in parts_data
-        if isinstance(part, dict) and part.get("type") == "text"
+        if part.get("type") == "text"
     ]
     metadata = body.get("metadata") or {}
     if not isinstance(metadata, dict):

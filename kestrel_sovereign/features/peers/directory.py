@@ -19,6 +19,8 @@ from urllib.parse import quote
 
 import httpx
 
+from kestrel_sovereign.a2a.transport_auth import A2A_TRANSPORT_KEY_HEADER
+
 
 PEER_CONNECT_TIMEOUT = 5.0
 PEER_READ_TIMEOUT = 300.0
@@ -238,7 +240,7 @@ class LocalHostPeerDirectory:
         self,
         host_url: str,
         *,
-        api_key: str = "",
+        transport_key: str = "",
         client_factory: Callable[..., Any] = httpx.AsyncClient,
         local_cancel: Optional[Callable[..., Any]] = None,
         local_get: Optional[Callable[..., Any]] = None,
@@ -248,7 +250,7 @@ class LocalHostPeerDirectory:
         ] = None,
     ) -> None:
         self._host_url = host_url.rstrip("/")
-        self._api_key = api_key
+        self._transport_key = transport_key
         self._client_factory = client_factory
         # Host-owned process-local capability; never serialized onto the wire.
         self._local_cancel = local_cancel
@@ -261,8 +263,8 @@ class LocalHostPeerDirectory:
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["X-API-Key"] = self._api_key
+        if self._transport_key:
+            headers[A2A_TRANSPORT_KEY_HEADER] = self._transport_key
         return headers
 
     @staticmethod

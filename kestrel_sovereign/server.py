@@ -42,6 +42,11 @@ from kestrel_sovereign.api_errors import (
     api_unhandled_exception_handler,
     register_api_error_handlers,
 )
+from kestrel_sovereign.a2a.transport_auth import (
+    A2A_TRANSPORT_KEY_HEADER,
+    ensure_a2a_transport_key,
+    is_a2a_transport_path,
+)
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -1323,7 +1328,7 @@ def _hosted_peer_directory_context(
 
         refreshed = refresh(
             host_url=host_url,
-            api_key=get_api_key(),
+            transport_key=ensure_a2a_transport_key(),
             local_cancel=local_cancel,
             local_get=local_get,
             local_subscribe=local_subscribe,
@@ -3223,6 +3228,34 @@ async def auth_middleware(request: Request, call_next):
         if verify_embed_cookie(request, _SESSION_SECRET):
             request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
             return await call_next(request)
+
+    # Automatic peers authenticate on a separate, route-limited lane. The
+    # discriminator is evaluated before the sovereign key and never falls
+    # through: adding both headers cannot promote peer transport to operator
+    # authority. Signed envelopes inside the admitted task routes establish
+    # the actual creator/recipient principal.
+    transport_credential = request.headers.get(A2A_TRANSPORT_KEY_HEADER)
+    if transport_credential is not None:
+        from kestrel_sovereign.auth import CallerContext
+
+        expected_transport = ensure_a2a_transport_key()
+        if not secrets.compare_digest(
+            transport_credential.encode("utf-8"),
+            expected_transport.encode("utf-8"),
+        ):
+            return api_error_response(
+                status_code=401,
+                code="authentication_required",
+                message="Invalid or missing A2A transport key",
+            )
+        if not is_a2a_transport_path(request.method, request.url.path):
+            return api_error_response(
+                status_code=403,
+                code="a2a_transport_scope_denied",
+                message="A2A transport is not authorized for this route",
+            )
+        request.state.caller = CallerContext.a2a_transport()
+        return await call_next(request)
 
     # Credential evaluation only happens inside this try. Dispatch of an
     # authenticated (or deliberately unauthenticated) request stays OUTSIDE

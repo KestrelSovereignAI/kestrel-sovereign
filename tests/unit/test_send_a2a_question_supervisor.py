@@ -136,7 +136,7 @@ def _make_feature(
     """
     feature = PeersFeature.__new__(PeersFeature)
     feature._host_url = "http://host:8888"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "Sender"
 
     fake_client = _FakeAsyncClient(sse_responses)

@@ -618,7 +618,7 @@ async def test_local_subscription_honors_total_deadline():
 
 
 @pytest.mark.asyncio
-async def test_local_task_read_has_no_api_key_only_http_fallback():
+async def test_local_task_read_has_no_unsigned_transport_only_http_fallback():
     directory_response = MagicMock(status_code=200)
     directory_response.raise_for_status.return_value = None
     directory_response.json.return_value = [{
@@ -631,7 +631,7 @@ async def test_local_task_read_has_no_api_key_only_http_fallback():
     client.get.return_value = directory_response
     adapter = LocalHostPeerDirectory(
         "http://local-host",
-        api_key="shared-host-key-is-not-a-principal",
+        transport_key="shared-host-key-is-not-a-principal",
         client_factory=lambda *args, **kwargs: client,
     )
     requester = PeerRequester("did:local:creator", object())
@@ -708,7 +708,7 @@ async def test_subprocess_task_reads_use_signed_http_principal_envelopes():
     transport = httpx.MockTransport(handler)
     adapter = LocalHostPeerDirectory(
         "http://local-host",
-        api_key="transport-key",
+        transport_key="transport-key",
         client_factory=lambda *args, **kwargs: httpx.AsyncClient(
             *args,
             transport=transport,
@@ -742,6 +742,11 @@ async def test_subprocess_task_reads_use_signed_http_principal_envelopes():
     ]
     assert requests[1].url.path.endswith("/private-task/read")
     assert requests[3].url.path.endswith("/private-task/subscribe")
+    assert all(
+        request.headers["X-Kestrel-A2A-Key"] == "transport-key"
+        for request in requests
+    )
+    assert all("X-API-Key" not in request.headers for request in requests)
 
 
 def test_subprocess_principal_payload_refuses_unsigned_identity():

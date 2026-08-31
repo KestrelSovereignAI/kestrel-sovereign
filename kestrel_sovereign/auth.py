@@ -9,6 +9,7 @@ class AuthMethod(str, Enum):
     API_KEY = "api_key"
     JWT = "jwt"
     OAUTH_SESSION = "oauth_session"
+    A2A_TRANSPORT = "a2a_transport"
     INTERNAL = "internal"  # Agent-to-agent or system calls
 
 
@@ -36,6 +37,16 @@ class CallerContext:
     @staticmethod
     def authenticated(identity: str, auth_method: AuthMethod = AuthMethod.OAUTH_SESSION) -> "CallerContext":
         return CallerContext(role=CallerRole.AUTHENTICATED, auth_method=auth_method, identity=identity)
+
+    @staticmethod
+    def a2a_transport() -> "CallerContext":
+        """Transport admission only; never sovereign or task authority."""
+
+        return CallerContext(
+            role=CallerRole.AUTHENTICATED,
+            auth_method=AuthMethod.A2A_TRANSPORT,
+            identity="a2a_transport",
+        )
 
     @staticmethod
     def anonymous() -> "CallerContext":

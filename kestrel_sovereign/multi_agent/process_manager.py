@@ -41,6 +41,7 @@ from kestrel_sovereign.config import (
     SEMANTIC_MAINTENANCE_CONFIG_ENV,
     SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
 )
+from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
 
 # NOTE: ``IDENTITY_EXPORT_DIR_ENV`` is imported lazily inside ``start_agent``
 # (its only use). Pulling it in at module scope would force ``identity``'s
@@ -889,6 +890,10 @@ class ProcessManager:
 
         # Build env
         env = self._load_env()
+        # Automatic peers receive a transport-only credential, never the
+        # sovereign operator key. The selected key is shared by this host's
+        # child processes and is route-scoped again by server auth.
+        ensure_a2a_transport_key(env, project_root=self.project_dir)
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
         # the resolved custody root in a dedicated child-only variable so

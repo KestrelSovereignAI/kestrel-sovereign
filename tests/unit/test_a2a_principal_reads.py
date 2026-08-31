@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -316,6 +317,122 @@ def test_signed_http_read_uses_verified_creator_principal(monkeypatch):
         "wire-read",
         CREATOR_A,
     )
+
+
+@pytest.mark.parametrize(
+    "malformed_message",
+    [
+        "not-an-object",
+        [],
+        {"role": "user", "parts": "not-a-list"},
+        {"role": "user", "parts": ""},
+        {"role": "user", "parts": 7},
+        {"role": "user", "parts": [7]},
+    ],
+)
+def test_principal_action_rejects_malformed_message_shape(
+    monkeypatch,
+    malformed_message,
+):
+    manager = SimpleNamespace(
+        get_task_for_creator=AsyncMock(return_value=None),
+    )
+    agent = SimpleNamespace(
+        agent_id=RECIPIENT_A,
+        did=RECIPIENT_A,
+        task_manager=manager,
+    )
+    app = _principal_endpoint_app(monkeypatch, agent)
+    body = _principal_action_body("wire-read", "read_task")
+    body["message"] = malformed_message
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/agent/tasks/wire-read/read",
+            json=body,
+        )
+
+    assert response.status_code == 400
+    assert "message" in response.json()["detail"]
+    manager.get_task_for_creator.assert_not_awaited()
+
+
+def _auth_request(method: str, path: str, headers: dict[str, str]) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": [
+                (key.lower().encode("ascii"), value.encode("ascii"))
+                for key, value in headers.items()
+            ],
+            "client": ("127.0.0.1", 10000),
+            "server": ("testserver", 80),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_peer_transport_auth_is_distinct_from_sovereign_task_views(
+    monkeypatch,
+):
+    """Peer transport reaches signed A2A POSTs but never legacy UI reads."""
+
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_API_KEY", "sovereign-key")
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "peer-transport-key")
+    admitted = []
+
+    async def observe_caller(request):
+        caller = request.state.caller
+        admitted.append(caller)
+        return JSONResponse(
+            {
+                "role": caller.role.value,
+                "auth_method": caller.auth_method.value,
+            }
+        )
+
+    peer_post = await server.auth_middleware(
+        _auth_request(
+            "POST",
+            "/api/agents/recipient/api/agent/tasks/team/queue/task-1/read",
+            {"X-Kestrel-A2A-Key": "peer-transport-key"},
+        ),
+        observe_caller,
+    )
+    peer_get = await server.auth_middleware(
+        _auth_request(
+            "GET",
+            "/api/agents/recipient/api/agent/tasks/task-1",
+            {
+                "X-Kestrel-A2A-Key": "peer-transport-key",
+                "X-API-Key": "sovereign-key",
+            },
+        ),
+        observe_caller,
+    )
+    operator_get = await server.auth_middleware(
+        _auth_request(
+            "GET",
+            "/api/agents/recipient/api/agent/tasks/task-1",
+            {"X-API-Key": "sovereign-key"},
+        ),
+        observe_caller,
+    )
+
+    assert peer_get.status_code == 403
+    assert peer_post.status_code == 200
+    assert peer_post.body == b'{"role":"authenticated","auth_method":"a2a_transport"}'
+    assert operator_get.status_code == 200
+    assert operator_get.body == b'{"role":"sovereign","auth_method":"api_key"}'
+    assert len(admitted) == 2
 
 
 def test_signed_http_subscription_uses_verified_creator_principal(monkeypatch):

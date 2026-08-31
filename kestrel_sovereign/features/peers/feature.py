@@ -32,6 +32,7 @@ import httpx
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
@@ -272,7 +273,7 @@ class PeersFeature(Feature):
 
     async def initialize(self):
         self._host_url = _discover_host_url()
-        self._api_key = os.environ.get("KESTREL_API_KEY", "")
+        self._transport_key = ensure_a2a_transport_key()
         self._own_name = self._get_own_name()
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and
@@ -385,7 +386,7 @@ class PeersFeature(Feature):
         # the first operation that installed this adapter.
         self._peer_router = LocalHostPeerDirectory(
             host_url,
-            api_key=getattr(self, "_api_key", ""),
+            transport_key=getattr(self, "_transport_key", ""),
             client_factory=lambda *args, **kwargs: httpx.AsyncClient(
                 *args, **kwargs,
             ),
@@ -444,14 +445,14 @@ class PeersFeature(Feature):
         self,
         *,
         host_url: str,
-        api_key: str,
+        transport_key: str,
         local_cancel=None,
         local_get=None,
         local_subscribe=None,
     ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
         """Refresh only the local compatibility adapter for hosted policy.
 
-        Host registration can occur after platform port resolution or API-key
+        Host registration can occur after platform port resolution or peer-key
         generation. Those are host-owned runtime facts, so the local adapter
         must be reconstructed from them before the host freezes its inbound
         policy. An injected scoped router is intentionally never replaced.
@@ -467,7 +468,7 @@ class PeersFeature(Feature):
         if router is not None and not isinstance(router, LocalHostPeerDirectory):
             return self._peer_directory_context()
         self._host_url = host_url.rstrip("/")
-        self._api_key = api_key
+        self._transport_key = transport_key
         self._local_host_cancel = local_cancel
         self._local_host_get = local_get
         self._local_host_subscribe = local_subscribe
