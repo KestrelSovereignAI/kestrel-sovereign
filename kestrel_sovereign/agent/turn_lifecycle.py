@@ -377,13 +377,51 @@ class TurnLifecycleMixin:
         ``KestrelAgent.initialize()`` while the host feature lifecycle is still
         being assembled by the server.  The server installs one shared event
         before initialization and sets it only after the host context registry
-        has been bound.  Directly-created/test agents have no event and retain
-        their established behavior.
+        has been bound.  Multi-agent initialization can still be absent from
+        the manager's fan-out at that instant, so gate release also reconciles
+        the shared publication generation before cognition may continue.
+        Directly-created/test agents have no shared state and retain their
+        established behavior.
         """
 
         gate = getattr(self, "_host_context_publication_gate", None)
         if gate is not None and not gate.is_set():
             await gate.wait()
+        self._synchronize_host_context_publication()
+
+    def _synchronize_host_context_publication(self) -> None:
+        """Bind the manager's latest host registry at the cognition barrier.
+
+        An agent is deliberately not routable until ``initialize()`` returns,
+        but its ready hooks can start cognition during initialization.  A
+        manager fan-out therefore cannot be the only publication mechanism:
+        the still-unregistered agent may be waiting on the same event that the
+        host is about to release.  The manager shares a generation box with
+        every constructed agent; this synchronous check makes rebinding atomic
+        with leaving the gate and is also safe when a late cold wake observes
+        an already-set gate.
+        """
+
+        state = getattr(self, "_host_context_publication_state", None)
+        if state is None:
+            return
+        generation = getattr(state, "generation", None)
+        if type(generation) is not int or generation < 0:
+            raise RuntimeError("host context publication state is invalid")
+        if getattr(self, "_host_context_publication_generation", None) == generation:
+            return
+
+        validate_registry = getattr(
+            self, "validate_host_context_clause_registry", None
+        )
+        bind_registry = getattr(self, "bind_host_context_clause_registry", None)
+        if not callable(validate_registry) or not callable(bind_registry):
+            raise RuntimeError("agent cannot synchronize host context publication")
+
+        registry = getattr(state, "registry", None)
+        validate_registry(registry)
+        bind_registry(registry)
+        self._host_context_publication_generation = generation
 
     @asynccontextmanager
     async def feature_config_transition(self) -> AsyncIterator[None]:

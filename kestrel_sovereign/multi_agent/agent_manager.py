@@ -593,6 +593,14 @@ def _loaded_agent_did(agent: object) -> Optional[str]:
     return None
 
 
+@dataclass
+class _HostContextPublicationState:
+    """Shared host registry generation observed by initializing agents."""
+
+    registry: object | None = None
+    generation: int = 0
+
+
 class AgentManager:
     """In-process multi-agent manager.
 
@@ -619,6 +627,7 @@ class AgentManager:
         self._base_data_dir = (base_data_dir or Path.cwd()).expanduser().resolve()
         self._host_context_clause_registry = None
         self._host_context_publication_gate: asyncio.Event | None = None
+        self._host_context_publication_state = _HostContextPublicationState()
         # A multi-agent host owns one mutable isolated-feature root.  The
         # per-agent namespace is derived below from the stable DID rather than
         # accepting the routing name as a path component.
@@ -1612,6 +1621,16 @@ class AgentManager:
             agent._host_context_publication_gate = (
                 self._host_context_publication_gate
             )
+            # Keep the live state box attached before initialize: ready hooks
+            # can enter cognition while the agent is still absent from
+            # ``_agents`` and therefore invisible to manager fan-out.  Leave
+            # the observed generation unset until the cognition barrier or
+            # registration seam performs a validated bind; construction alone
+            # is not proof that the prompt builder already consumes it.
+            agent._host_context_publication_state = (
+                self._host_context_publication_state
+            )
+            agent._host_context_publication_generation = None
             if scheduler_registration is not None:
                 agent._dynamic_scheduler_tenant_registration = (
                     scheduler_registration
@@ -1845,13 +1864,14 @@ class AgentManager:
                 f"name: {agent_id!r} -> {bound_name!r}"
             )
 
-        # Initialization snapshots host context before its first await.  Host
+        # Construction snapshots host context before ``initialize()``.  Host
         # feature publication can finish while a cold agent is still starting,
-        # after the manager's fan-out has already walked ``_agents``.  Rebind
-        # the authoritative registry at this single admission seam so the new
-        # agent cannot publish with that stale snapshot.  Do the validation
-        # before adding either routing entry: a namespace collision must reject
-        # onboarding without making the agent briefly addressable.
+        # after the manager's fan-out has already walked ``_agents``.  The turn
+        # barrier handles cognition during that window; rebind again at this
+        # final admission seam so the agent cannot become routable with a stale
+        # snapshot.  Validate before adding either routing entry: a namespace
+        # collision must reject onboarding without making the agent briefly
+        # addressable.
         registry = self._host_context_clause_registry
         validate_registry = getattr(
             agent, "validate_host_context_clause_registry", None
@@ -1867,9 +1887,14 @@ class AgentManager:
             validate_registry(registry)
             bind_registry(registry)
 
-        # The publication gate has the same construction/fan-out race.  Refresh
-        # it together with the registry before the agent becomes routable.
+        # Refresh every shared publication pointer before the agent becomes
+        # routable.  This also records that the direct rebind above consumed the
+        # current generation, avoiding redundant work on its first normal turn.
         agent._host_context_publication_gate = self._host_context_publication_gate
+        agent._host_context_publication_state = self._host_context_publication_state
+        agent._host_context_publication_generation = (
+            self._host_context_publication_state.generation
+        )
         self._agents[name] = agent
         self._agent_names[agent_id] = name
         # Publish the registered routing key as the human display name so the
@@ -2653,12 +2678,19 @@ class AgentManager:
             agent.validate_host_context_clause_registry(registry)
 
     def bind_host_context_clause_registry(self, registry) -> None:
-        """Publish host context to existing agents and every future agent."""
+        """Publish host context to loaded, initializing, and future agents."""
 
         self.validate_host_context_clause_registry(registry)
-        for agent in self._agents.values():
+        agents = tuple(self._agents.values())
+        for agent in agents:
             agent.bind_host_context_clause_registry(registry)
         self._host_context_clause_registry = registry
+        state = self._host_context_publication_state
+        state.registry = registry
+        state.generation += 1
+        for agent in agents:
+            agent._host_context_publication_state = state
+            agent._host_context_publication_generation = state.generation
 
     def set_host_context_publication_gate(self, gate: asyncio.Event) -> None:
         """Gate current and future agent turns until host policy is published."""
@@ -2666,6 +2698,9 @@ class AgentManager:
         self._host_context_publication_gate = gate
         for agent in self._agents.values():
             agent._host_context_publication_gate = gate
+            agent._host_context_publication_state = (
+                self._host_context_publication_state
+            )
 
     async def local_agent_configs_by_did(
         self,

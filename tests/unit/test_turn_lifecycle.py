@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.signals import CausationFrame, ResourceLock
@@ -61,6 +62,20 @@ class _RequestTurnAgent(RequestLifecycleMixin, TurnLifecycleMixin):
         self._active_request_counts = {}
         self._active_request_started_at = {}
         self._cancelled_requests = set()
+
+
+class _HostContextStubAgent(_StubAgent):
+    """Minimal host-context carrier using the real turn lifecycle boundary."""
+
+    def __init__(self, registry: object) -> None:
+        super().__init__()
+        self._host_context_clause_registry = registry
+
+    def validate_host_context_clause_registry(self, registry: object) -> None:
+        return None
+
+    def bind_host_context_clause_registry(self, registry: object) -> None:
+        self._host_context_clause_registry = registry
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +152,73 @@ async def test_turn_waits_for_host_context_publication_before_lock_entry():
     agent._host_context_publication_gate.set()
     await asyncio.wait_for(task, timeout=1)
     assert entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_waiting_unregistered_turn_rebinds_current_host_context_at_gate():
+    """Gate release cannot expose an initializing agent's stale snapshot."""
+
+    old_registry = object()
+    current_registry = object()
+    publication_state = SimpleNamespace(registry=old_registry, generation=1)
+    agent = _HostContextStubAgent(old_registry)
+    agent._host_context_publication_state = publication_state
+    agent._host_context_publication_generation = 1
+    agent._host_context_publication_gate = asyncio.Event()
+    observed = []
+
+    async def initializing_turn() -> None:
+        async with agent._turn_lifecycle():
+            observed.append(agent._host_context_clause_registry)
+
+    task = asyncio.create_task(initializing_turn())
+    await asyncio.sleep(0)
+    assert not observed
+
+    # Host publication cannot fan out to this still-unregistered agent.  Its
+    # shared state advances before the server releases the cognition barrier.
+    publication_state.registry = current_registry
+    publication_state.generation = 2
+    agent._host_context_publication_gate.set()
+
+    await asyncio.wait_for(task, timeout=1)
+    assert observed == [current_registry]
+    assert agent._host_context_publication_generation == 2
+
+
+@pytest.mark.asyncio
+async def test_waiting_turn_rejects_new_host_context_before_cognition():
+    """A stale initializing agent fails closed on a newly-visible collision."""
+
+    old_registry = object()
+    rejected_registry = object()
+    publication_state = SimpleNamespace(registry=rejected_registry, generation=2)
+    agent = _HostContextStubAgent(old_registry)
+    agent._host_context_publication_state = publication_state
+    agent._host_context_publication_generation = 1
+    agent._host_context_publication_gate = asyncio.Event()
+    entered = False
+
+    def reject(registry: object) -> None:
+        assert registry is rejected_registry
+        raise ValueError("context namespace collision")
+
+    agent.validate_host_context_clause_registry = reject
+
+    async def initializing_turn() -> None:
+        nonlocal entered
+        async with agent._turn_lifecycle():
+            entered = True
+
+    task = asyncio.create_task(initializing_turn())
+    await asyncio.sleep(0)
+    agent._host_context_publication_gate.set()
+
+    with pytest.raises(ValueError, match="context namespace collision"):
+        await asyncio.wait_for(task, timeout=1)
+    assert entered is False
+    assert agent._host_context_clause_registry is old_registry
+    assert agent._host_context_publication_generation == 1
 
 
 @pytest.mark.asyncio

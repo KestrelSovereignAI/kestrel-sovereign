@@ -15,6 +15,7 @@ import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.isolated_runtime import (
     IsolatedRuntimeNamespaceError,
@@ -42,6 +43,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
+from kestrel_sovereign.signals import OrderedLockManager
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 
 
@@ -278,7 +280,14 @@ class TestAgentManagerBasics:
             agent.bind_host_context_clause_registry.assert_called_once_with(
                 registry
             )
+            assert (
+                agent._host_context_publication_state
+                is manager._host_context_publication_state
+            )
+            assert agent._host_context_publication_generation == 1
         assert manager._host_context_clause_registry is registry
+        assert manager._host_context_publication_state.registry is registry
+        assert manager._host_context_publication_state.generation == 1
 
     def test_registration_rebinds_host_context_published_during_initialization(self):
         """A cold agent cannot retain the registry snapshot from construction."""
@@ -301,6 +310,14 @@ class TestAgentManagerBasics:
             current_registry
         )
         assert agent._host_context_publication_gate is publication_gate
+        assert (
+            agent._host_context_publication_state
+            is manager._host_context_publication_state
+        )
+        assert (
+            agent._host_context_publication_generation
+            == manager._host_context_publication_state.generation
+        )
         assert manager.get_agent("Cold") is agent
 
     def test_get_agent_name(self):
@@ -4221,6 +4238,11 @@ class TestLoadFromConfig:
 
         async def initialize_with_gate_bound():
             assert future_agent._host_context_publication_gate is publication_gate
+            assert (
+                future_agent._host_context_publication_state
+                is manager._host_context_publication_state
+            )
+            assert future_agent._host_context_publication_generation is None
             assert not publication_gate.is_set()
 
         future_agent.initialize.side_effect = initialize_with_gate_bound
@@ -4236,6 +4258,78 @@ class TestLoadFromConfig:
             is registry
         )
         assert future_agent._host_context_publication_gate is publication_gate
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_initializing_turn_rebinds_registry_before_gate_release(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """An unregistered ready-hook turn observes the published host policy."""
+
+        old_registry = object()
+        current_registry = object()
+        publication_gate = asyncio.Event()
+        initialize_started = asyncio.Event()
+
+        class InitializingTurnAgent(TurnLifecycleMixin):
+            def __init__(self):
+                self.did = "did:initializing"
+                self.agent_id = self.did
+                self._lock_manager = OrderedLockManager()
+                self._host_context_clause_registry = old_registry
+                self.observed_registry = None
+
+            def validate_host_context_clause_registry(self, registry):
+                return None
+
+            def bind_host_context_clause_registry(self, registry):
+                self._host_context_clause_registry = registry
+
+            async def initialize(self):
+                initialize_started.set()
+                async with self._turn_lifecycle():
+                    self.observed_registry = self._host_context_clause_registry
+
+            async def shutdown(self):
+                return None
+
+        agent = InitializingTurnAgent()
+        mock_agent_cls.return_value = agent
+        mock_get_did.return_value = agent.did
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager.bind_host_context_clause_registry(old_registry)
+        manager.set_host_context_publication_gate(publication_gate)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            initialize_task = asyncio.create_task(
+                manager._initialize_agent(
+                    "initializing",
+                    LocalAgentConfig(data_dir=Path("initializing"), port=8801),
+                )
+            )
+            await asyncio.wait_for(initialize_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert manager.list_agents() == {}
+
+            # Host publication misses ``_agents`` but advances the shared state
+            # before releasing every ready-hook turn waiting on the same gate.
+            manager.bind_host_context_clause_registry(current_registry)
+            publication_gate.set()
+            initialized = await asyncio.wait_for(initialize_task, timeout=1)
+
+        assert initialized is agent
+        assert agent.observed_registry is current_registry
+        assert agent._host_context_publication_generation == 2
+        assert manager.list_agents() == {}
 
     @pytest.mark.asyncio
     async def test_load_from_config_initializes_concurrently_and_registers_in_order(self):
