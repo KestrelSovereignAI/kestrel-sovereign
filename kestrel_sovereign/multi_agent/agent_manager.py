@@ -1483,6 +1483,21 @@ class AgentManager:
                 ),
             )
             cancelled, failure = await await_lifecycle_task_completion(task)
+            if isinstance(failure, asyncio.CancelledError):
+                # ``on_agent_ready`` is a best-effort post-publication phase.
+                # Real agents consume a hook-owned child cancellation inside
+                # that phase, but keep this boundary defensive for compatible
+                # agent implementations: reporting load cancellation here
+                # would leave a routable committed agent while its caller
+                # skips persistence handoff.  Caller cancellation is carried
+                # separately by ``cancelled`` because the manager-owned task
+                # is shielded and driven to settlement.
+                logger.warning(
+                    "Deferred best-effort readiness cancelled for published "
+                    "agent %r; preserving the committed load",
+                    _loaded_agent_did(agent),
+                )
+                return cancelled
             if failure is not None:
                 raise failure
             return cancelled

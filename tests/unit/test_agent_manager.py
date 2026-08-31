@@ -4575,6 +4575,41 @@ class TestLoadFromConfig:
         assert manager._agent_operations == {}
 
     @pytest.mark.asyncio
+    async def test_create_preserves_config_when_ready_hook_cancels(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A best-effort hook cancellation cannot skip the create handoff."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        agent = _make_mock_agent("did:dynamic-ready-child-cancel")
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=asyncio.CancelledError("ready child cancelled")
+        )
+        manager._data_key_custody_conflict = lambda: None
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        monkeypatch.setattr(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            AsyncMock(),
+        )
+
+        loaded = await manager.create_agent("DynamicReadyChildCancel")
+
+        assert loaded is agent
+        assert manager.get_agent("DynamicReadyChildCancel") is agent
+        assert manager._created_configs["DynamicReadyChildCancel"] == LocalAgentConfig(
+            data_dir=Path("agent_data") / "DynamicReadyChildCancel",
+            port=8801,
+            autostart=True,
+        )
+        agent.shutdown.assert_not_awaited()
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
     async def test_create_cancellation_during_readiness_preserves_config_handoff(
         self,
         monkeypatch,

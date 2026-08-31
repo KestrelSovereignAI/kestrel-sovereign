@@ -824,6 +824,34 @@ async def test_deferred_readiness_completion_is_exactly_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_deferred_best_effort_hook_child_cancellation_settles_readiness(tmp_path):
+    """A hook-owned cancelled child cannot cancel the published agent's boot."""
+
+    agent = _agent(tmp_path)
+    gate = asyncio.Event()
+    gate.set()
+    agent._host_context_publication_gate = gate
+    agent.defer_agent_readiness_to_host()
+
+    class ChildCancelledReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            child = asyncio.create_task(asyncio.sleep(0))
+            child.cancel()
+            await child
+
+    feature = ChildCancelledReadyFeature(agent)
+    agent.features[feature.name] = feature
+    await agent._run_or_defer_agent_ready_hooks()
+    assert agent._agent_ready_hooks_deferred is True
+
+    await agent.complete_deferred_agent_readiness()
+
+    assert agent._agent_ready_hooks_deferred is False
+    assert agent._agent_ready_hooks_completed is True
+    assert agent._agent_readiness_host_owned is False
+
+
+@pytest.mark.asyncio
 async def test_runtime_enable_registers_contributed_hard_permission_immediately(
     tmp_path,
 ):

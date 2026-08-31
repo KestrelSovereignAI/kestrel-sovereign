@@ -3537,7 +3537,15 @@ class KestrelAgent(
                 continue
             try:
                 await ready_hook(self)
-            except Exception as e:
+            except (Exception, asyncio.CancelledError) as e:
+                # Ready hooks are explicitly best-effort.  A hook can await a
+                # child task that was independently cancelled; on modern
+                # Python that outcome is a BaseException and used to cancel
+                # the entire deferred-readiness task after host publication.
+                # Manager-owned caller cancellation never cancels this task
+                # (it is joined through a shield), so treating the hook-local
+                # outcome like every other optional hook failure preserves the
+                # committed agent lifecycle.
                 logging.warning(
                     "on_agent_ready failed for %s: %s",
                     getattr(feature, "name", type(feature).__name__), e,
