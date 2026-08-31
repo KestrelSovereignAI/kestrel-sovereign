@@ -28,10 +28,14 @@ from kestrel_sovereign.storage.database_clock import database_now_sql
 
 HOST_HOLD_TARGET = "host"
 _SCHEMA_LOCK = "hold_state_v1"
+_HISTORY_LOCK_KEY = "kestrel:hold:history-anchor"
 _WITNESS_BACKFILL = "hold_state_witness_ledgers_v1"
 _INITIALIZATION_WITNESS_PAYLOAD = b"kestrel-hold-state-initialized-v1\n"
+_HISTORY_ANCHOR_HEADER = b"kestrel-hold-history-v1\n"
+_HISTORY_ANCHOR_MAX_BYTES = 256
 _POSTGRES_WITNESS_AGENT_ID = "__kestrel_host_control__"
 _POSTGRES_WITNESS_KEY = "hold_schema_initialized_v1"
+_POSTGRES_HISTORY_ANCHOR_KEY = "hold_history_anchor_v1"
 _HOLD_SCHEMA_TABLES = frozenset(
     {
         "hold_latches",
@@ -154,6 +158,13 @@ def hold_initialization_witness_path(control_db_path: str | Path) -> Path:
 
     path = absolute_without_following_leaf(Path(control_db_path))
     return Path(f"{path}.hold-initialized-v1")
+
+
+def hold_history_anchor_path(control_db_path: str | Path) -> Path:
+    """Return the external receipt-history anchor for one control database."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    return Path(f"{path}.hold-history-v1")
 
 
 def _terminal_authority_ids(
@@ -395,6 +406,7 @@ class HoldStore:
         db: Any,
         *,
         initialization_witness_path: str | Path | None = None,
+        history_anchor_path: str | Path | None = None,
     ):
         self._db = db
         if initialization_witness_path is not None:
@@ -412,27 +424,57 @@ class HoldStore:
         else:
             self._initialization_witness_path = None
 
+        if history_anchor_path is not None:
+            self._history_anchor_path = absolute_without_following_leaf(
+                Path(history_anchor_path)
+            )
+        elif initialization_witness_path is not None:
+            self._history_anchor_path = absolute_without_following_leaf(
+                Path(f"{initialization_witness_path}.history-v1")
+            )
+        elif getattr(db, "backend_type", "") == "sqlite":
+            backend = getattr(db, "backend", None)
+            db_path = getattr(backend, "db_path", None)
+            self._history_anchor_path = (
+                None
+                if not db_path or db_path == ":memory:"
+                else hold_history_anchor_path(db_path)
+            )
+        else:
+            self._history_anchor_path = None
+
+    @staticmethod
+    def _read_file_evidence(
+        path: Path,
+        *,
+        label: str,
+        max_bytes: int,
+    ) -> bytes | None:
+        """Read one complete private evidence file without following links."""
+
+        if not path_exists(path):
+            return None
+        try:
+            descriptor = open_private_file(path, os.O_RDONLY, label=label)
+            try:
+                return os.read(descriptor, max_bytes + 1)
+            finally:
+                os.close(descriptor)
+        except PrivateStorageError as exc:
+            raise HoldCorruptStateError(f"{label} cannot be trusted: {exc}") from exc
+
     def _read_file_initialization_witness(self) -> bool:
         """Return whether the external initialized marker is present and valid."""
 
         path = self._initialization_witness_path
         assert path is not None
-        if not path_exists(path):
+        payload = self._read_file_evidence(
+            path,
+            label="Hold initialization witness",
+            max_bytes=len(_INITIALIZATION_WITNESS_PAYLOAD),
+        )
+        if payload is None:
             return False
-        try:
-            descriptor = open_private_file(
-                path,
-                os.O_RDONLY,
-                label="Hold initialization witness",
-            )
-            try:
-                payload = os.read(descriptor, len(_INITIALIZATION_WITNESS_PAYLOAD) + 1)
-            finally:
-                os.close(descriptor)
-        except PrivateStorageError as exc:
-            raise HoldCorruptStateError(
-                f"Hold initialization witness cannot be trusted: {exc}"
-            ) from exc
         if payload != _INITIALIZATION_WITNESS_PAYLOAD:
             raise HoldCorruptStateError(
                 "Hold initialization witness has invalid durable evidence"
@@ -472,47 +514,36 @@ class HoldStore:
         finally:
             os.close(descriptor)
 
-    def _write_file_initialization_witness(self) -> None:
-        """Atomically publish a complete local initialized marker."""
+    def _write_file_evidence(self, path: Path, payload: bytes, *, label: str) -> None:
+        """Atomically replace one private evidence file with fsynced content."""
 
-        path = self._initialization_witness_path
-        assert path is not None
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         try:
             descriptor = open_private_file(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                label="Hold initialization witness",
+                label=label,
             )
         except PrivateStorageError as exc:
-            raise HoldStateError(
-                f"could not persist Hold initialization witness: {exc}"
-            ) from exc
+            raise HoldStateError(f"could not persist {label}: {exc}") from exc
         try:
-            view = memoryview(_INITIALIZATION_WITNESS_PAYLOAD)
+            view = memoryview(payload)
             while view:
                 written = os.write(descriptor, view)
                 if written <= 0:
-                    raise OSError("short write while persisting Hold witness")
+                    raise OSError(f"short write while persisting {label}")
                 view = view[written:]
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = -1
 
-            # A concurrent initializer may already have published an exact
-            # complete marker. Otherwise replace from the same private
-            # directory: readers can observe only absence or the fsynced
-            # payload, never the temporary inode while it is being written.
-            if path_exists(path) and self._read_file_initialization_witness():
-                os.unlink(temporary)
-                self._fsync_witness_directory(path)
-                return
+            # Replace from the same private directory: readers can observe only
+            # the previous complete payload or the new fsynced payload, never
+            # the temporary inode while it is being written.
             os.replace(temporary, path)
             self._fsync_witness_directory(path)
         except OSError as exc:
-            raise HoldStateError(
-                f"could not persist Hold initialization witness: {exc}"
-            ) from exc
+            raise HoldStateError(f"could not persist {label}: {exc}") from exc
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -521,6 +552,19 @@ class HoldStore:
                     os.unlink(temporary)
                 except OSError:
                     pass
+
+    def _write_file_initialization_witness(self) -> None:
+        """Atomically publish a complete local initialized marker."""
+
+        path = self._initialization_witness_path
+        assert path is not None
+        if path_exists(path) and self._read_file_initialization_witness():
+            return
+        self._write_file_evidence(
+            path,
+            _INITIALIZATION_WITNESS_PAYLOAD,
+            label="Hold initialization witness",
+        )
 
     async def _write_initialization_witness(self) -> None:
         """Publish initialized evidence after the Hold schema commits."""
@@ -546,6 +590,108 @@ class HoldStore:
                 "could not persist PostgreSQL Hold initialization witness"
             )
 
+    async def _current_history_anchor_payload(self) -> bytes:
+        """Hash the complete immutable receipt set in a stable global order."""
+
+        rows = await self._db.fetchall(
+            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id"
+        )
+        digest = hashlib.sha256()
+        digest.update(_HISTORY_ANCHOR_HEADER)
+        for row in rows:
+            receipt = _receipt_from_row(row)
+            for value in (receipt.receipt_id, _receipt_content_digest(row)):
+                encoded = value.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        return (
+            _HISTORY_ANCHOR_HEADER
+            + str(len(rows)).encode("ascii")
+            + b"\n"
+            + digest.hexdigest().encode("ascii")
+            + b"\n"
+        )
+
+    async def _read_history_anchor(self) -> bytes | None:
+        """Read the receipt-history head from custody outside Hold tables."""
+
+        if self._history_anchor_path is not None:
+            payload = self._read_file_evidence(
+                self._history_anchor_path,
+                label="Hold history anchor",
+                max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+            )
+        elif getattr(self._db, "backend_type", "") == "postgres":
+            rows = await self._db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (_POSTGRES_WITNESS_AGENT_ID, _POSTGRES_HISTORY_ANCHOR_KEY),
+            )
+            if not rows:
+                return None
+            if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(rows[0][0], str):
+                raise HoldCorruptStateError(
+                    "PostgreSQL Hold history anchor has invalid durable evidence"
+                )
+            try:
+                payload = rows[0][0].encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise HoldCorruptStateError(
+                    "PostgreSQL Hold history anchor has invalid durable evidence"
+                ) from exc
+        else:
+            raise HoldStateError("durable Hold requires an external history anchor")
+
+        if payload is None:
+            return None
+        parts = payload.splitlines()
+        if (
+            len(parts) != 3
+            or parts[0] != _HISTORY_ANCHOR_HEADER.rstrip(b"\n")
+            or not parts[1].isdigit()
+            or str(int(parts[1])).encode("ascii") != parts[1]
+            or len(parts[2]) != 64
+            or any(byte not in b"0123456789abcdef" for byte in parts[2])
+            or not payload.endswith(b"\n")
+        ):
+            raise HoldCorruptStateError(
+                "Hold history anchor has invalid durable evidence"
+            )
+        return payload
+
+    async def _write_history_anchor(self) -> None:
+        """Publish the receipt-history head before a mutation can return."""
+
+        payload = await self._current_history_anchor_payload()
+        if self._history_anchor_path is not None:
+            self._write_file_evidence(
+                self._history_anchor_path,
+                payload,
+                label="Hold history anchor",
+            )
+            return
+        if getattr(self._db, "backend_type", "") != "postgres":
+            raise HoldStateError("durable Hold requires an external history anchor")
+        await self._db.execute(
+            "INSERT INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT (agent_id, key) DO UPDATE SET value = excluded.value",
+            (
+                _POSTGRES_WITNESS_AGENT_ID,
+                _POSTGRES_HISTORY_ANCHOR_KEY,
+                payload.decode("ascii"),
+            ),
+        )
+
+    async def _assert_history_anchor_intact(self) -> None:
+        """Fail closed when the database no longer matches its durable head."""
+
+        anchored = await self._read_history_anchor()
+        if anchored is None:
+            raise HoldCorruptStateError("Hold history anchor is missing")
+        if anchored != await self._current_history_anchor_payload():
+            raise HoldCorruptStateError(
+                "Hold history anchor does not match receipt history"
+            )
+
     async def _existing_schema_tables(self) -> set[str]:
         placeholders = ", ".join("?" for _ in _HOLD_SCHEMA_TABLES)
         names = tuple(sorted(_HOLD_SCHEMA_TABLES))
@@ -569,8 +715,29 @@ class HoldStore:
 
         try:
             initialized = await self._read_initialization_witness()
-            await self._ensure_schema_transaction(initialized=initialized)
+            anchored = await self._read_history_anchor()
+            existing = await self._existing_schema_tables()
+            legacy_tables = {"hold_latches", "hold_receipts"}
+            if initialized and anchored is None:
+                raise HoldCorruptStateError("Hold history anchor is missing")
             if not initialized:
+                if anchored is not None:
+                    raise HoldCorruptStateError(
+                        "Hold history anchor exists without its initialization witness"
+                    )
+                if existing - legacy_tables:
+                    raise HoldCorruptStateError(
+                        "Hold initialization witness is missing for an "
+                        "initialized schema"
+                    )
+            await self._ensure_schema_transaction(initialized=initialized)
+            if initialized:
+                await self._assert_history_anchor_intact()
+            else:
+                # The history head is published first. A crash between these
+                # two writes leaves conflicting evidence and therefore fails
+                # closed rather than treating current rows as a fresh store.
+                await self._write_history_anchor()
                 await self._write_initialization_witness()
         except BaseException as exc:
             domain_error = _domain_error_from_chain(exc)
@@ -678,7 +845,11 @@ class HoldStore:
             if migration_complete is not None:
                 await self._assert_completed_witness_migration_intact()
                 return
-
+            if initialized:
+                raise HoldCorruptStateError(
+                    "initialized Hold schema is missing its required witness "
+                    "migration marker"
+                )
             # Seed the witness exactly once for upgraded databases. Future
             # schema checks never derive missing witnesses from mutable receipt
             # rows after the durable migration marker exists. Without that
@@ -840,10 +1011,12 @@ class HoldStore:
     ) -> None:
         if getattr(self._db, "backend_type", "") != "postgres":
             return
-        # One global acquisition order for every writer: operation first,
-        # target second.  The operation lock closes cross-target reuse of one
-        # id; the target lock closes the absent-row authorization/mutation gap.
+        # One global acquisition order for every writer: history first,
+        # operation second, target third. The global lock serializes the
+        # database-wide receipt head across otherwise-independent targets; the
+        # other locks close operation reuse and absent-row mutation gaps.
         for key in (
+            _HISTORY_LOCK_KEY,
             f"kestrel:hold:operation:{operation_id}",
             f"kestrel:hold:target:{scope.value}:{target_id}",
         ):
@@ -859,13 +1032,15 @@ class HoldStore:
 
         if getattr(self._db, "backend_type", "") != "postgres":
             return
-        keys = sorted(
+        target_keys = sorted(
             {
                 f"kestrel:hold:target:{scope.value}:{target_id}"
                 for scope, target_id in targets
             }
         )
-        for key in keys:
+        # Every read validates the database-wide history anchor. Its shared
+        # lock must therefore precede the same target locks as every writer.
+        for key in (_HISTORY_LOCK_KEY, *target_keys):
             await self._db.execute(
                 "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))",
                 (key,),
@@ -1112,6 +1287,7 @@ class HoldStore:
                 # or ruled out, so a successful read must fail closed until the
                 # database is repaired.
                 await self._assert_no_orphaned_operation_witnesses()
+                await self._assert_history_anchor_intact()
                 return
             raise HoldCorruptStateError(
                 "unheld projection retains active Hold authority"
@@ -1155,6 +1331,7 @@ class HoldStore:
                 "Hold receipt content witness does not match receipt history"
             )
         await self._assert_no_orphaned_operation_witnesses()
+        await self._assert_history_anchor_intact()
 
     async def _validate_latch_projection(
         self,
@@ -1344,38 +1521,42 @@ class HoldStore:
                     prior_hold_receipt_id=prior.hold_receipt_id,
                     resulting_hold_receipt_id=prior.hold_receipt_id,
                 )
-                return HoldMutation(receipt=receipt, current=prior)
-
-            receipt_id = str(uuid4())
-            receipt = await self._insert_receipt(
-                operation_id=operation,
-                action=HoldAction.HOLD,
-                disposition=HoldDisposition.APPLIED,
-                scope=resolved_scope,
-                target_id=resolved_target,
-                reason=why,
-                actor_id=actor,
-                expected_hold_receipt_id="",
-                prior_hold_receipt_id=(prior.hold_receipt_id if prior else ""),
-                resulting_hold_receipt_id=receipt_id,
-                receipt_id=receipt_id,
-            )
-            await self._db.execute(
-                "UPDATE hold_latches SET active = 1, hold_receipt_id = ?, "
-                "reason = ?, actor_id = ?, set_at = ?, revision = revision + 1 "
-                "WHERE scope = ? AND target_id = ?",
-                (
-                    receipt.receipt_id,
-                    why,
-                    actor,
-                    receipt.occurred_at,
-                    resolved_scope.value,
-                    resolved_target,
-                ),
-            )
-            current = _latch_from_row(
-                await self._read_latch_row(resolved_scope, resolved_target)
-            )
+                current = prior
+            else:
+                receipt_id = str(uuid4())
+                receipt = await self._insert_receipt(
+                    operation_id=operation,
+                    action=HoldAction.HOLD,
+                    disposition=HoldDisposition.APPLIED,
+                    scope=resolved_scope,
+                    target_id=resolved_target,
+                    reason=why,
+                    actor_id=actor,
+                    expected_hold_receipt_id="",
+                    prior_hold_receipt_id=(prior.hold_receipt_id if prior else ""),
+                    resulting_hold_receipt_id=receipt_id,
+                    receipt_id=receipt_id,
+                )
+                await self._db.execute(
+                    "UPDATE hold_latches SET active = 1, hold_receipt_id = ?, "
+                    "reason = ?, actor_id = ?, set_at = ?, revision = revision + 1 "
+                    "WHERE scope = ? AND target_id = ?",
+                    (
+                        receipt.receipt_id,
+                        why,
+                        actor,
+                        receipt.occurred_at,
+                        resolved_scope.value,
+                        resolved_target,
+                    ),
+                )
+                current = _latch_from_row(
+                    await self._read_latch_row(resolved_scope, resolved_target)
+                )
+            # Every non-replay path inserts exactly one immutable receipt. Keep
+            # the anchor call after every latch write so an earlier failure
+            # rolls the database back without advancing external evidence.
+            await self._write_history_anchor()
             return HoldMutation(receipt=receipt, current=current)
 
     async def release_hold(
@@ -1489,6 +1670,7 @@ class HoldStore:
             current = _latch_from_row(
                 await self._read_latch_row(resolved_scope, resolved_target)
             )
+            await self._write_history_anchor()
             return HoldMutation(receipt=receipt, current=current)
 
     async def get_hold(
@@ -1595,6 +1777,7 @@ class HoldStore:
         async with self._db.transaction():
             row = await self._validate_operation_witness(operation)
             if row is None:
+                await self._assert_history_anchor_intact()
                 return None
             receipt = _receipt_from_row(row)
             targets = ((receipt.scope, receipt.target_id),)
