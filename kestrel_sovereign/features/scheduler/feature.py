@@ -886,53 +886,6 @@ class SchedulerFeature(Feature):
             session_id=session_id,
             visibility=visibility,
         )
-        if task_name == SELF_FOLLOWUP_TASK_NAME:
-            # Serialize delivery with privacy transitions (#3112 gate-6 P1).
-            #
-            # I refused this finding once, on the grounds that its stated
-            # mechanism — a mode change BETWEEN the fire-time check and this
-            # call — is unreachable, since that stretch is straight-line. That
-            # much was right, and it was the wrong reason to do nothing: the
-            # payload was built from persisted intent BEFORE this await, and
-            # `dispatch_signal` itself awaits persistence, locking and turn
-            # admission. A transition landing inside that window delivers
-            # conversation content into a cognition turn under a mode that
-            # forbids it. Reproducible by passing the guard in FULL mode,
-            # suspending the dispatcher, switching to EPHEMERAL, and resuming.
-            #
-            # I had already written that the residual concern was real and
-            # different, and then treated "the pointer is wrong" as grounds to
-            # leave it. A finding's mechanism can be wrong while its claim is
-            # right — which is the thing I keep writing down.
-            #
-            # Holding the agent's transition lock across delivery is the same
-            # remedy applied at creation, at the other end of the row's life.
-            lock_getter = getattr(self.agent, "_get_privacy_transition_lock", None)
-            if callable(lock_getter):
-                async with lock_getter():
-                    from kestrel_sovereign.features.storage_access import (
-                        hides_persisted_user_content,
-                    )
-
-                    # Re-check INSIDE the lock: the mode may have changed
-                    # between the earlier guard and acquiring it.
-                    if hides_persisted_user_content(self.agent):
-                        logger.warning(
-                            "SchedulerFeature: refusing to deliver %r -- privacy "
-                            "mode became volatile before delivery (#3112 gate-6).",
-                            task_name,
-                        )
-                        return ScheduledTaskOutcome(
-                            status="failed",
-                            result_text=(
-                                f"refused: {task_name} was queued under a durable "
-                                "privacy mode, but the mode became volatile "
-                                "before the turn could be delivered"
-                            ),
-                        )
-                    result = await dispatcher.dispatch_signal(signal)
-                    return self._translate_signal_result(result, task_name)
-
         result = await dispatcher.dispatch_signal(signal)
         return self._translate_signal_result(result, task_name)
 
