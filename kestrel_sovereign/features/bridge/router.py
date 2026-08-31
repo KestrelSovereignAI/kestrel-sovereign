@@ -378,6 +378,9 @@ def get_router() -> APIRouter:
                         invocation_provenance=invocation_provenance,
                     ),
                     operation="bridge agent stream cleanup",
+                    cleanup_requested=lambda: agent.is_request_cancelled(
+                        request_id
+                    ),
                 )
                 bind_request_operation_if_supported(
                     agent,
