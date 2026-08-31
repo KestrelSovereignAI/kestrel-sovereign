@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import stat
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -80,8 +81,11 @@ def _read_local_identity_json(path: Path) -> Optional[Mapping[str, Any]]:
 def _verification_document_from_material(
     path: Path,
     did: str,
+    *,
+    material: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Mapping[str, Any]]:
-    material = _read_local_identity_json(path)
+    if material is None:
+        material = _read_local_identity_json(path)
     if material is None:
         return None
     if path.parent.name == "successions":
@@ -112,7 +116,15 @@ def _verification_document_from_material(
 
 
 class ProcessA2ADidResolver:
-    """Resolve subprocess peers from operator-selected local identity roots."""
+    """Resolve subprocess peers from an immutable startup registry.
+
+    The launcher selects the identity roots, but managed peers commonly share
+    an OS account and can therefore rewrite one another's public export files.
+    Reading those files for every envelope would let a peer replace another
+    principal's verification key after startup.  Snapshot the validated public
+    documents while the resolver is installed and never consult the writable
+    roots on an authorization path again.
+    """
 
     def __init__(
         self,
@@ -120,24 +132,43 @@ class ProcessA2ADidResolver:
         *,
         federated_fallback: bool = False,
     ) -> None:
-        self._identity_roots = identity_roots
         self._federated_fallback = federated_fallback
-
-    def resolve(self, did: str) -> Optional[Mapping[str, Any]]:
-        if not isinstance(did, str) or not did:
-            return None
-        documents = []
-        for root in self._identity_roots:
+        documents: dict[str, list[Mapping[str, Any]]] = {}
+        for root in identity_roots:
             candidates = tuple(sorted(root.glob("*_did.json")))
             successions = root / "successions"
             if successions.is_dir() and not successions.is_symlink():
                 candidates += tuple(sorted(successions.glob("*.json")))
             for path in candidates:
-                document = _verification_document_from_material(path, did)
+                material = _read_local_identity_json(path)
+                if material is None:
+                    continue
+                document_id = (
+                    material.get("successor_did")
+                    if path.parent.name == "successions"
+                    else material.get("id")
+                )
+                if not isinstance(document_id, str) or not document_id:
+                    continue
+                document = _verification_document_from_material(
+                    path,
+                    document_id,
+                    material=material,
+                )
                 if document is not None:
-                    documents.append(document)
+                    documents.setdefault(document_id, []).append(
+                        deepcopy(document)
+                    )
+        self._documents = {
+            did: tuple(claims) for did, claims in documents.items()
+        }
+
+    def resolve(self, did: str) -> Optional[Mapping[str, Any]]:
+        if not isinstance(did, str) or not did:
+            return None
+        documents = self._documents.get(did, ())
         if len(documents) == 1:
-            return documents[0]
+            return deepcopy(documents[0])
         if len(documents) > 1:
             logger.warning(
                 "A2A DID resolution refused for %s: multiple process identity "

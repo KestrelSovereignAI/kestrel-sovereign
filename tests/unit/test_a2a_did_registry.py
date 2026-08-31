@@ -281,3 +281,36 @@ def test_process_registry_resolves_rotated_successor_material(tmp_path):
     assert document["verificationMethod"] == (
         sender.identity.new_verification_methods
     )
+
+
+def test_process_registry_snapshot_cannot_be_rewritten_by_sibling(tmp_path):
+    """A sibling cannot replace a peer's verification key after startup."""
+
+    sender, _ = _hybrid_agent(DID_A)
+    attacker, _ = _hybrid_agent(DID_A)
+    sender_root = tmp_path / "sender"
+    sender_root.mkdir()
+    identity_path = sender_root / "sender_did.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "id": DID_A,
+                "verificationMethod": sender.identity.new_verification_methods,
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolver = ProcessA2ADidResolver((sender_root,))
+
+    original = resolver.resolve(DID_A)
+    identity_path.write_text(
+        json.dumps(
+            {
+                "id": DID_A,
+                "verificationMethod": attacker.identity.new_verification_methods,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert resolver.resolve(DID_A) == original
