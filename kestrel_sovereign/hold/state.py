@@ -1756,6 +1756,10 @@ class HoldStore:
                     raise HoldCorruptStateError(
                         "Hold boot-state target is missing its identity"
                     )
+                if target_id != target_id.strip():
+                    raise HoldCorruptStateError(
+                        "Hold boot-state target has a noncanonical identity"
+                    )
                 targets.add((scope, target_id))
 
             active: list[HoldState] = []
@@ -2616,7 +2620,7 @@ class HoldStore:
             await self._lock_read_history()
             row = await self._validate_operation_witness(operation)
             if row is None:
-                await self._assert_history_anchor_intact()
+                await self._assert_global_history_intact()
                 return None
             receipt = _receipt_from_row(row)
             targets = ((receipt.scope, receipt.target_id),)
