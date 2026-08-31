@@ -34,6 +34,14 @@ will not chmod a shared operator directory such as `/data` or `/tmp`. The
 database leaf and SQLite auxiliaries must be regular single-link files; symbolic
 links, hard links, and special files fail closed.
 
+The supported SQLite Docker images set this override beneath their persistent
+agent-data mount (`/app/agent_data/host-data/kestrel_host.db`, or
+`/data/host-data/kestrel_host.db` for the sovereign image). Recreating a
+container therefore preserves the active Hold database and its adjacent
+history/pending-publication witnesses with the agent database. Custom images
+must provide an equivalent persistent mount; the process-home default is not a
+durability boundary inside a replaceable container.
+
 ## Secure SQLite creation
 
 Kestrel opens or pre-creates the main database with `O_NOFOLLOW` where the

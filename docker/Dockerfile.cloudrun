@@ -62,6 +62,7 @@ USER kestrel
 ENV PYTHONUNBUFFERED=1
 ENV KESTREL_ENV=production
 ENV KESTREL_DB_PATH=/app/agent_data
+ENV KESTREL_HOST_DB_PATH=/app/agent_data/host-data/kestrel_host.db
 ENV PORT=8080
 
 # Cloud Run injects PORT env var

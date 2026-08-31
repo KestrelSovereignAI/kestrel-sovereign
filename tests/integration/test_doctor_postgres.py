@@ -13,6 +13,11 @@ The unit suite fakes asyncpg's public connection surface. This runs Doctor's
 isolated asyncpg worker against a real database, because "the query I wrote is
 the query PostgreSQL accepts" is exactly what a fake cannot tell me.
 
+These governance-query tests intentionally provision one cluster only. A
+healthy governance result therefore still carries Doctor's separate mandatory
+Hold-evidence failure. Unit coverage exercises both cluster-identity probes;
+live independence requires two PostgreSQL clusters and is not inferred here.
+
 Run against any throwaway PostgreSQL:
 
     TEST_POSTGRES_URL=postgresql://u:p@127.0.0.1:5432/db pytest \
@@ -63,6 +68,22 @@ if not POSTGRES_URL:  # pragma: no cover - environment gate
 CONSTITUTION = b"# Kestrel Constitution\n\nv1, for the doctor.\n"
 AGENT_DID = "did:web:doctor.example:kestrel"
 NEIGHBOUR_DID = "did:web:doctor.example:neighbour"
+
+
+@pytest.fixture(autouse=True)
+def _one_cluster_contract(monkeypatch):
+    """Keep this one-cluster suite deterministic under an operator shell."""
+
+    monkeypatch.delenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", raising=False)
+
+
+def _assert_governance_ready_but_hold_unconfigured(report):
+    """Assert no defect except this suite's deliberate second-cluster gap."""
+
+    assert report.fail == [
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required for PostgreSQL "
+        "Hold rollback evidence"
+    ], f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
 @pytest.fixture
@@ -406,7 +427,7 @@ def test_explicit_dsn_parameters_outrank_project_pg_environment(
 
     report = diagnose(tmp_path)
 
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    _assert_governance_ready_but_hold_unconfigured(report)
 
 
 def test_asyncpg_search_path_is_applied_to_doctors_session(
@@ -451,7 +472,7 @@ def test_asyncpg_search_path_is_applied_to_doctors_session(
 
     report = diagnose(tmp_path)
 
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    _assert_governance_ready_but_hold_unconfigured(report)
 
 
 def test_runtime_rejected_startup_setting_is_not_reported_healthy(
@@ -513,7 +534,7 @@ def test_asyncpg_031_service_file_reaches_doctor_unchanged(
 
     report = diagnose(tmp_path)
 
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    _assert_governance_ready_but_hold_unconfigured(report)
 
 
 def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
@@ -621,7 +642,7 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
 
     report = diagnose(tmp_path)
 
-    assert report.ready, f"fail={report.fail}"
+    _assert_governance_ready_but_hold_unconfigured(report)
     assert any(
         "holds no record for this agent yet" in m for m in report.warn
     ), f"warn={report.warn}"

@@ -1676,14 +1676,9 @@ async def _shutdown_host_features(app: FastAPI) -> None:
     except Exception as exc:  # noqa: BLE001 - preserve the existing best effort
         logger.warning("Host feature shutdown failed: %s", exc)
     finally:
-        # Router/UI state must not outlive a failed feature shutdown.  Each
+        # Router/UI state must not outlive a failed feature shutdown. Each
         # following cleanup is in a ``finally`` so one bad unmount cannot leave
-        # the host session factory or database live.
-        session_factory = (
-            getattr(host_context, "session_factory", None)
-            if host_context is not None
-            else None
-        )
+        # the host context's independently-owned resources live.
         try:
             _hf.unmount_host_features(app)
         finally:
@@ -1693,60 +1688,11 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                 try:
                     _unmount_feature_ui_assets(app)
                 finally:
-                    try:
-                        if session_factory is not None:
-                            await session_factory.close()
-                    except Exception as exc:  # noqa: BLE001 - close host DB too
-                        logger.warning(
-                            "Host feature session-factory shutdown failed: %s", exc
-                        )
-                    finally:
-                        hold_evidence_db = (
-                            getattr(host_context, "hold_evidence_db", None)
-                            if host_context is not None
-                            else None
-                        )
-                        hold_db = (
-                            getattr(host_context, "hold_db", None)
-                            if host_context is not None
-                            else None
-                        )
-                        host_db = (
-                            getattr(host_context, "db", None)
-                            if host_context is not None
-                            else None
-                        )
-                        if (
-                            hold_evidence_db is not None
-                            and hold_evidence_db is not hold_db
-                            and hold_evidence_db is not host_db
-                            and hasattr(hold_evidence_db, "close")
-                        ):
-                            try:
-                                await hold_evidence_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Hold evidence database shutdown failed: %s",
-                                    exc,
-                                )
-                        if (
-                            hold_db is not None
-                            and hold_db is not host_db
-                            and hasattr(hold_db, "close")
-                        ):
-                            try:
-                                await hold_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Hold database shutdown failed: %s", exc
-                                )
-                        if host_db is not None and hasattr(host_db, "close"):
-                            try:
-                                await host_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Host feature database shutdown failed: %s", exc
-                                )
+                    from kestrel_sovereign.host_features.context import (
+                        close_host_context_resources,
+                    )
+
+                    await close_host_context_resources(host_context)
 
 
 def _uses_shared_postgres_scheduler() -> bool:

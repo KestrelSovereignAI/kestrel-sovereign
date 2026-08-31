@@ -7,6 +7,7 @@ endpoints, the host-scoped UI surface, and that per-agent behavior is untouched.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -593,6 +594,36 @@ async def test_host_shutdown_closes_separate_hold_backend_once():
     await server._shutdown_host_features(app)
 
     session_factory.close.assert_awaited_once()
+    hold_db.close.assert_awaited_once()
+    host_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_host_shutdown_closes_later_databases_after_close_cancellation():
+    """One owner preserving cancellation cannot strand the remaining owners."""
+
+    from kestrel_sovereign import server
+
+    evidence_db = SimpleNamespace(
+        close=AsyncMock(side_effect=asyncio.CancelledError())
+    )
+    hold_db = SimpleNamespace(close=AsyncMock())
+    host_db = SimpleNamespace(close=AsyncMock())
+    session_factory = SimpleNamespace(close=AsyncMock())
+    app = FastAPI()
+    app.state.host_features = []
+    app.state.host_context = SovereignHostContext(
+        db=host_db,
+        session_factory=session_factory,
+        hold_db=hold_db,
+        hold_evidence_db=evidence_db,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await server._shutdown_host_features(app)
+
+    session_factory.close.assert_awaited_once()
+    evidence_db.close.assert_awaited_once()
     hold_db.close.assert_awaited_once()
     host_db.close.assert_awaited_once()
 

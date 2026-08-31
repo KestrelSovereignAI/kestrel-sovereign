@@ -2134,20 +2134,205 @@ class _FakePostgres:
 def _postgres_host(monkeypatch, fake):
     from kestrel_sovereign import doctor as doctor_module
 
+    runtime_dsn = "postgresql://durable.example/kestrel"
+    evidence_dsn = "postgresql://evidence.example/kestrel"
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable.example/kestrel")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+    monkeypatch.setenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", evidence_dsn)
+
+    def _fetch(dsn, sql, params=(), **_kwargs):
+        if "pg_control_system" in sql:
+            identity = (
+                "primary-cluster" if dsn == runtime_dsn else "evidence-cluster"
+            )
+            return [(identity,)]
+        return doctor_module._postgres_fetch_rows_in_process(
+            dsn,
+            sql,
+            params,
+            connect=fake.connect,
+        )
+
     monkeypatch.setattr(
         doctor_module,
         "_fetch_postgres_rows_isolated",
-        lambda dsn, sql, params=(), **_kwargs: (
-            doctor_module._postgres_fetch_rows_in_process(
-                dsn,
-                sql,
-                params,
-                connect=fake.connect,
-            )
-        ),
+        _fetch,
     )
+
+
+def test_postgres_doctor_requires_hold_evidence_database(tmp_path, monkeypatch):
+    """Doctor cannot report ready when server boot lacks mandatory custody."""
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    monkeypatch.delenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", raising=False)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL" in message
+        for message in report.fail
+    ), report.fail
+
+
+def test_postgres_doctor_does_not_reprobe_failed_primary_for_hold(
+    tmp_path,
+    monkeypatch,
+):
+    """A governance outage already proves the primary is not ready."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(
+        monkeypatch,
+        _FakePostgres({}, connect_error=OSError("connection timed out")),
+    )
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    cluster_probes: list[str] = []
+
+    def _track_cluster_probes(dsn, sql, params=(), **kwargs):
+        if "pg_control_system" in sql:
+            cluster_probes.append(dsn)
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _track_cluster_probes,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert cluster_probes == ["postgresql://evidence.example/kestrel"]
+    assert any(
+        "runtime database reachability was not established" in message
+        for message in report.fail
+    ), report.fail
+
+
+def test_postgres_doctor_rejects_same_cluster_hold_evidence(tmp_path, monkeypatch):
+    """Different connection strings cannot disguise one restore domain."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+
+    def _same_cluster(dsn, sql, params=(), **kwargs):
+        if "pg_control_system" in sql:
+            return [("same-cluster",)]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _same_cluster)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("independent PostgreSQL cluster" in message for message in report.fail)
+
+
+def test_postgres_doctor_rejects_same_hold_evidence_url_without_probing(
+    tmp_path,
+    monkeypatch,
+):
+    """The obvious same-service configuration fails before any connection."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    runtime_dsn = "postgresql://durable.example/kestrel"
+    monkeypatch.setenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", runtime_dsn)
+
+    original_fetch = doctor._fetch_postgres_rows_isolated
+
+    def _unexpected_probe(dsn, sql, params=(), **kwargs):
+        if "pg_control_system" in sql:
+            pytest.fail("identical Hold DSNs reached the cluster probe")
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _unexpected_probe)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("independent PostgreSQL cluster" in message for message in report.fail)
+
+
+@pytest.mark.parametrize(
+    ("target", "failure", "message"),
+    [
+        ("primary", "connection", "primary database is unreachable"),
+        ("evidence", "connection", "evidence database is unreachable"),
+        ("primary", "query", "requires EXECUTE on pg_catalog.pg_control_system"),
+        ("evidence", "query", "requires EXECUTE on pg_catalog.pg_control_system"),
+    ],
+)
+def test_postgres_doctor_probes_hold_database_connectivity_and_privilege(
+    tmp_path,
+    monkeypatch,
+    target,
+    failure,
+    message,
+):
+    """Both custody services require connection and cluster-identity access."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    primary_dsn = "postgresql://durable.example/kestrel"
+    evidence_dsn = "postgresql://evidence.example/kestrel"
+    failed_dsn = primary_dsn if target == "primary" else evidence_dsn
+
+    def _fail_cluster_probe(dsn, sql, params=(), **kwargs):
+        if dsn == failed_dsn and "pg_control_system" in sql:
+            error_type = (
+                doctor._PostgresProbeConnectionError
+                if failure == "connection"
+                else doctor._PostgresProbeQueryError
+            )
+            raise error_type("injected evidence probe failure")
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _fail_cluster_probe,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(message in item for item in report.fail), report.fail
+
+
+def test_postgres_doctor_rejects_invalid_cluster_identity(tmp_path, monkeypatch):
+    """A successful query must still return one canonical non-empty identity."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    evidence_dsn = "postgresql://evidence.example/kestrel"
+
+    def _invalid_identity(dsn, sql, params=(), **kwargs):
+        if dsn == evidence_dsn and "pg_control_system" in sql:
+            return [("",)]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _invalid_identity)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("returned invalid data" in item for item in report.fail), report.fail
 
 
 def test_on_postgres_the_drift_verdict_comes_from_the_runtime_database(
