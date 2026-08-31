@@ -202,7 +202,7 @@ class TestStaticHelpers:
 
         After an OOM, a `kill -9` or a reboot the number is free for the OS to
         reuse, and the old path signalled whatever now held it — so
-        `kestrel stop --force` could SIGKILL an unrelated process (#2987).
+        `kestrel terminate --force` could SIGKILL an unrelated process (#2987).
         """
         victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         time.sleep(0.4)
@@ -642,18 +642,18 @@ class TestStartAgent:
 
 
 # -----------------------------------------------------------------------
-# Stop agent tests
+# Terminate agent tests
 # -----------------------------------------------------------------------
 
 class TestTerminateAgent:
     """Test terminating agent processes."""
 
-    def test_stop_unregistered_agent_returns_true(self, pm):
-        """Stopping an unregistered agent is a no-op (returns True)."""
+    def test_terminate_unregistered_agent_returns_true(self, pm):
+        """Terminating an unregistered agent is a no-op (returns True)."""
         assert pm.terminate_agent("nonexistent") is True
 
     def test_terminate_agent_not_running_returns_true(self, pm, project_dir):
-        """Stopping a registered but non-running agent returns True."""
+        """Terminating a registered but non-running agent returns True."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -661,7 +661,7 @@ class TestTerminateAgent:
         assert pm.terminate_agent("claw") is True
 
     def test_terminate_agent_sends_sigterm(self, pm, project_dir):
-        """Stopping a running agent sends SIGTERM first."""
+        """Terminating a running agent sends SIGTERM first."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -705,7 +705,7 @@ class TestTerminateAgent:
         assert last_call == ((99999,), {"force": True, "started_at": None})
 
     def test_terminate_agent_clears_pid(self, pm, project_dir):
-        """Stopping an agent clears its PID file."""
+        """Terminating an agent clears its PID file."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -734,7 +734,7 @@ class TestTerminateAgent:
             result = pm.terminate_agent("claw", timeout=0.01)
 
         assert result is False
-        # The PID file is the only record of a process that outlived the stop;
+        # The PID file is the only record of a process that outlived termination;
         # clearing it would strand a live agent with nothing pointing at it.
         assert ap.pid_file.exists()
         assert ap.pid == 99999

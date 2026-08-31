@@ -177,7 +177,7 @@ literal value.
 Stop the host when you are finished:
 
 ```bash
-uv run kestrel stop
+uv run kestrel terminate
 ```
 
 ## Alternative — start only the named agent
@@ -195,7 +195,7 @@ and `/v1/...` endpoints are all top-level on the named agent's URL—there is no
 `/api/agents/Kestrel` prefix in standalone mode.
 
 Do not run the host and a standalone process for the same agent at once. If the
-host is already running, stop it first with `uv run kestrel stop`.
+host is already running, terminate it first with `uv run kestrel terminate`.
 
 ## Optional — create an additional agent
 
