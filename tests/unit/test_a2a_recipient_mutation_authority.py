@@ -551,6 +551,78 @@ async def test_handler_terminal_outcome_reconciles_live_cas_without_replacing_wi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+async def test_handler_nonterminal_outcome_reconciles_live_progress(tmp_path, sync):
+    """A handler's requested-input result must survive its WORKING update."""
+
+    manager = await create_task_manager(
+        str(tmp_path / f"handler-input-{sync}.db"),
+        host_agent_id=RECIPIENT,
+    )
+
+    class InputHandler:
+        async def handle_task(self, task):
+            await manager.update_status(
+                task.id,
+                TaskState.WORKING,
+                agent_name=RECIPIENT,
+                recipient_agent_id=RECIPIENT,
+            )
+            task.status = TaskStatus(
+                state=TaskState.INPUT_REQUIRED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="Which account?")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="input-worker",
+            description="worker that requests input after publishing progress",
+            url="/agents/input-worker",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="ask",
+                    name="ask",
+                    description="request required input",
+                )
+            ],
+        ),
+        InputHandler(),
+    )
+    notify_status = AsyncMock(wraps=manager._notify_status_update)
+    manager._notify_status_update = notify_status
+    try:
+        returned = await manager.execute_skill("input-worker", "ask", {}, sync=sync)
+        if not sync:
+            await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(returned.id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.INPUT_REQUIRED
+        assert persisted.status.message.parts[0].text == "Which account?"
+        if sync:
+            assert returned.status.state is TaskState.INPUT_REQUIRED
+        else:
+            input_notifications = [
+                call
+                for call in notify_status.await_args_list
+                if call.args[0].status.state is TaskState.INPUT_REQUIRED
+            ]
+            assert len(input_notifications) == 1
+            assert input_notifications[0].kwargs["final"] is False
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_async_terminal_commit_lost_ack_still_emits_completion_wake(tmp_path):
     """An uncertain terminal commit must retain ownership of its projections."""
 

@@ -421,50 +421,35 @@ class TaskManager:
             expected_state = task.status.state
             task = await handler.handle_task(task)
             if task.status.state is TaskState.CANCELED:
-                task = await self._persist_handler_cancellation(
+                task, _ = await self._persist_execution_outcome(
                     task,
                     authority_agent_id=authority_agent_id,
+                    expected_state=expected_state,
                 )
             else:
-                terminal_operation_id = (
-                    uuid4().hex
-                    if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}
-                    else None
-                )
-                saved: Optional[bool] = None
                 try:
                     async with self.task_store._backend.transaction():
-                        saved = await self._save_recipient_execution_result(
+                        task, _ = await self._persist_execution_outcome(
                             task,
                             authority_agent_id=authority_agent_id,
                             expected_state=expected_state,
-                            terminal_operation_id=terminal_operation_id,
                         )
                 except Exception as save_err:
                     logger.error(
-                        f"Failed to save completed task {task.id}: {save_err}. "
+                        f"Failed to save task outcome {task.id}: {save_err}. "
                         "Retrying outside transaction..."
                     )
                     try:
-                        saved = await self._save_recipient_execution_result(
+                        task, _ = await self._persist_execution_outcome(
                             task,
                             authority_agent_id=authority_agent_id,
                             expected_state=expected_state,
-                            terminal_operation_id=terminal_operation_id,
                         )
                     except Exception as retry_err:
                         logger.critical(
-                            f"Task {task.id} completed but save failed permanently: {retry_err}. "
+                            f"Task outcome {task.id} failed to save permanently: {retry_err}. "
                             f"Result lost for skill={skill_id}, agent={agent_id}"
                         )
-                if saved is False:
-                    task = (
-                        await self.task_store.get_for_recipient(
-                            task.id,
-                            authority_agent_id,
-                        )
-                        or task
-                    )
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
@@ -603,7 +588,11 @@ class TaskManager:
                 expected_state=expected_state,
             )
             if owns_notification:
-                await self._notify_status_update(task, final=True)
+                await self._notify_status_update(
+                    task,
+                    final=task.status.state
+                    in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
+                )
         except asyncio.CancelledError:
             try:
                 await self.cancel_task(
@@ -628,7 +617,11 @@ class TaskManager:
                 expected_state=expected_state,
             )
             if owns_notification:
-                await self._notify_status_update(task, final=True)
+                await self._notify_status_update(
+                    task,
+                    final=task.status.state
+                    in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
+                )
 
     async def _persist_execution_outcome(
         self,
@@ -707,15 +700,39 @@ class TaskManager:
                 )
                 current = None
             return (current or task), True
-        if saved is False:
-            # Another terminal writer won the live-set CAS and owns the
-            # corresponding completion signal. Returning its durable state
-            # must not emit the same terminal event a second time.
+        attempted_states: set[TaskState] = set()
+        while saved is False:
+            # A terminal writer owns the durable result and its notification.
+            # A remaining live state may instead be progress published by this
+            # handler while it ran. Reconcile only a transition that is valid
+            # from that exact current state, and retain the CAS on every retry.
             current = await self.task_store.get_for_recipient(
                 task.id,
                 authority_agent_id,
             )
-            return (current or task), False
+            if current is None:
+                return task, False
+            current_state = current.status.state
+            if current_state in {
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.CANCELED,
+            }:
+                return current, False
+            if current_state is task.status.state:
+                return current, False
+            if (
+                task.status.state not in VALID_TRANSITIONS.get(current_state, set())
+                or current_state in attempted_states
+            ):
+                return current, False
+            attempted_states.add(current_state)
+            saved = await self._save_recipient_execution_result(
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=current_state,
+                terminal_operation_id=terminal_operation_id,
+            )
         return task, True
 
     async def _save_recipient_execution_result(
