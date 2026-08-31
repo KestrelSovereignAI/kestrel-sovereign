@@ -131,6 +131,62 @@ async def test_artifact_authority_is_recipient_and_predicated_in_store(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_unauthorized_failure_does_not_write_victim_observability(tmp_path):
+    """Rejected task mutations must not leave attacker-authored projections."""
+
+    manager = await create_task_manager(str(tmp_path / "failure-observability.db"))
+    try:
+        await manager.create_task(
+            _params("unauthorized-failure"),
+            agent_name=RECIPIENT,
+            creator_agent_id=CREATOR,
+        )
+
+        with pytest.raises(TaskMutationAuthorizationError):
+            await manager.fail_task(
+                "unauthorized-failure",
+                "forged failure",
+                agent_name=PEER,
+                recipient_agent_id=PEER,
+            )
+
+        task = await manager.get_task("unauthorized-failure")
+        assert task.status.state is TaskState.SUBMITTED
+        error_events = await manager.observability_store._backend.fetch_all(
+            """
+            SELECT agent_name, session_id, error_message
+            FROM a2a_observability
+            WHERE event_type = 'error'
+            """
+        )
+        assert error_events == []
+
+        failed = await manager.fail_task(
+            "unauthorized-failure",
+            "recipient failure",
+            agent_name=RECIPIENT,
+            recipient_agent_id=RECIPIENT,
+        )
+        assert failed.status.state is TaskState.FAILED
+        error_events = await manager.observability_store._backend.fetch_all(
+            """
+            SELECT agent_name, session_id, error_message
+            FROM a2a_observability
+            WHERE event_type = 'error'
+            """
+        )
+        assert error_events == [
+            (
+                RECIPIENT,
+                "session-unauthorized-failure",
+                "recipient failure",
+            )
+        ]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_id_only_host_can_authorize_response_and_artifact(tmp_path):
     """A supported durable identity must not degrade to the host class name."""
 

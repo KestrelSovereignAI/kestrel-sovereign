@@ -1399,24 +1399,34 @@ class TaskManager:
             parts=[TextPart(text=f"Task failed: {error}")]
         )
 
-        # Log error to observability
-        if agent_name:
-            task = await self.task_store.get(task_id)
-            await self.observability_store.log_error(
-                agent_name=agent_name,
-                error_type="task_failure",
-                error_message=error,
-                session_id=task.sessionId if task else None,
-                metadata={"task_id": task_id}
-            )
-
-        return await self.update_status(
+        task = await self.update_status(
             task_id=task_id,
             new_state=TaskState.FAILED,
             message=message,
             agent_name=agent_name,
             recipient_agent_id=recipient_agent_id,
         )
+
+        # Failure telemetry is a projection of the recipient-authorized durable
+        # transition.  Emitting it before update_status would let a rejected
+        # caller write attacker-authored data tied to another task's session.
+        if agent_name:
+            try:
+                await self.observability_store.log_error(
+                    agent_name=agent_name,
+                    error_type="task_failure",
+                    error_message=error,
+                    session_id=task.sessionId,
+                    metadata={"task_id": task_id},
+                )
+            except Exception:
+                logger.warning(
+                    "Task %s failed durably but failure observability logging failed",
+                    task_id,
+                    exc_info=True,
+                )
+
+        return task
 
     async def complete_task(
         self,
