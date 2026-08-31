@@ -2580,6 +2580,56 @@ async def test_postgres_evidence_lock_recovers_partial_pair_binding(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "fanout"),
+    [("cluster", 2), ("domain", 2), ("bindings", 4)],
+)
+async def test_failed_parallel_custody_probe_awaits_cancelled_siblings(
+    monkeypatch,
+    phase,
+    fanout,
+):
+    """Startup cleanup never races database probes left behind by a peer error."""
+
+    primary = SimpleNamespace(backend_type="postgres")
+    evidence = SimpleNamespace(backend_type="postgres")
+    store = HoldStore(primary, evidence_db=evidence)
+    all_started = asyncio.Event()
+    never_finishes = asyncio.Event()
+    started = 0
+    cancelled: set[int] = set()
+
+    async def probe(*_args, **_kwargs):
+        nonlocal started
+        probe_id = started
+        started += 1
+        if started == fanout:
+            all_started.set()
+        await all_started.wait()
+        if probe_id == 0:
+            raise RuntimeError("injected custody probe failure")
+        try:
+            await never_finishes.wait()
+        finally:
+            cancelled.add(probe_id)
+
+    if phase == "cluster":
+        monkeypatch.setattr(store, "_postgres_cluster_identity", probe)
+        operation = store._assert_postgres_clusters_independent()
+    elif phase == "domain":
+        monkeypatch.setattr(store, "_postgres_domain_identity", probe)
+        operation = store._assert_postgres_evidence_domain_independent()
+    else:
+        monkeypatch.setattr(store, "_read_postgres_binding", probe)
+        operation = store._read_postgres_custody_roles(evidence)
+
+    with pytest.raises(RuntimeError, match="injected custody probe failure"):
+        await operation
+
+    assert cancelled == set(range(1, fanout))
+
+
+@pytest.mark.asyncio
 async def test_postgres_public_read_uses_external_evidence_protocol(monkeypatch):
     """A live read cannot bypass recovery or the cross-service session lock."""
 

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Awaitable, Mapping, Optional
 from uuid import UUID, uuid4
 
 try:  # pragma: no cover - exercised on Kestrel's POSIX deployment targets
@@ -109,6 +109,31 @@ class HoldIdempotencyConflict(HoldStateError):
 
 class HoldCorruptStateError(HoldStateError):
     """Persisted Hold state cannot be interpreted safely."""
+
+
+async def _gather_database_probes(
+    *probes: Awaitable[Any],
+) -> tuple[Any, ...]:
+    """Cancel and await every sibling before a failed probe leaves its scope."""
+
+    tasks = tuple(asyncio.ensure_future(probe) for probe in probes)
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        cleanup = asyncio.gather(*tasks, return_exceptions=True)
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Repeated cancellation must not let a database probe escape
+                # into host-context pool cleanup. Re-raise the original failure
+                # only after every owned child has reached a terminal state.
+                continue
+        await cleanup
+        raise
 
 
 def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:
@@ -665,7 +690,7 @@ class HoldStore:
         evidence_db = self._evidence_db
         if evidence_db is None:
             return
-        primary, evidence = await asyncio.gather(
+        primary, evidence = await _gather_database_probes(
             self._postgres_cluster_identity(self._db, label="primary"),
             self._postgres_cluster_identity(evidence_db, label="evidence"),
         )
@@ -707,7 +732,7 @@ class HoldStore:
         """Read the expected and forbidden role records from both databases."""
 
         return tuple(
-            await asyncio.gather(
+            await _gather_database_probes(
                 self._read_postgres_binding(
                     self._db,
                     _POSTGRES_PRIMARY_BINDING_KEY,
@@ -778,7 +803,7 @@ class HoldStore:
         evidence_db = self._evidence_db
         if evidence_db is None:
             return
-        primary, evidence = await asyncio.gather(
+        primary, evidence = await _gather_database_probes(
             self._postgres_domain_identity(self._db, label="primary"),
             self._postgres_domain_identity(evidence_db, label="evidence"),
         )
