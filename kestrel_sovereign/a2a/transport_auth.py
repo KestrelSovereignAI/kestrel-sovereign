@@ -43,6 +43,10 @@ def _validate_transport_key(value: str, *, source: str) -> str:
         for character in selected
     ):
         raise A2ATransportKeyError(f"{source} contains control characters")
+    if any(ord(character) > 0x7E for character in selected):
+        raise A2ATransportKeyError(
+            f"{source} must contain only header-safe ASCII characters"
+        )
     return selected
 
 

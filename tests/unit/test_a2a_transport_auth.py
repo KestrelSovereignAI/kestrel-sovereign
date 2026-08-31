@@ -90,6 +90,38 @@ def test_blank_export_is_replaced_and_stable(monkeypatch, tmp_path):
     assert os.environ[transport_auth.A2A_TRANSPORT_KEY_ENV] == first
 
 
+def test_non_ascii_transport_key_fails_before_http_serialization(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        transport_auth.A2A_TRANSPORT_KEY_ENV,
+        "peer-☃-key",
+    )
+
+    with pytest.raises(
+        transport_auth.A2ATransportKeyError,
+        match="ASCII",
+    ):
+        transport_auth.ensure_a2a_transport_key(project_root=tmp_path)
+
+
+def test_non_ascii_transport_key_file_fails_before_http_serialization(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv(transport_auth.A2A_TRANSPORT_KEY_ENV, raising=False)
+    key_path = tmp_path / transport_auth.A2A_TRANSPORT_KEY_FILE
+    key_path.write_text("peer-☃-key\n", encoding="utf-8")
+    key_path.chmod(0o600)
+
+    with pytest.raises(
+        transport_auth.A2ATransportKeyError,
+        match="ASCII",
+    ):
+        transport_auth.ensure_a2a_transport_key(project_root=tmp_path)
+
+
 def test_generated_key_survives_independent_launcher_processes(
     monkeypatch,
     tmp_path,
