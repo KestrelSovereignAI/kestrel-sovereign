@@ -2146,6 +2146,8 @@ def _postgres_host(monkeypatch, fake):
                 "primary-cluster" if dsn == runtime_dsn else "evidence-cluster"
             )
             return [(identity,)]
+        if sql == doctor_module._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [(None,)]
         return doctor_module._postgres_fetch_rows_in_process(
             dsn,
             sql,
@@ -2233,6 +2235,44 @@ def test_postgres_doctor_rejects_same_cluster_hold_evidence(tmp_path, monkeypatc
 
     assert not report.ready
     assert any("independent PostgreSQL cluster" in message for message in report.fail)
+
+
+def test_postgres_doctor_rejects_swapped_persisted_custody_roles(
+    tmp_path,
+    monkeypatch,
+):
+    """Readiness cannot approve a pair that runtime refuses before mutation."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    primary_dsn = "postgresql://durable.example/kestrel"
+
+    def _persisted_roles(dsn, sql, params=(), **kwargs):
+        if sql == doctor._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [("agent_metadata",)]
+        if sql == doctor._POSTGRES_HOLD_CUSTODY_SQL:
+            wrong_key = (
+                "hold_evidence_custody_binding_v1"
+                if dsn == primary_dsn
+                else "hold_primary_custody_binding_v1"
+            )
+            return [(wrong_key, "persisted-role")]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _persisted_roles,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("wrong durable custody role" in message for message in report.fail)
+    assert not any("custody roles verified" in message for message in report.ok)
 
 
 def test_postgres_doctor_rejects_same_hold_evidence_url_without_probing(

@@ -333,6 +333,7 @@ async def build_host_context(
         from kestrel_sovereign.hold.state import (
             hold_history_anchor_path,
             hold_initialization_witness_path,
+            preflight_postgres_hold_custody,
         )
 
         resolved = prepare_host_database(db_path)
@@ -355,6 +356,11 @@ async def build_host_context(
                     "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an "
                     "independent rollback domain"
                 )
+            # AsyncDatabase.postgres() initializes the full runtime schema.
+            # Inspect cluster identity and any existing custody declaration
+            # through raw read-only pools before either configured database can
+            # be mutated by that factory.
+            await preflight_postgres_hold_custody(dsn, evidence_dsn)
             # Hold operations are serialized by their independent evidence
             # protocol, so wider pools add connection demand without adding
             # useful concurrency. Keep both pools load-bearingly small: the

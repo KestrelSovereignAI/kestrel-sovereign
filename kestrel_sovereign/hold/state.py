@@ -111,6 +111,191 @@ class HoldCorruptStateError(HoldStateError):
     """Persisted Hold state cannot be interpreted safely."""
 
 
+@dataclass(frozen=True)
+class PostgresHoldCustodySnapshot:
+    """Read-only identity and role evidence from one PostgreSQL database."""
+
+    cluster_identity: str
+    domain_identity: str | None = None
+    primary_binding: str | None = None
+    evidence_binding: str | None = None
+
+
+def postgres_hold_custody_binding_payload(
+    pair_id: UUID,
+    primary_identity: str,
+    evidence_identity: str,
+) -> str:
+    """Encode the durable declaration binding both custody databases."""
+
+    return (
+        _POSTGRES_CUSTODY_BINDING_PREFIX
+        + str(pair_id)
+        + "|"
+        + primary_identity
+        + "|"
+        + evidence_identity
+    )
+
+
+def _validate_postgres_domain_identity(identity: str, *, label: str) -> None:
+    if not identity.startswith(_POSTGRES_ROLLBACK_DOMAIN_PREFIX):
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} rollback domain"
+        )
+    try:
+        parsed = UUID(identity.removeprefix(_POSTGRES_ROLLBACK_DOMAIN_PREFIX))
+    except (ValueError, AttributeError) as exc:
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} rollback domain"
+        ) from exc
+    if identity != _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(parsed):
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} rollback domain"
+        )
+
+
+def _validate_postgres_custody_binding(
+    payload: str,
+    *,
+    primary_identity: str,
+    evidence_identity: str,
+) -> UUID:
+    if not payload.startswith(_POSTGRES_CUSTODY_BINDING_PREFIX):
+        raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+    parts = payload.removeprefix(_POSTGRES_CUSTODY_BINDING_PREFIX).split("|")
+    if len(parts) != 3:
+        raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+    pair, bound_primary, bound_evidence = parts
+    try:
+        pair_id = UUID(pair)
+    except ValueError as exc:
+        raise HoldStateError("PostgreSQL Hold custody binding is invalid") from exc
+    if str(pair_id) != pair or (
+        bound_primary != primary_identity or bound_evidence != evidence_identity
+    ):
+        raise HoldStateError(
+            "PostgreSQL Hold custody binding does not match the configured pair"
+        )
+    return pair_id
+
+
+def validate_postgres_hold_custody(
+    primary: PostgresHoldCustodySnapshot,
+    evidence: PostgresHoldCustodySnapshot,
+) -> None:
+    """Fail closed on a read-only snapshot before either schema is mutated.
+
+    A brand-new pair has no metadata table yet and is valid to initialize. Once
+    either side contains role evidence, the persisted domains and pair binding
+    must describe exactly the configured primary/evidence ordering.
+    """
+
+    if (
+        not isinstance(primary.cluster_identity, str)
+        or not primary.cluster_identity.strip()
+    ):
+        raise HoldStateError(
+            "could not verify PostgreSQL Hold primary cluster identity"
+        )
+    if (
+        not isinstance(evidence.cluster_identity, str)
+        or not evidence.cluster_identity.strip()
+    ):
+        raise HoldStateError(
+            "could not verify PostgreSQL Hold evidence cluster identity"
+        )
+    if primary.cluster_identity == evidence.cluster_identity:
+        raise HoldStateError(
+            "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+        )
+
+    if (
+        primary.evidence_binding is not None
+        or evidence.primary_binding is not None
+    ):
+        raise HoldStateError(
+            "PostgreSQL Hold database has the wrong durable custody role"
+        )
+
+    for label, identity in (
+        ("primary", primary.domain_identity),
+        ("evidence", evidence.domain_identity),
+    ):
+        if identity is not None:
+            if not isinstance(identity, str):
+                raise HoldStateError(
+                    f"could not verify PostgreSQL Hold {label} rollback domain"
+                )
+            _validate_postgres_domain_identity(identity, label=label)
+
+    if (
+        primary.domain_identity is not None
+        and primary.domain_identity == evidence.domain_identity
+    ):
+        raise HoldStateError(
+            "PostgreSQL Hold evidence must use an independent rollback domain"
+        )
+
+    expected = tuple(
+        binding
+        for binding in (primary.primary_binding, evidence.evidence_binding)
+        if binding is not None
+    )
+    if not expected:
+        return
+    if primary.domain_identity is None or evidence.domain_identity is None:
+        raise HoldStateError(
+            "PostgreSQL Hold custody binding lacks a durable rollback domain"
+        )
+    for binding in expected:
+        if not isinstance(binding, str):
+            raise HoldStateError("PostgreSQL Hold custody binding is invalid")
+        _validate_postgres_custody_binding(
+            binding,
+            primary_identity=primary.domain_identity,
+            evidence_identity=evidence.domain_identity,
+        )
+    if len(expected) == 2 and expected[0] != expected[1]:
+        raise HoldStateError(
+            "PostgreSQL Hold custody binding disagrees between databases"
+        )
+
+
+def postgres_hold_custody_snapshot_from_rows(
+    cluster_identity: str,
+    rows: list[Any] | tuple[Any, ...],
+    *,
+    label: str,
+) -> PostgresHoldCustodySnapshot:
+    """Parse the three allowlisted custody keys from read-only query rows."""
+
+    values: dict[str, str] = {}
+    allowed = {
+        _POSTGRES_ROLLBACK_DOMAIN_KEY,
+        _POSTGRES_PRIMARY_BINDING_KEY,
+        _POSTGRES_EVIDENCE_BINDING_KEY,
+    }
+    for row in rows:
+        if (
+            len(row) != 2
+            or not isinstance(row[0], str)
+            or row[0] not in allowed
+            or row[0] in values
+            or not isinstance(row[1], str)
+        ):
+            raise HoldStateError(
+                f"PostgreSQL Hold {label} custody metadata is invalid"
+            )
+        values[row[0]] = row[1]
+    return PostgresHoldCustodySnapshot(
+        cluster_identity=cluster_identity,
+        domain_identity=values.get(_POSTGRES_ROLLBACK_DOMAIN_KEY),
+        primary_binding=values.get(_POSTGRES_PRIMARY_BINDING_KEY),
+        evidence_binding=values.get(_POSTGRES_EVIDENCE_BINDING_KEY),
+    )
+
+
 async def _gather_database_probes(
     *probes: Awaitable[Any],
 ) -> tuple[Any, ...]:
@@ -134,6 +319,159 @@ async def _gather_database_probes(
                 continue
         await cleanup
         raise
+
+
+async def _read_postgres_hold_custody_snapshot(
+    backend: Any,
+    *,
+    label: str,
+) -> PostgresHoldCustodySnapshot:
+    """Read custody evidence without creating or changing database objects."""
+
+    try:
+        cluster_rows = await backend.fetch_all(
+            "SELECT system_identifier::text FROM pg_catalog.pg_control_system()"
+        )
+    except Exception as exc:
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} cluster identity; "
+            "the runtime role requires EXECUTE on "
+            "pg_catalog.pg_control_system()"
+        ) from exc
+    if (
+        len(cluster_rows) != 1
+        or len(cluster_rows[0]) != 1
+        or not isinstance(cluster_rows[0][0], str)
+        or not cluster_rows[0][0].strip()
+    ):
+        raise HoldStateError(
+            f"could not verify PostgreSQL Hold {label} cluster identity"
+        )
+    cluster_identity = cluster_rows[0][0]
+
+    try:
+        table_rows = await backend.fetch_all(
+            "SELECT to_regclass('agent_metadata')::text"
+        )
+    except Exception as exc:
+        raise HoldStateError(
+            f"could not inspect PostgreSQL Hold {label} custody metadata"
+        ) from exc
+    if len(table_rows) != 1 or len(table_rows[0]) != 1:
+        raise HoldStateError(
+            f"could not inspect PostgreSQL Hold {label} custody metadata"
+        )
+    table_name = table_rows[0][0]
+    if table_name is None:
+        return PostgresHoldCustodySnapshot(cluster_identity=cluster_identity)
+    if not isinstance(table_name, str) or not table_name.strip():
+        raise HoldStateError(
+            f"could not inspect PostgreSQL Hold {label} custody metadata"
+        )
+
+    try:
+        rows = await backend.fetch_all(
+            "SELECT key, value FROM agent_metadata "
+            "WHERE agent_id = ? AND key IN (?, ?, ?)",
+            (
+                _POSTGRES_WITNESS_AGENT_ID,
+                _POSTGRES_ROLLBACK_DOMAIN_KEY,
+                _POSTGRES_PRIMARY_BINDING_KEY,
+                _POSTGRES_EVIDENCE_BINDING_KEY,
+            ),
+        )
+    except Exception as exc:
+        raise HoldStateError(
+            f"could not inspect PostgreSQL Hold {label} custody metadata"
+        ) from exc
+
+    return postgres_hold_custody_snapshot_from_rows(
+        cluster_identity,
+        rows,
+        label=label,
+    )
+
+
+async def _close_postgres_preflight_backends(
+    *backends: Any,
+) -> tuple[BaseException, ...]:
+    """Finish every raw-pool close even under repeated caller cancellation."""
+
+    async def close_all() -> tuple[Any, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(backend.close() for backend in backends),
+                return_exceptions=True,
+            )
+        )
+
+    cleanup = asyncio.create_task(close_all())
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    results = cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError()
+    return tuple(result for result in results if isinstance(result, BaseException))
+
+
+async def preflight_postgres_hold_custody(
+    primary_dsn: str,
+    evidence_dsn: str,
+) -> None:
+    """Verify existing custody roles through raw, read-only PostgreSQL pools."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    primary_backend = PostgresBackend(
+        dsn=primary_dsn,
+        min_pool_size=1,
+        max_pool_size=1,
+    )
+    evidence_backend = PostgresBackend(
+        dsn=evidence_dsn,
+        min_pool_size=1,
+        max_pool_size=1,
+    )
+    failure: BaseException | None = None
+    try:
+        await _gather_database_probes(
+            primary_backend.connect(),
+            evidence_backend.connect(),
+        )
+        primary, evidence = await _gather_database_probes(
+            _read_postgres_hold_custody_snapshot(
+                primary_backend,
+                label="primary",
+            ),
+            _read_postgres_hold_custody_snapshot(
+                evidence_backend,
+                label="evidence",
+            ),
+        )
+        validate_postgres_hold_custody(primary, evidence)
+    except BaseException as exc:
+        failure = exc
+
+    close_errors: tuple[BaseException, ...] = ()
+    try:
+        close_errors = await _close_postgres_preflight_backends(
+            primary_backend,
+            evidence_backend,
+        )
+    except asyncio.CancelledError as exc:
+        failure = exc
+
+    if failure is not None:
+        raise failure.with_traceback(failure.__traceback__)
+    if close_errors:
+        raise HoldStateError(
+            "could not close PostgreSQL Hold custody preflight connections"
+        ) from close_errors[0]
 
 
 def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:
@@ -647,16 +985,7 @@ class HoldStore:
                 f"could not verify PostgreSQL Hold {label} rollback domain"
             )
         identity = rows[0][0]
-        try:
-            parsed = UUID(identity.removeprefix(_POSTGRES_ROLLBACK_DOMAIN_PREFIX))
-        except (ValueError, AttributeError) as exc:
-            raise HoldStateError(
-                f"could not verify PostgreSQL Hold {label} rollback domain"
-            ) from exc
-        if identity != _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(parsed):
-            raise HoldStateError(
-                f"could not verify PostgreSQL Hold {label} rollback domain"
-            )
+        _validate_postgres_domain_identity(identity, label=label)
         return identity
 
     async def _postgres_cluster_identity(self, db: Any, *, label: str) -> str:
@@ -762,13 +1091,10 @@ class HoldStore:
         primary_identity: str,
         evidence_identity: str,
     ) -> str:
-        return (
-            _POSTGRES_CUSTODY_BINDING_PREFIX
-            + str(pair_id)
-            + "|"
-            + primary_identity
-            + "|"
-            + evidence_identity
+        return postgres_hold_custody_binding_payload(
+            pair_id,
+            primary_identity,
+            evidence_identity,
         )
 
     @staticmethod
@@ -778,24 +1104,11 @@ class HoldStore:
         primary_identity: str,
         evidence_identity: str,
     ) -> UUID:
-        if not payload.startswith(_POSTGRES_CUSTODY_BINDING_PREFIX):
-            raise HoldStateError("PostgreSQL Hold custody binding is invalid")
-        parts = payload.removeprefix(_POSTGRES_CUSTODY_BINDING_PREFIX).split("|")
-        if len(parts) != 3:
-            raise HoldStateError("PostgreSQL Hold custody binding is invalid")
-        pair, bound_primary, bound_evidence = parts
-        try:
-            pair_id = UUID(pair)
-        except ValueError as exc:
-            raise HoldStateError("PostgreSQL Hold custody binding is invalid") from exc
-        if str(pair_id) != pair or (
-            bound_primary != primary_identity
-            or bound_evidence != evidence_identity
-        ):
-            raise HoldStateError(
-                "PostgreSQL Hold custody binding does not match the configured pair"
-            )
-        return pair_id
+        return _validate_postgres_custody_binding(
+            payload,
+            primary_identity=primary_identity,
+            evidence_identity=evidence_identity,
+        )
 
     async def _assert_postgres_evidence_domain_independent(self) -> None:
         """Bind each database permanently to one side of this custody pair."""
