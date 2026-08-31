@@ -886,6 +886,53 @@ class SchedulerFeature(Feature):
             session_id=session_id,
             visibility=visibility,
         )
+        if task_name == SELF_FOLLOWUP_TASK_NAME:
+            # Serialize delivery with privacy transitions (#3112 gate-6 P1).
+            #
+            # I refused this finding once, on the grounds that its stated
+            # mechanism — a mode change BETWEEN the fire-time check and this
+            # call — is unreachable, since that stretch is straight-line. That
+            # much was right, and it was the wrong reason to do nothing: the
+            # payload was built from persisted intent BEFORE this await, and
+            # `dispatch_signal` itself awaits persistence, locking and turn
+            # admission. A transition landing inside that window delivers
+            # conversation content into a cognition turn under a mode that
+            # forbids it. Reproducible by passing the guard in FULL mode,
+            # suspending the dispatcher, switching to EPHEMERAL, and resuming.
+            #
+            # I had already written that the residual concern was real and
+            # different, and then treated "the pointer is wrong" as grounds to
+            # leave it. A finding's mechanism can be wrong while its claim is
+            # right — which is the thing I keep writing down.
+            #
+            # Holding the agent's transition lock across delivery is the same
+            # remedy applied at creation, at the other end of the row's life.
+            lock_getter = getattr(self.agent, "_get_privacy_transition_lock", None)
+            if callable(lock_getter):
+                async with lock_getter():
+                    from kestrel_sovereign.features.storage_access import (
+                        hides_persisted_user_content,
+                    )
+
+                    # Re-check INSIDE the lock: the mode may have changed
+                    # between the earlier guard and acquiring it.
+                    if hides_persisted_user_content(self.agent):
+                        logger.warning(
+                            "SchedulerFeature: refusing to deliver %r -- privacy "
+                            "mode became volatile before delivery (#3112 gate-6).",
+                            task_name,
+                        )
+                        return ScheduledTaskOutcome(
+                            status="failed",
+                            result_text=(
+                                f"refused: {task_name} was queued under a durable "
+                                "privacy mode, but the mode became volatile "
+                                "before the turn could be delivered"
+                            ),
+                        )
+                    result = await dispatcher.dispatch_signal(signal)
+                    return self._translate_signal_result(result, task_name)
+
         result = await dispatcher.dispatch_signal(signal)
         return self._translate_signal_result(result, task_name)
 
@@ -1260,6 +1307,31 @@ class SchedulerFeature(Feature):
     #: text. A volatile privacy mode promises this content does not outlive
     #: the session, so it must not be read back out of durable storage.
     CONVERSATION_DERIVED_ARG_KEYS: frozenset = frozenset({"intent"})
+
+    def _redact_execution_result(
+        self, task_name: str, result_text: Any
+    ) -> Any:
+        """Redact a stored follow-up RESULT when privacy forbids reading it.
+
+        `task_execution_log.result_text` holds the follow-up's complete
+        cognition response — strictly more conversation-derived than the intent
+        that produced it. The first cut of the read-path guard redacted the
+        INPUT (`args_json.intent`) and left this untouched, so switching to a
+        volatile mode hid the question and returned the answer (#3112 gate-6 P1,
+        found reviewing that very fix).
+
+        Redacting the input and not the output is the same two-doors mistake
+        the input guard was written to fix, one field along.
+        """
+        if task_name != SELF_FOLLOWUP_TASK_NAME or not result_text:
+            return result_text
+        from kestrel_sovereign.features.storage_access import (
+            hides_persisted_user_content,
+        )
+
+        if not hides_persisted_user_content(self.agent):
+            return result_text
+        return "[redacted: volatile privacy mode]"
 
     def _redact_conversation_derived_args(
         self, task_name: str, args: Dict[str, Any]
@@ -4174,7 +4246,9 @@ class SchedulerFeature(Feature):
                 "id": row[0],
                 "task_id": row[1],
                 "status": row[2],
-                "result_text": row[3],
+                # Same column, older reader — guarding only the new projection
+                # would leave this one open on identical rows (#3112 gate-6 P1).
+                "result_text": self._redact_execution_result(row[6], row[3]),
                 "duration_ms": row[4],
                 "executed_at": row[5],
                 "task_name": row[6],
@@ -4291,7 +4365,9 @@ class SchedulerFeature(Feature):
                 execution = {
                     "id": log_row[0],
                     "status": log_row[1],
-                    "result_text": log_row[2],
+                    "result_text": self._redact_execution_result(
+                        SELF_FOLLOWUP_TASK_NAME, log_row[2]
+                    ),
                     "executed_at": log_row[3],
                     "attempt_count": log_row[4],
                 }
