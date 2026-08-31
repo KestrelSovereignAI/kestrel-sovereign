@@ -307,6 +307,19 @@ def test_quarantine_removes_exact_survivors_when_set_ledger_is_missing() -> None
     assert registry.quarantine_registration_set(active) is False
 
 
+def test_quarantine_rejects_forged_set_wrapping_public_registration() -> None:
+    registry = _registry()
+    workflow = WorkflowRegistration("victim", "workflow", lambda: None)
+    active = registry.register("victim", workflows=(workflow,))
+    public = registry.get_workflow_registration(workflow.name)
+    assert public is workflow
+    forged = OperatorRegistrationSet(owner="victim", workflows=(public,))
+
+    assert registry.quarantine_registration_set(forged) is False
+    assert registry.resolve_workflow_actor(workflow.name) is workflow.actor
+    registry.unregister(active)
+
+
 def test_removing_middle_version_does_not_disturb_or_resurrect_other_sets() -> None:
     registry = _registry()
     first = _service("first", "1.0.0", object())

@@ -9,7 +9,7 @@ artifacts, HTTP projection, and feature-specific behavior belong elsewhere.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from threading import RLock
 
@@ -100,6 +100,12 @@ class OperatorRegistrationSet:
     services: tuple[ServiceRegistration, ...] = ()
     workflows: tuple[WorkflowRegistration, ...] = ()
     execution_targets: tuple[ExecutionTargetRegistration, ...] = ()
+    _registry_seal: object | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 class OperatorRuntimeRegistry:
@@ -122,6 +128,10 @@ class OperatorRuntimeRegistry:
             tuple[str, str], ExecutionTargetRegistration
         ] = {}
         self._active_sets: dict[int, OperatorRegistrationSet] = {}
+        # Registry-private minting authority. A set retains this seal even if
+        # the mutable active-set index drifts, so recovery can distinguish the
+        # exact issued teardown capability from a caller-constructed wrapper.
+        self._registration_set_seal = object()
 
     def register(
         self,
@@ -179,6 +189,11 @@ class OperatorRuntimeRegistry:
             if any(key in self._targets for key in target_keys):
                 raise OperatorRegistrationConflictError(_TARGET_CONFLICT)
 
+            object.__setattr__(
+                registration_set,
+                "_registry_seal",
+                self._registration_set_seal,
+            )
             self._services.update(zip(service_keys, service_values, strict=True))
             self._workflows.update(zip(workflow_keys, workflow_values, strict=True))
             self._targets.update(zip(target_keys, target_values, strict=True))
@@ -201,6 +216,7 @@ class OperatorRuntimeRegistry:
                     (registration.descriptor.tenant_id, registration.descriptor.target_id)
                 ]
             del self._active_sets[id(active)]
+            object.__setattr__(active, "_registry_seal", None)
 
     def quarantine_registration_set(
         self, registration_set: OperatorRegistrationSet
@@ -218,11 +234,14 @@ class OperatorRuntimeRegistry:
         if not isinstance(registration_set, OperatorRegistrationSet):
             raise TypeError("registration_set must be an OperatorRegistrationSet")
         with self._lock:
+            if registration_set._registry_seal is not self._registration_set_seal:
+                return False
             active = self._active_sets.get(id(registration_set))
             had_active_set = active is registration_set
-            if not had_active_set:
+            if active is not None and not had_active_set:
+                return False
+            if active is None:
                 active = registration_set
-            removed_survivor = False
             for registration in active.services:
                 resident = self._services.get(registration.reference)
                 if (
@@ -230,12 +249,10 @@ class OperatorRuntimeRegistry:
                     and resident.service is registration.service
                 ):
                     del self._services[registration.reference]
-                    removed_survivor = True
             for registration in active.workflows:
                 resident = self._workflows.get(registration.name)
                 if resident is registration and resident.actor is registration.actor:
                     del self._workflows[registration.name]
-                    removed_survivor = True
             for registration in active.execution_targets:
                 key = (
                     registration.descriptor.tenant_id,
@@ -247,10 +264,10 @@ class OperatorRuntimeRegistry:
                     and resident.handle is registration.handle
                 ):
                     del self._targets[key]
-                    removed_survivor = True
             if had_active_set:
                 del self._active_sets[id(active)]
-            return had_active_set or removed_survivor
+            object.__setattr__(active, "_registry_seal", None)
+            return True
 
     def validate_registration_set(
         self, registration_set: OperatorRegistrationSet
@@ -426,7 +443,10 @@ class OperatorRuntimeRegistry:
         """Return the exact active set while ``self._lock`` is held."""
 
         active = self._active_sets.get(id(registration_set))
-        if active is not registration_set:
+        if (
+            active is not registration_set
+            or registration_set._registry_seal is not self._registration_set_seal
+        ):
             raise OperatorRegistrationIdentityError(
                 "operator registration set is not active"
             )
