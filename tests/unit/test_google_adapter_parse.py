@@ -57,6 +57,24 @@ async def test_no_candidates():
 
 
 @pytest.mark.asyncio
+async def test_cached_usage_is_normalized_on_direct_google_route():
+    result = await _get(SimpleNamespace(
+        candidates=[],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=11,
+            candidates_token_count=4,
+            total_token_count=15,
+            cached_content_token_count=7,
+        ),
+    ))
+
+    assert result.input_tokens == 4
+    assert result.output_tokens == 4
+    assert result.total_tokens == 8
+    assert result.cache_read_input_tokens == 7
+
+
+@pytest.mark.asyncio
 async def test_text_part_with_none_function_call():
     """google-genai Part ALWAYS has a `function_call` attribute (None for text),
     so the old `hasattr(part, 'function_call')` entered the tool branch and

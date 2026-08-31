@@ -40,10 +40,19 @@ SAFE_MODE_COMMANDS: Final[frozenset[str]] = frozenset(
     for command, rule in RECOVERY_COMMAND_POLICY.items()
     if rule.allowed_in_safe_mode
 )
-SOVEREIGN_COMMANDS: Final[frozenset[str]] = frozenset(
+RECOVERY_SOVEREIGN_COMMANDS: Final[frozenset[str]] = frozenset(
     command
     for command, rule in RECOVERY_COMMAND_POLICY.items()
     if rule.requires_sovereign
+)
+
+# Host-wide provisioning commands are sovereign control surfaces even though
+# they are intentionally unavailable during bootstrap/recovery.  Keeping them
+# outside ``RECOVERY_COMMAND_POLICY`` prevents authority classification from
+# accidentally granting an early-boot execution path.
+HOST_ADMIN_COMMANDS: Final[frozenset[str]] = frozenset({"!create-agent"})
+SOVEREIGN_COMMANDS: Final[frozenset[str]] = (
+    RECOVERY_SOVEREIGN_COMMANDS | HOST_ADMIN_COMMANDS
 )
 
 BOOTSTRAP_CONTROL_COMMANDS: Final[frozenset[str]] = frozenset(
@@ -67,6 +76,6 @@ def prefixed_command_token(user_input: str) -> str | None:
 
 
 def requires_sovereign_authority(command: str) -> bool:
-    """Return whether a canonical recovery command is sovereign-only."""
-    rule = RECOVERY_COMMAND_POLICY.get(command)
-    return rule is not None and rule.requires_sovereign
+    """Return whether a canonical command requires sovereign authority."""
+
+    return command in SOVEREIGN_COMMANDS

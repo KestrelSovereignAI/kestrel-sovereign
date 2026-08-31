@@ -1018,7 +1018,7 @@ class TestCancellation:
 
         agent.register_active_request("request-456")
         agent._current_request_id = "request-456"
-        agent._cancelled_requests.add("request-456")
+        agent.cancel_current_request("request-456")
 
         assert agent.is_request_cancelled() is True
 
@@ -1030,7 +1030,7 @@ class TestCancellation:
         )
 
         agent.register_active_request("request-456")
-        agent._cancelled_requests.add("request-456")
+        agent.cancel_current_request("request-456")
 
         assert agent.is_request_cancelled("request-456") is True
         assert agent.is_request_cancelled("request-789") is False

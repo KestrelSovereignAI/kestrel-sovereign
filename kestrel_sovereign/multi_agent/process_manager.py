@@ -150,7 +150,7 @@ class ProcessManager:
         pm = ProcessManager(project_dir=Path("/path/to/kestrel"))
         pm.start_all(multi_agent_config)
         ...
-        pm.stop_all()
+        pm.terminate_all()
     """
 
     def __init__(self, project_dir: Path):
@@ -249,7 +249,7 @@ class ProcessManager:
     def find_pids_on_port(port: int) -> list[int]:
         """Return PIDs of processes currently listening on `port`.
 
-        Used by `kestrel stop` to reap orphans — servers whose PID file was
+        Used by `kestrel terminate` to reap orphans — servers whose PID file was
         lost or never written, which would otherwise block a subsequent start.
         Returns an empty list on any failure (tool missing, parse error).
         """
@@ -984,8 +984,8 @@ class ProcessManager:
         self._agents[name] = ap
         return ap
 
-    def stop_agent(self, name: str, timeout: float = 5.0) -> bool:
-        """Stop a single agent process.
+    def terminate_agent(self, name: str, timeout: float = 5.0) -> bool:
+        """Terminate a single agent process.
 
         Args:
             name: Agent name.
@@ -995,7 +995,7 @@ class ProcessManager:
             True only once the agent is confirmed gone (or was never running).
             False if it is still running after SIGKILL.
 
-        A stop is reported on the strength of the postcondition, never on the
+        Termination is reported on the strength of the postcondition, never on the
         strength of having sent a signal: ``kill_process`` cannot signal a
         process owned by another user at all, and a delivered signal is not
         proof it was honoured. On failure the PID file is deliberately left in
@@ -1014,7 +1014,7 @@ class ProcessManager:
 
         # Reap before asking anything about the process. An agent that exited
         # on its own is a zombie until this process — its parent, via
-        # ``subprocess.Popen`` — collects it, and a stop that returns early
+        # ``subprocess.Popen`` — collects it, and termination that returns early
         # because the child is already gone must still not leave that corpse
         # behind for the lifetime of the host.
         if ap.pid is not None:
@@ -1026,7 +1026,7 @@ class ProcessManager:
             ap.pid = None
             return True
 
-        logger.info(f"Stopping agent '{name}' (PID {ap.pid})...")
+        logger.info(f"Terminating agent '{name}' (PID {ap.pid})...")
         self.kill_process(ap.pid, force=False, started_at=ap.started_at)
 
         # Wait for graceful shutdown
@@ -1038,14 +1038,16 @@ class ProcessManager:
 
         # Force kill if still running
         if self.is_process_running(ap.pid):
-            logger.warning(f"Agent '{name}' didn't stop gracefully, sending SIGKILL")
+            logger.warning(
+                f"Agent '{name}' did not terminate gracefully, sending SIGKILL"
+            )
             self.kill_process(ap.pid, force=True, started_at=ap.started_at)
             time.sleep(0.5)
 
         # Reap before judging. ``start_agent`` spawns agents with
         # ``subprocess.Popen``, so this process is their parent, and a killed
         # child that nobody waits on stays a ZOMBIE — for which
-        # ``os.kill(pid, 0)`` succeeds. Without this, a stop that worked
+        # ``os.kill(pid, 0)`` succeeds. Without this, termination that worked
         # perfectly would report failure, and keep reporting it until the
         # parent happened to exit. Measured: state 'Z', probe says alive.
         self._reap_if_child(ap.pid)
@@ -1060,7 +1062,7 @@ class ProcessManager:
         if ap.pid_file:
             self.clear_pid(ap.pid_file)
         ap.pid = None
-        logger.info(f"Agent '{name}' stopped")
+        logger.info(f"Agent '{name}' terminated")
         return True
 
     def start_autostart_agents(
@@ -1101,8 +1103,8 @@ class ProcessManager:
         except (ChildProcessError, OSError):
             pass
 
-    def stop_all(self, timeout: float = 5.0) -> list[str]:
-        """Stop all managed agent processes.
+    def terminate_all(self, timeout: float = 5.0) -> list[str]:
+        """Terminate all managed agent processes.
 
         Args:
             timeout: Seconds to wait per agent for graceful shutdown.
@@ -1115,9 +1117,10 @@ class ProcessManager:
         """
         still_running = []
         for name in list(self._agents):
-            if not self.stop_agent(name, timeout=timeout):
+            if not self.terminate_agent(name, timeout=timeout):
                 still_running.append(name)
         return still_running
+
 
     def get_agent_status(self, name: str) -> dict:
         """Get status info for a single agent.

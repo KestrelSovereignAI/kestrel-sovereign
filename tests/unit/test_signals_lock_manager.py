@@ -6,6 +6,7 @@ must hold under contention.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,6 +71,41 @@ async def test_task_ownership_does_not_confuse_a_different_task():
             return mgr.is_owned_by_current_task(ResourceLock.MEMORY)
 
         assert await asyncio.create_task(inspect_from_child()) is False
+
+
+@pytest.mark.asyncio
+async def test_isolated_invocation_inherits_only_explicit_dispatch_lock_ownership():
+    """The cancellable turn child must not deadlock reacquiring its signal lock."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+
+    mgr = OrderedLockManager()
+
+    class Owner:
+        dispatcher = SimpleNamespace(lock_manager=mgr)
+
+        def register_active_request(self, _request_id):
+            return None
+
+        def bind_request_operation(self, _request_id, _operation):
+            return None
+
+        def is_request_cancelled(self, _request_id):
+            return False
+
+        def _cleanup_cancelled_request(self, _request_id):
+            return None
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            if not mgr.is_owned_by_current_task(ResourceLock.MEMORY):
+                async with mgr.acquire({ResourceLock.MEMORY}):
+                    return "reacquired"
+            return "inherited"
+
+    async with mgr.acquire({ResourceLock.MEMORY}):
+        async with asyncio.timeout(0.1):
+            assert await Owner().run(invocation_id="lock-handoff") == "inherited"
 
 
 @pytest.mark.asyncio

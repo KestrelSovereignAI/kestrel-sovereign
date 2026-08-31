@@ -4,6 +4,7 @@ from .directory import (
     PeerDirectoryRouter,
     PeerIdentity,
     PeerRequester,
+    PeerTaskConflictError,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "PeerDirectoryRouter",
     "PeerIdentity",
     "PeerRequester",
+    "PeerTaskConflictError",
 ]

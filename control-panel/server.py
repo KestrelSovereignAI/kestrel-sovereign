@@ -293,9 +293,9 @@ async def start_agent(agent_id: str):
     }
 
 
-@app.post("/api/agents/{agent_id}/stop")
-async def stop_agent(agent_id: str):
-    """Stop a running agent."""
+@app.post("/api/agents/{agent_id}/terminate")
+async def terminate_agent(agent_id: str):
+    """Terminate a running agent process."""
     if agent_id not in running_agents:
         raise HTTPException(400, f"Agent {agent_id} is not running")
     
@@ -308,7 +308,7 @@ async def stop_agent(agent_id: str):
     
     del running_agents[agent_id]
     
-    return {"status": "stopped", "agent_id": agent_id}
+    return {"status": "terminated", "agent_id": agent_id}
 
 
 @app.get("/api/agents/{agent_id}/logs")

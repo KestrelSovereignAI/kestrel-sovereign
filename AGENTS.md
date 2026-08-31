@@ -258,7 +258,9 @@ always discoverable from a failed `schedule_add`. `github_pr_watch`
 (#1618) polls a GitHub PR/issue and emits a `github.pr_activity`
 COGNITION signal only when a watched field changes (state, merge,
 comments, checks) — args travel in the scheduled task's `args_json`
-(`repo`, `pr`/`issue`/`number`, optional `triggers`, `notify`).
+(`repo`, `pr`/`issue`/`number`, optional `triggers`). Legacy `notify` is ignored:
+an agent-owned watcher dispatches locally and may not forge a peer into its
+signal target or causation chain.
 
 #### Scheduling your own follow-up turn (`self_followup`)
 

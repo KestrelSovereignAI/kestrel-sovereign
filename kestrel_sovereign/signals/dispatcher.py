@@ -3988,6 +3988,133 @@ class SignalDispatcher:
                 audit=audit,
             )
 
+        # Some COGNITION sources are volatile wakeups over durable work.  The
+        # producer's process-local task handle cannot prove that another worker
+        # has not withdrawn that work, so let the execution worker revalidate
+        # against the source's durable authority immediately before it builds
+        # or runs a cognition turn.  Missing hooks preserve existing sources.
+        validate_execution = getattr(
+            self._agent,
+            "validate_cognition_signal_execution",
+            None,
+        )
+        if callable(validate_execution):
+            validation_error = validate_execution(signal)
+            if asyncio.iscoroutine(validation_error):
+                validation_error = await validation_error
+            if validation_error is not None:
+                return self._fail(
+                    signal,
+                    start,
+                    Status.DROPPED_VALIDATION,
+                    error=str(validation_error),
+                    registration=registration,
+                    audit=audit,
+                )
+
+        async def await_monitored_execution(execution):
+            """Race cognition against source-owned durable withdrawal."""
+
+            async def execute_with_tracking():
+                result = await execution
+                # A monitored cognition turn runs in ``execution_task``.
+                # ContextVar writes belong to that task and are invisible to
+                # the dispatcher's parent task, so carry the audit value back
+                # explicitly with the result.
+                from kestrel_sovereign.agent.context_manager import (
+                    get_current_injection_tracking,
+                )
+
+                return result, get_current_injection_tracking()
+
+            monitor_execution = getattr(
+                self._agent,
+                "monitor_cognition_signal_execution",
+                None,
+            )
+            if not callable(monitor_execution):
+                result, tracking = await execute_with_tracking()
+                return result, None, tracking
+
+            try:
+                monitor = monitor_execution(signal)
+            except BaseException:
+                if inspect.iscoroutine(execution):
+                    execution.close()
+                raise
+            if not inspect.isawaitable(monitor):
+                if monitor is not None:
+                    if inspect.iscoroutine(execution):
+                        execution.close()
+                    return None, str(monitor), None
+                result, tracking = await execute_with_tracking()
+                return result, None, tracking
+
+            monitor_task = asyncio.create_task(
+                monitor,
+                name=f"signal_cognition_monitor:{signal.id}",
+            )
+            execution_task = None
+            try:
+                # Start the durable withdrawal monitor first, then repeat the
+                # source validation at the exact cognition handoff. The first
+                # validation avoids building a turn for stale work; this read
+                # closes the interval between that check and task creation.
+                if callable(validate_execution):
+                    handoff_error = validate_execution(signal)
+                    if asyncio.iscoroutine(handoff_error):
+                        handoff_error = await handoff_error
+                    if handoff_error is not None:
+                        return None, str(handoff_error), None
+                if monitor_task.done():
+                    withdrawal = await monitor_task
+                    if withdrawal is not None:
+                        return None, str(withdrawal), None
+
+                execution_task = asyncio.create_task(
+                    execute_with_tracking(),
+                    name=f"signal_cognition:{signal.id}",
+                )
+                done, _ = await asyncio.wait(
+                    {execution_task, monitor_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if monitor_task in done:
+                    withdrawal = await monitor_task
+                    if withdrawal is not None:
+                        if not execution_task.done():
+                            execution_task.cancel()
+                        await asyncio.gather(
+                            execution_task,
+                            return_exceptions=True,
+                        )
+                        return None, str(withdrawal), None
+                result, tracking = await execution_task
+                return result, None, tracking
+            finally:
+                tasks = tuple(
+                    task for task in (execution_task, monitor_task)
+                    if task is not None
+                )
+                if execution_task is None and inspect.iscoroutine(execution):
+                    execution.close()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+                finish_execution = getattr(
+                    self._agent,
+                    "finish_cognition_signal_execution",
+                    None,
+                )
+                if callable(finish_execution):
+                    finished = finish_execution(signal)
+                    if inspect.isawaitable(finished):
+                        await finished
+
         # Resolve the constitution body for full-injection sources.
         # Codex round-5 P1 fix: the dispatcher UNCONDITIONALLY
         # prepends a fenced constitution block to the rendered
@@ -4325,13 +4452,21 @@ class SignalDispatcher:
                 "mode": signal.mode.value,
             }
 
+        execution_withdrawal = None
+        injection_tracking = None
         try:
             if process_input_kwargs:
-                result = await self._agent.process_input(
-                    prompt, **process_input_kwargs
+                result, execution_withdrawal, injection_tracking = (
+                    await await_monitored_execution(
+                    self._agent.process_input(prompt, **process_input_kwargs)
+                    )
                 )
             else:
-                result = await self._agent.process_input(prompt)
+                result, execution_withdrawal, injection_tracking = (
+                    await await_monitored_execution(
+                    self._agent.process_input(prompt)
+                    )
+                )
         except Exception:
             if receipt_tool_registered:
                 clear_receipt = getattr(
@@ -4344,17 +4479,28 @@ class SignalDispatcher:
             if clear_chain is not None:
                 clear_chain(token)
 
+        if execution_withdrawal is not None:
+            if receipt_tool_registered:
+                clear_receipt = getattr(
+                    self._agent, "clear_constitution_receipt_tool", None
+                )
+                if callable(clear_receipt):
+                    clear_receipt()
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=execution_withdrawal,
+                registration=registration,
+                audit=audit,
+            )
+
         # Codex round-13/14 P2: surface the agent's actual
         # injected/dropped clause tracking from the budget-aware
         # assembler into the signal_log audit. The tracking is
         # published per-async-task via a ContextVar in
         # `kestrel_sovereign.agent.context_manager`, so concurrent
         # COGNITION dispatches don't race on a shared attribute.
-        from kestrel_sovereign.agent.context_manager import (
-            get_current_injection_tracking,
-        )
-
-        injection_tracking = get_current_injection_tracking()
         if injection_tracking is not None:
             tracked_injected, tracked_dropped = injection_tracking
             if tracked_injected is not None:

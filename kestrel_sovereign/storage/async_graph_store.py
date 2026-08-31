@@ -16,12 +16,13 @@ All code paths that persist ``created_at`` MUST use
 ``datetime.now(timezone.utc).isoformat()`` (or an equivalent that
 produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
+import hashlib
 import json
 import logging
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, Optional, List, Any
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
@@ -30,6 +31,20 @@ from .async_conversation_store import _rows_affected
 logger = logging.getLogger(__name__)
 
 _DELETE_ID_BATCH = 500
+_GRAPH_NODE_RESERVATION_SHARDS = 128
+_GRAPH_NODE_RESERVATION_KEY_BY_SHARD = tuple(
+    int.from_bytes(
+        hashlib.sha256(
+            f"kestrel:graph-node-reservation-shard:{shard_id}".encode("utf-8")
+        ).digest()[:8],
+        "big",
+        signed=True,
+    )
+    for shard_id in range(_GRAPH_NODE_RESERVATION_SHARDS)
+)
+_GRAPH_NODE_RESERVATION_LOCK_KEYS = frozenset(
+    _GRAPH_NODE_RESERVATION_KEY_BY_SHARD
+)
 
 #: A SHA-256 digest as this codebase writes them: lowercase hex, 64 chars.
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -343,6 +358,67 @@ async def record_graph_node_owner(
     )
 
 
+async def reserve_provisional_agent_owner(
+    db: AsyncDatabase,
+    agent_id: str,
+    *,
+    additional_graph_node_ids: Iterable[str] = (),
+) -> None:
+    """Reserve an agent root without claiming a conflicting shared-graph id.
+
+    Avatar and backup storage can precede physical agent-root creation. Both
+    bootstrap paths use this one guard while their surrounding transaction is
+    open. ``additional_graph_node_ids`` carries the rest of that bootstrap's
+    complete write set, so PostgreSQL reserves every shard in canonical order
+    before validating the ownerless root and recording its witness.
+    """
+
+    if not agent_id:
+        raise ValueError("Provisional agent ownership requires an agent_id")
+    write_ids = (agent_id, *additional_graph_node_ids)
+    # This infrastructure repair has one deliberately privileged case: the
+    # caller's valid, ownerless legacy root is invisible to ordinary bound
+    # scope. Everything else is preflighted as the bound tenant before any
+    # reservation is taken, and the lower helper repeats that check after it
+    # owns the complete absent-id shard set.
+    await _preflight_bound_graph_node_locks(
+        db,
+        write_ids,
+        agent_id,
+        provisional_agent_id=agent_id,
+    )
+    await lock_graph_nodes_for_update(
+        db,
+        write_ids,
+        agent_id=agent_id,
+        provisional_agent_id=agent_id,
+    )
+    root = await db.fetchone(
+        "SELECT node_type, properties FROM graph_nodes WHERE node_id = ?",
+        (agent_id,),
+    )
+    if root and root[0] != "agent":
+        raise ValueError("Agent owner id collides with a non-agent graph node")
+    if root:
+        try:
+            properties = json.loads(root[1]) if root[1] else {}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Existing agent graph node has invalid properties") from exc
+        if not isinstance(properties, dict):
+            raise ValueError("Existing agent graph node has invalid properties")
+        declared = properties.get("agent_id")
+        if declared and declared != agent_id:
+            raise ValueError("Existing agent graph node declares another agent_id")
+
+    owner_rows = await db.fetchall(
+        "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+        (agent_id,),
+    )
+    if any(row[0] != agent_id for row in owner_rows):
+        raise ValueError("Agent owner id is owned by another agent")
+    await record_graph_node_owner(db, agent_id, agent_id)
+
+
 async def record_graph_edge_owner(
     db: AsyncDatabase,
     source_id: str,
@@ -384,7 +460,9 @@ async def release_graph_node_owners(
     if not agent_id:
         raise ValueError("Graph node ownership release requires an agent_id")
 
-    unique_node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+    unique_node_ids = await lock_graph_nodes_for_update(
+        db, node_ids, agent_id=agent_id
+    )
     affected = 0
     for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
         batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
@@ -441,6 +519,287 @@ async def release_graph_node_owners(
     return affected
 
 
+async def _acquire_sqlite_graph_writer_slot(db: AsyncDatabase) -> None:
+    """Acquire SQLite's writer slot without changing a graph row.
+
+    The caller owns the surrounding transaction. This explicit write is also
+    effective inside a same-task nested transaction, where a requested
+    ``BEGIN IMMEDIATE`` cannot replace the outer deferred ``BEGIN``.
+    """
+
+    if db.backend_type == "sqlite":
+        await db.execute("UPDATE graph_nodes SET node_id = node_id WHERE 0")
+
+
+async def _lock_graph_node_ids_for_insert(
+    db: AsyncDatabase,
+    node_ids: Iterable[str],
+) -> List[str]:
+    """Reserve graph identifiers through a bounded, canonical shard set.
+
+    PostgreSQL row locks cannot cover a missing row.  The graph therefore has
+    a fixed set of transaction-advisory reservation shards shared by composed
+    write-set locks and compare-and-create. Every identifier maps stably to one
+    shard, so equal IDs still serialize while an arbitrarily large replication
+    retains at most ``_GRAPH_NODE_RESERVATION_SHARDS`` shared locks. SQLite's
+    writer slot provides the equivalent serialization.
+
+    Call this before taking any graph row locks. Reservation shards are always
+    acquired in signed-key order; row locks then use the bytewise node-id order.
+    Keeping those lock classes in one global order prevents a shard collision
+    from creating a row-lock/advisory-lock cycle.
+    """
+
+    unique_node_ids = sorted(
+        dict.fromkeys(node_id for node_id in node_ids if node_id)
+    )
+    if db.backend_type == "sqlite":
+        await _acquire_sqlite_graph_writer_slot(db)
+        return unique_node_ids
+    if db.backend_type != "postgres":
+        return unique_node_ids
+    if not unique_node_ids:
+        return unique_node_ids
+
+    shard_ids = {
+        int.from_bytes(
+            hashlib.sha256(
+                f"kestrel:graph-node:{node_id}".encode("utf-8")
+            ).digest()[:8],
+            "big",
+        )
+        % _GRAPH_NODE_RESERVATION_SHARDS
+        for node_id in unique_node_ids
+    }
+    advisory_keys = sorted(
+        {_GRAPH_NODE_RESERVATION_KEY_BY_SHARD[shard_id] for shard_id in shard_ids}
+    )
+
+    # Nested writes join a caller's outer transaction, so their xact locks from
+    # earlier calls remain held. Sorting one call is insufficient: high->low in
+    # one transaction and low->high in another deadlocks even when their node
+    # IDs are disjoint but collide on these bounded shards. Identify only this
+    # graph namespace's retained bigint locks and refuse a backwards extension;
+    # composed writers must prelock their complete set in one call.
+    held_rows = await db.fetchall(
+        "SELECT classid::bigint, objid::bigint, objsubid "
+        "FROM pg_locks WHERE pid = pg_backend_pid() "
+        "AND locktype = 'advisory' AND granted"
+    )
+    held_graph_keys = set()
+    for class_id, object_id, object_sub_id in held_rows:
+        if int(object_sub_id) != 1:
+            continue
+        unsigned_key = (int(class_id) << 32) | int(object_id)
+        key = (
+            unsigned_key
+            if unsigned_key < (1 << 63)
+            else unsigned_key - (1 << 64)
+        )
+        if key in _GRAPH_NODE_RESERVATION_LOCK_KEYS:
+            held_graph_keys.add(key)
+
+    new_keys = [key for key in advisory_keys if key not in held_graph_keys]
+    if held_graph_keys and new_keys and new_keys[0] < max(held_graph_keys):
+        raise ValueError(
+            "Graph reservation shards would be acquired out of transaction "
+            "order; prelock the complete graph write set before nested writes"
+        )
+
+    for start in range(0, len(new_keys), _DELETE_ID_BATCH):
+        batch = new_keys[start:start + _DELETE_ID_BATCH]
+        values = ", ".join("(?::bigint)" for _ in batch)
+        await db.fetchall(
+            "SELECT pg_advisory_xact_lock(lock_key) "
+            f"FROM (VALUES {values}) AS graph_locks(lock_key) "
+            "ORDER BY lock_key",
+            tuple(batch),
+        )
+    return unique_node_ids
+
+
+async def _preflight_bound_graph_node_locks(
+    db: AsyncDatabase,
+    node_ids: Iterable[str],
+    agent_id: str,
+    *,
+    provisional_agent_id: str = "",
+) -> None:
+    """Reject rows outside a bound tenant before any physical lock is taken."""
+
+    if db.backend_type != "postgres" or not agent_id:
+        return
+    if provisional_agent_id and provisional_agent_id != agent_id:
+        raise ValueError("Provisional graph root must match the bound agent")
+    unique_node_ids = sorted(
+        dict.fromkeys(node_id for node_id in node_ids if node_id)
+    )
+    for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
+        batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = await db.fetchall(
+            "SELECT nodes.node_id, nodes.node_type, nodes.label, "
+            "nodes.properties, EXISTS("
+            "  SELECT 1 FROM graph_node_owners AS owner "
+            "  WHERE owner.node_id = nodes.node_id AND owner.agent_id = ?"
+            "), EXISTS("
+            "  SELECT 1 FROM graph_node_owners AS any_owner "
+            "  WHERE any_owner.node_id = nodes.node_id"
+            ") FROM graph_nodes AS nodes "
+            f"WHERE nodes.node_id IN ({placeholders})",
+            (agent_id, *batch),
+        )
+        for (
+            node_id,
+            node_type,
+            label,
+            raw_properties,
+            owned,
+            has_any_owner,
+        ) in rows:
+            if owned:
+                continue
+            try:
+                properties = json.loads(raw_properties) if raw_properties else {}
+                properties_valid = isinstance(properties, dict)
+            except (TypeError, ValueError):
+                properties = {}
+                properties_valid = False
+            if (
+                provisional_agent_id
+                and node_id == provisional_agent_id
+                and node_type == "agent"
+                and not has_any_owner
+                and properties_valid
+                and properties.get("agent_id") in (None, "", agent_id)
+            ):
+                continue
+            shape = _SHARED_CONTENT_SHAPES.get((node_type, label))
+            if shape is not None and shape.is_shareable(properties, node_id):
+                continue
+            raise ValueError(
+                "Cannot lock a graph node outside the bound agent"
+            )
+
+
+async def lock_graph_nodes_for_update(
+    db: AsyncDatabase,
+    node_ids: Iterable[str],
+    *,
+    agent_id: str = "",
+    provisional_agent_id: str = "",
+) -> List[str]:
+    """Lock graph rows in the canonical order before ownership mutation.
+
+    Callers own the surrounding transaction. SQLite obtains serialization from
+    that transaction's writer lock; PostgreSQL needs explicit row locks. When
+    ``agent_id`` is supplied, physical locks are limited to that tenant's rows
+    and valid fleet-shared content shapes. The sorted return value lets every
+    caller process overlapping batches in the same order.
+    """
+
+    unique_node_ids = sorted(
+        dict.fromkeys(node_id for node_id in node_ids if node_id)
+    )
+    if provisional_agent_id and provisional_agent_id != agent_id:
+        raise ValueError("Provisional graph root must match the bound agent")
+    if db.backend_type == "sqlite":
+        await _acquire_sqlite_graph_writer_slot(db)
+        return unique_node_ids
+    if db.backend_type != "postgres":
+        return unique_node_ids
+
+    # Reserve a fixed shard set before any physical row. This covers both
+    # absent/present transitions and existing rows without consuming one shared
+    # advisory slot per graph node, and establishes one lock-class order across
+    # every writer even when unrelated IDs collide onto the same shard.
+    await _lock_graph_node_ids_for_insert(db, unique_node_ids)
+    if agent_id and provisional_agent_id:
+        await _preflight_bound_graph_node_locks(
+            db,
+            unique_node_ids,
+            agent_id,
+            provisional_agent_id=provisional_agent_id,
+        )
+
+    if agent_id:
+        shared_clause = " OR ".join(
+            "(graph_nodes.node_type = ? AND graph_nodes.label = ?)"
+            for _ in _SHARED_CONTENT_SHAPES
+        )
+        shared_params = tuple(
+            value for key in _SHARED_CONTENT_SHAPES for value in key
+        )
+        lock_scope = (
+            "EXISTS(SELECT 1 FROM graph_node_owners AS lock_owner "
+            "WHERE lock_owner.node_id = graph_nodes.node_id "
+            "AND lock_owner.agent_id = ?)"
+        )
+        lock_scope_params: tuple[str, ...] = (agent_id,)
+        if shared_clause:
+            lock_scope = f"({lock_scope} OR {shared_clause})"
+            lock_scope_params += shared_params
+        if provisional_agent_id:
+            provisional_clause = (
+                "(graph_nodes.node_id = ? "
+                "AND graph_nodes.node_type = 'agent' "
+                "AND NOT EXISTS("
+                "  SELECT 1 FROM graph_node_owners AS provisional_owner "
+                "  WHERE provisional_owner.node_id = graph_nodes.node_id"
+                "))"
+            )
+            lock_scope = f"({lock_scope} OR {provisional_clause})"
+            lock_scope_params += (provisional_agent_id,)
+    else:
+        lock_scope = "1 = 1"
+        lock_scope_params = ()
+
+    existing_ids: set[str] = set()
+    for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
+        batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = await db.fetchall(
+            "SELECT node_id FROM graph_nodes "
+            f"WHERE node_id IN ({placeholders}) "
+            f"AND {lock_scope} "
+            'ORDER BY node_id COLLATE "C" FOR UPDATE',
+            (*batch, *lock_scope_params),
+        )
+        existing_ids.update(row[0] for row in rows)
+
+    absent_ids = [
+        node_id for node_id in unique_node_ids if node_id not in existing_ids
+    ]
+    if agent_id and provisional_agent_id:
+        # Recheck after waiting on an absent-id reservation. A foreign writer
+        # may have won the identifier between the caller's cheap preflight and
+        # this transaction's reservation. Only the privileged legacy-root
+        # repair needs to classify that state; ordinary public prelocking must
+        # treat a foreign row exactly like an absent row and the scoped SELECT
+        # below must take no physical lock on it.
+        await _preflight_bound_graph_node_locks(
+            db,
+            absent_ids,
+            agent_id,
+            provisional_agent_id=provisional_agent_id,
+        )
+
+    # A creator may have committed while this transaction waited for an absent-
+    # id reservation. Re-lock any such newly-present row while the reservation
+    # is held so deletion/ownership mutation cannot race its physical row.
+    for start in range(0, len(absent_ids), _DELETE_ID_BATCH):
+        batch = absent_ids[start:start + _DELETE_ID_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        await db.fetchall(
+            "SELECT node_id FROM graph_nodes "
+            f"WHERE node_id IN ({placeholders}) "
+            f"AND {lock_scope} "
+            'ORDER BY node_id COLLATE "C" FOR UPDATE',
+            (*batch, *lock_scope_params),
+        )
+    return unique_node_ids
+
+
 class NodeSwapResult(str, Enum):
     """Outcome of :meth:`AsyncGraphStore.compare_and_swap_node`.
 
@@ -459,6 +818,19 @@ class NodeSwapResult(str, Enum):
     # ``allowed_node_types`` — the privacy wrapper uses it to fail a durable
     # graph CAS closed in volatile modes (#2672) without a TOCTOU pre-read.
     TYPE_NOT_ALLOWED = "type_not_allowed"
+
+
+class NodeDeleteResult(str, Enum):
+    """Outcome of :meth:`AsyncGraphStore.compare_and_delete_node`.
+
+    ``DELETED`` means the node was removed from this store's tenant scope. A
+    shared physical row may remain visible to its other owners after a bound
+    store releases its own ownership witness.
+    """
+
+    DELETED = "deleted"
+    PREDICATE_FAILED = "predicate_failed"
+    NOT_FOUND = "not_found"
 
 
 @dataclass
@@ -504,6 +876,24 @@ class AsyncGraphStore:
         if self.agent_id and self.agent_id != agent_id:
             raise ValueError("Graph store is already bound to a different agent")
         self.agent_id = agent_id
+
+    async def lock_nodes_for_update(self, node_ids: Iterable[str]) -> List[str]:
+        """Lock a complete multi-node write set in canonical order.
+
+        The caller must own the surrounding transaction. Single-node writers
+        lock internally, but a workflow that will touch several nodes must take
+        the whole set first so two semantic write orders cannot become opposite
+        PostgreSQL lock orders. SQLite uses the same call to acquire its writer
+        slot before any read in the composed operation. A bound PostgreSQL
+        store treats foreign rows exactly like absent rows: it returns the same
+        canonical identifiers while its scoped SELECT takes no physical lock
+        on rows outside the tenant.
+        """
+
+        materialized = tuple(node_ids)
+        return await lock_graph_nodes_for_update(
+            self.db, materialized, agent_id=self.agent_id
+        )
 
     def _node_owner(self, node: GraphNode) -> str:
         declared = node.properties.get("agent_id") if node.properties else None
@@ -660,10 +1050,47 @@ class AsyncGraphStore:
         self._refuse_unshareable_properties(
             (node.node_type, node.label), node.properties, node.node_id
         )
+        if self.db.backend_type == "postgres" and owner:
+            # Establish whether this ID is already known to be outside the
+            # tenant before taking either its advisory reservation or physical
+            # row lock. Ordinary rows can never acquire a second owner, and a
+            # caller presenting a shared shape can proceed only when the stored
+            # identity is that same shared shape. Everything is re-read under
+            # lock below; this cheap preflight rejects only writes that are
+            # already guaranteed to fail and keeps an invalid tenant request
+            # from queueing behind a foreign transaction.
+            preflight_rows = await self.db.fetchall(
+                "SELECT owners.agent_id, nodes.node_type, nodes.label "
+                "FROM graph_node_owners AS owners "
+                "LEFT JOIN graph_nodes AS nodes ON nodes.node_id = owners.node_id "
+                "WHERE owners.node_id = ?",
+                (node.node_id,),
+            )
+            preflight_owners = {row[0] for row in preflight_rows}
+            has_foreign_owner = bool(preflight_owners - {owner})
+            stored_shapes = {(row[1], row[2]) for row in preflight_rows}
+            can_attempt_shared_admission = bool(
+                shape is not None
+                and stored_shapes == {(node.node_type, node.label)}
+            )
+            if has_foreign_owner and not can_attempt_shared_admission:
+                raise ValueError(
+                    "Cannot overwrite a graph node owned by another agent"
+                )
         async with self.db.transaction():
+            await lock_graph_nodes_for_update(
+                self.db, [node.node_id], agent_id=owner
+            )
+            # A compatible fleet-shared row adds only an ownership witness.
+            # Lock the physical row before deciding that on PostgreSQL: final-
+            # owner deletion locks the same row first, so it cannot delete the
+            # row between this identity read and ``record_graph_node_owner``.
+            lock_suffix = (
+                " FOR UPDATE" if self.db.backend_type == "postgres" else ""
+            )
             existing = await self.db.fetchone(
                 "SELECT node_type, label, properties FROM graph_nodes "
-                "WHERE node_id = ?",
+                f"WHERE node_id = ?{lock_suffix}",
                 (node.node_id,),
             )
             existing_owner_rows = await self.db.fetchall(
@@ -815,6 +1242,9 @@ class AsyncGraphStore:
         expected: Optional[Dict[str, Any]],
         new_node: GraphNode,
         allowed_node_types: Optional[frozenset] = None,
+        *,
+        expected_node_type: Optional[str] = None,
+        expected_label: Optional[str] = None,
     ) -> NodeSwapResult:
         """Atomically update a node's ``properties`` only if they still match.
 
@@ -865,6 +1295,11 @@ class AsyncGraphStore:
                 onto whatever row already exists. ``None`` (the default) imposes
                 no type constraint, preserving the primitive's original
                 behaviour for every non-privacy caller.
+            expected_node_type: Optional exact stored ``node_type`` predicate.
+                Must be supplied together with ``expected_label``. The pair is
+                added to the same atomic ``UPDATE`` predicate as ``expected``.
+            expected_label: Optional exact stored ``label`` predicate. Must be
+                supplied together with ``expected_node_type``.
 
         Returns:
             * :attr:`NodeSwapResult.SWAPPED` — the predicate held and the write
@@ -896,11 +1331,10 @@ class AsyncGraphStore:
             fail-closed on a real ``properties`` change: a writer that touched
             ``properties`` since your read yields ``PREDICATE_FAILED`` rather
             than overwriting their change. A concurrent ``node_type`` / ``label``
-            change is neither detected nor clobbered — it simply coexists,
-            because CAS reads and writes ``properties`` only. If a callsite needs
-            a wider whole-node predicate (also pinning ``node_type`` /
-            ``label``), add it as a distinct signature rather than loosening this
-            one.
+            change is neither detected nor clobbered by the default
+            properties-only signature. Callers that own an exact graph shape can
+            pass ``expected_node_type`` and ``expected_label`` to widen only the
+            predicate while retaining the properties-only write.
 
         Tenant scoping:
             On a store bound to an agent (:meth:`bind_agent`) this primitive is
@@ -920,6 +1354,17 @@ class AsyncGraphStore:
             ownerless behaviour the primitive shipped with, where any existing
             row is a visible ``PREDICATE_FAILED`` conflict.
         """
+        identity_clause, identity_params = self._identity_predicate(
+            expected_node_type=expected_node_type,
+            expected_label=expected_label,
+        )
+        if identity_params and (
+            new_node.node_type != expected_node_type
+            or new_node.label != expected_label
+        ):
+            raise ValueError(
+                "new_node identity must match expected_node_type and expected_label"
+            )
         new_properties = json.dumps(new_node.properties)
         # Resolve the caller's authoritative owner up front, exactly like
         # add_node: a bound store may only write nodes it owns, and rejects a
@@ -947,6 +1392,8 @@ class AsyncGraphStore:
                 placeholders = ", ".join("?" for _ in allowed_tuple)
                 type_clause = f" AND node_type IN ({placeholders})"
                 type_params = allowed_tuple
+            else:
+                type_clause = " AND 1 = 0"
 
         async with self.db.transaction():
             if expected is None:
@@ -973,6 +1420,29 @@ class AsyncGraphStore:
                 self._refuse_unshareable_properties(
                     (new_node.node_type, new_node.label), new_node.properties, node_id
                 )
+                if self.db.backend_type == "postgres" and owner:
+                    # Refuse an already-present foreign id before taking this
+                    # graph namespace's advisory lock.  The scoped result is
+                    # unchanged (NOT_FOUND), but one tenant cannot make an
+                    # invalid create queue behind another tenant's row work.
+                    visibility = await self.db.fetchone(
+                        "SELECT "
+                        "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?), "
+                        "EXISTS(SELECT 1 FROM graph_node_owners "
+                        "       WHERE node_id = ? AND agent_id = ?)",
+                        (node_id, node_id, owner),
+                    )
+                    if visibility and visibility[0]:
+                        return (
+                            NodeSwapResult.PREDICATE_FAILED
+                            if visibility[1]
+                            else NodeSwapResult.NOT_FOUND
+                        )
+                # Share the absent-row reservation used by composed graph
+                # writers.  Without this, PostgreSQL's conflict-safe INSERT
+                # can land while another transaction believes its complete
+                # (currently absent) graph write set is exclusively reserved.
+                await _lock_graph_node_ids_for_insert(self.db, [node_id])
                 affected = await self.db.execute(
                     self._insert_if_absent_node_sql(),
                     (node_id, new_node.node_type, new_node.label, new_properties),
@@ -1003,6 +1473,34 @@ class AsyncGraphStore:
                 if exists is not None:
                     return NodeSwapResult.PREDICATE_FAILED
                 return NodeSwapResult.NOT_FOUND
+
+            if self.db.backend_type == "postgres" and owner:
+                # Preserve the tenant-blind NOT_FOUND contract without letting
+                # an invalid tenant queue on either a foreign row or its graph
+                # reservation. Ownership mutations recheck under the same
+                # reservation below, so this unlocked probe is only a cheap
+                # refusal and never authorizes the write.
+                visible = await self.db.fetchone(
+                    f"SELECT 1 FROM graph_nodes WHERE node_id = ? AND {scope}",
+                    (node_id, *scope_params),
+                )
+                if visible is None:
+                    return NodeSwapResult.NOT_FOUND
+
+            # Existing-row CAS must enter through the same shard-before-row
+            # protocol as add/delete and composed graph writers. Otherwise it
+            # can hold this physical row while a composed writer holds the
+            # node's reservation shard, forming a PostgreSQL row<->advisory
+            # deadlock when CAS later extends its transaction to another node.
+            await _lock_graph_node_ids_for_insert(self.db, [node_id])
+            if self.db.backend_type == "postgres":
+                locked = await self.db.fetchone(
+                    "SELECT 1 FROM graph_nodes "
+                    f"WHERE node_id = ? AND {scope} FOR UPDATE",
+                    (node_id, *scope_params),
+                )
+                if locked is None:
+                    return NodeSwapResult.NOT_FOUND
 
             # An existing fleet-shared row has exactly ONE writer: ``add_node``.
             # This primitive refuses them rather than reimplementing that door's
@@ -1045,12 +1543,13 @@ class AsyncGraphStore:
                 "UPDATE graph_nodes "
                 "SET properties = ? "
                 f"WHERE node_id = ? AND {self._properties_match_predicate()}"
-                f"{type_clause}{shared_clause} "
+                f"{identity_clause}{type_clause}{shared_clause} "
                 f"AND {scope}",
                 (
                     new_properties,
                     node_id,
                     expected_properties,
+                    *identity_params,
                     *type_params,
                     *shared_params,
                     *scope_params,
@@ -1089,6 +1588,25 @@ class AsyncGraphStore:
             ):
                 return NodeSwapResult.TYPE_NOT_ALLOWED
             return NodeSwapResult.PREDICATE_FAILED
+
+    @staticmethod
+    def _identity_predicate(
+        *,
+        expected_node_type: Optional[str],
+        expected_label: Optional[str],
+    ) -> tuple[str, tuple[str, ...]]:
+        """Build one exact type+label predicate or reject a partial identity."""
+
+        if (expected_node_type is None) != (expected_label is None):
+            raise ValueError(
+                "expected_node_type and expected_label must be supplied together"
+            )
+        if expected_node_type is None:
+            return "", ()
+        return (
+            " AND node_type = ? AND label = ?",
+            (expected_node_type, expected_label),
+        )
 
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
         """Get a node by ID."""
@@ -1205,6 +1723,79 @@ class AsyncGraphStore:
             for row in rows
         ]
 
+    async def _delete_node_in_transaction(self, node_id: str) -> bool:
+        """Delete/release one node while the caller holds a transaction."""
+
+        if self.agent_id:
+            owned = await self.db.fetchone(
+                "SELECT 1 FROM graph_node_owners "
+                "WHERE node_id = ? AND agent_id = ?",
+                (node_id, self.agent_id),
+            )
+            if not owned:
+                return False
+
+            await release_graph_node_owners(self.db, [node_id], self.agent_id)
+            return True
+
+        await self.db.execute(
+            "DELETE FROM graph_edge_owners "
+            "WHERE source_id = ? OR target_id = ?",
+            (node_id, node_id),
+        )
+        await self.db.execute(
+            "DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?",
+            (node_id, node_id),
+        )
+        await self.db.execute(
+            "DELETE FROM graph_node_owners WHERE node_id = ?",
+            (node_id,),
+        )
+        removed = await self.db.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ?",
+            (node_id,),
+        )
+        return bool(_rows_affected(removed))
+
+    async def _visible_node_identity_for_update(
+        self, node_id: str
+    ) -> Optional[tuple[str, str]]:
+        """Read and lock one tenant-visible graph identity inside a transaction."""
+
+        scope, scope_params = self._node_scope()
+        if self.db.backend_type == "sqlite":
+            # A same-task nested ``transaction(immediate=True)`` inherits its
+            # caller's deferred BEGIN. Take SQLite's writer slot before even
+            # the ownership probe so no competing connection can commit and
+            # leave this transaction trying to upgrade a stale read snapshot.
+            await _acquire_sqlite_graph_writer_slot(self.db)
+        if self.agent_id:
+            # Scope before taking either the PostgreSQL advisory lock or the
+            # physical row lock. An invisible id must behave exactly like an
+            # absent id and must not let one tenant hold another tenant's locks
+            # until a caller-managed outer transaction eventually commits.
+            visible = await self.db.fetchone(
+                "SELECT 1 FROM graph_node_owners "
+                "WHERE node_id = ? AND agent_id = ?",
+                (node_id, self.agent_id),
+            )
+            if visible is None:
+                return None
+        # ``transaction(immediate=True)`` cannot upgrade a same-task outer
+        # deferred transaction because SQLite's nested transaction scope is a
+        # no-op. Acquire explicitly before reading identity so the composed
+        # public ``AsyncStorage.transaction()`` path remains serialized too.
+        # The scoped read below is deliberately repeated after locking: an
+        # ownership witness can disappear between the cheap probe and the lock.
+        await lock_graph_nodes_for_update(
+            self.db, [node_id], agent_id=self.agent_id
+        )
+        return await self.db.fetchone(
+            "SELECT node_type, label FROM graph_nodes "
+            f"WHERE node_id = ? AND {scope}",
+            (node_id, *scope_params),
+        )
+
     async def delete_node(self, node_id: str) -> None:
         """Release this store's node witness and reclaim ownerless rows.
 
@@ -1213,37 +1804,45 @@ class AsyncGraphStore:
         unbound maintenance store preserves the legacy physical-delete
         behavior.
         """
-        async with self.db.transaction():
-            if self.agent_id:
-                owned = await self.db.fetchone(
-                    "SELECT 1 FROM graph_node_owners "
-                    "WHERE node_id = ? AND agent_id = ?",
-                    (node_id, self.agent_id),
-                )
-                if not owned:
-                    return
+        async with self.db.transaction(immediate=True):
+            # Take the graph-row lock first when the row exists, but always run
+            # cleanup. Ownership and edge ledgers intentionally have no foreign
+            # keys, so an interrupted/legacy write can leave repairable records
+            # after the physical node has already disappeared.
+            await self._visible_node_identity_for_update(node_id)
+            await self._delete_node_in_transaction(node_id)
 
-                await release_graph_node_owners(
-                    self.db, [node_id], self.agent_id
-                )
-                return
+    async def compare_and_delete_node(
+        self,
+        node_id: str,
+        *,
+        expected_node_type: str,
+        expected_label: str,
+    ) -> NodeDeleteResult:
+        """Delete only while the visible node's exact identity still matches.
 
-            await self.db.execute(
-                "DELETE FROM graph_edge_owners "
-                "WHERE source_id = ? OR target_id = ?",
-                (node_id, node_id),
-            )
-            await self.db.execute(
-                "DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?",
-                (node_id, node_id)
-            )
-            await self.db.execute(
-                "DELETE FROM graph_node_owners WHERE node_id = ?",
-                (node_id,),
-            )
-            await self.db.execute(
-                "DELETE FROM graph_nodes WHERE node_id = ?",
-                (node_id,)
+        The type+label read and deletion share one serialized transaction.
+        SQLite acquires its writer slot before reading; PostgreSQL locks the
+        selected graph row. A whole-row writer that replaces the node before
+        this operation therefore yields ``PREDICATE_FAILED`` without losing its
+        replacement, while a writer arriving afterward waits until deletion
+        commits.
+
+        On a bound store, ``DELETED`` means this tenant's ownership witness was
+        released. A shared physical row remains for any other owners.
+        """
+
+        async with self.db.transaction(immediate=True):
+            existing = await self._visible_node_identity_for_update(node_id)
+            if existing is None:
+                return NodeDeleteResult.NOT_FOUND
+            if existing != (expected_node_type, expected_label):
+                return NodeDeleteResult.PREDICATE_FAILED
+            deleted = await self._delete_node_in_transaction(node_id)
+            return (
+                NodeDeleteResult.DELETED
+                if deleted
+                else NodeDeleteResult.NOT_FOUND
             )
 
     async def purge_agent_nodes(
@@ -1427,6 +2026,81 @@ class AsyncGraphStore:
         requested_owner = self.agent_id or declared or ""
 
         async with self.db.transaction():
+            if self.db.backend_type == "postgres" and requested_owner:
+                # Establish tenant scope before taking a physical/advisory row
+                # lock.  Invalid ordinary edges must not let a tenant queue on
+                # a foreign endpoint, while trusted lineage intentionally owns
+                # only its source and never locks its foreign/absent target.
+                preflight_owners = await self.db.fetchone(
+                    "SELECT "
+                    "EXISTS(SELECT 1 FROM graph_node_owners "
+                    "       WHERE node_id = ? AND agent_id = ?), "
+                    "EXISTS(SELECT 1 FROM graph_node_owners "
+                    "       WHERE node_id = ? AND agent_id = ?), "
+                    "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?)",
+                    (
+                        source_id,
+                        requested_owner,
+                        target_id,
+                        requested_owner,
+                        target_id,
+                    ),
+                )
+                preflight_owns_source = bool(
+                    preflight_owners and preflight_owners[0]
+                )
+                preflight_owns_target = bool(
+                    preflight_owners and preflight_owners[1]
+                )
+                preflight_target_exists = bool(
+                    preflight_owners and preflight_owners[2]
+                )
+                if trusted_cross_agent:
+                    if not preflight_owns_source:
+                        raise ValueError(
+                            "Trusted cross-agent edge source is not owned by the bound agent"
+                        )
+                elif not (
+                    preflight_owns_source
+                    and preflight_owns_target
+                    and preflight_target_exists
+                ):
+                    raise ValueError(
+                        "Graph edge endpoints are not both owned by the bound agent"
+                    )
+
+            # Node deletion and ownership release take graph rows before any
+            # edge ledger row. Ordinary edge admission must use the same order
+            # and lock both endpoints together (sorted by the shared helper),
+            # otherwise PostgreSQL can validate a soon-to-be-deleted witness
+            # through MVCC and commit a dangling edge after node cleanup has
+            # passed it. Trusted cross-agent edges deliberately permit an
+            # absent/foreign target, so only their owned source participates.
+            lock_ids = (
+                [source_id]
+                if self.db.backend_type == "postgres" and trusted_cross_agent
+                else [source_id, target_id]
+            )
+            await lock_graph_nodes_for_update(
+                self.db, lock_ids, agent_id=requested_owner
+            )
+            endpoint_rows = await self.db.fetchone(
+                "SELECT "
+                "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?), "
+                "EXISTS(SELECT 1 FROM graph_nodes WHERE node_id = ?)",
+                (source_id, target_id),
+            )
+            source_exists = bool(endpoint_rows and endpoint_rows[0])
+            target_exists = bool(endpoint_rows and endpoint_rows[1])
+            # Ordinary edges always require a materialized target. A bound
+            # bootstrap writer may use a provisionally-reserved source: avatar
+            # and backup workflows establish that source ownership witness
+            # before the physical agent root exists. The ownership checks below
+            # validate the reservation atomically. Unbound maintenance writers
+            # have no such proof and must present a physical source too.
+            if not requested_owner and (not source_exists or not target_exists):
+                raise ValueError("Graph edge endpoints do not both exist")
+
             if requested_owner:
                 endpoint_owners = await self.db.fetchone(
                     "SELECT "
@@ -1443,7 +2117,7 @@ class AsyncGraphStore:
                         raise ValueError(
                             "Trusted cross-agent edge source is not owned by the bound agent"
                         )
-                elif not (owns_source and owns_target):
+                elif not (owns_source and owns_target and target_exists):
                     raise ValueError(
                         "Graph edge endpoints are not both owned by the bound agent"
                     )

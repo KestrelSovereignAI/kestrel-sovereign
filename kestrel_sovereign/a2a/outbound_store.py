@@ -372,17 +372,26 @@ async def update_outbound_terminal_state(
     Returns the number of rows updated. If the task_id was never
     recorded (or the audit table was dropped), returns 0 — never
     raises, so the cognition turn doesn't break on a stale fetch.
-    Idempotent: updating with the same terminal_state twice is a
-    no-op net of the ``terminal_at`` stamp.
+    Idempotent: updating with the same terminal_state twice is a no-op net of
+    the ``terminal_at`` stamp. An authoritative remote cancellation may
+    supersede sender-local provisional states (deadline expiry or a dispatch
+    failure); it may not overwrite a contradictory remote terminal result.
     """
     now = datetime.now(timezone.utc).isoformat()
     affected = await db.execute(
         """
         UPDATE a2a_outbound_tasks
         SET terminal_state = ?, terminal_at = ?, error = COALESCE(?, error)
-        WHERE agent_id = ? AND task_id = ? AND terminal_state IS NULL
+        WHERE agent_id = ? AND task_id = ?
+          AND (
+              terminal_state IS NULL
+              OR (
+                  ? = 'canceled'
+                  AND terminal_state IN ('expired', 'dispatch_failed')
+              )
+          )
         """,
-        (terminal_state, now, error, agent_id, task_id),
+        (terminal_state, now, error, agent_id, task_id, terminal_state),
     )
     # AsyncDatabase.execute returns rows-affected as int. Older test
     # doubles may return a cursor-like object with .rowcount, or None;

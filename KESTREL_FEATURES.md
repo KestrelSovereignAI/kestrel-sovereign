@@ -514,10 +514,10 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `acknowledge_restart_escalation` | `!restart acknowledge-escalation` | `system` | `request_id` | 89 | `enabled` |
-| `cancel_restart_request` | `!restart cancel` | `system` | `request_id`, `reason` | 130 | `enabled` |
-| `list_restart_requests` | `!restart list` | `data_access` | `status` | 104 | `enabled` |
-| `list_restart_status_events` | `!restart events` | `data_access` | `limit`, `since` | 91 | `enabled` |
+| `acknowledge_restart_escalation` | `!restart acknowledge-escalation` | `system` | `request_id` | 109 | `enabled` |
+| `cancel_restart_request` | `!restart cancel` | `system` | `request_id`, `reason` | 144 | `enabled` |
+| `list_restart_requests` | `!restart list` | `data_access` | `status` | 119 | `enabled` |
+| `list_restart_status_events` | `!restart events` | `data_access` | `limit`, `since` | 103 | `enabled` |
 | `request_restart` | `!restart request` | `system` | `reason`, `urgency`, `policy`, `desired_window`, `operation`, `update_profile`, `target_ref`, `repo_path`, `allow_migrations` | 566 | `enabled` |
 | `restart_coordinator` | `!restart coordinator` | `system` |  | 47 | `enabled` |
 
@@ -744,6 +744,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/stream`
   - `GET /api/agent/tasks`
   - `POST /api/agent/tasks/send`
+  - `POST /api/agent/tasks/{task_id:path}/cancel`
   - `GET /api/agent/tasks/{task_id}`
   - `GET /api/agent/tasks/{task_id}/subscribe`
 - [`kestrel_sovereign/endpoints/auth_oauth.py`](kestrel_sovereign/endpoints/auth_oauth.py)
@@ -1041,11 +1042,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!audit` | `response_audit` |  | Show audit configuration and status |
 | `!audit-off` | `response_audit` |  | Disable per-response audit |
 | `!audit-on` | `response_audit` | `[mode]` | Enable per-response audit. mode: 'warn' (annotate risky responses) or 'strict' (block risky responses). |
-| `!restart acknowledge-escalation` | `restart_coordinator` | `<request_id>` | Acknowledge the bounded host-wide escalation policy for one pending restart request migrated from an older release. This is required once for legacy rows before a continuous busy deferral may override fleet quiescence. Pass request_id from list_restart_requests. |
-| `!restart cancel` | `restart_coordinator` | `<request_id> [reason]` | Cancel a still-pending restart request (status pending or approved). Rows already updating/executing/completed/rejected/canceled cannot be canceled. Pass request_id from data.request.id of request_restart (or data.requests[].id of list_restart_requests).<br><br>Returns: data={canceled: bool, request_id: str} (plus current_status when the cancel is refused). |
+| `!restart acknowledge-escalation` | `restart_coordinator` | `<request_id>` | Acknowledge the bounded host-wide escalation policy for one pending restart request filed by this agent and migrated from an older release. Requests filed by another agent cannot be acknowledged. This is required once for legacy rows before a continuous busy deferral may override fleet quiescence. Pass request_id from list_restart_requests. |
+| `!restart cancel` | `restart_coordinator` | `<request_id> [reason]` | Cancel this agent's still-pending restart request (status pending or approved). Another agent's request cannot be canceled. Rows already updating/executing/completed/rejected/canceled cannot be canceled. Pass request_id from data.request.id of request_restart (or data.requests[].id of list_restart_requests).<br><br>Returns: data={canceled: bool, request_id: str} (plus current_status when the cancel is refused). |
 | `!restart coordinator` | `restart_coordinator` |  | ACTION cron task — scan restart_requests, run safety checks, and execute pending requests by spawning a detached restart subprocess. No LLM cost. |
-| `!restart events` | `restart_coordinator` | `[limit] [since]` | List recent restart_status lifecycle events for chat-history reload and the agent's pre-turn snapshot. Newest first; uses the typed event records persisted alongside each SSE emit (#1562). |
-| `!restart list` | `restart_coordinator` | `[status]` | List restart requests, optionally filtered by status. Valid statuses: pending\|approved\|updating\|executing\|completed\|rejected\|canceled (omit status for all). An unknown status is rejected with the valid set rather than silently returning no rows.<br><br>Returns: data={count: int, requests: [<public dict>, ...]}. |
+| `!restart events` | `restart_coordinator` | `[limit] [since]` | List this agent's recent restart_status lifecycle events for chat-history reload and its pre-turn snapshot. Other agents' events are never visible. Newest first; uses the typed event records persisted alongside each SSE emit (#1562). |
+| `!restart list` | `restart_coordinator` | `[status]` | List restart requests filed by this agent, optionally filtered by status. Other agents' requests are never visible. Valid statuses: pending\|approved\|updating\|executing\|completed\|rejected\|canceled (omit status for all). An unknown status is rejected with the valid set rather than silently returning no rows.<br><br>Returns: data={count: int, requests: [<public dict>, ...]}. |
 | `!restart request` | `restart_coordinator` | `<reason> [urgency] [policy] [desired_window] [operation] [update_profile] [target_ref] [repo_path] [allow_migrations]` | File a durable restart request. The host coordinator evaluates safety and executes when conditions are met.<br><br>urgency: one of low\|normal\|high\|critical (default 'normal'); common synonyms are accepted ('medium'→normal, 'urgent'→high, 'emergency'→critical). Higher urgency is executed first.<br>policy: one of idle_agents_only\|allow_busy_after_timeout\|manual_only (default 'idle_agents_only'):<br>  - idle_agents_only: wait for every co-hosted agent to become idle; after a bounded continuous deferral, emit an audited escalation and proceed so one blocker cannot starve the host.<br>  - allow_busy_after_timeout: prefer idle, but execute anyway once the request has aged past the busy timeout even if the agent is still busy.<br>  - manual_only: never auto-execute; the row waits for an explicit dispatch.<br><br>operation='restart_only' (default) restarts the current code and NEVER updates it. operation='update_then_restart' first runs an explicit, allowlisted update profile (e.g. 'sovereign_local_uv_sync': git fetch + checkout target_ref + uv sync) against a local checkout, then restarts into the new code. Update mode requires update_profile and target_ref; repo_path defaults to the local Sovereign checkout. Updating/installing is always explicit and audited — it is never an implicit side effect of a plain restart.<br><br>Returns: data={created: bool, request: <public dict>}. The filed request's id is at data.request.id (NOT a top-level request_id) — pass it to list_restart_requests or cancel_restart_request. |
 | `!recall` | `save` | `<query> [item_type] [limit]` | Search saved items. Find previously saved stashes, excerpts, files, and items by meaning; legacy learned-fact graph rows may also appear by keyword during the compatibility window. Optional item_type filter must be one of: stash, file, excerpt, structured; passing one scopes the search to saved items only. |
 | `!recall delete` | `save` | `<item_id>` | Delete a saved item by ID. |
@@ -1113,6 +1114,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
+
 
 
 

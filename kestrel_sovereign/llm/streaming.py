@@ -861,7 +861,25 @@ class StreamingMixin:
         if tracker is not None and usage_available:
             try:
                 total_tokens = (input_tokens or 0) + (output_tokens or 0)
-                await tracker(model, provider_name, tokens=total_tokens)
+                cache_usage: Dict[str, int] = {}
+                cache_creation_input_tokens = getattr(
+                    response, "cache_creation_input_tokens", None
+                )
+                cache_read_input_tokens = getattr(
+                    response, "cache_read_input_tokens", None
+                )
+                if cache_creation_input_tokens is not None:
+                    cache_usage["cache_creation_input_tokens"] = (
+                        cache_creation_input_tokens
+                    )
+                if cache_read_input_tokens is not None:
+                    cache_usage["cache_read_input_tokens"] = cache_read_input_tokens
+                await tracker(
+                    model,
+                    provider_name,
+                    tokens=total_tokens,
+                    **cache_usage,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - independent test-fake sink
@@ -1028,6 +1046,12 @@ class StreamingMixin:
                     LLMResponse(
                         input_tokens=usage_sink.get("input_tokens"),
                         output_tokens=usage_sink.get("output_tokens"),
+                        cache_creation_input_tokens=usage_sink.get(
+                            "cache_creation_input_tokens"
+                        ),
+                        cache_read_input_tokens=usage_sink.get(
+                            "cache_read_input_tokens"
+                        ),
                     ),
                     model,
                     provider_name,
