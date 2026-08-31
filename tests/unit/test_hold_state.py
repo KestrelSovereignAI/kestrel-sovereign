@@ -666,8 +666,8 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         events.append(("sqlite", path))
         return fake_host_db
 
-    async def _postgres(_cls, dsn):
-        events.append(("postgres", dsn))
+    async def _postgres(_cls, dsn, **pool_sizes):
+        events.append(("postgres", dsn, pool_sizes))
         if dsn.endswith("/evidence"):
             return fake_evidence_db
         return fake_hold_db
@@ -705,8 +705,16 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     assert ctx.hold_store._history_anchor_path is None
     assert events[:5] == [
         ("sqlite", str(host_path)),
-        ("postgres", "postgresql://durable/host"),
-        ("postgres", "postgresql://independent/evidence"),
+        (
+            "postgres",
+            "postgresql://durable/host",
+            {"min_pool_size": 1, "max_pool_size": 1},
+        ),
+        (
+            "postgres",
+            "postgresql://independent/evidence",
+            {"min_pool_size": 1, "max_pool_size": 1},
+        ),
         ("hold-schema", fake_hold_db),
         ("hold-boot-read", fake_hold_db),
     ]
@@ -897,13 +905,59 @@ async def test_postgres_factory_closes_pool_when_core_schema_init_fails(
         events.append("schema")
         raise RuntimeError("core schema failed")
 
-    monkeypatch.setattr(postgres_module, "PostgresBackend", lambda dsn: _Backend())
+    monkeypatch.setattr(
+        postgres_module,
+        "PostgresBackend",
+        lambda **_kwargs: _Backend(),
+    )
     monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
 
     with pytest.raises(RuntimeError, match="core schema failed"):
         await database_module.AsyncDatabase.postgres("postgresql://durable/host")
 
     assert events == ["connect", "schema", "close"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_factory_forwards_explicit_pool_budget(monkeypatch):
+    """Special-purpose stores can reserve only their justified connections."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    constructor_args: dict[str, object] = {}
+
+    class _Backend:
+        backend_type = "postgres"
+
+        async def connect(self):
+            return None
+
+        async def close(self):
+            return None
+
+    def _backend(**kwargs):
+        constructor_args.update(kwargs)
+        return _Backend()
+
+    async def _init_schema(_self):
+        return None
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", _backend)
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", _init_schema)
+
+    db = await AsyncDatabase.postgres(
+        "postgresql://durable/hold",
+        min_pool_size=1,
+        max_pool_size=1,
+    )
+    await db.close()
+
+    assert constructor_args == {
+        "dsn": "postgresql://durable/hold",
+        "min_pool_size": 1,
+        "max_pool_size": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -929,7 +983,11 @@ async def test_database_factory_preserves_schema_error_when_cleanup_also_fails(
     async def _fail_schema(_self):
         raise RuntimeError("primary schema failure")
 
-    monkeypatch.setattr(postgres_module, "PostgresBackend", lambda dsn: _Backend())
+    monkeypatch.setattr(
+        postgres_module,
+        "PostgresBackend",
+        lambda **_kwargs: _Backend(),
+    )
     monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
 
     with pytest.raises(RuntimeError, match="primary schema failure"):
@@ -975,7 +1033,7 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _postgres(_cls, dsn):
+    async def _postgres(_cls, dsn, **_pool_sizes):
         if dsn.endswith("/evidence"):
             return fake_evidence_db
         return fake_hold_db
@@ -1054,7 +1112,7 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _postgres(_cls, dsn):
+    async def _postgres(_cls, dsn, **_pool_sizes):
         if dsn.endswith("/evidence"):
             return fake_evidence_db
         return fake_hold_db
@@ -1540,6 +1598,31 @@ async def test_absent_receipt_lookup_rejects_any_global_orphaned_tombstone(hold_
     )
 
     with pytest.raises(HoldCorruptStateError, match="missing receipt"):
+        await store.get_receipt("different-absent-operation")
+
+
+@pytest.mark.asyncio
+async def test_every_global_read_rejects_receipt_missing_operation_witness(hold_db):
+    """Runtime reads cannot certify history after a required witness is lost."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:missing-operation-witness",
+        actor_id="did:sovereign:operator",
+        reason="witness must remain durable",
+        operation_id="operation-that-loses-witness",
+    )
+    await db.execute(
+        "DELETE FROM hold_operation_witnesses WHERE operation_id = ?",
+        (held.receipt.operation_id,),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="missing an operation witness"):
+        await store.get_hold(held.receipt.scope, held.receipt.target_id)
+    with pytest.raises(HoldCorruptStateError, match="missing an operation witness"):
+        await store.read_boot_state()
+    with pytest.raises(HoldCorruptStateError, match="missing an operation witness"):
         await store.get_receipt("different-absent-operation")
 
 

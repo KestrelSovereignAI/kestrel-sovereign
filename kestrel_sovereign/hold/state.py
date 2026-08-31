@@ -1681,17 +1681,9 @@ class HoldStore:
                 "completed Hold witness migration is missing a content witness"
             )
 
-        missing_operation = await self._db.fetchone(
-            "SELECT r.operation_id FROM hold_receipts AS r "
-            "LEFT JOIN hold_operation_witnesses AS w "
-            "ON w.operation_id = r.operation_id "
-            "WHERE w.operation_id IS NULL LIMIT 1"
+        await self._assert_no_missing_operation_witnesses(
+            context="completed Hold witness migration",
         )
-        if missing_operation is not None:
-            raise HoldCorruptStateError(
-                "completed Hold witness migration is missing an operation witness"
-            )
-
         await self._assert_no_orphaned_operation_witnesses()
 
         missing_count = await self._db.fetchone(
@@ -1706,6 +1698,22 @@ class HoldStore:
             raise HoldCorruptStateError(
                 "completed Hold witness migration is missing a receipt-count witness"
             )
+
+    async def _assert_no_missing_operation_witnesses(
+        self,
+        *,
+        context: str = "Hold receipt history",
+    ) -> None:
+        """Reject immutable receipts whose global operation evidence was lost."""
+
+        missing_operation = await self._db.fetchone(
+            "SELECT r.operation_id FROM hold_receipts AS r "
+            "LEFT JOIN hold_operation_witnesses AS w "
+            "ON w.operation_id = r.operation_id "
+            "WHERE w.operation_id IS NULL LIMIT 1"
+        )
+        if missing_operation is not None:
+            raise HoldCorruptStateError(f"{context} is missing an operation witness")
 
     async def _assert_no_orphaned_operation_witnesses(self) -> None:
         """Reject append-only operation evidence without its immutable receipt."""
@@ -1724,6 +1732,7 @@ class HoldStore:
     async def _assert_global_history_intact(self) -> None:
         """Validate database-wide receipt evidence once per stable snapshot."""
 
+        await self._assert_no_missing_operation_witnesses()
         await self._assert_no_orphaned_operation_witnesses()
         await self._assert_history_anchor_intact()
 

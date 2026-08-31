@@ -330,9 +330,10 @@ def test_prod_instance_cap_matches_provisioned_database(live_config):
 
     ``durable_sovereign`` *permits* horizontal scale, but permission is not
     capacity.  Each serving instance opens up to ``max_pool_size`` (10) pooled
-    plus ``_advisory_max_pool_size`` (4) PostgreSQL connections, and the
-    provisioned Cloud SQL instance is a ``db-f1-micro`` with a ~25 connection
-    ceiling — so a second instance exhausts it.
+    plus ``_advisory_max_pool_size`` (4) runtime PostgreSQL connections and one
+    serialized Hold connection on the primary database. The provisioned Cloud
+    SQL instance is a ``db-f1-micro`` with a ~25 connection ceiling — so a
+    second instance exhausts it.
 
     The floor is the same argument read the other way: scaling to zero is safe
     only because custody is durable.  A cold start restores the pinned bundle
@@ -364,7 +365,13 @@ def test_prod_instance_cap_matches_provisioned_database(live_config):
     # Pin the per-instance connection cost the cap is derived from, so a change
     # to pool sizing surfaces here rather than as exhaustion in production.
     backend = PostgresBackend(dsn="postgresql://u:p@127.0.0.1:5432/db")
-    per_instance = backend._max_pool_size + backend._advisory_max_pool_size
+    hold_primary_pool_size = 1
+    per_instance = (
+        backend._max_pool_size
+        + backend._advisory_max_pool_size
+        + hold_primary_pool_size
+    )
+    assert per_instance <= 25
     assert per_instance * 2 > 25, (
         "two instances no longer exhaust a db-f1-micro; re-derive the cap "
         "instead of assuming this rationale still holds"
