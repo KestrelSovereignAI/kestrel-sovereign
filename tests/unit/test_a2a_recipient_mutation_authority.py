@@ -52,6 +52,12 @@ def _feature(manager, agent_id: str) -> TaskFeature:
     return feature
 
 
+def _feature_with_agent_id(manager, agent_id: str) -> TaskFeature:
+    feature = TaskFeature(SimpleNamespace(agent_id=agent_id))
+    feature.set_task_manager(manager)
+    return feature
+
+
 @pytest.mark.asyncio
 async def test_response_authority_is_recipient_not_creator_or_metadata(tmp_path):
     manager = await create_task_manager(str(tmp_path / "responses.db"))
@@ -117,6 +123,82 @@ async def test_artifact_authority_is_recipient_and_predicated_in_store(tmp_path)
         assert [artifact.name for artifact in task.artifacts] == [
             "recipient-output"
         ]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_id_only_host_can_authorize_response_and_artifact(tmp_path):
+    """A supported durable identity must not degrade to the host class name."""
+
+    manager = await create_task_manager(str(tmp_path / "agent-id-only.db"))
+    try:
+        await manager.create_task(
+            _params("agent-id-only-response"),
+            agent_name=RECIPIENT,
+            creator_agent_id=CREATOR,
+        )
+        response = await _feature_with_agent_id(
+            manager,
+            RECIPIENT,
+        ).respond_to_a2a_task(
+            "agent-id-only-response",
+            "recipient answer",
+        )
+
+        await manager.create_task(
+            _params("agent-id-only-artifact"),
+            agent_name=RECIPIENT,
+            creator_agent_id=CREATOR,
+        )
+        artifact = await _feature_with_agent_id(
+            manager,
+            RECIPIENT,
+        ).attach_artifact_to_a2a_task(
+            "agent-id-only-artifact",
+            "recipient-output",
+            "persist this",
+        )
+
+        assert response.status is ToolResultStatus.OK
+        assert artifact.status is ToolResultStatus.OK
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_response_and_artifact_fail_closed_without_durable_identity(tmp_path):
+    """A display/class name is never promoted to mutation authority."""
+
+    manager = await create_task_manager(str(tmp_path / "missing-identity.db"))
+    try:
+        for task_id in ("identityless-response", "identityless-artifact"):
+            await manager.create_task(
+                _params(task_id),
+                agent_name="SimpleNamespace",
+                creator_agent_id=CREATOR,
+            )
+        feature = TaskFeature(SimpleNamespace())
+        feature.set_task_manager(manager)
+
+        response = await feature.respond_to_a2a_task(
+            "identityless-response",
+            "must not persist",
+        )
+        artifact = await feature.attach_artifact_to_a2a_task(
+            "identityless-artifact",
+            "forged-output",
+            "must not persist",
+        )
+
+        assert response.status is ToolResultStatus.ERROR
+        assert artifact.status is ToolResultStatus.ERROR
+        assert "durable identity" in response.error
+        assert "durable identity" in artifact.error
+        response_task = await manager.get_task("identityless-response")
+        artifact_task = await manager.get_task("identityless-artifact")
+        assert response_task.status.state is TaskState.SUBMITTED
+        assert not artifact_task.artifacts
     finally:
         await manager.close()
 
@@ -351,10 +433,12 @@ async def test_handler_terminal_outcome_reconciles_live_cas_without_replacing_wi
         await manager.close()
 
 
-def test_task_feature_binds_mutations_to_runtime_did():
+def test_task_feature_binds_mutations_to_durable_runtime_identity():
     """Mutation guard: trusted principal comes from the feature's agent."""
 
     import inspect
 
     source = inspect.getsource(TaskFeature)
-    assert source.count("recipient_agent_id=agent_name") >= 4
+    assert source.count("recipient_agent_id=actor_agent_id") >= 4
+    assert 'for attribute in ("did", "agent_id")' in source
+    assert "type(self.agent).__name__" not in source
