@@ -641,11 +641,33 @@ class TaskManager:
                 False,
             )
 
-        saved = await self._save_recipient_execution_result(
-            task,
-            authority_agent_id=authority_agent_id,
-            expected_state=expected_state,
-        )
+        try:
+            saved = await self._save_recipient_execution_result(
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
+            )
+        except Exception as save_error:
+            # PostgreSQL can commit and then lose the COMMIT acknowledgement.
+            # Reconcile the recipient-scoped canonical row before treating the
+            # exception as a failed write: an exact durable copy proves this
+            # execution still owns the completion wake. A different payload or
+            # terminal state belongs to another writer and must not be narrated
+            # over. Cancellation remains outside this Exception-only recovery so
+            # task cancellation semantics are never swallowed.
+            try:
+                current = await self.task_store.get_for_recipient(
+                    task.id,
+                    authority_agent_id,
+                )
+            except BaseException as reconciliation_error:
+                raise save_error from reconciliation_error
+            if current is None or not self._same_recipient_execution_outcome(
+                current,
+                task,
+            ):
+                raise
+            return current, True
         if saved is False:
             # Another terminal writer won the live-set CAS and owns the
             # corresponding completion signal. Returning its durable state
@@ -656,6 +678,19 @@ class TaskManager:
             )
             return (current or task), False
         return task, True
+
+    @staticmethod
+    def _same_recipient_execution_outcome(current: Task, attempted: Task) -> bool:
+        """Whether a durable row is the exact terminal payload just attempted."""
+
+        return (
+            current.status.state is attempted.status.state
+            and current.status.message == attempted.status.message
+            and (current.artifacts or []) == (attempted.artifacts or [])
+            and (current.history or []) == (attempted.history or [])
+            and without_reserved_cancellation_receipt(current.metadata)
+            == without_reserved_cancellation_receipt(attempted.metadata)
+        )
 
     async def _save_recipient_execution_result(
         self,

@@ -433,6 +433,153 @@ async def test_handler_terminal_outcome_reconciles_live_cas_without_replacing_wi
         await manager.close()
 
 
+@pytest.mark.asyncio
+async def test_async_terminal_commit_lost_ack_still_emits_completion_wake(tmp_path):
+    """An uncertain terminal commit must retain ownership of its projections."""
+
+    manager = await create_task_manager(
+        str(tmp_path / "terminal-lost-ack.db"),
+        host_agent_id=RECIPIENT,
+    )
+
+    class CompletingHandler:
+        async def handle_task(self, task):
+            task.status = TaskStatus(
+                state=TaskState.COMPLETED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(text="committed result")],
+                ),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="worker",
+            description="uncertain commit worker",
+            url="/agents/worker",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="finish",
+                    name="finish",
+                    description="finish before losing the commit acknowledgement",
+                )
+            ],
+        ),
+        CompletingHandler(),
+    )
+    completions: list[str] = []
+    manager._on_task_complete = lambda task: completions.append(task.id)
+    canonical_save = manager.task_store.save_recipient_terminal_outcome
+    first_write = True
+
+    async def commit_then_lose_ack(*args, **kwargs):
+        nonlocal first_write
+        committed = await canonical_save(*args, **kwargs)
+        assert committed is True
+        if first_write:
+            first_write = False
+            raise RuntimeError("lost PostgreSQL COMMIT acknowledgement")
+        return committed
+
+    manager.task_store.save_recipient_terminal_outcome = commit_then_lose_ack
+    try:
+        submitted = await manager.execute_skill("worker", "finish", {}, sync=False)
+        terminal_events = asyncio.Queue()
+        manager._subscribers[submitted.id] = [terminal_events]
+
+        await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(submitted.id)
+        assert persisted is not None
+        assert persisted.status.state is TaskState.COMPLETED
+        assert persisted.status.message.parts[0].text == "committed result"
+        assert completions == [submitted.id]
+        event = terminal_events.get_nowait()
+        assert event["event"] == "status"
+        assert event["final"] is True
+        assert terminal_events.empty()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_terminal_write_does_not_claim_different_payload(tmp_path):
+    """A competing terminal payload remains the sole notification owner."""
+
+    manager = await create_task_manager(
+        str(tmp_path / "terminal-lost-ack-winner.db"),
+        host_agent_id=RECIPIENT,
+    )
+
+    class CompletingHandler:
+        async def handle_task(self, task):
+            task.status = TaskStatus(
+                state=TaskState.COMPLETED,
+                message=Message(role="agent", parts=[TextPart(text="our result")]),
+            )
+            return task
+
+        def get_skill_for_command(self, command):
+            return None
+
+    manager.register_agent(
+        AgentCard(
+            name="worker",
+            description="competing terminal writer",
+            url="/agents/worker",
+            version="1.0.0",
+            capabilities=AgentCapabilities(),
+            skills=[
+                AgentSkill(
+                    id="finish",
+                    name="finish",
+                    description="lose to a different terminal payload",
+                )
+            ],
+        ),
+        CompletingHandler(),
+    )
+    completions: list[str] = []
+    manager._on_task_complete = lambda task: completions.append(task.id)
+    canonical_save = manager.task_store.save_recipient_terminal_outcome
+    first_write = True
+
+    async def competing_commit_then_error(task, **kwargs):
+        nonlocal first_write
+        if first_write:
+            first_write = False
+            winner = task.model_copy(deep=True)
+            winner.status.message = Message(
+                role="agent",
+                parts=[TextPart(text="competing result")],
+            )
+            assert await canonical_save(winner, **kwargs) is True
+            raise RuntimeError("write outcome was uncertain")
+        return await canonical_save(task, **kwargs)
+
+    manager.task_store.save_recipient_terminal_outcome = competing_commit_then_error
+    try:
+        submitted = await manager.execute_skill("worker", "finish", {}, sync=False)
+        terminal_events = asyncio.Queue()
+        manager._subscribers[submitted.id] = [terminal_events]
+
+        await manager.drain_execution_tasks()
+
+        persisted = await manager.get_task(submitted.id)
+        assert persisted.status.state is TaskState.COMPLETED
+        assert persisted.status.message.parts[0].text == "competing result"
+        assert completions == []
+        assert terminal_events.empty()
+    finally:
+        await manager.close()
+
+
 def test_task_feature_binds_mutations_to_durable_runtime_identity():
     """Mutation guard: trusted principal comes from the feature's agent."""
 
