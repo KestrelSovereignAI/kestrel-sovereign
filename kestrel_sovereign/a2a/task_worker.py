@@ -91,14 +91,26 @@ class TaskWorker:
 
         Args:
             task_manager: TaskManager instance for task operations
-            agent_name: Name of the agent running this worker
+            agent_name: Display/observability name of the agent running this
+                worker
             poll_interval: Seconds between polling for new tasks
             max_concurrent: Maximum concurrent task processing
             max_retries: Maximum retry attempts for failed tasks
             retry_delay: Seconds to wait before retrying
         """
+        recipient_agent_id = getattr(task_manager, "host_agent_id", None)
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError(
+                "TaskWorker requires task_manager.host_agent_id as its durable "
+                "recipient identity"
+            )
+
         self.task_manager = task_manager
         self.agent_name = agent_name
+        # Authority has one source: the host-bound TaskManager identity.  The
+        # worker's display name remains useful for logs and observability but
+        # must never select or mutate durable recipient-owned tasks.
+        self.recipient_agent_id = recipient_agent_id
         self.poll_interval = poll_interval
         self.max_concurrent = max_concurrent
         self.max_retries = max_retries
@@ -165,7 +177,7 @@ class TaskWorker:
         # Get pending tasks
         pending = await self.task_manager.get_pending_tasks(
             limit=self.max_concurrent,
-            recipient_agent_id=self.agent_name,
+            recipient_agent_id=self.recipient_agent_id,
         )
 
         for task in pending:
@@ -205,7 +217,7 @@ class TaskWorker:
                     task_id=task_id,
                     new_state=TaskState.WORKING,
                     agent_name=self.agent_name,
-                    recipient_agent_id=self.agent_name,
+                    recipient_agent_id=self.recipient_agent_id,
                 )
 
                 # Execute handler
@@ -232,7 +244,7 @@ class TaskWorker:
                         new_state=TaskState.INPUT_REQUIRED,
                         message=message,
                         agent_name=self.agent_name,
-                        recipient_agent_id=self.agent_name,
+                        recipient_agent_id=self.recipient_agent_id,
                     )
                 elif result.success:
                     # Complete successfully
@@ -241,7 +253,7 @@ class TaskWorker:
                         response=result.response or "Task completed.",
                         agent_name=self.agent_name,
                         artifacts=result.artifacts,
-                        recipient_agent_id=self.agent_name,
+                        recipient_agent_id=self.recipient_agent_id,
                     )
                     # Clear retry count on success
                     self._retry_counts.pop(task_id, None)
@@ -271,7 +283,7 @@ class TaskWorker:
                 task_id=task_id,
                 new_state=TaskState.SUBMITTED,
                 agent_name=self.agent_name,
-                recipient_agent_id=self.agent_name,
+                recipient_agent_id=self.recipient_agent_id,
             )
 
             await asyncio.sleep(self.retry_delay)
@@ -282,7 +294,7 @@ class TaskWorker:
                 task_id=task_id,
                 error=f"Failed after {self.max_retries} attempts: {error}",
                 agent_name=self.agent_name,
-                recipient_agent_id=self.agent_name,
+                recipient_agent_id=self.recipient_agent_id,
             )
             self._retry_counts.pop(task_id, None)
 

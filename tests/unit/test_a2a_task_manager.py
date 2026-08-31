@@ -959,6 +959,7 @@ class TestTaskWorker:
     @pytest.mark.asyncio
     async def test_task_worker_register_handler(self, task_manager):
         """Test registering handlers with TaskWorker."""
+        task_manager.host_agent_id = "did:test:worker"
         worker = TaskWorker(
             task_manager=task_manager,
             agent_name="test-worker",

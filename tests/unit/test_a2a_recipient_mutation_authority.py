@@ -17,7 +17,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskMutationAuthorizationError,
 )
 from kestrel_sovereign.a2a.task_manager import create_task_manager
-from kestrel_sovereign.a2a.task_worker import TaskWorker
+from kestrel_sovereign.a2a.task_worker import SimpleTaskHandler, TaskResult, TaskWorker
 from kestrel_sovereign.a2a.types import (
     Artifact,
     DataPart,
@@ -263,10 +263,13 @@ async def test_recipient_poll_is_not_starved_by_older_foreign_rows(tmp_path):
 
 @pytest.mark.asyncio
 async def test_worker_wires_its_recipient_into_pending_poll():
-    manager = SimpleNamespace(get_pending_tasks=AsyncMock(return_value=[]))
+    manager = SimpleNamespace(
+        host_agent_id=RECIPIENT,
+        get_pending_tasks=AsyncMock(return_value=[]),
+    )
     worker = TaskWorker(
         manager,
-        agent_name=RECIPIENT,
+        agent_name="Meridian",
         max_concurrent=3,
     )
 
@@ -276,6 +279,61 @@ async def test_worker_wires_its_recipient_into_pending_poll():
         limit=3,
         recipient_agent_id=RECIPIENT,
     )
+
+
+def test_worker_fails_closed_without_manager_bound_recipient_identity():
+    """A display name, even a DID-shaped one, is not worker authority."""
+
+    manager = SimpleNamespace(
+        host_agent_id=None,
+        get_pending_tasks=AsyncMock(return_value=[]),
+    )
+
+    with pytest.raises(ValueError, match="task_manager.host_agent_id"):
+        TaskWorker(manager, agent_name=RECIPIENT)
+
+
+@pytest.mark.asyncio
+async def test_worker_display_name_does_not_replace_durable_recipient_authority(
+    tmp_path,
+):
+    """A display-named worker must still claim and finish its DID-owned work."""
+
+    manager = await create_task_manager(
+        str(tmp_path / "worker-display-name.db"),
+        host_agent_id=RECIPIENT,
+    )
+    try:
+        await manager.create_task(
+            _params("display-named-worker"),
+            agent_name=RECIPIENT,
+            creator_agent_id=CREATOR,
+        )
+        worker = TaskWorker(
+            manager,
+            agent_name="Meridian",
+            max_concurrent=1,
+        )
+        worker.register_handler(
+            SimpleTaskHandler(
+                lambda _task: TaskResult(
+                    success=True,
+                    response="finished by the DID recipient",
+                )
+            )
+        )
+        worker._semaphore = asyncio.Semaphore(1)
+
+        await worker._poll_and_process()
+        await asyncio.gather(*worker._tasks)
+
+        persisted = await manager.get_task("display-named-worker")
+        assert persisted.status.state is TaskState.COMPLETED
+        assert persisted.status.message.parts[0].text == (
+            "finished by the DID recipient"
+        )
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio
