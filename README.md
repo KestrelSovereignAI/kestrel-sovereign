@@ -300,6 +300,14 @@ DID join a known fresh-v2 fleet safely, but an absent/unknown provenance marker
 is always treated as a legacy migration; do not seed or unfence scheduler rows
 manually.
 
+The hosted agents share one operational PostgreSQL pool and one smaller pool
+for session advisory locks. Their per-process defaults are 20 and 4
+connections, respectively. Size them for the deployment's admitted fleet
+traffic with `KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE` and
+`KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE`; both settings must be
+positive integers. These are independent host budgets: scheduler effect gates
+use the scheduler host's own storage pool, not the agents' advisory pool.
+
 #### SDK 0.37 release cascade
 
 Core requires `kestrel-sovereign-sdk[tracing]>=0.37.0,<0.38`; the

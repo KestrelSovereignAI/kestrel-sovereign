@@ -139,7 +139,7 @@ class PostgresBackend(DatabaseBackend):
             max_pool_size: Maximum operational pool connections.
             advisory_max_pool_size: Optional advisory-lock pool bound. A
                 multi-tenant host sharing this backend should set an explicit
-                host-wide bound sized for admitted effect concurrency.
+                host-wide bound sized for its advisory-lock workload.
         """
         if not ASYNCPG_AVAILABLE:
             raise ImportError(
@@ -154,13 +154,12 @@ class PostgresBackend(DatabaseBackend):
         self._password = password
         self._min_pool_size = min_pool_size
         self._max_pool_size = max_pool_size
-        # Session advisory locks protect scheduler effects for their whole
-        # external-work span. Keep a *bounded*, separate pool for those gates:
-        # a waiter must not consume the last operational connection needed by
-        # an admitted effect's lease renewal/final CAS, and an unbounded direct
-        # connection per waiter would merely trade a deadlock for connection
-        # exhaustion. Standalone agents retain the historical cap of four;
-        # shared hosts explicitly budget this host-wide pool.
+        # Session advisory locks can span work performed through the ordinary
+        # pool. Keep a *bounded*, separate pool so a waiter cannot consume the
+        # last operational connection needed to finish that work; an unbounded
+        # direct connection per waiter would merely trade a deadlock for
+        # connection exhaustion. Standalone agents retain the historical cap
+        # of four; shared hosts explicitly budget this host-wide pool.
         if advisory_max_pool_size is not None and (
             type(advisory_max_pool_size) is not int or advisory_max_pool_size < 1
         ):

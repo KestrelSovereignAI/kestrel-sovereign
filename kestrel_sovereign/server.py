@@ -1715,6 +1715,31 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                                 )
 
 
+_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (
+    "KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE"
+)
+_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE_ENV = (
+    "KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE"
+)
+_DEFAULT_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE = 20
+_DEFAULT_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE = 4
+
+
+def _load_positive_int_env(name: str, default: int) -> int:
+    """Load a positive host-capacity setting, failing startup on bad input."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 def _uses_shared_postgres_scheduler() -> bool:
     """Whether this host can safely poll the fleet's shared schedule table."""
     return (
@@ -1729,14 +1754,25 @@ async def _start_shared_agent_postgres_backend(app: FastAPI):
     app.state.shared_agent_postgres_backend = None
     if not _uses_shared_postgres_scheduler():
         return None
-    from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
 
-    # This pool is host-wide, so align its advisory capacity with the host's
-    # admitted scheduler-effect concurrency rather than the old per-DID cap.
-    advisory_capacity = SchedulerFeature._load_max_concurrent_tasks()
+    # These pools are fleet-wide, not the old per-agent pools. Keep explicit,
+    # independent operator budgets for ordinary database work and for the much
+    # rarer session-advisory operations. Scheduler effect gates use the host
+    # scheduler's own storage backend, so its concurrency is deliberately not
+    # used to size either pool here.
+    operational_capacity = _load_positive_int_env(
+        _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV,
+        _DEFAULT_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE,
+    )
+    advisory_capacity = _load_positive_int_env(
+        _SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE_ENV,
+        _DEFAULT_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE,
+    )
     backend = PostgresBackend(
         dsn=os.environ["KESTREL_DATABASE_URL"],
+        min_pool_size=min(2, operational_capacity),
+        max_pool_size=operational_capacity,
         advisory_max_pool_size=advisory_capacity,
     )
     app.state.shared_agent_postgres_backend = backend

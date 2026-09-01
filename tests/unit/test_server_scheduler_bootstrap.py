@@ -13,7 +13,7 @@ from kestrel_sovereign import server
 
 
 @pytest.mark.asyncio
-async def test_server_owns_one_capacity_sized_backend_for_all_agents(
+async def test_server_owns_one_independently_capacity_sized_backend_for_all_agents(
     monkeypatch,
 ) -> None:
     instances = []
@@ -28,27 +28,83 @@ async def test_server_owns_one_capacity_sized_backend_for_all_agents(
     app = FastAPI()
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setenv("KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE", "31")
+    monkeypatch.setenv(
+        "KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE", "5"
+    )
     monkeypatch.setattr(
         "kestrel_sovereign.storage.db.postgres.PostgresBackend", _Backend
     )
-    monkeypatch.setattr(
-        "kestrel_sovereign.features.scheduler.feature."
-        "SchedulerFeature._load_max_concurrent_tasks",
-        lambda: 7,
-    )
-
     backend = await server._start_shared_agent_postgres_backend(app)
 
     assert backend is instances[0]
     assert backend.kwargs == {
         "dsn": "postgresql://scheduler-test",
-        "advisory_max_pool_size": 7,
+        "min_pool_size": 2,
+        "max_pool_size": 31,
+        "advisory_max_pool_size": 5,
     }
     backend.connect.assert_awaited_once()
     app.state.agent_manager = None
     app.state.startup_cleanup_agent_manager = None
     await server._shutdown_shared_agent_postgres_backend(app)
     backend.close.assert_awaited_once()
+    assert app.state.shared_agent_postgres_backend is None
+
+
+@pytest.mark.asyncio
+async def test_shared_agent_pool_defaults_are_not_scheduler_capacity(
+    monkeypatch,
+) -> None:
+    instances = []
+
+    class _Backend:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.connect = AsyncMock()
+            instances.append(self)
+
+    app = FastAPI()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.db.postgres.PostgresBackend", _Backend
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.feature."
+        "SchedulerFeature._load_max_concurrent_tasks",
+        lambda: 1,
+    )
+
+    await server._start_shared_agent_postgres_backend(app)
+
+    assert instances[0].kwargs == {
+        "dsn": "postgresql://scheduler-test",
+        "min_pool_size": 2,
+        "max_pool_size": 20,
+        "advisory_max_pool_size": 4,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE", "0"),
+        ("KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE", "many"),
+    ],
+)
+async def test_shared_agent_pool_rejects_invalid_capacity(
+    monkeypatch, name: str, value: str
+) -> None:
+    app = FastAPI()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+        await server._start_shared_agent_postgres_backend(app)
+
     assert app.state.shared_agent_postgres_backend is None
 
 
