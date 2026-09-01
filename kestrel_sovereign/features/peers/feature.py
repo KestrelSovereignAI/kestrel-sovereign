@@ -276,8 +276,8 @@ class PeersFeature(Feature):
         self._transport_key = ensure_a2a_transport_key()
         # ProcessManager children boot through the single-agent server branch
         # and therefore never receive AgentManager's in-memory DID resolver.
-        # Their launcher supplies only explicit local identity roots; install
-        # that public-material resolver before accepting signed peer actions.
+        # Their launcher supplies an authenticated public-material snapshot;
+        # install it before accepting signed peer actions.
         from kestrel_sovereign.a2a.did_registry import (
             install_process_a2a_did_resolver,
         )

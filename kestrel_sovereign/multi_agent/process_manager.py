@@ -32,8 +32,11 @@ from typing import Optional
 
 from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+    A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV,
+    A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
     A2A_PEER_IDENTITY_ROOTS_ENV,
     launcher_attested_a2a_verification_document,
+    stage_process_a2a_did_registry,
 )
 from kestrel_sovereign.a2a.transport_auth import (
     A2A_TRANSPORT_ONLY_ENV,
@@ -973,12 +976,13 @@ class ProcessManager:
                 ) from exc
             if document is not None:
                 identity_documents.append(document)
-        env.pop(A2A_PEER_IDENTITY_ROOTS_ENV, None)
-        env[A2A_PEER_IDENTITY_DOCUMENTS_ENV] = json.dumps(
-            identity_documents,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        for inherited_registry_key in (
+            A2A_PEER_IDENTITY_ROOTS_ENV,
+            A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+            A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV,
+            A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
+        ):
+            env.pop(inherited_registry_key, None)
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
         # the resolved custody root in a dedicated child-only variable so
@@ -1053,9 +1057,19 @@ class ProcessManager:
             "--host", host_bind, "--port", str(config.port),
         ]
 
-        pid = self._spawn(
-            cmd, env, log_file, pid_file, agent_name=name, port=config.port
+        registry_env, registry_file = stage_process_a2a_did_registry(
+            identity_documents,
+            launch_root=resolved_dir,
         )
+        env.update(registry_env)
+        try:
+            pid = self._spawn(
+                cmd, env, log_file, pid_file, agent_name=name, port=config.port
+            )
+        except BaseException:
+            if registry_file is not None:
+                registry_file.unlink(missing_ok=True)
+            raise
         logger.info(f"Started agent '{name}' on :{config.port} (PID {pid})")
 
         ap = AgentProcess(

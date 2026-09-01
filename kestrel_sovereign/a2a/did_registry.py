@@ -12,9 +12,14 @@ is enforced after cryptographic verification by
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import stat
+import sys
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -23,11 +28,172 @@ logger = logging.getLogger(__name__)
 
 A2A_PEER_IDENTITY_ROOTS_ENV = "KESTREL_A2A_PEER_IDENTITY_ROOTS"
 A2A_PEER_IDENTITY_DOCUMENTS_ENV = "KESTREL_A2A_PEER_IDENTITY_DOCUMENTS"
+A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV = (
+    "KESTREL_A2A_PEER_IDENTITY_DOCUMENTS_FILE"
+)
+A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV = (
+    "KESTREL_A2A_PEER_IDENTITY_DOCUMENTS_SHA256"
+)
 _MAX_PROCESS_REGISTRY_BYTES = 128 * 1024
+_MAX_WINDOWS_ENV_VALUE_CHARS = 32_766
+_PROCESS_REGISTRY_DIRECTORY = ".kestrel-launch"
+_PROCESS_REGISTRY_PREFIX = "a2a-peer-identities-"
 
 
 class ProcessA2ADidResolverConfigurationError(RuntimeError):
     """A process-managed peer verification registry is malformed."""
+
+
+def _platform_requires_process_registry_file(encoded_documents: str) -> bool:
+    """Whether registry JSON cannot safely travel in one environment value.
+
+    Modern Windows permits large Unicode environment blocks, but a single
+    user-defined variable is limited to 32,767 characters including its NUL.
+    POSIX launchers keep the established inline contract, whose explicit
+    128-KiB cap is below the per-entry limit on supported hosts.
+    """
+
+    return (
+        sys.platform == "win32"
+        and len(encoded_documents) > _MAX_WINDOWS_ENV_VALUE_CHARS
+    )
+
+
+def stage_process_a2a_did_registry(
+    documents: list[Mapping[str, Any]],
+    *,
+    launch_root: Path,
+) -> tuple[dict[str, str], Optional[Path]]:
+    """Prepare an authenticated, platform-safe child registry handoff.
+
+    The returned path, when present, is a one-shot launcher-created file. Its
+    content is public key material, but its authority comes from the SHA-256
+    digest inherited in the child's environment: a sibling cannot substitute
+    different keys by rewriting the file. The child verifies and removes it
+    during resolver installation.
+    """
+
+    encoded_text = json.dumps(
+        documents,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    encoded = encoded_text.encode("utf-8")
+    if len(encoded) > _MAX_PROCESS_REGISTRY_BYTES:
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry is too large"
+        )
+    if not _platform_requires_process_registry_file(encoded_text):
+        return {A2A_PEER_IDENTITY_DOCUMENTS_ENV: encoded_text}, None
+
+    registry_dir = Path(launch_root) / _PROCESS_REGISTRY_DIRECTORY
+    registry_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "posix":
+        registry_dir.chmod(0o700)
+    fd, raw_path = tempfile.mkstemp(
+        prefix=_PROCESS_REGISTRY_PREFIX,
+        suffix=".json",
+        dir=registry_dir,
+    )
+    registry_path = Path(raw_path)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as registry_file:
+            fd = -1
+            registry_file.write(encoded)
+            registry_file.flush()
+            os.fsync(registry_file.fileno())
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        registry_path.unlink(missing_ok=True)
+        raise
+
+    return (
+        {
+            A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV: str(registry_path.resolve()),
+            A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV: hashlib.sha256(
+                encoded
+            ).hexdigest(),
+        },
+        registry_path,
+    )
+
+
+def _read_authenticated_process_registry(
+    registry_path_value: str,
+    expected_digest: str,
+) -> str:
+    """Read and consume one launcher-created registry file."""
+
+    registry_path = Path(registry_path_value)
+    if not registry_path.is_absolute():
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry file path must be absolute"
+        )
+    if (
+        registry_path.parent.name != _PROCESS_REGISTRY_DIRECTORY
+        or not registry_path.name.startswith(_PROCESS_REGISTRY_PREFIX)
+    ):
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry file is not launcher-owned"
+        )
+    if (
+        len(expected_digest) != 64
+        or any(character not in "0123456789abcdef" for character in expected_digest)
+    ):
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry file digest is invalid"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(registry_path, flags)
+    except (OSError, ValueError) as exc:
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry file could not be opened"
+        ) from exc
+    should_unlink = False
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ProcessA2ADidResolverConfigurationError(
+                "A2A peer identity registry file is not a regular file"
+            )
+        should_unlink = True
+        if os.name == "posix" and (
+            file_stat.st_uid != os.geteuid() or file_stat.st_mode & 0o077
+        ):
+            raise ProcessA2ADidResolverConfigurationError(
+                "A2A peer identity registry file permissions are unsafe"
+            )
+        with os.fdopen(fd, "rb") as registry_file:
+            fd = -1
+            encoded = registry_file.read(_MAX_PROCESS_REGISTRY_BYTES + 1)
+        if len(encoded) > _MAX_PROCESS_REGISTRY_BYTES:
+            raise ProcessA2ADidResolverConfigurationError(
+                "A2A peer identity registry is too large"
+            )
+        actual_digest = hashlib.sha256(encoded).hexdigest()
+        if not hmac.compare_digest(actual_digest, expected_digest):
+            raise ProcessA2ADidResolverConfigurationError(
+                "A2A peer identity registry file failed authentication"
+            )
+        try:
+            decoded = encoded.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProcessA2ADidResolverConfigurationError(
+                "A2A peer identity registry is not valid UTF-8"
+            ) from exc
+        return decoded
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if should_unlink:
+            registry_path.unlink(missing_ok=True)
 
 
 def _validated_verification_document(
@@ -172,8 +338,29 @@ def install_process_a2a_did_resolver(
             "A2A peer identity roots are not an attested registry"
         )
     encoded_documents = environ.get(A2A_PEER_IDENTITY_DOCUMENTS_ENV)
-    if encoded_documents is None:
+    registry_file = environ.get(A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV)
+    registry_digest = environ.get(A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV)
+    if encoded_documents is not None and registry_file is not None:
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry has ambiguous launch sources"
+        )
+    if registry_file is None and registry_digest is not None:
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry file is missing"
+        )
+    if registry_file is not None and registry_digest is None:
+        raise ProcessA2ADidResolverConfigurationError(
+            "A2A peer identity registry file digest is missing"
+        )
+    if encoded_documents is None and registry_file is None:
         return None
+    if registry_file is not None:
+        assert registry_digest is not None
+        encoded_documents = _read_authenticated_process_registry(
+            registry_file,
+            registry_digest,
+        )
+    assert encoded_documents is not None
     if len(encoded_documents.encode("utf-8")) > _MAX_PROCESS_REGISTRY_BYTES:
         raise ProcessA2ADidResolverConfigurationError(
             "A2A peer identity registry is too large"
@@ -202,6 +389,13 @@ def install_process_a2a_did_resolver(
         federated_fallback=federated,
     )
     agent.a2a_did_resolver = resolver.resolve
+    if registry_file is not None and environ is os.environ:
+        # Feature initialization is intentionally repeatable. Once the
+        # one-shot file has been authenticated and consumed, remove its stale
+        # coordinates so a later PeersFeature.initialize() keeps the resolver
+        # it already installed instead of trying to reopen a deleted path.
+        os.environ.pop(A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV, None)
+        os.environ.pop(A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV, None)
     logger.info(
         "Process A2A verification DID resolver installed with %d "
         "launcher-attested document(s)",
@@ -357,6 +551,8 @@ def install_a2a_did_resolver(
 
 __all__ = [
     "A2A_PEER_IDENTITY_DOCUMENTS_ENV",
+    "A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV",
+    "A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV",
     "A2A_PEER_IDENTITY_ROOTS_ENV",
     "HostA2ADidResolver",
     "ProcessA2ADidResolver",
@@ -365,4 +561,5 @@ __all__ = [
     "install_process_a2a_did_resolver",
     "launcher_attested_a2a_verification_document",
     "local_a2a_verification_document",
+    "stage_process_a2a_did_registry",
 ]

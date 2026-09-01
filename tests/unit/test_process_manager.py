@@ -27,7 +27,10 @@ from kestrel_sovereign.multi_agent.process_manager import (
 )
 from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+    A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV,
+    A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
     A2A_PEER_IDENTITY_ROOTS_ENV,
+    install_process_a2a_did_resolver,
 )
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
@@ -666,6 +669,118 @@ class TestStartAgent:
         assert [call.args[0] for call in attest.call_args_list] == [
             roots[name] for name in configs
         ]
+
+    def test_large_hybrid_registry_uses_platform_safe_launch_transport(
+        self,
+        pm,
+        project_dir,
+    ):
+        """A valid peer fleet must not exceed Windows' per-variable limit."""
+
+        configs = {
+            f"peer-{index}": LocalAgentConfig(
+                data_dir=Path("agent_data") / f"peer-{index}",
+                port=8801 + index,
+            )
+            for index in range(11)
+        }
+        roster = MultiAgentConfig(agents=configs)
+        for name, config in configs.items():
+            peer_root = config.resolve_data_dir(project_dir)
+            peer_root.mkdir(parents=True, exist_ok=True)
+            (peer_root / "kestrel_prime.db").touch()
+            (peer_root / f"{name}_did.json").write_text("{}", encoding="utf-8")
+
+        documents = [
+            {
+                "id": f"did:web:example.test:peer-{index}",
+                "verificationMethod": [
+                    {
+                        "id": f"did:web:example.test:peer-{index}#key-1",
+                        "controller": f"did:web:example.test:peer-{index}",
+                        "publicKeyMultibase": "z" + ("K" * 3_000),
+                    }
+                ],
+            }
+            for index in range(11)
+        ]
+        anchors = iter(document["id"] for document in documents)
+        mock_process = MagicMock(pid=12345)
+        consumed_paths = []
+
+        def windows_constrained_popen(*args, **kwargs):
+            assert max(len(value) for value in kwargs["env"].values()) <= 32_767
+            assert A2A_PEER_IDENTITY_DOCUMENTS_ENV not in kwargs["env"]
+            registry_path = Path(
+                kwargs["env"][A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV]
+            )
+            assert len(
+                kwargs["env"][A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV]
+            ) == 64
+            assert registry_path.is_file()
+            recipient = MagicMock(a2a_did_resolver=None)
+            resolver = install_process_a2a_did_resolver(
+                recipient,
+                environment=kwargs["env"],
+            )
+            assert resolver is not None
+            assert resolver.resolve(documents[-1]["id"]) == documents[-1]
+            assert not registry_path.exists()
+            consumed_paths.append(registry_path)
+            return mock_process
+
+        with (
+            patch(
+                "kestrel_sovereign.identity.local_anchor.read_anchor_agent_did_sync",
+                side_effect=anchors,
+            ),
+            patch(
+                "kestrel_sovereign.multi_agent.process_manager."
+                "launcher_attested_a2a_verification_document",
+                side_effect=documents,
+            ),
+            patch(
+                "kestrel_sovereign.a2a.did_registry."
+                "_platform_requires_process_registry_file",
+                return_value=True,
+            ),
+            patch("subprocess.Popen", side_effect=windows_constrained_popen),
+        ):
+            started = pm.start_agent("peer-0", configs["peer-0"], roster=roster)
+
+        assert started.pid == 12345
+        assert len(consumed_paths) == 1
+
+    def test_failed_launch_removes_staged_peer_registry(
+        self,
+        pm,
+        project_dir,
+    ):
+        """A failed Popen must not strand its one-shot registry handoff."""
+
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        staged_paths = []
+
+        def failed_popen(*args, **kwargs):
+            staged_paths.append(
+                Path(kwargs["env"][A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV])
+            )
+            assert staged_paths[-1].is_file()
+            raise OSError("simulated Windows launch failure")
+
+        with (
+            patch(
+                "kestrel_sovereign.a2a.did_registry."
+                "_platform_requires_process_registry_file",
+                return_value=True,
+            ),
+            patch("subprocess.Popen", side_effect=failed_popen),
+            pytest.raises(OSError, match="simulated Windows launch failure"),
+        ):
+            pm.start_agent("claw", cfg)
+
+        assert len(staged_paths) == 1
+        assert not staged_paths[0].exists()
 
     def test_two_children_do_not_inherit_one_shared_parent_export_root(
         self,
