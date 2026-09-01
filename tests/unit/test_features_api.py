@@ -3,7 +3,7 @@
 import asyncio
 import shlex
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -2103,6 +2103,173 @@ class TestGetFeatureConfig:
 
 
 class TestUpdateFeatureConfig:
+    @pytest.mark.asyncio
+    async def test_live_turn_can_call_isolated_tool_after_config_fence_closes(
+        self, monkeypatch, tmp_path
+    ):
+        """A queued config transition cannot strand its current live turn."""
+
+        from kestrel_sovereign.features.isolated_runtime import (
+            InstalledFeatureRuntime,
+            ProxyFeature,
+        )
+
+        class Storage:
+            def __init__(self, agent_id):
+                self.agent_id = agent_id
+                self.nodes = {}
+
+            async def get_node(self, node_id):
+                return self.nodes.get(node_id)
+
+            async def compare_and_swap_node(self, node_id, expected, node):
+                current = self.nodes.get(node_id)
+                properties = None if current is None else current.properties
+                if properties != expected:
+                    return "predicate_failed"
+                self.nodes[node_id] = node
+                return "swapped"
+
+        tool_called = asyncio.Event()
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.event_handler = None
+
+            async def start(self):
+                return None
+
+            async def stop(self):
+                return None
+
+            async def health(self):
+                return True
+
+            @property
+            def capabilities(self):
+                return {"inbound_producer": False}
+
+            async def list_tools(self):
+                return [
+                    {
+                        "name": "ping",
+                        "description": "Ping",
+                        "category": "utility",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                            "required": ["message"],
+                        },
+                    }
+                ]
+
+            async def call_tool(self, name, args):
+                tool_called.set()
+                return {"name": name, "args": dict(args)}
+
+            def on_event(self, handler):
+                self.event_handler = handler
+
+        agent = _lifecycle_agent()
+        agent.storage = Storage(agent.did)
+        agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        runtime = InstalledFeatureRuntime(
+            class_name="DelayedToolFeature",
+            entry_point="test_pkg.feature:DelayedToolFeature",
+            distribution="test-pkg",
+            runtime="isolated-venv",
+            service="test_service",
+            description="Delayed tool fixture",
+        )
+        monkeypatch.setenv(
+            "KESTREL_FEATURE_DELAYEDTOOLFEATURE_BIN", "/bin/test-service"
+        )
+        feature = ProxyFeature(agent, runtime, client_factory=Client)
+        await feature.initialize()
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+        update = None
+        detached = None
+        rescue = None
+        blocked = False
+        try:
+            async with agent._turn_lifecycle():
+                update = asyncio.create_task(
+                    features_endpoint.update_feature_config(
+                        request,
+                        feature.name,
+                        features_endpoint.ConfigUpdateRequest(
+                            config={"enabled": True}
+                        ),
+                    )
+                )
+                for _ in range(100):
+                    if feature._traffic_gate.closed:
+                        break
+                    await asyncio.sleep(0.01)
+                assert feature._traffic_gate.closed is True
+
+                # A detached child inherits the ambient turn id, but it does
+                # not own the live turn and must remain behind the fence.
+                detached = asyncio.create_task(
+                    feature.call_isolated_tool("ping", {"message": "detached"})
+                )
+                await asyncio.sleep(0.02)
+                assert detached.done() is False
+                detached.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await detached
+
+                async def release_deadlock() -> None:
+                    nonlocal blocked
+                    await asyncio.sleep(0.05)
+                    if not tool_called.is_set():
+                        blocked = True
+                        # Cancel the queued config child so the gate reopens and
+                        # the live turn can report the cycle without leaking it.
+                        update.cancel()
+
+                rescue = asyncio.create_task(release_deadlock())
+                result = await feature.call_isolated_tool(
+                    "ping", {"message": "late"}
+                )
+                assert result == {
+                    "success": True,
+                    "tool": "ping",
+                    "result": {
+                        "name": "ping",
+                        "args": {"message": "late"},
+                    },
+                }
+                if not rescue.done():
+                    rescue.cancel()
+                with suppress(asyncio.CancelledError):
+                    await rescue
+
+            if not blocked:
+                response = await asyncio.wait_for(update, timeout=1)
+                assert response["config"] == {"enabled": True}
+                assert feature._traffic_gate.closed is False
+                assert feature._config_ingress_live_turn_bypass_active is False
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(update, timeout=1)
+        finally:
+            if update is not None and not update.done():
+                update.cancel()
+            if detached is not None and not detached.done():
+                detached.cancel()
+            if rescue is not None and not rescue.done():
+                rescue.cancel()
+            await feature.shutdown()
+
+        assert not blocked
+
     @pytest.mark.asyncio
     async def test_isolated_ingress_drains_before_config_takes_turn_lock(self):
         """An admitted callback cannot invert ingress-drain and turn locks."""

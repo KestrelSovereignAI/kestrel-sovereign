@@ -1695,9 +1695,24 @@ class _TrafficGate:
                 self._condition.notify_all()
 
     @asynccontextmanager
-    async def admit(self, *, wait_for_open: bool = True):
+    async def admit(
+        self,
+        *,
+        wait_for_open: bool = True,
+        allow_while_closed: bool | Callable[[], bool] = False,
+    ):
         async with self._condition:
             while self._closed and not self._sealed:
+                # Resolve dynamic authority only after taking the gate lock.
+                # Computing it at the call site would leave a scheduling gap
+                # where a config transition could close admission afterward.
+                may_bypass = (
+                    allow_while_closed()
+                    if callable(allow_while_closed)
+                    else allow_while_closed
+                )
+                if may_bypass:
+                    break
                 if not wait_for_open:
                     raise _TrafficGateClosedError()
                 await self._condition.wait()
@@ -6515,6 +6530,12 @@ class ProxyFeature(Feature):
         # skip restarting the freshly launched one.
         self._reloading = False
         self._config_ingress_transition_lock = asyncio.Lock()
+        # A config PATCH closes child admission before it queues for the
+        # agent's conversation lock.  The exact live turn that owns that lock
+        # may still reach an isolated tool after the close; let only that turn
+        # finish through this finite fence so the PATCH can acquire the lock.
+        # Terminal/sealed admission remains non-bypassable in _TrafficGate.
+        self._config_ingress_live_turn_bypass_active = False
         self._reload_lock = asyncio.Lock()
         self._reload_gen = 0
         # Resolve at construction, before feature startup/discovery can turn a
@@ -9192,6 +9213,21 @@ class ProxyFeature(Feature):
         lease.authorized_task = current_task
         return True
 
+    def _config_fence_allows_live_turn_tool(self) -> bool:
+        """Whether this caller may finish through the finite config fence."""
+
+        if not self._config_ingress_live_turn_bypass_active:
+            return False
+        belongs_to_live_turn = getattr(
+            self.agent, "_caller_belongs_to_live_turn", None
+        )
+        if not callable(belongs_to_live_turn):
+            return False
+        try:
+            return bool(belongs_to_live_turn())
+        except Exception:  # noqa: BLE001 - authorization fails closed
+            return False
+
     @asynccontextmanager
     async def config_transition_ingress_fence(self):
         """Drain isolated ingress before the endpoint takes CONVERSATION.
@@ -9247,6 +9283,7 @@ class ProxyFeature(Feature):
                     await self._quiesce_external_ingress(
                         external_ingress_quiesce
                     )
+                self._config_ingress_live_turn_bypass_active = True
                 gate_closed = True
                 await self._close_traffic_gate_admission()
                 await self._drain_traffic_gate()
@@ -9281,21 +9318,24 @@ class ProxyFeature(Feature):
 
                 async def finalize() -> None:
                     nonlocal gate_closed
-                    if self._fenced_recovery_failed:
-                        await self._quarantine_unreconciled_client(
-                            lifecycle_lock_held=False
-                        )
-                    if (
-                        external_ingress_quiesce is not None
-                        and not gate_closed
-                    ):
-                        gate_closed = True
-                        await self._close_traffic_gate_admission()
-                        await self._drain_traffic_gate()
-                    if gate_closed:
-                        await self._finalize_external_ingress_transition(
-                            external_ingress_quiesce
-                        )
+                    try:
+                        if self._fenced_recovery_failed:
+                            await self._quarantine_unreconciled_client(
+                                lifecycle_lock_held=False
+                            )
+                        if (
+                            external_ingress_quiesce is not None
+                            and not gate_closed
+                        ):
+                            gate_closed = True
+                            await self._close_traffic_gate_admission()
+                            await self._drain_traffic_gate()
+                        if gate_closed:
+                            await self._finalize_external_ingress_transition(
+                                external_ingress_quiesce
+                            )
+                    finally:
+                        self._config_ingress_live_turn_bypass_active = False
 
                 finalizer = asyncio.create_task(
                     finalize(),
@@ -11752,7 +11792,9 @@ class ProxyFeature(Feature):
         try:
             while True:
                 wake_idle = False
-                async with self._traffic_gate.admit():
+                async with self._traffic_gate.admit(
+                    allow_while_closed=self._config_fence_allows_live_turn_tool
+                ):
                     if self._client is None and self._idle_retired:
                         wake_idle = True
                     else:
