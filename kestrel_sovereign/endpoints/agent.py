@@ -3304,6 +3304,8 @@ async def get_task(request: Request, task_id: str):
             task_id,
             _task_recipient_principal(agent),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error loading task.")

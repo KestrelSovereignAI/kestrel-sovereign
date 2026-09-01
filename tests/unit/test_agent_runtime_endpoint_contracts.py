@@ -1055,6 +1055,28 @@ def test_task_detail_endpoint_returns_404_when_task_missing():
         _restore_app(app, original)
 
 
+def test_task_detail_endpoint_preserves_recipient_identity_readiness_503():
+    task_manager = MagicMock()
+    task_manager.get_task_for_recipient = AsyncMock()
+    agent = MagicMock(task_manager=task_manager)
+    agent.agent_id = None
+    agent.did = None
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/agent/tasks/not-ready",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 503
+        assert "durable recipient identity" in response.json()["detail"]
+        task_manager.get_task_for_recipient.assert_not_awaited()
+    finally:
+        _restore_app(app, original)
+
+
 def test_task_detail_endpoint_returns_404_when_task_manager_absent():
     agent = MagicMock(spec=[])  # no task_manager attribute
 
