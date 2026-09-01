@@ -81,7 +81,9 @@ for dir in "$AGENT_DATA_DIR"/*/; do
     # The Hold database lives on the persistent agent-data volume, but its
     # directory is host infrastructure. A restart must not mint an identity or
     # an agent database inside it.
-    [ "${dir%/}" = "${HOST_CONTROL_DIR%/}" ] && continue
+    case "${HOST_CONTROL_DIR%/}/" in
+        "${dir%/}/"*) continue ;;
+    esac
     agent_name=$(basename "$dir")
 
     # Bootstrap identity if missing

@@ -61,6 +61,11 @@ _POSTGRES_ROLLBACK_DOMAIN_PREFIX = "kestrel-hold-rollback-domain-v1:"
 _POSTGRES_PRIMARY_BINDING_KEY = "hold_primary_custody_binding_v1"
 _POSTGRES_EVIDENCE_BINDING_KEY = "hold_evidence_custody_binding_v1"
 _POSTGRES_CUSTODY_BINDING_PREFIX = "kestrel-hold-custody-binding-v1:"
+# Serialize the first core-schema publication independently on each PostgreSQL
+# database.  PostgreSQL's CREATE TABLE IF NOT EXISTS catalog probe can race a
+# peer cold start, so migration_lock() cannot be the first lock: its own table
+# does not exist yet.
+_POSTGRES_SCHEMA_BOOTSTRAP_LOCK = (0x004B4553, 0x5343484D)
 # Two signed int32 values spelling ``KES`` / ``HOLD``. The lock lives on the
 # independent evidence service and spans both primary commit and publication.
 _POSTGRES_EVIDENCE_LOCK = (0x004B4553, 0x484F4C44)
@@ -513,11 +518,22 @@ async def initialize_postgres_hold_databases(
     primary_db = None
     evidence_db = None
     try:
+        # Lock each database separately rather than holding both locks at once.
+        # Besides bounding the critical section, this avoids a deadlock if two
+        # still-unbound databases are accidentally presented in opposite roles
+        # by concurrent starts.  Custody-role validation below remains the
+        # authority that rejects that topology.
         primary_db = await AsyncDatabase.from_connected_backend(
-            primary_backend
+            primary_backend,
+            initialization_guard=primary_backend.advisory_locks(
+                (_POSTGRES_SCHEMA_BOOTSTRAP_LOCK,)
+            ),
         )
         evidence_db = await AsyncDatabase.from_connected_backend(
-            evidence_backend
+            evidence_backend,
+            initialization_guard=evidence_backend.advisory_locks(
+                (_POSTGRES_SCHEMA_BOOTSTRAP_LOCK,)
+            ),
         )
         return primary_db, evidence_db
     except BaseException as failure:
@@ -1221,6 +1237,36 @@ class HoldStore:
                 _POSTGRES_PRIMARY_BINDING_KEY,
                 binding,
             )
+            # INSERT .. DO NOTHING is a compare-and-declare boundary. Another
+            # host may have won it while this host was preparing a different
+            # evidence domain, because their serialization locks live on those
+            # different evidence clusters. Adopt a compatible winner (same
+            # pair, different UUID), but reject an incompatible winner before
+            # writing anything into this host's evidence database.
+            primary_binding = await self._read_postgres_binding(
+                self._db,
+                _POSTGRES_PRIMARY_BINDING_KEY,
+                label="primary",
+            )
+            primary_foreign = await self._read_postgres_binding(
+                self._db,
+                _POSTGRES_EVIDENCE_BINDING_KEY,
+                label="primary",
+            )
+            if primary_foreign is not None:
+                raise HoldStateError(
+                    "PostgreSQL Hold database has the wrong durable custody role"
+                )
+            if primary_binding is None:
+                raise HoldStateError(
+                    "PostgreSQL Hold primary custody binding was not durably published"
+                )
+            self._validate_custody_binding(
+                primary_binding,
+                primary_identity=primary,
+                evidence_identity=evidence,
+            )
+            binding = primary_binding
         if evidence_binding is None:
             await self._write_postgres_binding(
                 evidence_db,
