@@ -333,7 +333,7 @@ async def build_host_context(
         from kestrel_sovereign.hold.state import (
             hold_history_anchor_path,
             hold_initialization_witness_path,
-            preflight_postgres_hold_custody,
+            initialize_postgres_hold_databases,
         )
 
         resolved = prepare_host_database(db_path)
@@ -356,24 +356,16 @@ async def build_host_context(
                     "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an "
                     "independent rollback domain"
                 )
-            # AsyncDatabase.postgres() initializes the full runtime schema.
-            # Inspect cluster identity and any existing custody declaration
-            # through raw read-only pools before either configured database can
-            # be mutated by that factory.
-            await preflight_postgres_hold_custody(dsn, evidence_dsn)
             # Hold operations are serialized by their independent evidence
             # protocol, so wider pools add connection demand without adding
-            # useful concurrency. Keep both pools load-bearingly small: the
-            # ordinary runtime already reserves its own PostgreSQL budget.
-            hold_db = await AsyncDatabase.postgres(
+            # useful concurrency. The paired initializer keeps both pools
+            # load-bearingly small and, critically, initializes schema on the
+            # same connected backends whose cluster identity and custody roles
+            # it inspected. Reopening by DSN here would create a failover/
+            # load-balancer window between validation and the first write.
+            hold_db, hold_evidence_db = await initialize_postgres_hold_databases(
                 dsn,
-                min_pool_size=1,
-                max_pool_size=1,
-            )
-            hold_evidence_db = await AsyncDatabase.postgres(
                 evidence_dsn,
-                min_pool_size=1,
-                max_pool_size=1,
             )
             hold_location = "configured PostgreSQL database"
             initialization_witness_path = None

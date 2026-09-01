@@ -28,6 +28,7 @@ from kestrel_sovereign.hold.state import (
     _terminal_authority_ids,
     hold_history_anchor_path,
     hold_initialization_witness_path,
+    initialize_postgres_hold_databases,
     preflight_postgres_hold_custody,
     postgres_hold_custody_binding_payload,
     validate_postgres_hold_custody,
@@ -694,12 +695,6 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         events.append(("sqlite", path))
         return fake_host_db
 
-    async def _postgres(_cls, dsn, **pool_sizes):
-        events.append(("postgres", dsn, pool_sizes))
-        if dsn.endswith("/evidence"):
-            return fake_evidence_db
-        return fake_hold_db
-
     async def _ensure_schema(self):
         events.append(("hold-schema", self._db))
 
@@ -707,8 +702,9 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         events.append(("hold-boot-read", self._db))
         return ()
 
-    async def _preflight(primary_dsn, evidence_dsn):
-        events.append(("custody-preflight", primary_dsn, evidence_dsn))
+    async def _initialize(primary_dsn, evidence_dsn):
+        events.append(("custody-initialize", primary_dsn, evidence_dsn))
+        return fake_hold_db, fake_evidence_db
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
@@ -717,15 +713,14 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         "postgresql://independent/evidence",
     )
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
-    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
     monkeypatch.setattr(
         session_module, "make_session_factory", lambda db: _InnerFactory()
     )
     monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
     monkeypatch.setattr(HoldStore, "read_boot_state", _read_boot_state)
     monkeypatch.setattr(
-        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
-        _preflight,
+        "kestrel_sovereign.hold.state.initialize_postgres_hold_databases",
+        _initialize,
     )
 
     host_path = tmp_path / "existing-host-features.db"
@@ -738,22 +733,12 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     assert ctx.hold_store._evidence_db is fake_evidence_db
     assert ctx.hold_store._initialization_witness_path is None
     assert ctx.hold_store._history_anchor_path is None
-    assert events[:6] == [
+    assert events[:4] == [
         ("sqlite", str(host_path)),
         (
-            "custody-preflight",
+            "custody-initialize",
             "postgresql://durable/host",
             "postgresql://independent/evidence",
-        ),
-        (
-            "postgres",
-            "postgresql://durable/host",
-            {"min_pool_size": 1, "max_pool_size": 1},
-        ),
-        (
-            "postgres",
-            "postgresql://independent/evidence",
-            {"min_pool_size": 1, "max_pool_size": 1},
         ),
         ("hold-schema", fake_hold_db),
         ("hold-boot-read", fake_hold_db),
@@ -790,7 +775,7 @@ async def test_postgres_without_dsn_uses_runtime_sqlite_fallback(
         events.append(("sqlite", path))
         return fake_db
 
-    async def _postgres(_cls, _dsn):
+    async def _postgres_hold_initializer(_primary_dsn, _evidence_dsn):
         raise AssertionError("runtime fallback must not open PostgreSQL")
 
     async def _ensure_schema(self):
@@ -802,7 +787,10 @@ async def test_postgres_without_dsn_uses_runtime_sqlite_fallback(
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
-    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.state.initialize_postgres_hold_databases",
+        _postgres_hold_initializer,
+    )
     monkeypatch.setattr(
         session_module, "make_session_factory", lambda _db: _InnerFactory()
     )
@@ -848,14 +836,17 @@ async def test_postgres_hold_without_independent_evidence_fails_closed_at_boot(
     async def _sqlite(_cls, _path):
         return _DB()
 
-    async def _postgres(_cls, _dsn):
+    async def _postgres_hold_initializer(_primary_dsn, _evidence_dsn):
         raise AssertionError("missing evidence config must fail before PG opens")
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
     monkeypatch.delenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", raising=False)
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
-    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.state.initialize_postgres_hold_databases",
+        _postgres_hold_initializer,
+    )
     monkeypatch.setattr(
         session_module,
         "make_session_factory",
@@ -896,9 +887,6 @@ async def test_postgres_custody_preflight_failure_precedes_schema_initialization
     async def _sqlite(_cls, _path):
         return _DB()
 
-    async def _postgres(_cls, _dsn, **_pool_sizes):
-        pytest.fail("schema-initializing PostgreSQL factory ran before custody passed")
-
     async def _reject_custody(_primary_dsn, _evidence_dsn):
         events.append("custody-preflight")
         raise HoldStateError("wrong durable custody role")
@@ -910,14 +898,13 @@ async def test_postgres_custody_preflight_failure_precedes_schema_initialization
         "postgresql://independent/evidence",
     )
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
-    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
     monkeypatch.setattr(
         session_module,
         "make_session_factory",
         lambda _db: _InnerFactory(),
     )
     monkeypatch.setattr(
-        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
+        "kestrel_sovereign.hold.state.initialize_postgres_hold_databases",
         _reject_custody,
     )
 
@@ -1131,10 +1118,8 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _postgres(_cls, dsn, **_pool_sizes):
-        if dsn.endswith("/evidence"):
-            return fake_evidence_db
-        return fake_hold_db
+    async def _initialize(_primary_dsn, _evidence_dsn):
+        return fake_hold_db, fake_evidence_db
 
     async def _ensure_schema(_self):
         schema_entered.set()
@@ -1147,14 +1132,13 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
         "postgresql://independent/evidence",
     )
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
-    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
     monkeypatch.setattr(
         session_module, "make_session_factory", lambda _db: _InnerFactory()
     )
     monkeypatch.setattr(HoldStore, "ensure_schema", _ensure_schema)
     monkeypatch.setattr(
-        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
-        AsyncMock(),
+        "kestrel_sovereign.hold.state.initialize_postgres_hold_databases",
+        _initialize,
     )
 
     bootstrap = asyncio.create_task(
@@ -1214,10 +1198,8 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _postgres(_cls, dsn, **_pool_sizes):
-        if dsn.endswith("/evidence"):
-            return fake_evidence_db
-        return fake_hold_db
+    async def _initialize(_primary_dsn, _evidence_dsn):
+        return fake_hold_db, fake_evidence_db
 
     async def _fail_schema(_self):
         raise RuntimeError("schema opening failed")
@@ -1229,7 +1211,6 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
         "postgresql://independent/evidence",
     )
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
-    monkeypatch.setattr(AsyncDatabase, "postgres", classmethod(_postgres))
     monkeypatch.setattr(
         session_module,
         "make_session_factory",
@@ -1237,8 +1218,8 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
     )
     monkeypatch.setattr(HoldStore, "ensure_schema", _fail_schema)
     monkeypatch.setattr(
-        "kestrel_sovereign.hold.state.preflight_postgres_hold_custody",
-        AsyncMock(),
+        "kestrel_sovereign.hold.state.initialize_postgres_hold_databases",
+        _initialize,
     )
 
     bootstrap = asyncio.create_task(
@@ -2806,6 +2787,145 @@ async def test_postgres_custody_preflight_is_read_only_and_closes_raw_pools(
     assert len(backends) == 2
     assert all(backend.closed for backend in backends)
     assert all(len(backend.queries) == 2 for backend in backends)
+
+
+@pytest.mark.asyncio
+async def test_postgres_hold_schema_initializes_preflight_validated_backends(
+    monkeypatch,
+):
+    """Custody proof and schema writes retain one connected-pool identity."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    backends = []
+    events: list[tuple[str, object]] = []
+
+    class _Backend:
+        def __init__(self, *, dsn, min_pool_size, max_pool_size):
+            self.dsn = dsn
+            self.validated = False
+            assert (min_pool_size, max_pool_size) == (1, 1)
+            backends.append(self)
+
+        async def connect(self):
+            events.append(("connect", self))
+
+        async def fetch_all(self, query, params=()):
+            events.append(("validate", self))
+            if "pg_control_system" in query:
+                return [(self.dsn,)]
+            if "to_regclass" in query:
+                self.validated = True
+                return [(None,)]
+            raise AssertionError(f"unexpected custody query: {query}")
+
+        async def close(self):
+            events.append(("close", self))
+
+    class _DB:
+        def __init__(self, backend):
+            self.backend = backend
+
+        async def close(self):
+            await self.backend.close()
+
+    async def _from_connected(_cls, backend):
+        assert backend.validated
+        events.append(("schema", backend))
+        return _DB(backend)
+
+    async def _reopen_by_dsn(*_args, **_kwargs):
+        pytest.fail("validated Hold pools were discarded before schema init")
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
+    monkeypatch.setattr(
+        AsyncDatabase,
+        "from_connected_backend",
+        classmethod(_from_connected),
+    )
+    monkeypatch.setattr(
+        AsyncDatabase,
+        "postgres",
+        classmethod(_reopen_by_dsn),
+    )
+
+    primary, evidence = await initialize_postgres_hold_databases(
+        "postgresql://primary/db",
+        "postgresql://evidence/db",
+    )
+
+    assert len(backends) == 2
+    assert primary.backend is backends[0]
+    assert evidence.backend is backends[1]
+    for backend in backends:
+        validation = max(
+            index
+            for index, event in enumerate(events)
+            if event == ("validate", backend)
+        )
+        schema = events.index(("schema", backend))
+        assert validation < schema
+
+
+@pytest.mark.asyncio
+async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
+    monkeypatch,
+):
+    """A failed second schema cannot strand either validated backend."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    backends = []
+
+    class _Backend:
+        def __init__(self, *, dsn, min_pool_size, max_pool_size):
+            self.dsn = dsn
+            self.close_count = 0
+            assert (min_pool_size, max_pool_size) == (1, 1)
+            backends.append(self)
+
+        async def connect(self):
+            return None
+
+        async def fetch_all(self, query, params=()):
+            if "pg_control_system" in query:
+                return [(self.dsn,)]
+            if "to_regclass" in query:
+                return [(None,)]
+            raise AssertionError(f"unexpected custody query: {query}")
+
+        async def close(self):
+            self.close_count += 1
+
+    class _DB:
+        def __init__(self, backend):
+            self.backend = backend
+
+        async def close(self):
+            await self.backend.close()
+
+    async def _from_connected(_cls, backend):
+        if "evidence" in backend.dsn:
+            raise RuntimeError("injected evidence schema failure")
+        return _DB(backend)
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
+    monkeypatch.setattr(
+        AsyncDatabase,
+        "from_connected_backend",
+        classmethod(_from_connected),
+    )
+
+    with pytest.raises(RuntimeError, match="evidence schema failure"):
+        await initialize_postgres_hold_databases(
+            "postgresql://primary/db",
+            "postgresql://evidence/db",
+        )
+
+    assert len(backends) == 2
+    assert [backend.close_count for backend in backends] == [1, 1]
 
 
 @pytest.mark.asyncio
