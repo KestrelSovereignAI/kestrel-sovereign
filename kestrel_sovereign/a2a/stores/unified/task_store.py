@@ -32,6 +32,10 @@ class TaskAlreadyExistsError(ValueError):
     """A caller attempted to create a second task under an occupied ID."""
 
 
+class TaskMutationAuthorizationError(PermissionError):
+    """A responder mutation did not match the durable task recipient."""
+
+
 @dataclass(frozen=True)
 class TaskCancellationSnapshot:
     """Minimal durable state needed by live cancellation monitors."""
@@ -92,7 +96,8 @@ class TaskStore(UnifiedStoreBase):
                 canceled_by TEXT,
                 cancel_reason TEXT,
                 cancel_previous_status TEXT,
-                cancel_operation_id TEXT
+                cancel_operation_id TEXT,
+                terminal_operation_id TEXT
             )
         """)
 
@@ -171,7 +176,7 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 6
+                    SELECT COUNT(*) = 7
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -181,18 +186,9 @@ class TaskStore(UnifiedStoreBase):
                           'canceled_by',
                           'cancel_reason',
                           'cancel_previous_status',
-                          'cancel_operation_id'
+                          'cancel_operation_id',
+                          'terminal_operation_id'
                       )
-                )
-                AND EXISTS (
-                    SELECT 1
-                    FROM pg_proc procedure
-                    JOIN pg_namespace namespace
-                      ON namespace.oid = procedure.pronamespace
-                    WHERE namespace.nspname = current_schema()
-                      AND procedure.proname =
-                          'a2a_tasks_enforce_authority_fence'
-                      AND pg_get_function_identity_arguments(procedure.oid) = ''
                 )
                 AND EXISTS (
                     SELECT 1
@@ -201,10 +197,18 @@ class TaskStore(UnifiedStoreBase):
                       ON relation.oid = trigger.tgrelid
                     JOIN pg_namespace namespace
                       ON namespace.oid = relation.relnamespace
+                    JOIN pg_proc procedure
+                      ON procedure.oid = trigger.tgfoid
+                    JOIN pg_namespace procedure_namespace
+                      ON procedure_namespace.oid = procedure.pronamespace
                     WHERE namespace.nspname = current_schema()
                       AND relation.relname = 'a2a_tasks'
-                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v4'
                       AND NOT trigger.tgisinternal
+                      AND procedure_namespace.nspname = current_schema()
+                      AND procedure.proname =
+                          'a2a_tasks_enforce_authority_fence_v4'
+                      AND pg_get_function_identity_arguments(procedure.oid) = ''
                 )
                 AND (
                     SELECT COUNT(*) = 5
@@ -237,6 +241,7 @@ class TaskStore(UnifiedStoreBase):
             "cancel_reason",
             "cancel_previous_status",
             "cancel_operation_id",
+            "terminal_operation_id",
         )
         for column in authority_columns:
             await self.add_column_if_missing("a2a_tasks", column, "TEXT")
@@ -274,11 +279,18 @@ class TaskStore(UnifiedStoreBase):
 
         if self.is_postgres:
             await self._backend.execute_script("""
-                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence()
+                CREATE OR REPLACE FUNCTION a2a_tasks_enforce_authority_fence_v4()
                 RETURNS trigger AS $a2a_fence_function$
                 BEGIN
-                    IF TG_OP = 'UPDATE' AND OLD.status = 'canceled' THEN
-                        RAISE EXCEPTION 'canceled A2A task is terminal'
+                    IF TG_OP = 'UPDATE'
+                       AND OLD.status IN ('completed', 'failed', 'canceled') THEN
+                        RAISE EXCEPTION 'terminal A2A task cannot be replaced'
+                            USING ERRCODE = 'check_violation';
+                    END IF;
+                    IF TG_OP = 'INSERT'
+                       AND (NEW.creator_agent_id IS NULL
+                            OR NEW.recipient_agent_id IS NULL) THEN
+                        RAISE EXCEPTION 'A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
                     END IF;
                     IF NEW.status IN ('submitted', 'working', 'input-required')
@@ -295,44 +307,62 @@ class TaskStore(UnifiedStoreBase):
                     ON a2a_tasks;
                 DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v2
                     ON a2a_tasks;
-                CREATE TRIGGER a2a_tasks_authority_fence_v2
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v4
+                    ON a2a_tasks;
+                CREATE TRIGGER a2a_tasks_authority_fence_v4
                 BEFORE INSERT OR UPDATE ON a2a_tasks
                 FOR EACH ROW
-                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence();
+                EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v4();
+
+                DROP TRIGGER IF EXISTS a2a_tasks_authority_fence_v3
+                    ON a2a_tasks;
+
+                -- The old functions are no longer load-bearing. Drop them only
+                -- after their triggers; the v4 trigger is already present and
+                -- continues to fence terminal mutation and authority-less
+                -- inserts throughout a mixed-version rollout.
+                DROP FUNCTION IF EXISTS a2a_tasks_enforce_authority_fence_v3();
+                DROP FUNCTION IF EXISTS a2a_tasks_enforce_authority_fence();
             """)
             return
 
         await self._backend.execute_script("""
-            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_terminal_v2
+            -- SQLite executes each executescript statement visibly unless the
+            -- script opens its own transaction. Install every replacement
+            -- before retiring its predecessor so another connection never
+            -- observes a terminal row without an update/replace fence.
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_update_v3
             BEFORE UPDATE ON a2a_tasks
             FOR EACH ROW
-            WHEN OLD.status = 'canceled'
+            WHEN OLD.status IN ('completed', 'failed', 'canceled')
             BEGIN
-                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+                SELECT RAISE(ABORT, 'terminal A2A task cannot be replaced');
             END;
 
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_canceled_replace_v3
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_terminal_replace_v4
             BEFORE INSERT ON a2a_tasks
             FOR EACH ROW
             WHEN EXISTS (
                 SELECT 1
-                FROM a2a_tasks AS existing
-                WHERE existing.id = NEW.id
-                  AND existing.status = 'canceled'
+                 FROM a2a_tasks
+                 WHERE id = NEW.id
+                   AND status IN ('completed', 'failed', 'canceled')
             )
             BEGIN
-                SELECT RAISE(ABORT, 'canceled A2A task is terminal');
+                -- IGNORE runs before SQLite's REPLACE conflict action deletes
+                -- the occupied row. It therefore fences legacy INSERT OR
+                -- REPLACE while allowing modern INSERT ... ON CONFLICT DO
+                -- NOTHING to report its normal zero-row duplicate outcome.
+                SELECT RAISE(IGNORE);
             END;
 
-            CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_v2
+            CREATE TRIGGER IF NOT EXISTS a2a_tasks_authority_insert_v3
             BEFORE INSERT ON a2a_tasks
             FOR EACH ROW
-            WHEN NEW.status IN ('submitted', 'working', 'input-required')
-              AND (NEW.creator_agent_id IS NULL
-                   OR NEW.recipient_agent_id IS NULL)
+            WHEN NEW.creator_agent_id IS NULL
+              OR NEW.recipient_agent_id IS NULL
             BEGIN
-                SELECT RAISE(ABORT, 'live A2A task requires durable authority');
+                SELECT RAISE(ABORT, 'A2A task requires durable authority');
             END;
 
             CREATE TRIGGER IF NOT EXISTS a2a_tasks_live_authority_update_v2
@@ -344,6 +374,12 @@ class TaskStore(UnifiedStoreBase):
             BEGIN
                 SELECT RAISE(ABORT, 'live A2A task requires durable authority');
             END;
+
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v1;
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_terminal_v2;
+            DROP TRIGGER IF EXISTS a2a_tasks_canceled_replace_v3;
+            DROP TRIGGER IF EXISTS a2a_tasks_terminal_replace_v3;
+            DROP TRIGGER IF EXISTS a2a_tasks_live_authority_v2;
         """)
 
     async def save(
@@ -353,11 +389,11 @@ class TaskStore(UnifiedStoreBase):
         creator_agent_id: Optional[str] = None,
         recipient_agent_id: Optional[str] = None,
     ) -> bool:
-        """Create an authoritative task or persist a lifecycle update.
+        """Create an authoritative task.
 
-        Supplying either authority argument denotes initial creation and is
-        insert-only. Lifecycle saves omit both arguments and may update the
-        existing payload without ever touching authority columns.
+        Lifecycle persistence is deliberately a separate recipient-owned seam;
+        accepting an unscoped update here would let a shared-store worker mutate
+        any task whose identifier it learns.
         """
         if creator_agent_id is not None or recipient_agent_id is not None:
             if creator_agent_id is None or recipient_agent_id is None:
@@ -369,10 +405,88 @@ class TaskStore(UnifiedStoreBase):
             )
             return True
 
+        raise ValueError(
+            "Task lifecycle saves require save_recipient_lifecycle"
+        )
+
+    async def save_recipient_lifecycle(
+        self,
+        task: Task,
+        *,
+        recipient_agent_id: str,
+        expected_state: TaskState,
+    ) -> bool:
+        """CAS a worker result from one expected live recipient-owned state."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task lifecycle recipient must be a concrete identity")
+
         if task.status.state is TaskState.CANCELED:
             raise ValueError(
                 "CANCELED is an authorized transition; use cancel_if_authorized"
             )
+        if expected_state in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.CANCELED,
+        }:
+            raise ValueError("A terminal A2A lifecycle cannot be replaced")
+
+        return await self._save_recipient_lifecycle_from_states(
+            task,
+            recipient_agent_id=recipient_agent_id,
+            expected_states=(expected_state,),
+        )
+
+    async def save_recipient_terminal_outcome(
+        self,
+        task: Task,
+        *,
+        recipient_agent_id: str,
+        operation_id: str,
+    ) -> bool:
+        """Commit a handler's terminal result from whichever live state remains.
+
+        A recipient may legitimately publish WORKING while its handler is still
+        running. The handler result must therefore CAS against the live-state
+        set rather than the stale state in its in-memory snapshot. Terminal
+        states are deliberately absent from the predicate, so a cancellation
+        or competing completion remains immutable.
+        """
+
+        if task.status.state not in {TaskState.COMPLETED, TaskState.FAILED}:
+            raise ValueError(
+                "Recipient execution outcomes must be completed or failed"
+            )
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError(
+                "Recipient terminal operation ID must be a concrete string"
+            )
+        return await self._save_recipient_lifecycle_from_states(
+            task,
+            recipient_agent_id=recipient_agent_id,
+            expected_states=(
+                TaskState.SUBMITTED,
+                TaskState.WORKING,
+                TaskState.INPUT_REQUIRED,
+            ),
+            terminal_operation_id=operation_id,
+        )
+
+    async def _save_recipient_lifecycle_from_states(
+        self,
+        task: Task,
+        *,
+        recipient_agent_id: str,
+        expected_states: tuple[TaskState, ...],
+        terminal_operation_id: Optional[str] = None,
+    ) -> bool:
+        """CAS one recipient-owned payload from an explicit state set."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task lifecycle recipient must be a concrete identity")
+        if not expected_states:
+            raise ValueError("Task lifecycle CAS requires an expected state")
 
         message_json = task.status.message.model_dump_json() if task.status.message else None
         artifacts_json = json_dumps([a.model_dump() for a in (task.artifacts or [])])
@@ -389,8 +503,11 @@ class TaskStore(UnifiedStoreBase):
                 artifacts = ?,
                 history = ?,
                 metadata = ?,
+                terminal_operation_id = ?,
                 updated_at = {self.now_sql()}
-            WHERE id = ? AND status <> 'canceled'
+            WHERE id = ?
+              AND recipient_agent_id = ?
+              AND status IN ({", ".join("?" for _ in expected_states)})
             """,
             (
                 task.status.state.value,
@@ -398,7 +515,10 @@ class TaskStore(UnifiedStoreBase):
                 artifacts_json,
                 history_json,
                 metadata_json,
+                terminal_operation_id,
                 task.id,
+                recipient_agent_id,
+                *(state.value for state in expected_states),
             ),
         )
         return rows_affected == 1
@@ -468,6 +588,23 @@ class TaskStore(UnifiedStoreBase):
             return None
         return self._row_to_task(row)
 
+    async def get_for_recipient(
+        self,
+        task_id: str,
+        recipient_agent_id: str,
+    ) -> Optional[Task]:
+        """Retrieve a task only through its durable responder principal."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task recipient lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT * FROM a2a_tasks WHERE id = ? AND recipient_agent_id = ?",
+            (task_id, recipient_agent_id),
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
     async def get_cancellation_snapshot(
         self,
         task_id: str,
@@ -494,6 +631,22 @@ class TaskStore(UnifiedStoreBase):
         )
         return row[0] if row else None
 
+    async def get_recipient_terminal_operation_id(
+        self,
+        task_id: str,
+        recipient_agent_id: str,
+    ) -> Optional[str]:
+        """Return the private token proving which recipient terminal write won."""
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task recipient lookup requires a concrete identity")
+        row = await self._backend.fetch_one(
+            "SELECT terminal_operation_id FROM a2a_tasks "
+            "WHERE id = ? AND recipient_agent_id = ?",
+            (task_id, recipient_agent_id),
+        )
+        return row[0] if row else None
+
     async def is_task_recipient(self, task_id: str, agent_id: str) -> bool:
         """Whether ``agent_id`` is the durable execution recipient of ``task_id``."""
 
@@ -505,33 +658,76 @@ class TaskStore(UnifiedStoreBase):
         )
         return row is not None
 
-    async def get_pending_tasks(self, limit: int = 10) -> list[Task]:
-        """Get tasks ready for processing (SUBMITTED state)."""
+    async def get_pending_tasks(
+        self,
+        limit: int = 10,
+        *,
+        recipient_agent_id: Optional[str] = None,
+    ) -> list[Task]:
+        """Get submitted work, optionally constrained to one worker recipient."""
+
+        if recipient_agent_id is not None and (
+            not isinstance(recipient_agent_id, str)
+            or not recipient_agent_id.strip()
+        ):
+            raise ValueError("Pending-task recipient must be a concrete identity")
+        recipient_predicate = (
+            " AND recipient_agent_id = ?" if recipient_agent_id is not None else ""
+        )
+        params = (
+            (recipient_agent_id, limit)
+            if recipient_agent_id is not None
+            else (limit,)
+        )
         rows = await self._backend.fetch_all(
-            """
+            f"""
             SELECT * FROM a2a_tasks
             WHERE status = 'submitted'
+            {recipient_predicate}
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            (limit,),
+            params,
         )
         return [self._row_to_task(row) for row in rows]
 
-    async def update_status(self, task_id: str, status: TaskStatus) -> bool:
-        """Update a live task status without overwriting cancellation."""
+    async def update_status(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        recipient_agent_id: str,
+        expected_state: TaskState,
+    ) -> bool:
+        """Update a live task only when the durable recipient matches."""
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task status recipient must be a concrete identity")
         if status.state is TaskState.CANCELED:
             raise ValueError(
                 "CANCELED is an authorized transition; use cancel_if_authorized"
             )
+        if expected_state in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.CANCELED,
+        }:
+            raise ValueError("A terminal A2A lifecycle cannot be replaced")
         message_json = status.message.model_dump_json() if status.message else None
         rows_affected = await self._backend.execute(
             f"""
             UPDATE a2a_tasks
             SET status = ?, message = ?, updated_at = {self.now_sql()}
-            WHERE id = ? AND status <> 'canceled'
+            WHERE id = ?
+              AND recipient_agent_id = ?
+              AND status = ?
             """,
-            (status.state.value, message_json, task_id),
+            (
+                status.state.value,
+                message_json,
+                task_id,
+                recipient_agent_id,
+                expected_state.value,
+            ),
         )
         return rows_affected == 1
 
@@ -590,39 +786,65 @@ class TaskStore(UnifiedStoreBase):
                 )
             ],
         )
-        if task_payload is not None:
-            transaction = (
-                self._backend.transaction(immediate=True)
-                if self.is_sqlite
-                else self._backend.transaction()
+        transaction = (
+            self._backend.transaction(immediate=True)
+            if self.is_sqlite
+            else self._backend.transaction()
+        )
+        recipient_predicate = (
+            "AND recipient_agent_id = ?"
+            if expected_recipient_agent_id is not None
+            else ""
+        )
+        recipient_values = (
+            (expected_recipient_agent_id,)
+            if expected_recipient_agent_id is not None
+            else ()
+        )
+        live_authority_predicate = f"""
+            id = ?
+            AND status IN ('submitted', 'working', 'input-required')
+            AND (creator_agent_id = ? OR recipient_agent_id = ?)
+            {recipient_predicate}
+        """
+        authority_values = (
+            task_id,
+            actor_agent_id,
+            actor_agent_id,
+            *recipient_values,
+        )
+
+        def decode_json(value, default):
+            if value is None:
+                return default
+            if isinstance(value, (list, dict)):
+                return value
+            return json_loads(value) or default
+
+        def merge_sequence(current_items, payload_items):
+            merged = list(current_items)
+            for item in payload_items:
+                if item not in merged:
+                    merged.append(item)
+            return merged
+
+        async with transaction:
+            lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+            current = await self._backend.fetch_one(
+                f"""
+                SELECT * FROM a2a_tasks
+                WHERE {live_authority_predicate}
+                {lock_suffix}
+                """,
+                authority_values,
             )
-            async with transaction:
-                lock_suffix = " FOR UPDATE" if self.is_postgres else ""
-                current = await self._backend.fetch_one(
-                    "SELECT artifacts, history, metadata FROM a2a_tasks "
-                    f"WHERE id = ?{lock_suffix}",
-                    (task_id,),
-                )
-                if current is None:
-                    return None
+            if current is None:
+                return None
 
-                def decode_json(value, default):
-                    if value is None:
-                        return default
-                    if isinstance(value, (list, dict)):
-                        return value
-                    return json_loads(value) or default
-
-                def merge_sequence(current_items, payload_items):
-                    merged = list(current_items)
-                    for item in payload_items:
-                        if item not in merged:
-                            merged.append(item)
-                    return merged
-
-                current_artifacts = decode_json(current[0], [])
-                current_history = decode_json(current[1], [])
-                current_metadata = decode_json(current[2], {})
+            current_artifacts = decode_json(current[6], [])
+            current_history = decode_json(current[7], [])
+            current_metadata = decode_json(current[8], {})
+            if task_payload is not None:
                 payload_artifacts = [
                     artifact.model_dump()
                     for artifact in (task_payload.artifacts or [])
@@ -632,142 +854,71 @@ class TaskStore(UnifiedStoreBase):
                 ]
                 payload_metadata = dict(task_payload.metadata or {})
                 payload_metadata.pop("cancellation_receipt", None)
-                merged_metadata = {
-                    **current_metadata,
-                    **payload_metadata,
-                }
-                merged_history = merge_sequence(
-                    current_history,
-                    payload_history,
+                merged_artifacts = merge_sequence(
+                    current_artifacts, payload_artifacts
                 )
-                merged_history.append(message.model_dump())
-                recipient_predicate = (
-                    " AND recipient_agent_id = ?"
-                    if expected_recipient_agent_id is not None
-                    else ""
-                )
-                recipient_values = (
-                    (expected_recipient_agent_id,)
-                    if expected_recipient_agent_id is not None
-                    else ()
-                )
-                rows_affected = await self._backend.execute(
-                    f"""
-                    UPDATE a2a_tasks
-                    SET cancel_previous_status = status,
-                        status = 'canceled',
-                        message = ?,
-                        artifacts = ?,
-                        history = ?,
-                        metadata = ?,
-                        canceled_by = ?,
-                        cancel_reason = ?,
-                        cancel_operation_id = ?,
-                        updated_at = {self.now_sql()}
-                    WHERE id = ?
-                      AND status IN ('submitted', 'working', 'input-required')
-                      AND (creator_agent_id = ? OR recipient_agent_id = ?)
-                      {recipient_predicate}
-                    """,
-                    (
-                        message.model_dump_json(),
-                        json_dumps(
-                            merge_sequence(current_artifacts, payload_artifacts)
-                        ),
-                        json_dumps(merged_history),
-                        json_dumps(merged_metadata),
-                        actor_agent_id,
-                        reason,
-                        operation_id,
-                        task_id,
-                        actor_agent_id,
-                        actor_agent_id,
-                        *recipient_values,
-                    ),
-                )
-                if rows_affected != 1:
-                    return None
-                # Read the canonical canceled form before committing. A
-                # readback failure must roll the transition back rather than
-                # strand a durable CANCELED row before TaskManager can finish
-                # its queued-wake, SSE, session, and completion projections.
-                canceled_row = await self._backend.fetch_one(
-                    "SELECT * FROM a2a_tasks WHERE id = ?",
-                    (task_id,),
-                )
-                if canceled_row is None:
-                    raise RuntimeError(
-                        "Canceled task disappeared inside its transition"
-                    )
-                return self._row_to_task(canceled_row)
-
-        if self.is_postgres:
-            payload_assignment = (
-                "history = COALESCE(history, '[]'::jsonb) || ?::jsonb,"
-            )
-            payload_values = (json_dumps([message.model_dump()]),)
-        else:
-            payload_assignment = (
-                "history = json_insert(COALESCE(history, '[]'), '$[#]', json(?)),"
-            )
-            payload_values = (message.model_dump_json(),)
-        recipient_predicate = (
-            " AND recipient_agent_id = ?"
-            if expected_recipient_agent_id is not None
-            else ""
-        )
-        recipient_values = (
-            (expected_recipient_agent_id,)
-            if expected_recipient_agent_id is not None
-            else ()
-        )
-        transaction = (
-            self._backend.transaction(immediate=True)
-            if self.is_sqlite
-            else self._backend.transaction()
-        )
-        async with transaction:
+                merged_history = merge_sequence(current_history, payload_history)
+                merged_metadata = {**current_metadata, **payload_metadata}
+            else:
+                merged_artifacts = current_artifacts
+                merged_history = list(current_history)
+                merged_metadata = current_metadata
+            merged_history.append(message.model_dump())
+            artifacts_json = json_dumps(merged_artifacts)
+            history_json = json_dumps(merged_history)
+            metadata_json = json_dumps(merged_metadata)
+            message_json = message.model_dump_json()
             rows_affected = await self._backend.execute(
                 f"""
                 UPDATE a2a_tasks
                 SET cancel_previous_status = status,
                     status = 'canceled',
                     message = ?,
-                    {payload_assignment}
+                    artifacts = ?,
+                    history = ?,
+                    metadata = ?,
                     canceled_by = ?,
                     cancel_reason = ?,
                     cancel_operation_id = ?,
                     updated_at = {self.now_sql()}
-                WHERE id = ?
-                  AND status IN ('submitted', 'working', 'input-required')
-                  AND (creator_agent_id = ? OR recipient_agent_id = ?)
-                  {recipient_predicate}
+                WHERE {live_authority_predicate}
                 """,
                 (
-                    message.model_dump_json(),
-                    *payload_values,
+                    message_json,
+                    artifacts_json,
+                    history_json,
+                    metadata_json,
                     actor_agent_id,
                     reason,
                     operation_id,
-                    task_id,
-                    actor_agent_id,
-                    actor_agent_id,
-                    *recipient_values,
+                    *authority_values,
                 ),
             )
             if rows_affected != 1:
                 return None
-            canceled_row = await self._backend.fetch_one(
-                "SELECT * FROM a2a_tasks WHERE id = ?",
-                (task_id,),
-            )
-            if canceled_row is None:
-                raise RuntimeError(
-                    "Canceled task disappeared inside its transition"
-                )
-            return self._row_to_task(canceled_row)
+            # Materialize the exact committed payload from the locked row and
+            # the values written above.  A second read after commit can fail or
+            # be canceled after authority has already changed, which would
+            # wrongly roll back local intent and abandon every projection.
+            canceled_row = list(current)
+            canceled_row[4] = TaskState.CANCELED.value
+            canceled_row[5] = message_json
+            canceled_row[6] = artifacts_json
+            canceled_row[7] = history_json
+            canceled_row[8] = metadata_json
+            canceled_row[13] = actor_agent_id
+            canceled_row[14] = reason
+            canceled_row[15] = current[4]
+            canceled_row[16] = operation_id
+            return self._row_to_task(tuple(canceled_row))
 
-    async def add_artifact(self, task_id: str, artifact: Artifact) -> None:
+    async def add_artifact(
+        self,
+        task_id: str,
+        artifact: Artifact,
+        *,
+        recipient_agent_id: str,
+    ) -> None:
         """Append an artifact without crossing a terminal-state transition.
 
         Cancellation may merge a handler's partial payload into this same JSON
@@ -777,23 +928,27 @@ class TaskStore(UnifiedStoreBase):
         sees an already-appended artifact, or the later append is refused.
         """
 
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task artifact recipient must be a concrete identity")
+
         transaction = (
             self._backend.transaction(immediate=True)
             if self.is_sqlite
             else self._backend.transaction()
         )
+        unauthorized = False
         terminal_status: Optional[str] = None
         update_conflict = False
         async with transaction:
             lock_suffix = " FOR UPDATE" if self.is_postgres else ""
             row = await self._backend.fetch_one(
                 "SELECT artifacts, status FROM a2a_tasks "
-                f"WHERE id = ?{lock_suffix}",
-                (task_id,),
+                f"WHERE id = ? AND recipient_agent_id = ?{lock_suffix}",
+                (task_id, recipient_agent_id),
             )
             if not row:
-                raise ValueError(f"Task not found: {task_id}")
-            if row[1] not in {
+                unauthorized = True
+            elif row[1] not in {
                 TaskState.SUBMITTED.value,
                 TaskState.WORKING.value,
                 TaskState.INPUT_REQUIRED.value,
@@ -812,11 +967,16 @@ class TaskStore(UnifiedStoreBase):
                     UPDATE a2a_tasks
                     SET artifacts = ?, updated_at = {self.now_sql()}
                     WHERE id = ?
+                      AND recipient_agent_id = ?
                       AND status IN ('submitted', 'working', 'input-required')
                     """,
-                    (json_dumps(artifacts), task_id),
+                    (json_dumps(artifacts), task_id, recipient_agent_id),
                 )
                 update_conflict = rows_affected != 1
+        if unauthorized:
+            raise TaskMutationAuthorizationError(
+                f"Task mutation was not authorized or task was not found: {task_id}"
+            )
         if terminal_status is not None:
             raise ValueError(
                 f"Cannot add artifact to terminal task {task_id}: {terminal_status}"
@@ -906,7 +1066,8 @@ class TaskStore(UnifiedStoreBase):
         5: message, 6: artifacts, 7: history, 8: metadata,
         9: created_at, 10: updated_at, 11: creator_agent_id,
         12: recipient_agent_id, 13: canceled_by, 14: cancel_reason,
-        15: cancel_previous_status, 16: cancel_operation_id
+        15: cancel_previous_status, 16: cancel_operation_id,
+        17: terminal_operation_id
         """
         artifacts_data = json_loads(row[6]) if row[6] else []
         history_data = json_loads(row[7]) if row[7] else []

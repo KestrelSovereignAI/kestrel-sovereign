@@ -70,6 +70,62 @@ async def test_process_input_is_the_canonical_active_turn_inventory():
 
 
 @pytest.mark.asyncio
+async def test_stale_caller_cancellation_count_does_not_escape_isolated_stop():
+    """Only cancellation added during the child await belongs to the caller."""
+
+    from kestrel_sovereign.agent.invocation import (
+        InvocationCancelledError,
+        bind_async_invocation,
+    )
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    started = asyncio.Event()
+    continued = asyncio.Event()
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._abandoned_request_generations = {}
+            self._abandoned_request_dispositions = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            started.set()
+            await asyncio.Event().wait()
+
+    owner = Owner()
+
+    async def persistent_caller():
+        caller = asyncio.current_task()
+        assert caller is not None
+        caller.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        assert caller.cancelling() == 1
+        with pytest.raises(InvocationCancelledError):
+            await owner.run(invocation_id="stale-caller-cancel")
+        continued.set()
+
+    turn = asyncio.create_task(persistent_caller())
+    await started.wait()
+    assert owner.cancel_current_request("stale-caller-cancel") is True
+    await asyncio.wait_for(continued.wait(), timeout=1)
+    await turn
+    assert not owner._abandoned_generations("stale-caller-cancel")
+
+
+@pytest.mark.asyncio
 async def test_isolated_turn_preserves_context_outputs_for_caller_audit():
     """Task isolation retains sequential-await ContextVar semantics."""
 
@@ -308,6 +364,48 @@ async def test_stop_after_terminal_child_failure_is_not_abandoned():
         is RequestCompletionDisposition.COMPLETED
     )
     assert getattr(owner, "_abandoned_request_generations", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_after_stop_marker_is_clean_completion():
+    """A canceled transport owner does not imply failed child cleanup."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestCompletionDisposition,
+        RequestLifecycleMixin,
+    )
+
+    started = asyncio.Event()
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            started.set()
+            await asyncio.Event().wait()
+
+    owner = Owner()
+    turn = asyncio.create_task(owner.run(invocation_id="caller-shutdown"))
+    await started.wait()
+    assert owner.cancel_current_request("caller-shutdown") is True
+    completion = asyncio.create_task(
+        owner.wait_for_request_completion("caller-shutdown")
+    )
+    turn.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert await completion is RequestCompletionDisposition.COMPLETED
+    assert not owner._abandoned_generations("caller-shutdown")
 
 
 @pytest.mark.asyncio
