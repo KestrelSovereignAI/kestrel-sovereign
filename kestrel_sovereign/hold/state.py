@@ -428,6 +428,28 @@ async def preflight_postgres_hold_custody(
 ) -> None:
     """Verify existing custody roles through raw, read-only PostgreSQL pools."""
 
+    primary_backend, evidence_backend = (
+        await _connect_postgres_hold_custody_backends(
+            primary_dsn,
+            evidence_dsn,
+        )
+    )
+    close_errors = await _close_postgres_preflight_backends(
+        primary_backend,
+        evidence_backend,
+    )
+    if close_errors:
+        raise HoldStateError(
+            "could not close PostgreSQL Hold custody preflight connections"
+        ) from close_errors[0]
+
+
+async def _connect_postgres_hold_custody_backends(
+    primary_dsn: str,
+    evidence_dsn: str,
+) -> tuple[Any, Any]:
+    """Return the exact connected pools whose custody roles were validated."""
+
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
 
     primary_backend = PostgresBackend(
@@ -440,7 +462,6 @@ async def preflight_postgres_hold_custody(
         min_pool_size=1,
         max_pool_size=1,
     )
-    failure: BaseException | None = None
     try:
         await _gather_database_probes(
             primary_backend.connect(),
@@ -457,24 +478,63 @@ async def preflight_postgres_hold_custody(
             ),
         )
         validate_postgres_hold_custody(primary, evidence)
-    except BaseException as exc:
-        failure = exc
-
-    close_errors: tuple[BaseException, ...] = ()
-    try:
-        close_errors = await _close_postgres_preflight_backends(
-            primary_backend,
-            evidence_backend,
-        )
-    except asyncio.CancelledError as exc:
-        failure = exc
-
-    if failure is not None:
+    except BaseException as failure:
+        close_errors: tuple[BaseException, ...] = ()
+        try:
+            close_errors = await _close_postgres_preflight_backends(
+                primary_backend,
+                evidence_backend,
+            )
+        except asyncio.CancelledError as cancellation:
+            failure = cancellation
+        for close_error in close_errors:
+            failure.add_note(
+                "Additional PostgreSQL Hold custody preflight close failure: "
+                f"{close_error!r}"
+            )
         raise failure.with_traceback(failure.__traceback__)
-    if close_errors:
-        raise HoldStateError(
-            "could not close PostgreSQL Hold custody preflight connections"
-        ) from close_errors[0]
+    return primary_backend, evidence_backend
+
+
+async def initialize_postgres_hold_databases(
+    primary_dsn: str,
+    evidence_dsn: str,
+) -> tuple[Any, Any]:
+    """Validate, then initialize schema on those same connected PG pools."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    primary_backend, evidence_backend = (
+        await _connect_postgres_hold_custody_backends(
+            primary_dsn,
+            evidence_dsn,
+        )
+    )
+    primary_db = None
+    evidence_db = None
+    try:
+        primary_db = await AsyncDatabase.from_connected_backend(
+            primary_backend
+        )
+        evidence_db = await AsyncDatabase.from_connected_backend(
+            evidence_backend
+        )
+        return primary_db, evidence_db
+    except BaseException as failure:
+        close_errors: tuple[BaseException, ...] = ()
+        try:
+            close_errors = await _close_postgres_preflight_backends(
+                primary_db or primary_backend,
+                evidence_db or evidence_backend,
+            )
+        except asyncio.CancelledError as cancellation:
+            failure = cancellation
+        for close_error in close_errors:
+            failure.add_note(
+                "Additional PostgreSQL Hold database initialization close failure: "
+                f"{close_error!r}"
+            )
+        raise failure.with_traceback(failure.__traceback__)
 
 
 def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:

@@ -985,6 +985,27 @@ class AsyncDatabase:
         # dialect-specific connection retirement have completed.
         self._sovereign_sqla_factory = None
         self._sovereign_sqla_retirement_owner = None
+
+    @classmethod
+    async def from_connected_backend(
+        cls,
+        backend: DatabaseBackend,
+    ) -> "AsyncDatabase":
+        """Take ownership of a connected backend and initialize its schema.
+
+        Callers that must inspect a specific connected pool before any schema
+        mutation use this boundary rather than discarding that pool and opening
+        a second one through :meth:`postgres`.
+        """
+
+        db = cls(backend)
+        try:
+            await db._init_schema()
+        except BaseException:
+            await _close_failed_database_initialization(db)
+            raise
+        db._initialized = True
+        return db
     
     @classmethod
     async def create(cls, config: Optional[Dict[str, Any]] = None) -> "AsyncDatabase":
@@ -999,27 +1020,14 @@ class AsyncDatabase:
             Connected AsyncDatabase instance
         """
         backend = await get_backend(config)
-        db = cls(backend)
-        try:
-            await db._init_schema()
-        except BaseException:
-            await _close_failed_database_initialization(db)
-            raise
-        db._initialized = True
-        return db
+        return await cls.from_connected_backend(backend)
     
     @classmethod
     async def sqlite(cls, db_path: str) -> "AsyncDatabase":
         """Create SQLite database at given path."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
-        db = cls(backend)
-        try:
-            await db._init_schema()
-        except BaseException:
-            await _close_failed_database_initialization(db)
-            raise
-        db._initialized = True
+        db = await cls.from_connected_backend(backend)
         logger.info(f"SQLite database connected: {db_path}")
         return db
     
@@ -1040,13 +1048,7 @@ class AsyncDatabase:
             max_pool_size=max_pool_size,
         )
         await backend.connect()
-        db = cls(backend)
-        try:
-            await db._init_schema()
-        except BaseException:
-            await _close_failed_database_initialization(db)
-            raise
-        db._initialized = True
+        db = await cls.from_connected_backend(backend)
         logger.info("PostgreSQL database connected")
         return db
 
