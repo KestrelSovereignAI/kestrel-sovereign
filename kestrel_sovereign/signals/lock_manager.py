@@ -34,12 +34,19 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from contextvars import Context, ContextVar
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterable, Optional
 
 from kestrel_sdk.signals import ResourceLock
 
 logger = logging.getLogger(__name__)
+
+
+_delegated_lock_ownership: ContextVar[dict[int, frozenset[object]]] = ContextVar(
+    "kestrel_delegated_lock_ownership",
+    default={},
+)
 
 
 # How long to wait before reporting, and then re-reporting, a contended
@@ -74,6 +81,11 @@ class LockHolder:
     acquired_at: float
     owner_task: Optional[asyncio.Task[object]] = field(
         default=None, repr=False, compare=False
+    )
+    ownership_token: object = field(
+        default_factory=object,
+        repr=False,
+        compare=False,
     )
 
     def held_seconds(self) -> float:
@@ -307,11 +319,44 @@ class OrderedLockManager:
         different task currently holds the resource.
         """
         holder = self._holders.get(name)
-        return bool(
-            holder is not None
-            and holder.owner_task is not None
-            and holder.owner_task is asyncio.current_task()
+        if holder is None or holder.owner_task is None:
+            return False
+        if holder.owner_task is asyncio.current_task():
+            return True
+        delegated = _delegated_lock_ownership.get().get(id(self), frozenset())
+        return holder.ownership_token in delegated
+
+    def delegate_current_task_ownership(self, context: Context) -> None:
+        """Hand this task's exact live holds to one isolated child context.
+
+        Task ownership remains the default: ordinary child tasks do not inherit
+        a non-reentrant lock. The invocation boundary calls this explicitly
+        because it moves the same logical signal turn into a cancellable task.
+        Tokens are unique per acquisition, so a copied delegation stops
+        matching as soon as that acquisition releases.
+        """
+
+        if not isinstance(context, Context):
+            raise TypeError("lock ownership delegation requires a Context")
+        current_task = asyncio.current_task()
+        live_tokens = frozenset(
+            holder.ownership_token for holder in self._holders.values()
         )
+        inherited = _delegated_lock_ownership.get().get(
+            id(self), frozenset()
+        ) & live_tokens
+        direct = frozenset(
+            holder.ownership_token
+            for holder in self._holders.values()
+            if holder.owner_task is current_task
+        )
+        delegations = dict(_delegated_lock_ownership.get())
+        delegated = inherited | direct
+        if delegated:
+            delegations[id(self)] = delegated
+        else:
+            delegations.pop(id(self), None)
+        context.run(_delegated_lock_ownership.set, delegations)
 
     def holder(self, name: ResourceLock) -> Optional[LockHolder]:
         """Who currently holds ``name``, for diagnostics and tests.

@@ -245,7 +245,7 @@ def cmd_start(args) -> int:
         try:
             pm.start_agent(args.name, agent_cfg, multi_agent.host.bind, standalone=True)
         except RuntimeError as e:
-            print(f"          \u274c")
+            print("          \u274c")
             print(f"   {e}")
             return 1
 
@@ -330,7 +330,7 @@ def _start_inprocess_mode(
         orphans = pm.find_pids_on_port(multi_agent.host.port)
         print(f"   Port {multi_agent.host.port} already in use"
               + (f" by PID(s) {orphans}" if orphans else ""))
-        print(f"   Run: kestrel stop   (add --force if it doesn't die)")
+        print("   Run: kestrel terminate   (add --force if it doesn't die)")
         return 1
 
     env = pm._load_env()
@@ -442,7 +442,7 @@ def _report_port_still_held(label: str, port: int) -> None:
     """Explain a port that survived SIGKILL, and how to find its owner."""
     print(
         f"   {label}: port :{port} is still in use — "
-        f"not reporting {label} as stopped"
+        f"not reporting {label} as terminated"
     )
     # A remediation naming a tool the platform does not ship is not a
     # remediation. Windows is a supported target and has no lsof.
@@ -452,15 +452,15 @@ def _report_port_still_held(label: str, port: int) -> None:
         print(f"   Identify the owner with: lsof -nP -iTCP:{port} -sTCP:LISTEN")
 
 
-def cmd_stop(args) -> int:
-    """Stop host and/or agents."""
+def cmd_terminate(args) -> int:
+    """Terminate host and/or agent processes."""
     project_dir = cli._get_project_dir()
     multi_agent = cli.MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
     force = getattr(args, "force", False)
 
     if args.name:
-        # Stop a single agent
+        # Terminate a single agent process.
         local_agents = multi_agent.get_local_agents()
         if args.name not in local_agents:
             print(f"Agent '{args.name}' not found in multi_agent config")
@@ -470,11 +470,11 @@ def cmd_stop(args) -> int:
         pm.register_agent(args.name, agent_cfg)
         ap = pm._agents.get(args.name)
         if ap and ap.pid:
-            print(f"   Stopping {args.name} (PID: {ap.pid})...")
+            print(f"   Terminating {args.name} (PID: {ap.pid})...")
             if not pm.terminate_agent(args.name):
                 print(
                     f"   {args.name}: PID {ap.pid} is still running after "
-                    f"SIGKILL — not reporting {args.name} as stopped"
+                    f"SIGKILL — not reporting {args.name} as terminated"
                 )
                 return 1
             # The tracked PID being gone does not mean the port is free: a
@@ -483,14 +483,14 @@ def cmd_stop(args) -> int:
             if ProcessManager.is_port_in_use(agent_cfg.port, multi_agent.host.bind):
                 _report_port_still_held(args.name, agent_cfg.port)
                 return 1
-            print(f"   {args.name} stopped")
+            print(f"   {args.name} terminated")
             return 0
 
         reaped = _reap_orphans_on_port(
             agent_cfg.port, args.name, force, multi_agent.host.bind
         )
         if reaped is PortReapResult.RELEASED:
-            print(f"   {args.name} stopped (orphan)")
+            print(f"   {args.name} terminated (orphan)")
         elif reaped is PortReapResult.NOTHING_FOUND:
             print(f"   {args.name} is not running")
         else:
@@ -498,35 +498,35 @@ def cmd_stop(args) -> int:
             return 1
         return 0
 
-    # Stop everything: agents first, then host
-    print("\U0001F6D1 Stopping Kestrel MultiAgent...")
+    # Terminate everything: agent processes first, then the host process.
+    print("\U0001F6D1 Terminating Kestrel MultiAgent...")
 
     # Anything that outlived the stop, named so the summary cannot claim a
     # clean shutdown over the top of it.
-    unstopped: list[str] = []
+    unterminated: list[str] = []
 
     for name, cfg in multi_agent.get_local_agents().items():
         pm.register_agent(name, cfg)
         ap = pm._agents.get(name)
         if ap and ap.pid:
-            print(f"   Stopping {name} (PID: {ap.pid})...")
+            print(f"   Terminating {name} (PID: {ap.pid})...")
             if not pm.terminate_agent(name):
                 print(
                     f"   {name}: PID {ap.pid} is still running after SIGKILL"
                 )
-                unstopped.append(name)
+                unterminated.append(name)
             elif ProcessManager.is_port_in_use(cfg.port, multi_agent.host.bind):
                 _report_port_still_held(name, cfg.port)
-                unstopped.append(name)
+                unterminated.append(name)
             else:
-                print(f"   {name} stopped")
+                print(f"   {name} terminated")
         elif _reap_orphans_on_port(
             cfg.port, name, force, multi_agent.host.bind
         ) is PortReapResult.STILL_HELD:
             _report_port_still_held(name, cfg.port)
-            unstopped.append(name)
+            unterminated.append(name)
 
-    # Stop host
+    # Terminate host process.
     host_pid_file = _host_pid_file(project_dir)
     # The verified read, so "nothing is there" and "something else is there
     # now" are different answers. A number alone could not tell them apart,
@@ -534,7 +534,7 @@ def cmd_stop(args) -> int:
     host_record = pm.read_pid_record(host_pid_file)
     host_pid = host_record.pid if host_record.is_running else None
     if host_pid:
-        print(f"   Stopping host (PID: {host_pid})...")
+        print(f"   Terminating host (PID: {host_pid})...")
         # The instant from the FILE, not a fresh lookup. Looking it up again
         # would read whatever holds the number now, so a PID reused between
         # the read and the kill would be validated against itself and
@@ -572,9 +572,9 @@ def cmd_stop(args) -> int:
                 )
             if port_held:
                 _report_port_still_held("host", multi_agent.host.port)
-            unstopped.append("host")
+            unterminated.append("host")
         else:
-            print("   host stopped")
+            print("   host terminated")
     else:
         if host_record.status is PidStatus.STALE:
             # Known to name a process that is gone, or one that is not the
@@ -587,23 +587,23 @@ def cmd_stop(args) -> int:
             multi_agent.host.port, "host", force, multi_agent.host.bind
         ) is PortReapResult.STILL_HELD:
             _report_port_still_held("host", multi_agent.host.port)
-            unstopped.append("host")
+            unterminated.append("host")
 
-    if unstopped:
+    if unterminated:
         print(
-            "\u274c MultiAgent stop incomplete — still running: "
-            + ", ".join(unstopped)
+            "\u274c MultiAgent termination incomplete — still running: "
+            + ", ".join(unterminated)
         )
         return 1
 
-    print("\u2705 MultiAgent stopped")
+    print("\u2705 MultiAgent terminated")
     return 0
 
 
 def cmd_restart(args) -> int:
-    """Restart host and/or agents (stop then start)."""
-    # Through ``cli.`` so test patches of cli.cmd_stop / cli.cmd_start apply.
-    rc = cli.cmd_stop(args)
+    """Restart host and/or agents (terminate then start)."""
+    # Through ``cli.`` so test patches of cli.cmd_terminate / cli.cmd_start apply.
+    rc = cli.cmd_terminate(args)
     if rc != 0:
         return rc
     print()
@@ -1674,16 +1674,19 @@ def cmd_logs(args) -> int:
 
 
 def add_lifecycle_subparsers(subparsers) -> None:
-    """Register start/stop/restart/update/status/logs on ``subparsers``."""
+    """Register start/terminate/restart/update/status/logs on ``subparsers``."""
     # kestrel start [name]
     start_p = subparsers.add_parser("start", help="Start host and/or agents")
     start_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
     _add_startup_timeout_argument(start_p)
 
-    # kestrel stop [name] [--force]
-    stop_p = subparsers.add_parser("stop", help="Stop host and/or agents")
-    stop_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
-    stop_p.add_argument(
+    # kestrel terminate [name] [--force]
+    terminate_p = subparsers.add_parser(
+        "terminate",
+        help="Terminate host and/or agent processes",
+    )
+    terminate_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
+    terminate_p.add_argument(
         "--force", action="store_true",
         help="Send SIGKILL instead of SIGTERM (also used when reaping orphans)",
     )

@@ -44,9 +44,15 @@ def _make_feature(initial_state: TaskState = TaskState.SUBMITTED):
         return state["task"] if state["task"].id == task_id else None
 
     async def update_status(
-        task_id, new_state, message=None, agent_name=None,
+        task_id,
+        new_state,
+        message=None,
+        agent_name=None,
+        *,
+        recipient_agent_id,
     ):
         assert state["task"].id == task_id
+        assert recipient_agent_id == "did:test:receiver"
         # Validate the transition matches the receiver's expected
         # chain. SUBMITTED → WORKING, WORKING → COMPLETED/FAILED/CANCELED.
         prior = state["task"].status.state
@@ -264,8 +270,15 @@ def _make_feature_with_artifact_tracking(initial_state: TaskState = TaskState.WO
     async def get_task(task_id):
         return state["task"] if state["task"].id == task_id else None
 
-    async def add_artifact(task_id, artifact, agent_name=None):
+    async def add_artifact(
+        task_id,
+        artifact,
+        agent_name=None,
+        *,
+        recipient_agent_id,
+    ):
         assert state["task"].id == task_id
+        assert recipient_agent_id == "did:test:receiver"
         state["added"].append(artifact)
         if state["task"].artifacts is None:
             state["task"].artifacts = []

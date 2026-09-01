@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 
 from kestrel_sovereign.auth import AuthMethod, CallerRole
 
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
+
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers (same pattern as test_endpoint_contract_suite.py)
@@ -270,6 +272,38 @@ def test_bridge_invoke_failure_logs_no_message_or_exception_text():
         assert marker not in logged
         assert "provider rejected" not in logged
         assert error_log.call_args.kwargs.get("exc_info") is None
+    finally:
+        _restore_app(app, original)
+
+
+def test_bridge_invoke_reports_cooperative_stop_as_conflict():
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+
+    agent = MagicMock()
+    agent.process_input = AsyncMock(
+        side_effect=InvocationCancelledError("isolated turn stopped")
+    )
+    _wire_bridge_feature(agent)
+
+    app, original = _prepare_app(agent)
+    try:
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        app.include_router(get_router())
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/bridge/invoke",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Request-ID": "bridge-stopped-turn",
+                    },
+                    json={"message": "stop this", "channel_type": "api"},
+                )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Request stopped during execution."
+        assert response.headers["X-Request-ID"] == "bridge-stopped-turn"
     finally:
         _restore_app(app, original)
 

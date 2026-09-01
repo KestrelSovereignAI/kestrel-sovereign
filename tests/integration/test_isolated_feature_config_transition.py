@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import signal
 import sys
 from unittest.mock import Mock
@@ -17,10 +18,22 @@ from kestrel_sdk.isolated_feature import (
 )
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
-from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+from kestrel_sovereign.features.isolated_runtime import (
+    ProxyFeature,
+    configure_hosted_isolated_runtime_lifecycle,
+)
 
 
 _TEST_AGENT_DID = "did:test:isolated-integration"
+
+
+def _package_index_is_explicitly_disabled() -> bool:
+    """Return whether the runner declared package resolution unavailable."""
+
+    return any(
+        os.environ.get(name, "").strip().casefold() in {"1", "true", "yes", "on"}
+        for name in ("UV_OFFLINE", "UV_NO_INDEX", "PIP_NO_INDEX")
+    )
 
 
 def _config_node_id(feature_name: str) -> str:
@@ -170,6 +183,230 @@ async def test_proxy_forwards_empty_config_through_real_subprocess_wrapper(
         assert json.loads(configured.read_text()) == {}
     finally:
         await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_hosted_idle_retirement_reaps_and_cold_starts_real_subprocess(
+    monkeypatch, tmp_path
+):
+    """Idle lifecycle telemetry and restart evidence come from a real child."""
+
+    service_script = tmp_path / "idle_lifecycle_service.py"
+    service_script.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import asyncio",
+                "from kestrel_sdk.isolated_feature import IsolatedFeatureService",
+                "",
+                "class IdleLifecycleService(IsolatedFeatureService):",
+                "    def __init__(self):",
+                "        super().__init__(name='idle-lifecycle', version='1.0.0')",
+                "        self.advertise_inbound_producer(False)",
+                "        self.register_host_ingress('poke', self.poke)",
+                "",
+                "    async def poke(self, payload):",
+                "        return {'generation': payload['generation']}",
+                "",
+                "async def main():",
+                "    await IdleLifecycleService().run_stdio()",
+                "",
+                "asyncio.run(main())",
+                "",
+            ]
+        )
+    )
+    service_script.chmod(0o755)
+
+    runtime = InstalledFeatureRuntime(
+        class_name="IdleLifecycleFeature",
+        entry_point="test_pkg.feature:IdleLifecycleFeature",
+        distribution="test-pkg",
+        runtime="isolated-venv",
+        service="idle-lifecycle-service",
+    )
+    snapshots = []
+    agent = Mock(
+        did=_TEST_AGENT_DID,
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        features={},
+    )
+    agent.storage = _Storage()
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    configure_hosted_isolated_runtime_lifecycle(
+        agent,
+        idle_timeout_seconds=3600,
+        telemetry_observer=snapshots.append,
+    )
+    monkeypatch.setenv(
+        "KESTREL_FEATURE_IDLELIFECYCLEFEATURE_BIN", str(service_script)
+    )
+    feature = ProxyFeature(agent, runtime)
+    first_process = second_process = None
+
+    try:
+        await feature.initialize()
+        first_process = feature._client.process
+        running = await feature.sample_runtime_telemetry()
+        assert first_process is not None
+        assert running.state == "running"
+        assert running.active_processes == 1
+        assert running.process_count == 1
+        assert running.rss_bytes is not None and running.rss_bytes > 0
+        assert running.open_fds is not None and running.open_fds > 0
+
+        assert feature._last_used_monotonic is not None
+        feature._last_used_monotonic -= 7200
+        retired = await feature._retire_idle_generation(
+            expected_activity_generation=feature._activity_generation,
+            expected_last_used=feature._last_used_monotonic,
+        )
+
+        assert retired is True
+        assert first_process.returncode is not None
+        idle = feature.runtime_telemetry_snapshot()
+        assert idle.state == "idle"
+        assert idle.active_processes == 0
+        assert idle.cleanup_eligible is True
+        assert idle.rss_bytes is None
+
+        work_dir = feature._feature_runtime_dir() / "work"
+        work_dir.rmdir()
+        assert work_dir.exists() is False
+
+        assert await feature.call_host_ingress("poke", {"generation": 2}) == {
+            "generation": 2
+        }
+        assert work_dir.is_dir()
+        second_process = feature._client.process
+        restarted = await feature.sample_runtime_telemetry()
+        assert second_process is not None
+        assert second_process.pid != first_process.pid
+        assert restarted.state == "running"
+        assert restarted.lifecycle_generation == 2
+        assert restarted.restart_count == 0
+        assert restarted.idle_wake_count == 1
+        assert restarted.process_count == 1
+        assert {snapshot.feature for snapshot in snapshots} == {
+            "IdleLifecycleFeature"
+        }
+    finally:
+        await feature.shutdown()
+
+    assert second_process is not None
+    assert second_process.returncode is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    _package_index_is_explicitly_disabled(),
+    reason="managed-venv integration requires the SDK package index",
+)
+async def test_hosted_idle_monitor_reclaims_and_reprovisions_real_managed_venv(
+    tmp_path,
+):
+    """The real deadline path reaps, reclaims, provisions, and cold-wakes."""
+
+    project = tmp_path / "idle-managed-project"
+    package = project / "idle_managed_feature"
+    package.mkdir(parents=True)
+    (project / "pyproject.toml").write_text(
+        """\
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idle-managed-feature"
+version = "1.0.0"
+dependencies = ["kestrel-sovereign-sdk>=0.37.0,<0.38"]
+
+[project.scripts]
+idle-managed-service = "idle_managed_feature.service:main"
+"""
+    )
+    (package / "__init__.py").write_text("")
+    (package / "service.py").write_text(
+        """\
+import asyncio
+
+from kestrel_sdk.isolated_feature import IsolatedFeatureService
+
+
+class IdleManagedService(IsolatedFeatureService):
+    def __init__(self):
+        super().__init__(name="idle-managed", version="1.0.0")
+        self.advertise_inbound_producer(False)
+        self.register_host_ingress("poke", self.poke)
+
+    async def poke(self, payload):
+        return {"generation": payload["generation"]}
+
+
+def main():
+    asyncio.run(IdleManagedService().run_stdio())
+"""
+    )
+
+    runtime = InstalledFeatureRuntime(
+        class_name="IdleManagedFeature",
+        entry_point="idle_managed_feature.feature:IdleManagedFeature",
+        distribution="idle-managed-feature",
+        runtime="isolated-venv",
+        service="idle-managed-service",
+        project=str(project),
+    )
+    snapshots = []
+    agent = Mock(
+        did=_TEST_AGENT_DID,
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        features={},
+    )
+    agent.storage = _Storage()
+    agent.isolated_runtime_root = tmp_path / "runtimes"
+    agent.isolated_runtime_namespace = "tenant/agent"
+    configure_hosted_isolated_runtime_lifecycle(
+        agent,
+        idle_timeout_seconds=0.1,
+        telemetry_observer=snapshots.append,
+    )
+    feature = ProxyFeature(agent, runtime)
+    first_process = second_process = None
+
+    try:
+        await feature.initialize()
+        first_process = feature._client.process
+        assert first_process is not None
+        assert feature._idle_monitor_task is not None
+        assert not feature._idle_monitor_task.done()
+
+        for _ in range(300):
+            if any(snapshot.state == "idle" for snapshot in snapshots):
+                break
+            await asyncio.sleep(0.02)
+        assert any(snapshot.state == "idle" for snapshot in snapshots)
+        assert first_process.returncode is not None
+
+        managed_venv = feature._feature_runtime_dir() / ".venv"
+        assert managed_venv.is_dir()
+        outcome = await feature.reclaim_idle_workspace()
+        assert outcome.value == "removed"
+        assert not managed_venv.exists()
+
+        assert await feature.call_host_ingress("poke", {"generation": 2}) == {
+            "generation": 2
+        }
+        second_process = feature._client.process
+        assert second_process is not None
+        assert second_process.pid != first_process.pid
+        assert managed_venv.is_dir()
+        assert feature._last_cache_hit is False
+    finally:
+        await feature.shutdown()
+
+    assert second_process is not None
+    assert second_process.returncode is not None
 
 
 @pytest.mark.asyncio

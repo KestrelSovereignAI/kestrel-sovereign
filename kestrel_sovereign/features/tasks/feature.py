@@ -102,6 +102,17 @@ class TaskFeature(Feature):
     # don't have to unpack a ToolResult envelope just to read state.
     # ------------------------------------------------------------------
 
+    def _durable_agent_id(self) -> Optional[str]:
+        """Return the host's durable identity, never a display-derived name."""
+
+        if self.agent is None:
+            return None
+        for attribute in ("did", "agent_id"):
+            value = getattr(self.agent, attribute, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
     async def _get_task_status_data(self, task_id: str) -> Dict[str, Any]:
         """Fetch a task and shape its status into a dict.
 
@@ -1074,6 +1085,13 @@ class TaskFeature(Feature):
         if terminal == TaskState.CANCELED:
             return await self.cancel_task(task_id, reason=content)
 
+        actor_agent_id = self._durable_agent_id()
+        if actor_agent_id is None:
+            return ToolResult.failed(
+                "Task response requires this agent's durable identity",
+                data={"task_id": task_id},
+            )
+
         try:
             task = await self.task_manager.get_task(task_id)
         except Exception as e:
@@ -1094,7 +1112,6 @@ class TaskFeature(Feature):
                 data={"task_id": task_id, "state": current.value},
             )
 
-        agent_name = getattr(self.agent, "did", None) or type(self.agent).__name__
         response_message = Message(
             role="agent",
             parts=[TextPart(text=content)],
@@ -1109,20 +1126,23 @@ class TaskFeature(Feature):
                 await self.task_manager.update_status(
                     task_id=task_id,
                     new_state=TaskState.WORKING,
-                    agent_name=agent_name,
+                    agent_name=actor_agent_id,
+                    recipient_agent_id=actor_agent_id,
                 )
                 updated = await self.task_manager.update_status(
                     task_id=task_id,
                     new_state=terminal,
                     message=response_message,
-                    agent_name=agent_name,
+                    agent_name=actor_agent_id,
+                    recipient_agent_id=actor_agent_id,
                 )
             else:
                 updated = await self.task_manager.update_status(
                     task_id=task_id,
                     new_state=terminal,
                     message=response_message,
-                    agent_name=agent_name,
+                    agent_name=actor_agent_id,
+                    recipient_agent_id=actor_agent_id,
                 )
         except ValueError as e:
             # Transition validator caught an illegal sequence (rare —
@@ -1220,9 +1240,12 @@ class TaskFeature(Feature):
                 data={"task_id": task_id},
             )
 
-        agent_name = (
-            getattr(self.agent, "did", None) or type(self.agent).__name__
-        )
+        actor_agent_id = self._durable_agent_id()
+        if actor_agent_id is None:
+            return ToolResult.failed(
+                "Task artifact attachment requires this agent's durable identity",
+                data={"task_id": task_id, "name": name, "index": index},
+            )
         artifact = Artifact(
             name=name,
             parts=[TextPart(text=content)],
@@ -1233,7 +1256,8 @@ class TaskFeature(Feature):
             updated = await self.task_manager.add_artifact(
                 task_id=task_id,
                 artifact=artifact,
-                agent_name=agent_name,
+                agent_name=actor_agent_id,
+                recipient_agent_id=actor_agent_id,
             )
         except ValueError as e:
             return ToolResult.failed(
@@ -1283,13 +1307,7 @@ class TaskFeature(Feature):
         if not self.task_manager:
             return ToolResult.failed("Task manager not available")
 
-        actor_agent_id = None
-        if self.agent is not None:
-            for attribute in ("did", "agent_id"):
-                value = getattr(self.agent, attribute, None)
-                if isinstance(value, str) and value:
-                    actor_agent_id = value
-                    break
+        actor_agent_id = self._durable_agent_id()
         if actor_agent_id is None:
             return ToolResult.failed(
                 "Task cancellation requires this agent's durable identity",

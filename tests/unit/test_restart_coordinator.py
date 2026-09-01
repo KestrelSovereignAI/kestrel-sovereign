@@ -1009,11 +1009,17 @@ def _attach_lifecycle(agent):
     agent._current_request_id = None
     agent._active_request_started_at = {}
     agent._cancelled_requests = set()
+    agent._pending_request_cancellations = {}
     for name in (
         "register_active_request",
+        "_prune_pending_request_cancellations",
+        "_consume_pending_request_cancellation",
         "prune_stale_active_requests",
         "active_request_ages",
         "_cleanup_cancelled_request",
+        "_request_generation_for_cleanup",
+        "_remember_pruned_cleanup_generation",
+        "_forget_pruned_cleanup_generation",
     ):
         setattr(
             agent, name,
@@ -2543,6 +2549,42 @@ async def test_idle_ignores_a2a_question_supervisor_tasks(tmp_path):
     finally:
         sup_task.cancel()
         replay_task.cancel()
+        work_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_idle_ignores_isolated_runtime_lifecycle_daemons(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+
+    async def _never():
+        await asyncio.Event().wait()
+
+    supervisor = asyncio.create_task(_never(), name="isolated-feature:Search")
+    idle_monitor = asyncio.create_task(
+        _never(), name="isolated-feature-idle:Search"
+    )
+    telemetry = asyncio.create_task(
+        _never(), name="isolated-runtime-telemetry:Search"
+    )
+    work_task = asyncio.create_task(_never(), name="isolated-call:Search")
+    try:
+        feat.agent._background_tasks = {supervisor, idle_monitor, telemetry}
+        assert feat._agent_appears_idle()["idle"] is True
+
+        feat.agent._background_tasks = {
+            supervisor,
+            idle_monitor,
+            telemetry,
+            work_task,
+        }
+        busy = feat._agent_appears_idle()
+        assert busy["idle"] is False
+        assert "isolated-call:Search" in busy["reason"]
+        assert "isolated-feature" not in busy["reason"]
+    finally:
+        supervisor.cancel()
+        idle_monitor.cancel()
+        telemetry.cancel()
         work_task.cancel()
 
 

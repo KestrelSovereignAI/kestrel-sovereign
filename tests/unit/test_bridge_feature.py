@@ -39,6 +39,8 @@ from kestrel_sovereign.features.bridge.protocol import (
 )
 from kestrel_sovereign.features.bridge.router import _build_context_note
 
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
+
 
 # ============================================================================
 # Helpers
@@ -781,6 +783,11 @@ class TestGetRouter:
         # Check it's an APIRouter with the expected prefix
         assert router.prefix == "/api/bridge"
         assert "bridge" in router.tags
+
+    def test_reuses_router_so_rate_limits_are_registered_once(self):
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        assert get_router() is get_router()
 
     def test_has_expected_routes(self):
         from kestrel_sovereign.features.bridge.router import get_router
