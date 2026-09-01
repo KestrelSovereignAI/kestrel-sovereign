@@ -600,14 +600,35 @@ _cursor_owned_inbound_protocol: ContextVar[bool] = ContextVar(
 _telegram_terminal_inbound_disposition: ContextVar[str | None] = ContextVar(
     "isolated_telegram_terminal_inbound_disposition", default=None
 )
-# The generic feature-config endpoint owns this task-local token only after it
-# has paused producers and drained Core admission. The child task that acquires
-# the agent's conversation boundary inherits the token, allowing ``set_config``
-# to keep the same fence instead of attempting a second drain while holding the
-# turn lock.
-_active_config_ingress_fence: ContextVar[tuple[object, bool] | None] = ContextVar(
-    "isolated_active_config_ingress_fence", default=None
-)
+@dataclass(slots=True)
+class _ConfigIngressFenceLease:
+    """Mutable authority for one exact proxy lifecycle ingress boundary.
+
+    Context variables are copied into child tasks.  Keeping liveness and exact
+    lifecycle identity on a shared object means a detached copy becomes inert
+    when its owner exits, while the endpoint can explicitly authorize only the
+    child task that acquired the agent's conversation boundary.
+    """
+
+    feature: object
+    lifecycle_generation: int
+    client: object | None
+    traffic_gate: object
+    owner_task: asyncio.Task[Any] | None
+    idle_wake_failed: bool
+    requires_closed_gate: bool
+    active: bool = True
+    authorized_task: asyncio.Task[Any] | None = None
+    transition_started: bool = False
+
+
+# The generic feature-config endpoint owns this task-local lease only after it
+# has paused producers and drained Core admission. Its conversation-bound child
+# inherits the object but must explicitly claim it before ``set_config`` may
+# reuse the fence. Detached ContextVar copies therefore carry no durable bypass.
+_active_config_ingress_fence: ContextVar[
+    _ConfigIngressFenceLease | None
+] = ContextVar("isolated_active_config_ingress_fence", default=None)
 
 # A staged config must survive a short process pause, but it must not turn an
 # interrupted deploy or process death into a permanent write lock.  Readers
@@ -9116,31 +9137,103 @@ class ProxyFeature(Feature):
             return True
         return False
 
+    def _config_ingress_lease_is_current(
+        self,
+        lease: object,
+        *,
+        require_current_client: bool,
+        require_current_task: bool,
+    ) -> bool:
+        """Whether one lease still owns this exact live ingress generation."""
+
+        if not isinstance(lease, _ConfigIngressFenceLease):
+            return False
+        if (
+            not lease.active
+            or lease.feature is not self
+            or lease.lifecycle_generation != self._terminal_lifecycle_generation
+            or lease.traffic_gate is not self._traffic_gate
+        ):
+            return False
+        if lease.requires_closed_gate and (
+            not self._traffic_gate.closed or self._traffic_gate.sealed
+        ):
+            return False
+        if require_current_client and self._client is not lease.client:
+            return False
+        if require_current_task:
+            current_task = asyncio.current_task()
+            if (
+                current_task is not lease.owner_task
+                and current_task is not lease.authorized_task
+            ):
+                return False
+        return True
+
+    def claim_config_transition_ingress_fence(self, lease: object) -> bool:
+        """Authorize the endpoint's exact conversation-bound transition task."""
+
+        if _active_config_ingress_fence.get() is not lease:
+            return False
+        if not self._config_ingress_lease_is_current(
+            lease,
+            require_current_client=True,
+            require_current_task=False,
+        ):
+            return False
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return False
+        if (
+            lease.authorized_task is not None
+            and lease.authorized_task is not current_task
+        ):
+            return False
+        lease.authorized_task = current_task
+        return True
+
     @asynccontextmanager
     async def config_transition_ingress_fence(self):
         """Drain isolated ingress before the endpoint takes CONVERSATION.
 
         The generic endpoint holds this boundary through config persistence,
         context-clause publication, and any rollback. Its owned transition task
-        inherits the task-local token below, so :meth:`set_config` reuses this
-        fence instead of attempting a traffic drain while it owns the agent's
-        turn lock.
+        inherits and explicitly claims the task-local lease, so
+        :meth:`set_config` reuses this fence instead of attempting a traffic
+        drain while it owns the agent's turn lock.
         """
 
         inherited = _active_config_ingress_fence.get()
-        if inherited is not None and inherited[0] is self:
-            yield
-            return
+        if inherited is not None and inherited.feature is self:
+            if self._config_ingress_lease_is_current(
+                inherited,
+                require_current_client=not inherited.transition_started,
+                require_current_task=True,
+            ):
+                yield inherited
+                return
+            if inherited.active:
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature changed during config ingress transition."
+                )
 
         async with self._config_ingress_transition_lock:
             idle_wake_failed = await self._wake_idle_for_config_transition()
             if self._terminal_lifecycle_latched or self._stopping:
-                token = _active_config_ingress_fence.set(
-                    (self, idle_wake_failed)
+                lease = _ConfigIngressFenceLease(
+                    feature=self,
+                    lifecycle_generation=self._terminal_lifecycle_generation,
+                    client=self._client,
+                    traffic_gate=self._traffic_gate,
+                    owner_task=asyncio.current_task(),
+                    idle_wake_failed=idle_wake_failed,
+                    requires_closed_gate=False,
                 )
+                token = _active_config_ingress_fence.set(lease)
                 try:
-                    yield
+                    yield lease
                 finally:
+                    lease.active = False
                     _active_config_ingress_fence.reset(token)
                 return
 
@@ -9148,6 +9241,7 @@ class ProxyFeature(Feature):
             gate_closed = False
             body_error: BaseException | None = None
             token = None
+            lease = None
             try:
                 if external_ingress_quiesce is not None:
                     await self._quiesce_external_ingress(
@@ -9156,15 +9250,23 @@ class ProxyFeature(Feature):
                 gate_closed = True
                 await self._close_traffic_gate_admission()
                 await self._drain_traffic_gate()
-                token = _active_config_ingress_fence.set(
-                    (self, idle_wake_failed)
+                lease = _ConfigIngressFenceLease(
+                    feature=self,
+                    lifecycle_generation=self._terminal_lifecycle_generation,
+                    client=self._client,
+                    traffic_gate=self._traffic_gate,
+                    owner_task=asyncio.current_task(),
+                    idle_wake_failed=idle_wake_failed,
+                    requires_closed_gate=True,
                 )
+                token = _active_config_ingress_fence.set(lease)
                 try:
-                    yield
+                    yield lease
                 except BaseException as exc:  # noqa: BLE001 - body outcome wins
                     body_error = exc
                     raise
                 finally:
+                    lease.active = False
                     _active_config_ingress_fence.reset(token)
                     token = None
             except BaseException as exc:  # noqa: BLE001 - finalizer still owns gate
@@ -9173,6 +9275,8 @@ class ProxyFeature(Feature):
                 raise
             finally:
                 if token is not None:
+                    if lease is not None:
+                        lease.active = False
                     _active_config_ingress_fence.reset(token)
 
                 async def finalize() -> None:
@@ -9256,15 +9360,36 @@ class ProxyFeature(Feature):
         """Serialize direct writers or reuse the endpoint's ingress fence."""
 
         inherited = _active_config_ingress_fence.get()
-        if inherited is not None and inherited[0] is self:
-            return await self._set_config_under_ingress_boundary(
-                config,
-                _preserve_secret_fields=_preserve_secret_fields,
-                _validate_effective_config=_validate_effective_config,
-                _expected_commit=_expected_commit,
-                _ingress_fenced=True,
-                _idle_wake_failed=inherited[1],
-            )
+        if inherited is not None and inherited.feature is self:
+            if self._config_ingress_lease_is_current(
+                inherited,
+                require_current_client=not inherited.transition_started,
+                require_current_task=True,
+            ):
+                inherited.transition_started = True
+                try:
+                    return await self._set_config_under_ingress_boundary(
+                        config,
+                        _preserve_secret_fields=_preserve_secret_fields,
+                        _validate_effective_config=_validate_effective_config,
+                        _expected_commit=_expected_commit,
+                        _ingress_fenced=True,
+                        _idle_wake_failed=inherited.idle_wake_failed,
+                    )
+                finally:
+                    # Re-arm exact-client validation for any later operation
+                    # in the same outer fence. During the call, reconciliation
+                    # may legitimately replace the client while the lease owns
+                    # the still-closed gate.
+                    inherited.client = self._client
+                    inherited.transition_started = False
+            if inherited.active:
+                # Waiting for the lock here would deadlock with the outer task
+                # that owns it. Fail closed; the endpoint returns a retryable
+                # generation conflict after the outer boundary unwinds.
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature changed during config ingress transition."
+                )
         async with self._config_ingress_transition_lock:
             return await self._set_config_under_ingress_boundary(
                 config,
@@ -10908,6 +11033,27 @@ class ProxyFeature(Feature):
         a shielded task so caller cancellation cannot release ``_reload_lock``
         with a paused producer or half-mutated gate left behind.
         """
+
+        inherited = _active_config_ingress_fence.get()
+        if inherited is not None and inherited.feature is self:
+            if self._config_ingress_lease_is_current(
+                inherited,
+                require_current_client=not inherited.transition_started,
+                require_current_task=True,
+            ):
+                task = asyncio.create_task(
+                    self._reconcile_client_to_authoritative_config(
+                        config,
+                        force=force,
+                    ),
+                    name=f"isolated-config-reconcile-owned:{self.name}",
+                )
+                await _await_task_until_complete(task, preserve_cancellation=False)
+                return
+            if inherited.active:
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature changed during config ingress transition."
+                )
 
         async def reconcile() -> None:
             external_ingress_quiesce = self._new_external_ingress_quiesce()

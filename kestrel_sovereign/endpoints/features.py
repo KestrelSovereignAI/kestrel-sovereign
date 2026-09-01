@@ -1018,7 +1018,7 @@ async def update_feature_config(
     # task below owns that agent's cognition boundary.
     async with _feature_config_update_lock(agent):
         feature = _get_feature_or_404(agent, name)
-        async with _feature_config_ingress_fence(feature):
+        async with _feature_config_ingress_fence(feature) as ingress_lease:
             return await _settle_feature_transition(
                 agent,
                 lambda: _update_feature_config_generation(
@@ -1026,6 +1026,7 @@ async def update_feature_config(
                     feature,
                     name,
                     body,
+                    ingress_lease,
                 ),
                 feature_name=name,
                 operation="configuration reconciliation",
@@ -1050,11 +1051,11 @@ async def _feature_config_ingress_fence(feature: object):
         feature, "config_transition_ingress_fence", None
     )
     if descriptor is None:
-        yield
+        yield None
         return
     fence = getattr(feature, "config_transition_ingress_fence")
-    async with fence():
-        yield
+    async with fence() as lease:
+        yield lease
 
 
 async def _update_feature_config_generation(
@@ -1062,6 +1063,7 @@ async def _update_feature_config_generation(
     expected_feature: object,
     name: str,
     body: ConfigUpdateRequest,
+    ingress_lease: object,
 ) -> Dict[str, Any]:
     """Mutate only the feature generation whose ingress was fenced."""
 
@@ -1074,6 +1076,19 @@ async def _update_feature_config_generation(
                 "retry against the current generation"
             ),
         )
+    claim_descriptor = inspect.getattr_static(
+        current, "claim_config_transition_ingress_fence", None
+    )
+    if ingress_lease is not None and claim_descriptor is not None:
+        claim = getattr(current, "claim_config_transition_ingress_fence")
+        if claim(ingress_lease) is not True:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Feature '{name}' changed while configuration was queued; "
+                    "retry against the current generation"
+                ),
+            )
     return await _update_feature_config_locked(agent, current, name, body)
 
 

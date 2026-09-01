@@ -11963,6 +11963,223 @@ async def test_endpoint_ingress_fence_is_reused_by_real_proxy_config_transition(
 
 
 @pytest.mark.asyncio
+async def test_nested_reconciliation_keeps_endpoint_ingress_fence_closed(
+    monkeypatch, tmp_path
+):
+    """A rollback reconciliation cannot finalize its caller's ingress fence."""
+
+    old_config = {"enabled": True, "revision": "old"}
+
+    class NestedFenceClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            state = (
+                "quiesced"
+                if name == "external-ingress-quiesce"
+                else "resumed"
+            )
+            return {"status": "ok", "http_status": 200, "state": state}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=NestedFenceClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        client = feature._client
+
+        async with feature.config_transition_ingress_fence():
+            await feature._reconcile_client_to_authoritative_config_with_ingress_fence(
+                old_config,
+                force=False,
+            )
+            assert feature._traffic_gate.closed is True
+            assert [call[0] for call in client.ingress_calls] == [
+                "external-ingress-quiesce"
+            ]
+
+        assert [call[0] for call in client.ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert feature._traffic_gate.closed is False
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_detached_task_cannot_reuse_expired_config_ingress_fence(
+    monkeypatch, tmp_path
+):
+    """A copied ContextVar lease reacquires ingress after its owner exits."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+    release_detached = asyncio.Event()
+
+    class DetachedFenceClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ingress_calls = []
+            self.prepare_gate_states = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            state = (
+                "quiesced"
+                if name == "external-ingress-quiesce"
+                else "resumed"
+            )
+            return {"status": "ok", "http_status": 200, "state": state}
+
+        async def prepare_config_transition(self, config):
+            self.prepare_gate_states.append(feature._traffic_gate.closed)
+            return ConfigTransitionResult.applied()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=DetachedFenceClient)
+    detached = None
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        client = feature._client
+
+        async with feature.config_transition_ingress_fence():
+            async def delayed_update():
+                await release_detached.wait()
+                return await feature.set_config(next_config)
+
+            detached = asyncio.create_task(delayed_update())
+
+        release_detached.set()
+        receipt = await asyncio.wait_for(detached, timeout=1)
+
+        assert receipt.config == next_config
+        assert client.prepare_gate_states == [True]
+        assert [call[0] for call in client.ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert feature._traffic_gate.closed is False
+    finally:
+        release_detached.set()
+        if detached is not None and not detached.done():
+            detached.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await detached
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_same_proxy_reenable_invalidates_active_config_ingress_lease(
+    monkeypatch, tmp_path
+):
+    """Object identity cannot carry a fence across disable/enable generations."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+
+    class LifecycleFenceClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.prepare_gate_states = []
+
+        async def prepare_config_transition(self, config):
+            self.prepare_gate_states.append(feature._traffic_gate.closed)
+            return ConfigTransitionResult.applied()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=LifecycleFenceClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        first_client = feature._client
+
+        async with feature.config_transition_ingress_fence():
+            await feature.shutdown()
+            await feature.initialize()
+            second_client = feature._client
+
+            assert second_client is not first_client
+            with pytest.raises(
+                IsolatedRuntimePreparationError,
+                match="changed during config ingress transition",
+            ):
+                await feature.set_config(next_config)
+
+            assert second_client.prepare_gate_states == []
+            assert feature._host_config == old_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_config_ingress_lease_binds_terminal_lifecycle_generation(
+    monkeypatch, tmp_path
+):
+    """A newer terminal intent invalidates a lease before client publication moves."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+
+    class GenerationFenceClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        async def prepare_config_transition(self, config):
+            return ConfigTransitionResult.applied()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=GenerationFenceClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        client = feature._client
+
+        async with feature.config_transition_ingress_fence():
+            # The synchronous generation bump is the revocation edge used by
+            # shutdown before it can acquire the reload lock or move _client.
+            feature._terminal_lifecycle_generation += 1
+
+            with pytest.raises(
+                IsolatedRuntimePreparationError,
+                match="changed during config ingress transition",
+            ):
+                await feature.set_config(next_config)
+
+            assert feature._client is client
+            assert feature._host_config == old_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_external_ingress_resumes_after_failed_transition_rollback(monkeypatch, tmp_path):
     """A failed staged transition resumes polling before reopening Core admission."""
 

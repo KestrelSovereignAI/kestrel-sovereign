@@ -1808,6 +1808,68 @@ class TestUpdateFeatureConfig:
         assert state == {"mode": "new"}
         assert response["config"] == {"mode": "new"}
 
+    @pytest.mark.asyncio
+    async def test_config_rejects_fence_from_superseded_feature_lifecycle(self):
+        """The generation fenced before CONVERSATION must still own ingress."""
+
+        fence_entered = asyncio.Event()
+        state = {"mode": "old"}
+
+        class LifecycleBoundFeature:
+            name = "TestFeature"
+            enabled = True
+            config_schema = None
+
+            def __init__(self):
+                self.generation = 0
+                self.set_calls = 0
+
+            async def get_config(self):
+                return dict(state)
+
+            async def set_config(self, config):
+                self.set_calls += 1
+                state.clear()
+                state.update(config)
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                lease = (self, self.generation)
+                fence_entered.set()
+                yield lease
+
+            def claim_config_transition_ingress_fence(self, lease):
+                return lease == (self, self.generation)
+
+        feature = LifecycleBoundFeature()
+        agent = _lifecycle_agent(features={feature.name: feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent.feature_config_transition():
+            update = asyncio.create_task(
+                features_endpoint.update_feature_config(
+                    request,
+                    feature.name,
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                )
+            )
+            await asyncio.wait_for(fence_entered.wait(), timeout=1)
+            feature.generation += 1
+
+        with pytest.raises(HTTPException) as error:
+            await asyncio.wait_for(update, timeout=1)
+
+        assert error.value.status_code == 409
+        assert "changed while configuration was queued" in error.value.detail
+        assert feature.set_calls == 0
+        assert state == {"mode": "old"}
+
     def test_updates_config(self):
         feature = _make_feature(config={"enabled": True})
         agent = _make_agent(features={"TestFeature": feature})
