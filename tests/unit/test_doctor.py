@@ -2304,12 +2304,34 @@ def test_postgres_doctor_rejects_same_hold_evidence_url_without_probing(
 
 
 @pytest.mark.parametrize(
-    ("target", "failure", "message"),
+    ("target", "failure", "message", "forbidden"),
     [
-        ("primary", "connection", "primary database is unreachable"),
-        ("evidence", "connection", "evidence database is unreachable"),
-        ("primary", "query", "requires EXECUTE on pg_catalog.pg_control_system"),
-        ("evidence", "query", "requires EXECUTE on pg_catalog.pg_control_system"),
+        ("primary", "connection", "primary database is unreachable", ""),
+        ("evidence", "connection", "evidence database is unreachable", ""),
+        (
+            "primary",
+            "query",
+            "requires EXECUTE on pg_catalog.pg_control_system",
+            "",
+        ),
+        (
+            "evidence",
+            "query",
+            "requires EXECUTE on pg_catalog.pg_control_system",
+            "",
+        ),
+        (
+            "primary",
+            "timeout",
+            "bounded diagnostic timed out",
+            "requires EXECUTE",
+        ),
+        (
+            "evidence",
+            "tooling",
+            "diagnostic tooling failed",
+            "requires EXECUTE",
+        ),
     ],
 )
 def test_postgres_doctor_probes_hold_database_connectivity_and_privilege(
@@ -2318,6 +2340,7 @@ def test_postgres_doctor_probes_hold_database_connectivity_and_privilege(
     target,
     failure,
     message,
+    forbidden,
 ):
     """Both custody services require connection and cluster-identity access."""
 
@@ -2332,11 +2355,12 @@ def test_postgres_doctor_probes_hold_database_connectivity_and_privilege(
 
     def _fail_cluster_probe(dsn, sql, params=(), **kwargs):
         if dsn == failed_dsn and "pg_control_system" in sql:
-            error_type = (
-                doctor._PostgresProbeConnectionError
-                if failure == "connection"
-                else doctor._PostgresProbeQueryError
-            )
+            error_type = {
+                "connection": doctor._PostgresProbeConnectionError,
+                "query": doctor._PostgresProbeQueryError,
+                "timeout": doctor._PostgresProbeTimeoutError,
+                "tooling": doctor._PostgresProbeError,
+            }[failure]
             raise error_type("injected evidence probe failure")
         return original_fetch(dsn, sql, params, **kwargs)
 
@@ -2350,6 +2374,8 @@ def test_postgres_doctor_probes_hold_database_connectivity_and_privilege(
 
     assert not report.ready
     assert any(message in item for item in report.fail), report.fail
+    if forbidden:
+        assert not any(forbidden in item for item in report.fail), report.fail
 
 
 def test_postgres_doctor_rejects_invalid_cluster_identity(tmp_path, monkeypatch):

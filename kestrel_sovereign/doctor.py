@@ -363,11 +363,21 @@ def _read_postgres_cluster_identity(
                 f"PostgreSQL Hold {label} database is unreachable: "
                 f"{_safe(exc, source)}"
             )
-        else:
+        elif failure == "runtime_database":
             report.fail.append(
                 f"PostgreSQL Hold {label} cluster identity NOT verified: "
                 "the runtime role requires EXECUTE on "
                 f"pg_catalog.pg_control_system() ({_safe(exc, source)})"
+            )
+        elif failure == "diagnostic_timeout":
+            report.fail.append(
+                f"PostgreSQL Hold {label} cluster identity NOT verified: "
+                f"the bounded diagnostic timed out ({_safe(exc, source)})"
+            )
+        else:
+            report.fail.append(
+                f"PostgreSQL Hold {label} cluster identity NOT verified: "
+                f"diagnostic tooling failed ({_safe(exc, source)})"
             )
         return None
 

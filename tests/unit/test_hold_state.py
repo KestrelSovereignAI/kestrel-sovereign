@@ -3383,6 +3383,60 @@ async def test_sqlite_bootstrap_intent_recovers_after_schema_commit(
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_intent_cannot_reanchor_different_receipt_history(tmp_path):
+    """A restored bootstrap marker authorizes only its recorded receipt head."""
+
+    path = tmp_path / "bootstrap-history-binding.db"
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await store.set_hold(
+        scope="host",
+        actor_id="did:sovereign:operator",
+        reason="survives evidence restore",
+        operation_id="bootstrap-binding-hold",
+    )
+    assert store._initialization_witness_path is not None
+    assert store._history_anchor_path is not None
+    store._initialization_witness_path.unlink()
+    store._history_anchor_path.unlink()
+    store._write_bootstrap_intent(
+        store._history_anchor_payload_from_rows([])
+    )
+
+    try:
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="bootstrap intent does not match receipt history",
+        ):
+            await store.ensure_schema()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_ensure_schema_does_not_self_chain_typed_failure(
+    hold_db,
+    monkeypatch,
+):
+    """A direct Hold refusal remains inspectable as a normal exception chain."""
+
+    _db, store = hold_db
+    refusal = HoldCorruptStateError("injected typed refusal")
+    monkeypatch.setattr(
+        store,
+        "_ensure_external_schema_protocol",
+        AsyncMock(side_effect=refusal),
+    )
+
+    with pytest.raises(HoldCorruptStateError) as caught:
+        await store.ensure_schema()
+
+    assert caught.value is refusal
+    assert caught.value.__cause__ is not caught.value
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["get", "set", "release"])
 async def test_imported_duplicate_latch_fails_closed_on_single_target_paths(
     tmp_path,
