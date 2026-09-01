@@ -562,12 +562,17 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     canonical activation used by boot and the disable/enable rails alike.
     """
     agent = get_agent(request)
-    return await _settle_feature_transition(
-        agent,
-        lambda: _enable_feature_locked(agent, name),
-        feature_name=name,
-        operation="enable",
-    )
+    # Config PATCH takes this mutex before its ingress fence and then queues on
+    # CONVERSATION. Enable can reach an isolated setter while it owns that turn
+    # boundary, so it must take the same outer mutex first; otherwise PATCH can
+    # own ingress while enable owns CONVERSATION and both wait forever.
+    async with _feature_config_update_lock(agent):
+        return await _settle_feature_transition(
+            agent,
+            lambda: _enable_feature_locked(agent, name),
+            feature_name=name,
+            operation="enable",
+        )
 
 
 async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
@@ -710,12 +715,16 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     disable also use.
     """
     agent = get_agent(request)
-    return await _settle_feature_transition(
-        agent,
-        lambda: _disable_feature_locked(agent, name),
-        feature_name=name,
-        operation="disable",
-    )
+    # A failed teardown re-activates the previous generation. Serialize that
+    # possible config-bearing rollback with PATCH/enable before taking the turn
+    # boundary so rollback cannot recreate their lock-order inversion.
+    async with _feature_config_update_lock(agent):
+        return await _settle_feature_transition(
+            agent,
+            lambda: _disable_feature_locked(agent, name),
+            feature_name=name,
+            operation="disable",
+        )
 
 
 async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
@@ -931,12 +940,13 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     # awaits may enter privacy-governed work without waiting on a lock held by
     # their HTTP parent.  The settlement helper still cancels a child that was
     # cancelled while QUEUED, and only shields it after acquisition.
-    return await _settle_feature_transition(
-        agent,
-        lambda: _remove_feature_locked(agent, pkg_info),
-        feature_name=name,
-        operation="remove",
-    )
+    async with _feature_config_update_lock(agent):
+        return await _settle_feature_transition(
+            agent,
+            lambda: _remove_feature_locked(agent, pkg_info),
+            feature_name=name,
+            operation="remove",
+        )
 
 
 async def _remove_feature_locked(

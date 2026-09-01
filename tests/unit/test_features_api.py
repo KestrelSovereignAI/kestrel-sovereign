@@ -303,6 +303,96 @@ class TestGetFeatureDetail:
 
 class TestEnableFeature:
     @pytest.mark.asyncio
+    async def test_enable_and_config_use_ingress_before_conversation_lock(self):
+        """A config PATCH cannot deadlock a concurrent runtime re-enable."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class IngressFeature(SDKFixtureFeature):
+            contribution_prefix = "enable-config-lock-order"
+            config_schema = {"type": "object", "additionalProperties": True}
+
+            def __init__(self, agent):
+                super().__init__(agent)
+                self._config_ingress_lock = asyncio.Lock()
+                self.activation_started = asyncio.Event()
+                self.release_activation = asyncio.Event()
+                self.config = {"mode": "old"}
+                self._active_lease = None
+                self._authorized_task = None
+
+            async def initialize(self):
+                self.activation_started.set()
+                await self.release_activation.wait()
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                async with self._config_ingress_lock:
+                    lease = object()
+                    self._active_lease = lease
+                    try:
+                        yield lease
+                    finally:
+                        self._active_lease = None
+                        self._authorized_task = None
+
+            def claim_config_transition_ingress_fence(self, lease):
+                if lease is not self._active_lease:
+                    return False
+                self._authorized_task = asyncio.current_task()
+                return True
+
+            async def get_config(self):
+                return dict(self.config)
+
+            async def set_config(self, config):
+                if asyncio.current_task() is self._authorized_task:
+                    self.config = dict(config)
+                    return
+                async with self._config_ingress_lock:
+                    self.config = dict(config)
+
+        agent = _lifecycle_agent()
+        feature = IngressFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        agent._declared_feature_config = lambda _name: {"mode": "declared"}
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        enable = asyncio.create_task(
+            features_endpoint.enable_feature(request, feature.name)
+        )
+        await asyncio.wait_for(feature.activation_started.wait(), timeout=1)
+        update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "patched"}),
+            )
+        )
+        # Give the competing request a chance to take the wrong first lock.
+        await asyncio.sleep(0.05)
+        feature.release_activation.set()
+
+        _done, pending = await asyncio.wait({enable, update}, timeout=0.5)
+        deadlocked = bool(pending)
+        if deadlocked:
+            # A queued PATCH owns ingress while enable owns CONVERSATION. Cancel
+            # the queued PATCH so its fence unwinds and the test can fail cleanly.
+            update.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(update, timeout=1)
+            await asyncio.wait_for(enable, timeout=1)
+
+        assert not deadlocked
+        assert (await enable)["status"] == "enabled"
+        assert (await update)["config"] == {"mode": "patched"}
+
+    @pytest.mark.asyncio
     async def test_queued_cognition_rechecks_safe_mode_after_transition_lock(self):
         """A turn admitted before a quarantine latch cannot run afterward."""
 
