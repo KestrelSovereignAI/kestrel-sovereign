@@ -29,3 +29,19 @@ def test_multi_agent_entrypoint_refuses_durable_cloudrun():
     assert "per agent; refusing local inception" in script
     assert "is_test_instance=True" in script
     assert "is_demo=True" in script
+
+
+def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
+    """A persistent Hold directory is host state, not an agent candidate."""
+
+    script = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text()
+
+    control_dir = script.index('HOST_CONTROL_DIR="$(dirname -- ')
+    agent_loop = script.index('for dir in "$AGENT_DATA_DIR"/*/')
+    exclusion = script.index(
+        '[ "${dir%/}" = "${HOST_CONTROL_DIR%/}" ] && continue',
+        agent_loop,
+    )
+    inception = script.index("create_kestrel_identity", agent_loop)
+
+    assert control_dir < agent_loop < exclusion < inception
