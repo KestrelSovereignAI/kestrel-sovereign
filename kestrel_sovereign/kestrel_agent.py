@@ -119,6 +119,7 @@ if TYPE_CHECKING:
         PeerRequester,
     )
     from kestrel_sovereign.knowledge.inference import InferenceProfile
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -577,6 +578,7 @@ class KestrelAgent(
         *,
         database_url: Optional[str] = None,
         db_backend: Optional[str] = None,
+        shared_postgres_advisory_backend: Optional["PostgresBackend"] = None,
         allowed_features: Optional[set] = None,
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
@@ -621,6 +623,11 @@ class KestrelAgent(
                 copied from the supplied pool.
             db_backend: Database backend type ('sqlite' or 'postgres').
                        Defaults to KESTREL_DB_BACKEND env var or 'sqlite'.
+            shared_postgres_advisory_backend: Optional trusted host
+                       ``PostgresBackend`` wrapping the exact same ``pg_pool``.
+                       Hosted child agents delegate session advisory locks to
+                       its one bounded pool. The host owns its lifecycle;
+                       standalone agents omit this and retain a private pool.
             allowed_features: Optional set of feature class names to load.
                        If None, all discovered features are loaded.
                        Mandatory features always load regardless.
@@ -1261,6 +1268,9 @@ class KestrelAgent(
 
         # Determine database backend
         self._db_backend = effective_db_backend
+        self._shared_postgres_advisory_backend = (
+            shared_postgres_advisory_backend
+        )
         # Birth-record capability the runtime database could not be given and
         # no retry can supply (#2871). Surfaced by the ``birth_record`` health
         # check; empty on every healthy agent.
@@ -1901,6 +1911,21 @@ class KestrelAgent(
                 f"with per-request passphrase"
             )
 
+    def _build_shared_pool_postgres_backend(self):
+        """Build this agent's storage backend over its host-supplied pool."""
+
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        return PostgresBackend.from_pool(
+            self.pg_pool,
+            advisory_dsn=(
+                None
+                if self._shared_postgres_advisory_backend is not None
+                else self._explicit_advisory_dsn
+            ),
+            advisory_backend=self._shared_postgres_advisory_backend,
+        )
+
     async def initialize(self) -> None:
         """Boot the agent as an explicit, ordered, rollback-safe phase sequence.
 
@@ -2012,16 +2037,12 @@ class KestrelAgent(
         if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
             # PostgreSQL backend - reuse shared pool if available
             if self.pg_pool:
-                from kestrel_sovereign.storage.db.postgres import PostgresBackend
                 # A PostgreSQL scheduler effect holds a session advisory gate
                 # across target execution. Its bounded dedicated pool needs the
                 # same DSN, never the shared operational pool, or a waiting
                 # fence could consume the connection required for renewal/final
                 # CAS. A missing DSN fails clearly at the first scheduler gate.
-                pg_backend = PostgresBackend.from_pool(
-                    self.pg_pool,
-                    advisory_dsn=self._explicit_advisory_dsn,
-                )
+                pg_backend = self._build_shared_pool_postgres_backend()
                 self._raw_storage = AsyncStorage(
                     backend=pg_backend,
                     agent_id=self.did,

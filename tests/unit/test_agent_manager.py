@@ -5122,6 +5122,57 @@ class TestLoadFromConfig:
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_postgres_host_factory_wires_one_shared_pool_into_every_agent(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        monkeypatch,
+        tmp_path,
+    ):
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        class _Pool:
+            def get_max_size(self):
+                return 10
+
+        pool = _Pool()
+        host_backend = PostgresBackend.from_pool(
+            pool,
+            advisory_dsn="postgresql://host/kestrel",
+            advisory_max_pool_size=6,
+        )
+        mock_agent_cls.side_effect = [
+            _make_mock_agent("did:tenant-a"),
+            _make_mock_agent("did:tenant-b"),
+        ]
+        mock_get_did.side_effect = ["did:tenant-a", "did:tenant-b"]
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+        manager = AgentManager(
+            base_data_dir=tmp_path,
+            shared_postgres_backend=host_backend,
+        )
+        config = LocalAgentConfig(data_dir=Path("agent_data/companion"), port=8801)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("Companion A", config)
+            await manager._initialize_agent("Companion B", config)
+
+        first, second = (call.kwargs for call in mock_agent_cls.call_args_list)
+        assert first["pg_pool"] is pool
+        assert second["pg_pool"] is pool
+        assert first["shared_postgres_advisory_backend"] is host_backend
+        assert second["shared_postgres_advisory_backend"] is host_backend
+        assert host_backend._advisory_max_pool_size == 6
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_postgres_host_factory_binds_per_agent_lifecycle_policy(
         self,
         mock_llm_cls,

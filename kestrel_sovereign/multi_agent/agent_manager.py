@@ -631,7 +631,15 @@ class AgentManager:
                 HostedIsolatedRuntimeLifecyclePolicy | None,
             ]
         ] = None,
+        shared_postgres_backend: object | None = None,
     ):
+        if shared_postgres_backend is not None:
+            from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+            if not isinstance(shared_postgres_backend, PostgresBackend):
+                raise TypeError("shared_postgres_backend must be a PostgresBackend")
+            if not shared_postgres_backend.is_connected:
+                raise ValueError("shared_postgres_backend must already be connected")
         self._agents: dict[str, KestrelAgent] = {}
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
@@ -655,6 +663,10 @@ class AgentManager:
         self._hosted_isolated_runtime_lifecycle_policy_factory = (
             hosted_isolated_runtime_lifecycle_policy_factory
         )
+        # The server owns this backend and closes it only after the manager has
+        # terminally drained every child. Each hosted child gets the exact same
+        # operational pool and delegates advisory sessions back to this owner.
+        self._shared_postgres_backend = shared_postgres_backend
         self._lock = asyncio.Lock()
         # Inbound hosted A2A verification/authorization/task persistence holds
         # a shared reader lease from DID resolution through create_task.
@@ -1679,12 +1691,21 @@ class AgentManager:
                 runtime_root, runtime_namespace = self._isolated_runtime_scope(
                     agent_did
                 )
+                shared_postgres_pool = (
+                    self._shared_postgres_backend.operational_pool
+                    if self._shared_postgres_backend is not None
+                    else None
+                )
                 agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
                     llm_service=llm_service,
                     database_url=database_url,
                     db_backend="postgres",
+                    pg_pool=shared_postgres_pool,
+                    shared_postgres_advisory_backend=(
+                        self._shared_postgres_backend
+                    ),
                     allowed_features=allowed_features,
                     host_context_clause_registry=self._host_context_clause_registry,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
