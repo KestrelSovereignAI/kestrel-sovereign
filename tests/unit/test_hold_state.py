@@ -1004,6 +1004,43 @@ async def test_postgres_factory_closes_pool_when_core_schema_init_fails(
 
 
 @pytest.mark.asyncio
+async def test_connected_backend_exits_schema_guard_before_failure_close(
+    monkeypatch,
+):
+    """Unlock the bootstrap session before closing all backend-owned pools."""
+
+    events: list[str] = []
+
+    class _Backend:
+        backend_type = "postgres"
+
+        async def close(self):
+            events.append("close")
+
+    @asynccontextmanager
+    async def initialization_guard():
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    async def _fail_schema(_self):
+        events.append("schema")
+        raise RuntimeError("core schema failed")
+
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", _fail_schema)
+
+    with pytest.raises(RuntimeError, match="core schema failed"):
+        await AsyncDatabase.from_connected_backend(
+            _Backend(),
+            initialization_guard=initialization_guard(),
+        )
+
+    assert events == ["lock", "schema", "unlock", "close"]
+
+
+@pytest.mark.asyncio
 async def test_postgres_factory_forwards_explicit_pool_budget(monkeypatch):
     """Special-purpose stores can reserve only their justified connections."""
 
@@ -2820,6 +2857,12 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
                 return [(None,)]
             raise AssertionError(f"unexpected custody query: {query}")
 
+        @asynccontextmanager
+        async def advisory_locks(self, keys):
+            assert keys == ((0x004B4553, 0x5343484D),)
+            events.append(("schema-lock", self))
+            yield
+
         async def close(self):
             events.append(("close", self))
 
@@ -2830,9 +2873,11 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
         async def close(self):
             await self.backend.close()
 
-    async def _from_connected(_cls, backend):
+    async def _from_connected(_cls, backend, *, initialization_guard=None):
         assert backend.validated
-        events.append(("schema", backend))
+        assert initialization_guard is not None
+        async with initialization_guard:
+            events.append(("schema", backend))
         return _DB(backend)
 
     async def _reopen_by_dsn(*_args, **_kwargs):
@@ -2865,7 +2910,98 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
             if event == ("validate", backend)
         )
         schema = events.index(("schema", backend))
-        assert validation < schema
+        schema_lock = events.index(("schema-lock", backend))
+        assert validation < schema_lock < schema
+
+
+@pytest.mark.asyncio
+async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
+    monkeypatch,
+):
+    """Concurrent blank-pair starts cannot race PostgreSQL catalog creation."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    connect_barrier = asyncio.Barrier(4)
+    schema_locks = {
+        "postgresql://primary/db": asyncio.Lock(),
+        "postgresql://evidence/db": asyncio.Lock(),
+    }
+    active = {dsn: 0 for dsn in schema_locks}
+    max_active = {dsn: 0 for dsn in schema_locks}
+
+    class _Backend:
+        def __init__(self, *, dsn, min_pool_size, max_pool_size):
+            self.dsn = dsn
+            assert (min_pool_size, max_pool_size) == (1, 1)
+
+        async def connect(self):
+            await connect_barrier.wait()
+
+        async def fetch_all(self, query, params=()):
+            if "pg_control_system" in query:
+                return [(self.dsn,)]
+            if "to_regclass" in query:
+                return [(None,)]
+            raise AssertionError(f"unexpected custody query: {query}")
+
+        @asynccontextmanager
+        async def advisory_locks(self, keys):
+            assert keys == ((0x004B4553, 0x5343484D),)
+            async with schema_locks[self.dsn]:
+                yield
+
+        async def close(self):
+            return None
+
+    class _DB:
+        def __init__(self, backend):
+            self.backend = backend
+
+        async def close(self):
+            await self.backend.close()
+
+    async def _from_connected(_cls, backend, *, initialization_guard=None):
+        assert initialization_guard is not None
+        async with initialization_guard:
+            active[backend.dsn] += 1
+            max_active[backend.dsn] = max(
+                max_active[backend.dsn], active[backend.dsn]
+            )
+            try:
+                # Reproduce the catalog window in which two CREATE TABLE IF NOT
+                # EXISTS initializers would both pass the existence probe.
+                await asyncio.sleep(0.01)
+                if active[backend.dsn] != 1:
+                    raise RuntimeError("duplicate catalog relation")
+                return _DB(backend)
+            finally:
+                active[backend.dsn] -= 1
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
+    monkeypatch.setattr(
+        AsyncDatabase,
+        "from_connected_backend",
+        classmethod(_from_connected),
+    )
+
+    pairs = await asyncio.gather(
+        initialize_postgres_hold_databases(
+            "postgresql://primary/db",
+            "postgresql://evidence/db",
+        ),
+        initialize_postgres_hold_databases(
+            "postgresql://primary/db",
+            "postgresql://evidence/db",
+        ),
+    )
+
+    assert len(pairs) == 2
+    assert max_active == {
+        "postgresql://primary/db": 1,
+        "postgresql://evidence/db": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -2896,6 +3032,11 @@ async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
                 return [(None,)]
             raise AssertionError(f"unexpected custody query: {query}")
 
+        @asynccontextmanager
+        async def advisory_locks(self, keys):
+            assert keys == ((0x004B4553, 0x5343484D),)
+            yield
+
         async def close(self):
             self.close_count += 1
 
@@ -2906,10 +3047,12 @@ async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
         async def close(self):
             await self.backend.close()
 
-    async def _from_connected(_cls, backend):
-        if "evidence" in backend.dsn:
-            raise RuntimeError("injected evidence schema failure")
-        return _DB(backend)
+    async def _from_connected(_cls, backend, *, initialization_guard=None):
+        assert initialization_guard is not None
+        async with initialization_guard:
+            if "evidence" in backend.dsn:
+                raise RuntimeError("injected evidence schema failure")
+            return _DB(backend)
 
     monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
     monkeypatch.setattr(
@@ -2965,6 +3108,48 @@ async def test_postgres_evidence_lock_recovers_partial_pair_binding(monkeypatch)
         primary.metadata["hold_primary_custody_binding_v1"]
         == evidence.metadata["hold_evidence_custody_binding_v1"]
     )
+
+
+@pytest.mark.asyncio
+async def test_postgres_binding_race_does_not_strand_losing_evidence_domain():
+    """A competing evidence pair loses before publishing its durable role."""
+
+    primary = _PostgresCustodyFacade("cluster-primary")
+    evidence_a = _PostgresCustodyFacade("cluster-evidence-a")
+    evidence_b = _PostgresCustodyFacade("cluster-evidence-b")
+    first_read = asyncio.Barrier(2)
+
+    class _RacingStore(HoldStore):
+        def __init__(self, db, *, evidence_db):
+            super().__init__(db, evidence_db=evidence_db)
+            self._first_role_read = True
+
+        async def _read_postgres_custody_roles(self, evidence_db):
+            roles = await super()._read_postgres_custody_roles(evidence_db)
+            if self._first_role_read:
+                self._first_role_read = False
+                await first_read.wait()
+            return roles
+
+    results = await asyncio.gather(
+        _RacingStore(
+            primary, evidence_db=evidence_a
+        )._assert_postgres_evidence_domain_independent(),
+        _RacingStore(
+            primary, evidence_db=evidence_b
+        )._assert_postgres_evidence_domain_independent(),
+        return_exceptions=True,
+    )
+
+    assert sum(result is None for result in results) == 1
+    assert sum(isinstance(result, HoldStateError) for result in results) == 1
+    primary_binding = primary.metadata["hold_primary_custody_binding_v1"]
+    evidence_bindings = [
+        evidence.metadata.get("hold_evidence_custody_binding_v1")
+        for evidence in (evidence_a, evidence_b)
+    ]
+    assert evidence_bindings.count(primary_binding) == 1
+    assert evidence_bindings.count(None) == 1
 
 
 @pytest.mark.asyncio

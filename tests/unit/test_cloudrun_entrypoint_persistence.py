@@ -39,9 +39,10 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
     control_dir = script.index('HOST_CONTROL_DIR="$(dirname -- ')
     agent_loop = script.index('for dir in "$AGENT_DATA_DIR"/*/')
     exclusion = script.index(
-        '[ "${dir%/}" = "${HOST_CONTROL_DIR%/}" ] && continue',
+        'case "${HOST_CONTROL_DIR%/}/" in',
         agent_loop,
     )
+    subtree = script.index('"${dir%/}/"*) continue ;;', exclusion)
     inception = script.index("create_kestrel_identity", agent_loop)
 
-    assert control_dir < agent_loop < exclusion < inception
+    assert control_dir < agent_loop < exclusion < subtree < inception

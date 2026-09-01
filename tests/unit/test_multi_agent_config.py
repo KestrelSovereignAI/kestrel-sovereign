@@ -535,6 +535,24 @@ class TestAutoDiscovery:
 
         assert list(config.agents) == ["real-agent"]
 
+    def test_auto_discover_excludes_nested_host_control_subtree(
+        self, tmp_path, monkeypatch
+    ):
+        """A custom nested custody path reserves its direct child subtree."""
+
+        agent_data = tmp_path / "agent_data"
+        agent_dir = agent_data / "real-agent"
+        host_dir = agent_data / "host-data" / "control"
+        agent_dir.mkdir(parents=True)
+        host_dir.mkdir(parents=True)
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH", str(host_dir / "kestrel_host.db")
+        )
+
+        config = MultiAgentConfig.auto_discover(agent_data, include_empty=True)
+
+        assert list(config.agents) == ["real-agent"]
+
     def test_auto_discover_skips_invalid_dirs(self, tmp_path):
         """Test that auto-discovery skips directories without kestrel_prime.db."""
         agent_data = tmp_path / "agent_data"

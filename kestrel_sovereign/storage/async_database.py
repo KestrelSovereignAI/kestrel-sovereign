@@ -990,17 +990,25 @@ class AsyncDatabase:
     async def from_connected_backend(
         cls,
         backend: DatabaseBackend,
+        *,
+        initialization_guard: Any = None,
     ) -> "AsyncDatabase":
         """Take ownership of a connected backend and initialize its schema.
 
         Callers that must inspect a specific connected pool before any schema
         mutation use this boundary rather than discarding that pool and opening
-        a second one through :meth:`postgres`.
+        a second one through :meth:`postgres`. ``initialization_guard`` may be
+        an async context manager that serializes the first schema publication;
+        it is exited before failure cleanup closes the owned backend.
         """
 
         db = cls(backend)
         try:
-            await db._init_schema()
+            if initialization_guard is None:
+                await db._init_schema()
+            else:
+                async with initialization_guard:
+                    await db._init_schema()
         except BaseException:
             await _close_failed_database_initialization(db)
             raise
