@@ -23,6 +23,7 @@ from kestrel_sovereign.agent.context_builder import (
     MANDATORY_SYSTEM_SUBSECTIONS,
 )
 from kestrel_sovereign.agent.context_manager import ContextManager, ContextResult
+from kestrel_sovereign.agent.context_stages import EPHEMERAL_NOTICE
 from kestrel_sovereign.agent.token_budget import ElasticTokenBudget, RESPONSE_RESERVE
 
 
@@ -126,6 +127,67 @@ class TestMeasureMandatoryFloor:
 
 
 class TestDegradedModeFlow:
+    @pytest.mark.asyncio
+    async def test_fallback_formatter_funds_its_exact_mandatory_floor(self):
+        """Optional legacy bytes cannot make a valid tracked fallback degrade."""
+
+        storage = MagicMock()
+        cb = ContextBuilder(storage)
+        cb._bootstrap_loader._cache = OrderedDict(
+            [("TOOLS.md", "optional tool notes")]
+        )
+        cb._bootstrap_loader._loaded = True
+        cm = ContextManager(storage=storage, context_builder=cb)
+        constitution = "word " * 5_000
+
+        result = await cm.build_context_plan(
+            query="",
+            constitution=constitution,
+            include_briefing=False,
+            include_memories=False,
+            include_rag=False,
+            conversation_history=[],
+        )
+
+        tracked_floor = cb.measure_mandatory_system_tokens(
+            constitution=constitution,
+            tracked_prompt=True,
+        )
+        assert result.degraded_mode is False
+        assert result.mandatory_system_tokens == tracked_floor
+        assert result.total_tokens <= result.total_budget
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_fallback_reports_tracked_mandatory_floor(self):
+        """EPHEMERAL fallback preflight and evidence use the renderer it sends."""
+
+        storage = MagicMock()
+        cb = ContextBuilder(storage)
+        cb._bootstrap_loader._cache = OrderedDict(
+            [
+                ("SOUL.md", "mandatory identity"),
+                ("TOOLS.md", "optional tool notes " * 100_000),
+            ]
+        )
+        cb._bootstrap_loader._loaded = True
+        cm = ContextManager(storage=storage, context_builder=cb)
+
+        result = await cm.build_context_plan(
+            query="",
+            constitution="C",
+            include_briefing=False,
+            privacy_mode="EPHEMERAL",
+        )
+
+        tracked_floor = cb.measure_mandatory_system_tokens(
+            constitution="C",
+            required_suffix=EPHEMERAL_NOTICE,
+            tracked_prompt=True,
+        )
+        assert result.degraded_mode is False
+        assert tracked_floor > 0
+        assert result.mandatory_system_tokens == tracked_floor
+
     @pytest.mark.asyncio
     async def test_optional_legacy_prompt_is_trimmed_for_tool_aware_ceiling(self):
         """Large optional bootstrap text yields to required tool schemas.

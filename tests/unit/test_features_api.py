@@ -3,6 +3,7 @@
 import asyncio
 import shlex
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -1740,6 +1741,73 @@ class TestGetFeatureConfig:
 
 
 class TestUpdateFeatureConfig:
+    @pytest.mark.asyncio
+    async def test_isolated_ingress_drains_before_config_takes_turn_lock(self):
+        """An admitted callback cannot invert ingress-drain and turn locks."""
+
+        state = {"mode": "old"}
+        release_cognition = asyncio.Event()
+        cognition_done = asyncio.Event()
+        fence_entered = False
+
+        class AdmittedIngressFeature:
+            name = "TestFeature"
+            enabled = True
+            config_schema = None
+
+            async def get_config(self):
+                return dict(state)
+
+            async def set_config(self, config):
+                # The old endpoint first takes CONVERSATION, then reaches the
+                # isolated setter's traffic drain. The admitted callback below
+                # needs that same turn lock, reproducing the production cycle.
+                release_cognition.set()
+                await asyncio.wait_for(cognition_done.wait(), timeout=0.05)
+                state.clear()
+                state.update(config)
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                nonlocal fence_entered
+                fence_entered = True
+                release_cognition.set()
+                await asyncio.wait_for(cognition_done.wait(), timeout=1)
+                yield
+
+        feature = AdmittedIngressFeature()
+        agent = _lifecycle_agent(features={feature.name: feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async def admitted_cognition():
+            await release_cognition.wait()
+            async with agent._turn_lifecycle():
+                cognition_done.set()
+
+        cognition = asyncio.create_task(admitted_cognition())
+        try:
+            response = await asyncio.wait_for(
+                features_endpoint.update_feature_config(
+                    request,
+                    feature.name,
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                ),
+                timeout=1,
+            )
+        finally:
+            release_cognition.set()
+            await asyncio.wait_for(cognition, timeout=1)
+
+        assert fence_entered is True
+        assert state == {"mode": "new"}
+        assert response["config"] == {"mode": "new"}
+
     def test_updates_config(self):
         feature = _make_feature(config={"enabled": True})
         agent = _make_agent(features={"TestFeature": feature})

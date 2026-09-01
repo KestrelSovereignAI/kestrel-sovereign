@@ -11899,6 +11899,70 @@ async def test_external_ingress_quiesces_callback_while_admission_is_open_then_d
 
 
 @pytest.mark.asyncio
+async def test_endpoint_ingress_fence_is_reused_by_real_proxy_config_transition(
+    monkeypatch, tmp_path
+):
+    """The endpoint-owned fence remains the only producer boundary."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+
+    class FencedIngressClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                assert feature._traffic_gate.closed is False
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            assert feature._traffic_gate.closed is True
+            return {"status": "ok", "http_status": 200, "state": "resumed"}
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            assert feature._traffic_gate.closed is True
+            assert [call[0] for call in self.ingress_calls] == [
+                "external-ingress-quiesce"
+            ]
+            return ConfigTransitionResult.applied()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FencedIngressClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        client = feature._client
+
+        async with feature.config_transition_ingress_fence():
+            receipt = await feature.set_config(next_config)
+            assert receipt.config == next_config
+            assert feature._traffic_gate.closed is True
+            assert [call[0] for call in client.ingress_calls] == [
+                "external-ingress-quiesce"
+            ]
+
+        assert [call[0] for call in client.ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert feature._traffic_gate.closed is False
+        assert feature._host_config == next_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_external_ingress_resumes_after_failed_transition_rollback(monkeypatch, tmp_path):
     """A failed staged transition resumes polling before reopening Core admission."""
 

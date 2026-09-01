@@ -1017,17 +1017,19 @@ async def update_feature_config(
     # This narrow lock prevents same-agent rollback crossing while the owned
     # task below owns that agent's cognition boundary.
     async with _feature_config_update_lock(agent):
-        return await _settle_feature_transition(
-            agent,
-            lambda: _update_feature_config_locked(
+        feature = _get_feature_or_404(agent, name)
+        async with _feature_config_ingress_fence(feature):
+            return await _settle_feature_transition(
                 agent,
-                _get_feature_or_404(agent, name),
-                name,
-                body,
-            ),
-            feature_name=name,
-            operation="configuration reconciliation",
-        )
+                lambda: _update_feature_config_generation(
+                    agent,
+                    feature,
+                    name,
+                    body,
+                ),
+                feature_name=name,
+                operation="configuration reconciliation",
+            )
 
 
 def _feature_config_update_lock(agent: object) -> asyncio.Lock:
@@ -1038,6 +1040,41 @@ def _feature_config_update_lock(agent: object) -> asyncio.Lock:
         lock = asyncio.Lock()
         setattr(agent, "_feature_config_update_lock", lock)
     return lock
+
+
+@asynccontextmanager
+async def _feature_config_ingress_fence(feature: object):
+    """Let an isolated feature drain ingress before the agent turn lock."""
+
+    descriptor = inspect.getattr_static(
+        feature, "config_transition_ingress_fence", None
+    )
+    if descriptor is None:
+        yield
+        return
+    fence = getattr(feature, "config_transition_ingress_fence")
+    async with fence():
+        yield
+
+
+async def _update_feature_config_generation(
+    agent: object,
+    expected_feature: object,
+    name: str,
+    body: ConfigUpdateRequest,
+) -> Dict[str, Any]:
+    """Mutate only the feature generation whose ingress was fenced."""
+
+    current = _get_feature_or_404(agent, name)
+    if current is not expected_feature:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Feature '{name}' changed while configuration was queued; "
+                "retry against the current generation"
+            ),
+        )
+    return await _update_feature_config_locked(agent, current, name, body)
 
 
 @asynccontextmanager
