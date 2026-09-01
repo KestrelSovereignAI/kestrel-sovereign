@@ -1715,12 +1715,107 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                                 )
 
 
+_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (
+    "KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE"
+)
+_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE_ENV = (
+    "KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE"
+)
+_DEFAULT_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE = 20
+_DEFAULT_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE = 4
+
+
+def _load_positive_int_env(name: str, default: int) -> int:
+    """Load a positive host-capacity setting, failing startup on bad input."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 def _uses_shared_postgres_scheduler() -> bool:
     """Whether this host can safely poll the fleet's shared schedule table."""
     return (
         os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower() == "postgres"
         and bool(os.environ.get("KESTREL_DATABASE_URL"))
     )
+
+
+async def _start_shared_agent_postgres_backend(app: FastAPI):
+    """Create the host-owned pools shared by every local PostgreSQL agent."""
+
+    app.state.shared_agent_postgres_backend = None
+    if not _uses_shared_postgres_scheduler():
+        return None
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    # These pools are fleet-wide, not the old per-agent pools. Keep explicit,
+    # independent operator budgets for ordinary database work and for the much
+    # rarer session-advisory operations. Scheduler effect gates use the host
+    # scheduler's own storage backend, so its concurrency is deliberately not
+    # used to size either pool here.
+    operational_capacity = _load_positive_int_env(
+        _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV,
+        _DEFAULT_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE,
+    )
+    advisory_capacity = _load_positive_int_env(
+        _SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE_ENV,
+        _DEFAULT_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE,
+    )
+    backend = PostgresBackend(
+        dsn=os.environ["KESTREL_DATABASE_URL"],
+        min_pool_size=min(2, operational_capacity),
+        max_pool_size=operational_capacity,
+        advisory_max_pool_size=advisory_capacity,
+    )
+    app.state.shared_agent_postgres_backend = backend
+    try:
+        await backend.connect()
+    except BaseException as startup_failure:
+        cleanup = asyncio.create_task(
+            backend.close(), name="shared_agent_postgres_startup_cleanup"
+        )
+        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
+            cleanup
+        )
+        if cleanup_failure is None:
+            app.state.shared_agent_postgres_backend = None
+        else:
+            startup_failure.add_note(
+                "Shared PostgreSQL startup cleanup also failed: "
+                f"{type(cleanup_failure).__name__}"
+            )
+        if cleanup_cancelled and not isinstance(
+            startup_failure, asyncio.CancelledError
+        ):
+            raise asyncio.CancelledError() from startup_failure
+        raise
+    return backend
+
+
+async def _shutdown_shared_agent_postgres_backend(app: FastAPI) -> None:
+    """Close host-owned pools only after every child has terminally drained."""
+
+    backend = getattr(app.state, "shared_agent_postgres_backend", None)
+    if backend is None:
+        return
+    if (
+        getattr(app.state, "agent_manager", None) is not None
+        or getattr(app.state, "startup_cleanup_agent_manager", None) is not None
+    ):
+        raise RuntimeError(
+            "refusing to close shared PostgreSQL pools while an agent manager "
+            "still owns children"
+        )
+    await backend.close()
+    app.state.shared_agent_postgres_backend = None
 
 
 async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, config) -> None:
@@ -2153,6 +2248,10 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # onboarding can remount routes or UI after their only teardown pass.
         ("host-features", lambda: _shutdown_host_features(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        (
+            "shared-agent-postgres",
+            lambda: _shutdown_shared_agent_postgres_backend(app),
+        ),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
         phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
@@ -2333,7 +2432,11 @@ async def _lifespan_startup(app: FastAPI):
                 auto_discover_fallback=True,
             )
             _apply_platform_host_port(config, os.environ)
-            manager = AgentManager(base_data_dir=Path.cwd())
+            shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
+            manager = AgentManager(
+                base_data_dir=Path.cwd(),
+                shared_postgres_backend=shared_postgres_backend,
+            )
             app.state.agent_manager = manager
             # Persistence context for runtime agent creation (#2358): when the
             # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent

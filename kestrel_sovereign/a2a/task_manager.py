@@ -38,6 +38,7 @@ from kestrel_sovereign.a2a.stores import (
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskCancellationSnapshot,
+    TaskMutationAuthorizationError,
     without_reserved_cancellation_receipt,
 )
 from typing import Protocol, runtime_checkable, TYPE_CHECKING
@@ -417,31 +418,38 @@ class TaskManager:
 
         if sync:
             # Execute synchronously with transaction safety
+            expected_state = task.status.state
             task = await handler.handle_task(task)
             if task.status.state is TaskState.CANCELED:
-                task = await self._persist_handler_cancellation(
+                task, _ = await self._persist_execution_outcome(
                     task,
                     authority_agent_id=authority_agent_id,
+                    expected_state=expected_state,
                 )
             else:
-                saved: Optional[bool] = None
                 try:
                     async with self.task_store._backend.transaction():
-                        saved = await self.task_store.save(task)
+                        task, _ = await self._persist_execution_outcome(
+                            task,
+                            authority_agent_id=authority_agent_id,
+                            expected_state=expected_state,
+                        )
                 except Exception as save_err:
                     logger.error(
-                        f"Failed to save completed task {task.id}: {save_err}. "
+                        f"Failed to save task outcome {task.id}: {save_err}. "
                         "Retrying outside transaction..."
                     )
                     try:
-                        saved = await self.task_store.save(task)
+                        task, _ = await self._persist_execution_outcome(
+                            task,
+                            authority_agent_id=authority_agent_id,
+                            expected_state=expected_state,
+                        )
                     except Exception as retry_err:
                         logger.critical(
-                            f"Task {task.id} completed but save failed permanently: {retry_err}. "
+                            f"Task outcome {task.id} failed to save permanently: {retry_err}. "
                             f"Result lost for skill={skill_id}, agent={agent_id}"
                         )
-                if saved is False:
-                    task = await self.task_store.get(task.id) or task
 
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
@@ -571,13 +579,20 @@ class TaskManager:
         authority_agent_id: str,
     ) -> None:
         """Execute a task asynchronously and update the store."""
+        expected_state = task.status.state
         try:
             task = await handler.handle_task(task)
             task, owns_notification = await self._persist_execution_outcome(
-                task, authority_agent_id=authority_agent_id
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
             )
             if owns_notification:
-                await self._notify_status_update(task, final=True)
+                await self._notify_status_update(
+                    task,
+                    final=task.status.state
+                    in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
+                )
         except asyncio.CancelledError:
             try:
                 await self.cancel_task(
@@ -597,16 +612,23 @@ class TaskManager:
                 message=Message(role="agent", parts=[TextPart(text=str(e))])
             )
             task, owns_notification = await self._persist_execution_outcome(
-                task, authority_agent_id=authority_agent_id
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
             )
             if owns_notification:
-                await self._notify_status_update(task, final=True)
+                await self._notify_status_update(
+                    task,
+                    final=task.status.state
+                    in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED},
+                )
 
     async def _persist_execution_outcome(
         self,
         task: Task,
         *,
         authority_agent_id: str,
+        expected_state: TaskState,
     ) -> tuple[Task, bool]:
         """Persist a worker result and report ownership of terminal notification."""
 
@@ -619,12 +641,98 @@ class TaskManager:
                 False,
             )
 
-        saved = await self.task_store.save(task)
-        if saved is False:
-            # Another terminal writer won its CAS and owns the corresponding
-            # completion signal. Returning its durable state must not emit the
-            # same terminal event a second time.
-            return (await self.task_store.get(task.id) or task), False
+        terminal_operation_id = (
+            uuid4().hex
+            if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}
+            else None
+        )
+        try:
+            saved = await self._save_recipient_execution_result(
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
+                terminal_operation_id=terminal_operation_id,
+            )
+        except Exception as save_error:
+            # PostgreSQL can commit and then lose the COMMIT acknowledgement.
+            # Reconcile the recipient-scoped canonical row before treating the
+            # exception as a failed write: the private per-attempt token proves
+            # this execution still owns the completion wake without comparing
+            # model values that JSON persistence may normalize. A different
+            # token belongs to another writer and must not be narrated over.
+            # Cancellation remains outside this Exception-only recovery so task
+            # cancellation semantics are never swallowed.
+            if terminal_operation_id is None:
+                raise
+            try:
+                committed_operation_id = (
+                    await self.task_store.get_recipient_terminal_operation_id(
+                        task.id,
+                        authority_agent_id,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as reconciliation_error:
+                raise save_error from reconciliation_error
+            if committed_operation_id != terminal_operation_id:
+                raise
+
+            # The private token is the single durable proof that this attempt
+            # committed and therefore owns exactly one completion wake. Prefer
+            # the canonical payload (persistence may normalize it), but a
+            # transient full-row read outage cannot revoke ownership after the
+            # token has matched or divert execution into a losing FAILED CAS.
+            try:
+                current = await self.task_store.get_for_recipient(
+                    task.id,
+                    authority_agent_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Task %s terminal commit was proven by operation token but "
+                    "its canonical payload could not be reread; emitting the "
+                    "attempted terminal notification",
+                    task.id,
+                    exc_info=True,
+                )
+                current = None
+            return (current or task), True
+        attempted_states: set[TaskState] = set()
+        while saved is False:
+            # A terminal writer owns the durable result and its notification.
+            # A remaining live state may instead be progress published by this
+            # handler while it ran. Reconcile only a transition that is valid
+            # from that exact current state, and retain the CAS on every retry.
+            current = await self.task_store.get_for_recipient(
+                task.id,
+                authority_agent_id,
+            )
+            if current is None:
+                return task, False
+            current_state = current.status.state
+            if current_state in {
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.CANCELED,
+            }:
+                return current, False
+            if current_state is task.status.state:
+                return current, False
+            if (
+                task.status.state not in VALID_TRANSITIONS.get(current_state, set())
+                or current_state in attempted_states
+            ):
+                return current, False
+            attempted_states.add(current_state)
+            saved = await self._save_recipient_execution_result(
+                task,
+                authority_agent_id=authority_agent_id,
+                expected_state=current_state,
+                terminal_operation_id=terminal_operation_id,
+            )
         return task, True
 
     def _refuse_command_authored_self_followup(
@@ -684,6 +792,30 @@ class TaskManager:
             ),
             "refused": "command_authored_self_followup",
         }
+
+    async def _save_recipient_execution_result(
+        self,
+        task: Task,
+        *,
+        authority_agent_id: str,
+        expected_state: TaskState,
+        terminal_operation_id: Optional[str],
+    ) -> bool:
+        """Persist a handler result without mistaking live progress for a winner."""
+
+        if task.status.state in {TaskState.COMPLETED, TaskState.FAILED}:
+            if terminal_operation_id is None:
+                raise ValueError("Terminal execution outcome requires an operation ID")
+            return await self.task_store.save_recipient_terminal_outcome(
+                task,
+                recipient_agent_id=authority_agent_id,
+                operation_id=terminal_operation_id,
+            )
+        return await self.task_store.save_recipient_lifecycle(
+            task,
+            recipient_agent_id=authority_agent_id,
+            expected_state=expected_state,
+        )
 
     async def execute_command(self, user_input: str) -> Optional[dict]:
         """
@@ -932,7 +1064,7 @@ class TaskManager:
         try:
             canonical = await self.task_store.get(task.id)
             canonical_read_succeeded = canonical is not None
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             canonical = None
             logger.warning(
                 "Task %s was accepted but its canonical readback failed",
@@ -961,6 +1093,8 @@ class TaskManager:
         new_state: TaskState,
         message: Optional[Message] = None,
         agent_name: Optional[str] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Update task status with state transition validation.
@@ -969,7 +1103,8 @@ class TaskManager:
             task_id: ID of the task to update
             new_state: New state to transition to
             message: Optional status message
-            agent_name: Agent performing the update (for observability)
+            agent_name: Agent performing the update (for observability only)
+            recipient_agent_id: Trusted durable recipient performing the write
 
         Returns:
             Updated Task object
@@ -982,9 +1117,14 @@ class TaskManager:
                 "CANCELED is an authorized transition; use cancel_task"
             )
 
-        task = await self.task_store.get(task_id)
+        task = await self.task_store.get_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
         if not task:
-            raise ValueError(f"Task not found: {task_id}")
+            raise TaskMutationAuthorizationError(
+                f"Task mutation was not authorized or task was not found: {task_id}"
+            )
 
         # Validate state transition
         current_state = task.status.state
@@ -1005,9 +1145,16 @@ class TaskManager:
             task.history.append(message)
 
         # Save updated task (use save() to persist both status and history)
-        saved = await self.task_store.save(task)
+        saved = await self.task_store.save_recipient_lifecycle(
+            task,
+            recipient_agent_id=recipient_agent_id,
+            expected_state=current_state,
+        )
         if saved is False:
-            persisted = await self.task_store.get(task_id)
+            persisted = await self.task_store.get_for_recipient(
+                task_id,
+                recipient_agent_id,
+            )
             state = persisted.status.state if persisted else TaskState.UNKNOWN
             raise ValueError(
                 f"Invalid state transition: task is already {state}"
@@ -1031,6 +1178,8 @@ class TaskManager:
         task_id: str,
         artifact: Artifact,
         agent_name: Optional[str] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Add an artifact to a task.
@@ -1038,20 +1187,33 @@ class TaskManager:
         Args:
             task_id: ID of the task
             artifact: Artifact to add
-            agent_name: Agent producing the artifact (for observability)
+            agent_name: Agent producing the artifact (for observability only)
+            recipient_agent_id: Trusted durable recipient performing the write
 
         Returns:
             Updated Task object
         """
-        task = await self.task_store.get(task_id)
+        task = await self.task_store.get_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
         if not task:
-            raise ValueError(f"Task not found: {task_id}")
+            raise TaskMutationAuthorizationError(
+                f"Task mutation was not authorized or task was not found: {task_id}"
+            )
 
         # Add artifact
-        await self.task_store.add_artifact(task_id, artifact)
+        await self.task_store.add_artifact(
+            task_id,
+            artifact,
+            recipient_agent_id=recipient_agent_id,
+        )
 
         # Refresh task
-        task = await self.task_store.get(task_id)
+        task = await self.task_store.get_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
 
         # Notify subscribers
         await self._notify_artifact_update(task_id, artifact)
@@ -1084,9 +1246,18 @@ class TaskManager:
         """Get all tasks in a session."""
         return await self.task_store.list_tasks(session_id=session_id, limit=limit)
 
-    async def get_pending_tasks(self, limit: int = 100) -> list[Task]:
-        """Get all pending (submitted) tasks ready for processing."""
-        return await self.task_store.get_pending_tasks(limit=limit)
+    async def get_pending_tasks(
+        self,
+        limit: int = 100,
+        *,
+        recipient_agent_id: Optional[str] = None,
+    ) -> list[Task]:
+        """Get pending tasks, with durable recipient scoping for workers."""
+
+        return await self.task_store.get_pending_tasks(
+            limit=limit,
+            recipient_agent_id=recipient_agent_id,
+        )
 
     async def list_tasks(
         self,
@@ -1303,6 +1474,8 @@ class TaskManager:
         task_id: str,
         error: str,
         agent_name: Optional[str] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Mark a task as failed.
@@ -1320,23 +1493,34 @@ class TaskManager:
             parts=[TextPart(text=f"Task failed: {error}")]
         )
 
-        # Log error to observability
-        if agent_name:
-            task = await self.task_store.get(task_id)
-            await self.observability_store.log_error(
-                agent_name=agent_name,
-                error_type="task_failure",
-                error_message=error,
-                session_id=task.sessionId if task else None,
-                metadata={"task_id": task_id}
-            )
-
-        return await self.update_status(
+        task = await self.update_status(
             task_id=task_id,
             new_state=TaskState.FAILED,
             message=message,
             agent_name=agent_name,
+            recipient_agent_id=recipient_agent_id,
         )
+
+        # Failure telemetry is a projection of the recipient-authorized durable
+        # transition.  Emitting it before update_status would let a rejected
+        # caller write attacker-authored data tied to another task's session.
+        if agent_name:
+            try:
+                await self.observability_store.log_error(
+                    agent_name=agent_name,
+                    error_type="task_failure",
+                    error_message=error,
+                    session_id=task.sessionId,
+                    metadata={"task_id": task_id},
+                )
+            except Exception:
+                logger.warning(
+                    "Task %s failed durably but failure observability logging failed",
+                    task_id,
+                    exc_info=True,
+                )
+
+        return task
 
     async def complete_task(
         self,
@@ -1344,6 +1528,8 @@ class TaskManager:
         response: str,
         agent_name: Optional[str] = None,
         artifacts: Optional[list[Artifact]] = None,
+        *,
+        recipient_agent_id: str,
     ) -> Task:
         """
         Complete a task with a response.
@@ -1360,7 +1546,12 @@ class TaskManager:
         # Add artifacts if provided
         if artifacts:
             for artifact in artifacts:
-                await self.add_artifact(task_id, artifact, agent_name)
+                await self.add_artifact(
+                    task_id,
+                    artifact,
+                    agent_name,
+                    recipient_agent_id=recipient_agent_id,
+                )
 
         message = Message(
             role="agent",
@@ -1372,6 +1563,7 @@ class TaskManager:
             new_state=TaskState.COMPLETED,
             message=message,
             agent_name=agent_name,
+            recipient_agent_id=recipient_agent_id,
         )
 
     async def _project_status_transition(

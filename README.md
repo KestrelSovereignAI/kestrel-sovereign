@@ -300,9 +300,17 @@ DID join a known fresh-v2 fleet safely, but an absent/unknown provenance marker
 is always treated as a legacy migration; do not seed or unfence scheduler rows
 manually.
 
-#### SDK 0.36 release cascade
+The hosted agents share one operational PostgreSQL pool and one smaller pool
+for session advisory locks. Their per-process defaults are 20 and 4
+connections, respectively. Size them for the deployment's admitted fleet
+traffic with `KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE` and
+`KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE`; both settings must be
+positive integers. These are independent host budgets: scheduler effect gates
+use the scheduler host's own storage pool, not the agents' advisory pool.
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.36.0,<0.37`; the
+#### SDK 0.37 release cascade
+
+Core requires `kestrel-sovereign-sdk[tracing]>=0.37.0,<0.38`; the
 `observability` extra carries the same SDK line with `metrics`. This is a
 runtime contract for durable isolated execution, provider-neutral private
 inference leases (including bounded owner-scoped idle renewal), and private
@@ -312,8 +320,8 @@ contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
-| Frinz | `kestrel-sovereign-sdk>=0.36.0,<0.37` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.36.0,<0.37` | External prerequisite; Core does not claim observability has changed. |
+| Frinz | `kestrel-sovereign-sdk>=0.37.0,<0.38` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.37.0,<0.38` | External prerequisite; Core does not claim observability has changed. |
 
 Verify the published Frinz and observability constraints and tests before the
 Core publish. Do not weaken Core's requirement to make an older sibling

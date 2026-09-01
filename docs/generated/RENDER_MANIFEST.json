@@ -303,6 +303,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/HOSTED_ISOLATED_RUNTIME_LIFECYCLE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Hosted Isolated Runtime Lifecycle",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "kestrel_sovereign/features/scheduler/feature.py",
         "kestrel_sovereign/storage/car_builder.py",
