@@ -121,6 +121,7 @@ class PostgresBackend(DatabaseBackend):
         password: Optional[str] = None,
         min_pool_size: int = 2,
         max_pool_size: int = 10,
+        advisory_max_pool_size: Optional[int] = None,
     ):
         """
         Initialize PostgreSQL backend.
@@ -135,7 +136,10 @@ class PostgresBackend(DatabaseBackend):
             user: Database user
             password: Database password
             min_pool_size: Minimum pool connections
-            max_pool_size: Maximum pool connections
+            max_pool_size: Maximum operational pool connections.
+            advisory_max_pool_size: Optional advisory-lock pool bound. A
+                multi-tenant host sharing this backend should set an explicit
+                host-wide bound sized for admitted effect concurrency.
         """
         if not ASYNCPG_AVAILABLE:
             raise ImportError(
@@ -155,9 +159,17 @@ class PostgresBackend(DatabaseBackend):
         # a waiter must not consume the last operational connection needed by
         # an admitted effect's lease renewal/final CAS, and an unbounded direct
         # connection per waiter would merely trade a deadlock for connection
-        # exhaustion. Four sessions are enough for distinct-DID concurrency;
-        # smaller operational pools keep the same cap.
-        self._advisory_max_pool_size = max(1, min(max_pool_size, 4))
+        # exhaustion. Standalone agents retain the historical cap of four;
+        # shared hosts explicitly budget this host-wide pool.
+        if advisory_max_pool_size is not None and (
+            type(advisory_max_pool_size) is not int or advisory_max_pool_size < 1
+        ):
+            raise ValueError("advisory_max_pool_size must be a positive integer")
+        self._advisory_max_pool_size = (
+            advisory_max_pool_size
+            if advisory_max_pool_size is not None
+            else max(1, min(max_pool_size, 4))
+        )
         self._advisory_dsn = dsn
         self._advisory_connect_args: tuple[Any, ...] = (dsn,) if dsn else ()
         self._advisory_connect_kwargs: dict[str, Any] = {}
@@ -192,6 +204,7 @@ class PostgresBackend(DatabaseBackend):
         advisory_dsn: Optional[str] = None,
         advisory_connect_kwargs: Optional[dict[str, Any]] = None,
         advisory_backend: Optional["PostgresBackend"] = None,
+        advisory_max_pool_size: Optional[int] = None,
     ) -> "PostgresBackend":
         """
         Create a PostgresBackend from an existing asyncpg pool.
@@ -213,13 +226,20 @@ class PostgresBackend(DatabaseBackend):
                 operational pool, must own its advisory pool directly, and is
                 owned by the caller. It cannot be combined with a connection
                 recipe supplied to this child.
+            advisory_max_pool_size: Optional explicit bound for a directly
+                owned advisory pool. Delegating children inherit the host's
+                bound and cannot override it.
 
         Returns:
             PostgresBackend wrapping the pool
         """
         instance = cls.__new__(cls)
         if advisory_backend is not None:
-            if advisory_dsn is not None or advisory_connect_kwargs is not None:
+            if (
+                advisory_dsn is not None
+                or advisory_connect_kwargs is not None
+                or advisory_max_pool_size is not None
+            ):
                 raise ValueError(
                     "advisory_backend cannot be combined with an advisory "
                     "connection recipe"
@@ -249,7 +269,15 @@ class PostgresBackend(DatabaseBackend):
             operational_max = int(pool.get_max_size())
         except (AttributeError, TypeError, ValueError):
             operational_max = 4
-        instance._advisory_max_pool_size = max(1, min(operational_max, 4))
+        if advisory_max_pool_size is not None and (
+            type(advisory_max_pool_size) is not int or advisory_max_pool_size < 1
+        ):
+            raise ValueError("advisory_max_pool_size must be a positive integer")
+        instance._advisory_max_pool_size = (
+            advisory_max_pool_size
+            if advisory_max_pool_size is not None
+            else max(1, min(operational_max, 4))
+        )
         pool_args, pool_kwargs = cls._advisory_settings_from_pool(pool)
         if advisory_dsn is not None:
             pool_args = (advisory_dsn,)
@@ -376,6 +404,12 @@ class PostgresBackend(DatabaseBackend):
     @property
     def is_connected(self) -> bool:
         return self._pool is not None
+
+    @property
+    def operational_pool(self) -> "asyncpg.Pool":
+        """Return the connected pool for trusted same-process host wiring."""
+
+        return self._ensure_connected()
     
     async def connect(self) -> None:
         """Connect to PostgreSQL and create connection pool."""

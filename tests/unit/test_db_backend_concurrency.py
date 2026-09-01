@@ -85,6 +85,18 @@ def test_postgres_advisory_delegate_requires_direct_same_pool_owner():
             advisory_dsn="postgresql://child/kestrel",
             advisory_backend=host,
         )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        PostgresBackend.from_pool(
+            primary_pool,
+            advisory_backend=host,
+            advisory_max_pool_size=6,
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        PostgresBackend.from_pool(
+            primary_pool,
+            advisory_dsn="postgresql://host/kestrel",
+            advisory_max_pool_size=0,
+        )
 
 
 def test_kestrel_agent_wires_trusted_shared_advisory_backend():

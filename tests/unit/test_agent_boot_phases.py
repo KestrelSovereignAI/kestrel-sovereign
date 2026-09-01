@@ -961,7 +961,8 @@ async def test_concurrent_initialize_is_refused(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_storage_phase_uses_shared_postgres_pool(tmp_path):
+@pytest.mark.parametrize("shared_advisory", [False, True])
+async def test_storage_phase_uses_shared_postgres_pool(tmp_path, shared_advisory):
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
     credentials = await create_kestrel_identity_async(
@@ -970,12 +971,14 @@ async def test_storage_phase_uses_shared_postgres_pool(tmp_path):
         agent_name="Shared pool semantic authority test",
     )
     pool = MagicMock()
+    host_advisory_backend = MagicMock() if shared_advisory else None
     agent = KestrelAgent(
         did=credentials.agent_did,
         storage_path=str(tmp_path / "kestrel_prime.db"),
         db_backend="postgres",
         pg_pool=pool,
         database_url="postgresql://scheduler-test/kestrel",
+        shared_postgres_advisory_backend=host_advisory_backend,
         llm_service=MagicMock(),
     )
     assert agent.identity is not None
@@ -1006,8 +1009,10 @@ async def test_storage_phase_uses_shared_postgres_pool(tmp_path):
         # The shared pool was adopted (not a fresh DSN connection).
         MockPGBackend.from_pool.assert_called_once_with(
             pool,
-            advisory_dsn="postgresql://scheduler-test/kestrel",
-            advisory_backend=None,
+            advisory_dsn=(
+                None if shared_advisory else "postgresql://scheduler-test/kestrel"
+            ),
+            advisory_backend=host_advisory_backend,
         )
         _, kwargs = MockStorage.call_args
         assert kwargs.get("backend") is pg_backend

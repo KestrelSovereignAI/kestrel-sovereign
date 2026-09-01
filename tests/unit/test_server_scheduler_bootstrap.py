@@ -13,6 +13,60 @@ from kestrel_sovereign import server
 
 
 @pytest.mark.asyncio
+async def test_server_owns_one_capacity_sized_backend_for_all_agents(
+    monkeypatch,
+) -> None:
+    instances = []
+
+    class _Backend:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.connect = AsyncMock()
+            self.close = AsyncMock()
+            instances.append(self)
+
+    app = FastAPI()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.db.postgres.PostgresBackend", _Backend
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.feature."
+        "SchedulerFeature._load_max_concurrent_tasks",
+        lambda: 7,
+    )
+
+    backend = await server._start_shared_agent_postgres_backend(app)
+
+    assert backend is instances[0]
+    assert backend.kwargs == {
+        "dsn": "postgresql://scheduler-test",
+        "advisory_max_pool_size": 7,
+    }
+    backend.connect.assert_awaited_once()
+    app.state.agent_manager = None
+    app.state.startup_cleanup_agent_manager = None
+    await server._shutdown_shared_agent_postgres_backend(app)
+    backend.close.assert_awaited_once()
+    assert app.state.shared_agent_postgres_backend is None
+
+
+@pytest.mark.asyncio
+async def test_server_refuses_to_close_shared_pool_while_manager_is_live() -> None:
+    app = FastAPI()
+    backend = SimpleNamespace(close=AsyncMock())
+    app.state.shared_agent_postgres_backend = backend
+    app.state.agent_manager = object()
+    app.state.startup_cleanup_agent_manager = None
+
+    with pytest.raises(RuntimeError, match="manager still owns children"):
+        await server._shutdown_shared_agent_postgres_backend(app)
+
+    backend.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_protocol_preflight_seeds_all_resolved_dids_without_polling(
     monkeypatch,
 ) -> None:
@@ -247,15 +301,27 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert config is fake_config
         events.append("host-start")
 
+    shared_backend = object()
+
+    async def _shared_backend(_app):
+        return shared_backend
+
+    def _manager_factory(**kwargs):
+        assert kwargs["shared_postgres_backend"] is shared_backend
+        return manager
+
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
     monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
-    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_k: manager)
+    monkeypatch.setattr(agent_manager, "AgentManager", _manager_factory)
     monkeypatch.setattr(
         server, "_prepare_shared_postgres_scheduler_protocol", _preflight
+    )
+    monkeypatch.setattr(
+        server, "_start_shared_agent_postgres_backend", _shared_backend
     )
     monkeypatch.setattr(server, "_start_host_scheduler", _start)
     monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *_a, **_k: None)
