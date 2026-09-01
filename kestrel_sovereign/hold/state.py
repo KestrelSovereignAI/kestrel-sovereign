@@ -47,6 +47,9 @@ _INITIALIZATION_WITNESS_PAYLOAD = b"kestrel-hold-state-initialized-v1\n"
 _BOOTSTRAP_INTENT_PAYLOAD = b"kestrel-hold-bootstrap-pending-v1\n"
 _HISTORY_ANCHOR_HEADER = b"kestrel-hold-history-v1\n"
 _HISTORY_ANCHOR_MAX_BYTES = 256
+_BOOTSTRAP_INTENT_MAX_BYTES = (
+    len(_BOOTSTRAP_INTENT_PAYLOAD) + _HISTORY_ANCHOR_MAX_BYTES
+)
 _EVIDENCE_LOCK_POLL_SECONDS = 0.01
 _POSTGRES_WITNESS_AGENT_ID = "__kestrel_host_control__"
 _POSTGRES_WITNESS_KEY = "hold_schema_initialized_v1"
@@ -1373,29 +1376,36 @@ class HoldStore:
         except OSError as exc:
             raise HoldStateError(f"could not remove {label}: {exc}") from exc
 
-    def _read_bootstrap_intent(self) -> bool:
+    def _read_bootstrap_intent(self) -> bytes | None:
         path = self._bootstrap_intent_path
         if path is None:
-            return False
+            return None
         payload = self._read_file_evidence(
             path,
             label="Hold bootstrap intent",
-            max_bytes=len(_BOOTSTRAP_INTENT_PAYLOAD),
+            max_bytes=_BOOTSTRAP_INTENT_MAX_BYTES,
         )
         if payload is None:
-            return False
-        if payload != _BOOTSTRAP_INTENT_PAYLOAD:
+            return None
+        if not payload.startswith(_BOOTSTRAP_INTENT_PAYLOAD):
             raise HoldCorruptStateError(
                 "Hold bootstrap intent has invalid durable evidence"
             )
-        return True
+        try:
+            return self._validate_history_anchor_payload(
+                payload.removeprefix(_BOOTSTRAP_INTENT_PAYLOAD)
+            )
+        except HoldCorruptStateError as exc:
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent has invalid durable evidence"
+            ) from exc
 
-    def _write_bootstrap_intent(self) -> None:
+    def _write_bootstrap_intent(self, history_anchor: bytes) -> None:
         path = self._bootstrap_intent_path
         assert path is not None
         self._write_file_evidence(
             path,
-            _BOOTSTRAP_INTENT_PAYLOAD,
+            _BOOTSTRAP_INTENT_PAYLOAD + history_anchor,
             label="Hold bootstrap intent",
         )
 
@@ -1404,7 +1414,7 @@ class HoldStore:
         if path is not None:
             self._remove_file_evidence(path, label="Hold bootstrap intent")
 
-    async def _read_external_bootstrap_intent(self) -> bool:
+    async def _read_external_bootstrap_intent(self) -> bytes | None:
         if self._bootstrap_intent_path is not None:
             return self._read_bootstrap_intent()
         payload = await self._read_postgres_evidence(
@@ -1412,20 +1422,30 @@ class HoldStore:
             label="bootstrap intent",
         )
         if payload is None:
-            return False
-        if payload != _BOOTSTRAP_INTENT_PAYLOAD:
+            return None
+        if not payload.startswith(_BOOTSTRAP_INTENT_PAYLOAD):
             raise HoldCorruptStateError(
                 "PostgreSQL Hold bootstrap intent has invalid durable evidence"
             )
-        return True
+        try:
+            return self._validate_history_anchor_payload(
+                payload.removeprefix(_BOOTSTRAP_INTENT_PAYLOAD)
+            )
+        except HoldCorruptStateError as exc:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold bootstrap intent has invalid durable evidence"
+            ) from exc
 
-    async def _write_external_bootstrap_intent(self) -> None:
+    async def _write_external_bootstrap_intent(
+        self,
+        history_anchor: bytes,
+    ) -> None:
         if self._bootstrap_intent_path is not None:
-            self._write_bootstrap_intent()
+            self._write_bootstrap_intent(history_anchor)
             return
         await self._write_postgres_evidence(
             _POSTGRES_BOOTSTRAP_INTENT_KEY,
-            _BOOTSTRAP_INTENT_PAYLOAD,
+            _BOOTSTRAP_INTENT_PAYLOAD + history_anchor,
         )
 
     async def _remove_external_bootstrap_intent(self) -> None:
@@ -1472,6 +1492,12 @@ class HoldStore:
         rows = await self._db.fetchall(
             f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id"
         )
+        return self._history_anchor_payload_from_rows(rows)
+
+    @staticmethod
+    def _history_anchor_payload_from_rows(rows: list[Any] | tuple[Any, ...]) -> bytes:
+        """Build the canonical receipt head, including the empty history."""
+
         digest = hashlib.sha256()
         digest.update(_HISTORY_ANCHOR_HEADER)
         for row in rows:
@@ -1487,6 +1513,13 @@ class HoldStore:
             + digest.hexdigest().encode("ascii")
             + b"\n"
         )
+
+    async def _bootstrap_history_anchor(self, existing: set[str]) -> bytes:
+        """Read the receipt head a pending bootstrap is authorized to migrate."""
+
+        if "hold_receipts" not in existing:
+            return self._history_anchor_payload_from_rows([])
+        return await self._current_history_anchor_payload()
 
     async def _read_history_anchor(self) -> bytes | None:
         """Read the receipt-history head from custody outside Hold tables."""
@@ -1763,6 +1796,8 @@ class HoldStore:
         except BaseException as exc:
             domain_error = _domain_error_from_chain(exc)
             if domain_error is not None:
+                if domain_error is exc:
+                    raise
                 raise domain_error from exc
             raise
 
@@ -1793,14 +1828,21 @@ class HoldStore:
         initialized = await self._read_initialization_witness()
         anchored = await self._read_history_anchor()
         existing = await self._existing_schema_tables()
-        bootstrap_pending = await self._read_external_bootstrap_intent()
+        bootstrap_history = await self._read_external_bootstrap_intent()
         self._validate_schema_evidence(
             initialized=initialized,
             anchored=anchored,
             existing=existing,
-            bootstrap_pending=bootstrap_pending,
+            bootstrap_pending=bootstrap_history is not None,
         )
-
+        current_bootstrap_history = await self._bootstrap_history_anchor(existing)
+        if (
+            bootstrap_history is not None
+            and bootstrap_history != current_bootstrap_history
+        ):
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent does not match receipt history"
+            )
         if initialized:
             missing = sorted(_HOLD_SCHEMA_TABLES - existing)
             if missing:
@@ -1811,7 +1853,7 @@ class HoldStore:
             await self._recover_history_publication()
             await self._ensure_schema_transaction(initialized=True)
             await self._assert_history_anchor_intact()
-            if bootstrap_pending:
+            if bootstrap_history is not None:
                 await self._remove_external_bootstrap_intent()
             return
 
@@ -1819,11 +1861,13 @@ class HoldStore:
             raise HoldCorruptStateError(
                 "Hold history publication exists without initialized schema"
             )
-        if not bootstrap_pending:
+        if bootstrap_history is None:
             # Durable intent precedes DDL. If the process stops anywhere after
             # this write, a later initializer may finish exactly this bootstrap
             # rather than mistaking committed v1 tables for unexplained state.
-            await self._write_external_bootstrap_intent()
+            await self._write_external_bootstrap_intent(
+                current_bootstrap_history
+            )
         await self._ensure_schema_transaction(initialized=False)
         # The database transaction has committed while the cross-process lock
         # still excludes readers and peer initializers. Publish both pieces of
