@@ -74,6 +74,7 @@ from kestrel_sovereign.agent.boot import (
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.constitution import (
     ConstitutionMixin,
+    SafeModeCause,
     safe_mode_cognition_block,
 )
 from kestrel_sovereign.agent.streaming import (
@@ -3981,11 +3982,19 @@ class KestrelAgent(
                 "Feature context suppression failed during a privacy transition; "
                 "cognition is blocked until lifecycle integrity is restored"
             )
+            self._feature_lifecycle_integrity_uncertain = True
+            self._feature_lifecycle_repair_verified = False
             try:
-                await self.enter_safe_mode(safe_mode_reason)
+                await self.enter_safe_mode(
+                    safe_mode_reason,
+                    cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
+                )
             except (Exception, asyncio.CancelledError):
                 self._safe_mode = True
                 self._safe_mode_reason = safe_mode_reason
+                self._safe_mode_cause = (
+                    SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+                )
             raise RuntimeError(
                 "feature context could not be suppressed during privacy transition"
             ) from None
@@ -4539,6 +4548,31 @@ class KestrelAgent(
         """Withdraw exact surviving contributions after a drifted teardown."""
 
         return self._ensure_feature_contribution_runtime().quarantine(feature)
+
+    def verify_feature_lifecycle_integrity(self) -> bool:
+        """Verify a clean, fully booted contribution generation after restart.
+
+        A process that observed incomplete quarantine cannot certify itself;
+        restart reconstructs the registries from feature declarations. Only a
+        READY boot with an exact, side-effect-free registry validation is a
+        repair proof accepted by the Safe Mode exit path.
+        """
+
+        if getattr(self, "_feature_lifecycle_integrity_uncertain", False):
+            return False
+        if self._boot_state is not BootPhaseState.READY:
+            return False
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is None:
+            return False
+        try:
+            return runtime.validate_active_integrity() is True
+        except Exception as exc:  # noqa: BLE001 - report type, remain restricted
+            logging.error(
+                "Feature lifecycle integrity validation reported %s",
+                type(exc).__name__,
+            )
+            return False
 
     def refresh_all_feature_context_clauses(self, *, fail_closed: bool = False):
         """Republish clauses after a host-owned configuration transition."""
@@ -5195,14 +5229,22 @@ class KestrelAgent(
                     "Feature activation contribution quarantine failed; "
                     "cognition is blocked until lifecycle integrity is restored"
                 )
+                self._feature_lifecycle_integrity_uncertain = True
+                self._feature_lifecycle_repair_verified = False
                 try:
-                    await self.enter_safe_mode(safe_mode_reason)
+                    await self.enter_safe_mode(
+                        safe_mode_reason,
+                        cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
+                    )
                 except (Exception, asyncio.CancelledError):
                     # Safe Mode persistence is best-effort here, but the
                     # in-memory cognition latch is not. A second failure must
                     # not reopen prompts over an untrusted feature generation.
                     self._safe_mode = True
                     self._safe_mode_reason = safe_mode_reason
+                    self._safe_mode_cause = (
+                        SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+                    )
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None

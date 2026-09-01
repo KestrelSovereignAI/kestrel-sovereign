@@ -461,6 +461,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "state_not_persisted": "restricted_by_unsaved_state",
         "identity_missing": "identity_missing",
         "memory_unreadable": "memory_unreadable",
+        "feature_lifecycle_uncertain": "feature_lifecycle_uncertain",
         "unrecorded": "cause_unrecorded",
     }
     cause = getattr(agent, "_safe_mode_cause", None)
@@ -482,6 +483,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "identity_missing",
         "bootstrap_incomplete",
         "memory_unreadable",
+        "feature_lifecycle_uncertain",
         "restricted_by_unsaved_state",
         "cause_unrecorded",
         "state_unavailable",

@@ -193,9 +193,53 @@ async def test_privacy_suppression_failure_latches_safe_mode(tmp_path):
     assert error.value.__cause__ is None
     assert agent._safe_mode is True
     assert "privacy transition" in agent._safe_mode_reason.lower()
+    assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+    assert agent._feature_lifecycle_integrity_uncertain is True
     assert agent._privacy_mode is PrivacyMode.ISOLATED
     assert runtime.is_active(feature)
     assert runtime.active_context_clauses() == (foreign,)
+
+
+def test_lifecycle_integrity_validation_rejects_foreign_context_generation(
+    tmp_path,
+):
+    """Restart repair proof validates the exact live contribution generation."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    runtime.validate_active_integrity()
+
+    original = runtime.active_context_clauses()[0]
+    runtime.context_clause_registry._clauses[original.identity] = replace(
+        original,
+        body="foreign lifecycle generation",
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="active feature contribution integrity does not match",
+    ):
+        runtime.validate_active_integrity()
+
+
+def test_agent_accepts_only_ready_clean_lifecycle_generation(tmp_path):
+    """A clean restart must be READY and exact before Safe Mode can exit."""
+
+    from kestrel_sovereign.agent.boot import BootPhaseState
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+
+    assert agent.verify_feature_lifecycle_integrity() is False
+    agent._boot_state = BootPhaseState.READY
+    assert agent.verify_feature_lifecycle_integrity() is True
+
+    agent._feature_lifecycle_integrity_uncertain = True
+    assert agent.verify_feature_lifecycle_integrity() is False
 
 
 def test_host_refresh_failure_suppresses_stale_context_without_rerendering(

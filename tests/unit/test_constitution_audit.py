@@ -549,6 +549,70 @@ async def test_exit_refuses_to_clear_durable_safe_mode_when_audit_fails(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_exit_requires_feature_lifecycle_repair_verification(tmp_path):
+    """A constitution audit alone cannot clear uncertain prompt authority."""
+
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(db_path, now)
+    await agent.enter_safe_mode(
+        "feature contribution quarantine failed",
+        cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
+    )
+    agent._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+    agent.verify_feature_lifecycle_integrity = MagicMock(return_value=False)
+
+    try:
+        blocked = await agent.exit_safe_mode(authorization="sovereign_api_key")
+
+        assert "feature lifecycle repair verification failed" in blocked
+        assert agent._safe_mode is True
+        agent.verify_feature_lifecycle_integrity.assert_called_once_with()
+
+        agent.verify_feature_lifecycle_integrity.reset_mock()
+        agent.verify_feature_lifecycle_integrity.return_value = True
+        repaired = await agent.exit_safe_mode(authorization="sovereign_api_key")
+
+        assert "deactivated" in repaired
+        assert agent._safe_mode is False
+        agent.verify_feature_lifecycle_integrity.assert_called_once_with()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_cause_survives_diagnostic_safe_mode_reentry(tmp_path):
+    """A diagnostic audit cannot replace the unrepaired lifecycle cause."""
+
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(tmp_path / "agent.db", now)
+    try:
+        await agent.enter_safe_mode(
+            "feature contribution quarantine failed",
+            cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
+        )
+        await agent.enter_safe_mode("constitution audit also failed")
+
+        assert (
+            agent._safe_mode_cause
+            == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+        )
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert (
+            persisted.safe_mode_cause
+            == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_overdue_audit_remains_due_across_restart_with_injected_clock(tmp_path):
     """No sleeps: a 25-hour-old success triggers a startup full audit."""
     db_path = tmp_path / "agent.db"

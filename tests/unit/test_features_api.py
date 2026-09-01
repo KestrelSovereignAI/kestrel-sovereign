@@ -689,6 +689,8 @@ class TestEnableFeature:
 
         assert agent._safe_mode is True
         assert "quarantine failed" in agent._safe_mode_reason
+        assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+        assert agent._feature_lifecycle_integrity_uncertain is True
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.endpoints.features.get_registry")
@@ -801,6 +803,8 @@ class TestEnableFeature:
 
         assert agent._safe_mode is True
         assert agent._safe_mode_reason == "package quarantine failed"
+        assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+        assert agent._feature_lifecycle_integrity_uncertain is True
 
     @pytest.mark.asyncio
     async def test_ready_hook_cancelled_error_remains_best_effort(self):
@@ -2601,6 +2605,8 @@ class TestUpdateFeatureConfig:
         assert error.value.__cause__ is None
         assert agent._safe_mode is True
         assert "quarantine failed" in agent._safe_mode_reason
+        assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+        assert agent._feature_lifecycle_integrity_uncertain is True
         assert feature.enabled is False
         assert runtime.is_active(feature)
         assert runtime.active_context_clauses() == (foreign,)

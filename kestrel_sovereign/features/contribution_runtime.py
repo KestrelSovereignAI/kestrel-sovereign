@@ -903,6 +903,34 @@ class FeatureContributionRuntime:
                 "active feature contribution identity does not match"
             )
         values = active.prepared.contributions
+        self._validate_active_contributions(feature, active)
+
+        for registration_set in reversed(active.execution_target_registrations):
+            self.operator_registry.unregister(registration_set)
+        self.operator_registry.unregister(active.operator_registrations)
+        for registration in values.wait_providers:
+            self.wait_registry.deregister(registration.name, registration.provider)
+        if active.permission_registration is not None:
+            self.permission_defaults_registry.unregister(
+                active.permission_registration
+            )
+        self.setup_step_registry.unregister_batch(values.setup_steps)
+        self.context_clause_registry.unregister_batch(active.context_clauses)
+        # Past every validation, in the same mutating stretch as the other
+        # unregistrations: drop this feature's claims. The registry removes each
+        # source only when its last holder lets go.
+        self.source_registry.release_all(feature)
+        del self._active[id(feature)]
+        return True
+
+    def _validate_active_contributions(
+        self,
+        feature: object,
+        active: ActiveFeatureContributions,
+    ) -> None:
+        """Validate one exact inverse without mutating any registry."""
+
+        values = active.prepared.contributions
         # No per-lifecycle source list any more: the registry holds the claims,
         # so teardown just lets go of what this feature held. A source another
         # holder still needs simply stays (#3053).
@@ -969,22 +997,40 @@ class FeatureContributionRuntime:
         for registration_set in active.execution_target_registrations:
             self.operator_registry.validate_registration_set(registration_set)
 
-        for registration_set in reversed(active.execution_target_registrations):
-            self.operator_registry.unregister(registration_set)
-        self.operator_registry.unregister(active.operator_registrations)
-        for registration in values.wait_providers:
-            self.wait_registry.deregister(registration.name, registration.provider)
-        if active.permission_registration is not None:
-            self.permission_defaults_registry.unregister(
-                active.permission_registration
+    def validate_active_integrity(self) -> bool:
+        """Prove that retained capabilities match the live registry generation.
+
+        This is the restart-time repair proof for a durable lifecycle Safe Mode
+        cause. It executes no feature code and mutates no registry.
+        """
+
+        try:
+            for key, active in tuple(self._active.items()):
+                feature = active.prepared.feature
+                if key != id(feature):
+                    raise FeatureContributionRuntimeError(
+                        "active feature contribution identity does not match"
+                    )
+                self._validate_active_contributions(feature, active)
+
+            expected_context = tuple(
+                clause
+                for active in self._active.values()
+                for clause in active.context_clauses
             )
-        self.setup_step_registry.unregister_batch(values.setup_steps)
-        self.context_clause_registry.unregister_batch(active.context_clauses)
-        # Past every validation, in the same mutating stretch as the other
-        # unregistrations: drop this feature's claims. The registry removes each
-        # source only when its last holder lets go.
-        self.source_registry.release_all(feature)
-        del self._active[id(feature)]
+            resident_context = self.context_clause_registry.snapshot()
+            if len(expected_context) != len(resident_context) or any(
+                self.context_clause_registry._clauses.get(clause.identity)
+                is not clause
+                for clause in expected_context
+            ):
+                raise FeatureContributionRuntimeError(
+                    "active context-clause registry identity does not match"
+                )
+        except FeatureContributionRuntimeError:
+            raise FeatureContributionRuntimeError(
+                "active feature contribution integrity does not match"
+            ) from None
         return True
 
     def quarantine(self, feature: object) -> bool:

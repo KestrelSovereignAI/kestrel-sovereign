@@ -667,11 +667,17 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
 async def _enter_feature_quarantine_safe_mode(agent: object, reason: str) -> None:
     """Latch cognition closed when contribution ownership cannot be repaired."""
 
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+
+    lifecycle_cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    setattr(agent, "_feature_lifecycle_integrity_uncertain", True)
+    setattr(agent, "_feature_lifecycle_repair_verified", False)
+    setattr(agent, "_safe_mode_cause", lifecycle_cause)
     entered = False
     enter_safe_mode = getattr(agent, "enter_safe_mode", None)
     if callable(enter_safe_mode):
         try:
-            result = enter_safe_mode(reason)
+            result = enter_safe_mode(reason, cause=lifecycle_cause)
             if inspect.isawaitable(result):
                 await result
             entered = getattr(agent, "_safe_mode", False) is True
@@ -682,6 +688,7 @@ async def _enter_feature_quarantine_safe_mode(agent: object, reason: str) -> Non
         # persistence API. The in-memory latch is still the minimum safe state.
         setattr(agent, "_safe_mode", True)
         setattr(agent, "_safe_mode_reason", reason)
+        setattr(agent, "_safe_mode_cause", lifecycle_cause)
 
 
 @router.post("/api/features/{name}/disable")
