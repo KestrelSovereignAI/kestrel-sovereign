@@ -303,6 +303,88 @@ class TestGetFeatureDetail:
 
 class TestEnableFeature:
     @pytest.mark.asyncio
+    async def test_queued_cognition_rechecks_safe_mode_after_transition_lock(self):
+        """A turn admitted before a quarantine latch cannot run afterward."""
+
+        agent = _lifecycle_agent()
+        agent.storage = object()
+        agent.context_manager = object()
+        agent.bootstrap_service = None
+        agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+        agent._maybe_audit = AsyncMock()
+        agent._process_input_traced_locked = AsyncMock(return_value="MODEL-RAN")
+        real_turn_lifecycle = agent._turn_lifecycle
+        lock_attempted = asyncio.Event()
+
+        @asynccontextmanager
+        async def observed_turn_lifecycle():
+            lock_attempted.set()
+            async with real_turn_lifecycle():
+                yield
+
+        agent._turn_lifecycle = observed_turn_lifecycle
+
+        async with real_turn_lifecycle():
+            turn = asyncio.create_task(agent.process_input("queued cognition"))
+            await asyncio.wait_for(lock_attempted.wait(), timeout=1)
+            assert not turn.done()
+            agent._safe_mode = True
+            agent._safe_mode_reason = "feature contribution quarantine failed"
+
+        response = await asyncio.wait_for(turn, timeout=1)
+
+        assert "SAFE MODE ACTIVE" in response
+        agent._process_input_traced_locked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_queued_stream_rechecks_safe_mode_after_transition_lock(self):
+        """The streaming entry point shares the post-lock cognition guard."""
+
+        agent = _lifecycle_agent()
+        agent.storage = object()
+        agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+        agent._maybe_audit = AsyncMock()
+        model_started = False
+        real_turn_lifecycle = agent._turn_lifecycle
+        lock_attempted = asyncio.Event()
+
+        @asynccontextmanager
+        async def observed_turn_lifecycle():
+            lock_attempted.set()
+            async with real_turn_lifecycle():
+                yield
+
+        agent._turn_lifecycle = observed_turn_lifecycle
+
+        async def stream_model(*_args, **_kwargs):
+            nonlocal model_started
+            model_started = True
+            yield "MODEL-RAN"
+
+        agent._process_input_streaming_traced_locked = stream_model
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in agent.process_input_streaming(
+                    "queued streaming cognition"
+                )
+            ]
+
+        async with real_turn_lifecycle():
+            turn = asyncio.create_task(collect())
+            await asyncio.wait_for(lock_attempted.wait(), timeout=1)
+            assert not turn.done()
+            agent._safe_mode = True
+            agent._safe_mode_reason = "feature contribution quarantine failed"
+
+        chunks = await asyncio.wait_for(turn, timeout=1)
+
+        assert len(chunks) == 1
+        assert "SAFE MODE ACTIVE" in chunks[0]
+        assert model_started is False
+
+    @pytest.mark.asyncio
     async def test_enable_hook_can_reenter_privacy_transition(self):
         """The owned mutation task must own the conversation boundary.
 
@@ -1080,6 +1162,47 @@ class TestDisableFeature:
             second.wait_provider.kind, second.wait_provider
         )
         assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_disable_rollback_latches_safe_mode_on_foreign_context_drift(
+        self, mock_registry
+    ):
+        """An unprovable rollback blocks cognition over the surviving clause."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        runtime = agent.feature_contribution_runtime
+        original = runtime.active_context_clauses()[0]
+        foreign = replace(original, body="foreign replacement prompt bytes")
+        runtime.context_clause_registry._clauses[original.identity] = foreign
+        info = FeaturePackageInfo(
+            name="foreign-drift-pkg",
+            package="kestrel-feature-foreign-drift",
+            git="",
+            features=[feature.name],
+            description="foreign context drift fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="complete feature generation") as error:
+            await features_endpoint.disable_feature(request, info.name)
+
+        assert error.value.__cause__ is None
+        assert agent._safe_mode is True
+        assert "rollback" in agent._safe_mode_reason.lower()
+        assert feature.enabled is False
+        assert runtime.is_active(feature)
+        assert runtime.active_context_clauses() == (foreign,)
 
     @pytest.mark.parametrize(
         "feature_name",
@@ -2429,6 +2552,58 @@ class TestUpdateFeatureConfig:
         assert not agent.feature_contribution_runtime.is_active(feature)
         assert not agent.feature_contribution_runtime.active_context_clauses()
         assert agent.signal_registry.get(feature.source.name) is None
+
+    @pytest.mark.asyncio
+    async def test_config_quarantine_failure_latches_safe_mode(self):
+        """A failed config repair cannot leave prompt authority cognitive."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        state = {"mode": "old"}
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        runtime = agent.feature_contribution_runtime
+        original = runtime.active_context_clauses()[0]
+        foreign = replace(original, body="foreign config replacement")
+        runtime.context_clause_registry._clauses[original.identity] = foreign
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            await _propagate_cancelled_child()
+
+        feature.get_config = get_config
+        feature.set_config = set_config
+        agent.refresh_feature_context_clauses = MagicMock(
+            side_effect=RuntimeError("private renderer detail")
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="feature contributions could not be quarantined",
+        ) as error:
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+
+        assert error.value.__cause__ is None
+        assert agent._safe_mode is True
+        assert "quarantine failed" in agent._safe_mode_reason
+        assert feature.enabled is False
+        assert runtime.is_active(feature)
+        assert runtime.active_context_clauses() == (foreign,)
 
     def test_failed_refresh_and_rollback_disables_feature_runtime(self):
         """A doubly-failed transition is quarantined instead of split-brain."""

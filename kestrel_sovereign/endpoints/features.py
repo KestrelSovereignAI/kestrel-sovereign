@@ -785,11 +785,13 @@ async def _restore_feature_group(
                 # imperative cleanup. Withdraw those exact survivors before the
                 # complete package generation is prepared again.
                 agent._quarantine_feature_contributions(feature)
-            except Exception:
-                logger.exception(
-                    "%s rollback contribution quarantine failed for feature '%s'",
+            except (Exception, asyncio.CancelledError) as quarantine_exc:
+                logger.error(
+                    "%s rollback contribution quarantine for feature '%s' "
+                    "reported %s",
                     operation,
                     class_name,
+                    type(quarantine_exc).__name__,
                 )
 
     prepared_by_feature: Dict[int, Any] = {}
@@ -803,10 +805,11 @@ async def _restore_feature_group(
                 id(feature): item
                 for feature, item in prepared.activatable(enabled)
             }
-        except (Exception, asyncio.CancelledError):
-            logger.exception(
-                "%s rollback contribution batch preparation failed",
+        except (Exception, asyncio.CancelledError) as preparation_exc:
+            logger.error(
+                "%s rollback contribution batch preparation reported %s",
                 operation,
+                type(preparation_exc).__name__,
             )
 
     restored: List[tuple[str, Any]] = []
@@ -834,12 +837,13 @@ async def _restore_feature_group(
                     operation,
                     class_name,
                 )
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as activation_exc:
             restore_complete = False
-            logger.exception(
-                "%s rollback (re-activate) failed for feature '%s'",
+            logger.error(
+                "%s rollback re-activation for feature '%s' reported %s",
                 operation,
                 class_name,
+                type(activation_exc).__name__,
             )
         else:
             logger.info(
@@ -854,6 +858,16 @@ async def _restore_feature_group(
     if restore_complete and len(restored) == len(enabled):
         for _class_name, feature in restored:
             await agent._notify_feature_runtime_ready(feature)
+        return
+
+    await _enter_feature_quarantine_safe_mode(
+        agent,
+        f"{operation} rollback could not restore the complete feature "
+        "generation; cognition is blocked until lifecycle integrity is restored",
+    )
+    raise RuntimeError(
+        f"{operation.lower()} rollback could not restore the complete feature generation"
+    ) from None
 
 
 @router.post("/api/features/{name}/remove")
@@ -1378,15 +1392,20 @@ async def _disable_feature_after_config_reconciliation_failure(
             else:
                 try:
                     agent._quarantine_feature_contributions(feature)
-                except Exception:
+                except (Exception, asyncio.CancelledError):
                     quarantine_error = RuntimeError(
                         "feature contributions could not be quarantined"
                     )
+    feature.enabled = False
     if quarantine_error is not None:
+        await _enter_feature_quarantine_safe_mode(
+            agent,
+            "Feature configuration contribution quarantine failed; "
+            "cognition is blocked until lifecycle integrity is restored",
+        )
         # Raise after leaving the teardown handler so a third-party exception
         # cannot survive in __context__ and leak private configuration bytes.
-        raise quarantine_error
-    feature.enabled = False
+        raise quarantine_error from None
 
 
 def _validate_config(config: Dict[str, Any], schema: Dict[str, Any]) -> None:

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from kestrel_sovereign.command_policy import (
     GENESIS_AUDIT_BYPASS_COMMANDS,
+    SAFE_MODE_COMMANDS,
     prefixed_command_token,
 )
 
@@ -110,6 +111,42 @@ def describe_safe_mode_restriction(agent, *, audit_pending: bool = False) -> str
     ):
         phrase += " (this restriction could not be saved and will not survive a restart)"
     return phrase
+
+
+def safe_mode_cognition_block(agent, user_input: str) -> str | None:
+    """Return the shared Safe Mode block, or allow one diagnostic command."""
+
+    safe_mode = getattr(agent, "_safe_mode", False) is True
+    audit_pending = (
+        getattr(agent, "_constitution_audit_pending", False) is True
+    )
+    if not (safe_mode or audit_pending):
+        return None
+
+    command = prefixed_command_token(user_input)
+    if command is not None:
+        if command in SAFE_MODE_COMMANDS:
+            return None
+        blocked_by = describe_safe_mode_restriction(
+            agent, audit_pending=audit_pending
+        )
+        return (
+            "🚨 SAFE MODE ACTIVE\n\n"
+            f"The agent is operating in restricted mode due to {blocked_by}.\n"
+            "Only diagnostic commands are available: !safe-mode, "
+            "!verify-constitution, !reanchor-constitution, !status, !help\n\n"
+            "Please contact your administrator to resolve it."
+        )
+
+    restriction = describe_safe_mode_restriction(
+        agent, audit_pending=audit_pending
+    )
+    return (
+        "🚨 SAFE MODE ACTIVE\n\n"
+        f"The agent cannot process queries due to {restriction}.\n"
+        "Use !safe-mode to check status or !verify-constitution to re-verify.\n\n"
+        "Normal operation will resume once the restriction is cleared."
+    )
 
 
 class ConstitutionMixin:

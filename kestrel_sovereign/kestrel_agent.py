@@ -54,7 +54,6 @@ class HostFeatureConfigError(RuntimeError):
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
-    SAFE_MODE_COMMANDS,
     prefixed_command_token,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
@@ -73,7 +72,10 @@ from kestrel_sovereign.agent.boot import (
     run_boot_sequence,
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
-from kestrel_sovereign.agent.constitution import ConstitutionMixin
+from kestrel_sovereign.agent.constitution import (
+    ConstitutionMixin,
+    safe_mode_cognition_block,
+)
 from kestrel_sovereign.agent.streaming import (
     StreamingMixin,
     resolve_turn_invocation_context,
@@ -3967,7 +3969,26 @@ class KestrelAgent(
         # privacy-transition lock is still held. Renderer failure must never
         # preserve pre-transition bytes: suppress every optional feature clause
         # without executing feature code and continue in the safer mode.
-        self.refresh_all_feature_context_clauses(fail_closed=True)
+        try:
+            self.refresh_all_feature_context_clauses(fail_closed=True)
+        except (Exception, asyncio.CancelledError) as suppression_exc:
+            logging.critical(
+                "Feature context suppression during privacy transition "
+                "reported %s; entering Safe Mode",
+                type(suppression_exc).__name__,
+            )
+            safe_mode_reason = (
+                "Feature context suppression failed during a privacy transition; "
+                "cognition is blocked until lifecycle integrity is restored"
+            )
+            try:
+                await self.enter_safe_mode(safe_mode_reason)
+            except (Exception, asyncio.CancelledError):
+                self._safe_mode = True
+                self._safe_mode_reason = safe_mode_reason
+            raise RuntimeError(
+                "feature context could not be suppressed during privacy transition"
+            ) from None
 
         config = privacy_mode_to_config(mode)
         model_switched = self._apply_privacy_model_transition(config)
@@ -5759,47 +5780,10 @@ Expected Duration: {expected_duration}
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
 
-        # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands.
-        # ``process_input`` can receive a restart signal while initialize() is
-        # still constructing the agent, so absent flags are not restrictions.
-        safe_mode = getattr(self, "_safe_mode", False) is True
-        audit_pending = (
-            getattr(self, "_constitution_audit_pending", False) is True
-        )
-        if safe_mode or audit_pending:
-            command = prefixed_command_token(user_input)
-            if command is not None:
-                if command not in SAFE_MODE_COMMANDS:
-                    from kestrel_sovereign.agent.constitution import (
-                        describe_safe_mode_restriction,
-                    )
-
-                    # A blocked COMMAND was told "integrity issue" whatever
-                    # the cause, so the branch an operator hits while trying
-                    # to diagnose was the one still misreporting it.
-                    blocked_by = describe_safe_mode_restriction(
-                        self, audit_pending=audit_pending
-                    )
-                    return (
-                        "🚨 SAFE MODE ACTIVE\\n\\n"
-                        f"The agent is operating in restricted mode due to {blocked_by}.\\n"
-                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
-                        "Please contact your administrator to resolve it."
-                    )
-            else:
-                from kestrel_sovereign.agent.constitution import (
-                    describe_safe_mode_restriction,
-                )
-
-                restriction = describe_safe_mode_restriction(
-                    self, audit_pending=audit_pending
-                )
-                return (
-                    "🚨 SAFE MODE ACTIVE\\n\\n"
-                    f"The agent cannot process queries due to {restriction}.\\n"
-                    "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
-                    "Normal operation will resume once the restriction is cleared."
-                )
+        # Check before queueing so an already-restricted turn returns promptly.
+        safe_mode_block = safe_mode_cognition_block(self, user_input)
+        if safe_mode_block is not None:
+            return safe_mode_block
 
         # Everything below this point CAN touch conversation history
         # (bootstrap writes, command handlers may persist state, the LLM
@@ -5807,6 +5791,14 @@ Expected Duration: {expected_duration}
         # lifecycle here so bootstrap and command-handling paths cannot
         # interleave with a heartbeat tick or another HTTP request.
         async with self._turn_lifecycle():
+            # A feature/privacy transition can latch Safe Mode while this turn
+            # is queued for the same boundary. Recheck after acquisition so a
+            # request admitted under the prior generation cannot execute over
+            # prompt authority that failed quarantine.
+            safe_mode_block = safe_mode_cognition_block(self, user_input)
+            if safe_mode_block is not None:
+                return safe_mode_block
+
             # Record THIS turn's session as soon as the turn lock is held —
             # before command handling — so tools invoked via an explicit
             # ``!command`` (e.g. request_restart's origin-session capture) see

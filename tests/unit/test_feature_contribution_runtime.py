@@ -164,6 +164,40 @@ async def test_privacy_transition_republishes_all_active_context_clauses(tmp_pat
     assert feature.context_renderer_calls == 2
 
 
+@pytest.mark.asyncio
+async def test_privacy_suppression_failure_latches_safe_mode(tmp_path):
+    """A privacy transition never resumes cognition over untrusted context."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    original = runtime.active_context_clauses()[0]
+    foreign = replace(original, body="foreign privacy replacement")
+    runtime.context_clause_registry._clauses[original.identity] = foreign
+    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
+    agent.privacy_agent = SimpleNamespace(
+        set_mode=lambda _mode: "Privacy mode changed.",
+        privacy_config=None,
+    )
+    agent._privacy_mode = PrivacyMode.NORMAL
+    agent.features = {}
+    agent.llm_service = None
+
+    with pytest.raises(
+        RuntimeError,
+        match="feature context could not be suppressed during privacy transition",
+    ) as error:
+        await agent._apply_privacy_mode_locked(PrivacyMode.ISOLATED)
+
+    assert error.value.__cause__ is None
+    assert agent._safe_mode is True
+    assert "privacy transition" in agent._safe_mode_reason.lower()
+    assert agent._privacy_mode is PrivacyMode.ISOLATED
+    assert runtime.is_active(feature)
+    assert runtime.active_context_clauses() == (foreign,)
+
+
 def test_host_refresh_failure_suppresses_stale_context_without_rerendering(
     tmp_path, caplog
 ):
