@@ -1007,6 +1007,7 @@ async def test_storage_phase_uses_shared_postgres_pool(tmp_path):
         MockPGBackend.from_pool.assert_called_once_with(
             pool,
             advisory_dsn="postgresql://scheduler-test/kestrel",
+            advisory_backend=None,
         )
         _, kwargs = MockStorage.call_args
         assert kwargs.get("backend") is pg_backend

@@ -167,6 +167,7 @@ class PostgresBackend(DatabaseBackend):
         )
         self._advisory_pool: Optional[asyncpg.Pool] = None
         self._advisory_pool_lock = asyncio.Lock()
+        self._advisory_backend: Optional["PostgresBackend"] = None
         
         self._pool: Optional[asyncpg.Pool] = None
         # PER-TASK transaction connection (#1726). Previously a single shared
@@ -190,6 +191,7 @@ class PostgresBackend(DatabaseBackend):
         *,
         advisory_dsn: Optional[str] = None,
         advisory_connect_kwargs: Optional[dict[str, Any]] = None,
+        advisory_backend: Optional["PostgresBackend"] = None,
     ) -> "PostgresBackend":
         """
         Create a PostgresBackend from an existing asyncpg pool.
@@ -206,11 +208,32 @@ class PostgresBackend(DatabaseBackend):
                 settings are copied from asyncpg's pool construction context.
             advisory_connect_kwargs: Connection options for the dedicated
                 advisory-lock pool, such as a non-default ``search_path``.
+            advisory_backend: Trusted host backend whose bounded advisory pool
+                this child may share. The delegate must wrap this exact
+                operational pool, must own its advisory pool directly, and is
+                owned by the caller. It cannot be combined with a connection
+                recipe supplied to this child.
 
         Returns:
             PostgresBackend wrapping the pool
         """
         instance = cls.__new__(cls)
+        if advisory_backend is not None:
+            if advisory_dsn is not None or advisory_connect_kwargs is not None:
+                raise ValueError(
+                    "advisory_backend cannot be combined with an advisory "
+                    "connection recipe"
+                )
+            if not isinstance(advisory_backend, cls):
+                raise TypeError("advisory_backend must be a PostgresBackend")
+            if advisory_backend._pool is not pool:
+                raise ValueError(
+                    "advisory_backend must wrap the same operational pool"
+                )
+            if advisory_backend._advisory_backend is not None:
+                raise ValueError(
+                    "advisory_backend must own its advisory pool directly"
+                )
         # Preserve the wrapped pool's no-DSN contract for unrelated consumers
         # (for example SQLAlchemy session factories). The scheduler-only
         # dedicated advisory pool has its own explicit connection source.
@@ -250,6 +273,7 @@ class PostgresBackend(DatabaseBackend):
         )
         instance._advisory_pool = None
         instance._advisory_pool_lock = asyncio.Lock()
+        instance._advisory_backend = advisory_backend
         instance._pool = pool
         instance._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
         instance._owns_pool = False  # Mark that we don't own the pool
@@ -456,6 +480,8 @@ class PostgresBackend(DatabaseBackend):
         # Retain the normal backend lifecycle check: an advisory pool is not a
         # hidden replacement for a closed primary database backend.
         self._ensure_connected()
+        if self._advisory_backend is not None:
+            return await self._advisory_backend._ensure_advisory_pool()
         if self._advisory_pool is not None:
             return self._advisory_pool
         async with self._advisory_pool_lock:

@@ -12,9 +12,103 @@ from __future__ import annotations
 
 import asyncio
 from collections import UserList
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
+
+
+@pytest.mark.asyncio
+async def test_postgres_children_share_one_host_owned_advisory_pool():
+    """Hosted children delegate gates without owning or closing the pool."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        def get_max_size(self):
+            return 3
+
+    primary_pool = _Pool()
+    host = PostgresBackend.from_pool(
+        primary_pool,
+        advisory_dsn="postgresql://host/kestrel",
+    )
+    first = PostgresBackend.from_pool(primary_pool, advisory_backend=host)
+    second = PostgresBackend.from_pool(primary_pool, advisory_backend=host)
+    advisory_pool = SimpleNamespace(close=AsyncMock())
+
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await first._ensure_advisory_pool() is advisory_pool
+        assert await second._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once()
+    assert first._advisory_pool is None
+    assert second._advisory_pool is None
+
+    await first.close()
+    advisory_pool.close.assert_not_awaited()
+    assert host._advisory_pool is advisory_pool
+
+    await host.close()
+    advisory_pool.close.assert_awaited_once()
+
+
+def test_postgres_advisory_delegate_requires_direct_same_pool_owner():
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        def get_max_size(self):
+            return 3
+
+    primary_pool = _Pool()
+    other_pool = _Pool()
+    other_host = PostgresBackend.from_pool(
+        other_pool, advisory_dsn="postgresql://other/kestrel"
+    )
+    with pytest.raises(ValueError, match="same operational pool"):
+        PostgresBackend.from_pool(primary_pool, advisory_backend=other_host)
+
+    host = PostgresBackend.from_pool(
+        primary_pool, advisory_dsn="postgresql://host/kestrel"
+    )
+    delegated = PostgresBackend.from_pool(primary_pool, advisory_backend=host)
+    with pytest.raises(ValueError, match="own its advisory pool directly"):
+        PostgresBackend.from_pool(primary_pool, advisory_backend=delegated)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        PostgresBackend.from_pool(
+            primary_pool,
+            advisory_dsn="postgresql://child/kestrel",
+            advisory_backend=host,
+        )
+
+
+def test_kestrel_agent_wires_trusted_shared_advisory_backend():
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    primary_pool = object()
+    host_backend = object()
+    agent = KestrelAgent(
+        did="did:kestrel:test:shared-advisory",
+        pg_pool=primary_pool,
+        database_url="postgresql://must-not-create-a-child-pool/kestrel",
+        db_backend="postgres",
+        shared_postgres_advisory_backend=host_backend,
+    )
+    built = object()
+    with patch.object(PostgresBackend, "from_pool", return_value=built) as factory:
+        assert agent._build_shared_pool_postgres_backend() is built
+
+    factory.assert_called_once_with(
+        primary_pool,
+        advisory_dsn=None,
+        advisory_backend=host_backend,
+    )
 
 
 def test_postgres_from_pool_keeps_advisory_dsn_outside_operational_pool_state():
