@@ -22,6 +22,7 @@ PORT="${PORT:-8080}"
 MULTI_AGENT_CONFIG="${KESTREL_MULTI_AGENT_CONFIG:-/app/multi_agent.toml}"
 AGENT_DATA_DIR="${KESTREL_AGENT_DATA_DIR:-/app/agent_data}"
 PERSISTENCE_MODE="${KESTREL_DEPLOYMENT_PERSISTENCE:-}"
+HOST_CONTROL_DIR="$(dirname -- "${KESTREL_HOST_DB_PATH:-/app/agent_data/host-data/kestrel_host.db}")"
 
 if [ "$PERSISTENCE_MODE" = "durable_sovereign" ]; then
     echo "FATAL: durable multi-agent Cloud Run needs one custody bundle and database binding per agent; refusing local inception." >&2
@@ -77,6 +78,10 @@ fi
 # Bootstrap identity and initialize DB for each agent data dir
 for dir in "$AGENT_DATA_DIR"/*/; do
     [ -d "$dir" ] || continue
+    # The Hold database lives on the persistent agent-data volume, but its
+    # directory is host infrastructure. A restart must not mint an identity or
+    # an agent database inside it.
+    [ "${dir%/}" = "${HOST_CONTROL_DIR%/}" ] && continue
     agent_name=$(basename "$dir")
 
     # Bootstrap identity if missing

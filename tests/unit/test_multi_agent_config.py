@@ -514,6 +514,27 @@ class TestAutoDiscovery:
         assert config.agents["agent2"].port == 8802
         assert config.agents["agent3"].port == 8803
 
+    def test_auto_discover_excludes_configured_host_control_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """Persistent Hold custody must never become an auto-started agent."""
+
+        agent_data = tmp_path / "agent_data"
+        agent_dir = agent_data / "real-agent"
+        host_dir = agent_data / "host-data"
+        agent_dir.mkdir(parents=True)
+        host_dir.mkdir()
+        (agent_dir / "kestrel_prime.db").touch()
+        # Reproduce a restart after the host has created its own SQLite file.
+        (host_dir / "kestrel_host.db").touch()
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH", str(host_dir / "kestrel_host.db")
+        )
+
+        config = MultiAgentConfig.auto_discover(agent_data, include_empty=True)
+
+        assert list(config.agents) == ["real-agent"]
+
     def test_auto_discover_skips_invalid_dirs(self, tmp_path):
         """Test that auto-discovery skips directories without kestrel_prime.db."""
         agent_data = tmp_path / "agent_data"
