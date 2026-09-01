@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import weakref
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable
 
 from kestrel_sdk.features import (
@@ -646,6 +646,16 @@ class ActiveFeatureContributions:
     permission_registration: PermissionDefaultRegistration | None
     context_clauses: tuple[ResolvedContextClause, ...] = ()
     execution_target_registrations: tuple[OperatorRegistrationSet, ...] = ()
+    # Quarantine is deliberately best-effort across independent registries.
+    # Operator registration sets are the exception: their authenticated
+    # withdrawal consumes a one-shot issuance seal. If a later registry fails,
+    # retain which exact capabilities already completed so a retry can finish
+    # instead of presenting a consumed seal again and becoming unrecoverable.
+    quarantined_operator_set_ids: set[int] = field(
+        default_factory=set,
+        repr=False,
+        compare=False,
+    )
 
 
 class FeatureContributionRuntime:
@@ -1018,35 +1028,37 @@ class FeatureContributionRuntime:
 
         failed = False
 
-        def attempt(operation, *, require_true: bool = False) -> None:
+        def attempt(operation) -> None:
             nonlocal failed
             try:
-                result = operation()
+                operation()
             except Exception:
                 # The public error below is deliberately fixed text. Registry
                 # exceptions can include third-party names or representations.
                 failed = True
-            else:
-                # Capability-set quarantine is an authenticated withdrawal:
-                # ``False`` means the retained set was not accepted and its
-                # services/workflows/targets may still be executable.  Do not
-                # erase the active lifecycle record or report cleanup success.
-                if require_true and result is not True:
-                    failed = True
+
+        def quarantine_operator_set(registration_set: OperatorRegistrationSet) -> None:
+            nonlocal failed
+            capability_id = id(registration_set)
+            if capability_id in active.quarantined_operator_set_ids:
+                return
+            try:
+                withdrawn = self.operator_registry.quarantine_registration_set(
+                    registration_set
+                )
+            except Exception:
+                # Keep the retained capability unmarked so a later repair can
+                # retry its authenticated withdrawal.
+                failed = True
+                return
+            if withdrawn is not True:
+                failed = True
+                return
+            active.quarantined_operator_set_ids.add(capability_id)
 
         for registration_set in reversed(active.execution_target_registrations):
-            attempt(
-                lambda item=registration_set: (
-                    self.operator_registry.quarantine_registration_set(item)
-                ),
-                require_true=True,
-            )
-        attempt(
-            lambda: self.operator_registry.quarantine_registration_set(
-                active.operator_registrations
-            ),
-            require_true=True,
-        )
+            quarantine_operator_set(registration_set)
+        quarantine_operator_set(active.operator_registrations)
 
         for registration in active.prepared.contributions.wait_providers:
             if self.wait_registry.contains(registration.name, registration.provider):

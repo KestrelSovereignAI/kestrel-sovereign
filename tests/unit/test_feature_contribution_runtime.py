@@ -1394,6 +1394,101 @@ def test_quarantine_reports_rejected_operator_issuance(tmp_path):
     ) is feature.actor
 
 
+def test_quarantine_retry_preserves_consumed_operator_withdrawal(
+    monkeypatch, tmp_path
+):
+    """A later cleanup failure must not make one-shot withdrawal unretryable."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    operator_set = runtime._active[id(feature)].operator_registrations
+
+    original_unregister = runtime.permission_defaults_registry.unregister
+    calls = 0
+
+    def fail_once(registration):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient permission cleanup failure")
+        return original_unregister(registration)
+
+    monkeypatch.setattr(
+        runtime.permission_defaults_registry,
+        "unregister",
+        fail_once,
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="feature contributions could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    # The operator set is an authenticated one-shot capability. Its successful
+    # withdrawal consumes the seal even though the later permission cleanup
+    # failed and the lifecycle record must remain for a retry.
+    assert operator_set._registry_seal is None
+    assert id(operator_set) not in runtime.operator_registry._issued_set_seals
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is None
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is None
+    assert runtime.is_active(feature)
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    _assert_live(agent, feature, False)
+
+
+def test_quarantine_retry_skips_completed_target_set_after_issuance_repair(tmp_path):
+    """Repairing a rejected set lets retry finish past an earlier consumed set."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    target = ExecutionTargetRegistration(
+        owner=feature.contribution_owner,
+        descriptor=ExecutionTargetDescriptor(
+            target_id="quarantine-retry-target",
+            target_kind="container",
+            display_name="Quarantine retry target",
+            tenant_id="tenant",
+            boundary_id="workspace",
+            capabilities=frozenset({"shell.execute"}),
+        ),
+        handle=object(),
+    )
+    target_set = runtime.register_execution_targets(feature, (target,))
+    active = runtime._active[id(feature)]
+    base_set = active.operator_registrations
+
+    # Target sets are quarantined in reverse order before the base service and
+    # workflow set. Simulate issuance-ledger drift in that later base set.
+    base_issuance = runtime.operator_registry._issued_set_seals.pop(id(base_set))
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="feature contributions could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    assert target_set._registry_seal is None
+    assert id(target_set) in active.quarantined_operator_set_ids
+    assert runtime.is_active(feature)
+
+    # Once the rejected capability's provenance is repaired, the retry must
+    # skip the already-consumed target set and complete the lifecycle cleanup.
+    runtime.operator_registry._issued_set_seals[id(base_set)] = base_issuance
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    _assert_live(agent, feature, False)
+
+
 def test_quarantine_removes_exact_signal_source_without_claim_ledger(tmp_path):
     """An unheld exact source cannot remain dispatchable after fail-close."""
 
