@@ -663,6 +663,57 @@ async def test_boot_rejects_whitespace_changing_persisted_target(hold_db):
 
 
 @pytest.mark.asyncio
+async def test_boot_rejects_foreign_host_witness_target_as_corruption(hold_db):
+    """Persisted host evidence cannot escape through caller-input validation."""
+
+    db, store = hold_db
+    await db.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        await db.execute(
+            "INSERT INTO hold_receipt_witnesses "
+            "(scope, target_id, receipt_count) VALUES (?, ?, ?)",
+            ("host", "foreign-host", 0),
+        )
+    finally:
+        await db.execute("PRAGMA ignore_check_constraints = OFF")
+
+    with pytest.raises(HoldCorruptStateError, match="foreign host"):
+        await store.read_boot_state()
+
+
+@pytest.mark.asyncio
+async def test_read_rejects_duplicate_receipt_count_witnesses(hold_db):
+    """A damaged witness table cannot make one conflicting row invisible."""
+
+    db, store = hold_db
+    await db.execute(
+        "ALTER TABLE hold_receipt_witnesses "
+        "RENAME TO hold_receipt_witnesses_valid"
+    )
+    await db.execute(
+        "CREATE TABLE hold_receipt_witnesses ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "receipt_count INTEGER NOT NULL)"
+    )
+    await db.execute(
+        "INSERT INTO hold_receipt_witnesses "
+        "(scope, target_id, receipt_count) VALUES (?, ?, ?), (?, ?, ?)",
+        (
+            "agent",
+            "did:agent:duplicate-witness",
+            0,
+            "agent",
+            "did:agent:duplicate-witness",
+            999,
+        ),
+    )
+    await db.execute("DROP TABLE hold_receipt_witnesses_valid")
+
+    with pytest.raises(HoldCorruptStateError, match="witness is duplicated"):
+        await store.get_hold("agent", "did:agent:duplicate-witness")
+
+
+@pytest.mark.asyncio
 async def test_host_context_uses_configured_postgres_for_durable_hold(
     monkeypatch,
     tmp_path,

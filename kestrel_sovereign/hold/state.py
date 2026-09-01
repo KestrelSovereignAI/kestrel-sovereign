@@ -2257,6 +2257,10 @@ class HoldStore:
                     raise HoldCorruptStateError(
                         "Hold boot-state target has a noncanonical identity"
                     )
+                if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
+                    raise HoldCorruptStateError(
+                        "Hold boot-state target has a foreign host identity"
+                    )
                 targets.add((scope, target_id))
 
             active: list[HoldState] = []
@@ -2515,18 +2519,24 @@ class HoldStore:
                 raise HoldCorruptStateError(
                     "hold latch row has invalid typed fields"
                 ) from exc
-        witness_row = await self._db.fetchone(
+        witness_rows = await self._db.fetchall(
             "SELECT receipt_count FROM hold_receipt_witnesses "
             "WHERE scope = ? AND target_id = ?",
             (scope.value, target_id),
         )
-        if witness_row is None and not receipts and projection_row is None:
+        if not witness_rows and not receipts and projection_row is None:
             witnessed_receipts = 0
-        elif witness_row is None or len(witness_row) != 1:
+        elif not witness_rows:
             raise HoldCorruptStateError("Hold receipt-count witness is missing")
+        elif len(witness_rows) != 1:
+            raise HoldCorruptStateError("Hold receipt-count witness is duplicated")
+        elif len(witness_rows[0]) != 1:
+            raise HoldCorruptStateError(
+                "Hold receipt-count witness has an unexpected shape"
+            )
         else:
             try:
-                witnessed_receipts = _exact_nonnegative_revision(witness_row[0])
+                witnessed_receipts = _exact_nonnegative_revision(witness_rows[0][0])
             except (TypeError, ValueError) as exc:
                 raise HoldCorruptStateError(
                     "Hold receipt-count witness has invalid typed fields"
