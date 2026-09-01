@@ -5149,16 +5149,42 @@ class KestrelAgent(
         except (Exception, asyncio.CancelledError):
             # Atomic activation: undo whatever partially registered so a failed
             # enable can't strand hooks / sources / tools. Soft teardown keeps
-            # the instance loaded (re-enable-able); its own errors are logged so
-            # the ORIGINAL activation error is what surfaces.
+            # the instance loaded (re-enable-able). If exact-inverse drift makes
+            # that teardown fail, quarantine every exact survivor before the
+            # ORIGINAL activation error is allowed to surface; otherwise a
+            # disabled feature can keep contributing prompt bytes.
+            quarantine_error = None
             try:
                 await self._unregister_feature_runtime(feature, unload=False)
             except (Exception, asyncio.CancelledError) as cleanup_exc:
                 logging.warning(
-                    "Cleanup after failed activation of feature '%s' failed: %s",
+                    "Cleanup after failed activation of feature '%s' reported %s; "
+                    "quarantining surviving contributions",
                     getattr(feature, "name", type(feature).__name__),
-                    cleanup_exc,
+                    type(cleanup_exc).__name__,
                 )
+                try:
+                    self._quarantine_feature_contributions(feature)
+                except (Exception, asyncio.CancelledError):
+                    quarantine_error = RuntimeError(
+                        "failed activation contributions could not be quarantined"
+                    )
+            if quarantine_error is not None:
+                safe_mode_reason = (
+                    "Feature activation contribution quarantine failed; "
+                    "cognition is blocked until lifecycle integrity is restored"
+                )
+                try:
+                    await self.enter_safe_mode(safe_mode_reason)
+                except (Exception, asyncio.CancelledError):
+                    # Safe Mode persistence is best-effort here, but the
+                    # in-memory cognition latch is not. A second failure must
+                    # not reopen prompts over an untrusted feature generation.
+                    self._safe_mode = True
+                    self._safe_mode_reason = safe_mode_reason
+                # Do not retain a third-party cleanup/quarantine exception as a
+                # printable cause; either may contain feature configuration.
+                raise quarantine_error from None
             raise
 
         if notify_ready:

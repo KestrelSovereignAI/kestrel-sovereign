@@ -536,6 +536,79 @@ class TestEnableFeature:
         assert not agent.feature_contribution_runtime.active_context_clauses()
 
     @pytest.mark.asyncio
+    async def test_failed_activation_quarantines_context_after_teardown_drift(self):
+        """A failed enable cannot retain prompt bytes when exact cleanup drifts."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class DriftedActivationFeature(SDKFixtureFeature):
+            contribution_prefix = "drifted-activation-fixture"
+
+        agent = _lifecycle_agent()
+        feature = DriftedActivationFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+
+        async def drift_then_fail():
+            agent.wait_registry.deregister(
+                feature.wait_provider.kind,
+                feature.wait_provider,
+            )
+            raise RuntimeError("activation failed after contribution drift")
+
+        feature.on_enable = drift_then_fail
+
+        with pytest.raises(
+            RuntimeError,
+            match="activation failed after contribution drift",
+        ):
+            await agent._activate_feature_runtime(feature)
+
+        runtime = agent.feature_contribution_runtime
+        assert feature.enabled is False
+        assert not runtime.is_active(feature)
+        assert runtime.active_context_clauses() == ()
+
+    @pytest.mark.asyncio
+    async def test_failed_activation_latches_safe_mode_if_quarantine_fails(
+        self, monkeypatch
+    ):
+        """Unrepairable activation ownership blocks later cognition."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class UnrepairableActivationFeature(SDKFixtureFeature):
+            contribution_prefix = "unrepairable-activation-fixture"
+
+        agent = _lifecycle_agent()
+        feature = UnrepairableActivationFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+
+        async def drift_then_fail():
+            agent.wait_registry.deregister(
+                feature.wait_provider.kind,
+                feature.wait_provider,
+            )
+            raise RuntimeError("activation failure must be superseded")
+
+        feature.on_enable = drift_then_fail
+        monkeypatch.setattr(
+            agent,
+            "_quarantine_feature_contributions",
+            MagicMock(side_effect=RuntimeError("private quarantine failure")),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="failed activation contributions could not be quarantined",
+        ):
+            await agent._activate_feature_runtime(feature)
+
+        assert agent._safe_mode is True
+        assert "quarantine failed" in agent._safe_mode_reason
+
+    @pytest.mark.asyncio
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     async def test_package_hook_cancellation_rolls_back_prior_enabled_member(
         self, mock_registry
@@ -574,6 +647,78 @@ class TestEnableFeature:
         assert first.enabled is False
         assert second.enabled is False
         assert not agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_package_enable_quarantines_prior_member_after_rollback_drift(
+        self, mock_registry
+    ):
+        """A failed package enable cannot retain a disabled member's context."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstPackageFeature(SDKFixtureFeature):
+            contribution_prefix = "rollback-drift-first"
+
+        class SecondPackageFeature(SDKFixtureFeature):
+            contribution_prefix = "rollback-drift-second"
+
+        agent = _lifecycle_agent()
+        first = FirstPackageFeature(agent)
+        second = SecondPackageFeature(agent)
+        first.enabled = False
+        second.enabled = False
+
+        async def drift_first_then_fail():
+            agent.wait_registry.deregister(
+                first.wait_provider.kind,
+                first.wait_provider,
+            )
+            raise RuntimeError("later package activation failed")
+
+        second.on_enable = drift_first_then_fail
+        agent.features = {first.name: first, second.name: second}
+        mock_registry.return_value = {
+            "rollback-drift-pkg": FeaturePackageInfo(
+                name="rollback-drift-pkg",
+                package="kestrel-feature-rollback-drift",
+                git="",
+                features=[first.name, second.name],
+                description="rollback drift fixture",
+            )
+        }
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="later package activation failed"):
+            await features_endpoint.enable_feature(request, "rollback-drift-pkg")
+
+        runtime = agent.feature_contribution_runtime
+        assert first.enabled is False
+        assert second.enabled is False
+        assert not runtime.is_active(first)
+        assert not runtime.is_active(second)
+        assert runtime.active_context_clauses() == ()
+
+    @pytest.mark.asyncio
+    async def test_quarantine_safe_mode_helper_latches_after_entry_failure(self):
+        """Package rollback has a synchronous fail-closed compatibility latch."""
+
+        agent = SimpleNamespace(_safe_mode=False)
+
+        async def fail_entry(_reason):
+            raise RuntimeError("safe-mode persistence unavailable")
+
+        agent.enter_safe_mode = fail_entry
+        await features_endpoint._enter_feature_quarantine_safe_mode(
+            agent,
+            "package quarantine failed",
+        )
+
+        assert agent._safe_mode is True
+        assert agent._safe_mode_reason == "package quarantine failed"
 
     @pytest.mark.asyncio
     async def test_ready_hook_cancelled_error_remains_best_effort(self):

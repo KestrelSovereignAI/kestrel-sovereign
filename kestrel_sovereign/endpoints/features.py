@@ -612,16 +612,42 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
         # Group transaction: roll the already-activated members back to the
         # disabled state (soft-toggle) so a partial package-enable never leaves
         # a mix of live and dead members.
+        quarantine_error = None
         for class_name, feature in reversed(activated):
             try:
                 await agent._unregister_feature_runtime(feature, unload=False)
-            except (Exception, asyncio.CancelledError):
-                logger.exception(
-                    "Enable rollback (re-disable) failed for feature '%s'",
+            except (Exception, asyncio.CancelledError) as cleanup_exc:
+                logger.error(
+                    "Enable rollback (re-disable) for feature '%s' reported %s; "
+                    "quarantining surviving contributions",
                     class_name,
+                    type(cleanup_exc).__name__,
                 )
+                quarantine_descriptor = inspect.getattr_static(
+                    agent, "_quarantine_feature_contributions", None
+                )
+                if quarantine_descriptor is None:
+                    quarantine_error = RuntimeError(
+                        "package enable rollback contribution quarantine is unavailable"
+                    )
+                    continue
+                try:
+                    agent._quarantine_feature_contributions(feature)
+                except (Exception, asyncio.CancelledError):
+                    quarantine_error = RuntimeError(
+                        "package enable rollback contributions could not be quarantined"
+                    )
             else:
                 logger.info("Rolled back enable of feature '%s'", class_name)
+        if quarantine_error is not None:
+            await _enter_feature_quarantine_safe_mode(
+                agent,
+                "Package enable rollback contribution quarantine failed; "
+                "cognition is blocked until lifecycle integrity is restored",
+            )
+            # A disabled member must never retain prompt authority. Surface a
+            # fixed error without chaining arbitrary feature cleanup details.
+            raise quarantine_error from None
         raise
 
     # A ready hook may explicitly enter cognition. Keep that seam closed until
@@ -636,6 +662,26 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
         "status": "enabled",
         "capabilities": compute_feature_capabilities(agent),
     }
+
+
+async def _enter_feature_quarantine_safe_mode(agent: object, reason: str) -> None:
+    """Latch cognition closed when contribution ownership cannot be repaired."""
+
+    entered = False
+    enter_safe_mode = getattr(agent, "enter_safe_mode", None)
+    if callable(enter_safe_mode):
+        try:
+            result = enter_safe_mode(reason)
+            if inspect.isawaitable(result):
+                await result
+            entered = getattr(agent, "_safe_mode", False) is True
+        except (Exception, asyncio.CancelledError):
+            pass
+    if not entered:
+        # A lightweight compatibility agent may not expose the constitutional
+        # persistence API. The in-memory latch is still the minimum safe state.
+        setattr(agent, "_safe_mode", True)
+        setattr(agent, "_safe_mode_reason", reason)
 
 
 @router.post("/api/features/{name}/disable")
