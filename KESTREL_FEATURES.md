@@ -292,7 +292,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `fs_list` | `!fs-list` | `file_operations` | `path` | 61 | `enabled` |
 | `fs_read` | `!fs-read` | `file_operations` | `path` | 60 | `enabled` |
 | `fs_write` | `!fs-write` | `file_operations` | `path`, `content` | 85 | `enabled` |
-| `shell` | `!shell` | `system` | `command`, `timeout` | 115 | `enabled` |
+| `shell` | `!shell` | `system` | `command`, `timeout` | 183 | `enabled` |
 
 ### `consent` (ConsentFeature)
 
@@ -950,7 +950,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!fs-list` | `computer_use` | `<path>` | List a directory (allow-list auto-approves; outside list requires human approval). |
 | `!fs-read` | `computer_use` | `<path>` | Read a file (allow-list auto-approves; outside list requires human approval). |
 | `!fs-write` | `computer_use` | `<path> <content>` | Replace the contents of a file (always approval-gated). |
-| `!shell` | `computer_use` | `<command> [timeout]` | Run a shell command. Deny-listed binaries hard-refuse; auto-approved binaries run without a prompt; everything else routes through the ApprovalQueue. |
+| `!shell` | `computer_use` | `<command> [timeout]` | Run a command. The command is tokenized and executed directly — there is NO shell, so a bare character a shell would interpret (`\|`, `;`, `>`, `$`, `*`, `~`, `#`, `{`, backtick, backslash) is refused rather than passed through as a literal. Quote it if you meant it literally: `echo 'price$'`. Deny-listed binaries hard-refuse; auto-approved binaries run without a prompt; everything else routes through the ApprovalQueue. |
 | `!consent-log` | `consent` | `[limit]` | View recent consent records showing the agent's perspective on past changes. |
 | `!consent-stats` | `consent` |  | View consent statistics grouped by action type and sentiment. |
 | `!constitution` | `constitution` | `[article] [search] [summary]` | Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary. |
