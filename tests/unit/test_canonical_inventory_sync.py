@@ -12,6 +12,7 @@ from kestrel_sovereign.feature_inventory import (
     discover_exported_feature_classes,
     discover_router_routes,
     render_inventory_markdown,
+    replace_generated_inventory,
 )
 from scripts import check_docs_links
 
@@ -27,6 +28,79 @@ def test_canonical_inventory_generated_region_is_exact():
     rendered = render_inventory_markdown(build_inventory()).strip()
 
     assert checked_in == rendered
+
+
+def test_writing_the_inventory_twice_changes_nothing_the_second_time():
+    """#3116: ``--write`` appended one blank line on every invocation.
+
+    The existing region test cannot see this: it compares both sides
+    ``.strip()``ed, so whitespace inside the region is invisible to it
+    and the drift was unbounded and silent. Byte equality is the only
+    assertion that catches it.
+
+    A synthetic document rather than the real file, so the test states
+    the property (a second write is a no-op) without depending on the
+    checked-in file being current — that is a different claim, and
+    test_canonical_inventory_generated_region_is_exact already makes it.
+    """
+    generated = f"{GENERATED_START}\n\n| a | b |\n\n{GENERATED_END}\n"
+    document = (
+        "# Title\n\nPreamble.\n\n"
+        f"{GENERATED_START}\n\nstale\n\n{GENERATED_END}\n"
+        "\n## Authentication Surface\n\nTail text.\n"
+    )
+
+    once = replace_generated_inventory(document, generated)
+    twice = replace_generated_inventory(once, generated)
+
+    assert twice == once, "a second write must be a no-op"
+    assert once.endswith("Tail text.\n"), "the trailing newline must survive"
+    assert "\n\n\n" not in once, "no blank line may accumulate at the boundary"
+    # The property has to hold for a document that already carries the
+    # accumulated damage, since that is what every checkout has.
+    damaged = once.replace(
+        f"{GENERATED_END}\n\n", f"{GENERATED_END}\n\n\n\n\n\n", 1
+    )
+    assert replace_generated_inventory(damaged, generated) == once, (
+        "the splice must collapse blank lines a previous run left, not "
+        "preserve them"
+    )
+
+
+def test_writing_the_inventory_keeps_a_region_that_ends_the_file():
+    """The region can be the last thing in the file.
+
+    Then there is no tail to separate from, and adding a blank line
+    would leave the file ending in one. Dropping the newline instead is
+    the failure the first attempt at #3116 produced — git reports
+    ``\\ No newline at end of file``.
+    """
+    generated = f"{GENERATED_START}\n\n| a | b |\n\n{GENERATED_END}\n"
+    document = f"# Title\n\n{GENERATED_START}\n\nstale\n\n{GENERATED_END}\n"
+
+    once = replace_generated_inventory(document, generated)
+
+    assert once.endswith(f"{GENERATED_END}\n"), once[-60:]
+    assert replace_generated_inventory(once, generated) == once
+
+
+def test_the_checked_in_inventory_is_a_fixed_point():
+    """The file on disk must already be what another write would produce.
+
+    The region test proves the generated content matches; this proves
+    the splice around it does too, so `--write` on a clean checkout
+    leaves the tree clean — which is the whole point of a generated
+    file being checked in.
+    """
+    path = PROJECT_ROOT / "KESTREL_FEATURES.md"
+    existing = path.read_text(encoding="utf-8")
+    rewritten = replace_generated_inventory(
+        existing, render_inventory_markdown(build_inventory())
+    )
+    assert rewritten == existing, (
+        "python -m scripts.generate_feature_inventory --write would change "
+        "the checked-in file"
+    )
 
 
 def test_canonical_inventory_keeps_feature_snapshot_counts_in_sync():
