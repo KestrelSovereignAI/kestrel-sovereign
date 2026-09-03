@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import socket
@@ -42,6 +43,8 @@ from kestrel_sovereign.knowledge.capabilities import (
     semantic_capabilities_from_config,
 )
 from kestrel_sovereign.knowledge.inference import inference_profile_from_config
+from kestrel_sovereign.knowledge.release_evidence import release_gate_specs
+from kestrel_sovereign.knowledge.release_evidence_models import ErasureStage
 from kestrel_sovereign.knowledge.release_evidence_models import _canonical_json
 
 
@@ -50,8 +53,198 @@ _TEST_SIGNING_PUBLIC_KEY = _TEST_SIGNING_PRIVATE_KEY.public_key().public_bytes(
     serialization.Encoding.Raw,
     serialization.PublicFormat.Raw,
 ).hex()
-from kestrel_sovereign.knowledge.release_evidence import release_gate_specs
-from kestrel_sovereign.knowledge.release_evidence_models import ErasureStage
+
+
+@pytest.mark.asyncio
+async def test_kite_invoke_stop_cancels_evidence_before_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop must own Kite work and suppress a raced signed-success response."""
+
+    from fastapi import FastAPI, Response
+    from starlette.requests import Request
+
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.endpoints.agent import invoke_agent
+
+    started = asyncio.Event()
+    released = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class LiveKiteAgent(RequestLifecycleMixin):
+        agent_id = "did:test:kite-stop"
+
+        def __init__(self) -> None:
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+
+    async def slow_evidence(*_args, **_kwargs):
+        started.set()
+        try:
+            await released.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "diagnostics", {"completed": True}
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.endpoints.agent._kite_runtime_observation",
+        slow_evidence,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.endpoints.agent._kite_evidence_signature",
+        lambda _payload: "test-signature",
+    )
+    agent = LiveKiteAgent()
+    app = FastAPI()
+    app.state.agent = agent
+    body = json.dumps(
+        {
+            "request_id": "kite-live",
+            "kite_evidence": {
+                "operation": "diagnostics",
+                "nonce": "a" * 64,
+            },
+        }
+    ).encode()
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/agent/invoke",
+            "raw_path": b"/api/agent/invoke",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "app": app,
+        },
+        receive,
+    )
+    endpoint = getattr(invoke_agent, "__wrapped__", invoke_agent)
+    invocation = asyncio.create_task(endpoint(request, Response()))
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert agent.cancel_current_request("kite-live") is True
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+    finally:
+        released.set()
+        result = await asyncio.wait_for(invocation, timeout=1)
+
+    assert result["response"] == "Request stopped during execution."
+    assert "kite_evidence" not in result
+    assert agent._active_request_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_kite_invoke_rechecks_stop_after_evidence_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Stop linearized at task completion must suppress signed success."""
+
+    from fastapi import FastAPI, Response
+    from starlette.requests import Request
+
+    from kestrel_sovereign.endpoints.agent import invoke_agent
+
+    class CompletionRaceAgent:
+        agent_id = "did:test:kite-completion-race"
+
+        def __init__(self) -> None:
+            self.cancel_checks = 0
+            self.cleaned = []
+
+        def register_active_request(self, _request_id: str) -> None:
+            return None
+
+        def bind_request_operation(
+            self, _request_id: str, _operation: asyncio.Task
+        ) -> None:
+            return None
+
+        def is_request_cancelled(self, _request_id: str) -> bool:
+            self.cancel_checks += 1
+            return self.cancel_checks >= 2
+
+        def _cleanup_cancelled_request(self, request_id: str) -> None:
+            self.cleaned.append(request_id)
+
+    async def completed_evidence(*_args, **_kwargs):
+        return "diagnostics", {"completed": True}
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.endpoints.agent._kite_runtime_observation",
+        completed_evidence,
+    )
+
+    def reject_signature(_payload):
+        raise AssertionError("stopped evidence must not be signed")
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.endpoints.agent._kite_evidence_signature",
+        reject_signature,
+    )
+    agent = CompletionRaceAgent()
+    app = FastAPI()
+    app.state.agent = agent
+    body = json.dumps(
+        {
+            "request_id": "kite-completion-race",
+            "kite_evidence": {
+                "operation": "diagnostics",
+                "nonce": "b" * 64,
+            },
+        }
+    ).encode()
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/agent/invoke",
+            "raw_path": b"/api/agent/invoke",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "app": app,
+        },
+        receive,
+    )
+    endpoint = getattr(invoke_agent, "__wrapped__", invoke_agent)
+
+    result = await endpoint(request, Response())
+
+    assert result["response"] == "Request stopped during execution."
+    assert "kite_evidence" not in result
+    assert agent.cancel_checks == 2
+    assert agent.cleaned == ["kite-completion-race"]
 
 
 class _Reply:

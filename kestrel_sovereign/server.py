@@ -436,12 +436,61 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     entered_at = getattr(agent, "_safe_mode_entered_at", None)
     if isinstance(entered_at, datetime):
         record["entered_at"] = entered_at.isoformat()
+    # Every cause that is true, not the first one an elif chain reaches.
+    # Several can hold at once — an audit can fail AND the store be
+    # unreachable — and the previous chain reported only the store, hiding a
+    # constitutional violation Amendment III requires be reported. It also
+    # made "integrity_restriction" the else branch, so a restriction with no
+    # other explanation was reported to the Sovereign as a violation of their
+    # constitution whether or not anything failed to verify (#2920).
+    failures: list[str] = []
     if audit_pending and not safe_mode:
-        record["failure"] = "startup_audit_required"
-    elif getattr(agent, "_constitution_state_load_error", None):
-        record["failure"] = "state_unavailable"
-    else:
-        record["failure"] = "integrity_restriction"
+        failures.append("startup_audit_required")
+    if getattr(agent, "_constitution_state_load_error", None):
+        failures.append("state_unavailable")
+    if getattr(agent, "_constitution_state_persistence_pending", False):
+        failures.append("state_not_persisted")
+    # Every cause maps to its own name, independently. An elif chain here
+    # dropped a recorded cause whenever another failure was already present,
+    # and recognising only two of them reported the rest as "unrecorded" —
+    # which is a claim about the record, not about the agent.
+    _CAUSE_FAILURES = {
+        "integrity": "integrity_restriction",
+        "bootstrap": "bootstrap_incomplete",
+        "state_unavailable": "state_unavailable",
+        "state_not_persisted": "restricted_by_unsaved_state",
+        "identity_missing": "identity_missing",
+        "memory_unreadable": "memory_unreadable",
+        "unrecorded": "cause_unrecorded",
+    }
+    cause = getattr(agent, "_safe_mode_cause", None)
+    if safe_mode:
+        named = _CAUSE_FAILURES.get(cause)
+        if named is None:
+            # Restricted with nothing recorded saying why. Named as such
+            # rather than attributed to integrity: an absent cause is not
+            # evidence of a violation.
+            named = "cause_unrecorded"
+        if named not in failures:
+            failures.append(named)
+    record["failures"] = failures
+    # ``failure`` stays for readers that predate the list. It carries the
+    # gravest active cause, so a client reading one string is never told
+    # something milder than what is actually true.
+    _SEVERITY = [
+        "integrity_restriction",
+        "identity_missing",
+        "bootstrap_incomplete",
+        "memory_unreadable",
+        "restricted_by_unsaved_state",
+        "cause_unrecorded",
+        "state_unavailable",
+        "state_not_persisted",
+        "startup_audit_required",
+    ]
+    record["failure"] = next(
+        (f for f in _SEVERITY if f in failures), "integrity_restriction"
+    )
     return record
 
 
@@ -1182,7 +1231,12 @@ def _active_local_peer_host_url(app: FastAPI) -> Optional[str]:
     return explicit_url.rstrip("/") if explicit_url else None
 
 
-def _hosted_peer_directory_context(app: FastAPI, agent) -> tuple[object, object]:
+def _hosted_peer_directory_context(
+    app: FastAPI,
+    agent,
+    *,
+    manager=None,
+) -> tuple[object, object]:
     """Return the effective directory pair for one hosted agent's A2A policy.
 
     ``PeersFeature`` owns the local-host compatibility adapter after feature
@@ -1236,7 +1290,22 @@ def _hosted_peer_directory_context(app: FastAPI, agent) -> tuple[object, object]
         refresh = getattr(peer_feature, "refresh_local_host_peer_directory", None)
         if not callable(refresh):
             return None, None
-        refreshed = refresh(host_url=host_url, api_key=get_api_key())
+        local_cancel = None
+        if manager is not None:
+            async def local_cancel(requester, peer, task_id, payload):
+                return await manager.cancel_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                    payload=payload,
+                )
+
+        refreshed = refresh(
+            host_url=host_url,
+            api_key=get_api_key(),
+            local_cancel=local_cancel,
+        )
         return refreshed if refreshed is not None else (None, None)
     return (
         getattr(agent, "peer_directory_router", None),
@@ -1281,7 +1350,11 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         federated_fallback=federated,
     )
     install_a2a_inbound_sender_authorizer(manager, recipient=agent)
-    peer_router, peer_requester = _hosted_peer_directory_context(app, agent)
+    peer_router, peer_requester = _hosted_peer_directory_context(
+        app,
+        agent,
+        manager=manager,
+    )
     manager.install_a2a_hosted_policy(
         agent,
         resolver=agent.a2a_did_resolver,
@@ -1642,12 +1715,107 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                                 )
 
 
+_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (
+    "KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE"
+)
+_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE_ENV = (
+    "KESTREL_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE"
+)
+_DEFAULT_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE = 20
+_DEFAULT_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE = 4
+
+
+def _load_positive_int_env(name: str, default: int) -> int:
+    """Load a positive host-capacity setting, failing startup on bad input."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 def _uses_shared_postgres_scheduler() -> bool:
     """Whether this host can safely poll the fleet's shared schedule table."""
     return (
         os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower() == "postgres"
         and bool(os.environ.get("KESTREL_DATABASE_URL"))
     )
+
+
+async def _start_shared_agent_postgres_backend(app: FastAPI):
+    """Create the host-owned pools shared by every local PostgreSQL agent."""
+
+    app.state.shared_agent_postgres_backend = None
+    if not _uses_shared_postgres_scheduler():
+        return None
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    # These pools are fleet-wide, not the old per-agent pools. Keep explicit,
+    # independent operator budgets for ordinary database work and for the much
+    # rarer session-advisory operations. Scheduler effect gates use the host
+    # scheduler's own storage backend, so its concurrency is deliberately not
+    # used to size either pool here.
+    operational_capacity = _load_positive_int_env(
+        _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV,
+        _DEFAULT_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE,
+    )
+    advisory_capacity = _load_positive_int_env(
+        _SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE_ENV,
+        _DEFAULT_SHARED_AGENT_POSTGRES_ADVISORY_MAX_POOL_SIZE,
+    )
+    backend = PostgresBackend(
+        dsn=os.environ["KESTREL_DATABASE_URL"],
+        min_pool_size=min(2, operational_capacity),
+        max_pool_size=operational_capacity,
+        advisory_max_pool_size=advisory_capacity,
+    )
+    app.state.shared_agent_postgres_backend = backend
+    try:
+        await backend.connect()
+    except BaseException as startup_failure:
+        cleanup = asyncio.create_task(
+            backend.close(), name="shared_agent_postgres_startup_cleanup"
+        )
+        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
+            cleanup
+        )
+        if cleanup_failure is None:
+            app.state.shared_agent_postgres_backend = None
+        else:
+            startup_failure.add_note(
+                "Shared PostgreSQL startup cleanup also failed: "
+                f"{type(cleanup_failure).__name__}"
+            )
+        if cleanup_cancelled and not isinstance(
+            startup_failure, asyncio.CancelledError
+        ):
+            raise asyncio.CancelledError() from startup_failure
+        raise
+    return backend
+
+
+async def _shutdown_shared_agent_postgres_backend(app: FastAPI) -> None:
+    """Close host-owned pools only after every child has terminally drained."""
+
+    backend = getattr(app.state, "shared_agent_postgres_backend", None)
+    if backend is None:
+        return
+    if (
+        getattr(app.state, "agent_manager", None) is not None
+        or getattr(app.state, "startup_cleanup_agent_manager", None) is not None
+    ):
+        raise RuntimeError(
+            "refusing to close shared PostgreSQL pools while an agent manager "
+            "still owns children"
+        )
+    await backend.close()
+    app.state.shared_agent_postgres_backend = None
 
 
 async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, config) -> None:
@@ -2080,6 +2248,10 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
         # onboarding can remount routes or UI after their only teardown pass.
         ("host-features", lambda: _shutdown_host_features(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        (
+            "shared-agent-postgres",
+            lambda: _shutdown_shared_agent_postgres_backend(app),
+        ),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
         phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
@@ -2260,7 +2432,11 @@ async def _lifespan_startup(app: FastAPI):
                 auto_discover_fallback=True,
             )
             _apply_platform_host_port(config, os.environ)
-            manager = AgentManager(base_data_dir=Path.cwd())
+            shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
+            manager = AgentManager(
+                base_data_dir=Path.cwd(),
+                shared_postgres_backend=shared_postgres_backend,
+            )
             app.state.agent_manager = manager
             # Persistence context for runtime agent creation (#2358): when the
             # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent

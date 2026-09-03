@@ -9,8 +9,10 @@ import pytest
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
+    HOST_ADMIN_COMMANDS,
     RECOVERY_COMMAND_POLICY,
     RECOVERY_COMMANDS,
+    RECOVERY_SOVEREIGN_COMMANDS,
     SAFE_MODE_COMMANDS,
     SOVEREIGN_COMMANDS,
 )
@@ -207,12 +209,16 @@ def test_recovery_policy_is_complete_immutable_and_authority_derived():
         }
     )
     assert SOVEREIGN_COMMANDS == frozenset(
-        {"!safe-mode", "!reanchor-constitution"}
+        {"!safe-mode", "!reanchor-constitution", "!create-agent"}
     )
-    assert SOVEREIGN_COMMANDS == frozenset(
+    assert RECOVERY_SOVEREIGN_COMMANDS == frozenset(
         command
         for command, rule in RECOVERY_COMMAND_POLICY.items()
         if rule.requires_sovereign
+    )
+    assert HOST_ADMIN_COMMANDS == frozenset({"!create-agent"})
+    assert SOVEREIGN_COMMANDS == (
+        RECOVERY_SOVEREIGN_COMMANDS | HOST_ADMIN_COMMANDS
     )
     with pytest.raises(TypeError):
         RECOVERY_COMMAND_POLICY["!status"] = True

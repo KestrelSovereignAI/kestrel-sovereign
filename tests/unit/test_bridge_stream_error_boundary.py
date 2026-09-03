@@ -17,15 +17,17 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
 
 
 API_KEY = "test-bridge-key"
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 
-def _boot(process_input_streaming):
+def _boot(process_input_streaming, *, cancellation_after_stream=False):
     """Boot the real app with a single agent exposing a BridgeFeature and the
     given ``process_input_streaming`` async generator. Returns ``(app, restore)``.
     """
@@ -53,6 +55,14 @@ def _boot(process_input_streaming):
     agent = MagicMock()
     agent.features = {"BridgeFeature": bridge}
     agent.process_input_streaming = process_input_streaming
+    cancellation_checks = 0
+
+    def _is_request_cancelled(_request_id):
+        nonlocal cancellation_checks
+        cancellation_checks += 1
+        return cancellation_after_stream and cancellation_checks >= 2
+
+    agent.is_request_cancelled = MagicMock(side_effect=_is_request_cancelled)
 
     app.router.lifespan_context = noop_lifespan
     app.state.agent = agent
@@ -68,9 +78,12 @@ def _boot(process_input_streaming):
     return app, restore
 
 
-def _post_stream(process_input_streaming):
+def _post_stream(process_input_streaming, *, cancellation_after_stream=False):
     os.environ["KESTREL_API_KEY"] = API_KEY
-    app, restore = _boot(process_input_streaming)
+    app, restore = _boot(
+        process_input_streaming,
+        cancellation_after_stream=cancellation_after_stream,
+    )
     try:
         with TestClient(app) as client:
             return client.post(
@@ -78,6 +91,31 @@ def _post_stream(process_input_streaming):
                 json={"message": "hi", "channel_type": "api"},
                 headers={"X-API-Key": API_KEY},
             )
+    finally:
+        restore()
+
+
+def _post_stream_with_agent(
+    process_input_streaming,
+    *,
+    cancellation_after_stream=False,
+):
+    """Drive the real bridge route and retain its test agent for assertions."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    app, restore = _boot(
+        process_input_streaming,
+        cancellation_after_stream=cancellation_after_stream,
+    )
+    agent = app.state.agent
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/bridge/stream",
+                json={"message": "hi", "channel_type": "api"},
+                headers={"X-API-Key": API_KEY},
+            )
+        return response, agent
     finally:
         restore()
 
@@ -96,6 +134,56 @@ def _error_events(text: str):
         if isinstance(payload, dict) and payload.get("type") == "error":
             events.append(payload)
     return events
+
+
+def _events(text: str):
+    events = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[len("data:") :].strip())
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
+def test_bridge_stream_reports_stopped_command_instead_of_success():
+    """Clean command EOF still carries the live request cancellation marker."""
+
+    async def _stopped_command(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+
+    response = _post_stream(
+        _stopped_command,
+        cancellation_after_stream=True,
+    )
+
+    assert response.status_code == 200
+    events = _events(response.text)
+    assert [event["type"] for event in events] == ["stopped"]
+    assert events[0]["request_id"]
+
+
+def test_bridge_stream_withholds_chunk_queued_before_stop():
+    """The bridge owner rechecks Stop before publishing a producer chunk."""
+
+    async def _queued(*_args, **_kwargs):
+        yield "must not escape"
+
+    response, agent = _post_stream_with_agent(
+        _queued,
+        cancellation_after_stream=True,
+    )
+
+    assert response.status_code == 200
+    assert [event["type"] for event in _events(response.text)] == ["stopped"]
+    assert "must not escape" not in response.text
+    assert agent.features["BridgeFeature"].log_invocation.await_count == 1
 
 
 def test_bridge_stream_generic_exception_emits_safe_constant_not_str_e():
@@ -117,6 +205,20 @@ def test_bridge_stream_generic_exception_emits_safe_constant_not_str_e():
     assert len(errors) == 1
     assert marker not in errors[0]["message"]
     assert "could not be completed" in errors[0]["message"]
+
+
+def test_bridge_source_failure_is_not_recorded_as_abandoned_cleanup():
+    """The bridge must reserve ABANDONED for an actual close failure."""
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("provider failed")
+        yield  # pragma: no cover
+
+    response, agent = _post_stream_with_agent(_boom)
+
+    assert response.status_code == 200
+    agent._cleanup_cancelled_request.assert_called_once()
+    assert agent._cleanup_cancelled_request.call_args.kwargs == {}
 
 
 def test_bridge_stream_llm_streaming_error_provider_marker_never_surfaces():

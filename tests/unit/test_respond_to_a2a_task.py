@@ -44,9 +44,15 @@ def _make_feature(initial_state: TaskState = TaskState.SUBMITTED):
         return state["task"] if state["task"].id == task_id else None
 
     async def update_status(
-        task_id, new_state, message=None, agent_name=None,
+        task_id,
+        new_state,
+        message=None,
+        agent_name=None,
+        *,
+        recipient_agent_id,
     ):
         assert state["task"].id == task_id
+        assert recipient_agent_id == "did:test:receiver"
         # Validate the transition matches the receiver's expected
         # chain. SUBMITTED → WORKING, WORKING → COMPLETED/FAILED/CANCELED.
         prior = state["task"].status.state
@@ -58,9 +64,24 @@ def _make_feature(initial_state: TaskState = TaskState.SUBMITTED):
         ]
         return state["task"]
 
+    async def cancel_task(task_id, reason=None, agent_name=None):
+        assert state["task"].id == task_id
+        prior = state["task"].status.state
+        state["task"].status = TaskStatus(
+            state=TaskState.CANCELED,
+            message=Message(
+                role="agent", parts=[TextPart(text=reason or "Task canceled")]
+            ),
+        )
+        state["transitions"] = state.get("transitions", []) + [
+            (prior.value, TaskState.CANCELED.value)
+        ]
+        return state["task"]
+
     task_manager = MagicMock()
     task_manager.get_task = AsyncMock(side_effect=get_task)
     task_manager.update_status = AsyncMock(side_effect=update_status)
+    task_manager.cancel_task = AsyncMock(side_effect=cancel_task)
 
     agent = SimpleNamespace(did="did:test:receiver")
     feature = TaskFeature(agent)
@@ -134,6 +155,11 @@ async def test_canceled_state_supported():
     )
     assert result.status is ToolResultStatus.OK
     assert state["task"].status.state == TaskState.CANCELED
+    feature.task_manager.cancel_task.assert_awaited_once_with(
+        "task-1",
+        reason="declining: out of scope",
+        agent_name="did:test:receiver",
+    )
 
 
 @pytest.mark.asyncio
@@ -244,8 +270,15 @@ def _make_feature_with_artifact_tracking(initial_state: TaskState = TaskState.WO
     async def get_task(task_id):
         return state["task"] if state["task"].id == task_id else None
 
-    async def add_artifact(task_id, artifact, agent_name=None):
+    async def add_artifact(
+        task_id,
+        artifact,
+        agent_name=None,
+        *,
+        recipient_agent_id,
+    ):
         assert state["task"].id == task_id
+        assert recipient_agent_id == "did:test:receiver"
         state["added"].append(artifact)
         if state["task"].artifacts is None:
             state["task"].artifacts = []

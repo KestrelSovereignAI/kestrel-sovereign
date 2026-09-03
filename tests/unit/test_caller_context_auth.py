@@ -115,6 +115,40 @@ async def test_anonymous_rejected_from_reanchor():
     assert "unauthorized" in result.lower()
 
 
+@pytest.mark.asyncio
+async def test_sovereign_can_create_trusted_agent():
+    handler, agent = _make_handler()
+    agent.create_trusted_agent = AsyncMock(return_value="created")
+
+    result = await handler.handle(
+        "!create-agent child", caller=CallerContext.sovereign()
+    )
+
+    assert result == "created"
+    agent.create_trusted_agent.assert_awaited_once_with("child")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller",
+    [
+        None,
+        CallerContext.anonymous(),
+        CallerContext.authenticated("user@example.com"),
+        CallerContext.authenticated("jwt@example.com", auth_method=AuthMethod.JWT),
+    ],
+)
+async def test_non_sovereign_caller_cannot_create_trusted_agent(caller):
+    handler, agent = _make_handler()
+    agent.create_trusted_agent = AsyncMock(return_value="created")
+
+    result = await handler.handle("!create-agent child", caller=caller)
+
+    assert "unauthorized" in result.lower()
+    assert "sovereign" in result.lower()
+    agent.create_trusted_agent.assert_not_awaited()
+
+
 # Non-governance commands should work for any caller
 
 @pytest.mark.asyncio

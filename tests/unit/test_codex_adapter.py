@@ -394,8 +394,70 @@ class TestUsageProjection:
             "totalTokens": 100, "inputTokens": 90,
             "cachedInputTokens": 40, "outputTokens": 10,
         }}) == {
-            "input_tokens": 90, "output_tokens": 10,
-            "total_tokens": 100, "cache_read_input_tokens": 40,
+            "input_tokens": 50, "output_tokens": 10,
+            "total_tokens": 60, "cache_read_input_tokens": 40,
+        }
+
+    def test_reused_thread_projects_latest_turn_not_cumulative_total(self):
+        assert _usage_from({
+            "total": {
+                "totalTokens": 300,
+                "inputTokens": 270,
+                "cachedInputTokens": 120,
+                "outputTokens": 30,
+            },
+            "last": {
+                "totalTokens": 100,
+                "inputTokens": 90,
+                "cachedInputTokens": 40,
+                "outputTokens": 10,
+            },
+        }) == {
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "total_tokens": 60,
+            "cache_read_input_tokens": 40,
+        }
+
+    @pytest.mark.parametrize(
+        ("last_key", "latest"),
+        [
+            (
+                "lastTokenUsage",
+                {
+                    "totalTokens": 100,
+                    "inputTokens": 90,
+                    "cachedInputTokens": 40,
+                    "outputTokens": 10,
+                },
+            ),
+            (
+                "last_token_usage",
+                {
+                    "total_tokens": 100,
+                    "input_tokens": 90,
+                    "cached_input_tokens": 40,
+                    "output_tokens": 10,
+                },
+            ),
+        ],
+    )
+    def test_reused_thread_accepts_supported_latest_turn_spellings(
+        self, last_key, latest
+    ):
+        assert _usage_from({
+            "total": {
+                "totalTokens": 300,
+                "inputTokens": 270,
+                "cachedInputTokens": 120,
+                "outputTokens": 30,
+            },
+            last_key: latest,
+        }) == {
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "total_tokens": 60,
+            "cache_read_input_tokens": 40,
         }
 
 
@@ -596,10 +658,49 @@ class TestAdapterTextPath:
         )
         assert isinstance(r, LLMResponse)
         assert r.content == "Hello"
-        assert (r.input_tokens, r.output_tokens, r.total_tokens) == (7, 2, 9)
+        assert (r.input_tokens, r.output_tokens, r.total_tokens) == (4, 2, 6)
         assert r.cache_read_input_tokens == 3
         cached_id, cached_fp = a._session_threads["s1"]
         assert cached_id == "thr-1" and cached_fp  # fingerprint set
+
+    @pytest.mark.asyncio
+    async def test_snake_case_usage_event_drives_per_turn_accounting(self):
+        events = [
+            {"method": "item/agentMessage/delta", "params": {"delta": "Hi"}},
+            {
+                "method": "thread/token_usage/updated",
+                "params": {
+                    "token_usage": {
+                        "total": {
+                            "input_tokens": 270,
+                            "cached_input_tokens": 120,
+                            "output_tokens": 30,
+                            "total_tokens": 300,
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 90,
+                            "cached_input_tokens": 40,
+                            "output_tokens": 10,
+                            "total_tokens": 100,
+                        },
+                    }
+                },
+            },
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        response = await _adapter_with(events).get_response(
+            client="ignored",
+            model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="snake-usage",
+        )
+
+        assert (
+            response.input_tokens,
+            response.output_tokens,
+            response.total_tokens,
+            response.cache_read_input_tokens,
+        ) == (50, 10, 60, 40)
 
     @pytest.mark.asyncio
     async def test_multimodal_user_turn_materializes_app_server_local_image(self):
@@ -1815,8 +1916,6 @@ class TestToolExecutorBridge:
         ``item/reasoning/textDelta`` and ``item/reasoning/summaryTextDelta``,
         not the generic ``/reasoning/delta`` suffix the earlier code
         guessed at."""
-        from kestrel_sovereign.llm.adapter import ThinkingDelta
-
         events = [
             {"method": "item/reasoning/textDelta",
              "params": {"delta": "thinking-one"}},
@@ -2286,6 +2385,42 @@ class TestCodexApprovalBridge:
         assert reply == {"decision": "accept"}
         assert len(captured) == 1, (
             "compound command must reach the queue, not auto-accept"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_escaped_quote_cannot_hide_a_command_separator(self):
+        """codex review round 6, P1 — a regression #3129 introduced.
+
+        Simplifying the quote walk dropped backslash handling, so
+        ``echo foo\'; sudo -n true`` opened a single-quoted region at
+        the ESCAPED apostrophe and the ``;`` after it looked quoted.
+        The compound guard saw nothing, ``BinaryPolicy`` saw an
+        allow-listed ``echo``, and this bridge auto-accepted — while a
+        real shell reads the apostrophe as a literal and runs the
+        second command. Verified against bash: it prints the second
+        command's output.
+
+        The tool that motivated #3129 was never exposed (a backslash is
+        not an inert character, so its own rule refuses the line). This
+        door was, which is why the test lives here as well as on the
+        predicate.
+        """
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["echo"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+
+        reply = await handler({"command": "echo foo\\'; rm -rf /tmp/x"})
+
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1, (
+            "an escaped quote must not hide the separator from the queue"
         )
 
     @pytest.mark.asyncio

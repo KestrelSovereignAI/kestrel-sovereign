@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -39,6 +40,7 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_graph_store import (
     AsyncGraphStore,
     GraphNode,
+    NodeDeleteResult,
     NodeSwapResult,
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
@@ -110,6 +112,47 @@ class TestNodeSwapResult:
         # the plain string, not "NodeSwapResult.SWAPPED".
         assert NodeSwapResult.SWAPPED.value == "swapped"
         assert str(NodeSwapResult.SWAPPED) in ("swapped", "NodeSwapResult.SWAPPED")
+
+    def test_delete_result_is_str_enum(self):
+        assert NodeDeleteResult.DELETED == "deleted"
+        assert NodeDeleteResult.PREDICATE_FAILED == "predicate_failed"
+        assert NodeDeleteResult.NOT_FOUND == "not_found"
+
+
+async def test_postgres_bulk_row_locks_use_python_compatible_byte_order():
+    """Every batch must use the same UTF-8 ordering used to form the batches."""
+
+    import kestrel_sovereign.storage.async_graph_store as graph_store_module
+
+    class _PostgresProbe:
+        backend_type = "postgres"
+
+        def __init__(self):
+            self.queries = []
+
+        async def fetchall(self, query, params=()):
+            self.queries.append(query)
+            if "FROM graph_nodes" in query:
+                return [(node_id,) for node_id in params]
+            return []
+
+    db = _PostgresProbe()
+    node_ids = [f"node:{index:04d}" for index in range(501)] + [
+        "node:angstrom:\u00e5",
+        "node:emoji:\U0001f642",
+    ]
+
+    locked = await graph_store_module.lock_graph_nodes_for_update(db, node_ids)
+
+    assert locked == sorted(node_ids)
+    row_lock_queries = [
+        query for query in db.queries if "FROM graph_nodes" in query
+    ]
+    assert len(row_lock_queries) == 2
+    assert all(
+        'ORDER BY node_id COLLATE "C" FOR UPDATE' in query
+        for query in row_lock_queries
+    )
 
 
 # =====================================================================
@@ -230,6 +273,130 @@ class TestCompareAndSwap:
         assert after.label == "After"
         # ...and our properties change landed.
         assert after.properties == {"status": "done"}
+
+    async def test_expected_identity_refuses_post_read_relabel(self, graph_store):
+        """A caller that owns one graph shape can atomically refuse a row that
+        was relabeled after its read, even when the properties still match."""
+        nid = _nid("identity-label")
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="owned", label="Before")
+        )
+        snapshot = (await graph_store.get_node(nid)).properties
+
+        # Another whole-row writer changes identity but preserves the exact
+        # properties snapshot, reproducing the gap in a properties-only CAS.
+        await graph_store.add_node(
+            _node(nid, dict(snapshot), node_type="owned", label="After")
+        )
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            snapshot,
+            _node(nid, {"status": "done"}, node_type="owned", label="Before"),
+            expected_node_type="owned",
+            expected_label="Before",
+        )
+
+        assert result == NodeSwapResult.PREDICATE_FAILED
+        after = await graph_store.get_node(nid)
+        assert after.label == "After"
+        assert after.properties == {"status": "pending"}
+
+    async def test_expected_identity_refuses_post_read_retype(self, graph_store):
+        nid = _nid("identity-type")
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="owned", label="Stable")
+        )
+        snapshot = (await graph_store.get_node(nid)).properties
+        await graph_store.add_node(
+            _node(nid, dict(snapshot), node_type="foreign", label="Stable")
+        )
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            snapshot,
+            _node(nid, {"status": "done"}, node_type="owned", label="Stable"),
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeSwapResult.PREDICATE_FAILED
+        after = await graph_store.get_node(nid)
+        assert after.node_type == "foreign"
+        assert after.properties == {"status": "pending"}
+
+    async def test_expected_identity_allows_compare_and_create(self, graph_store):
+        nid = _nid("identity-create")
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            None,
+            _node(nid, {"status": "fresh"}, node_type="owned", label="Stable"),
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeSwapResult.SWAPPED
+        created = await graph_store.get_node(nid)
+        assert created is not None
+        assert created.node_type == "owned"
+        assert created.label == "Stable"
+
+    async def test_expected_identity_requires_type_and_label_together(
+        self, graph_store
+    ):
+        nid = _nid("identity-partial")
+        with pytest.raises(ValueError, match="expected_node_type.*expected_label"):
+            await graph_store.compare_and_swap_node(
+                nid,
+                None,
+                _node(nid, {"status": "fresh"}),
+                expected_node_type="cas_node",
+            )
+        assert await graph_store.get_node(nid) is None
+
+    async def test_expected_identity_rejects_a_different_new_node_shape(
+        self, graph_store
+    ):
+        nid = _nid("identity-new-shape")
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="owned", label="Stable")
+        )
+        snapshot = (await graph_store.get_node(nid)).properties
+
+        with pytest.raises(ValueError, match="new_node identity must match"):
+            await graph_store.compare_and_swap_node(
+                nid,
+                snapshot,
+                _node(
+                    nid,
+                    {"status": "done"},
+                    node_type="owned",
+                    label="Different",
+                ),
+                expected_node_type="owned",
+                expected_label="Stable",
+            )
+
+        after = await graph_store.get_node(nid)
+        assert after.label == "Stable"
+        assert after.properties == {"status": "pending"}
+
+    async def test_empty_allowed_type_set_denies_existing_swap(self, graph_store):
+        """An explicit empty allowlist must deny every effective node type."""
+        nid = _nid("empty-types")
+        await graph_store.add_node(_node(nid, {"status": "pending"}))
+        snapshot = (await graph_store.get_node(nid)).properties
+
+        result = await graph_store.compare_and_swap_node(
+            nid,
+            snapshot,
+            _node(nid, {"status": "done"}),
+            allowed_node_types=frozenset(),
+        )
+
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
+        assert (await graph_store.get_node(nid)).properties == {"status": "pending"}
 
     async def test_snapshot_round_trips_through_get_node(self, graph_store):
         """A snapshot obtained via get_node must be an accepted predicate even
@@ -429,6 +596,355 @@ class TestAddNodeUnchanged:
 
 
 # =====================================================================
+# Atomic compare-and-delete by graph identity (dual backend)
+# =====================================================================
+
+
+class TestCompareAndDelete:
+
+    async def test_matching_identity_is_deleted(self, graph_store):
+        nid = _nid("delete-match")
+        await graph_store.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Stable")
+        )
+
+        result = await graph_store.compare_and_delete_node(
+            nid, expected_node_type="owned", expected_label="Stable"
+        )
+
+        assert result == "deleted"
+        assert await graph_store.get_node(nid) is None
+
+    @pytest.mark.parametrize(
+        "replacement_type,replacement_label",
+        (("foreign", "Stable"), ("owned", "After")),
+    )
+    async def test_post_read_identity_change_is_not_deleted(
+        self, graph_store, replacement_type, replacement_label
+    ):
+        nid = _nid("delete-race")
+        await graph_store.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Before")
+        )
+        observed = await graph_store.get_node(nid)
+        assert observed.node_type == "owned"
+        assert observed.label == "Before"
+
+        # Reproduce a replacement after the caller's read but before its delete.
+        await graph_store.add_node(
+            _node(
+                nid,
+                {"status": "replacement", "sentinel": "must survive"},
+                node_type=replacement_type,
+                label=replacement_label,
+            )
+        )
+
+        result = await graph_store.compare_and_delete_node(
+            nid, expected_node_type="owned", expected_label="Before"
+        )
+
+        assert result == "predicate_failed"
+        after = await graph_store.get_node(nid)
+        assert after is not None
+        assert after.node_type == replacement_type
+        assert after.label == replacement_label
+        assert after.properties == {
+            "status": "replacement",
+            "sentinel": "must survive",
+        }
+
+    async def test_absent_node_is_not_found(self, graph_store):
+        result = await graph_store.compare_and_delete_node(
+            _nid("delete-absent"),
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+        assert result == "not_found"
+
+    async def test_public_immediate_transaction_locks_before_outer_read(
+        self, tmp_path
+    ):
+        """A public atomic read/write scope takes SQLite's slot up front.
+
+        A nested graph mutation cannot upgrade a deferred snapshot after a
+        competing connection commits.  The storage and privacy facades must
+        therefore expose the backend's immediate mode so callers composing a
+        read with conditional deletion can serialize before that first read.
+        """
+
+        db_path = str(tmp_path / "nested-delete.db")
+        first_storage = await AsyncStorage.create_sqlite(db_path)
+        first = PrivacyEnforcingStorage(first_storage, PrivacyMode.NORMAL)
+        second = await AsyncStorage.create_sqlite(db_path)
+        nid = _nid("nested-delete")
+        await first.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Before")
+        )
+
+        replacement = None
+        try:
+            async with first.transaction(immediate=True):
+                observed = await first.get_node(nid)
+                assert observed is not None
+                assert observed.label == "Before"
+                replacement = asyncio.create_task(
+                    second.add_node(
+                        _node(
+                            nid,
+                            {"status": "replacement", "sentinel": "must survive"},
+                            node_type="owned",
+                            label="After",
+                        )
+                    )
+                )
+                await asyncio.sleep(0.1)
+                assert not replacement.done(), (
+                    "replacement passed the public immediate transaction"
+                )
+                result = await first.compare_and_delete_node(
+                    nid,
+                    expected_node_type="owned",
+                    expected_label="Before",
+                )
+            assert result == NodeDeleteResult.DELETED
+
+            await asyncio.wait_for(replacement, timeout=5)
+            after = await second.get_node(nid)
+            assert after is not None
+            assert after.label == "After"
+            assert after.properties["sentinel"] == "must survive"
+        finally:
+            if replacement is not None and not replacement.done():
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+            await first_storage.close()
+            await second.close()
+
+    async def test_bound_delete_nested_in_deferred_transaction_locks_before_probe(
+        self, tmp_path, monkeypatch
+    ):
+        """A bound delete must not establish a stale SQLite snapshot first."""
+
+        import kestrel_sovereign.storage.async_graph_store as graph_module
+
+        db_path = str(tmp_path / "nested-bound-delete.db")
+        first_storage = await AsyncStorage.create_sqlite(db_path)
+        second_storage = await AsyncStorage.create_sqlite(db_path)
+        first = AsyncGraphStore(first_storage.db, agent_id="agent-a")
+        second = AsyncGraphStore(second_storage.db, agent_id="agent-a")
+        nid = _nid("nested-bound-delete")
+        await first.add_node(
+            _node(nid, {"status": "stale"}, node_type="owned", label="Before")
+        )
+
+        original_lock = graph_module.lock_graph_nodes_for_update
+        replacement = None
+        raced = False
+
+        async def race_after_visibility(db, node_ids, *, agent_id=""):
+            nonlocal raced, replacement
+            if db is first.db and not raced:
+                raced = True
+                replacement = asyncio.create_task(
+                    second.add_node(
+                        _node(
+                            nid,
+                            {"status": "replacement", "sentinel": "must survive"},
+                            node_type="owned",
+                            label="After",
+                        )
+                    )
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(replacement), timeout=0.25
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            return await original_lock(db, node_ids, agent_id=agent_id)
+
+        monkeypatch.setattr(
+            graph_module, "lock_graph_nodes_for_update", race_after_visibility
+        )
+        try:
+            async with first.db.transaction():
+                result = await first.compare_and_delete_node(
+                    nid,
+                    expected_node_type="owned",
+                    expected_label="Before",
+                )
+            assert result == NodeDeleteResult.DELETED
+
+            assert replacement is not None
+            await asyncio.wait_for(replacement, timeout=5)
+            after = await second.get_node(nid)
+            assert after is not None
+            assert after.label == "After"
+            assert after.properties["sentinel"] == "must survive"
+        finally:
+            if replacement is not None and not replacement.done():
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+            await first_storage.close()
+            await second_storage.close()
+
+    async def test_ordinary_unbound_delete_cleans_dangling_graph_records(
+        self, graph_store
+    ):
+        """Physical maintenance deletion still repairs an absent graph row."""
+
+        nid = _nid("dangling-unbound")
+        source = _nid("dangling-source")
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, "agent-a"),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", "{}"),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edge_owners "
+            "(source_id, target_id, label, agent_id) VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", "agent-a"),
+        )
+
+        await graph_store.delete_node(nid)
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_node_owners WHERE node_id = ?", (nid,)
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE target_id = ?", (nid,)
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edge_owners WHERE target_id = ?", (nid,)
+        ) is None
+
+    async def test_ordinary_bound_delete_releases_dangling_owned_records(
+        self, graph_store
+    ):
+        """A tenant can repair its witnesses even after the node disappeared."""
+
+        agent_id = f"agent:{uuid.uuid4().hex}"
+        bound = AsyncGraphStore(graph_store.db, agent_id=agent_id)
+        nid = _nid("dangling-bound")
+        source = _nid("dangling-source")
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, agent_id),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", "{}"),
+        )
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_edge_owners "
+            "(source_id, target_id, label, agent_id) VALUES (?, ?, ?, ?)",
+            (source, nid, "dangling", agent_id),
+        )
+
+        await bound.delete_node(nid)
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_node_owners WHERE node_id = ? AND agent_id = ?",
+            (nid, agent_id),
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE target_id = ?", (nid,)
+        ) is None
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edge_owners WHERE target_id = ?", (nid,)
+        ) is None
+
+
+# =====================================================================
+# Edge admission and endpoint deletion serialization
+# =====================================================================
+
+
+class TestEdgeAdmission:
+    @pytest.mark.parametrize("missing", ["source", "target"])
+    async def test_unbound_edge_rejects_a_missing_endpoint(
+        self, graph_store, missing
+    ):
+        """Maintenance callers cannot introduce a newly dangling edge."""
+
+        source_id = _nid("edge-source")
+        target_id = _nid("edge-target")
+        existing_id = target_id if missing == "source" else source_id
+        await graph_store.add_node(_node(existing_id, {"status": "present"}))
+
+        with pytest.raises(Exception, match="endpoints"):
+            await graph_store.add_edge(source_id, target_id, "references")
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges "
+            "WHERE source_id = ? AND target_id = ? AND label = ?",
+            (source_id, target_id, "references"),
+        ) is None
+
+    async def test_bound_edge_accepts_a_provisionally_reserved_source(
+        self, graph_store
+    ):
+        """Bootstrap may reserve the agent owner before creating its root."""
+
+        agent_id = f"agent:{uuid.uuid4().hex}"
+        target_id = _nid("bootstrap-target")
+        bound = AsyncGraphStore(graph_store.db, agent_id=agent_id)
+        await graph_store.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (agent_id, agent_id),
+        )
+        await bound.add_node(
+            _node(
+                target_id,
+                {"agent_id": agent_id},
+                node_type="owned",
+                label="Target",
+            )
+        )
+
+        await bound.add_edge(agent_id, target_id, "bootstrap")
+
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges "
+            "WHERE source_id = ? AND target_id = ? AND label = ?",
+            (agent_id, target_id, "bootstrap"),
+        ) is not None
+
+    async def test_bound_edge_hides_foreign_target_existence(self, graph_store):
+        """Missing and foreign targets are indistinguishable to a tenant."""
+
+        store_a = AsyncGraphStore(graph_store.db, agent_id="agent-a")
+        store_b = AsyncGraphStore(graph_store.db, agent_id="agent-b")
+        source_id = _nid("owned-source")
+        foreign_id = _nid("foreign-target")
+        missing_id = _nid("missing-target")
+        await store_a.add_node(
+            _node(source_id, {"agent_id": "agent-a"}, node_type="owned")
+        )
+        await store_b.add_node(
+            _node(foreign_id, {"agent_id": "agent-b"}, node_type="owned")
+        )
+
+        with pytest.raises(Exception) as missing_error:
+            await store_a.add_edge(source_id, missing_id, "references")
+        with pytest.raises(Exception) as foreign_error:
+            await store_a.add_edge(source_id, foreign_id, "references")
+
+        assert type(missing_error.value) is type(foreign_error.value)
+        assert str(missing_error.value) == str(foreign_error.value)
+        assert await graph_store.db.fetchone(
+            "SELECT 1 FROM graph_edges WHERE source_id = ? AND label = ?",
+            (source_id, "references"),
+        ) is None
+
+
+# =====================================================================
 # Facade + privacy wrapper (SQLite; proves the delegation chain is atomic)
 # =====================================================================
 
@@ -468,6 +984,83 @@ class TestFacadeAndPrivacyWrapper:
             results = await asyncio.gather(*(swap(i) for i in range(8)))
             assert sum(1 for r in results if r == NodeSwapResult.SWAPPED) == 1
             assert sum(1 for r in results if r == NodeSwapResult.PREDICATE_FAILED) == 7
+        finally:
+            await storage.close()
+
+    async def test_privacy_wrapper_forwards_expected_identity(self, tmp_path):
+        storage = await AsyncStorage.create_sqlite(str(tmp_path / "identity.db"))
+        wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        try:
+            nid = _nid("wrapped-identity")
+            await wrapped.add_node(
+                _node(
+                    nid,
+                    {"status": "pending"},
+                    node_type="owned",
+                    label="Before",
+                )
+            )
+            snapshot = (await wrapped.get_node(nid)).properties
+            await storage.add_node(
+                _node(
+                    nid,
+                    dict(snapshot),
+                    node_type="owned",
+                    label="After",
+                )
+            )
+
+            result = await wrapped.compare_and_swap_node(
+                nid,
+                snapshot,
+                _node(
+                    nid,
+                    {"status": "done"},
+                    node_type="owned",
+                    label="Before",
+                ),
+                expected_node_type="owned",
+                expected_label="Before",
+            )
+
+            assert result == NodeSwapResult.PREDICATE_FAILED
+            assert (await storage.get_node(nid)).properties == {"status": "pending"}
+        finally:
+            await storage.close()
+
+    async def test_facade_and_graph_privacy_proxy_compare_and_delete(self, tmp_path):
+        storage = await AsyncStorage.create_sqlite(str(tmp_path / "delete.db"))
+        wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        try:
+            facade_id = _nid("facade-delete")
+            await storage.add_node(
+                _node(facade_id, {}, node_type="owned", label="Facade")
+            )
+            assert await storage.compare_and_delete_node(
+                facade_id,
+                expected_node_type="owned",
+                expected_label="Facade",
+            ) == "deleted"
+
+            wrapper_id = _nid("wrapper-delete")
+            await wrapped.add_node(
+                _node(wrapper_id, {}, node_type="owned", label="Wrapper")
+            )
+            assert await wrapped.compare_and_delete_node(
+                wrapper_id,
+                expected_node_type="owned",
+                expected_label="Wrapper",
+            ) == "deleted"
+
+            proxy_id = _nid("proxy-delete")
+            await wrapped.add_node(
+                _node(proxy_id, {}, node_type="owned", label="Proxy")
+            )
+            assert await wrapped.graph.compare_and_delete_node(
+                proxy_id,
+                expected_node_type="owned",
+                expected_label="Proxy",
+            ) == "deleted"
         finally:
             await storage.close()
 
@@ -630,6 +1223,83 @@ class TestBoundOwnershipCAS:
         )
         assert result == NodeSwapResult.SWAPPED
         assert (await store_a.get_node(nid)).properties == {"status": "done"}
+
+    async def test_bound_compare_delete_cannot_observe_foreign_node(
+        self, bound_pair
+    ):
+        store_a, store_b = bound_pair
+        nid = _nid("bound-delete-foreign")
+        await store_a.add_node(
+            _node(nid, {"status": "A-owned"}, node_type="owned", label="Stable")
+        )
+
+        result = await store_b.compare_and_delete_node(
+            nid,
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeDeleteResult.NOT_FOUND
+        assert await store_b.get_node(nid) is None
+        assert (await store_a.get_node(nid)).properties == {"status": "A-owned"}
+
+    async def test_bound_compare_delete_does_not_lock_foreign_node(
+        self, bound_pair, monkeypatch
+    ):
+        """Tenant scope is checked before any graph-row/advisory lock."""
+
+        import kestrel_sovereign.storage.async_graph_store as graph_module
+
+        store_a, store_b = bound_pair
+        nid = _nid("bound-delete-no-foreign-lock")
+        await store_a.add_node(
+            _node(nid, {"status": "A-owned"}, node_type="owned", label="Stable")
+        )
+        lock = AsyncMock(return_value=[nid])
+        monkeypatch.setattr(graph_module, "lock_graph_nodes_for_update", lock)
+
+        result = await store_b.compare_and_delete_node(
+            nid,
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeDeleteResult.NOT_FOUND
+        lock.assert_not_awaited()
+
+    async def test_bound_compare_delete_releases_only_callers_shared_witness(
+        self, bound_pair
+    ):
+        store_a, store_b = bound_pair
+        nid = _nid("bound-delete-shared")
+        unbound = AsyncGraphStore(store_a.db)
+        await unbound.add_node(
+            _node(nid, {"status": "shared"}, node_type="owned", label="Stable")
+        )
+        await store_a.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, "agent-a"),
+        )
+        await store_a.db.execute_commit(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (nid, "agent-b"),
+        )
+
+        result = await store_a.compare_and_delete_node(
+            nid,
+            expected_node_type="owned",
+            expected_label="Stable",
+        )
+
+        assert result == NodeDeleteResult.DELETED
+        assert await store_a.get_node(nid) is None
+        remaining = await store_b.get_node(nid)
+        assert remaining is not None
+        assert remaining.properties == {"status": "shared"}
+        owners = await store_a.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?", (nid,)
+        )
+        assert {row[0] for row in owners} == {"agent-b"}
 
     async def test_bound_create_rejects_foreign_declared_owner(self, bound_pair):
         """A bound store refuses a new_node that declares a different agent_id —

@@ -1331,12 +1331,19 @@ def test_health_reports_startup_audit_pending_as_restricted():
     agent._safe_mode = False
     agent._constitution_audit_pending = True
     agent._safe_mode_entered_at = None
+    # An unset attribute on a MagicMock is a truthy Mock, so every cause the
+    # report consults has to be stated or the agent reports faults it does
+    # not have. This one is only awaiting its first audit.
+    agent._constitution_state_load_error = None
+    agent._constitution_state_persistence_pending = False
+    agent._safe_mode_cause = None
 
     record = _constitution_safe_mode_record("Kite", agent)
 
     assert record["state"] == "audit_pending"
     assert record["error_code"] == "constitution_audit_pending"
     assert record["failure"] == "startup_audit_required"
+    assert record["failures"] == ["startup_audit_required"]
 
 
 def test_detailed_health_cannot_report_healthy_during_safe_mode():
@@ -1771,3 +1778,167 @@ def test_oauth_session_can_access_detailed_health():
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
     assert "operator-only backend diagnostic" in response.text
+
+
+def _restricted_agent(**overrides):
+    """An agent with every cause explicitly false unless a test says otherwise."""
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._constitution_audit_pending = False
+    agent._safe_mode_entered_at = None
+    agent._constitution_state_load_error = None
+    agent._constitution_state_persistence_pending = False
+    agent._safe_mode_cause = "integrity"
+    for key, value in overrides.items():
+        setattr(agent, key, value)
+    return agent
+
+
+def test_an_integrity_failure_is_not_hidden_by_a_store_outage():
+    """Both causes are true; the report must not pick one and drop the other.
+
+    The old chain was an ``elif``, so a store outage masked the integrity
+    finding — and Amendment III requires any discrepancy be reported to the
+    Sovereign. Under-reporting a constitutional violation is the failure that
+    matters here, not the redundancy.
+    """
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(_constitution_state_load_error="DatabaseError")
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert "integrity_restriction" in record["failures"]
+    assert "state_unavailable" in record["failures"]
+    # The single-string field carries the gravest, never the milder one.
+    assert record["failure"] == "integrity_restriction"
+
+
+def test_a_store_outage_alone_is_not_reported_as_an_integrity_failure():
+    """Reporting availability as integrity tells the Sovereign a lie.
+
+    ``integrity_restriction`` used to be the else branch, so any restriction
+    without another explanation was attributed to a failed verification.
+    """
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(
+        _constitution_state_load_error="DatabaseError",
+        _safe_mode_cause="state_unavailable",
+    )
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert record["failures"] == ["state_unavailable"]
+    assert "integrity_restriction" not in record["failures"]
+
+
+def test_a_restriction_with_no_recorded_cause_says_so():
+    """A missing field is not evidence of a constitutional violation."""
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(_safe_mode_cause=None)
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert record["failures"] == ["cause_unrecorded"]
+    assert "integrity_restriction" not in record["failures"]
+
+
+def test_an_in_memory_only_latch_is_reported_as_not_durable():
+    """A Safe Mode that could not be written down must not imply durability."""
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(_constitution_state_persistence_pending=True)
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert "state_not_persisted" in record["failures"]
+    assert "integrity_restriction" in record["failures"]
+
+
+def test_every_recorded_cause_maps_to_its_own_name():
+    """A cause the dispatch does not know is not "unrecorded".
+
+    Recognising only integrity and bootstrap reported a recorded
+    state_unavailable cause as cause_unrecorded — a claim about the record
+    rather than about the agent.
+    """
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    expected = {
+        "integrity": "integrity_restriction",
+        "bootstrap": "bootstrap_incomplete",
+        "state_unavailable": "state_unavailable",
+        # The trigger and the live durability fact are different claims and
+        # get different names: this is "restricted because a write failed",
+        # while the flag separately reports whether state is durable now.
+        "state_not_persisted": "restricted_by_unsaved_state",
+        "identity_missing": "identity_missing",
+        "memory_unreadable": "memory_unreadable",
+        "unrecorded": "cause_unrecorded",
+    }
+    for cause, name in expected.items():
+        agent = _restricted_agent(_safe_mode_cause=cause)
+        record = _constitution_safe_mode_record("Kite", agent)
+        assert name in record["failures"], f"{cause} -> {record['failures']}"
+
+
+def test_a_recorded_cause_is_not_dropped_when_another_failure_is_present():
+    """The dispatch must not skip the cause because a fault already fired."""
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(
+        _safe_mode_cause="unrecorded",
+        _constitution_state_load_error="DatabaseError",
+    )
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert "cause_unrecorded" in record["failures"]
+    assert "state_unavailable" in record["failures"]
+
+
+def test_a_missing_identity_is_not_downgraded_to_an_integrity_claim():
+    """`failure` must rank every cause the list can contain.
+
+    A value absent from the ranking matched nothing and fell through to the
+    fallback, so clients reading the single string — the lifecycle CLI among
+    them — were told the constitution failed when it had not.
+    """
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = _restricted_agent(_safe_mode_cause="identity_missing")
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert record["failures"] == ["identity_missing"]
+    assert record["failure"] == "identity_missing"
+
+
+def test_every_cause_has_a_report_path_and_a_phrase():
+    """A cause with nowhere to be reported is how this defect happens again.
+
+    Three tables have to know each one: the health dispatch, the severity
+    ranking behind the compatibility `failure` string, and the Sovereign-facing
+    phrasing. Each of those was, at some point in this fix, missing an entry —
+    and each time the omission surfaced as "cause_unrecorded" or, worse, as a
+    fallback to `integrity_restriction`, telling the operator the constitution
+    had failed when it had not.
+    """
+    import re
+
+    from kestrel_sovereign.agent.constitution import (
+        SafeModeCause,
+        _RESTRICTION_PHRASES,
+    )
+    import kestrel_sovereign.server as server_module
+
+    src = open(server_module.__file__).read()
+    dispatch = dict(
+        re.findall(r'"(\w+)": "(\w+)"', src.split("_CAUSE_FAILURES")[1].split("}")[0])
+    )
+    severity = re.findall(r'"(\w+)"', src.split("_SEVERITY = [")[1].split("]")[0])
+
+    causes = [c.value for c in SafeModeCause]
+    assert [c for c in causes if c not in dispatch] == [], "cause has no health mapping"
+    assert [n for n in dispatch.values() if n not in severity] == [], (
+        "failure name is unranked, so `failure` falls back to integrity"
+    )
+    assert [c for c in causes if c not in _RESTRICTION_PHRASES] == [], (
+        "cause has no Sovereign-facing phrasing"
+    )

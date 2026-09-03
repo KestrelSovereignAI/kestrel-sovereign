@@ -53,9 +53,11 @@ from .store import (
     KNOWN_URGENCIES,
     PENDING_STATES,
     acknowledge_escalation,
+    cancel_request_if_owned,
     clear_deferral_started,
     ensure_restart_requests_table,
     get_request,
+    get_request_for_agent,
     insert_request,
     list_requests,
     list_requests_needing_wake,
@@ -184,7 +186,7 @@ def _tail(raw: Any) -> str:
 
 
 # Background-task name prefixes for *infrastructure* work that must never
-# hold off an idle restart (#1626). Three shapes all wedged
+# hold off an idle restart (#1626). Six shapes all wedged
 # ``idle_agents_only`` forever by being counted as "busy":
 #   - ``durable_signal_log`` — fire-and-forget log writes that complete in
 #     well under a second but are minted continuously by heartbeats/scheduler
@@ -213,6 +215,17 @@ def _tail(raw: Any) -> str:
 #     supervisor is deadline-bounded (it exits at ``timeout_seconds`` and
 #     replay expires past-deadline rows); do not exclude any peer wait that
 #     lacks that guarantee.
+#   - ``isolated-feature:`` — the pre-existing child-process supervisor. It is
+#     a permanent lifecycle daemon, not agent cognition. Excluding it changes
+#     prior ``idle_agents_only`` behavior intentionally: merely hosting an
+#     isolated child no longer pins a requested restart forever; shutdown owns
+#     and terminates the supervisor before restart.
+#   - ``isolated-feature-idle:`` — the permanent idle-retirement monitor. Its
+#     only work is observing the already-recorded activity generation and
+#     retiring an eligible child, so it must not make that agent appear busy.
+#   - ``isolated-runtime-telemetry:`` — advisory, coalesced telemetry delivery.
+#     It neither admits user work nor owns lifecycle progress, and shutdown
+#     cancels the exact tracked task before restart.
 # None is user/signal work; real work (``signal_dispatch:*``) still
 # defers a restart. The name is already stamped on the task at creation —
 # it was just never read here. New long-lived/bookkeeping daemons must be
@@ -221,6 +234,9 @@ _INFRA_TASK_PREFIXES = (
     "durable_signal_log",
     "a2a_question_expiry_sweep",
     "a2a_question_supervisor:",
+    "isolated-feature:",
+    "isolated-feature-idle:",
+    "isolated-runtime-telemetry:",
 )
 
 
@@ -636,7 +652,8 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="list_restart_requests",
         description=(
-            "List restart requests, optionally filtered by status. Valid "
+            "List restart requests filed by this agent, optionally filtered "
+            "by status. Other agents' requests are never visible. Valid "
             "statuses: pending|approved|updating|executing|completed|"
             "rejected|canceled (omit status for all). An unknown status is "
             "rejected with the valid set rather than silently returning no "
@@ -663,8 +680,16 @@ class RestartCoordinatorFeature(Feature):
                     f"got {status!r}",
                     data={"count": 0, "requests": []},
                 )
+        requester = self._agent_requester_id()
+        if requester is None:
+            return ToolResult.failed(
+                "Restart request access requires this agent's durable identity",
+                data={"count": 0, "requests": []},
+            )
         rows = await list_requests(
-            self._db, status=(status_filter or None),
+            self._db,
+            status=(status_filter or None),
+            agent_id=requester,
         )
         return ToolResult.ok(
             confirmation=f"{len(rows)} restart request(s)",
@@ -677,8 +702,9 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="list_restart_status_events",
         description=(
-            "List recent restart_status lifecycle events for chat-"
-            "history reload and the agent's pre-turn snapshot. Newest "
+            "List this agent's recent restart_status lifecycle events for "
+            "chat-history reload and its pre-turn snapshot. Other agents' "
+            "events are never visible. Newest "
             "first; uses the typed event records persisted alongside "
             "each SSE emit (#1562)."
         ),
@@ -698,10 +724,17 @@ class RestartCoordinatorFeature(Feature):
         except (TypeError, ValueError):
             limit_int = 100
         limit_int = max(1, min(1000, limit_int))
+        requester = self._agent_requester_id()
+        if requester is None:
+            return ToolResult.failed(
+                "Restart event access requires this agent's durable identity",
+                data={"count": 0, "events": []},
+            )
         rows = await list_recent_events_for_history(
             self._db,
             limit=limit_int,
             since=(since.strip() or None),
+            agent_id=requester,
         )
         return ToolResult.ok(
             confirmation=f"{len(rows)} restart status event(s)",
@@ -715,7 +748,9 @@ class RestartCoordinatorFeature(Feature):
         name="acknowledge_restart_escalation",
         description=(
             "Acknowledge the bounded host-wide escalation policy for one "
-            "pending restart request migrated from an older release. This "
+            "pending restart request filed by this agent and migrated from "
+            "an older release. Requests filed by another agent cannot be "
+            "acknowledged. This "
             "is required once for legacy rows before a continuous busy "
             "deferral may override fleet quiescence. Pass request_id from "
             "list_restart_requests."
@@ -735,24 +770,29 @@ class RestartCoordinatorFeature(Feature):
                 "request_id is required",
                 data={"acknowledged": False},
             )
-        row = await get_request(self._db, normalized)
-        if row is None:
+        requester = self._agent_requester_id()
+        if requester is None:
             return ToolResult.failed(
-                f"No restart request with id {request_id!r}",
+                "Restart request access requires this agent's durable identity",
                 data={"acknowledged": False, "request_id": normalized},
             )
-        if row.status not in PENDING_STATES:
+        if not await acknowledge_escalation(
+            self._db,
+            normalized,
+            requested_by_agent=requester,
+        ):
+            row = await get_request_for_agent(self._db, normalized, requester)
+            if row is not None and row.status not in PENDING_STATES:
+                return ToolResult.failed(
+                    f"Cannot acknowledge a request in state {row.status!r}",
+                    data={
+                        "acknowledged": False,
+                        "request_id": normalized,
+                        "current_status": row.status,
+                    },
+                )
             return ToolResult.failed(
-                f"Cannot acknowledge a request in state {row.status!r}",
-                data={
-                    "acknowledged": False,
-                    "request_id": normalized,
-                    "current_status": row.status,
-                },
-            )
-        if not await acknowledge_escalation(self._db, normalized):
-            return ToolResult.failed(
-                "Escalation acknowledgement did not land",
+                "Restart request is unavailable or not authorized",
                 data={"acknowledged": False, "request_id": normalized},
             )
         return ToolResult.ok(
@@ -763,8 +803,9 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="cancel_restart_request",
         description=(
-            "Cancel a still-pending restart request (status pending or "
-            "approved). Rows already updating/executing/completed/rejected/"
+            "Cancel this agent's still-pending restart request (status "
+            "pending or approved). Another agent's request cannot be "
+            "canceled. Rows already updating/executing/completed/rejected/"
             "canceled cannot be canceled. Pass request_id from "
             "data.request.id of request_restart (or data.requests[].id of "
             "list_restart_requests).\n\n"
@@ -787,50 +828,60 @@ class RestartCoordinatorFeature(Feature):
                 "request_id is required",
                 data={"canceled": False},
             )
-        row = await get_request(self._db, request_id.strip())
-        if row is None:
+        normalized = request_id.strip()
+        requester = self._agent_requester_id()
+        if requester is None:
             return ToolResult.failed(
-                f"No restart request with id {request_id!r}",
-                data={"canceled": False, "request_id": request_id},
+                "Restart request access requires this agent's durable identity",
+                data={"canceled": False, "request_id": normalized},
             )
-        if row.status not in PENDING_STATES:
-            return ToolResult.failed(
-                f"Cannot cancel a request in state {row.status!r} — "
-                f"only pending/approved can be canceled",
-                data={
-                    "canceled": False,
-                    "request_id": request_id,
-                    "current_status": row.status,
-                },
-            )
-        ok = await update_status(
-            self._db, row.id,
-            status="canceled",
+        ok = await cancel_request_if_owned(
+            self._db,
+            normalized,
+            requested_by_agent=requester,
             status_reason=(reason.strip() or "canceled by agent"),
             completed_at=datetime.now(timezone.utc).isoformat(),
-            expected_current_status=row.status,
         )
         if not ok:
-            # Lost the race — someone else moved the row first.
-            fresh = await get_request(self._db, row.id)
-            current = fresh.status if fresh else "missing"
+            # A scoped re-read may explain an owned lifecycle race. Missing and
+            # foreign rows intentionally share one public result.
+            fresh = await get_request_for_agent(self._db, normalized, requester)
+            if fresh is None:
+                return ToolResult.failed(
+                    "Restart request is unavailable or not authorized",
+                    data={"canceled": False, "request_id": normalized},
+                )
+            current = fresh.status
             return ToolResult.failed(
                 f"Race: request transitioned to {current!r} before "
                 f"cancel landed",
                 data={
                     "canceled": False,
-                    "request_id": request_id,
+                    "request_id": normalized,
                     "current_status": current,
                 },
+            )
+        row = await get_request_for_agent(self._db, normalized, requester)
+        if row is None or row.status != "canceled":
+            raise RuntimeError(
+                "Canceled restart request did not remain durably visible"
             )
         await self._emit_status_event(
             row, state="canceled",
             status_reason=(reason.strip() or "canceled by agent"),
         )
         return ToolResult.ok(
-            confirmation=f"Canceled restart request {row.id}",
-            data={"canceled": True, "request_id": row.id},
+            confirmation=f"Canceled restart request {normalized}",
+            data={"canceled": True, "request_id": normalized},
         )
+
+    def _agent_requester_id(self) -> Optional[str]:
+        """Return the trusted durable principal bound to this feature instance."""
+
+        value = getattr(self.agent, "did", None)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()
 
     @tool(
         name="restart_coordinator",
@@ -2267,7 +2318,7 @@ class RestartCoordinatorFeature(Feature):
         """
         # POLL to the deadline rather than checking once at the end. The
         # realistic failure — ``os.kill`` refused (EPERM: host under another
-        # uid, pid-file mismatch) — has ``cmd_stop`` burn ~5.5s on
+        # uid, pid-file mismatch) — has ``cmd_terminate`` burn ~5.5s on
         # SIGTERM/poll/SIGKILL before ``cmd_start`` fails on the port, so the
         # child dies around 7-10s. A single check at 10.0s is a coin flip
         # against that, and losing it means the watchdog declares the dispatch

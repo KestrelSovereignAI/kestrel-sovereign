@@ -17,8 +17,12 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     privacy_hides_persisted,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    stopped_invocation_http_error,
 )
-from kestrel_sovereign.agent.invocation import invocation_id_response_header
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    invocation_id_response_header,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +316,8 @@ async def trigger_sovereignty_import(request: Request, http_response: Response):
 
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return {"success": True, "message": result}
+    except InvocationCancelledError as error:
+        raise stopped_invocation_http_error(request_id) from error
     except HTTPException:
         raise
     except Exception as e:

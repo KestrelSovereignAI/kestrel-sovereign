@@ -7,8 +7,8 @@ It subsumes main.py's interactive chat into `kestrel shell <name>`.
 Commands:
     kestrel start                  # start all agents in-process (default)
     kestrel start <name>           # start just one agent (standalone process)
-    kestrel stop                   # stop everything (agents first, then host)
-    kestrel stop <name>            # stop just one agent
+    kestrel terminate              # terminate everything (agents first, then host)
+    kestrel terminate <name>       # terminate one agent process
     kestrel status                 # table: host + all agents with ports, PIDs, status
     kestrel logs <name>            # tail agent logs (or "host" for host logs)
     kestrel list                   # list multi_agent agents, ports, data dirs
@@ -568,8 +568,19 @@ async def _run_shell(agent_dir: Path, args) -> int:
                     print("   Please verify KESTREL_DATA_KEY and restart.")
                     print("   Use !quit to exit.")
                     if hasattr(agent, 'enter_safe_mode'):
+                        # An availability failure of stored MEMORY — not a
+                        # failed verification, and not governance state
+                        # either. The constitution was never read, so nothing
+                        # about it was found wrong, and the runtime-state
+                        # store is answering fine; pointing the operator at
+                        # either would send them to the wrong place (#2920).
+                        from kestrel_sovereign.agent.constitution import (
+                            SafeModeCause,
+                        )
+
                         await agent.enter_safe_mode(
-                            "Repeated encrypted-state decryption failures"
+                            "Repeated encrypted-state decryption failures",
+                            cause=SafeModeCause.MEMORY_UNREADABLE.value,
                         )
 
     except KeyboardInterrupt:
@@ -1145,7 +1156,7 @@ def cmd_constitution_reanchor(args) -> int:
 
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the multi_agent's PID file rather
-    # than probing the network — same source-of-truth as `kestrel stop`.
+    # than probing the network — same source-of-truth as `kestrel terminate`.
     holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
     if holder:
         print(
@@ -1508,7 +1519,7 @@ def _agent_holder(project_dir, agent_name, agent_cfg) -> Optional[str]:
     four reported "not running".
 
     The remedy differs by mode, which is why this returns the command rather
-    than a bool: ``kestrel stop <agent>`` cannot stop an agent that has no
+    than a bool: ``kestrel terminate <agent>`` cannot terminate an agent that has no
     process of its own, so prescribing it in in-process mode gives an
     operator advice that can never work, and every retry refuses again.
     """
@@ -1516,18 +1527,18 @@ def _agent_holder(project_dir, agent_name, agent_cfg) -> Optional[str]:
         from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        # The same verified read ``kestrel stop`` uses, so the guard and the
+        # The same verified read ``kestrel terminate`` uses, so the guard and the
         # remedy it prescribes cannot disagree about whether an agent is up.
         # ``is_running`` counts an undecidable record as running: it names a
         # process that IS alive, and waving a guard past a live agent is the
         # failure that costs something (#2995).
         agent_pid = ProcessManager.agent_pid_file(resolved_dir)
         if ProcessManager.read_pid_record(agent_pid).is_running:
-            return f"kestrel stop {agent_name}"
+            return f"kestrel terminate {agent_name}"
 
         host_pid = project_dir / "logs" / ".host.pid"
         if ProcessManager.read_pid_record(host_pid).is_running:
-            return "kestrel stop"
+            return "kestrel terminate"
 
         return None
     except Exception:
@@ -1810,7 +1821,7 @@ def cmd_config(args) -> int:
 # `kestrel_sovereign.cli.<name>` (patched git/uv update helpers included).
 from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     cmd_start,
-    cmd_stop,
+    cmd_terminate,
     cmd_restart,
     cmd_update,
     cmd_status,
@@ -2342,7 +2353,7 @@ def main() -> int:
 
     commands = {
         "start": cmd_start,
-        "stop": cmd_stop,
+        "terminate": cmd_terminate,
         "restart": cmd_restart,
         "update": cmd_update,
         "status": cmd_status,
