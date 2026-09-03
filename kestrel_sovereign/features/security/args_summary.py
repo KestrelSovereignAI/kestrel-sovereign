@@ -129,9 +129,15 @@ def mask_sensitive(data: Any) -> Any:
     Dicts and lists are walked recursively; a key matching any
     :data:`SENSITIVE_KEY_SUBSTRINGS` substring has its value replaced with
     :data:`MASK` regardless of the value's type (so a nested secret dict is
-    masked wholesale rather than descended into). Scalars pass through
-    unchanged.
+    masked wholesale rather than descended into). A string value is run
+    through :func:`mask_sensitive_regions`: a JSON-encoded payload carried
+    as a string (``{"payload": "{\\"api_key\\": ...}"}``) has no dict key
+    for this walk to see, and the unparseable branch masked exactly that
+    shape while this one showed it (round 14 review). Other scalars pass
+    through unchanged.
     """
+    if isinstance(data, str):
+        return mask_sensitive_regions(data)
     if isinstance(data, dict):
         result: dict = {}
         for key, value in data.items():
@@ -145,8 +151,14 @@ def mask_sensitive(data: Any) -> Any:
     return data
 
 
-def remask_summary(summary: Optional[str], max_length: int = 500) -> Optional[str]:
+def remask_summary(summary: Optional[str]) -> Optional[str]:
     """Re-apply masking to an ALREADY-PERSISTED summary, at read time (#3107).
+
+    Masking substitutes; it never removes. There is deliberately no cap here:
+    the writer's cap is the only cap (core writers 500 characters, Talon's
+    outcome rows 1,000, ``tool_audit`` unbounded), and a read-side cap of 500
+    cut a matched Talon outcome down to a row that showed neither the phrase
+    the match was made on nor the ``issue_number`` the caller asked for.
 
     ``summarize_args`` masks on the way in, which makes the stored value safe
     only for rows written by a code path that had that masking. It says nothing
@@ -178,11 +190,11 @@ def remask_summary(summary: Optional[str], max_length: int = 500) -> Optional[st
     except (ValueError, TypeError):
         # Same rule as the searchable projection: mask the sensitive VALUES
         # and keep the rest, rather than withholding the whole row.
-        return mask_sensitive_regions(summary)[:max_length]
+        return mask_sensitive_regions(summary)
     if not isinstance(parsed, (dict, list)):
-        return summary[:max_length]
+        return summary
     try:
-        return json.dumps(mask_sensitive(parsed), default=str)[:max_length]
+        return json.dumps(mask_sensitive(parsed), default=str)
     except (TypeError, ValueError):
         return "(summary could not be re-masked; not shown)"
 

@@ -21,8 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.features.security.args_summary import (
     mask_sensitive_regions,
-    SENSITIVE_KEY_SUBSTRINGS,
     mask_sensitive,
+    remask_summary,
 )
 
 #: The audit-search tool's own name. Its rows are excluded from every search
@@ -1438,7 +1438,14 @@ class PermissionStore:
                 "action": row["action"],
                 "decision": row["decision"],
                 "user_choice": row["user_choice"],
-                "args_summary": row["args_summary"],
+                # Re-masked HERE, in the store's own read path: the searchable
+                # projection is masked (fold_stored_summary), and the row that
+                # comes back must be the same text, whoever calls this. A
+                # re-mask that lived only in the tool left the store
+                # disagreeing with itself about its own rows, and the next
+                # caller (an endpoint, another feature) would have leaked a
+                # legacy row the tool had been hiding (round 14 review).
+                "args_summary": remask_summary(row["args_summary"]),
                 "timestamp": row["created_at"],
             }
             for row in rows

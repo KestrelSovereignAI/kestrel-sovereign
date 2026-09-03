@@ -23,6 +23,8 @@ arguments, and a row the query does not describe stays invisible.
 """
 
 import asyncio
+import json
+
 import pytest
 
 from kestrel_sovereign.features.security.permissions import PermissionStore
@@ -1084,17 +1086,22 @@ async def test_a_legacy_unmasked_secret_is_masked_on_the_way_out(store):
         args_summary='{"api_key": "sk-live-LEGACY-LEAK", "memo": "orphaned"}',
     )
 
+    # The search read path — new in #3107 — re-masks in the STORE, so every
+    # caller of it sees the same text the searchable projection matched on
+    # (round 14: a re-mask that lived only in the tool left the next caller
+    # to leak what the tool hid).
     matches, _ = await store.search_audit_log("orphaned")
     assert len(matches) == 1
-    raw = matches[0]["args_summary"]
-    assert "sk-live-LEGACY-LEAK" in raw, (
-        "the STORE returns what is stored; masking is the tool's job so the "
-        "operator HTTP surface keeps its existing behaviour"
-    )
+    shown = matches[0]["args_summary"]
+    assert "sk-live-LEGACY-LEAK" not in shown
+    assert "***MASKED***" in shown and "orphaned" in shown
 
-    from kestrel_sovereign.features.security.args_summary import remask_summary
-    assert "sk-live-LEGACY-LEAK" not in remask_summary(raw)
-    assert "***MASKED***" in remask_summary(raw)
+    # The operator's existing surface, get_audit_log (/api/security/audit),
+    # is untouched: it returns what is stored, as it always has.
+    recent = await store.get_audit_log(limit=5)
+    assert any("sk-live-LEGACY-LEAK" in (r.get("args_summary") or "") for r in recent), (
+        "get_audit_log's behaviour must not change under this ticket"
+    )
 
 
 @pytest.mark.asyncio
@@ -1797,3 +1804,113 @@ def test_the_dead_sensitive_key_regex_is_gone():
     import kestrel_sovereign.features.security.permissions as permissions
     assert not hasattr(args_summary, "SENSITIVE_JSON_KEY")
     assert not hasattr(permissions, "_SENSITIVE_JSON_KEY")
+
+
+# --------------------------------------------------------------------------
+# Round 15: masking substitutes, never removes; the store's own read path is
+# the re-mask door; a JSON-encoded payload string is masked in every branch.
+# --------------------------------------------------------------------------
+
+def _talon_outcome_row(length: int = 900) -> str:
+    # The shape kestrel_feature_talon persists at [:1000]: a long body, then
+    # the fields the read-back exists to recover, past any 500-char cut.
+    body = "## Details\\n" + ("the worker orphaned its lease " * 40)
+    row = json.dumps({
+        "action": "filed_and_dispatched",
+        "body": body,
+        "phrase": "unmistakable-tail-phrase",
+        "issue_number": 3107,
+        "job_id": "job-77",
+    })
+    assert len(row) >= length, len(row)
+    return row
+
+
+def test_remask_summary_never_shrinks_a_row():
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+
+    row = _talon_outcome_row()
+    shown = remask_summary(row)
+    assert "unmistakable-tail-phrase" in shown and '"issue_number": 3107' in shown
+    # An unparseable long row keeps its tail too.
+    cut = row[:850]
+    assert remask_summary(cut).endswith(cut[-40:])
+
+
+@pytest.mark.asyncio
+async def test_a_match_past_500_characters_is_shown_with_the_fields_it_matched_on(tmp_path):
+    """A read-side cap of 500 returned a matched Talon outcome that showed
+    neither the phrase the match was made on nor issue_number — the fields
+    the tool exists to recover — and then blamed the writer for the cut."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "long.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="TalonFeature", tool_name="talon_file_and_claim.outcome",
+        action="tool_outcome", decision="filed_and_dispatched",
+        args_summary=_talon_outcome_row(),
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="unmistakable-tail-phrase")
+    assert result.data["count"] == 1
+    shown = result.data["matches"][0]["args_summary"]
+    assert "unmistakable-tail-phrase" in shown
+    assert '"issue_number": 3107' in shown and "job-77" in shown
+
+    miss = await feature.security_audit_search(query="zz-no-such-phrase")
+    assert "500 characters now" not in miss.confirmation
+    assert "other writers set their own cap" in miss.confirmation
+
+
+@pytest.mark.asyncio
+async def test_the_store_read_path_masks_a_legacy_row_for_every_caller(tmp_path):
+    """The re-mask lived only in the tool; the store returned its own rows
+    raw, so the next caller of search_audit_log would have leaked what the
+    tool hid. One door, in the store."""
+    store = PermissionStore(str(tmp_path / "store-door.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="WalletAgent", tool_name="send_payment",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary='{"api_key": "sk-live-LEAKY", "memo": "orphans the worker"}',
+    )
+    rows, _ = await store.search_audit_log("orphans the worker")
+    assert len(rows) == 1
+    assert "sk-live-LEAKY" not in rows[0]["args_summary"]
+    assert "***MASKED***" in rows[0]["args_summary"]
+    assert "orphans the worker" in rows[0]["args_summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_json_encoded_payload_string_is_masked_in_every_branch(tmp_path):
+    """mask_sensitive only saw dict keys, so a sensitive key inside a
+    string-encoded payload survived the parseable branch (and its fold was
+    searchable) while the unparseable branch masked the same bytes."""
+    from kestrel_sovereign.features.security.args_summary import (
+        mask_sensitive, remask_summary, summarize_args,
+    )
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    nested = json.dumps({"api_key": "sk-NESTED"})
+    row = json.dumps({"payload": nested, "memo": "orphans the worker"})
+    assert "sk-NESTED" not in remask_summary(row)
+    assert "sk-nested" not in fold_stored_summary(row)
+    assert "sk-NESTED" not in summarize_args({"payload": nested})
+    assert mask_sensitive({"payload": nested})["payload"] != nested
+    assert mask_sensitive("orphaned keyboard worker") == "orphaned keyboard worker"
+
+    store = PermissionStore(str(tmp_path / "nested.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="WalletAgent", tool_name="send_payment",
+        action="tool_execution", decision="auto_mode_allowed", args_summary=row,
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    shown = await feature.security_audit_search(query="orphans the worker")
+    assert shown.data["count"] == 1 and "sk-NESTED" not in str(shown.data)
+    assert (await feature.security_audit_search(query="sk-NEST")).data["count"] == 0

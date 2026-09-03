@@ -13,7 +13,6 @@ from typing import Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
-from kestrel_sovereign.features.security.args_summary import remask_summary
 from kestrel_sovereign.features.security.permissions import (
     SEARCH_TOOL_NAME,
     PermissionLevel,
@@ -1374,14 +1373,16 @@ class SecurityFeature(Feature):
 
         if not matches:
             # An empty result is NOT proof the thing was never done. Say so:
-            # this searches recorded arguments, masked and truncated to 500
-            # characters, so a match past that cut is invisible here.
+            # this searches recorded arguments, masked and truncated by their
+            # WRITER, so a match past that cut is invisible here. The read
+            # path adds no cut of its own.
             return ToolResult.ok(
                 confirmation=(
                     f"No recorded tool call matched ({scope_text}).\n"
                     "This searches the masked argument summary, which is "
-                    "truncated when written — at 500 characters now, and at "
-                    "200 for rows written before that was unified, so an older "
+                    "truncated when written — core writers cap it at 500 "
+                    "characters (200 for rows written before that was "
+                    "unified), other writers set their own cap — so an older "
                     "row is cut shorter than a new one. A distinguishing "
                     "detail past its own row's cut cannot match. Absence here "
                     "is weak evidence, not proof you never did it."
@@ -1397,13 +1398,11 @@ class SecurityFeature(Feature):
                 },
             )
 
-        # Re-mask on the way out. The stored value is only as safe as the
-        # writer that produced it, and this tool cannot verify the provenance
-        # of rows it did not write — including pre-F252 ApprovalQueue rows,
-        # which kept an unmasked copy. Masking here makes the guarantee a
-        # property of THIS path rather than of every historical writer.
-        for entry in matches:
-            entry["args_summary"] = remask_summary(entry.get("args_summary"))
+        # Rows arrive re-masked from the store's own read path
+        # (PermissionStore.search_audit_log): the stored value is only as safe
+        # as the writer that produced it, and provenance is unknowable for
+        # rows this tool did not write. One door, in the store, so every
+        # caller of that read path gets the same text this tool shows.
 
         # An ALLOWLIST, not a refusal list. Listing the refusals means a
         # decision value added later — or one already in the table that this
