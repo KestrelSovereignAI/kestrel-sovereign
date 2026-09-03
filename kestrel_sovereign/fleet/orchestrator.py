@@ -336,6 +336,12 @@ WORKFLOW_MUTATION_TOOLS = frozenset(
         "workflow_pause",
         "workflow_resume",
         "workflow_remediate",
+        # Scheduler-executable one-shot targets (kestrel-feature-workflows
+        # 0.5.x): each RESOLVES an await_signal wait — a deadline win or a
+        # durable delivery — i.e. it advances run state. They exist for the
+        # scheduler to fire, never for the orchestrator to call (#3195).
+        "workflow_await_signal_deadline",
+        "workflow_await_signal_delivery",
     }
 )
 
