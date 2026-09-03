@@ -190,15 +190,25 @@ _REDACTION = RedactionPolicy(
 # call it" cron sources. Builtin tasks (backup_snapshot, trash_retention)
 # get their own handlers wired by SchedulerFeature.
 ToolLookup = Callable[[str, dict], Awaitable[Any]]
+#: ``task_name -> the closed vocabulary of ``data["reason_code"]`` values the
+#: feature owning that task declared`` (``Feature.tool_reason_codes``). Resolved
+#: per failure, not at registration, because features load after the
+#: scheduler registers its sources.
+ReasonCodeLookup = Callable[[str], frozenset[str]]
 
 
 def _require_successful_task_result(
     task_name: str,
     result: Any,
     *,
+    declared_reason_codes: frozenset[str],
     decode_json_envelope: bool = False,
 ) -> Any:
     """Turn a structured task failure into a failed scheduler dispatch.
+
+    ``declared_reason_codes`` is the vocabulary the task's owner declared for
+    ``data["reason_code"]``; only a member of it may name the cause in the
+    raised message (see :func:`_failure_reason_code`).
 
     Permission blocks remain normal handler results: the scheduler runner needs
     their structured outcome to pause the schedule and persist operator-facing
@@ -292,12 +302,14 @@ def _require_successful_task_result(
         )
         # The prose above stays out of the exception on purpose (see the note
         # above: the dispatcher persists exception text outside the bounded
-        # result-summary channel). A tool's `reason_code` is not prose — it is
-        # a short controlled token the tool chose — so it can cross that
-        # boundary safely and is the difference between a diagnosable failure
-        # and five identical days of "scheduled tool signal_dispatch failed"
-        # in signal_log with no cause attached.
-        reason_code = _failure_reason_code(evaluated_result)
+        # result-summary channel). A `reason_code` its owning feature DECLARED
+        # is not prose — it is one of a closed set of tokens the producer
+        # named up front — so it can cross that boundary safely and is the
+        # difference between a diagnosable failure and five identical days of
+        # "scheduled tool signal_dispatch failed" in signal_log with no cause.
+        reason_code = _failure_reason_code(
+            evaluated_result, task_name=task_name, declared=declared_reason_codes
+        )
         if reason_code:
             raise RuntimeError(
                 f"scheduled tool {task_name} failed ({reason_code})"
@@ -306,9 +318,13 @@ def _require_successful_task_result(
     return result
 
 
-def _prepare_scheduled_tool_result(task_name: str, result: Any) -> Any:
+def _prepare_scheduled_tool_result(
+    task_name: str, result: Any, *, declared_reason_codes: frozenset[str]
+) -> Any:
     """Validate and serialize one feature-tool result at the source boundary."""
-    checked = _require_successful_task_result(task_name, result)
+    checked = _require_successful_task_result(
+        task_name, result, declared_reason_codes=declared_reason_codes
+    )
     if isinstance(checked, ScheduledTaskOutcome) or isinstance(checked, str):
         return checked
 
@@ -323,6 +339,7 @@ def _prepare_scheduled_tool_result(task_name: str, result: Any) -> Any:
 def _wrap_builtin_action_handler(
     handler: ActionHandler,
     task_name: str,
+    reason_codes: ReasonCodeLookup,
 ) -> ActionHandler:
     """Apply the scheduled-result contract to a bespoke ACTION handler."""
 
@@ -337,13 +354,18 @@ def _wrap_builtin_action_handler(
                 f"scheduled task {task_name} raised"
             ) from None
         return _require_successful_task_result(
-            task_name, result, decode_json_envelope=True
+            task_name,
+            result,
+            declared_reason_codes=reason_codes(task_name),
+            decode_json_envelope=True,
         )
 
     return checked_handler
 
 
-def _make_action_handler(lookup: ToolLookup, task_name: str) -> ActionHandler:
+def _make_action_handler(
+    lookup: ToolLookup, task_name: str, reason_codes: ReasonCodeLookup
+) -> ActionHandler:
     """Return an ACTION handler that runs `lookup(task_name, payload)`."""
 
     async def handler(payload: dict) -> Any:
@@ -354,13 +376,15 @@ def _make_action_handler(lookup: ToolLookup, task_name: str) -> ActionHandler:
             raise RuntimeError(
                 f"scheduled tool {task_name} raised"
             ) from None
-        return _prepare_scheduled_tool_result(task_name, result)
+        return _prepare_scheduled_tool_result(
+            task_name, result, declared_reason_codes=reason_codes(task_name)
+        )
 
     return handler
 
 
 def _make_artifact_handler(
-    lookup: ToolLookup, task_name: str
+    lookup: ToolLookup, task_name: str, reason_codes: ReasonCodeLookup
 ) -> ArtifactHandler:
     """Return an ARTIFACT handler that runs `lookup(task_name, signal.payload)`
     and returns the tool's output as the artifact."""
@@ -373,7 +397,9 @@ def _make_artifact_handler(
             raise RuntimeError(
                 f"scheduled tool {task_name} raised"
             ) from None
-        return _prepare_scheduled_tool_result(task_name, result)
+        return _prepare_scheduled_tool_result(
+            task_name, result, declared_reason_codes=reason_codes(task_name)
+        )
 
     return handler
 
@@ -386,6 +412,7 @@ def _make_artifact_handler(
 def build_cron_registrations(
     *,
     tool_lookup: ToolLookup,
+    reason_codes_lookup: ReasonCodeLookup,
     builtin_handlers: dict[str, ActionHandler] | None = None,
 ) -> list[SourceRegistration]:
     """Build SourceRegistration instances for all built-in cron tasks.
@@ -395,6 +422,10 @@ def build_cron_registrations(
             tasks not in `builtin_handlers`. It returns the raw feature-tool
             result; the source handler owns structured failure validation and
             legacy JSON serialization for every caller of this builder.
+        reason_codes_lookup: Fn `(task_name) -> frozenset[str]`: the
+            ``reason_code`` vocabulary the task's owning feature declared.
+            Every handler (tool and built-in) resolves it at failure time and
+            admits only a declared code into the raised message.
         builtin_handlers: Per-task ACTION handlers that bypass tool
             lookup entirely. Used for `backup_snapshot` (calls
             sync.force_snapshot directly) and `trash_retention` (calls
@@ -412,14 +443,18 @@ def build_cron_registrations(
         if mode == SignalMode.ACTION:
             builtin_handler = builtin_handlers.get(task_name)
             handler: ActionHandler | None = (
-                _make_action_handler(tool_lookup, task_name)
+                _make_action_handler(tool_lookup, task_name, reason_codes_lookup)
                 if builtin_handler is None
-                else _wrap_builtin_action_handler(builtin_handler, task_name)
+                else _wrap_builtin_action_handler(
+                    builtin_handler, task_name, reason_codes_lookup
+                )
             )
             artifact_handler = None
         else:  # ARTIFACT
             handler = None
-            artifact_handler = _make_artifact_handler(tool_lookup, task_name)
+            artifact_handler = _make_artifact_handler(
+                tool_lookup, task_name, reason_codes_lookup
+            )
 
         registrations.append(
             SourceRegistration(
@@ -482,16 +517,22 @@ def _outcome_reason_code(code: Any) -> str:
     return token if token in _OUTCOME_REASON_CODES else ""
 
 
-_CONSTANT_TOKEN = re.compile(r"[A-Z][A-Z0-9_]*")
+def _failure_reason_code(
+    result: Any, *, task_name: str, declared: frozenset[str]
+) -> str:
+    """Return a tool's ``reason_code`` if its owner declared it, else "".
 
+    Bounded by MEMBERSHIP in the owning feature's declared vocabulary
+    (``Feature.tool_reason_codes``) — the rule the outcome door already
+    applies to the sleep vocabulary — never by shape. A shape rule cannot
+    tell a constant from an identifier spelled like one
+    (``CLAIM_DENIED_<REPO>``), and this text leaves the redaction/cap
+    boundary for ``signal_log.error``. ``_bounded_token`` still fences the
+    value first, so a declared code that is prose cannot cross either.
 
-def _failure_reason_code(result: Any) -> str:
-    """Return a tool's short ``reason_code``, or "" when it did not set one.
-
-    Bounded deliberately: only a token-shaped value crosses into the exception
-    text, never free-form error prose, so the redaction rationale above is
-    preserved. Anything unexpectedly long or non-token is dropped rather than
-    truncated, because a half-token is worse than none.
+    An undeclared value is dropped and logged by tool name only — never by
+    value — so the producer learns to declare it instead of losing the cause
+    silently.
     """
     data = None
     if isinstance(result, ToolResult):
@@ -500,10 +541,16 @@ def _failure_reason_code(result: Any) -> str:
         data = result.get("data") if isinstance(result.get("data"), dict) else result
     if not isinstance(data, dict):
         return ""
-    token = _bounded_token(data.get("reason_code"))
-    # Constant-shaped (UPPER_SNAKE), the way every core and Talon code is
-    # spelled: a tool that interpolated an owner, a repo or a job id into a
-    # lowercase/mixed token would otherwise ride it into signal_log.error.
-    # The outcome door bounds by vocabulary membership instead (see
-    # _outcome_reason_code); both share _bounded_token.
-    return token if _CONSTANT_TOKEN.fullmatch(token) else ""
+    raw = data.get("reason_code")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return ""
+    token = _bounded_token(raw)
+    if token and token in declared:
+        return token
+    logger.warning(
+        "Scheduled tool %s returned a reason_code it has not declared; "
+        "dropped. Declare it in the owning feature's tool_reason_codes so "
+        "the cause can reach signal_log.error.",
+        task_name,
+    )
+    return ""

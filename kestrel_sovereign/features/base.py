@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
@@ -214,6 +214,16 @@ class Feature(_SdkFeature):
 
     # Node type used for persisting feature config in the knowledge graph.
     _CONFIG_NODE_TYPE = "feature_config"
+
+    #: The closed vocabulary of ``data["reason_code"]`` values each of this
+    #: feature's tools may return in a failed result, keyed by tool name.
+    #: When a scheduled tool fails, the scheduler names the cause in the
+    #: dispatch failure — text that leaves the redaction/cap boundary for
+    #: ``signal_log.error`` — only by membership here, never by shape (#3184).
+    #: A code that is not declared is dropped and logged as undeclared. Read
+    #: by attribute name, so an out-of-tree feature (subclassing the SDK
+    #: Feature) declares it the same way.
+    tool_reason_codes: ClassVar[Mapping[str, frozenset[str]]] = {}
 
     def __init__(self, agent):
         self.agent = agent

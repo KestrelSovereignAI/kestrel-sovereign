@@ -2103,6 +2103,35 @@ class TestTaskExecutor:
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_direct_run_names_only_a_declared_reason_code(self):
+        # The direct-run path (#3184): a failed ToolResult's reason_code
+        # reaches the raised message only when the owning feature declared
+        # it in ``tool_reason_codes`` — the same door the cron sources use.
+        from kestrel_sdk.tools.result import ToolResult
+
+        feature = SchedulerFeature(MagicMock())
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+        mock_tool = MagicMock()
+        mock_tool.name = "wellness_check"
+        mock_tool.execute = AsyncMock(return_value=ToolResult.failed(
+            "the score fell below threshold at /Users/someone/private",
+            data={"reason_code": "WELLNESS_DOWN"},
+        ))
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        feature.agent.features = {"WellnessFeature": mock_feature}
+
+        mock_feature.tool_reason_codes = {"wellness_check": frozenset({"WELLNESS_DOWN"})}
+        with pytest.raises(RuntimeError) as excinfo:
+            await feature._lookup_and_run_tool("wellness_check", {})
+        assert str(excinfo.value) == "scheduled tool wellness_check failed (WELLNESS_DOWN)"
+
+        mock_feature.tool_reason_codes = {}
+        with pytest.raises(RuntimeError) as excinfo:
+            await feature._lookup_and_run_tool("wellness_check", {})
+        assert str(excinfo.value) == "scheduled tool wellness_check failed"
+
+    @pytest.mark.asyncio
     async def test_custom_signal_dispatch_schedule_routes_through_cron_source(
         self, feature,
     ):

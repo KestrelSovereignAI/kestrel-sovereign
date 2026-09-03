@@ -32,6 +32,11 @@ from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+
+
+def _NO_REASON_CODES(task_name: str) -> frozenset[str]:
+    """A registration built with no declared reason codes: nothing crosses."""
+    return frozenset()
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
@@ -183,7 +188,7 @@ def test_build_cron_registrations_match_cron_tasks_table():
     async def _lookup(name, args):
         return None
 
-    regs = build_cron_registrations(tool_lookup=_lookup)
+    regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     assert len(regs) == len(CRON_TASKS)
     names = [r.name for r in regs]
     assert all(n.startswith("cron.") for n in names)
@@ -194,7 +199,7 @@ def test_action_registrations_have_handler_artifact_have_artifact_handler():
     async def _lookup(name, args):
         return f"lookup:{name}"
 
-    regs = build_cron_registrations(tool_lookup=_lookup)
+    regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     for reg in regs:
         if reg.default_mode == SignalMode.ACTION:
             assert reg.handler is not None, f"{reg.name} ACTION needs handler"
@@ -220,7 +225,7 @@ def test_builtin_handlers_override_tool_lookup():
         captured.append(("backup", args))
         return "backup-ok"
 
-    regs = build_cron_registrations(
+    regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=lookup,
         builtin_handlers={"backup_snapshot": fake_backup},
     )
@@ -256,7 +261,7 @@ async def test_user_scheduled_signal_dispatch_uses_cron_action_source(
         captured.append((name, args))
         return f"ran:{name}"
 
-    for reg in build_cron_registrations(tool_lookup=fake_lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -292,7 +297,7 @@ async def test_artifact_task_dispatches_through_artifact_handler(
     async def fake_lookup(name, args):
         return f"briefing:{name}"
 
-    for reg in build_cron_registrations(tool_lookup=fake_lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -319,7 +324,7 @@ async def test_json_shaped_string_artifact_is_not_a_scheduler_envelope(
     async def fake_lookup(name, args):
         return artifact
 
-    for reg in build_cron_registrations(tool_lookup=fake_lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -345,7 +350,7 @@ async def test_handler_exception_becomes_failed_status(
     async def lookup_raises(name, args):
         raise RuntimeError("tool blew up")
 
-    for reg in build_cron_registrations(tool_lookup=lookup_raises):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_raises):
         registry.register(reg)
 
     signal = Signal(
@@ -388,7 +393,8 @@ async def test_failed_tool_result_becomes_failed_status(
     scheduler_feature = SchedulerFeature(agent)
 
     for reg in build_cron_registrations(
-        tool_lookup=scheduler_feature._lookup_raw_tool_result
+        tool_lookup=scheduler_feature._lookup_raw_tool_result,
+        reason_codes_lookup=scheduler_feature._declared_reason_codes,
     ):
         registry.register(reg)
 
@@ -437,7 +443,7 @@ async def test_permission_block_is_expected_outcome_without_dispatcher_traceback
     async def lookup_blocked(name, args):
         return blocked
 
-    for reg in build_cron_registrations(tool_lookup=lookup_blocked):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_blocked):
         registry.register(reg)
 
     signal = Signal(
@@ -508,7 +514,7 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
     agent.sleep = sleep
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -639,7 +645,7 @@ async def test_builtin_json_envelopes_follow_scheduler_result_contract(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={task_name: handler},
     ):
@@ -718,7 +724,7 @@ async def test_backup_without_sync_service_is_a_successful_skipped_dispatch(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
     ):
@@ -754,7 +760,7 @@ async def test_backup_without_targets_is_a_successful_skipped_dispatch(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
     ):
@@ -793,7 +799,7 @@ async def test_backup_with_failed_targets_is_a_failed_dispatch(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
     ):
@@ -838,7 +844,7 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -900,7 +906,7 @@ async def test_real_sleep_privacy_skip_then_export_failure_names_the_export(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -962,7 +968,7 @@ async def test_real_sleep_nonterminal_reports_remain_successful_cron_dispatches(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -1015,7 +1021,7 @@ async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(
+    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -1048,7 +1054,7 @@ async def test_signal_log_writes_redacted_args(dispatcher_components):
     async def lookup(name, args):
         return "ok"
 
-    for reg in build_cron_registrations(tool_lookup=lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)
 
     signal = Signal(
@@ -1092,7 +1098,7 @@ async def test_concurrent_memory_tasks_serialize(dispatcher_components):
             order.append(f"end:{name}")
         return None
 
-    for reg in build_cron_registrations(tool_lookup=lookup):
+    for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)
 
     sig_a = Signal(
