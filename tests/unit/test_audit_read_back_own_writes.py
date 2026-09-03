@@ -1106,10 +1106,10 @@ async def test_an_unmaskable_row_naming_a_secret_is_not_searchable(tmp_path):
     it back a character at a time from hit/no-hit, while every returned row
     showed ***MASKED***. So the searchable projection is the masked one now.
 
-    A row too truncated to parse cannot be masked field-by-field, which means it
-    cannot be *searched* field-by-field either. If it names a sensitive key at
-    all it leaves the corpus. Losing the match is the safe failure; being an
-    oracle for a legacy credential is not."""
+    A row too truncated to parse cannot be masked field-by-field. Round 13:
+    the sensitive VALUE is masked through the end of its (cut) JSON string
+    and the rest of the row stays searchable — the oracle is closed at the
+    value, and a benign field beside it no longer leaves the corpus."""
     from kestrel_sovereign.features.security.feature import SecurityFeature
 
     store = PermissionStore(str(tmp_path / "unmaskable.db"))
@@ -1124,9 +1124,8 @@ async def test_an_unmaskable_row_naming_a_secret_is_not_searchable(tmp_path):
     feature.permission_store = store
     result = await feature.security_audit_search(query="orphaned worker")
 
-    assert result.data["count"] == 0, (
-        "an unparseable row naming a sensitive key leaves the searchable "
-        "corpus entirely — it cannot be masked, so it must not be matchable"
+    assert result.data["count"] == 1, (
+        "the benign field beside a masked secret must stay searchable"
     )
     assert "sk-live-CUT" not in result.confirmation
     assert "sk-live-CUT" not in str(result.data)
@@ -1134,9 +1133,11 @@ async def test_an_unmaskable_row_naming_a_secret_is_not_searchable(tmp_path):
     # And the oracle is closed at the source: the query never reaches the raw
     # value, so hit/no-hit cannot be used to walk it out.
     from kestrel_sovereign.features.security.permissions import fold_stored_summary
-    assert fold_stored_summary(
-        '{"memo": "orphaned worker", "api_key": "sk-live-CUT'
-    ) == ""
+    folded = fold_stored_summary('{"memo": "orphaned worker", "api_key": "sk-live-CUT')
+    assert "sk-live" not in folded and "cut" not in folded
+    # ...but the benign field beside it stays searchable: dropping the whole
+    # row silently shrank the corpus (round 13).
+    assert "orphaned worker" in folded
 
 
 @pytest.mark.asyncio
@@ -1298,11 +1299,12 @@ async def test_an_ordinary_query_containing_key_still_searches(store):
     from kestrel_sovereign.features.security.permissions import (
         fold_stored_summary,
     )
-    assert fold_stored_summary(hostile) == "", (
-        "precondition: the summary rule DOES fold this away — that is correct "
-        "for a stored row and wrong for a query"
+    folded = fold_stored_summary(hostile)
+    assert "rotation" not in folded and "***masked***" in folded, (
+        "precondition: the summary rule DOES mask the value after a key "
+        "position — that is correct for a stored row and wrong for a query"
     )
-    assert fold_query(hostile), "the query rule must not"
+    assert "rotation" in fold_query(hostile), "the query rule must not"
     matches, _ = await store.search_audit_log(hostile)
     assert matches == [], "and the search must return nothing, not everything"
 
@@ -1451,8 +1453,11 @@ async def test_an_unparseable_row_without_a_sensitive_key_is_still_shown(tmp_pat
     truncated = '{"title": "orphans the worker", "body": "' + "x" * 40  # cut mid-value
     assert remask_summary(truncated) == truncated
     leaking = '{"memo": "orphaned worker", "api_key": "sk-live-CUT'
-    assert "sk-live-CUT" not in remask_summary(leaking)
-    assert "not shown" in remask_summary(leaking)
+    shown = remask_summary(leaking)
+    assert "sk-live-CUT" not in shown
+    # Round 13: the sensitive VALUE is masked and the rest is shown, rather
+    # than withholding the whole row.
+    assert "***MASKED***" in shown and "orphaned worker" in shown
 
     store = PermissionStore(str(tmp_path / "truncated.db"))
     await store.initialize()
@@ -1656,3 +1661,71 @@ async def test_an_absurd_days_window_is_refused_not_an_overflow(tmp_path):
     result = await feature.security_audit_search(query="anything", days=10**9)
     assert result.status is ToolResultStatus.ERROR
     assert "days must be <=" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_row_with_a_masked_token_is_still_searchable(tmp_path):
+    """The ticket's own motivating shape: a filing carrying a token (masked at
+    write time) beside a long body, cut mid-structure at 500. The row left the
+    corpus for naming a sensitive key, and the no-match text blamed truncation
+    for a phrase that sat INSIDE the cut."""
+    from kestrel_sovereign.features.security.args_summary import (
+        remask_summary, summarize_args,
+    )
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    stored = summarize_args({
+        "token": "ghp_secret_value",
+        "repo": "KestrelSovereignAI/kestrel-talon",
+        "body": "Killing a tracked job orphans the worker. " * 20,
+    })
+    assert len(stored) == 500 and "ghp_secret" not in stored
+
+    store = PermissionStore(str(tmp_path / "masked_token.db"))
+    await store.initialize()
+    await _log_filing(store, stored)
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="orphans the worker")
+    assert result.data["count"] == 1
+    assert "orphans the worker" in result.confirmation
+    assert "ghp_secret" not in result.confirmation
+
+    # The oracle stays closed at the VALUE: a legacy raw secret beside a
+    # benign field is masked through the end of its (cut) string.
+    shown = remask_summary('{"memo": "orphaned worker", "api_key": "sk-live-CUT')
+    assert "sk-live" not in shown and "orphaned worker" in shown
+
+
+@pytest.mark.asyncio
+async def test_days_window_excludes_an_iso_row_older_than_the_window(tmp_path):
+    """The cutoff clause normalizes created_at before comparing; a plain
+    `created_at >= ?` left every test green while a ~44h-old ISO row leaked
+    into a 1-day window ('T' sorts above ' ')."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    db_path = tmp_path / "iso_ts.db"
+    store = PermissionStore(str(db_path))
+    await store.initialize()
+    # Same calendar date as the cutoff, earlier in the day: compared as raw
+    # text, "T" (84) at index 10 sorts above the cutoff's " " (32), so an
+    # unnormalized comparison admits a row that is OUTSIDE the window.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    old_stamp = cutoff.replace(hour=0, minute=0, second=1, microsecond=0).isoformat()
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO security_audit_log "
+        "(feature_name, tool_name, action, decision, user_choice, "
+        " args_summary, created_at) VALUES (?,?,?,?,?,?,?)",
+        ("GitHubFeature", "create_github_issue", "tool_execution",
+         "auto_mode_allowed", None, _FILING_ONE, old_stamp),
+    )
+    raw.commit()
+    raw.close()
+
+    matches, _ = await store.search_audit_log("orphans the worker", days=1)
+    assert matches == [], f"a row stamped {old_stamp} is outside a 1-day window"
+    matches, _ = await store.search_audit_log("orphans the worker", days=2)
+    assert len(matches) == 1

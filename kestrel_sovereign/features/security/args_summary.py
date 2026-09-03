@@ -40,6 +40,32 @@ SENSITIVE_JSON_KEY = re.compile(
     re.IGNORECASE,
 )
 
+#: The VALUE that follows a sensitive key in serialized-but-unparseable JSON:
+#: a JSON string (possibly unterminated — the row was cut mid-value) or a
+#: bare scalar up to the next separator.
+_SENSITIVE_JSON_REGION = re.compile(
+    r'("[^"]*(?:%s)[^"]*"\s*:\s*)("(?:[^"\\]|\\.)*"?|[^,}\]]*)' % "|".join(
+        re.escape(sub) for sub in SENSITIVE_KEY_SUBSTRINGS
+    ),
+    re.IGNORECASE,
+)
+
+
+def mask_sensitive_regions(text):
+    """Mask the value of every sensitive key in JSON text that will not parse.
+
+    A row truncated mid-structure cannot be masked field-by-field. Dropping
+    the whole row whenever a sensitive key appeared silently shrank the corpus
+    the caller believes it searched — a filing that carried a (write-time
+    masked) ``token`` beside a long body left the read-back entirely, and the
+    no-match text then blamed truncation for a phrase INSIDE the cut. Only
+    the sensitive VALUE is the oracle risk; the rest of the row is data the
+    caller is entitled to match. The value is replaced through the end of its
+    JSON string — an unterminated string runs to the end of the text — so no
+    tail of a secret survives.
+    """
+    return _SENSITIVE_JSON_REGION.sub(lambda m: m.group(1) + '"***MASKED***"', text)
+
 #: Placeholder written in place of a sensitive value.
 MASK = "***MASKED***"
 
@@ -96,9 +122,9 @@ def remask_summary(summary: Optional[str], max_length: int = 500) -> Optional[st
     try:
         parsed = json.loads(summary)
     except (ValueError, TypeError):
-        if SENSITIVE_JSON_KEY.search(summary):
-            return "(summary truncated and names a sensitive key; not shown)"
-        return summary[:max_length]
+        # Same rule as the searchable projection: mask the sensitive VALUES
+        # and keep the rest, rather than withholding the whole row.
+        return mask_sensitive_regions(summary)[:max_length]
     if not isinstance(parsed, (dict, list)):
         return summary[:max_length]
     try:

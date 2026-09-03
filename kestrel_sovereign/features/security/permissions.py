@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.features.security.args_summary import (
+    mask_sensitive_regions,
     SENSITIVE_JSON_KEY,
     SENSITIVE_KEY_SUBSTRINGS,
     mask_sensitive,
@@ -84,9 +85,11 @@ def fold_stored_summary(text):
         # POSITIONS. Scanning the whole serialized text meant a benign value
         # like "orphaned keyboard worker" contained "key" and silently left the
         # corpus, which defeats the long summaries this fallback exists for.
-        if _SENSITIVE_JSON_KEY.search(text):
-            return ""
-        return _decode_escapes(text).casefold()
+        # Mask the sensitive VALUES (through the end of each JSON string, so
+        # no tail of a secret survives a truncation) and fold the rest: the
+        # oracle is closed at the value, and the row's other fields stay in
+        # the corpus the caller believes it searched (#3107 round 13).
+        return _decode_escapes(mask_sensitive_regions(text)).casefold()
 
     if isinstance(parsed, (dict, list)):
         # MASK BEFORE FOLDING. Masking only on the way out closes the display
