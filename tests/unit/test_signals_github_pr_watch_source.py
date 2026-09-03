@@ -410,3 +410,74 @@ async def test_fetch_pr_state_issue_skips_checks(monkeypatch):
     state = await fetch_pr_state("owner/name", 1614, token="t", kind="issue")
     assert not any("check-runs" in u or u.endswith("/status") for u in calls)
     assert normalize_pr_state(state)["checks_status"] == ""
+
+
+# --------------------------------------------------------------------------
+# #3191 — one run per check name, and a combined verdict that can resolve.
+# --------------------------------------------------------------------------
+
+def test_summarize_checks_keeps_only_the_newest_run_per_name():
+    """A re-run CI lists the same name twice; the stale failure must not sit
+    beside the fresh success in the fingerprint."""
+    runs = {"check_runs": [
+        {"name": "unit-tests", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-09-01T10:00:00Z", "completed_at": "2026-09-01T10:05:00Z", "id": 1},
+        {"name": "unit-tests", "status": "completed", "conclusion": "success",
+         "started_at": "2026-09-01T11:00:00Z", "completed_at": "2026-09-01T11:05:00Z", "id": 2},
+    ]}
+    summary = summarize_checks(runs, {"state": "pending", "statuses": []})
+    assert summary.count("check:unit-tests=") == 1
+    assert "check:unit-tests=completed/success" in summary
+    assert "failure" not in summary
+
+
+def test_summarize_checks_newest_run_is_the_highest_id_then_started_at():
+    # An in-progress re-run has no completed_at yet: it is still the newest.
+    runs = {"check_runs": [
+        {"name": "ci", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-09-01T10:00:00Z", "completed_at": "2026-09-01T10:05:00Z", "id": 1},
+        {"name": "ci", "status": "in_progress", "conclusion": None,
+         "started_at": "2026-09-01T12:00:00Z", "completed_at": None, "id": 2},
+    ]}
+    summary = summarize_checks(runs, None)
+    assert "check:ci=in_progress/" in summary and "failure" not in summary
+    assert "combined=pending" in summary
+    # Ids decide even against a later-looking timestamp on the older run.
+    runs = {"check_runs": [
+        {"name": "ci", "status": "completed", "conclusion": "failure", "id": 7,
+         "completed_at": "2026-09-02T00:00:00Z"},
+        {"name": "ci", "status": "completed", "conclusion": "success", "id": 9,
+         "completed_at": "2026-09-01T00:00:00Z"},
+    ]}
+    assert "check:ci=completed/success" in summarize_checks(runs, None)
+    # No ids at all (fixtures): started_at breaks the tie.
+    runs = {"check_runs": [
+        {"name": "ci", "status": "completed", "conclusion": "failure", "started_at": "2026-09-01T10:00:00Z"},
+        {"name": "ci", "status": "completed", "conclusion": "success", "started_at": "2026-09-01T11:00:00Z"},
+    ]}
+    assert "check:ci=completed/success" in summarize_checks(runs, None)
+
+
+def test_summarize_checks_combined_resolves_from_check_runs():
+    """With no legacy status contexts, GitHub's combined status is ``pending``
+    forever; the verdict has to come from the runs that actually gate the PR."""
+    green = {"check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "success"},
+        {"name": "lint", "status": "completed", "conclusion": "skipped"},
+    ]}
+    assert "combined=success" in summarize_checks(green, {"state": "pending", "statuses": []})
+    red = {"check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "success"},
+        {"name": "test", "status": "completed", "conclusion": "timed_out"},
+    ]}
+    assert "combined=failure" in summarize_checks(red, {"state": "pending", "statuses": []})
+
+
+def test_summarize_checks_combined_still_honours_a_real_legacy_status():
+    runs = {"check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "success"},
+    ]}
+    legacy = {"state": "failure", "statuses": [{"context": "ci/legacy", "state": "failure"}]}
+    summary = summarize_checks(runs, legacy)
+    assert "combined=failure" in summary
+    assert "status:ci/legacy=failure" in summary
