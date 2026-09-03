@@ -161,7 +161,16 @@ def changed_line_map(
     # bytes, or a .gitattributes -diff/binary rule) otherwise emits only
     # "Binary files ... differ" — no headers, no hunks — and the file vanished
     # from both maps, rendering as clean. Door four of the same invariant.
-    diff = _git("diff", "-U0", "--no-color", "--no-ext-diff", "--text", *diff_spec)
+    # --src-prefix/--dst-prefix: _patch_path strips a literal `a/`/`b/`, and
+    # diff.mnemonicPrefix, diff.srcPrefix/dstPrefix and diff.noprefix all
+    # change that. Two of them crashed the advisory run on `git show`; the
+    # third, in a repo with a top-level `a/` directory, keyed the maps to the
+    # wrong file and analysed a decoy — a clean bill of health with nothing
+    # in NOT ANALYSED. Pinning the prefixes overrides all three.
+    diff = _git(
+        "diff", "-U0", "--no-color", "--no-ext-diff", "--text",
+        "--src-prefix=a/", "--dst-prefix=b/", *diff_spec,
+    )
     _UNANALYSED.clear()  # one run's record starts here, ends in collect()
     new_map: dict[str, set[int]] = defaultdict(set)
     old_map: dict[str, set[int]] = defaultdict(set)

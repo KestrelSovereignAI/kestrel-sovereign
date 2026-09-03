@@ -1474,3 +1474,29 @@ def test_the_not_analysed_footer_names_what_it_lists() -> None:
     footer = checker.render([], unparseable=["sib.py"])
     assert "could not be read or parsed" in footer
     assert "changed files" not in footer
+
+
+@pytest.mark.parametrize("config", [
+    ("diff.mnemonicPrefix", "true"),   # --- c/mod.py / +++ w/mod.py
+    ("diff.srcPrefix", "src/"),
+    ("diff.noprefix", "true"),         # --- mod.py — and `a/` is a real directory below
+])
+def test_diff_path_prefixes_are_pinned_against_git_config(repo: Path, config) -> None:
+    """``_patch_path`` strips a literal ``a/``/``b/``. A prefix config either
+    keyed the maps to a path git cannot show (a traceback out of an advisory
+    gate) or, with ``noprefix`` in a repo that has a top-level ``a/``,
+    stripped a REAL directory and analysed a decoy file at the root — a clean
+    bill of health with nothing in NOT ANALYSED."""
+    (repo / "a").mkdir()
+    (repo / "a" / "foo.py").write_text('A = "tool_execution"\n')
+    (repo / "foo.py").write_text('DECOY = "unrelated_name"\n')
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    _run(repo, "config", *config)
+    (repo / "a" / "foo.py").write_text('A = "subagent_dispatch"\n')
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert set(new_map) == {"a/foo.py"} and set(old_map) == {"a/foo.py"}, (new_map, old_map)
+    finding = _named(_findings(repo), "tool_execution")
+    assert [o.path for o in finding.unchanged] == ["sib.py"]
+    assert checker.main(["--strict"]) == 1
