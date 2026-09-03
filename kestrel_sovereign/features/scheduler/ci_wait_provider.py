@@ -14,7 +14,7 @@ head-commit check runs and combined status to decide a terminal verdict:
   * open + checks still running,
     or the rollup was not read      -> PENDING (keep watching)
 
-The change-detection primitives (``fetch``/``summarize_checks``) are reused
+The change-detection primitives (``_github_get_check_runs``/``_check_verdict``) are reused
 from :mod:`kestrel_sovereign.signals.sources.github_pr_watch`, which is pure
 core — this provider does NOT depend on the out-of-tree GitHub feature.
 
@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 # A CI handle is a PR reference: ``owner/repo#123``. The owner/repo half may
 # contain the usual GitHub name characters; the number is the PR/issue id.
 _CI_HANDLE_RE = re.compile(r"^(?P<repo>[^\s#]+/[^\s#]+)#(?P<number>\d+)$")
+
 
 def parse_ci_handle(handle: str) -> Tuple[str, int]:
     """Split a ``owner/repo#123`` CI handle into ``(repo, number)``.
