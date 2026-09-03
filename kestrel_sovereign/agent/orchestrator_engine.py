@@ -48,6 +48,10 @@ from kestrel_sovereign.agent.turn_lifecycle import (
 from kestrel_sovereign.storage.privacy_wrapper import (
     bind_transition_lock_reentry,
 )
+from kestrel_sovereign.signals.context import (
+    bind_current_signal,
+    get_current_signal,
+)
 from kestrel_sovereign.agent.streaming import (
     _build_revise_sentinel,
     _build_tool_sentinel,
@@ -682,6 +686,35 @@ class OrchestratorEngineMixin:
         # transport parameter, logging context, or agent-global session. The
         # binding is explicitly empty when this executor was built off-turn.
         turn_session_binding = capture_turn_session_binding(self)
+        # Capture the OWNING turn's in-flight Signal for the same reason as the
+        # three bindings above (#3112 review P1 — the FOURTH instance of this
+        # defect in this one function). ``set_current_signal`` is called in
+        # exactly one place, ``SignalDispatcher`` around ``process_input``, on
+        # the dispatching task. The codex reader task's frozen pre-turn snapshot
+        # therefore reads ``None``, and any guard of the form "refuse when the
+        # current signal is X" silently stops guarding. The concrete casualty is
+        # the scheduler's ``self_followup`` single-hop limit: a follow-up turn
+        # could schedule another follow-up without bound. ``None`` off a
+        # signal-driven turn is the correct value and stays correct.
+        turn_signal = get_current_signal()
+        # Capture the OWNING turn's scheduler execution scope -- the FIFTH
+        # instance of this defect in this one function (#3112 gate-2 P1).
+        # A ``self_followup`` turn runs inside a scheduler execution, and an
+        # isolated/effectful tool reads ``get_current_scheduler_execution()``
+        # to stamp its stable idempotency key. On the codex reader task that
+        # returns ``None``, so the tool omits the key -- and an occurrence
+        # retried after lease/finalization uncertainty repeats the effect.
+        # For a feature whose worked example is "merge PR N once CI settles",
+        # the concrete casualty is a merge running twice.
+        #
+        # Imported here rather than at module scope: this engine must not take
+        # a hard import dependency on an optional feature package.
+        from kestrel_sovereign.features.scheduler.runner import (
+            bind_scheduler_execution_scope,
+            capture_scheduler_execution_scope,
+        )
+
+        turn_scheduler_scope = capture_scheduler_execution_scope()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -691,7 +724,9 @@ class OrchestratorEngineMixin:
             capture: Dict[str, Any] = {}
             with bind_part_collector(turn_part_collector), \
                     bind_transition_lock_reentry(transition_reentry_token), \
-                    bind_turn_session(turn_session_binding):
+                    bind_turn_session(turn_session_binding), \
+                    bind_current_signal(turn_signal), \
+                    bind_scheduler_execution_scope(turn_scheduler_scope):
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,

@@ -8,7 +8,14 @@ SCHEDULER_SAFETY_DISABLEMENT_REASONS = frozenset({
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
 })
 
+# task_execution_log status for a COGNITION occurrence the dispatcher dropped
+# before the turn ran (rate limit, quiet hours, coalescing). Deliberately not
+# 'success' and not 'skipped': the schedule promised a turn and produced none
+# (#3101).
+MISSED_COGNITION_STATUS = "missed"
+
 __all__ = [
+    "MISSED_COGNITION_STATUS",
     "ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE",
     "SCHEDULER_SAFETY_DISABLEMENT_REASONS",
 ]

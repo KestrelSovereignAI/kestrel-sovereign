@@ -735,6 +735,64 @@ class TaskManager:
             )
         return task, True
 
+    def _refuse_command_authored_self_followup(
+        self, skill_id: str, user_input: str
+    ) -> Optional[dict]:
+        """Refuse a chat-typed ``self_followup`` schedule (#3112 P1).
+
+        Returns a failure dict when the command would create a
+        ``self_followup`` row, else ``None``.
+
+        Deliberately does NOT reuse ``parse_command_args``: that binder is
+        strictly positional, so a JSON ``args_json`` containing spaces shreds
+        across later parameters (#3118) and ``task_name`` cannot be trusted to
+        land in ``task_name``. This scans the raw text for the task name
+        instead, which is the one token whose presence is unambiguous no matter
+        where the positional binder puts it -- but matched as an exact TOKEN
+        rather than a substring, because over-matching was not in fact free:
+        it refused unrelated schedules that merely mentioned the name inside
+        another argument's value. Under-matching would admit the row this
+        guard exists to keep out.
+        """
+        from kestrel_sovereign.signals.sources.self_followup import (
+            TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
+        )
+
+        if not skill_id.startswith("schedule_"):
+            return None
+        # Exact-TOKEN, not substring (#3112 gate-2 P2). A bare substring scan
+        # refused unrelated schedules that merely mention the name inside
+        # another value -- e.g.
+        #   !schedule add @hourly github_pr_watch {"repo":"owner/self_followup"}
+        # Tokenizing keeps the #3118 robustness the substring scan was chosen
+        # for -- we still never trust the positional binder to put task_name in
+        # task_name -- while dropping the over-refusal: to create the row, the
+        # name must bind to the task_name PARAMETER, which means it has to
+        # appear as its own whitespace-delimited token (or as an explicit
+        # task_name=<name>). Embedded in a larger JSON token it cannot bind,
+        # so refusing it protected nothing and cost a legitimate schedule.
+        tokens = user_input.split()
+        if not any(
+            token == SELF_FOLLOWUP_TASK_NAME
+            or token == f"task_name={SELF_FOLLOWUP_TASK_NAME}"
+            for token in tokens
+        ):
+            return None
+        return {
+            "success": False,
+            "error": (
+                f"'{SELF_FOLLOWUP_TASK_NAME}' cannot be scheduled from a chat "
+                "command. It carries THIS agent's own intention across its own "
+                "turn boundary and its signal source is registered TRUSTED on "
+                "exactly that ground; text typed at the command surface is "
+                "author-by-a-human, so accepting it would wake a full "
+                "cognition turn at a trust level its registration does not "
+                "describe. Ask the agent in chat to schedule its own "
+                "follow-up instead."
+            ),
+            "refused": "command_authored_self_followup",
+        }
+
     async def _save_recipient_execution_result(
         self,
         task: Task,
@@ -776,6 +834,25 @@ class TaskManager:
             return None
 
         agent_id, skill_id = result
+
+        # #3112 P1: reaching THIS function is the only authorship fact core
+        # has. Both callers (`endpoints/agent.py`, `command_handler.py`) are
+        # chat command surfaces: the text was typed by a human, never composed
+        # by the model. Everything downstream — `execute_skill`, the scheduler
+        # guards — is shared with A2A routing and the in-turn tool loop, so by
+        # the time args reach `_prepare_self_followup_args` that distinction is
+        # gone and every guard there is reduced to inferring it. The chain of
+        # proxies (session-truthiness -> turn-ownership) ran out here.
+        #
+        # `self_followup` exists so the agent can carry ITS OWN intention
+        # across ITS OWN turn boundary at Trust.TRUSTED. A human asking for
+        # later work is a different request with a different trust story, and
+        # `SourceRegistration.trust` is static per source so it cannot be
+        # downgraded per row. Refuse the pairing outright rather than accept
+        # it at a trust level the registration comment does not describe.
+        refusal = self._refuse_command_authored_self_followup(skill_id, user_input)
+        if refusal is not None:
+            return refusal
 
         # Parse command arguments using the tool's parser if available
         args = {}

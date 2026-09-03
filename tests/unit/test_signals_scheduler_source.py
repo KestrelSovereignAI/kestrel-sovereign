@@ -114,14 +114,20 @@ def test_all_cron_tasks_are_classified():
         "restart_coordinator",  # #1512
         "github_pr_watch",  # #1618
         "ecosystem_discovery_watch",  # #2281
+        "self_followup",  # #3101 — agent-authored one-shot follow-up turn
     ])
 
 
 def test_action_vs_artifact_split_matches_design():
     """ACTION = side effect, no LLM follow-up. ARTIFACT = produces a
     result via feature workflow that may use an LLM internally but
-    doesn't enter conversation history."""
-    by_mode = {SignalMode.ACTION: set(), SignalMode.ARTIFACT: set()}
+    doesn't enter conversation history. COGNITION = a real turn that
+    enters conversation history."""
+    by_mode = {
+        SignalMode.ACTION: set(),
+        SignalMode.ARTIFACT: set(),
+        SignalMode.COGNITION: set(),
+    }
     for name, mode, _ in CRON_TASKS:
         by_mode[mode].add(name)
     assert by_mode[SignalMode.ACTION] == {
@@ -142,6 +148,10 @@ def test_action_vs_artifact_split_matches_design():
         "reflect",
         "memory_consolidate",
     }
+    # #3101 — the only cron task that is a genuine agent turn. It carries an
+    # intention the agent formed in an earlier turn across the turn boundary,
+    # so it must enter conversation history rather than produce an artifact.
+    assert by_mode[SignalMode.COGNITION] == {"self_followup"}
 
 
 def test_no_cron_source_declares_conversation():
@@ -199,6 +209,20 @@ def test_action_registrations_have_handler_artifact_have_artifact_handler():
         if reg.default_mode == SignalMode.ACTION:
             assert reg.handler is not None, f"{reg.name} ACTION needs handler"
             assert reg.artifact_handler is None
+        elif reg.default_mode == SignalMode.COGNITION:
+            # A COGNITION cron task has no handler of either kind: the
+            # dispatcher renders the prompt template and runs a turn. A
+            # registration with neither a handler nor a template would accept
+            # a dispatch and produce nothing, which is the silent no-op #3101
+            # exists to prevent.
+            assert reg.handler is None, f"{reg.name} COGNITION takes no handler"
+            assert reg.artifact_handler is None
+            assert reg.prompt_template is not None, (
+                f"{reg.name} COGNITION needs a prompt_template to reach a turn"
+            )
+            assert reg.prompt_template.exists(), (
+                f"{reg.name} prompt_template {reg.prompt_template} is missing"
+            )
         else:
             assert reg.artifact_handler is not None, (
                 f"{reg.name} ARTIFACT needs artifact_handler"

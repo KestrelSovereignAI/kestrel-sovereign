@@ -8,6 +8,7 @@ process death leaves a lease which another runner may recover after expiry.
 """
 
 import asyncio
+import contextlib
 import contextvars
 import hashlib
 import hmac
@@ -434,6 +435,42 @@ def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
     if scope is None or not scope.active:
         return None
     return scope.execution
+
+
+def capture_scheduler_execution_scope() -> Optional[_SchedulerExecutionScope]:
+    """Capture the raw active execution scope for re-binding on another task.
+
+    Returns the SCOPE, not the execution, deliberately: the scope carries the
+    revocation flag the runner flips when a lease is lost, so a re-bound copy
+    keeps observing revocation instead of pinning a stale-but-valid-looking
+    identity. Capturing ``execution`` alone would hand a task an idempotency
+    key that outlives the claim it belongs to.
+    """
+
+    return _current_execution.get()
+
+
+@contextlib.contextmanager
+def bind_scheduler_execution_scope(scope: Optional[_SchedulerExecutionScope]):
+    """Re-present a captured execution scope on the current task (#3112).
+
+    The codex app-server dispatches each inline tool on a reader-spawned task
+    carrying a frozen pre-turn ContextVar snapshot, so a scheduled turn's tools
+    read ``None`` from ``get_current_scheduler_execution()`` and omit their
+    stable idempotency key. An occurrence retried after lease/finalization
+    uncertainty could then repeat an irreversible effect -- a merge running
+    twice.
+
+    Exposed as a binder rather than another hand-rolled set/reset pair so the
+    next transport re-binds by calling this, instead of by remembering that
+    this ContextVar exists.
+    """
+
+    token = _current_execution.set(scope)
+    try:
+        yield
+    finally:
+        _current_execution.reset(token)
 
 
 @dataclass
@@ -3333,6 +3370,32 @@ class SchedulerRunner:
                 logger.warning("Task %s returned non-numeric outcome signal %r; dropping", task.id, raw[1])
                 signal = None
             return "success", text, signal, False
+        # A ToolResult carrying an ERROR status is a REFUSAL, not a success
+        # (#3112 gate-2 P2). Every scheduled feature tool returns a
+        # ToolResult, which matches neither branch above and fell through to
+        # the catch-all -- so a tool that refused on every fire was recorded
+        # as succeeding on every fire, and its error text was buried inside a
+        # dataclass repr. The runner's own `except Exception` handler does not
+        # cover this: it catches RAISED failures, and a RETURNED refusal never
+        # raises.
+        #
+        # Detected structurally (a `status` whose value is the error string)
+        # rather than by importing ToolResult, so this stays independent of
+        # the SDK import graph and also covers the SDK's own status enum
+        # changing shape. Duck-typed on purpose: the runner deliberately
+        # tolerates legacy executor doubles that are not real ToolResults.
+        status_attr = getattr(raw, "status", None)
+        status_value = getattr(status_attr, "value", status_attr)
+        if isinstance(status_value, str) and status_value.lower() == "error":
+            detail = getattr(raw, "error", None) or getattr(
+                raw, "confirmation", None
+            )
+            return (
+                "failed",
+                str(detail) if detail else str(raw),
+                None,
+                False,
+            )
         return "success", raw if isinstance(raw, str) else (str(raw) if raw is not None else None), None, False
 
     async def _finalize(

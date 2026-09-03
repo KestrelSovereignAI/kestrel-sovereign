@@ -319,6 +319,42 @@ class TurnLifecycleMixin:
             )
         return None
 
+    def owns_live_turn(self) -> bool:
+        """True when the CALLING task owns the turn that is live right now.
+
+        The POSITIVE half of :meth:`get_turn_bound_session_id`. That accessor
+        computes this exact ownership fact and then degrades it to a session
+        id, so its None means three different things — no turn, a live turn
+        with no chat session, or an agent double without the accessor. A
+        caller that needs "was this authored inside my own turn?" cannot ask
+        a session id, because a session-less turn answers the same None as no
+        turn at all (#3112 review).
+
+        Both arms of the pairing count as ownership: an explicit
+        ``_BOUND_TURN_SESSION`` binding whose ``turn_id`` matches the live
+        turn (the arm that survives a task boundary, and therefore the one
+        the inline tool executor is reached through), and the task-local
+        ``_CURRENT_TURN_ID`` matching the live turn. A task that merely
+        INHERITED a finished turn's ContextVar fails both, because
+        ``_live_turn_id`` is cleared in the turn's ``finally``.
+
+        Not a security boundary against a task spawned inside the agent's own
+        live turn: such a task inherits a matching id and is reported as
+        owning the turn. That is intended — it IS agent-authored work — but
+        it means this answers "agent-authored, in-turn" and not "is the
+        cognition turn itself".
+        """
+        live_turn_id = getattr(self, "_live_turn_id", None)
+        if not live_turn_id:
+            return False
+        propagated = _BOUND_TURN_SESSION.get()
+        if propagated is not None and propagated.agent is self:
+            return bool(
+                propagated.turn_id and propagated.turn_id == live_turn_id
+            )
+        turn_id = _CURRENT_TURN_ID.get()
+        return bool(turn_id and turn_id == live_turn_id)
+
     def _get_turn_bound_session_id(self) -> Optional[str]:
         """Compatibility alias for :meth:`get_turn_bound_session_id`.
 

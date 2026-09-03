@@ -1284,6 +1284,32 @@ class Feature(_SdkFeature):
             return session_id.strip()
         return None
 
+    def _owns_live_turn(self) -> bool:
+        """True when this feature call is running inside the agent's live turn.
+
+        Use this — not ``_turn_session_id()`` truthiness — for any guard that
+        asks "is this agent-authored, in-turn work?". ``_turn_session_id()``
+        answers None for a live turn that simply has no chat session, which is
+        indistinguishable from a caller with no turn at all; a guard built on
+        it refuses legitimate session-less turns and is the reason #3112's
+        first in-turn check was wrong.
+
+        False for an agent that does not implement the accessor. That is
+        deliberately the SAFE direction for a refusal guard: an agent double
+        we cannot interrogate is treated as not-in-turn rather than waved
+        through.
+        """
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return False
+        resolve = getattr(agent, "owns_live_turn", None)
+        if not callable(resolve):
+            return False
+        try:
+            return bool(resolve())
+        except Exception:  # pragma: no cover - defensive; stub agents
+            return False
+
     async def execute_as_subagent(
         self,
         task: str,
@@ -1503,13 +1529,48 @@ class Feature(_SdkFeature):
             bind_transition_lock_reentry,
             current_bound_reentry_token,
         )
+        from kestrel_sovereign.signals.context import (
+            bind_current_signal,
+            get_current_signal,
+        )
         transition_reentry_token = current_bound_reentry_token()
         turn_session_binding = capture_turn_session_binding(self.agent)
+        # The waking Signal is the fourth turn-scoped binding this boundary
+        # drops (#3112; the parent-turn twin is in
+        # ``OrchestratorEngineMixin._make_inline_tool_executor``). Guards that
+        # ask "what woke this turn?" — notably the scheduler's single-hop
+        # self_followup refusal — read ``get_current_signal()``; on the codex
+        # app-server route this subagent's inline tools run on a freshly
+        # spawned reader task whose frozen snapshot has no signal, so the
+        # guard's ``is not None`` test short-circuits and the refusal never
+        # fires. Capture on the owning task and re-present. An executor built
+        # off-turn captures ``None``, so this never manufactures a waking
+        # signal where there was none.
+        turn_signal = get_current_signal()
+        # SIXTH instance, and the twin of the fifth: the parent-turn boundary
+        # in ``OrchestratorEngineMixin._make_inline_tool_executor`` re-presents
+        # the scheduler execution scope, and this subagent boundary did not.
+        # A ``self_followup`` turn that delegates to a subagent whose inline
+        # tool is isolated/effectful therefore stamps NO idempotency key, and
+        # an occurrence retried after lease/finalization uncertainty repeats
+        # the effect -- the "merge PR N once CI settles" example merging twice,
+        # one reader-task boundary further out.
+        #
+        # Imported here rather than at module scope: features/base.py must not
+        # take a hard import dependency on an optional feature package.
+        from kestrel_sovereign.features.scheduler.runner import (
+            bind_scheduler_execution_scope,
+            capture_scheduler_execution_scope,
+        )
+
+        turn_scheduler_scope = capture_scheduler_execution_scope()
 
         async def _exec(name: str, args: Dict[str, Any]):
             with (
                 bind_transition_lock_reentry(transition_reentry_token),
                 bind_turn_session(turn_session_binding),
+                bind_current_signal(turn_signal),
+                bind_scheduler_execution_scope(turn_scheduler_scope),
             ):
                 return await self._execute_subagent_tool(
                     tool_name=name,
@@ -1557,8 +1618,8 @@ class Feature(_SdkFeature):
                 return (effective_args_value, result_value)
             return result_value
 
-        tool = tools_by_name.get(tool_name)
-        if tool is None:
+        selected_tool = tools_by_name.get(tool_name)
+        if selected_tool is None:
             return _shape(args, {
                 "success": False,
                 "error": (
@@ -1667,7 +1728,7 @@ class Feature(_SdkFeature):
                 # before the DENY/ASK branch.
 
             try:
-                result = await tool.execute(**effective_args)
+                result = await selected_tool.execute(**effective_args)
             except Exception as e:
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
@@ -1802,7 +1863,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         # Get tools by name for execution
-        tools_by_name = {tool.name: tool for tool in self.get_tools()}
+        tools_by_name = {t.name: t for t in self.get_tools()}
 
         for iteration in range(max_iterations):
             # Warn when approaching iteration limit

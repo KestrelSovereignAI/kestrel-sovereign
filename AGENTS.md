@@ -262,6 +262,56 @@ comments, checks) — args travel in the scheduled task's `args_json`
 an agent-owned watcher dispatches locally and may not forge a peer into its
 signal target or causation chain.
 
+#### Scheduling your own follow-up turn (`self_followup`)
+
+An intention formed inside a turn ("verify PR N once CI settles, then merge")
+does not survive the turn boundary on its own. `self_followup` (#3101) is the
+one-shot cron source that carries one across: it is the only COGNITION entry in
+`CRON_TASKS`, so the deadline fires a *genuine turn* with the intention text
+rendered into its prompt — not a liveness ping, not an echo.
+
+```python
+# Programmatic call. This is the ONLY form that carries an intent
+# containing spaces -- see the surface limitation below.
+schedule_add_deadline(
+    delay_seconds=1200,
+    task_name="self_followup",
+    args_json='{"intent": "check whether CI on PR 3096 went green, then merge"}',
+)
+```
+
+Give the deadline exactly one way — `run_at` (absolute, needs an offset) or
+`delay_seconds` (relative, resolved against the scheduler's database clock).
+`args_json` takes only `intent`; the scheduler fills the rest of the payload.
+
+**Surface limitation (#3112).** The `!schedule deadline` chat command cannot
+express this call. `AgentTool.parse_command_args` binds strictly by position and
+never reads `key=value`, so a `key=value` line lands the literal string
+`"delay_seconds=1200"` in `run_at`. Positional form fares no better here:
+`args_json` is declared `str` (not `object`) and is not the final parameter, so a
+JSON payload containing spaces is split on whitespace and smeared across
+`misfire_policy`, `misfire_grace_seconds`, `idempotency_key` and `delay_seconds`
+-- and it parses *without error*. Only a whitespace-free `args_json` survives the
+chat surface, which the `intent` payload never is. Schedule a follow-up
+programmatically until that is fixed.
+
+Two bounds are deliberate and are enforced as **refusals at schedule time**,
+never as a silent downgrade — an accept that produces no turn is worse than an
+explicit refusal:
+
+- **Single hop.** A follow-up turn may not schedule another follow-up. A
+  persisted row starts a fresh causation chain, so `allow_self_loops=False`
+  cannot see this case; `SchedulerFeature` refuses it directly.
+- **One-shot only.** A recurring self-followup is a standing order to spend on
+  turns forever.
+
+A follow-up scheduled from a chat turn is bound to that session and comes back
+`USER_VISIBLE` in the same pane; one scheduled from unattended work stays
+`INTERNAL` and log-only. A bound follow-up whose source could not surface is
+refused rather than fired into a blank pane (#2877/#2922). Use
+`!schedule self-followups` to see every follow-up with its outcome — a dropped
+turn is recorded `missed`, never filed alongside genuine successes.
+
 #### Coding workflows and provider ownership
 
 Core retains the provider-neutral `stalled_work_rescue` workflow registrations
