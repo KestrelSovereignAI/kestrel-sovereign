@@ -220,6 +220,12 @@ def _require_successful_task_result(
             result.status,
             result.result_text,
         )
+        # Same bound as the tool door below: a token crosses, prose does not.
+        reason_code = _failure_reason_code({"reason_code": result.reason_code})
+        if reason_code:
+            raise RuntimeError(
+                f"scheduled task {task_name} returned {result.status} ({reason_code})"
+            )
         raise RuntimeError(
             f"scheduled task {task_name} returned {result.status}"
         )

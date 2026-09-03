@@ -16,8 +16,12 @@ chose, so it can cross the boundary while the rationale above is preserved.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 from kestrel_sovereign.signals.sources.scheduler import _failure_reason_code
 
@@ -114,3 +118,45 @@ def test_without_a_reason_code_the_message_is_exactly_as_before():
     with pytest.raises(RuntimeError) as excinfo:
         _require_successful_task_result("signal_dispatch", failed)
     assert str(excinfo.value) == "scheduled tool signal_dispatch failed"
+
+
+def test_the_json_envelope_door_carries_the_reason_code_too():
+    # Built-in handlers return a JSON object STRING; the code must be read
+    # from the decoded envelope, not from the raw string.
+    envelope = json.dumps(
+        {"success": False, "error": "boom", "data": {"reason_code": "TRASH_SWEEP_BLOCKED"}}
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result(
+            "trash_retention", envelope, decode_json_envelope=True
+        )
+    assert str(excinfo.value) == "scheduled tool trash_retention failed (TRASH_SWEEP_BLOCKED)"
+
+
+def test_a_failed_outcome_names_its_reason_code():
+    outcome = ScheduledTaskOutcome(
+        status="failed",
+        result_text=json.dumps({"error": "sleep_failed"}),
+        reason_code="SLEEP_FAILED",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("sleep", outcome)
+    assert str(excinfo.value) == "scheduled task sleep returned failed (SLEEP_FAILED)"
+
+
+def test_a_failed_outcome_without_a_code_reads_exactly_as_before():
+    outcome = ScheduledTaskOutcome(status="failed", result_text="{}")
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("sleep", outcome)
+    assert str(excinfo.value) == "scheduled task sleep returned failed"
+
+
+def test_a_failed_outcome_prose_reason_never_crosses_the_boundary():
+    outcome = ScheduledTaskOutcome(
+        status="failed",
+        result_text="{}",
+        reason_code="the semantic sweep hit: /Users/someone/private",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("sleep", outcome)
+    assert str(excinfo.value) == "scheduled task sleep returned failed"

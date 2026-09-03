@@ -1301,6 +1301,7 @@ class SchedulerFeature(Feature):
                 status="failed",
                 result_text=json.dumps({"error": "sleep_failed"}),
                 pause_schedule=False,
+                reason_code="SLEEP_FAILED",
             )
 
         data = report.to_dict() if hasattr(report, "to_dict") else {}
@@ -1341,10 +1342,14 @@ class SchedulerFeature(Feature):
             and not consolidation_skipped
             and not maintenance_skipped
         ):
+            # ``SleepReport.error`` is the cycle's own content-free token
+            # (e.g. ``semantic_artifact_expiry_sweep_failed``); the raise site
+            # drops it if it is ever prose-shaped.
             return ScheduledTaskOutcome(
                 status="failed",
                 result_text=result_text,
                 pause_schedule=False,
+                reason_code=str(data.get("error") or ""),
             )
         return result_text
 

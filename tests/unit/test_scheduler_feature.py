@@ -3685,3 +3685,37 @@ def test_fetch_url_selects_endpoint_by_kind():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_handle_sleep_raised_cycle_names_sleep_failed_as_its_reason_code():
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(side_effect=RuntimeError("cycle blew up"))
+    feature = SchedulerFeature(agent)
+    feature._agent_id = "test-agent"  # the exception path logs it
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.status == "failed"
+    assert outcome.reason_code == "SLEEP_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_handle_sleep_failed_report_carries_the_reports_error_token():
+    class _Report:
+        def to_dict(self):
+            return {
+                "success": False,
+                "error": "semantic_artifact_expiry_sweep_failed",
+            }
+
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(return_value=_Report())
+    feature = SchedulerFeature(agent)
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.status == "failed"
+    assert outcome.reason_code == "semantic_artifact_expiry_sweep_failed"
