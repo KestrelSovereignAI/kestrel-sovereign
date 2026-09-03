@@ -133,6 +133,13 @@ def _sleep_failure_reason(value: Any) -> Optional[str]:
     return None
 
 
+#: The one extractor for "which known code does this sleep failure carry".
+#: The scheduler's sleep door uses it too, so a composed error such as
+#: ``semantic_artifact_expiry_sweep_failed; consolidation_skipped`` yields the
+#: code at both sites instead of prose that a token bound then drops.
+sleep_failure_reason = _sleep_failure_reason
+
+
 def _semantic_maintenance_capability_summary(value: Any) -> Tuple[int, str]:
     """Return a bounded capability-version count and deterministic digest.
 

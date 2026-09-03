@@ -1603,7 +1603,11 @@ class StrategicMemoryFeature(Feature):
         if mode not in ("execute", "suggest"):
             return ToolResult.failed(
                 f"Invalid mode '{mode}'. Must be one of: execute, suggest.",
-                data={"mode": mode, "dispatched": False},
+                data={
+                    "mode": mode,
+                    "dispatched": False,
+                    "reason_code": "INVALID_DISPATCH_MODE",
+                },
             )
 
         issue = await pick_top_issue(self._strategy_data_view())

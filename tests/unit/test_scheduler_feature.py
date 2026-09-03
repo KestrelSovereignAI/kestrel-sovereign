@@ -3719,3 +3719,28 @@ async def test_handle_sleep_failed_report_carries_the_reports_error_token():
     assert isinstance(outcome, ScheduledTaskOutcome)
     assert outcome.status == "failed"
     assert outcome.reason_code == "semantic_artifact_expiry_sweep_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, expected", [
+    # The normal case: a later phase appended to an earlier code.
+    ("semantic_artifact_expiry_sweep_failed; consolidation_skipped",
+     "semantic_artifact_expiry_sweep_failed"),
+    # Interpolated exception text carries no known code: nothing crosses.
+    ("Export failed: disk full at /Volumes/private", ""),
+])
+async def test_handle_sleep_failed_report_extracts_the_known_code_from_a_composed_error(
+    error, expected
+):
+    class _Report:
+        def to_dict(self):
+            return {"success": False, "error": error}
+
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(return_value=_Report())
+    feature = SchedulerFeature(agent)
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.reason_code == expected

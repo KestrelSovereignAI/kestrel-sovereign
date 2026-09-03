@@ -986,8 +986,10 @@ async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
     ))
 
     assert result.status == Status.FAILED
+    # The code is the report's own content-free token (#3184); the private
+    # detail behind it still never crosses.
     assert (result.error or "").endswith(
-        "scheduled task sleep returned failed"
+        "scheduled task sleep returned failed (semantic_artifact_expiry_sweep_failed)"
     )
     assert "private storage detail" not in (result.error or "")
 
