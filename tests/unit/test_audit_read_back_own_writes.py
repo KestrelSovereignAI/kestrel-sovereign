@@ -1729,3 +1729,71 @@ async def test_days_window_excludes_an_iso_row_older_than_the_window(tmp_path):
     assert matches == [], f"a row stamped {old_stamp} is outside a 1-day window"
     matches, _ = await store.search_audit_log("orphans the worker", days=2)
     assert len(matches) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 14: a sensitive key whose value is a container is masked through the
+# balanced close (or to the cut), in both projections.
+# --------------------------------------------------------------------------
+
+def test_mask_sensitive_regions_masks_a_container_value_wholesale():
+    from kestrel_sovereign.features.security.args_summary import mask_sensitive_regions
+
+    # A dict value: the regex that only knew strings stopped at the first
+    # comma and let `"b": "sk-live-BBB-LEAK"` through.
+    cut = '{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BBB-LEAK"}, "body": "## Deta'
+    masked = mask_sensitive_regions(cut)
+    assert masked == '{"memo": "orphaned worker", "secrets": "***MASKED***", "body": "## Deta'
+    # A list value, with a nested object and a string holding a brace.
+    cut = '{"api_keys": ["sk-1", {"k": "sk-2}"}], "memo": "x"'
+    assert mask_sensitive_regions(cut) == '{"api_keys": "***MASKED***", "memo": "x"'
+    # A container the truncation cut open runs to the end of the text.
+    cut = '{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BB'
+    assert mask_sensitive_regions(cut) == '{"memo": "orphaned worker", "secrets": "***MASKED***"'
+    # The shapes round 13 already handled still hold: a string, an unterminated
+    # string, a bare scalar, an escaped quote inside the secret.
+    assert mask_sensitive_regions('{"token": "abc", "n": 1') == '{"token": "***MASKED***", "n": 1'
+    assert mask_sensitive_regions('{"token": "ab') == '{"token": "***MASKED***"'
+    assert mask_sensitive_regions('{"token": 12345, "n": 1') == '{"token": "***MASKED***", "n": 1'
+    assert mask_sensitive_regions('{"token": "a\\"b", "n": 1') == '{"token": "***MASKED***", "n": 1'
+
+
+@pytest.mark.asyncio
+async def test_a_container_valued_secret_in_an_unmaskable_row_is_not_searchable(tmp_path):
+    """The round-7 oracle one value-shape over: with the dict's tail surviving
+    the mask, ``sk-live-B`` / ``sk-live-BB`` hit and ``zz`` missed, walking
+    the credential out a character at a time while the display showed
+    ***MASKED*** for the first entry only."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "container.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="WalletAgent", tool_name="send_payment",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary='{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BBB-LEAK"}, "body": "## Deta',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    shown = await feature.security_audit_search(query="orphaned worker")
+    assert shown.data["count"] == 1
+    assert "LEAK" not in shown.confirmation and "LEAK" not in str(shown.data)
+    assert '"secrets": "***MASKED***"' in str(shown.data)
+    for probe in ("sk-live-B", "sk-live-BB", "AAA-LE"):
+        result = await feature.security_audit_search(query=probe)
+        assert result.data["count"] == 0, f"{probe!r} matched: the oracle is open"
+
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+    folded = fold_stored_summary('{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BBB-LEAK"}, "body": "## Deta')
+    assert "leak" not in folded and "orphaned worker" in folded and "## deta" in folded
+
+
+def test_the_dead_sensitive_key_regex_is_gone():
+    # Round 13 replaced drop-the-row with mask-and-keep; the regex that
+    # decided the drop had no caller left and a comment describing the old
+    # rule sat above its alias.
+    import kestrel_sovereign.features.security.args_summary as args_summary
+    import kestrel_sovereign.features.security.permissions as permissions
+    assert not hasattr(args_summary, "SENSITIVE_JSON_KEY")
+    assert not hasattr(permissions, "_SENSITIVE_JSON_KEY")

@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.features.security.args_summary import (
     mask_sensitive_regions,
-    SENSITIVE_JSON_KEY,
     SENSITIVE_KEY_SUBSTRINGS,
     mask_sensitive,
 )
@@ -85,8 +84,9 @@ def fold_stored_summary(text):
         # POSITIONS. Scanning the whole serialized text meant a benign value
         # like "orphaned keyboard worker" contained "key" and silently left the
         # corpus, which defeats the long summaries this fallback exists for.
-        # Mask the sensitive VALUES (through the end of each JSON string, so
-        # no tail of a secret survives a truncation) and fold the rest: the
+        # Mask the sensitive VALUES (through the end of each value — string,
+        # container or scalar — so no tail of a secret survives a truncation)
+        # and fold the rest: the
         # oracle is closed at the value, and the row's other fields stay in
         # the corpus the caller believes it searched (#3107 round 13).
         return _decode_escapes(mask_sensitive_regions(text)).casefold()
@@ -134,13 +134,6 @@ def _flatten_json(value):
     walk(value)
     return " ".join(parts)
 
-
-#: A row too truncated to parse cannot be masked field-by-field. If it names a
-#: sensitive key at all, it is dropped from the searchable projection entirely
-#: rather than matched raw — losing a match is the safe failure.
-#: One rule at both projections: the displayed one (args_summary.remask_summary)
-#: uses the same pattern, so they cannot disagree about what is safe.
-_SENSITIVE_JSON_KEY = SENSITIVE_JSON_KEY
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 _JSON_ESCAPES = {
@@ -1251,10 +1244,11 @@ class PermissionStore:
         tool_name: Optional[str],
         days: Optional[int],
     ) -> Tuple[str, List[Any]]:
-        """Build the shared WHERE clause for a match, and its parameters.
+        """Build the WHERE clause for a match, and its parameters.
 
-        One builder for both the page and the count so the breadth gate can
-        never disagree with what the page would return.
+        One builder, so the page and its headroom row (the breadth signal
+        ``search_audit_log`` reads instead of a count query) come from the
+        same predicate and cannot disagree.
         """
         def _escape_like(text: str) -> str:
             """Neutralise LIKE metacharacters in a literal."""

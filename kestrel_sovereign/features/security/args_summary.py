@@ -18,9 +18,10 @@ from typing import Any, Optional
 #: Substrings (matched case-insensitively) that mark a key as sensitive.
 #: A sensitive name in KEY POSITION — `"...key...":` — rather than anywhere in
 #: the text. The value side is data and may legitimately contain these words.
-#: Shared by the searchable projection (permissions.fold_stored_summary) and
-#: the displayed one (remask_summary) so the two cannot disagree about which
-#: unparseable rows are safe.
+#: :func:`mask_sensitive_regions` is the one masker both the searchable
+#: projection (permissions.fold_stored_summary) and the displayed one
+#: (remask_summary) apply to an unparseable row, so the two cannot disagree
+#: about what is masked.
 SENSITIVE_KEY_SUBSTRINGS = (
     "password",
     "secret",
@@ -33,22 +34,58 @@ SENSITIVE_KEY_SUBSTRINGS = (
     "social_security",
 )
 
-SENSITIVE_JSON_KEY = re.compile(
-    r'"[^"]*(?:%s)[^"]*"\s*:' % "|".join(
+#: A sensitive key in key position, with the ``:`` and whitespace that
+#: precede its value, in serialized-but-unparseable JSON.
+_SENSITIVE_JSON_KEY_PREFIX = re.compile(
+    r'"[^"]*(?:%s)[^"]*"\s*:\s*' % "|".join(
         re.escape(sub) for sub in SENSITIVE_KEY_SUBSTRINGS
     ),
     re.IGNORECASE,
 )
 
-#: The VALUE that follows a sensitive key in serialized-but-unparseable JSON:
-#: a JSON string (possibly unterminated — the row was cut mid-value) or a
-#: bare scalar up to the next separator.
-_SENSITIVE_JSON_REGION = re.compile(
-    r'("[^"]*(?:%s)[^"]*"\s*:\s*)("(?:[^"\\]|\\.)*"?|[^,}\]]*)' % "|".join(
-        re.escape(sub) for sub in SENSITIVE_KEY_SUBSTRINGS
-    ),
-    re.IGNORECASE,
-)
+_BARE_SCALAR = re.compile(r"[^,}\]]*")
+
+
+def _value_end(text: str, start: int) -> int:
+    """Index just past the JSON value beginning at ``start``, or ``len(text)``
+    when the value is cut off — a string, a balanced ``{}``/``[]`` container
+    (strings inside it respected), or a bare scalar up to the next separator.
+    """
+    if start >= len(text):
+        return start
+    first = text[start]
+    if first == '"':
+        i = start + 1
+        while i < len(text):
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == '"':
+                return i + 1
+            i += 1
+        return len(text)
+    if first in "{[":
+        depth = 0
+        in_string = False
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if in_string:
+                if ch == "\\":
+                    i += 1
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return len(text)
+    return _BARE_SCALAR.match(text, start).end()
 
 
 def mask_sensitive_regions(text):
@@ -60,11 +97,27 @@ def mask_sensitive_regions(text):
     masked) ``token`` beside a long body left the read-back entirely, and the
     no-match text then blamed truncation for a phrase INSIDE the cut. Only
     the sensitive VALUE is the oracle risk; the rest of the row is data the
-    caller is entitled to match. The value is replaced through the end of its
-    JSON string — an unterminated string runs to the end of the text — so no
-    tail of a secret survives.
+    caller is entitled to match. The value is replaced through the end of
+    whatever JSON value follows the key — a string, a whole ``{}``/``[]``
+    container (masked wholesale, as :func:`mask_sensitive` masks a nested
+    secret dict), or a bare scalar — and a value the truncation cut off runs
+    to the end of the text, so no tail of a secret survives. A regex that
+    only knew strings stopped at a container's first comma and let the rest
+    of it through both projections (round 13 review).
     """
-    return _SENSITIVE_JSON_REGION.sub(lambda m: m.group(1) + '"***MASKED***"', text)
+    out = []
+    pos = 0
+    while True:
+        match = _SENSITIVE_JSON_KEY_PREFIX.search(text, pos)
+        if match is None:
+            break
+        out.append(text[pos:match.end()])
+        out.append('"***MASKED***"')
+        # Resume past the whole value: a sensitive key nested inside a masked
+        # container is covered by the mask, not matched again.
+        pos = _value_end(text, match.end())
+    out.append(text[pos:])
+    return "".join(out)
 
 #: Placeholder written in place of a sensitive value.
 MASK = "***MASKED***"
@@ -107,15 +160,16 @@ def remask_summary(summary: Optional[str], max_length: int = 500) -> Optional[st
 
     Cheap for the common case: a row already masked re-masks to itself.
 
-    A summary too truncated to parse cannot be re-masked field-by-field. It is
-    shown raw only when it names no sensitive key in key position — the same
-    rule the searchable projection applies (``fold_stored_summary``) — and is
-    withheld otherwise. ``summarize_args`` truncates at 500 chars mid-structure,
-    so on the live corpus ~30% of rows with arguments are unparseable, the
-    long-issue-body filings that motivated this tool among them; withholding
-    all of them degraded the read-back to what ``security_audit`` already gave.
-    A value cannot appear without its key, so a key-position check on the
-    truncated text is exactly as strong as field-by-field masking would be.
+    A summary too truncated to parse cannot be re-masked field-by-field. Its
+    sensitive VALUES are masked in place by :func:`mask_sensitive_regions` —
+    the same helper the searchable projection applies (``fold_stored_summary``),
+    so display and match are the same text — and the rest of the row is shown.
+    ``summarize_args`` truncates at 500 chars mid-structure, so on the live
+    corpus ~30% of rows with arguments are unparseable, the long-issue-body
+    filings that motivated this tool among them; withholding all of them
+    degraded the read-back to what ``security_audit`` already gave. A value
+    cannot appear without its key, so masking from each sensitive key through
+    the end of its value is exactly as strong as field-by-field masking.
     """
     if not summary:
         return summary
