@@ -60,14 +60,10 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, WaitStatus
-from kestrel_sovereign.signals.sources.github_pr_watch import (
-    _FAIL_CONCLUSIONS,
-    _check_verdict,
-    _positive_count,
-)
+from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +233,7 @@ class CIWaitable:
         combined_status: Any = None
         if head_sha:
             check_runs = await _github_get(
-                f"{base}/commits/{head_sha}/check-runs",
+                f"{base}/commits/{head_sha}/check-runs?per_page=100",
                 token=token, timeout=10, ref=f"{ref} check-runs",
             )
             combined_status = await _github_get(

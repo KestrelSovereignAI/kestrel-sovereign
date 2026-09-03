@@ -482,7 +482,7 @@ async def test_poll_through_real_fetch_resolves_completed_rollup(monkeypatch):
                 "mergeable_state": "clean",
                 "head": {"sha": "362b6c0d85573b25ee4fba32278d6ad2f1cbf80c"},
             }
-        if url.endswith("/check-runs"):
+        if "/check-runs" in url:
             return _pr_2934_check_runs()
         if url.endswith("/status"):
             return _combined_status_actions_only()
@@ -494,7 +494,7 @@ async def test_poll_through_real_fetch_resolves_completed_rollup(monkeypatch):
 
     assert status.outcome is Outcome.DONE
     assert status.data["checks"] == "success"
-    assert any(u.endswith("/check-runs") for u in seen)
+    assert any("/check-runs?per_page=100" in u for u in seen)
 
 
 @pytest.mark.asyncio

@@ -329,7 +329,7 @@ async def test_fetch_pr_state_derives_checks_from_real_apis(monkeypatch):
         calls.append(url)
         if url.endswith("/pulls/1614"):
             return _real_pr()
-        if url.endswith("/commits/abc123/check-runs"):
+        if "/commits/abc123/check-runs" in url:
             return {"check_runs": [
                 {"name": "build", "status": "completed", "conclusion": "success"},
             ]}
@@ -341,7 +341,9 @@ async def test_fetch_pr_state_derives_checks_from_real_apis(monkeypatch):
 
     state = await fetch_pr_state("owner/name", 1614, token="t", kind="pr")
     # Head-commit check/status endpoints were both queried.
-    assert any("check-runs" in u for u in calls)
+    assert any("check-runs?per_page=100" in u for u in calls), (
+        "the rollup must be read a full page at a time, not GitHub's default 30"
+    )
     assert any(u.endswith("/commits/abc123/status") for u in calls)
     # The derived summary reflects the real check run, not a synthetic field.
     assert "build=completed/success" in state["checks_status"]
@@ -359,7 +361,7 @@ async def test_fetch_pr_state_ci_transition_changes_fingerprint(monkeypatch):
     async def fake_get(url, *, token, timeout, ref):
         if url.endswith("/pulls/1614"):
             return _real_pr()
-        if url.endswith("/check-runs"):
+        if "/check-runs" in url:
             return check_runs_box["value"]
         if url.endswith("/status"):
             return status_box["value"]
@@ -465,3 +467,16 @@ def test_summarize_checks_combined_still_honours_a_real_legacy_status():
     summary = summarize_checks(runs, legacy)
     assert "combined=failure" in summary
     assert "status:ci/legacy=failure" in summary
+
+
+def test_check_verdict_treats_unreturned_runs_as_pending():
+    """GitHub pages the rollup; a total_count above what came back means
+    gates this call never saw, and an unread gate is not a success."""
+    from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
+
+    page = {"total_count": 45, "check_runs": [
+        {"name": f"job-{i}", "status": "completed", "conclusion": "success"} for i in range(30)
+    ]}
+    assert _check_verdict(page, {"state": "pending", "statuses": []}) == "pending"
+    page["total_count"] = 30
+    assert _check_verdict(page, {"state": "pending", "statuses": []}) == "success"

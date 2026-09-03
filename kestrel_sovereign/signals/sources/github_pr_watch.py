@@ -217,6 +217,14 @@ def _check_verdict(
         return "unknown"
     if not runs and not statuses and not combined_state:
         return "none"
+    # The rollup is read one page at a time (per_page=100). A commit whose
+    # check runs outnumber what was returned has gates this call never saw;
+    # an unread gate is an evidence gap, and the honest verdict for a gap
+    # is "not terminal yet", never success.
+    if isinstance(check_runs, dict):
+        total = check_runs.get("total_count")
+        if isinstance(total, int) and total > len(runs):
+            return "pending"
 
     # Not terminal yet if any check run is still queued/in_progress, or the
     # combined/legacy status is still pending.
@@ -485,7 +493,9 @@ async def fetch_pr_state(
     head_sha = head.get("sha") if isinstance(head, dict) else None
     if kind != "issue" and head_sha:
         check_runs = await _github_get(
-            f"{base}/commits/{head_sha}/check-runs",
+            # GitHub pages at 30 by default; an unread page is an unread gate,
+            # and _check_verdict treats total_count > returned as pending.
+            f"{base}/commits/{head_sha}/check-runs?per_page=100",
             token=token,
             timeout=timeout,
             ref=f"{ref} check-runs",
