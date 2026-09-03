@@ -1316,6 +1316,24 @@ def test_an_untracked_file_that_cannot_be_decoded_is_not_analysed(repo: Path) ->
     (repo / "new.py").write_bytes(b'# caf\xe9\nB = "tool_execution"\n')  # untracked, latin-1
 
     assert "new.py" in _unparseable(repo)
+    # The only change in the tree is the unreadable one: main must not
+    # short-circuit past its own NOT ANALYSED report.
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_changed_file_git_renders_as_binary_is_still_analysed(repo: Path) -> None:
+    """`git diff` emits only "Binary files differ" — no hunks — for a path a
+    .gitattributes rule (or a NUL byte) marks binary, and the file vanished
+    from both maps: door four of the same false-clean invariant."""
+    (repo / ".gitattributes").write_text("mod.py -diff\n")
+    (repo / "mod.py").write_text('MARK = "tool_execution"\n')
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('MARK = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("sib.py", 1)]
+    assert checker.main(["--strict"]) == 1
 
 
 def test_a_removed_line_in_a_non_utf8_file_does_not_crash_the_gate(repo: Path) -> None:

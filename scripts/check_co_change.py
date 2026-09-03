@@ -157,7 +157,11 @@ def changed_line_map(
     The old side is kept because a *removed* literal is what leaves siblings
     behind under the old name.
     """
-    diff = _git("diff", "-U0", "--no-color", "--no-ext-diff", *diff_spec)
+    # --text: a .py that git renders as binary (a NUL byte in the first 8000
+    # bytes, or a .gitattributes -diff/binary rule) otherwise emits only
+    # "Binary files ... differ" — no headers, no hunks — and the file vanished
+    # from both maps, rendering as clean. Door four of the same invariant.
+    diff = _git("diff", "-U0", "--no-color", "--no-ext-diff", "--text", *diff_spec)
     _UNANALYSED.clear()  # one run's record starts here, ends in collect()
     new_map: dict[str, set[int]] = defaultdict(set)
     old_map: dict[str, set[int]] = defaultdict(set)
@@ -706,7 +710,6 @@ def collect(
     literals: set[str] = set()
 
     unparseable: list[str] = []
-    unsearchable: list[str] = []
     for path, lines in new_map.items():
         if not path.endswith(".py"):
             continue
@@ -909,11 +912,10 @@ def collect(
         # the AST still decides equality, so precision is unchanged.
         argv_safe = not any(ord(ch) < 32 for ch in value)
         candidates = _candidate_files(value, fixed=True) if argv_safe else set()
-        if not argv_safe and not longest:
-            # Nothing searchable and nothing to say about it — but say that,
-            # rather than silently dropping the literal.
-            unsearchable.append(value)
-            continue
+        # ``literals_on`` admits a value only with an alphanumeric run of at
+        # least MIN_LITERAL_LEN, so ``longest`` is never empty here: every
+        # literal is searchable by its run even when its raw bytes are not
+        # argv-safe.
         # Widen only on a run distinctive enough to stay cheap. `"__init__"`
         # widens to `init`, which matches most of the tree: indexing that
         # candidate set took the gate from 0.8s to 16s. A short run buys a rare
@@ -956,8 +958,6 @@ def collect(
         if touched and untouched:
             findings.append(Finding("literal", value, touched, untouched))
 
-    if unsearchable:
-        structural.extend((f'"{value!r}"', 0) for value in sorted(unsearchable))
     # Candidates the AST pass could not open or parse are NOT ANALYSED too:
     # the same footer and the same --strict refusal as a changed file in that
     # state, because the consequence is the same — a site that was never
@@ -1094,7 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
     # the merge base against the working tree, so excluding them here recreated
     # exactly the mixed-revision false clean that change was made to fix.
     new_map, old_map = changed_line_map(diff_spec, include_untracked=True)
-    if not new_map and not old_map:
+    if not new_map and not old_map and not _UNANALYSED:
         print("co-change: no changed lines to analyse.")
         return 0
 
