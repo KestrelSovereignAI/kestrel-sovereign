@@ -367,6 +367,43 @@ def test_kestrel_uses_current_interpreter_and_module_entrypoint(monkeypatch):
     ]
 
 
+def test_start_and_health_tears_down_with_terminate(tmp_path, monkeypatch):
+    _make_post_wizard_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kestrel(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(verify, "_kestrel", fake_kestrel)
+    monkeypatch.setattr(verify, "_poll_health", lambda *_args, **_kwargs: True)
+
+    assert _run(verify.cmd_start_and_health, agent_name="Kestrel") == 0
+    assert calls == [("start", "Kestrel"), ("terminate", "Kestrel")]
+
+
+def test_host_probe_tears_down_with_terminate(tmp_path, monkeypatch):
+    _make_post_wizard_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kestrel(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(verify, "_kestrel", fake_kestrel)
+    monkeypatch.setattr(verify, "_poll_health", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        verify,
+        "_post_chat_completions",
+        lambda *_args, **_kwargs: (503, "agent initialization unavailable"),
+    )
+
+    assert _run(verify.cmd_host_and_chat_503) == 0
+    assert calls == [("start",), ("terminate",)]
+
+
 def test_main_dispatch_unknown_subcommand_exits():
     """Unknown subcommand should fail at argparse, not silently no-op."""
     with pytest.raises(SystemExit):

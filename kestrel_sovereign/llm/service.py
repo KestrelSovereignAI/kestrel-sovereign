@@ -413,6 +413,17 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Model discovery uses process-wide SharedModelCache (see model_cache.py).
         # Pre-populate from disk if this is the first LLMService instance.
+        # vendor -> last model-discovery error (#3190). Records the fact that a
+        # vendor's catalog could NOT be retrieved, which ``len(catalog) > 0``
+        # cannot express: a failed ``list_models`` and a vendor that genuinely
+        # serves nothing both yield an empty list.
+        #
+        # MUST be created before ``_load_from_disk_cache()`` on the next line.
+        # That call restores a persisted catalog AND its failure record, so
+        # initialising this afterwards made the restoration dead code on every
+        # real construction — the map it wrote into did not exist yet, and the
+        # later assignment then replaced it with an empty one (codex r2 P1).
+        self._discovery_failures: Dict[str, str] = {}
         self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
@@ -454,6 +465,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # shape are dropped by model_preference._load_model_preference().
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
+
+        # Set when a PERSISTED mandate failed to apply at boot (#3190) — the
+        # operator set a model and it is not in effect. Cleared by a successful
+        # set_model_preference.
+        self._mandate_load_error: Optional[str] = None
 
         # Top-level embedding-route knob (#2263). ``[llm] embedding_route =
         # "<vendor>:<route>"`` selects the embedding channel independently of
@@ -544,6 +560,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Metering callback for usage billing (Vending Machine)
         # Set via set_metering_callback() after initialization
         self._metering_callback = None
+        # Optional billing fields explicitly accepted by the callback. Keep
+        # the historical cost boolean below for callers/tests that inspect it.
+        self._metering_callback_optional_kwargs: frozenset[str] = frozenset()
         # Whether the registered callback accepts the optional per-call
         # ``cost`` kwarg (#1806). Resolved in set_metering_callback().
         self._metering_callback_accepts_cost = False
@@ -1800,6 +1819,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         model: str,
         vendor: Optional[str] = None,
         route: Optional[str] = None,
+        *,
+        validate: bool = True,
     ) -> None:
         """Set the mandated model selection for this session.
 
@@ -1859,9 +1880,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # must be held to the same bar, else a hallucinated/stale
             # ``{vendor, route, model}`` lands a broken mandate that only
             # surfaces on the NEXT request (the #1927 route-fidelity skew).
-            self._validate_explicit_mandate(model, vendor, route)
+            if validate:
+                self._validate_explicit_mandate(model, vendor, route)
 
         self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
+        # A mandate is in effect again — clear any recorded boot-time drop so
+        # the health surface stops reporting a condition the operator fixed
+        # (#3190). Without this the warning is sticky for the process lifetime.
+        self._mandate_load_error = None
         if route:
             logger.info("Model preference set: %s:%s/%s", vendor, route, model)
         else:
@@ -2011,6 +2037,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        # Returning to automatic routing is a DELIBERATE unpinned state, so the
+        # boot-failure notice must go with it (#3190 r3 P2). Only the set path
+        # cleared it, so health went on reporting "a persisted preference
+        # failed to apply; running UNPINNED" about a state the operator chose.
+        # A flag that one door sets and only one other door clears is a flag
+        # that gets stuck.
+        self._mandate_load_error = None
         logger.info("Model preference cleared, using default route order")
 
         if self._preference_persistence_callback:
@@ -3295,29 +3328,55 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 completion_tokens=int,
             )
 
-        The callback MAY additionally accept an optional ``cost`` keyword
-        (the provider-reported per-call cost in USD, e.g. OpenRouter
+        The callback MAY additionally accept optional ``cost``,
+        ``cache_creation_input_tokens``, and ``cache_read_input_tokens``
+        keywords. A callback opts into cache-aware prompt semantics only by
+        explicitly naming at least one cache keyword in its signature;
+        ``**kwargs`` alone remains a legacy, inclusive-prompt callback. For a
+        cache-aware callback, ``prompt_tokens`` follows the SDK contract and
+        excludes the separately supplied cache buckets. For a callback that
+        does not explicitly accept a cache bucket, that bucket is folded back
+        into ``prompt_tokens`` so existing billing integrations never silently
+        lose billable usage.
+
+        ``cost`` is the provider-reported per-call cost in USD (e.g. OpenRouter
         ``usage.cost``; ``None`` when the provider does not report one).
-        Callbacks that don't declare ``cost`` (or ``**kwargs``) are still
-        called with the original signature — see #1806.
+        Callbacks that don't declare an optional keyword (or ``**kwargs``) are
+        still called with the original signature — see #1806 and #3019.
 
         Args:
             callback: Async function to call after each LLM call
         """
         self._metering_callback = callback
-        # Detect whether the callback opts into the optional per-call cost
-        # (#1806) so we stay backward-compatible with callbacks written
-        # against the original (provider, model, tokens) signature.
-        accepts_cost = False
+        # Detect exactly which optional billing fields the callback opts into
+        # so we stay backward-compatible with the original signature.
+        optional_names = {
+            "cost",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        }
+        accepted_optional: set[str] = set()
         try:
             params = inspect.signature(callback).parameters
-            accepts_cost = "cost" in params or any(
+            accepts_all = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
+            accepted_optional = optional_names.intersection(params)
+            # ``cost`` predates the cache split and historically treated
+            # ``**kwargs`` as acceptance. Preserve that extension contract,
+            # while cache semantics require an explicit named parameter: a
+            # generic kwargs sink may ignore unfamiliar fields and bill only
+            # from prompt_tokens.
+            if accepts_all:
+                accepted_optional.add("cost")
         except (ValueError, TypeError):
-            accepts_cost = False
-        self._metering_callback_accepts_cost = accepts_cost
-        logger.info("LLM metering enabled (per-call cost: %s)", accepts_cost)
+            accepted_optional = set()
+        self._metering_callback_optional_kwargs = frozenset(accepted_optional)
+        self._metering_callback_accepts_cost = "cost" in accepted_optional
+        logger.info(
+            "LLM metering enabled (optional fields: %s)",
+            sorted(accepted_optional),
+        )
 
     def set_observability_context(
         self,
@@ -3571,8 +3630,18 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             tracked_tokens = (input_tokens or 0) + (output_tokens or 0)
         if track_model_usage and usage_tracker_ready and tracked_tokens is not None:
             try:
+                cache_usage: dict[str, int] = {}
+                if cache_creation_input_tokens is not None:
+                    cache_usage["cache_creation_input_tokens"] = (
+                        cache_creation_input_tokens
+                    )
+                if cache_read_input_tokens is not None:
+                    cache_usage["cache_read_input_tokens"] = cache_read_input_tokens
                 await self._track_model_usage(
-                    model, provider_name, tokens=tracked_tokens
+                    model,
+                    provider_name,
+                    tokens=tracked_tokens,
+                    **cache_usage,
                 )
             except asyncio.CancelledError:
                 raise
@@ -3831,6 +3900,23 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if not usage_available:
             record_metadata.setdefault("usage_available", False)
 
+        # ``input_tokens`` follows the SDK's cache-aware contract and excludes
+        # separately reported cache buckets.  The older observability row and
+        # Prometheus counter have only one input field, so preserve their
+        # historical inclusive total by folding those buckets back in at the
+        # compatibility boundary.  The structured log and new usage tables
+        # below keep the separated values.
+        legacy_input_tokens = input_tokens
+        if legacy_input_tokens is not None:
+            legacy_input_tokens += sum(
+                value
+                for value in (
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                )
+                if value is not None
+            )
+
         # Log to observability store
         observability_store = getattr(self, "_observability_store", None)
         if observability_store:
@@ -3850,7 +3936,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     error_message=error_message,
                     tool_calls=tool_calls,
                     metadata=record_metadata,
-                    input_tokens=input_tokens,
+                    input_tokens=legacy_input_tokens,
                     output_tokens=output_tokens,
                 )
             except asyncio.CancelledError:
@@ -3874,9 +3960,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 LLM_DURATION.labels(provider=provider, model=model).observe(
                     duration_ms / 1000
                 )
-                if input_tokens is not None:
+                if legacy_input_tokens is not None:
                     LLM_TOKENS.labels(model=model, direction="input").inc(
-                        input_tokens
+                        legacy_input_tokens
                     )
                 if output_tokens is not None:
                     LLM_TOKENS.labels(model=model, direction="output").inc(
@@ -3900,19 +3986,38 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             user_id = context.user_id
 
             if companion_id and user_id:
+                accepted_optional = getattr(
+                    self, "_metering_callback_optional_kwargs", frozenset()
+                )
+                billable_prompt_tokens = input_tokens or 0
+                cache_buckets = {
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                }
+                for name, value in cache_buckets.items():
+                    if name not in accepted_optional and value is not None:
+                        billable_prompt_tokens += value
                 meter_kwargs = dict(
                     companion_id=companion_id,
                     user_id=user_id,
                     provider=provider,
                     model=model,
-                    prompt_tokens=input_tokens or 0,
+                    prompt_tokens=billable_prompt_tokens,
                     completion_tokens=output_tokens or 0,
                 )
-                # Only pass the provider-reported per-call cost (#1806) to
-                # callbacks that opted in; keeps the original signature
-                # working for callbacks that don't declare ``cost``.
-                if getattr(self, "_metering_callback_accepts_cost", False):
-                    meter_kwargs["cost"] = cost
+                optional_values = {
+                    "cost": cost,
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens,
+                }
+                # Only pass optional fields to callbacks that opted in; this
+                # keeps callbacks written against the original signature live.
+                # An explicitly named cache parameter receives ``None`` when
+                # the provider omitted that metric, just like ``cost``. This
+                # supports required keyword-only parameters without inventing
+                # a reported zero or dropping the whole billing event.
+                for name in accepted_optional:
+                    meter_kwargs[name] = optional_values[name]
                 try:
                     await metering_callback(**meter_kwargs)
                 except asyncio.CancelledError:
@@ -4207,6 +4312,22 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         target_selector = self._get_default_mandate_selector()
+        # Whether this is an EXPLICIT selection comes from the CANONICAL
+        # routing metadata, not a second opinion computed here (#3190 r7 P1).
+        #
+        # The catalog guard below must apply the same rule generation applies —
+        # it skips the guard for an explicit pin, and an audit that does not
+        # would reject a target the very same request just generated with
+        # (warn mode annotating every response, strict mode denying every one,
+        # r6 P1). But "explicit" is a question `_compute_route_authorization`
+        # already answers, and the hand-rolled version disagreed with it: a
+        # bare model, or a vendor selector matching several routes, is NOT
+        # explicit there, and treating it as explicit here would let a stale or
+        # cross-vendor model broadcast across routes past a guard generation
+        # still enforces.
+        #
+        # Re-deriving a predicate that exists is how the two ends drift apart
+        # in the first place. One question, one implementation.
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
             pref_vendor = self._mandate_preference.get("vendor")
@@ -4254,6 +4375,26 @@ No other text or formatting.
             errors = {}
             for provider in available_providers:
                 logger.info(f"Auditing with provider: {provider['name']}")
+                # The audit keeps this guard UNCONDITIONALLY, unlike the
+                # generation path which skips it for an explicit selection
+                # (#3190 r9 P1).
+                #
+                # Three rounds were spent trying to make the audit mirror
+                # generation, because during a discovery outage a pinned route
+                # generates fine and then fails its own audit. That is a real
+                # annoyance and the fix for it was wrong: this guard is what
+                # makes the audit FAIL CLOSED at risk 3 when no route can serve
+                # the mandated model, and
+                # `test_get_audit_response_failclosed_when_no_route_serves_mandate`
+                # is that contract. Skipping it on explicitness returned risk 1
+                # for a genuinely unservable model.
+                #
+                # Explicitness cannot tell a transiently incomplete catalog from
+                # a model that truly is not there — the same thing this whole
+                # change concluded is unknowable from the catalog alone. Given
+                # that, an auditor that refuses to vouch for a route it cannot
+                # verify is behaving correctly. Degrading a fail-closed security
+                # check to make an outage more comfortable is the wrong trade.
                 if target_model and not self._model_available_for_route(provider, target_model):
                     # Record the skip so that if EVERY route rejects the
                     # mandated model, the loop fails closed (risk=3) instead of

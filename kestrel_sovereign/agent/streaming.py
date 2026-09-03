@@ -20,6 +20,7 @@ from kestrel_sovereign.agent.parts import (
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     bind_async_generator_invocation,
     current_invocation_id,
 )
@@ -1007,17 +1008,19 @@ class StreamingMixin:
             getattr(self, "_constitution_audit_pending", False) is True
         )
         if (safe_mode or audit_pending) and not user_input.startswith("!"):
-            restriction = (
-                "a required startup integrity audit"
-                if audit_pending
-                else "an integrity failure"
+            from kestrel_sovereign.agent.constitution import (
+                describe_safe_mode_restriction,
+            )
+
+            restriction = describe_safe_mode_restriction(
+                self, audit_pending=audit_pending
             )
             yield (
                 "🚨 SAFE MODE ACTIVE\n\n"
                 f"The agent cannot process queries due to {restriction}.\n"
                 "Use !safe-mode to check status or !verify-constitution to "
                 "re-verify.\n\n"
-                "Normal operation will resume once integrity is restored."
+                "Normal operation will resume once the restriction is cleared."
             )
             return
 
@@ -1066,14 +1069,21 @@ class StreamingMixin:
                 # Preserve the pre-existing positional call shape
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
-                result = await self.process_input(
-                    user_input,
-                    model_override,
-                    session_id=session_id,
-                    caller=caller,
-                    invocation_context=invocation_context,
-                    invocation_id=current_invocation_id(),
-                )
+                try:
+                    result = await self.process_input(
+                        user_input,
+                        model_override,
+                        session_id=session_id,
+                        caller=caller,
+                        invocation_context=invocation_context,
+                        invocation_id=current_invocation_id(),
+                    )
+                except InvocationCancelledError:
+                    # The command delegate owns an isolated child so Stop does
+                    # not cancel a persistent transport task. Its typed unwind
+                    # is normal end-of-stream; the endpoint's post-loop check
+                    # emits the standard Stop notice and completes cleanup.
+                    return
                 yield result
                 release_parts = not getattr(result, "denied", False) and not (
                     getattr(result, "enforcing", False)

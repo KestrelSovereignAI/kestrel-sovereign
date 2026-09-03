@@ -43,7 +43,7 @@ class _TaskStore:
         self._backend = _Backend()
         self.saved = []
 
-    async def save(self, task):
+    async def save(self, task, **_authority):
         self.saved.append(task)
 
 

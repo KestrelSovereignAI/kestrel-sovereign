@@ -57,6 +57,65 @@ cd tests/e2e && npx playwright test
 
 Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
 
+## Closing your own loop (agents shipping their own work)
+
+If you dispatched the work, you own it to merge. Nobody is watching the PR for
+you, and an agent that stops at "pushed, awaiting review" has handed its work to
+a queue with no reader. This is the standing procedure, and it needs no
+permission each time.
+
+### 1. Review your own full diff before asking anyone else to
+
+```bash
+cd <worktree> && codex review --base main
+```
+
+**Against `main`, not against your last iteration.** Talon's per-run review sees
+only that run's diff, so a PR spanning a failed run plus a resume has never been
+seen whole by anything. Every defect a human reviewer found in agent-authored
+PRs through 2026-08-25 lived across exactly that boundary.
+
+It takes 10–45 minutes and **buffers its output**, so silence is not a hang. A
+review that times out exits 0 with no verdict — no findings printed is not the
+same as no findings, and only the second means clean.
+
+### 2. Act on what it finds, and verify by mutation
+
+Reproduce each finding before fixing it; a finding's pointer can be wrong while
+its claim is right, and the reverse. Then for every guard you add, break it
+deliberately and confirm a test fails naming it. A test written straight after a
+fix tends to exercise exactly the path just patched — so mutate the **wiring**
+too (does the producer still call the thing?), not only the line you changed.
+
+If three rounds find the same defect one door over, the rule is keyed on a
+proxy. Stop fixing doors and ask what the doors have in common.
+
+### 3. Say what you did NOT verify
+
+Name the gaps in your own work: suites not run, sandboxes that refused, claims
+resting on inference rather than measurement. A completeness claim you cannot
+demonstrate is worth less than an honest boundary.
+
+### 4. Merge when the gates are met
+
+Squash-merge your own PR when **all** of these hold:
+
+- CI green (every required check, not just unit tests)
+- a full-diff `codex review --base main` came back with **a printed verdict**
+  and no unaddressed P1
+- every finding you fixed has a test that fails without the fix
+
+If a gate is not met, say which one and what you need. Do not sit silently on a
+finished branch: record a blocker AND say so out loud in your turn output,
+because a blocker nobody reads is a blocker nobody acts on.
+
+### What you already have
+
+Unrestricted `shell` (arbitrary `timeout`, no upper clamp), `git`, `gh`, and
+`codex` on PATH. Almost nothing here is a capability you lack; it is a procedure
+that has to survive the turn boundary, which is why it is written down here
+rather than remembered.
+
 ## Kestrel Talon (GitHub Issue Processor)
 
 The in-agent control surface is owned by the independently installed
@@ -199,7 +258,9 @@ always discoverable from a failed `schedule_add`. `github_pr_watch`
 (#1618) polls a GitHub PR/issue and emits a `github.pr_activity`
 COGNITION signal only when a watched field changes (state, merge,
 comments, checks) — args travel in the scheduled task's `args_json`
-(`repo`, `pr`/`issue`/`number`, optional `triggers`, `notify`).
+(`repo`, `pr`/`issue`/`number`, optional `triggers`). Legacy `notify` is ignored:
+an agent-owned watcher dispatches locally and may not forge a peer into its
+signal target or causation chain.
 
 #### Coding workflows and provider ownership
 

@@ -7,6 +7,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
+from enum import Enum
 from datetime import datetime, timezone
 
 from kestrel_sovereign.command_policy import (
@@ -28,6 +29,87 @@ from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
 )
+
+
+class SafeModeCause(str, Enum):
+    """Why cognition is restricted.
+
+    Amendment III makes Safe Mode the response to *integrity* failure, and
+    requires any discrepancy to be reported to the Sovereign — on the stated
+    grounds that "the system cannot be permitted to lie about itself". So the
+    cause has to be recorded rather than inferred: reporting a store outage as
+    an integrity failure tells the Sovereign their constitution was violated
+    when it was not, and that is the lie the amendment exists to prevent.
+    """
+
+    #: The constitution did not verify. The only cause Amendment III names.
+    INTEGRITY = "integrity"
+    #: The governing constitution could not be assembled at startup.
+    BOOTSTRAP = "bootstrap"
+    #: Authoritative runtime state could not be READ. An availability fact.
+    STATE_UNAVAILABLE = "state_unavailable"
+    #: The restriction is held in memory only, because the store could not be
+    #: written. It is real, but it is not durable, and saying otherwise would
+    #: promise a latch that does not survive a restart.
+    STATE_NOT_PERSISTED = "state_not_persisted"
+    #: Durable state read cleanly, but the identity node it describes is
+    #: gone. Not an outage — the read succeeded — and not a hash mismatch
+    #: either. Amendment III requires the discrepancy be reported, so it is
+    #: named rather than folded into a neighbour.
+    IDENTITY_MISSING = "identity_missing"
+    #: Stored conversation memory could not be decrypted. An availability
+    #: failure of the memory, not of governance state and not of the
+    #: constitution — saying "governance state could not be read" would
+    #: misdirect the operator to a store that is answering fine.
+    MEMORY_UNREADABLE = "memory_unreadable"
+    #: Restored from a durable record written before causes were recorded.
+    #: Deliberately not INTEGRITY: an unrecorded cause is not evidence of one.
+    UNRECORDED = "unrecorded"
+
+
+#: What to tell the Sovereign, per recorded cause. Amendment III requires the
+#: discrepancy be reported; it does not permit reporting a different one, and
+#: three separate surfaces were each hard-coding "an integrity failure".
+_RESTRICTION_PHRASES = {
+    SafeModeCause.INTEGRITY.value: "an integrity failure",
+    SafeModeCause.BOOTSTRAP.value: "an incomplete constitution bootstrap",
+    SafeModeCause.STATE_UNAVAILABLE.value: (
+        "governance state that could not be read"
+    ),
+    SafeModeCause.STATE_NOT_PERSISTED.value: (
+        "governance state that could not be saved"
+    ),
+    SafeModeCause.IDENTITY_MISSING.value: "a missing agent identity record",
+    SafeModeCause.MEMORY_UNREADABLE.value: (
+        "stored memory that could not be decrypted"
+    ),
+    SafeModeCause.UNRECORDED.value: "a restriction whose cause was not recorded",
+}
+
+
+def describe_safe_mode_restriction(agent, *, audit_pending: bool = False) -> str:
+    """Phrase the restriction from what was recorded, not from a default.
+
+    A startup audit outranks the stored cause because it describes why
+    cognition is refused right now. Otherwise the recorded cause decides, and
+    an absent one says so rather than borrowing integrity's name.
+    """
+    if audit_pending:
+        return "a required startup integrity audit"
+    cause = getattr(agent, "_safe_mode_cause", None)
+    phrase = _RESTRICTION_PHRASES.get(
+        cause, "a restriction whose cause was not recorded"
+    )
+    # A latch held only in memory is a second active fact, and the cause slot
+    # deliberately keeps the stronger one. Health reports both; the Sovereign
+    # was told only the first, and "not durable" is exactly what they need to
+    # know before restarting.
+    if (
+        getattr(agent, "_constitution_state_persistence_pending", False)
+        and cause != SafeModeCause.STATE_NOT_PERSISTED.value
+    ):
+        phrase += " (this restriction could not be saved and will not survive a restart)"
+    return phrase
 
 
 class ConstitutionMixin:
@@ -447,6 +529,7 @@ class ConstitutionMixin:
         self._constitution_state_load_error = None
         self._constitution_audit_pending = False
         self._constitution_state_persistence_pending = False
+        self._safe_mode_cause: Optional[str] = None
 
     def _constitution_now(self) -> datetime:
         """Return an aware UTC time, using the injected test clock if present."""
@@ -501,6 +584,7 @@ class ConstitutionMixin:
             agent_id=self.agent_id,
             safe_mode=self._safe_mode if safe_mode is None else safe_mode,
             safe_mode_reason=self._safe_mode_reason,
+            safe_mode_cause=self._safe_mode_cause,
             safe_mode_entered_at=self._safe_mode_entered_at,
             safe_mode_exited_at=self._safe_mode_exited_at,
             safe_mode_exit_authorization=self._safe_mode_exit_authorization,
@@ -540,12 +624,17 @@ class ConstitutionMixin:
         )
         pending_reason = self._safe_mode_reason
         pending_entered_at = self._safe_mode_entered_at
+        # Captured with the rest: restoring the prior row overwrites the
+        # buffered cause before this is persisted, so the new restriction
+        # would be written with the previous row's cause or none at all.
+        pending_cause = vars(self).get("_safe_mode_cause")
 
         async def persist_pending_entry(store) -> None:
             if not pending_entry:
                 return
             self._safe_mode = True
             self._safe_mode_reason = pending_reason
+            self._safe_mode_cause = pending_cause
             self._safe_mode_entered_at = pending_entered_at
             self._safe_mode_exited_at = None
             self._safe_mode_exit_authorization = None
@@ -587,6 +676,17 @@ class ConstitutionMixin:
 
             self._safe_mode = state.safe_mode
             self._safe_mode_reason = state.safe_mode_reason
+            # UNRECORDED is for rows written before causes were persisted —
+            # a NULL column, not every restart. Labelling a known cause
+            # UNRECORDED after a routine restart loses it from the report;
+            # calling a missing one INTEGRITY manufactures a constitutional
+            # violation out of an absent field. Both are wrong, differently.
+            if not state.safe_mode:
+                self._safe_mode_cause = None
+            else:
+                self._safe_mode_cause = (
+                    state.safe_mode_cause or SafeModeCause.UNRECORDED.value
+                )
             self._safe_mode_entered_at = state.safe_mode_entered_at
             self._safe_mode_exited_at = state.safe_mode_exited_at
             self._safe_mode_exit_authorization = (
@@ -619,7 +719,8 @@ class ConstitutionMixin:
                 and not self._safe_mode
             ):
                 await self.enter_safe_mode(
-                    "Agent identity node missing during constitutional restore"
+                    "Agent identity node missing during constitutional restore",
+                    cause=SafeModeCause.IDENTITY_MISSING.value,
                 )
             if self._safe_mode:
                 logging.critical(
@@ -628,15 +729,48 @@ class ConstitutionMixin:
         except Exception as exc:  # noqa: BLE001 - state failure must fail closed
             self._mark_constitution_state_unavailable(exc)
 
-    def _mark_constitution_state_unavailable(self, exc: Exception) -> None:
-        """Keep cognition blocked when authoritative state cannot be trusted."""
+    def _mark_constitution_state_unavailable(
+        self,
+        exc: Exception,
+        *,
+        cause: str = SafeModeCause.STATE_UNAVAILABLE.value,
+        read_failed: bool = True,
+    ) -> None:
+        """Keep cognition blocked when authoritative state cannot be trusted.
+
+        ``read_failed`` separates the two ways trust is lost. A failed READ
+        leaves the state unknown; a failed WRITE leaves it known but not
+        durable. Recording a write failure as a read outage made health report
+        an outage that never happened, and ``_constitution_state_load_error``
+        is a fact about reading — setting it for a write error is the same
+        confusion one field down.
+        """
         now = self._constitution_now()
+        # Read BEFORE this call sets the flag, or it is always true and the
+        # scoping below does nothing.
+        was_restricted = bool(getattr(self, "_safe_mode", False))
         self._safe_mode = True
-        self._safe_mode_reason = "Constitution runtime state unavailable"
+        # Does NOT overwrite an existing reason. An integrity finding followed
+        # by a failed state read used to be reported as "state unavailable",
+        # which hid a constitutional violation Amendment III requires be
+        # reported. The availability fact has its own home below; it does not
+        # need this slot, and taking it downgraded the stronger claim.
+        #
+        # Preserved only while that restriction is still in force. After an
+        # authorized exit the reason and cause linger as history, and carrying
+        # them forward would report an exited violation as a live one.
+        self._safe_mode_reason = (
+            (self._safe_mode_reason if was_restricted else None)
+            or "Constitution runtime state unavailable"
+        )
+        self._safe_mode_cause = (
+            (self._safe_mode_cause if was_restricted else None) or cause
+        )
         self._safe_mode_entered_at = (
             getattr(self, "_safe_mode_entered_at", None) or now
         )
-        self._constitution_state_load_error = type(exc).__name__
+        if read_failed:
+            self._constitution_state_load_error = type(exc).__name__
         self._constitution_audit_pending = False
         logging.critical(
             "CONSTITUTION STATE unavailable; remaining in Safe Mode (%s)",
@@ -665,16 +799,25 @@ class ConstitutionMixin:
             # connects instead of pretending the write succeeded.
             if "_constitution_state_store" not in vars(self):
                 return vars(self).get("_constitution_state_load_error") is None
+            was_restricted = bool(getattr(self, "_safe_mode", False))
             self._safe_mode = True
             self._safe_mode_reason = (
-                self._safe_mode_reason
+                (self._safe_mode_reason if was_restricted else None)
                 or "Constitution runtime state not initialized"
+            )
+            self._safe_mode_cause = (
+                (self._safe_mode_cause if was_restricted else None)
+                or SafeModeCause.STATE_NOT_PERSISTED.value
             )
             self._safe_mode_entered_at = (
                 self._safe_mode_entered_at or self._constitution_now()
             )
             self._constitution_state_persistence_pending = True
             return False
+        # Decided BEFORE the snapshot is built. Clearing it afterwards left the
+        # stale cause in the row just written, so a restart restored
+        # ``state_not_persisted`` and health claimed the recovered write had
+        # never persisted. The except path re-sets it if this write fails.
         try:
             await store.write(
                 self._constitution_state_snapshot(
@@ -688,9 +831,30 @@ class ConstitutionMixin:
                 event_reason=event_reason,
                 event_authorization=event_authorization,
             )
+            # The snapshot is on disk, so whatever earlier failure set this is
+            # no longer true. Leaving it set reported ``state_not_persisted``
+            # for the rest of the process after one transient write error.
+            # Only the durability FACT clears. The cause is why cognition is
+            # restricted — a write that failed really is the trigger — and
+            # erasing it to UNRECORDED lost that across a restart, leaving
+            # health and `!safe-mode` claiming no cause was recorded. The two
+            # are separate questions and only one of them just changed.
+            self._constitution_state_persistence_pending = False
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
-            self._mark_constitution_state_unavailable(exc)
+            # The write failed, so whatever this call was recording exists
+            # only in memory and will not survive a restart. That is a
+            # different fact from the store being unreadable, and only the
+            # latter was being recorded — so a Safe Mode entered during a
+            # disk-full or disconnected write reported no durability warning
+            # at all while promising a latch that "clears only with an
+            # authorized exit".
+            self._constitution_state_persistence_pending = True
+            self._mark_constitution_state_unavailable(
+                exc,
+                cause=SafeModeCause.STATE_NOT_PERSISTED.value,
+                read_failed=False,
+            )
             return False
 
     async def _record_successful_constitution_audit(
@@ -789,7 +953,8 @@ class ConstitutionMixin:
             governing = await self._get_governing_constitution()
             if governing.startswith("Error:"):
                 await self.enter_safe_mode(
-                    f"Startup constitution bootstrap failed: {governing}"
+                    f"Startup constitution bootstrap failed: {governing}",
+                    cause=SafeModeCause.BOOTSTRAP.value,
                 )
                 return
         is_valid, message = await self._verify_constitution_integrity()
@@ -1198,12 +1363,24 @@ class ConstitutionMixin:
         logging.info("Spawn mandate constraints verified successfully")
         return True, "Spawn mandate constraints verified"
 
-    async def enter_safe_mode(self, reason: str):
-        """Enter Safe Mode and durably record the security boundary."""
-        async with ConstitutionMixin._constitution_state_guard(self):
-            return await ConstitutionMixin._enter_safe_mode_locked(self, reason)
+    async def enter_safe_mode(
+        self, reason: str, *, cause: str = SafeModeCause.INTEGRITY.value
+    ):
+        """Enter Safe Mode and durably record the security boundary.
 
-    async def _enter_safe_mode_locked(self, reason: str) -> bool:
+        ``cause`` defaults to INTEGRITY because that is what Amendment III
+        names, and every caller that does not say otherwise is reporting a
+        failed verification. Callers restricting cognition for a different
+        reason must say so — the report must not have to guess.
+        """
+        async with ConstitutionMixin._constitution_state_guard(self):
+            return await ConstitutionMixin._enter_safe_mode_locked(
+                self, reason, cause=cause
+            )
+
+    async def _enter_safe_mode_locked(
+        self, reason: str, *, cause: str = SafeModeCause.INTEGRITY.value
+    ) -> bool:
         """Locked implementation of :meth:`enter_safe_mode`."""
         # Record agent consent before entering safe mode
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
@@ -1220,6 +1397,7 @@ class ConstitutionMixin:
         was_already_safe = self._safe_mode
         self._safe_mode = True
         self._safe_mode_reason = reason
+        self._safe_mode_cause = cause
         self._safe_mode_entered_at = (
             (getattr(self, "_safe_mode_entered_at", None) or now)
             if was_already_safe
@@ -1395,6 +1573,9 @@ class ConstitutionMixin:
         """
         pruned: list[str] = []
         async with self.storage.transaction():
+            await self.storage.lock_nodes_for_update(
+                [self.agent_id, constitution_hash]
+            )
             if await self.storage.get_node(constitution_hash) is None:
                 constitution_node = GraphNode(
                     node_id=constitution_hash,
@@ -1679,6 +1860,12 @@ class ConstitutionMixin:
                         "signer": verification.signer,
                         "created_at": amendment_artifact.get("created_at"),
                     },
+                )
+                # The runtime and setup reanchor writers touch these shared
+                # rows in different semantic order. Take the complete set first
+                # so PostgreSQL always observes one canonical lock order.
+                await self.storage.lock_nodes_for_update(
+                    [self.agent_id, artifact_hash, stored_hash]
                 )
                 await self.storage.add_node(
                     artifact_node,

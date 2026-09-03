@@ -7,8 +7,8 @@ It subsumes main.py's interactive chat into `kestrel shell <name>`.
 Commands:
     kestrel start                  # start all agents in-process (default)
     kestrel start <name>           # start just one agent (standalone process)
-    kestrel stop                   # stop everything (agents first, then host)
-    kestrel stop <name>            # stop just one agent
+    kestrel terminate              # terminate everything (agents first, then host)
+    kestrel terminate <name>       # terminate one agent process
     kestrel status                 # table: host + all agents with ports, PIDs, status
     kestrel logs <name>            # tail agent logs (or "host" for host logs)
     kestrel list                   # list multi_agent agents, ports, data dirs
@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from kestrel_sovereign import __version__
 from kestrel_sovereign.paths import load_project_env, spawned_agent_env
@@ -568,8 +568,19 @@ async def _run_shell(agent_dir: Path, args) -> int:
                     print("   Please verify KESTREL_DATA_KEY and restart.")
                     print("   Use !quit to exit.")
                     if hasattr(agent, 'enter_safe_mode'):
+                        # An availability failure of stored MEMORY — not a
+                        # failed verification, and not governance state
+                        # either. The constitution was never read, so nothing
+                        # about it was found wrong, and the runtime-state
+                        # store is answering fine; pointing the operator at
+                        # either would send them to the wrong place (#2920).
+                        from kestrel_sovereign.agent.constitution import (
+                            SafeModeCause,
+                        )
+
                         await agent.enter_safe_mode(
-                            "Repeated encrypted-state decryption failures"
+                            "Repeated encrypted-state decryption failures",
+                            cause=SafeModeCause.MEMORY_UNREADABLE.value,
                         )
 
     except KeyboardInterrupt:
@@ -647,12 +658,157 @@ def cmd_storage(args) -> int:
     """Dispatch ``kestrel storage`` subcommands."""
     storage_commands = {
         "health": cmd_storage_health,
+        "stamp-sessions": cmd_storage_stamp_sessions,
     }
     handler = storage_commands.get(args.storage_command)
     if handler is None:
-        print("Usage: kestrel storage {health}")
+        print("Usage: kestrel storage {health,stamp-sessions}")
         return 1
     return handler(args)
+
+
+def cmd_storage_stamp_sessions(args) -> int:
+    """Write down which session each legacy conversation row is in (#3120).
+
+    Idempotent: a row that names its session is not a candidate, and a row this
+    refuses is refused again for the same reason. Run it as often as you like.
+    """
+    import asyncio
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.legacy_session_stamp import (
+        stamp_legacy_sessions,
+    )
+
+    if bool(args.db) == bool(args.dsn):
+        print(
+            "error: give exactly one of --db (SQLite path) or --dsn "
+            "(PostgreSQL connection string).",
+            file=sys.stderr,
+        )
+        return 2
+    if args.db and not os.path.exists(args.db):
+        # Opening a path that is not there CREATES it, initialises a schema and
+        # reports zero rows stamped — a misspelling would look like success
+        # while the database meant stayed untouched.
+        print(f"error: no database at {args.db}", file=sys.stderr)
+        return 2
+
+    async def run() -> Optional[Dict[str, int]]:
+        # Looked at BEFORE it is opened. Both constructors run `_init_schema`,
+        # which CREATES `conversation_history` and the rest of the core schema
+        # — so a check made after opening always passes, and a mistyped path or
+        # a DSN naming somebody else's database would be initialised and
+        # reported as a zero-row success.
+        if not await _holds_conversation_history(args.db, args.dsn):
+            print(
+                f"error: {_target_label(args.db, args.dsn)} is not a Kestrel "
+                "conversation database",
+                file=sys.stderr,
+            )
+            return None
+        db = (
+            await AsyncDatabase.postgres(args.dsn)
+            if args.dsn
+            else await AsyncDatabase.sqlite(args.db)
+        )
+        try:
+            return await stamp_legacy_sessions(db, args.agent_id)
+        finally:
+            await db.close()
+
+    result = asyncio.run(run())
+    if result is None:
+        return 2
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(
+            f"{result['stamped']} legacy rows now name their session; "
+            f"{result['refused']} left as they stand because their own claim "
+            "names a different live session, and which is right is not this "
+            f"pass's to decide; {result['skipped']} left for another reason "
+            "(an unreadable document, a key the column may not hold). See the "
+            "log for each refusal."
+        )
+        if result["incomplete"]:
+            print(
+                f"{result['incomplete']} agent(s) had rows move under the "
+                "pass, so it did not finish them. Run it again.",
+                file=sys.stderr,
+            )
+    # A pass that lost a race is not a failure and is not a completion either.
+    # Saying so in the exit status is what lets a script notice.
+    return 1 if result["incomplete"] else 0
+
+
+def _target_label(db_path, dsn) -> str:
+    """A DSN without its credentials, or the path as given.
+
+    An error message goes to stderr, into terminal history and CI logs, and a
+    connection string carries a username and password.
+    """
+    if not dsn:
+        return str(db_path)
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(dsn)
+    host = parsed.hostname or "?"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{host}{port}{parsed.path or ''}"
+
+
+async def _holds_conversation_history(db_path, dsn) -> bool:
+    """Whether the target already IS a Kestrel conversation database.
+
+    Asked through a connection that creates nothing: ``AsyncDatabase``'s
+    constructors initialise a schema on the way in, which would make the
+    question answer itself.
+    """
+    if dsn:
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        backend = PostgresBackend(dsn=dsn)
+        await backend.connect()
+        try:
+            # Through ``to_regclass`` and ``pg_attribute``, which resolve the
+            # relation an unqualified statement will actually reach.
+            # ``information_schema.columns`` aggregates every schema on the
+            # search path and beyond it, so a same-named table elsewhere can
+            # make a wrong target pass or a right one fail.
+            found = await backend.fetch_one(
+                "SELECT count(*) FROM pg_attribute "
+                "WHERE attrelid = to_regclass('conversation_history') "
+                "AND attname IN ('agent_id', 'metadata', 'created_at') "
+                "AND NOT attisdropped",
+                (),
+            )
+            # Three named columns, not merely a table of that name: a
+            # `conversation_history` belonging to something else would
+            # otherwise be opened, and opening runs `_init_schema`.
+            return bool(found and int(found[0]) == 3)
+        finally:
+            await backend.close()
+
+    import sqlite3
+
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(conversation_history)"
+            )
+        }
+        # Three named columns, not merely a table of that name: a
+        # `conversation_history` belonging to something else would otherwise be
+        # opened, and opening runs `_init_schema`.
+        return {"agent_id", "metadata", "created_at"} <= columns
+    finally:
+        connection.close()
 
 
 async def _run_auth_login(args) -> int:
@@ -1000,7 +1156,7 @@ def cmd_constitution_reanchor(args) -> int:
 
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the multi_agent's PID file rather
-    # than probing the network — same source-of-truth as `kestrel stop`.
+    # than probing the network — same source-of-truth as `kestrel terminate`.
     holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
     if holder:
         print(
@@ -1363,7 +1519,7 @@ def _agent_holder(project_dir, agent_name, agent_cfg) -> Optional[str]:
     four reported "not running".
 
     The remedy differs by mode, which is why this returns the command rather
-    than a bool: ``kestrel stop <agent>`` cannot stop an agent that has no
+    than a bool: ``kestrel terminate <agent>`` cannot terminate an agent that has no
     process of its own, so prescribing it in in-process mode gives an
     operator advice that can never work, and every retry refuses again.
     """
@@ -1371,18 +1527,18 @@ def _agent_holder(project_dir, agent_name, agent_cfg) -> Optional[str]:
         from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        # The same verified read ``kestrel stop`` uses, so the guard and the
+        # The same verified read ``kestrel terminate`` uses, so the guard and the
         # remedy it prescribes cannot disagree about whether an agent is up.
         # ``is_running`` counts an undecidable record as running: it names a
         # process that IS alive, and waving a guard past a live agent is the
         # failure that costs something (#2995).
         agent_pid = ProcessManager.agent_pid_file(resolved_dir)
         if ProcessManager.read_pid_record(agent_pid).is_running:
-            return f"kestrel stop {agent_name}"
+            return f"kestrel terminate {agent_name}"
 
         host_pid = project_dir / "logs" / ".host.pid"
         if ProcessManager.read_pid_record(host_pid).is_running:
-            return "kestrel stop"
+            return "kestrel terminate"
 
         return None
     except Exception:
@@ -1665,7 +1821,7 @@ def cmd_config(args) -> int:
 # `kestrel_sovereign.cli.<name>` (patched git/uv update helpers included).
 from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     cmd_start,
-    cmd_stop,
+    cmd_terminate,
     cmd_restart,
     cmd_update,
     cmd_status,
@@ -1846,6 +2002,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="GCS prefix used by GCSTarget (default: kestrel/)",
     )
     storage_health_p.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+    stamp_p = storage_sub.add_parser(
+        "stamp-sessions",
+        help="Write down which session each legacy conversation row is in",
+    )
+    stamp_p.add_argument("--db", help="Path to an existing SQLite database")
+    stamp_p.add_argument("--dsn", help="PostgreSQL connection string")
+    stamp_p.add_argument(
+        "--agent-id",
+        default=None,
+        help="Only this agent (default: every agent in the database)",
+    )
+    stamp_p.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON"
     )
 
@@ -2183,7 +2353,7 @@ def main() -> int:
 
     commands = {
         "start": cmd_start,
-        "stop": cmd_stop,
+        "terminate": cmd_terminate,
         "restart": cmd_restart,
         "update": cmd_update,
         "status": cmd_status,

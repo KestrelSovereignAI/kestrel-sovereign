@@ -206,6 +206,58 @@ async def test_mode_not_in_allowed_drops_validation(dispatcher_components):
 
 
 @pytest.mark.asyncio
+async def test_synchronous_cognition_monitor_refusal_drops_validation(
+    dispatcher_components,
+    tmp_path,
+):
+    c = dispatcher_components
+    template = tmp_path / "sync-monitor.md"
+    template.write_text("payload: {payload}")
+    c.registry.register(_cognition_reg(template, name="sync_monitor"))
+    c.agent.monitor_cognition_signal_execution = (
+        lambda _signal: "durable work was withdrawn"
+    )
+
+    result = await c.dispatcher.dispatch_signal(
+        _signal("sync_monitor", mode=SignalMode.COGNITION)
+    )
+
+    assert result.status is Status.DROPPED_VALIDATION
+    assert result.error == "durable work was withdrawn"
+    assert c.agent.process_input_calls == []
+
+
+@pytest.mark.asyncio
+async def test_monitored_cognition_revalidates_before_execution_handoff(
+    dispatcher_components,
+    tmp_path,
+):
+    """Cancellation after admission must win before cognition is scheduled."""
+
+    c = dispatcher_components
+    template = tmp_path / "handoff-monitor.md"
+    template.write_text("payload: {payload}")
+    c.registry.register(_cognition_reg(template, name="handoff_monitor"))
+    c.agent.validate_cognition_signal_execution = AsyncMock(
+        side_effect=[None, "durable work was withdrawn at handoff"]
+    )
+
+    async def monitor(_signal):
+        await asyncio.Event().wait()
+
+    c.agent.monitor_cognition_signal_execution = monitor
+
+    result = await c.dispatcher.dispatch_signal(
+        _signal("handoff_monitor", mode=SignalMode.COGNITION)
+    )
+
+    assert result.status is Status.DROPPED_VALIDATION
+    assert result.error == "durable work was withdrawn at handoff"
+    assert c.agent.validate_cognition_signal_execution.await_count == 2
+    assert c.agent.process_input_calls == []
+
+
+@pytest.mark.asyncio
 async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp_path):
     """UNTRUSTED + COGNITION → sanitizer runs and replaces payload."""
     c = dispatcher_components

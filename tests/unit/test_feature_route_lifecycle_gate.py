@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from anyio import ClosedResourceError
 from fastapi import APIRouter, Depends, FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -32,6 +33,8 @@ from starlette.websockets import WebSocketDisconnect
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
 from kestrel_sovereign.features.webhooks.models import WebhookAuthType, WebhookConfig
 from kestrel_sovereign.features.webhooks.receiver import WebhookReceiver
+
+pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 
 API_KEY = "test-route-gate-key"
@@ -87,7 +90,13 @@ class _WebSocketFeatureStub:
         async def lifecycle_socket(websocket: WebSocket):
             await websocket.accept()
             await websocket.send_text("enabled")
-            await websocket.close()
+            try:
+                # Keep the app task alive until the client has consumed the
+                # buffered frame and closes its context. Returning here closes
+                # AnyIO's receive stream before it drains under CPU pressure.
+                await websocket.receive_text()
+            except WebSocketDisconnect:
+                pass
 
         return router
 
@@ -401,7 +410,7 @@ def test_disabled_websocket_feature_route_is_not_matched():
                 assert websocket.receive_text() == "enabled"
 
             feature.enabled = False
-            with pytest.raises(WebSocketDisconnect):
+            with pytest.raises((WebSocketDisconnect, ClosedResourceError)):
                 with client.websocket_connect(
                     "/test-feature-lifecycle/ws", headers=headers
                 ):

@@ -24,15 +24,32 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    validate_request_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    invocation_log_correlation,
     invocation_id_response_header,
     new_stream_delivery_id,
+    validate_invocation_id,
 )
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+)
+from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
+)
+from kestrel_sovereign.stop import (
+    CancellationAuthority,
+    CooperativeStopTarget,
+    StopDisposition,
+    StopCleanupRegistry,
+    StopRequest,
+    StopScope,
 )
 
 logger = logging.getLogger(__name__)
@@ -391,18 +408,90 @@ async def invoke_agent(request: Request, http_response: Response):
         else:
             agent._current_request_id = request_id
 
+        request_cancelled = getattr(agent, "is_request_cancelled", None)
+        if callable(request_cancelled) and request_cancelled(request_id) is True:
+            try:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped before execution.",
+                    "session_id": session_id,
+                    "model": None,
+                    "provider": None,
+                }
+            finally:
+                agent._cleanup_cancelled_request(request_id)
+
         if isinstance(kite_evidence_request, dict):
             if user_input not in (None, ""):
                 raise _kite_evidence_error("Kite evidence requests cannot include input.")
+            owner_task = asyncio.current_task()
+            owner_cancellation_baseline = (
+                owner_task.cancelling() if owner_task is not None else 0
+            )
             try:
-                operation, observation = await _kite_runtime_observation(
-                    agent,
-                    request_id=request_id,
-                    provenance=request_invocation_provenance(
-                        request, source_locator="POST:/api/agent/invoke#kite-release-evidence",
+                evidence_task = asyncio.create_task(
+                    _kite_runtime_observation(
+                        agent,
+                        request_id=request_id,
+                        provenance=request_invocation_provenance(
+                            request,
+                            source_locator=(
+                                "POST:/api/agent/invoke#kite-release-evidence"
+                            ),
+                        ),
+                        request=kite_evidence_request,
                     ),
-                    request=kite_evidence_request,
+                    name=(
+                        "kite-evidence:"
+                        f"{invocation_log_correlation(request_id)}"
+                    ),
                 )
+                bind_operation = getattr(
+                    type(agent), "bind_request_operation", None
+                )
+                if callable(bind_operation):
+                    bind_operation(agent, request_id, evidence_task)
+                try:
+                    operation, observation = await evidence_task
+                except asyncio.CancelledError:
+                    if (
+                        owner_task is not None
+                        and owner_task.cancelling()
+                        > owner_cancellation_baseline
+                    ):
+                        raise
+                    if not (
+                        callable(request_cancelled)
+                        and request_cancelled(request_id) is True
+                    ):
+                        raise
+                    http_response.headers["X-Request-ID"] = (
+                        invocation_id_response_header(request_id)
+                    )
+                    return {
+                        "response": "Request stopped during execution.",
+                        "session_id": session_id,
+                        "model": None,
+                        "provider": None,
+                    }
+                # Stop can linearize after the evidence task has produced its
+                # observation but before this owner publishes signed success.
+                # Re-read the exact generation with no following await.
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    http_response.headers["X-Request-ID"] = (
+                        invocation_id_response_header(request_id)
+                    )
+                    return {
+                        "response": "Request stopped during execution.",
+                        "session_id": session_id,
+                        "model": None,
+                        "provider": None,
+                    }
             finally:
                 agent._cleanup_cancelled_request(request_id)
             nonce = kite_evidence_request.get("nonce")
@@ -442,6 +531,28 @@ async def invoke_agent(request: Request, http_response: Response):
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             )
+            if callable(request_cancelled) and request_cancelled(request_id) is True:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": effective_session_id,
+                    "model": None,
+                    "provider": None,
+                }
+        except (asyncio.CancelledError, InvocationCancelledError):
+            if callable(request_cancelled) and request_cancelled(request_id) is True:
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": effective_session_id,
+                    "model": None,
+                    "provider": None,
+                }
+            raise
         finally:
             agent._cleanup_cancelled_request(request_id)
         # Extract model/provider identity for frontend footer rendering (#1373)
@@ -691,18 +802,27 @@ async def stream_agent_response(request: Request):
             # chunk but BEFORE this async generator exits must not retroactively
             # append "Request stopped" to an already-delivered answer.
             response_chunk_yielded = False
+            agent_stream = None
             try:
+                if agent.is_request_cancelled(request_id) is True:
+                    yield stop_notice
+                    stop_notice_emitted = True
+                    return
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
-                async for chunk in agent.process_input_streaming(
-                    user_input,
-                    model_override=model_override,
-                    session_id=effective_session_id,
-                    audit_before_streaming=audit_before_streaming,
-                    caller=caller,
-                    request_id=request_id,
-                    invocation_provenance=invocation_provenance,
-                    attachments=attachments,
-                ):
+                agent_stream = OwnedAsyncIterator(
+                    lambda: agent.process_input_streaming(
+                        user_input,
+                        model_override=model_override,
+                        session_id=effective_session_id,
+                        audit_before_streaming=audit_before_streaming,
+                        caller=caller,
+                        request_id=request_id,
+                        invocation_provenance=invocation_provenance,
+                        attachments=attachments,
+                    ),
+                    operation="agent stream cleanup",
+                )
+                async for chunk in agent_stream:
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
                         yield stop_notice
@@ -765,10 +885,41 @@ async def stream_agent_response(request: Request):
                 )
                 yield agent_stream_error_block(e)
             finally:
-                # Signal stream completion for TTS consumers
-                await stream_tap.finish(stream_delivery_id)
-                # Cleanup request tracking
-                agent._cleanup_cancelled_request(request_id)
+                agent_stream_cleanup_failed = False
+                try:
+                    # One producer task owns construction, iteration, and close
+                    # of the nested generator. Its join is cancellation-safe
+                    # without moving ContextVar token reset into a copied task
+                    # context.
+                    if agent_stream is not None:
+                        await agent_stream.aclose()
+                except BaseException:
+                    agent_stream_cleanup_failed = (
+                        agent_stream is not None
+                        and agent_stream.cleanup_error is not None
+                    )
+                    raise
+                else:
+                    agent_stream_cleanup_failed = (
+                        agent_stream is not None
+                        and agent_stream.cleanup_error is not None
+                    )
+                finally:
+                    try:
+                        # Signal stream completion for TTS consumers
+                        await stream_tap.finish(stream_delivery_id)
+                    finally:
+                        # A failed nested close is an abandoned lifecycle,
+                        # never proof that Stop succeeded.
+                        if agent_stream_cleanup_failed:
+                            agent._cleanup_cancelled_request(
+                                request_id,
+                                disposition=(
+                                    RequestCompletionDisposition.ABANDONED
+                                ),
+                            )
+                        else:
+                            agent._cleanup_cancelled_request(request_id)
 
         headers = {
             "Cache-Control": "no-cache",
@@ -808,27 +959,281 @@ async def stop_agent_request(request: Request):
         # remain literal values.  Only X-Request-ID is a percent-encoded wire
         # form, so a client can copy an invoke/stream response header here
         # verbatim without forking the cancellation key.
+        body_has_request_id = "request_id" in data
+        query_has_request_id = "request_id" in request.query_params
         explicit_request_id = (
-            data.get("request_id") or request.query_params.get("request_id")
+            data["request_id"]
+            if body_has_request_id
+            else request.query_params.get("request_id")
         )
-        request_id = (
-            resolve_request_invocation_id(
-                request,
-                {"request_id": explicit_request_id}
-                if explicit_request_id is not None
-                else {},
-            )
-            if explicit_request_id is not None
+        explicit_request_id_present = (
+            body_has_request_id or query_has_request_id
+        )
+        body_has_turn_id = "turn_id" in data
+        query_has_turn_id = "turn_id" in request.query_params
+        explicit_turn_id_present = body_has_turn_id or query_has_turn_id
+        explicit_turn_id = (
+            data["turn_id"]
+            if body_has_turn_id
+            else request.query_params.get("turn_id")
+        )
+        if explicit_turn_id_present and (
+            explicit_request_id_present
             or request.headers.get("X-Request-ID") is not None
-            else None
-        )
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="ambiguous_stop_target",
+                message="Pass either request_id or turn_id, not both.",
+            )
+        if explicit_turn_id_present:
+            try:
+                turn_id = validate_invocation_id(explicit_turn_id)
+            except ValueError as error:
+                raise ApiHTTPException(
+                    status_code=400,
+                    code="invalid_turn_id",
+                    message=f"Invalid turn_id: {error}",
+                ) from error
+        else:
+            turn_id = None
+        if explicit_request_id_present:
+            request_id = validate_request_invocation_id(explicit_request_id)
+        elif request.headers.get("X-Request-ID") is not None:
+            request_id = resolve_request_invocation_id(request, {})
+        else:
+            request_id = None
         agent = get_agent(request)
-        cancelled = agent.cancel_current_request(request_id=request_id)
+        agent_id = getattr(agent, "agent_id", None)
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            # Compatibility for pre-inception/test agents. This is an address,
+            # not a grant; HTTP caller authorization remains at the route.
+            agent_id = "local-agent"
+        caller = getattr(request.state, "caller", None)
+        actor_id = getattr(caller, "identity", None)
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            actor_id = f"local-operator:{agent_id}"
+
+        active_request_ids = set(
+            getattr(agent, "_active_request_ids", set()) or set()
+        )
+        abandoned_turns = getattr(agent, "_abandoned_request_generations", None)
+        if isinstance(abandoned_turns, dict):
+            active_request_ids.update(abandoned_turns)
+        current_turn = getattr(agent, "_current_request_id", None)
+        if isinstance(current_turn, str) and current_turn:
+            active_request_ids.add(current_turn)
+        if request_id is not None:
+            active_request_ids.add(request_id)
+        instance_binding_accessor = vars(agent).get(
+            "active_turn_request_bindings"
+        )
+        if callable(instance_binding_accessor):
+            has_binding_accessor = True
+            raw_turn_bindings = instance_binding_accessor()
+        else:
+            class_binding_accessor = getattr(
+                type(agent),
+                "active_turn_request_bindings",
+                None,
+            )
+            has_binding_accessor = callable(class_binding_accessor)
+            raw_turn_bindings = (
+                class_binding_accessor(agent) if has_binding_accessor else None
+            )
+        if has_binding_accessor:
+            if not isinstance(raw_turn_bindings, dict):
+                raise TypeError("agent turn binding inventory has an invalid type")
+            turn_request_ids = {}
+            turn_request_generations = {}
+            for indexed_turn_id, binding in raw_turn_bindings.items():
+                if (
+                    not isinstance(indexed_turn_id, str)
+                    or not isinstance(binding, tuple)
+                    or len(binding) != 2
+                    or not isinstance(binding[0], str)
+                ):
+                    raise TypeError("agent turn binding inventory is malformed")
+                try:
+                    validate_invocation_id(indexed_turn_id)
+                    validate_invocation_id(binding[0])
+                except ValueError as error:
+                    raise TypeError(
+                        "agent turn binding inventory is malformed"
+                    ) from error
+                turn_request_ids[indexed_turn_id] = binding[0]
+                if binding[1] is not None:
+                    if (
+                        not isinstance(binding[1], int)
+                        or isinstance(binding[1], bool)
+                        or binding[1] <= 0
+                    ):
+                        raise TypeError("agent turn generation is malformed")
+                    turn_request_generations[indexed_turn_id] = binding[1]
+        else:
+            turn_index_accessor = vars(agent).get("active_turn_request_ids")
+            if not callable(turn_index_accessor):
+                turn_index_accessor = getattr(
+                    type(agent),
+                    "active_turn_request_ids",
+                    None,
+                )
+                if callable(turn_index_accessor):
+                    turn_request_ids = turn_index_accessor(agent)
+                else:
+                    turn_request_ids = {}
+            else:
+                turn_request_ids = turn_index_accessor()
+            turn_request_generations = {}
+        if not isinstance(turn_request_ids, dict):
+            raise TypeError("agent turn request inventory has an invalid type")
+        turn_addresses = active_request_ids.union(turn_request_ids)
+
+        async def cancel_request(stop_request: StopRequest) -> StopDisposition:
+            cancelled_request_ids: list[Optional[str]] = []
+            if stop_request.scope is StopScope.TURN:
+                cancel_kwargs = {"request_id": stop_request.target}
+                if stop_request.request_generation is not None:
+                    cancel_kwargs["generation"] = stop_request.request_generation
+                canceled = agent.cancel_current_request(**cancel_kwargs)
+                if canceled:
+                    cancelled_request_ids.append(stop_request.target)
+                else:
+                    # The matching invoke/stream may have been dispatched by
+                    # the client but not yet reached lifecycle registration.
+                    # Fence that exact ID briefly; registration consumes the
+                    # tombstone before cognition can begin.  Unknown IDs keep
+                    # the historical ALREADY_COMPLETE result.
+                    reserve = getattr(
+                        type(agent),
+                        "reserve_request_cancellation",
+                        None,
+                    )
+                    if (
+                        stop_request.request_generation is None
+                        and callable(reserve)
+                    ):
+                        reserve(agent, stop_request.target)
+            else:
+                canceled = False
+                for active_request_id in sorted(active_request_ids):
+                    request_cancelled = agent.cancel_current_request(
+                        request_id=active_request_id
+                    )
+                    if request_cancelled:
+                        cancelled_request_ids.append(active_request_id)
+                    canceled = request_cancelled or canceled
+                if not active_request_ids:
+                    canceled = agent.cancel_current_request(request_id=None)
+                    if canceled:
+                        cancelled_request_ids.append(None)
+            if canceled:
+                wait_for_completion = getattr(
+                    agent,
+                    "wait_for_request_completion",
+                    None,
+                )
+                if not callable(wait_for_completion):
+                    raise RuntimeError(
+                        "agent cannot confirm request lifecycle completion"
+                    )
+                # Every cancellation marker is installed before the first
+                # await, so agent-wide Stop reaches all snapshotted turns at
+                # once. STOPPED is returned only after each one has run its
+                # endpoint cleanup; CancellationAuthority bounds this wait.
+                abandoned = False
+                for cancelled_request_id in cancelled_request_ids:
+                    wait_kwargs = {}
+                    if (
+                        stop_request.scope is StopScope.TURN
+                        and stop_request.request_generation is not None
+                    ):
+                        wait_kwargs["generation"] = (
+                            stop_request.request_generation
+                        )
+                    completion_disposition = await wait_for_completion(
+                        cancelled_request_id,
+                        **wait_kwargs,
+                    )
+                    abandoned = abandoned or (
+                        completion_disposition
+                        is RequestCompletionDisposition.ABANDONED
+                    )
+                if abandoned:
+                    return StopDisposition.UNREACHABLE
+            return (
+                StopDisposition.STOPPED
+                if canceled
+                else StopDisposition.ALREADY_COMPLETE
+            )
+
+        cleanup_registry = getattr(
+            request.app.state,
+            "stop_cleanup_registry",
+            None,
+        )
+        if cleanup_registry is None:
+            cleanup_registry = StopCleanupRegistry()
+            request.app.state.stop_cleanup_registry = cleanup_registry
+        elif not isinstance(cleanup_registry, StopCleanupRegistry):
+            raise TypeError("app Stop cleanup registry has an invalid type")
+
+        authority = CancellationAuthority(
+            lambda: (
+                CooperativeStopTarget(
+                    target_id=agent_id,
+                    agent_id=agent_id,
+                    cancel=cancel_request,
+                    turn_ids=frozenset(turn_addresses),
+                    turn_request_ids=turn_request_ids,
+                    turn_request_generations=turn_request_generations,
+                ),
+            ),
+            cleanup_registry=cleanup_registry,
+        )
+        stop_request = StopRequest(
+            scope=(
+                StopScope.TURN
+                if request_id is not None or turn_id is not None
+                else StopScope.AGENT
+            ),
+            actor_id=actor_id,
+            target=(
+                turn_id
+                if turn_id is not None
+                else request_id if request_id is not None else agent_id
+            ),
+            target_agent_id=(
+                agent_id
+                if request_id is not None or turn_id is not None
+                else None
+            ),
+            target_is_turn_id=turn_id is not None,
+        )
+        outcomes = await authority.stop(stop_request)
+        failed_outcomes = tuple(
+            outcome
+            for outcome in outcomes
+            if outcome.disposition
+            in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
+        )
+        if failed_outcomes:
+            raise ApiHTTPException(
+                status_code=503,
+                code="stop_not_confirmed",
+                message="Cooperative Stop could not be confirmed.",
+                details=[outcome.to_dict() for outcome in failed_outcomes],
+            )
+        cancelled = any(
+            outcome.disposition is StopDisposition.STOPPED for outcome in outcomes
+        )
         return {
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
-            "message": "Request cancelled" if cancelled else "No active request to cancel"
+            "turn_id": turn_id,
+            "message": "Request cancelled" if cancelled else "No active request to cancel",
+            "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }
     except HTTPException:
         raise
@@ -2195,8 +2600,9 @@ async def _create_a2a_task_under_lifecycle_lease(
     sender_artifacts,
     manager,
     hosted_policy=None,
+    commit=None,
 ):
-    """Verify, authorize, and persist one task under a stable hosted topology."""
+    """Verify, authorize, and commit one A2A action under stable topology."""
     from kestrel_sovereign.a2a.envelope_signing import (
         canonical_message,
         verify_inbound_envelope,
@@ -2253,6 +2659,16 @@ async def _create_a2a_task_under_lifecycle_lease(
             status_code=403,
             detail=f"A2A sender verification failed: {sender_verdict.reason}",
         )
+    if callable(commit) and not sender_verdict.verified:
+        # Legacy unsigned envelopes are a narrow task-creation compatibility
+        # lane. They cannot authorize a destructive lifecycle transition: the
+        # shared host API key authenticates transport access, not the peer name
+        # in caller-controlled metadata. Local Core callers use the separate
+        # host-attested submission/cancellation contract instead.
+        raise HTTPException(
+            status_code=403,
+            detail="A2A cancellation requires a verified sender signature",
+        )
     if hosted_policy is not None:
         if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
             raise HTTPException(
@@ -2296,6 +2712,7 @@ async def _create_a2a_task_under_lifecycle_lease(
             agent,
             inbound_authorizer,
         )
+    authorized_legacy_sender_id = None
     if sender_verdict.verified:
         if inbound_authorizer is not None:
             if (
@@ -2381,10 +2798,10 @@ async def _create_a2a_task_under_lifecycle_lease(
             "authorize_a2a_legacy_unsigned_sender",
             None,
         )
-        authorized = False
+        authorized_sender_id = None
         if callable(authorize_legacy):
             try:
-                authorized = await authorize_legacy(
+                authorized_sender_id = await authorize_legacy(
                     agent,
                     claimed_sender,
                     hosted_policy,
@@ -2394,11 +2811,12 @@ async def _create_a2a_task_under_lifecycle_lease(
                     "Hosted legacy unsigned A2A sender authorization failed",
                     exc_info=True,
                 )
-        if authorized is not True:
+        if not isinstance(authorized_sender_id, str) or not authorized_sender_id:
             raise HTTPException(
                 status_code=403,
                 detail="A2A unsigned sender is not an authorized local legacy peer",
             )
+        authorized_legacy_sender_id = authorized_sender_id
         if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
             raise HTTPException(
                 status_code=403,
@@ -2411,6 +2829,60 @@ async def _create_a2a_task_under_lifecycle_lease(
         )
 
     params.metadata["sender_verified"] = sender_verdict.verified
+    authorized_sender_id = (
+        sender_verdict.sender
+        if sender_verdict.verified
+        else authorized_legacy_sender_id
+    )
+    # A same-host agent may create a task before its hybrid ceremony and
+    # cancel it afterward with its successor signing DID.  The manager witness
+    # cryptographically bound that successor DID to the exact live local agent;
+    # persist and compare the manager's stable routing DID so the principal
+    # does not change merely because its signing key advanced.  External
+    # senders retain their verified signing DID because this host has no local
+    # lifecycle witness with which to normalize them.
+    if (
+        sender_verdict.verified
+        and sender_witness is not None
+        and sender_witness[0] == "local"
+    ):
+        witnessed_agent = sender_witness[1]
+        stable_sender_id = None
+        for attribute in ("did", "agent_id"):
+            candidate = getattr(witnessed_agent, attribute, None)
+            if isinstance(candidate, str) and candidate:
+                stable_sender_id = candidate
+                break
+        witnessed_identity = sender_witness[2]
+        bound_dids = {
+            candidate
+            for candidate in (
+                getattr(witnessed_identity, "legacy_did", None),
+                getattr(witnessed_identity, "new_did", None),
+            )
+            if isinstance(candidate, str) and candidate
+        }
+        if (
+            isinstance(stable_sender_id, str)
+            and stable_sender_id in bound_dids
+            and sender_verdict.sender in bound_dids
+        ):
+            authorized_sender_id = stable_sender_id
+    if callable(commit):
+        try:
+            return await commit(authorized_sender_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Failed to commit verified A2A action: %s",
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500, detail="Failed to commit A2A action"
+            ) from exc
+
     local_name = (
         getattr(agent, "did", None)
         or getattr(agent, "_agent_name", None)
@@ -2421,7 +2893,10 @@ async def _create_a2a_task_under_lifecycle_lease(
             params=params,
             agent_name=local_name,
             artifacts=sender_artifacts or None,
+            creator_agent_id=authorized_sender_id,
         )
+    except TaskAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         logger.error(
             "Failed to create A2A task from peer submission: %s",
@@ -2437,6 +2912,7 @@ async def _create_verified_a2a_task(
     parts,
     raw_artifacts,
     sender_artifacts,
+    commit=None,
 ):
     """Use a shared manager lease for hosted recipients; preserve standalone flow."""
     manager = getattr(agent, "_a2a_host_manager", None)
@@ -2465,6 +2941,7 @@ async def _create_verified_a2a_task(
                 sender_artifacts,
                 manager,
                 hosted_policy,
+                commit,
             )
     return await _create_a2a_task_under_lifecycle_lease(
         agent,
@@ -2473,6 +2950,8 @@ async def _create_verified_a2a_task(
         raw_artifacts,
         sender_artifacts,
         None,
+        None,
+        commit,
     )
 
 
@@ -2677,6 +3156,104 @@ async def get_task(request: Request, task_id: str):
         "message": message_text,
         "artifacts": artifacts_payload,
         "metadata": task.metadata or {},
+    }
+
+
+@router.post("/tasks/{task_id:path}/cancel")
+@limiter.limit("120/minute")
+async def cancel_task_from_peer(request: Request, task_id: str):
+    """Cancel an A2A task through the recipient's authoritative store.
+
+    The API key authenticates the host connection, not the peer actor. The
+    cancellation therefore carries the same DID-signed, replay-protected
+    envelope as task creation and repeats the recipient's live peer-scope
+    authorization before the atomic creator/recipient predicate is applied.
+    """
+    agent = get_agent(request)
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(status_code=404, detail="TaskManager not available")
+
+    body = await _parse_json_body(request)
+    reason = body.get("reason") or "Task canceled by creator"
+    session_id = body.get("sessionId") or ""
+    metadata = body.get("metadata") or {}
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 4096:
+        raise HTTPException(
+            status_code=400,
+            detail="Cancellation reason must be a non-empty string up to 4096 characters",
+        )
+    if not isinstance(session_id, str) or not session_id:
+        raise HTTPException(status_code=400, detail="sessionId is required")
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="metadata must be an object")
+    if metadata.get("a2a_verb") != "cancel_task":
+        raise HTTPException(
+            status_code=400,
+            detail="Cancellation envelope must bind a2a_verb=cancel_task",
+        )
+
+    from kestrel_sovereign.a2a.task_manager import (
+        TaskCancellationAuthorizationError,
+    )
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    params = TaskSendParams(
+        id=task_id,
+        sessionId=session_id,
+        message=Message(role="user", parts=[TextPart(text=reason)]),
+        metadata=metadata,
+    )
+    recipient_agent_id = next(
+        (
+            candidate
+            for candidate in (
+                getattr(agent.task_manager, "host_agent_id", None),
+                getattr(agent, "did", None),
+                getattr(agent, "agent_id", None),
+            )
+            if isinstance(candidate, str) and candidate
+        ),
+        None,
+    )
+    if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="A2A task cancellation requires a durable recipient identity",
+        )
+
+    async def _cancel(authorized_sender_id: str):
+        if not isinstance(authorized_sender_id, str) or not authorized_sender_id:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A task cancellation requires an authenticated agent",
+            )
+        try:
+            return await agent.task_manager.cancel_task(
+                task_id,
+                reason=reason,
+                agent_name=authorized_sender_id,
+                recipient_agent_id=recipient_agent_id,
+            )
+        except TaskCancellationAuthorizationError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            status_code = 404 if str(exc) == f"Task not found: {task_id}" else 409
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    task = await _create_verified_a2a_task(
+        agent,
+        params,
+        params.message.parts,
+        [],
+        [],
+        commit=_cancel,
+    )
+    return {
+        "id": task.id,
+        "status": task.status.state.value,
+        "cancellation_receipt": (task.metadata or {}).get(
+            "cancellation_receipt"
+        ),
     }
 
 

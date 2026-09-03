@@ -35,7 +35,7 @@ from kestrel_sovereign.config import (
     TRUSTED_AGENTS_DIR,
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping, Callable
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
@@ -85,7 +85,10 @@ from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin,
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
-from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
+)
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.signals import OrderedLockManager
@@ -113,6 +116,7 @@ if TYPE_CHECKING:
         PeerRequester,
     )
     from kestrel_sovereign.knowledge.inference import InferenceProfile
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -571,6 +575,7 @@ class KestrelAgent(
         *,
         database_url: Optional[str] = None,
         db_backend: Optional[str] = None,
+        shared_postgres_advisory_backend: Optional["PostgresBackend"] = None,
         allowed_features: Optional[set] = None,
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
@@ -583,6 +588,9 @@ class KestrelAgent(
         isolated_runtime_namespace: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_legacy_root: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_hosted: bool = False,
+        isolated_runtime_idle_timeout_seconds: Optional[float] = None,
+        isolated_runtime_idle_timeouts: Optional[Mapping[str, Optional[float]]] = None,
+        isolated_runtime_telemetry_observer: Optional[Callable[[Any], Any]] = None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
@@ -611,6 +619,11 @@ class KestrelAgent(
                 copied from the supplied pool.
             db_backend: Database backend type ('sqlite' or 'postgres').
                        Defaults to KESTREL_DB_BACKEND env var or 'sqlite'.
+            shared_postgres_advisory_backend: Optional trusted host
+                       ``PostgresBackend`` wrapping the exact same ``pg_pool``.
+                       Hosted child agents delegate session advisory locks to
+                       its one bounded pool. The host owns its lifecycle;
+                       standalone agents omit this and retain a private pool.
             allowed_features: Optional set of feature class names to load.
                        If None, all discovered features are loaded.
                        Mandatory features always load regardless.
@@ -658,6 +671,12 @@ class KestrelAgent(
             isolated_runtime_hosted: Declares that this agent shares a host
                        runtime. Discovery of an isolated feature fails closed
                        unless an explicit root and namespace were supplied.
+            isolated_runtime_idle_timeout_seconds: Optional positive per-feature
+                       inactivity deadline for hosted isolated children.
+            isolated_runtime_idle_timeouts: Optional feature-class overrides;
+                       a None value disables retirement for that feature.
+            isolated_runtime_telemetry_observer: Optional host callback receiving
+                       sanitized snapshots for this exact agent only.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -750,6 +769,25 @@ class KestrelAgent(
             raise ValueError(
                 "isolated_runtime_legacy_root requires the hosted isolated "
                 "runtime root/namespace contract"
+            )
+        if (
+            isolated_runtime_idle_timeout_seconds is not None
+            or isolated_runtime_idle_timeouts is not None
+            or isolated_runtime_telemetry_observer is not None
+        ):
+            from kestrel_sovereign.features.isolated_runtime import (
+                configure_hosted_isolated_runtime_lifecycle,
+            )
+
+            if self.isolated_runtime_scope is None:
+                raise ValueError(
+                    "isolated runtime lifecycle policy requires an explicit hosted scope"
+                )
+            configure_hosted_isolated_runtime_lifecycle(
+                self,
+                idle_timeout_seconds=isolated_runtime_idle_timeout_seconds,
+                idle_timeouts=isolated_runtime_idle_timeouts,
+                telemetry_observer=isolated_runtime_telemetry_observer,
             )
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
@@ -1222,6 +1260,9 @@ class KestrelAgent(
 
         # Determine database backend
         self._db_backend = effective_db_backend
+        self._shared_postgres_advisory_backend = (
+            shared_postgres_advisory_backend
+        )
         # Birth-record capability the runtime database could not be given and
         # no retry can supply (#2871). Surfaced by the ``birth_record`` health
         # check; empty on every healthy agent.
@@ -1385,10 +1426,29 @@ class KestrelAgent(
         # running. Keep lifecycle registration ownership per delivery so one
         # completion cannot unregister the other.
         self._active_request_counts: dict[str, int] = {}
+        self._active_request_generations: dict[str, int] = {}
+        self._next_request_generation = 0
+        self._abandoned_request_generations: dict[str, set[int]] = {}
+        self._abandoned_request_dispositions: dict[
+            tuple[str, int], RequestCompletionDisposition
+        ] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
+        # Observable turn IDs resolve to the task-local invocation/request IDs
+        # that the cooperative Stop loop already understands (#3141).
+        self._turn_request_ids: dict[str, str] = {}
         self._cancelled_requests: set = set()
+        self._cancelled_request_generations: set[tuple[str, int]] = set()
+        # An exact Stop can race ahead of the matching HTTP request's lifecycle
+        # registration. The short-lived entry is consumed by that first
+        # generation so an acknowledged Stop cannot be followed by late work.
+        self._pending_request_cancellations: dict[str, float] = {}
+        # Stop is acknowledged only after endpoint cleanup has observed the
+        # request leave execution. RequestLifecycleMixin owns these waiters.
+        self._request_completion_events: dict[
+            tuple[str, int], asyncio.Future[object]
+        ] = {}
         # Task-reentrant so a durable-identity write (rename / description /
         # discovery / user-name / SOUL) invoked as a TOOL inside a streamed turn
         # — which already holds this lock across the whole turn — re-enters
@@ -1829,6 +1889,21 @@ class KestrelAgent(
                 f"with per-request passphrase"
             )
 
+    def _build_shared_pool_postgres_backend(self):
+        """Build this agent's storage backend over its host-supplied pool."""
+
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        return PostgresBackend.from_pool(
+            self.pg_pool,
+            advisory_dsn=(
+                None
+                if self._shared_postgres_advisory_backend is not None
+                else self._explicit_advisory_dsn
+            ),
+            advisory_backend=self._shared_postgres_advisory_backend,
+        )
+
     async def initialize(self) -> None:
         """Boot the agent as an explicit, ordered, rollback-safe phase sequence.
 
@@ -1940,16 +2015,12 @@ class KestrelAgent(
         if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
             # PostgreSQL backend - reuse shared pool if available
             if self.pg_pool:
-                from kestrel_sovereign.storage.db.postgres import PostgresBackend
                 # A PostgreSQL scheduler effect holds a session advisory gate
                 # across target execution. Its bounded dedicated pool needs the
                 # same DSN, never the shared operational pool, or a waiting
                 # fence could consume the connection required for renewal/final
                 # CAS. A missing DSN fails clearly at the first scheduler gate.
-                pg_backend = PostgresBackend.from_pool(
-                    self.pg_pool,
-                    advisory_dsn=self._explicit_advisory_dsn,
-                )
+                pg_backend = self._build_shared_pool_postgres_backend()
                 self._raw_storage = AsyncStorage(
                     backend=pg_backend,
                     agent_id=self.did,
@@ -2164,6 +2235,11 @@ class KestrelAgent(
             # — the missing piece behind every "I sent it, did you
             # get it?" thread (#645 / Emma↔Meridian).
             on_task_submitted=self._on_task_submitted,
+            # Cancellation is durable before this callback fires.  The agent
+            # uses it to suppress the matching queued cognition delivery so a
+            # withdrawn task cannot execute from its inline signal payload.
+            on_task_cancelled=self._on_task_cancelled,
+            on_task_cancellation_started=self._on_task_cancellation_started,
             # Provider returns the in-flight cognition turn's
             # causation chain (serialized) so outbound A2A tasks
             # carry the lineage. The dispatcher sets the chain on
@@ -2172,6 +2248,7 @@ class KestrelAgent(
             # See #905 review P1 — without this, A→B→A loops would
             # restart at depth 1 every iteration.
             causation_chain_provider=self._provide_causation_chain,
+            host_agent_id=self.did,
         )
         # Register teardown BEFORE initialize: ``TaskManager.initialize()`` opens
         # its A2A store connections (task/session/observability/memory/feedback)
@@ -2856,6 +2933,22 @@ class KestrelAgent(
                 "birth_record", cause_type="BirthRecordIdentityMissing"
             )
 
+    def _warn_unmatched_isolated_runtime_idle_timeouts(
+        self, discovered_features: tuple[Any, ...] | list[Any]
+    ) -> None:
+        """Make typoed pre-discovery lifecycle overrides operator-visible."""
+
+        idle_timeouts = self.__dict__.get("isolated_runtime_idle_timeouts", {})
+        if not isinstance(idle_timeouts, Mapping):
+            return
+        discovered_names = {feature.name for feature in discovered_features}
+        for unmatched_name in sorted(set(idle_timeouts) - discovered_names):
+            logging.warning(
+                "Ignoring isolated runtime idle timeout override for undiscovered "
+                "feature %s",
+                unmatched_name,
+            )
+
     async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
         """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""
         # Resolve agent name BEFORE features so features can use it
@@ -2935,6 +3028,7 @@ class KestrelAgent(
         discovered_features = discover_features(
             self, allowed_features=effective_features
         )
+        self._warn_unmatched_isolated_runtime_idle_timeouts(discovered_features)
         # Register the feature teardown BEFORE the loop so a failure partway
         # through registration (or in post_all_features_loaded below) rolls back
         # every feature already initialized — each feature.initialize() may have
@@ -5381,7 +5475,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    @bind_async_invocation("invocation_id")
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
@@ -5464,23 +5558,35 @@ Expected Duration: {expected_duration}
             command = prefixed_command_token(user_input)
             if command is not None:
                 if command not in SAFE_MODE_COMMANDS:
+                    from kestrel_sovereign.agent.constitution import (
+                        describe_safe_mode_restriction,
+                    )
+
+                    # A blocked COMMAND was told "integrity issue" whatever
+                    # the cause, so the branch an operator hits while trying
+                    # to diagnose was the one still misreporting it.
+                    blocked_by = describe_safe_mode_restriction(
+                        self, audit_pending=audit_pending
+                    )
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
-                        "The agent has detected an integrity issue and is operating in restricted mode.\\n"
+                        f"The agent is operating in restricted mode due to {blocked_by}.\\n"
                         "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
-                        "Please contact your administrator to resolve the integrity issue."
+                        "Please contact your administrator to resolve it."
                     )
             else:
-                restriction = (
-                    "a required startup integrity audit"
-                    if audit_pending
-                    else "an integrity failure"
+                from kestrel_sovereign.agent.constitution import (
+                    describe_safe_mode_restriction,
+                )
+
+                restriction = describe_safe_mode_restriction(
+                    self, audit_pending=audit_pending
                 )
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
                     f"The agent cannot process queries due to {restriction}.\\n"
                     "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
-                    "Normal operation will resume once integrity is restored."
+                    "Normal operation will resume once the restriction is cleared."
                 )
 
         # Everything below this point CAN touch conversation history
@@ -6987,6 +7093,7 @@ Expected Duration: {expected_duration}
     # - register_active_request
     # - cancel_current_request
     # - is_request_cancelled
+    # - wait_for_request_completion
     # - _cleanup_cancelled_request
 
     def resolve_effective_name(

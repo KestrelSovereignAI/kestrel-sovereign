@@ -1018,7 +1018,7 @@ class TestCancellation:
 
         agent.register_active_request("request-456")
         agent._current_request_id = "request-456"
-        agent._cancelled_requests.add("request-456")
+        agent.cancel_current_request("request-456")
 
         assert agent.is_request_cancelled() is True
 
@@ -1030,7 +1030,7 @@ class TestCancellation:
         )
 
         agent.register_active_request("request-456")
-        agent._cancelled_requests.add("request-456")
+        agent.cancel_current_request("request-456")
 
         assert agent.is_request_cancelled("request-456") is True
         assert agent.is_request_cancelled("request-789") is False
@@ -3884,7 +3884,6 @@ class TestInvocationContextEndToEndThreading:
     def test_process_input_streaming_accepts_positional_model_override(self):
         """Same backwards-compat cover for the streaming entry point."""
         import inspect as _inspect
-        from kestrel_sovereign.agent.streaming import StreamingMixin
         sig = _inspect.signature(StreamingMixin.process_input_streaming)
         params = list(sig.parameters.values())
         assert params[1].name == "user_input"

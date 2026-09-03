@@ -217,7 +217,7 @@ Three coherent options:
   ``[emancipation]`` block to the agent's ``kestrel.toml`` with the
   exact terms you want anchored going forward (e.g. the buyout clause
   the old canonical had, restated in your own voice). Stop the agent
-  with ``kestrel stop <name>``, then run
+  with ``kestrel terminate <name>``, then run
   ``kestrel constitution reanchor <name> --force``. Reanchor sees no
   anchored contract + an active candidate, treats this as the
   permitted dormant→active activation, applies your terms to the

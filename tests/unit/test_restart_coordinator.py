@@ -642,12 +642,21 @@ def test_list_restart_requests_description_includes_updating_and_returns():
     ):
         assert token in desc
     assert "count" in desc and "requests" in desc
+    assert "this agent" in desc
+    assert "Other agents' requests are never visible" in desc
 
 
 def test_cancel_restart_request_description_documents_returns():
     desc = _tool_desc(RestartCoordinatorFeature.cancel_restart_request)
     assert "canceled" in desc
     assert "request_id" in desc
+    assert "Another agent's request cannot be canceled" in desc
+
+
+def test_acknowledge_restart_escalation_description_is_principal_scoped():
+    desc = _tool_desc(RestartCoordinatorFeature.acknowledge_restart_escalation)
+    assert "filed by this agent" in desc
+    assert "another agent" in desc
 
 
 @pytest.mark.asyncio
@@ -746,7 +755,83 @@ async def test_cancel_unknown_id_errors(tmp_path):
     feat, _ = await _make_feature(tmp_path)
     cancel = await feat.cancel_restart_request("does-not-exist")
     assert cancel.error is not None
-    assert "No restart request" in cancel.error
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_cancel_another_agents_restart_request(tmp_path):
+    owner, backend = await _make_feature(tmp_path, did="did:test:owner")
+    attacker = RestartCoordinatorFeature(
+        _make_agent(backend, did="did:test:attacker")
+    )
+    await attacker.initialize()
+    created = await owner.request_restart(reason="owner-only restart")
+    request_id = created.data["request"]["id"]
+
+    unauthorized = await attacker.cancel_restart_request(request_id)
+    missing = await attacker.cancel_restart_request("missing-request")
+
+    assert unauthorized.error == missing.error
+    assert (await get_request(backend, request_id)).status == "pending"
+    assert (await owner.cancel_restart_request(request_id)).status is ToolResultStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_shared_store_cancel_race_has_one_authorized_winner(tmp_path):
+    first, backend = await _make_feature(tmp_path, did="did:test:owner")
+    second = RestartCoordinatorFeature(
+        _make_agent(backend, did="did:test:owner")
+    )
+    await second.initialize()
+    created = await first.request_restart(reason="race")
+    request_id = created.data["request"]["id"]
+
+    results = await asyncio.gather(
+        first.cancel_restart_request(request_id),
+        second.cancel_restart_request(request_id),
+    )
+
+    assert sum(result.status is ToolResultStatus.OK for result in results) == 1
+    assert sum(result.status is ToolResultStatus.ERROR for result in results) == 1
+    assert (await get_request(backend, request_id)).status == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_acknowledge_another_agents_escalation(tmp_path):
+    owner, backend = await _make_feature(tmp_path, did="did:test:owner")
+    attacker = RestartCoordinatorFeature(
+        _make_agent(backend, did="did:test:attacker")
+    )
+    await attacker.initialize()
+    created = await owner.request_restart(reason="legacy owner request")
+    request_id = created.data["request"]["id"]
+    await backend.execute(
+        "UPDATE restart_requests SET escalation_acknowledged = 0 WHERE id = ?",
+        (request_id,),
+    )
+
+    unauthorized = await attacker.acknowledge_restart_escalation(request_id)
+    missing = await attacker.acknowledge_restart_escalation("missing-request")
+
+    assert unauthorized.error == missing.error
+    assert (await get_request(backend, request_id)).escalation_acknowledged is False
+    acknowledged = await owner.acknowledge_restart_escalation(request_id)
+    assert acknowledged.status is ToolResultStatus.OK
+    assert (await get_request(backend, request_id)).escalation_acknowledged is True
+
+
+@pytest.mark.asyncio
+async def test_restart_request_list_is_scoped_to_requesting_agent(tmp_path):
+    owner, backend = await _make_feature(tmp_path, did="did:test:owner")
+    other = RestartCoordinatorFeature(_make_agent(backend, did="did:test:other"))
+    await other.initialize()
+    own = await owner.request_restart(reason="owner detail")
+    await other.request_restart(reason="other private detail")
+
+    listed = await owner.list_restart_requests()
+
+    assert listed.data["count"] == 1
+    assert listed.data["requests"][0]["id"] == own.data["request"]["id"]
+    assert "other private detail" not in str(listed.data)
 
 
 # ---------------------------------------------------------------------------
@@ -924,11 +1009,17 @@ def _attach_lifecycle(agent):
     agent._current_request_id = None
     agent._active_request_started_at = {}
     agent._cancelled_requests = set()
+    agent._pending_request_cancellations = {}
     for name in (
         "register_active_request",
+        "_prune_pending_request_cancellations",
+        "_consume_pending_request_cancellation",
         "prune_stale_active_requests",
         "active_request_ages",
         "_cleanup_cancelled_request",
+        "_request_generation_for_cleanup",
+        "_remember_pruned_cleanup_generation",
+        "_forget_pruned_cleanup_generation",
     ):
         setattr(
             agent, name,
@@ -2458,6 +2549,42 @@ async def test_idle_ignores_a2a_question_supervisor_tasks(tmp_path):
     finally:
         sup_task.cancel()
         replay_task.cancel()
+        work_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_idle_ignores_isolated_runtime_lifecycle_daemons(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+
+    async def _never():
+        await asyncio.Event().wait()
+
+    supervisor = asyncio.create_task(_never(), name="isolated-feature:Search")
+    idle_monitor = asyncio.create_task(
+        _never(), name="isolated-feature-idle:Search"
+    )
+    telemetry = asyncio.create_task(
+        _never(), name="isolated-runtime-telemetry:Search"
+    )
+    work_task = asyncio.create_task(_never(), name="isolated-call:Search")
+    try:
+        feat.agent._background_tasks = {supervisor, idle_monitor, telemetry}
+        assert feat._agent_appears_idle()["idle"] is True
+
+        feat.agent._background_tasks = {
+            supervisor,
+            idle_monitor,
+            telemetry,
+            work_task,
+        }
+        busy = feat._agent_appears_idle()
+        assert busy["idle"] is False
+        assert "isolated-call:Search" in busy["reason"]
+        assert "isolated-feature" not in busy["reason"]
+    finally:
+        supervisor.cancel()
+        idle_monitor.cancel()
+        telemetry.cancel()
         work_task.cancel()
 
 

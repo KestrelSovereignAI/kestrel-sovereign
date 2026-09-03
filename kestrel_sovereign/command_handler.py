@@ -513,7 +513,15 @@ class CommandHandler:
                 return await result
             return result
         if self.agent._safe_mode:
-            return "🚨 SAFE MODE ACTIVE: Agent functionality restricted due to integrity failure."
+            from kestrel_sovereign.agent.constitution import (
+                describe_safe_mode_restriction,
+            )
+
+            restriction = describe_safe_mode_restriction(self.agent)
+            return (
+                "🚨 SAFE MODE ACTIVE: Agent functionality restricted due to "
+                f"{restriction}."
+            )
         if getattr(self.agent, "_constitution_audit_pending", False):
             return "🚨 STARTUP AUDIT PENDING: Normal cognition remains restricted."
         return "✅ Normal operation mode. No integrity issues detected."

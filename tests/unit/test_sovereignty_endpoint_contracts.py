@@ -319,6 +319,33 @@ def test_sovereignty_import_uses_shared_request_identity_for_agent_command():
         _restore_app(app, original)
 
 
+def test_sovereignty_import_reports_cooperative_stop_as_conflict():
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+
+    agent = MagicMock(storage=MagicMock())
+    agent.process_input = AsyncMock(
+        side_effect=InvocationCancelledError("isolated turn stopped")
+    )
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/sovereignty/import",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Request-ID": "sovereignty-stopped-turn",
+                    },
+                    json={"cid": "bafyvalidstoppedturn"},
+                )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Request stopped during execution."
+        assert response.headers["X-Request-ID"] == "sovereignty-stopped-turn"
+    finally:
+        _restore_app(app, original)
+
+
 def test_sovereignty_files_listing_and_preview_contract(tmp_path):
     from kestrel_sovereign.endpoints import sovereignty as sovereignty_endpoints
 

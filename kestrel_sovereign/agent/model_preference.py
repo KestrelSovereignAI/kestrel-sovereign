@@ -98,7 +98,47 @@ class ModelPreferenceMixin:
                 )
                 return
             if model and model != "auto":
-                self.llm_service.set_model_preference(model, vendor, route)
+                # Re-applying our OWN persisted decision, so do not re-validate
+                # it against the live catalog (#3190).
+                #
+                # Validation belongs at the boundary where NEW information
+                # enters — `set_model_preference` from an operator or a tool,
+                # where #1927/#1946 guard against a hallucinated triple being
+                # written. Replaying a triple this agent already accepted is a
+                # different boundary, and gating it on a catalog fetched
+                # seconds earlier means a transient discovery problem silently
+                # revokes a deliberate choice.
+                #
+                # That is exactly the 2026-08-31 outage: the Anthropic key was
+                # disabled, `GET /v1/models` 401ed, the collapsed catalog
+                # "proved" claude-opus-5 unservable, this call raised, the
+                # except below swallowed it, and all four agents booted
+                # unpinned onto a 1B local model. The route itself was fine
+                # throughout — only discovery was broken.
+                #
+                # If the pin really is unservable, `resolve_provider_routing`
+                # raises `LLMProviderUnavailableError` at use time. Loud at the
+                # point of use beats silent at boot.
+                # Local model-ignoring routes keep their validation (#3190
+                # r8 P2). `llama_cpp` and `ollama` serve whatever model is
+                # currently loaded and ignore the requested id, and the
+                # streaming paths never call `_model_available_for_route`. So a
+                # stale persisted id restored without validation is not merely
+                # a wrong pin — responses from the newly loaded model get
+                # reported and METERED as the model that is no longer there.
+                #
+                # The bypass exists because a remote vendor's catalog can be
+                # transiently unfetchable while the route still serves the
+                # pinned model perfectly. That argument does not hold for a
+                # local server: its catalog is what it has actually loaded, so
+                # a populated local catalog that disagrees is evidence, not a
+                # discovery artefact.
+                from kestrel_sovereign.llm.service import _MODEL_IGNORING_VENDORS
+
+                revalidate = vendor in _MODEL_IGNORING_VENDORS
+                self.llm_service.set_model_preference(
+                    model, vendor, route, validate=revalidate
+                )
                 if vendor and route:
                     logging.info("Loaded persisted model preference: %s:%s/%s", vendor, route, model)
                 elif vendor:
@@ -107,6 +147,15 @@ class ModelPreferenceMixin:
                     logging.info("Loaded persisted model preference: %s", model)
         except Exception as e:
             logging.warning(f"Failed to load model preference: {e}")
+            # Record the drop for the health surface (#3190). A persisted pin
+            # that fails to apply is an operator-visible degradation: the agent
+            # then runs unpinned and routing falls through to route_priority,
+            # which with allow_paid_fallback=false can land on a 1B local model.
+            # A WARNING line in a multi-million-line host log is not a surface.
+            try:
+                self.llm_service._mandate_load_error = str(e)[:300]
+            except Exception:  # pragma: no cover - never fail boot on reporting
+                pass
 
     async def _persist_model_preference(
         self,
