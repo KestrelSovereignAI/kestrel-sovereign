@@ -338,8 +338,14 @@ WORKFLOW_MUTATION_TOOLS = frozenset(
         "workflow_remediate",
         # Scheduler-executable one-shot targets (kestrel-feature-workflows
         # 0.5.x): each RESOLVES an await_signal wait — a deadline win or a
-        # durable delivery — i.e. it advances run state. They exist for the
-        # scheduler to fire, never for the orchestrator to call (#3195).
+        # durable delivery — i.e. it advances run state, so the orchestrator
+        # must not call them (#3195). Note the ceiling cannot say
+        # "machine-only": MandateRestrictionHook matches on tool name alone,
+        # so a scheduler tick on THIS agent is denied too — which was already
+        # true under the positive allowlist before these names were listed.
+        # An await_signal stage on the orchestrator itself therefore cannot
+        # resolve; that is a durable-scheduler authority gap, not a
+        # classification one.
         "workflow_await_signal_deadline",
         "workflow_await_signal_delivery",
     }
