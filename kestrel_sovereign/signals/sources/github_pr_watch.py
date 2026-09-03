@@ -215,8 +215,21 @@ def _check_verdict(
 
     if not runs_read and not status_read:
         return "unknown"
+
+    # A ``total_count`` above what came back means gates this verdict never
+    # saw (a page the fetch could not follow, or a caller that read one
+    # page). An unread gate can only hide MORE failures, never turn an
+    # observed one into a pass, so it acts in exactly two places: it stops
+    # an empty page from reading as "no CI ran" (the rollup is not empty, it
+    # is unread), and it lowers "success" to "pending". It never touches an
+    # observed failure.
+    unread_runs = False
+    if isinstance(check_runs, dict):
+        total = check_runs.get("total_count")
+        unread_runs = isinstance(total, int) and total > len(runs)
+
     if not runs and not statuses and not combined_state:
-        return "none"
+        return "pending" if unread_runs else "none"
 
     # Not terminal yet if any check run is still queued/in_progress, or the
     # combined/legacy status is still pending.
@@ -239,15 +252,9 @@ def _check_verdict(
         if str(s.get("state", "") or "").lower() in ("failure", "error"):
             return "failure"
 
-    # Everything READ passed. A commit whose check runs outnumber what was
-    # returned (a page the fetch could not follow, or a caller that read one
-    # page) has gates this verdict never saw; an unread gate can only hide
-    # more failures, never turn an observed one into a pass, so it lowers
-    # "success" to "pending" and nothing else.
-    if isinstance(check_runs, dict):
-        total = check_runs.get("total_count")
-        if isinstance(total, int) and total > len(runs):
-            return "pending"
+    # Everything READ passed; gates never read keep it short of "success".
+    if unread_runs:
+        return "pending"
 
     return "success"
 
@@ -412,12 +419,6 @@ def evaluate_pr_watch(
 # ---------------------------------------------------------------------------
 
 
-#: Pages of check runs followed per commit. 100 per page × 10 pages covers
-#: any real rollup many times over; the cap keeps a pathological head from
-#: turning one poll into an unbounded crawl.
-_MAX_CHECK_RUN_PAGES = 10
-
-
 async def _github_get_check_runs(
     base: str, head_sha: str, *, token: str, timeout: int, ref: str
 ) -> Any:
@@ -427,6 +428,13 @@ async def _github_get_check_runs(
     ``page=`` until ``total_count`` is met, so a gate on page two is read
     rather than merely detected. Returns the first page's object with its
     ``check_runs`` extended, so callers see the shape the API documents.
+
+    The crawl is bounded by GitHub's own ``total_count``: every non-empty
+    page grows ``runs`` and an empty page ends the loop, so it issues at most
+    ``ceil(total_count / 100)`` requests. There is deliberately no fixed page
+    cap on top of that — a rollup larger than a cap would be read short every
+    poll, and :func:`_check_verdict` would then hold it at ``"pending"``
+    forever, the one state class this rollup must never settle in (#2939).
     """
     first = await _github_get(
         f"{base}/commits/{head_sha}/check-runs?per_page=100",
@@ -437,7 +445,7 @@ async def _github_get_check_runs(
     runs = [r for r in (first.get("check_runs") or []) if isinstance(r, dict)]
     total = first.get("total_count")
     page = 1
-    while isinstance(total, int) and len(runs) < total and page < _MAX_CHECK_RUN_PAGES:
+    while isinstance(total, int) and len(runs) < total:
         page += 1
         more = await _github_get(
             f"{base}/commits/{head_sha}/check-runs?per_page=100&page={page}",

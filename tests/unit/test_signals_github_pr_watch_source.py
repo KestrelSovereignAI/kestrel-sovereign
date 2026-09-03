@@ -486,6 +486,56 @@ def test_check_verdict_treats_unreturned_runs_as_pending_but_never_hides_a_failu
     assert _check_verdict(page, {"state": "pending", "statuses": []}) == "failure"
 
 
+def test_check_verdict_unread_runs_on_an_empty_page_are_pending_not_none():
+    """``total_count`` says gates exist but none came back: that rollup is
+    unread, not empty. "none" is terminal downstream (PARTIAL, "no CI ran"),
+    so it must not be reached past a total the read never met. The rule
+    still never hides an observed failure, and a zero total is still none."""
+    from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
+
+    empty_page = {"total_count": 45, "check_runs": []}
+    assert _check_verdict(empty_page, {"state": "pending", "statuses": []}) == "pending"
+    assert _check_verdict(empty_page, None) == "pending"
+    legacy_failure = {
+        "state": "failure", "statuses": [{"context": "ci/legacy", "state": "failure"}]
+    }
+    assert _check_verdict(empty_page, legacy_failure) == "failure"
+    assert _check_verdict({"total_count": 0, "check_runs": []}, None) == "none"
+
+
+@pytest.mark.asyncio
+async def test_fetch_check_runs_reads_a_rollup_larger_than_any_page_cap(monkeypatch):
+    """A 1,500-run head is read to the end and resolves terminal. A fixed page
+    cap read it short on every poll, and the unread-gate rule then pinned it
+    at "pending" for good — the one state class this module forbids."""
+    import re
+
+    import kestrel_sovereign.signals.sources.github_pr_watch as watch
+    from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
+
+    total = 1500
+    calls = []
+
+    async def fake_get(url, *, token, timeout, ref):
+        calls.append(url)
+        m = re.search(r"[?&]page=(\d+)", url)
+        page = int(m.group(1)) if m else 1
+        lo = (page - 1) * 100
+        return {"total_count": total, "check_runs": [
+            {"name": f"job-{i}", "status": "completed", "conclusion": "success"}
+            for i in range(lo, min(lo + 100, total))
+        ]}
+
+    monkeypatch.setattr(watch, "_github_get", fake_get)
+    rollup = await watch._github_get_check_runs(
+        "https://api.github.com/repos/o/r", "deadbeef", token="t", timeout=5, ref="o/r#7"
+    )
+
+    assert len(calls) == 15
+    assert len(rollup["check_runs"]) == total
+    assert _check_verdict(rollup, {"state": "pending", "statuses": []}) == "success"
+
+
 @pytest.mark.asyncio
 async def test_fetch_pr_state_follows_check_run_pages(monkeypatch):
     """The unread-page verdict must be a condition the fetch can clear: page
