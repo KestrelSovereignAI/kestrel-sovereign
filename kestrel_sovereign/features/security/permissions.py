@@ -52,7 +52,7 @@ def fold_query(text):
     """
     if not text:
         return text
-    return _decode_escapes(text).casefold()
+    return _decode_unicode_escapes(text).casefold()
 
 
 def fold_stored_summary(text):
@@ -101,9 +101,15 @@ def fold_stored_summary(text):
         # introduced, so `say "hello"`, multiline text and Windows paths would
         # not match their own stored form. ensure_ascii=False happens to fix
         # \uXXXX and nothing else.
-        return _flatten_json(parsed).casefold()
+        # Same hazard round 5 closed on the unparseable branch: json.dumps
+        # happily stores a lone surrogate (a cut emoji in model-emitted
+        # arguments), and handing one back to SQLite from inside the scalar
+        # function raises — which fails the WHOLE query, so one poisoned row
+        # made every search return an error, permanently. Replace here, at
+        # the one place the value crosses back into SQLite.
+        return _flatten_json(parsed).casefold().encode("utf-8", "replace").decode("utf-8")
     if isinstance(parsed, str):
-        return parsed.casefold()
+        return parsed.casefold().encode("utf-8", "replace").decode("utf-8")
     return str(parsed).casefold()
 
 
@@ -142,6 +148,34 @@ _STANDARD_ESCAPE = re.compile(r'\\(["\\/bfnrt])')
 _SURROGATE_PAIR = re.compile(
     r"\\u(d[89ab][0-9a-fA-F]{2})\\u(d[c-f][0-9a-fA-F]{2})", re.IGNORECASE
 )
+
+
+def _decode_unicode_escapes(text):
+    """Decode only ``\\uXXXX`` (and surrogate pairs) in a QUERY.
+
+    The stored side of a parseable row comes out of ``json.loads`` already
+    decoded, so a query must be treated the same way — decoding the standard
+    escapes too turned ``\\b`` in a grep the agent just ran into a backspace,
+    and the search for that exact command reported a false absence, with a
+    message telling the caller absence is weak evidence (#3107 round 10).
+    ``_decode_escapes`` keeps the standard escapes for the stored-unparseable
+    path, where they are load-bearing.
+    """
+    def _one(match):
+        code = int(match.group(1), 16)
+        if 0xD800 <= code <= 0xDFFF:
+            return match.group(0)
+        return chr(code)
+
+    paired = _SURROGATE_PAIR.sub(
+        lambda m: chr(
+            0x10000
+            + ((int(m.group(1), 16) - 0xD800) << 10)
+            + (int(m.group(2), 16) - 0xDC00)
+        ),
+        text,
+    )
+    return _UNICODE_ESCAPE.sub(_one, paired)
 
 
 def _decode_escapes(text):

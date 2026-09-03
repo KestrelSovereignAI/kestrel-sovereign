@@ -1541,3 +1541,74 @@ async def test_the_tool_masks_a_legacy_row_on_the_way_out(tmp_path):
     assert "sk-live-LEGACY-LEAK" not in result.confirmation
     assert "sk-live-LEGACY-LEAK" not in str(result.data)
     assert "***MASKED***" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_a_parseable_row_with_a_lone_surrogate_does_not_kill_every_search(tmp_path):
+    """Round 5 closed this on the unparseable branch only. json.dumps stores a
+    lone surrogate happily; handing it back to SQLite from the scalar function
+    raised, and a raised scalar fails the WHOLE query — one poisoned row and
+    every search errored, permanently."""
+    import json
+
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "surrogate.db"))
+    await store.initialize()
+    await _log_filing(store, json.dumps({"cmd": "grep -E stalled logs/host.log"}))
+    await _log_filing(store, json.dumps({"title": "note \ud83d"}))  # poisoned row
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="stalled")
+
+    assert result.status is not ToolResultStatus.ERROR, result.error
+    assert result.data["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_query_with_a_backslash_matches_the_command_the_agent_ran(store):
+    """The stored side of a parseable row is already decoded by json.loads; a
+    query that went through the standard-escape decoder turned ``\\b`` into a
+    backspace and reported the agent's own grep as never run."""
+    import json
+
+    command = 'grep -E "\\bstalled\\b" logs/host.log'
+    await _log_filing(store, json.dumps({"cmd": command}))
+
+    matches, _ = await store.search_audit_log(command)
+
+    assert len(matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_hook_door_keeps_the_shared_500_char_cap(tmp_path):
+    """Round 3 removed the hook's private 200-char override so both writers
+    truncate at the shared 500 and the read-back can state one bound.
+    Restoring ``max_length=200`` left every test green — the claim was
+    user-visible and unenforced."""
+    from kestrel_sdk.hooks import HookInput
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from kestrel_sovereign.features.security.hooks import SecurityHook
+    from kestrel_sovereign.features.security.permissions import PermissionLevel
+
+    store = PermissionStore(str(tmp_path / "cap.db"))
+    await store.initialize()
+    await store.register_tool("GitHubFeature", "create_github_issue", PermissionLevel.ALLOW)
+    hook = SecurityHook(store, ApprovalQueue(permission_store=store))
+
+    body = ("x" * 260) + " the phrase past the old cap " + ("y" * 40)
+    await hook.execute(HookInput(
+        session_id="s",
+        hook_event_name="PreToolUse",
+        tool_name="create_github_issue",
+        feature_name="GitHubFeature",
+        tool_input={"title": "t", "body": body},
+    ))
+
+    logged = await store.get_audit_log(10)
+    rows = [r for r in logged if r["tool"] == "create_github_issue"]
+    assert rows and len(rows[0]["args_summary"] or "") > 200
+    matches, _ = await store.search_audit_log("the phrase past the old cap")
+    assert len(matches) == 1
