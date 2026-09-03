@@ -399,8 +399,14 @@ def test_private_method_keeps_external_callers(repo: Path) -> None:
         "    def go(self):\n"
         "        return self._dispatch(1)\n"
     )
+    # Routed through a third module on purpose: ``user.py`` imports neither
+    # ``mod`` nor the name ``_dispatch``, so ``module_importers()`` cannot keep
+    # it in scope by accident — only the "methods are not module-private" rule
+    # can. With a direct ``from mod import Queue`` the test stayed green when
+    # that rule was deleted.
+    (repo / "hub.py").write_text("from mod import Queue\n")
     (repo / "user.py").write_text(
-        "from mod import Queue\n\n\ndef run(q: Queue):\n    return q._dispatch(2)\n"
+        "from hub import Queue\n\n\ndef run(q: Queue):\n    return q._dispatch(2)\n"
     )
     _commit(repo)
     text = (repo / "mod.py").read_text()
@@ -1269,3 +1275,21 @@ def test_a_c_quoted_filename_is_searched_for_unchanged_siblings(repo: Path) -> N
 
     finding = _named(_findings(repo), "tool_execution")
     assert [(o.path, o.line) for o in finding.unchanged] == [("café.py", 1)]
+
+
+# --------------------------------------------------------------------------
+# An untouched CANDIDATE that cannot be parsed is NOT ANALYSED, not clean.
+# --------------------------------------------------------------------------
+
+def test_an_unparseable_sibling_is_reported_not_silently_dropped(repo: Path) -> None:
+    """``_tree_for`` swallowed a sibling's read/parse failure and returned no
+    tree, so its occurrences vanished and the gate printed "every site was
+    touched" — the second door of the invariant ``collect`` already guards for
+    a CHANGED file in the same state."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "sib.py").write_text('B = "tool_execution"\ndef broken(\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    assert "sib.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1

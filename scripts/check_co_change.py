@@ -835,6 +835,14 @@ def collect(
                 )
                 if any(line in old_map.get(path, ()) for line in range(start, end + 1))
             ]
+            # Count-based reconciliation: an old site on a changed old line is
+            # assumed to be one of this file's touched NEW sites edited in
+            # place, so only the surplus is added. A file that REMOVES one
+            # call and ADDS another in the same diff is indistinguishable
+            # from an in-place edit by count, text, or coordinate (both trees
+            # differ at both ends), so that shape understates the headline
+            # "modified N of M" by one. The ``unchanged`` listing — what the
+            # reader acts on — is unaffected either way.
             already = sum(1 for o in touched if o.path == path)
             for start, end in old_changed[already:]:
                 touched.append(Occurrence(path, start, end))
