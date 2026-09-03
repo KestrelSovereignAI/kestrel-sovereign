@@ -158,16 +158,27 @@ def changed_line_map(
     old_map: dict[str, set[int]] = defaultdict(set)
     new_path: str | None = None
     old_path: str | None = None
+    # Headers only appear between a `diff --git` line and that file's first
+    # hunk. Once inside a hunk, a line beginning `--- ` is a REMOVED source
+    # line whose own text starts with `-- ` (a SQL comment at column zero),
+    # not a header; reading it as one re-keys the old-side map to a bogus
+    # path and voids every old-side line that follows.
+    in_hunk = False
     for line in diff.splitlines():
-        if line.startswith("--- "):
+        if line.startswith("diff --git "):
+            in_hunk = False
+            old_path = new_path = None
+            continue
+        if not in_hunk and line.startswith("--- "):
             old_path = _patch_path(line)
             continue
-        if line.startswith("+++ "):
+        if not in_hunk and line.startswith("+++ "):
             new_path = _patch_path(line)
             continue
         match = _HUNK.match(line)
         if not match:
             continue
+        in_hunk = True
         old_start, old_count, new_start, new_count = match.groups()
         if old_path is not None:
             count = 1 if old_count is None else int(old_count)

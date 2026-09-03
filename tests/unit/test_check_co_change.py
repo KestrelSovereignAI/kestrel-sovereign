@@ -1214,3 +1214,58 @@ def test_a_c_quoted_filename_is_decoded(repo: Path) -> None:
 
     finding = _named(_findings(repo), "tool_execution")
     assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 1)]
+
+
+# --------------------------------------------------------------------------
+# A diff BODY line is never a header. With -U0 there are no context lines, but
+# removed lines still carry a `-` prefix, so a source line that itself starts
+# with `-- ` (a SQL comment at column zero) reads as `--- ...` — the shape of a
+# file header. Reading it as one re-keys the old-side map to a bogus path and
+# the rename-one-of-N sibling is never surfaced.
+# --------------------------------------------------------------------------
+
+def test_a_removed_source_line_that_looks_like_a_header_is_not_one(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        'SQL = """\n-- a sql comment at column zero\n"""\n'
+        'A = "tool_execution"\nB = "tool_execution"\n'
+    )
+    (repo / "other.py").write_text('C = "tool_execution"\n')
+    _commit(repo)
+    # Delete the comment line and rename the literal at both mod.py sites;
+    # other.py keeps the old name and must be surfaced.
+    (repo / "mod.py").write_text(
+        'SQL = """\n"""\nA = "subagent_dispatch"\nB = "subagent_dispatch"\n'
+    )
+
+    _, old_map = checker.changed_line_map(["HEAD"])
+    assert set(old_map) == {"mod.py"}, f"body line read as a header: {sorted(old_map)}"
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("other.py", 1)]
+
+
+def test_a_removed_line_naming_a_py_file_does_not_become_a_lookup_path(repo: Path) -> None:
+    """The spoofed header survives the ``.py`` filter and crashed ``collect``."""
+    (repo / "mod.py").write_text(
+        'SQL = """\n-- see docs in helper.py\n"""\nA = "tool_execution"\n'
+    )
+    (repo / "other.py").write_text('C = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('SQL = """\n"""\nA = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")  # must not raise
+    assert [(o.path, o.line) for o in finding.unchanged] == [("other.py", 1)]
+
+
+def test_a_c_quoted_filename_is_searched_for_unchanged_siblings(repo: Path) -> None:
+    """Round 9 (`_paths`, NUL-delimited git output) guards the OTHER end of the
+    boundary: the non-ASCII file is the untouched sibling, which only the
+    `git grep -l` prefilter can find — a C-quoted name there is a path that
+    does not exist, and the occurrence silently vanishes."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "café.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("café.py", 1)]
