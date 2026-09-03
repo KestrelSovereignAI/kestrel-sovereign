@@ -21,6 +21,7 @@ Glob patterns are honored via ``fnmatch`` (delegated to
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from enum import Enum
@@ -235,47 +236,164 @@ def evaluate_argv_paths(
 _SHELL_CONTROL_CHARS = frozenset(";&|`$()<>\n\r")
 
 
-def command_contains_unquoted_shell_control(cmd: str) -> bool:
-    """Return True iff ``cmd`` has a shell control character outside
-    a quoted region.
+# Characters that reach a program unchanged: a shell gives them no
+# meaning in a bare word, and ``shlex`` treats them as ordinary too. The
+# rule below is an ALLOW-list of these rather than a deny-list of shell
+# constructs, and that direction is the whole point.
+#
+# Five rounds of review on #3129 each found another construct a
+# deny-list had missed — ``$[1+1]``, a comment, ``$"..."``, brace
+# expansion, a tilde after an assignment, a nested brace — or another
+# command it refused that bash and ``shlex`` agreed on. Enumerating what
+# a shell does is writing a shell; the list never closes. Enumerating
+# what a shell ignores closes immediately, and errs toward refusing.
+_INERT_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "-_./:=,+@%^"
+)
 
-    Catches: ``;``, ``&``/``&&``, ``|``/``||``, backticks, ``$(...)``,
-    ``$VAR`` substitution, redirects ``<``/``>``, newlines.
-    Misses: process substitution ``<(...)`` (covered by ``<``/``(``),
-    here-docs (covered by ``<``). Anything inside ``'...'``/``"..."``
-    is ignored — quoted control characters are inert to the shell.
 
-    Defense in depth, not exhaustive parsing. The QUEUE remains the
-    real authoritative gate for anything we downgrade.
+# Words a shell reads as GRAMMAR rather than as the name of a program.
+#
+# The character allow-list above is not enough on its own, because one
+# backend does not exec the argv it is handed: DockerSandboxBackend
+# rebuilds a bash script from it (``" ".join(shlex.quote(a))``) and runs
+# that (#3187). Quoting neutralises every metacharacter there — but a
+# bare word needs no quoting, so ``eval 'dd ...'``, ``FOO=x dd ...`` and
+# ``trap 'dd ...' EXIT`` survive intact and run a binary
+# ``BinaryPolicy`` never saw, having vetted ``eval``, ``FOO=x`` or
+# ``trap``.
+#
+# Listing the builtins that dispatch a command is the enumeration this
+# ticket has been burned by six times: round 7 named `eval`, `exec`,
+# `source`, `.`, `command`, `builtin`, and round 8 answered with
+# `trap` — with `mapfile -C`, `enable -f` and `complete -C` behind it.
+# So the rule is inverted, like the character rule before it: a BUILTIN
+# IS NOT A PROGRAM. Every builtin is refused except the few that are
+# also real binaries behaving identically, which is a short list that
+# closes.
+_BUILTINS_THAT_ARE_ALSO_PROGRAMS = frozenset(
+    {"echo", "printf", "test", "[", "true", "false", "pwd", "kill"}
+)
+
+# Snapshot of bash 5.2, NOT of whatever bash is on this machine. macOS
+# ships bash 3.2, whose `compgen -k` omits `coproc` and whose
+# `compgen -b` omits `mapfile`/`readarray`/`compopt` — so a differential
+# that only asked the local shell passed here and would have failed on
+# the Linux CI runner. The live check still runs, and catches anything a
+# newer bash adds; this snapshot is what makes the check version-proof
+# where the developer's shell is older than the runner's.
+#
+# It is a union of the shells the shipped backends can reach, because
+# "which shell" is not a constant here: DockerExecutor writes a script
+# it calls bash and runs it with `sh` inside `alpine:3.19`, where
+# /bin/sh is BusyBox. Measured in that image rather than read from
+# documentation — BusyBox ash has `chdir`, which bash does not, and
+# `shell("chdir /tmp")` therefore succeeded under the default backend
+# while failing "command not found" under the local one (codex round 9).
+#
+# The limit, stated rather than implied: this covers bash and BusyBox
+# ash. `DEFAULT_IMAGES` is configurable, so an operator who points the
+# backend at an image with a different shell gets grammar this does not
+# know. That is not fixable by a longer list — it is #3187, where a
+# backend named `exec(argv)` stops running a shell at all.
+_SHELL_RESERVED_WORDS = frozenset(
+    "if then else elif fi case esac for select while until do done in "
+    "function time coproc { } ! [[ ]]".split()
+)
+_SHELL_BUILTINS = frozenset(
+    ". : [ alias bg bind break builtin caller cd command compgen compopt "
+    "complete continue declare dirs disown echo enable eval exec exit "
+    "export false fc fg getopts hash help history jobs kill let local "
+    "logout mapfile popd printf pushd pwd read readarray readonly return "
+    "set shift shopt source suspend test times trap true type typeset "
+    "ulimit umask unalias unset wait "
+    # BusyBox ash, measured in alpine:3.19 — `chdir` is the only one it
+    # has that bash does not.
+    "chdir".split()
+)
+
+# An assignment needs a valid shell NAME before the ``=``. bash reports
+# "command not found" for ``--foo=bar`` and ``a-b=x``, so those are
+# ordinary command names and refusing them would be a false refusal —
+# the class codex flagged in round 4. The append form ``FOO+=x`` is an
+# assignment too, and the allow-list lets ``+`` through (round 8).
+_ASSIGNMENT_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
+
+
+@dataclass(frozen=True)
+class ShellSyntax:
+    """A character whose shell meaning this tool cannot honour."""
+
+    index: int
+    char: str
+
+
+def command_word_is_shell_grammar(word: str) -> str | None:
+    """Describe how *word* is grammar rather than a program, or None.
+
+    Only meaningful in command position — ``FOO=x`` is an ordinary
+    argument anywhere else, and ``if`` is just a word.
+    """
+    if not word:
+        return None
+    if _ASSIGNMENT_PREFIX.match(word):
+        return "an assignment, which sets a variable for another command"
+    if word in _SHELL_RESERVED_WORDS:
+        return "a shell keyword, which introduces a compound command"
+    if word in _SHELL_BUILTINS and word not in _BUILTINS_THAT_ARE_ALSO_PROGRAMS:
+        return "a shell builtin, not a program this tool can run"
+    return None
+
+
+def _quote_context(cmd: str):
+    r"""Yield ``(index, char, context, escaped)`` for each character.
+
+    ``context`` is ``"bare"``, ``"single"`` or ``"double"``; ``escaped``
+    says a backslash the shell honours precedes this character. Quote
+    marks that open or close a region are not yielded — they are
+    structure, not content — but an ESCAPED quote is, because it is
+    content: bash reads ``foo\\'`` as a literal apostrophe and keeps
+    reading the line unquoted.
+
+    That distinction is not decoration. Dropping it opened a bogus
+    single-quoted region at the escaped quote in
+    ``echo foo\\'; sudo -n true``, which hid the ``;`` from
+    :func:`first_unquoted_shell_control` — so ``BinaryPolicy`` saw an
+    allow-listed ``echo``, the codex bridge auto-accepted, and a real
+    shell ran the deny-listed second command with no approval. The
+    backslash itself is still yielded, so a caller that treats it as
+    significant sees it.
+
+    Single quotes take no escapes in a shell, so a backslash inside one
+    is an ordinary character.
     """
     if not isinstance(cmd, str):
-        return False
-    # Inside double quotes the shell still expands ``$VAR`` and runs
-    # ``$(...)`` / backticks. Only single-quoted regions truly disable
-    # those — so we treat ``$`` and backticks as risky regardless of
-    # double-quote context.
-    DQ_ACTIVE_CHARS = frozenset("$`")
-    in_single = False
-    in_double = False
+        return
+    in_single = in_double = False
     i = 0
     while i < len(cmd):
         c = cmd[i]
         if in_single:
             if c == "'":
                 in_single = False
+            else:
+                yield (i, c, "single", False)
             i += 1
             continue
+        context = "double" if in_double else "bare"
+        if c == "\\" and i + 1 < len(cmd):
+            yield (i, c, context, False)
+            yield (i + 1, cmd[i + 1], context, True)
+            i += 2
+            continue
         if in_double:
-            if c == "\\" and i + 1 < len(cmd):
-                # Skip an escaped char inside double quotes.
-                i += 2
-                continue
             if c == '"':
                 in_double = False
-                i += 1
-                continue
-            if c in DQ_ACTIVE_CHARS:
-                return True
+            else:
+                yield (i, c, "double", False)
             i += 1
             continue
         if c == "'":
@@ -286,12 +404,106 @@ def command_contains_unquoted_shell_control(cmd: str) -> bool:
             in_double = True
             i += 1
             continue
-        if c == "\\" and i + 1 < len(cmd):
-            # Outside quotes, a backslash escapes the next character —
-            # which still neutralizes its shell-control meaning. Skip.
-            i += 2
-            continue
-        if c in _SHELL_CONTROL_CHARS:
-            return True
+        yield (i, c, "bare", False)
         i += 1
-    return False
+
+
+def first_unquoted_shell_control(cmd: str) -> tuple[int, str] | None:
+    """First unquoted shell control character, counting every ``$``.
+
+    This is the compound-command guard's question (#1694): an
+    allow-listed first token cannot vouch for a string that might
+    compose a second command, so a suspicious ``$`` is worth an
+    approval prompt even when it would have been literal. Reading too
+    much here is free — the answer only routes a command to the queue.
+
+    Deliberately NOT the same reading as
+    :func:`first_shell_significant_character`. This one gates the codex
+    bridge, where a real shell runs the line; widening it to every
+    character a shell could interpret would put the operator in front
+    of ``ls -la`` for its hyphen.
+    """
+    for index, char, context, escaped in _quote_context(cmd):
+        if escaped or context == "single":
+            # A shell reads an escaped character literally, so it
+            # composes nothing — and the backslash that escaped it was
+            # yielded separately, for callers that care.
+            continue
+        if context == "double" and char not in "$`":
+            continue
+        if char in _SHELL_CONTROL_CHARS:
+            return (index, char)
+    return None
+
+
+def command_contains_unquoted_shell_control(cmd: str) -> bool:
+    """Return True iff ``cmd`` has a shell control character outside a
+    quoted region — see :func:`first_unquoted_shell_control`.
+    """
+    return first_unquoted_shell_control(cmd) is not None
+
+
+def first_shell_significant_character(cmd: str) -> ShellSyntax | None:
+    r"""First character a shell would read that ``exec`` will not.
+
+    The tool tokenizes with ``shlex`` and executes the argv vector, so
+    the question is whether the command that runs is the command that
+    was written (#3129). This answers it soundly rather than exactly:
+    a command it allows provably reaches the program as bash would have
+    built it, and some commands it refuses would in fact have been
+    identical.
+
+    That trade is deliberate. The exact answer requires modelling every
+    expansion bash performs, which five rounds of review demonstrated is
+    a shell rather than a predicate. The sound answer needs only the set
+    of characters a shell leaves alone, which is short and closed.
+
+    - Single-quoted text is inert to both, so anything may appear in it.
+    - Double-quoted text still expands ``$`` and backticks, and bash
+      drops a backslash where ``shlex`` keeps it, so those three are
+      refused there while ordinary characters are not.
+    - Bare text may hold only inert characters. Spaces and tabs
+      separate words for both; a newline does not — it separates
+      commands for bash.
+
+    A refused character is not a verdict on the caller's intent: if
+    they meant it literally, quoting it makes bash and ``exec`` agree by
+    construction, which is what the refusal offers back.
+    """
+    if not isinstance(cmd, str):
+        return None
+    for index, char, context, _escaped in _quote_context(cmd):
+        if context == "single":
+            continue
+        if context == "double":
+            # bash expands these inside double quotes, and removes a
+            # backslash that shlex keeps.
+            if char in "$`\\":
+                return ShellSyntax(index, char)
+            continue
+        if char in " \t":
+            continue
+        if char not in _INERT_CHARACTERS:
+            return ShellSyntax(index, char)
+    return None
+
+
+def quote_words_containing_shell_syntax(cmd: str) -> str | None:
+    """Rewrite *cmd* so every shell-significant character is literal.
+
+    The refusal can offer this because it is bounded by construction:
+    single-quoted text is inert to bash and to ``shlex`` alike, so the
+    rewrite's argv is the words themselves — and those words are what
+    the path and binary policies already vetted. That is the property
+    the ``bash -lc`` wrapper this once suggested could not have (#3130).
+
+    Returns ``None`` when the command cannot be tokenized, which is the
+    one case where there are no words to quote.
+    """
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return None
+    if not words:
+        return None
+    return " ".join(shlex.quote(word) for word in words)

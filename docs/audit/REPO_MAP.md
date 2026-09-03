@@ -18,7 +18,7 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-09-01
+**Generated:** 2026-09-03
 **Scope:** 2377 tracked files (1609 `.py`, 346 `.md`, 422 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
@@ -450,11 +450,11 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/computer_use/backends/local.py** — Local sandbox backend — direct host execution.
   - `class LocalSandboxBackend`
 - **kestrel_sovereign/features/computer_use/feature.py** — ComputerUseFeature: bounded host access wrapped in three gates + policy.
-  - `class ComputerUseFeature`
+  - `def shell_syntax_refusal(command, argv)`; `class ComputerUseFeature`
 - **kestrel_sovereign/features/computer_use/path_safety.py** — Path-safety guards for the computer-use feature.
   - `class PathSafetyError`; `def assert_no_traversal(candidate)`; `def resolve_realpath(candidate, base)`; `class MatchResult`; `def match_allow_list(candidate, allow, deny)`
 - **kestrel_sovereign/features/computer_use/policy.py** — Allow/deny policy resolution for paths and binaries.
-  - `class Decision`; `class PolicyResult`; `class PathPolicy`; `class BinaryPolicy`; `def split_command(cmd)`; `class ArgvPathResult`; `def evaluate_argv_paths(argv, path_policy)`; `def command_contains_unquoted_shell_control(cmd)`
+  - `class Decision`; `class PolicyResult`; `class PathPolicy`; `class BinaryPolicy`; `def split_command(cmd)`; `class ArgvPathResult`; `def evaluate_argv_paths(argv, path_policy)`; `class ShellSyntax`; `…`
 - **kestrel_sovereign/features/config_validation.py** — Transport-neutral validation of feature configuration against its schema.
   - `class FeatureConfigInvalid`; `def validate_feature_config(config, schema)`
 - **kestrel_sovereign/features/consent/__init__.py** — Agent Consent Protocol - recorded voice before significant changes.
@@ -2589,7 +2589,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_caller_context_endpoint_propagation.py** — Regression suite for #736 — every authenticated endpoint must pass a CallerContext into agent.process_input/process_input_streaming so that sovereign-command authorization is consistent regardless of…
   - `def test_chat_completions_propagates_sovereign_caller_from_api_key()`; `def test_bridge_invoke_propagates_sovereign_caller_from_api_key()`; `def test_bridge_stream_propagates_sovereign_caller_from_api_key()`; `def test_bridge_invoke_forwards_header_retry_id_and_trusted_provenance()`; `def test_bridge_invoke_failure_logs_no_message_or_exception_text()`; `def test_bridge_invoke_reports_cooperative_stop_as_conflict()`; `def test_bridge_stream_forwards_body_retry_id_and_trusted_provenance()`; `def test_bridge_stream_registers_and_releases_the_request_lifecycle()`
 - **tests/unit/test_canonical_inventory_sync.py** — Sync checks between the canonical inventory and the live code surface.
-  - `def test_canonical_inventory_generated_region_is_exact()`; `def test_canonical_inventory_keeps_feature_snapshot_counts_in_sync()`; `def test_canonical_inventory_mentions_all_router_files()`; `def test_canonical_inventory_mentions_all_discoverable_feature_modules()`; `def test_canonical_inventory_mentions_all_router_routes()`; `def test_canonical_inventory_mentions_all_app_routes()`; `def test_canonical_inventory_links_point_to_existing_paths()`
+  - `def test_canonical_inventory_generated_region_is_exact()`; `def test_writing_the_inventory_twice_changes_nothing_the_second_time()`; `def test_writing_the_inventory_keeps_a_region_that_ends_the_file()`; `def test_the_checked_in_inventory_is_a_fixed_point()`; `def test_canonical_inventory_keeps_feature_snapshot_counts_in_sync()`; `def test_canonical_inventory_mentions_all_router_files()`; `def test_canonical_inventory_mentions_all_discoverable_feature_modules()`; `def test_canonical_inventory_mentions_all_router_routes()`; `…`
 - **tests/unit/test_canonical_session_id_migration.py** — Tests for the canonical-session-id data migration (#2012).
   - `async def test_relinks_integer_session_id_to_marker_uuid(tmp_path)`; `async def test_leaves_legacy_timegap_anchor_alone(tmp_path)`; `async def test_leaves_uuid_session_ids_alone(tmp_path)`; `async def test_remaps_conversation_title(tmp_path)`; `async def test_title_collision_drops_integer_keeps_uuid(tmp_path)`; `async def test_idempotent_second_run_is_noop(tmp_path)`; `async def test_skips_marker_that_inherited_prior_session_uuid(tmp_path)`; `async def test_relinks_double_marker_same_session(tmp_path)`; `…`
 - **tests/unit/test_canonical_transport_split.py** — Canonical/transport split for the conversation record (#1402).
