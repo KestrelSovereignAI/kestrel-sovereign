@@ -413,6 +413,17 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Model discovery uses process-wide SharedModelCache (see model_cache.py).
         # Pre-populate from disk if this is the first LLMService instance.
+        # vendor -> last model-discovery error (#3190). Records the fact that a
+        # vendor's catalog could NOT be retrieved, which ``len(catalog) > 0``
+        # cannot express: a failed ``list_models`` and a vendor that genuinely
+        # serves nothing both yield an empty list.
+        #
+        # MUST be created before ``_load_from_disk_cache()`` on the next line.
+        # That call restores a persisted catalog AND its failure record, so
+        # initialising this afterwards made the restoration dead code on every
+        # real construction — the map it wrote into did not exist yet, and the
+        # later assignment then replaced it with an empty one (codex r2 P1).
+        self._discovery_failures: Dict[str, str] = {}
         self._load_from_disk_cache()  # Immediate availability before API discovery
 
         # Storage info cache
@@ -454,6 +465,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # shape are dropped by model_preference._load_model_preference().
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
+
+        # Set when a PERSISTED mandate failed to apply at boot (#3190) — the
+        # operator set a model and it is not in effect. Cleared by a successful
+        # set_model_preference.
+        self._mandate_load_error: Optional[str] = None
 
         # Top-level embedding-route knob (#2263). ``[llm] embedding_route =
         # "<vendor>:<route>"`` selects the embedding channel independently of
@@ -1803,6 +1819,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         model: str,
         vendor: Optional[str] = None,
         route: Optional[str] = None,
+        *,
+        validate: bool = True,
     ) -> None:
         """Set the mandated model selection for this session.
 
@@ -1862,9 +1880,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # must be held to the same bar, else a hallucinated/stale
             # ``{vendor, route, model}`` lands a broken mandate that only
             # surfaces on the NEXT request (the #1927 route-fidelity skew).
-            self._validate_explicit_mandate(model, vendor, route)
+            if validate:
+                self._validate_explicit_mandate(model, vendor, route)
 
         self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
+        # A mandate is in effect again — clear any recorded boot-time drop so
+        # the health surface stops reporting a condition the operator fixed
+        # (#3190). Without this the warning is sticky for the process lifetime.
+        self._mandate_load_error = None
         if route:
             logger.info("Model preference set: %s:%s/%s", vendor, route, model)
         else:
@@ -2014,6 +2037,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     def clear_model_preference(self) -> None:
         """Clear any mandated model preference, returning to default behavior."""
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
+        # Returning to automatic routing is a DELIBERATE unpinned state, so the
+        # boot-failure notice must go with it (#3190 r3 P2). Only the set path
+        # cleared it, so health went on reporting "a persisted preference
+        # failed to apply; running UNPINNED" about a state the operator chose.
+        # A flag that one door sets and only one other door clears is a flag
+        # that gets stuck.
+        self._mandate_load_error = None
         logger.info("Model preference cleared, using default route order")
 
         if self._preference_persistence_callback:
@@ -4282,6 +4312,22 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         target_selector = self._get_default_mandate_selector()
+        # Whether this is an EXPLICIT selection comes from the CANONICAL
+        # routing metadata, not a second opinion computed here (#3190 r7 P1).
+        #
+        # The catalog guard below must apply the same rule generation applies —
+        # it skips the guard for an explicit pin, and an audit that does not
+        # would reject a target the very same request just generated with
+        # (warn mode annotating every response, strict mode denying every one,
+        # r6 P1). But "explicit" is a question `_compute_route_authorization`
+        # already answers, and the hand-rolled version disagreed with it: a
+        # bare model, or a vendor selector matching several routes, is NOT
+        # explicit there, and treating it as explicit here would let a stale or
+        # cross-vendor model broadcast across routes past a guard generation
+        # still enforces.
+        #
+        # Re-deriving a predicate that exists is how the two ends drift apart
+        # in the first place. One question, one implementation.
         if not target_selector:
             pref_model = self._mandate_preference.get("model")
             pref_vendor = self._mandate_preference.get("vendor")
@@ -4329,6 +4375,26 @@ No other text or formatting.
             errors = {}
             for provider in available_providers:
                 logger.info(f"Auditing with provider: {provider['name']}")
+                # The audit keeps this guard UNCONDITIONALLY, unlike the
+                # generation path which skips it for an explicit selection
+                # (#3190 r9 P1).
+                #
+                # Three rounds were spent trying to make the audit mirror
+                # generation, because during a discovery outage a pinned route
+                # generates fine and then fails its own audit. That is a real
+                # annoyance and the fix for it was wrong: this guard is what
+                # makes the audit FAIL CLOSED at risk 3 when no route can serve
+                # the mandated model, and
+                # `test_get_audit_response_failclosed_when_no_route_serves_mandate`
+                # is that contract. Skipping it on explicitness returned risk 1
+                # for a genuinely unservable model.
+                #
+                # Explicitness cannot tell a transiently incomplete catalog from
+                # a model that truly is not there — the same thing this whole
+                # change concluded is unknowable from the catalog alone. Given
+                # that, an auditor that refuses to vouch for a route it cannot
+                # verify is behaving correctly. Degrading a fail-closed security
+                # check to make an outage more comfortable is the wrong trade.
                 if target_model and not self._model_available_for_route(provider, target_model):
                     # Record the skip so that if EVERY route rejects the
                     # mandated model, the loop fails closed (risk=3) instead of
