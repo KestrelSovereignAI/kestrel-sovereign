@@ -449,16 +449,20 @@ def test_a_call_inside_a_string_literal_is_not_a_call_site(repo: Path) -> None:
         "def helper(x):\n    return x\n\n\ndef caller():\n    return helper(1)\n"
     )
     (repo / "snippet.py").write_text('SOURCE = "helper(1)"\n# helper() in a comment\n')
+    # An untouched real caller, so a finding always exists and the assertion
+    # below runs unconditionally (it used to sit under `if findings:` and
+    # executed zero assertions on the correct implementation).
+    (repo / "other.py").write_text("from mod import helper\n\n\ndef g():\n    return helper(2)\n")
     _commit(repo)
     text = (repo / "mod.py").read_text().replace(
         "def helper(x):\n    return x", "def helper(x):\n    return x + 1"
     ).replace("return helper(1)", "return helper(11)")
     (repo / "mod.py").write_text(text)
 
-    findings = _findings(repo)
-    if findings:
-        paths = {o.path for o in _named(findings, "helper").unchanged}
-        assert "snippet.py" not in paths, "a string/comment was reported as a call site"
+    finding = _named(_findings(repo), "helper")
+    paths = [o.path for o in finding.unchanged]
+    assert "snippet.py" not in paths, "a string/comment was reported as a call site"
+    assert paths == ["other.py"]
 
 
 def test_removed_literal_counts_the_site_it_was_removed_from(repo: Path) -> None:
@@ -1564,3 +1568,69 @@ def test_a_multiline_attribute_is_touched_on_the_line_its_name_is_on(repo: Path)
     finding = _named(_findings(repo), "status")
     assert ("a.py", 7) in {(o.path, o.line) for o in finding.changed}, finding
     assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 5)]
+
+
+# --------------------------------------------------------------------------
+# Round 18: a rename or copy is wholly changed only when its entry has no
+# hunks; a copy's `---` header names the source and must not key the old map.
+# --------------------------------------------------------------------------
+
+def test_a_rename_with_edits_keeps_its_untouched_in_file_siblings(repo: Path) -> None:
+    """Seeding every line of a rename target marked the untouched sites inside
+    it as touched: 1 of 3 literals edited plus a `git mv` reported clean with
+    --strict green — the gate's motivating case answered backwards."""
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\n'
+        "PAD_1 = 1\nPAD_2 = 2\nPAD_3 = 3\nPAD_4 = 4\nPAD_5 = 5\n"
+    )
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\nC = "tool_execution"\n'
+        "PAD_1 = 1\nPAD_2 = 2\nPAD_3 = 3\nPAD_4 = 4\nPAD_5 = 5\n"
+    )
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert new_map == {"newmod.py": {1}} and old_map == {"mod.py": {1}}, (new_map, old_map)
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("newmod.py", 2), ("newmod.py", 3)]
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_renamed_functions_untouched_callers_in_the_same_file_are_surfaced(repo: Path) -> None:
+    body = "def shared(x):\n    return x\n" + "".join(
+        f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(3)
+    ) + "PAD = 1\nPAD2 = 2\nPAD3 = 3\n"
+    (repo / "mod.py").write_text(body)
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(body.replace("    return x\n", "    return x + 1\n", 1))
+
+    finding = _named(_findings(repo), "shared")
+    assert {o.path for o in finding.unchanged} == {"newmod.py"}
+    assert len(finding.unchanged) == 3
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_copy_with_edits_records_no_removals_from_its_source(repo: Path) -> None:
+    """A copy entry's `---` header names the SOURCE, and its hunk lines were
+    recorded as removals from it: a.py:1 counted as modified and listed as
+    unchanged in one report, 6 sites claimed where 5 exist."""
+    (repo / "a.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 1\n'
+    )
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_text(
+        'A = "subagent_dispatch"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 1\n'
+    )
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_text(
+        'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 9\n'
+    )
+
+    new_map, old_map = changed = checker.changed_line_map(["HEAD"])
+    assert old_map == {"a.py": {4}}, changed
+    assert new_map.get("b.py") == {1} and new_map.get("a.py") == {4}, changed
+    # Nothing removed "tool_execution" anywhere, so nothing is surfaced for it.
+    assert [f.name for f in _findings(repo) if f.name == "tool_execution"] == []

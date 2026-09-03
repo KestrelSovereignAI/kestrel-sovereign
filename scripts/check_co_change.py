@@ -183,9 +183,32 @@ def changed_line_map(
     # path and voids every old-side line that follows.
     in_hunk = False
     renamed_from: str | None = None
+    # A rename or copy target is wholly changed ONLY when its entry carries
+    # no hunks (a pure `git mv`, a byte copy). Git detects a rename that also
+    # carries edits (similarity >= 50%), and seeding every line of that
+    # target marked its untouched in-file siblings as touched — the gate's
+    # own motivating case answered backwards, with --strict green. So the
+    # seed is buffered here and applied when the entry ends, if and only if
+    # no hunk was seen; an entry with hunks is keyed by its headers and
+    # hunks exactly like a plain edit.
+    pending_seed: tuple[str, str | None, str] | None = None
+    is_copy = False
+
+    def flush_pending_seed() -> None:
+        nonlocal pending_seed
+        if pending_seed is not None and not in_hunk:
+            kind, seed_old, seed_new = pending_seed
+            if kind == "rename" and seed_old is not None:
+                _seed_rename(seed_old, seed_new, diff_spec[0], old_map, new_map)
+            else:
+                _seed_new_file(seed_new, new_map)
+        pending_seed = None
+
     for line in diff.splitlines():
         if line.startswith("diff --git "):
+            flush_pending_seed()
             in_hunk = False
+            is_copy = False
             old_path = new_path = renamed_from = None
             continue
         if not in_hunk and line.startswith("rename from "):
@@ -194,20 +217,23 @@ def changed_line_map(
         if not in_hunk and line.startswith("rename to "):
             renamed_to = _decode_git_path(line[len("rename to "):])
             if renamed_from and renamed_to:
-                _seed_rename(renamed_from, renamed_to, diff_spec[0], old_map, new_map)
+                pending_seed = ("rename", renamed_from, renamed_to)
             renamed_from = None
             continue
         if not in_hunk and line.startswith("copy to "):
-            # diff.renames=copies: the same zero-hunk extended-header shape as
-            # a pure rename, for a file that is a byte copy of a committed
-            # one. The source stays in place, so only the NEW side is wholly
-            # changed; the old-side seeding of a rename must not run.
+            # diff.renames=copies: the same extended-header shape as a
+            # rename, for a file derived from a committed one that stays in
+            # place. Only the NEW side can be wholly changed, and the entry's
+            # `---` header names the SOURCE — a copy removes nothing from it,
+            # so that header must not key the old-side map.
             copied_to = _decode_git_path(line[len("copy to "):])
+            is_copy = True
             if copied_to:
-                _seed_new_file(copied_to, new_map)
+                pending_seed = ("copy", None, copied_to)
             continue
         if not in_hunk and line.startswith("--- "):
-            old_path = _patch_path(line)
+            if not is_copy:
+                old_path = _patch_path(line)
             continue
         if not in_hunk and line.startswith("+++ "):
             new_path = _patch_path(line)
@@ -225,6 +251,7 @@ def changed_line_map(
             count = 1 if new_count is None else int(new_count)
             for offset in range(count):
                 new_map[new_path].add(int(new_start) + offset)
+    flush_pending_seed()
     if include_untracked:
         # `git diff` never mentions an untracked file, so a brand-new module —
         # every line of it new — was invisible and the gate reported clean on
@@ -264,7 +291,7 @@ def _seed_rename(
     old_map: dict[str, set[int]],
     new_map: dict[str, set[int]],
 ) -> None:
-    """A renamed file is wholly changed on both sides.
+    """A PURELY renamed file is wholly changed on both sides.
 
     A pure ``git mv`` emits no ``---``/``+++`` and no hunks, so both maps came
     back empty and ``--strict`` exited 0 over a change that strands every
@@ -273,7 +300,9 @@ def _seed_rename(
     and the same edit IS analysed; this makes the two shapes agree. Every old
     line is treated as removed (its definitions and literals left that path)
     and every new line as added, the untracked-file treatment applied to both
-    ends. A partial rename's hunks land on the same keys, a subset of this.
+    ends. The caller applies this only to an entry with no hunks: a rename
+    that also carries edits is keyed by its hunks like a plain edit, so the
+    untouched sites inside the renamed file stay untouched.
     """
     if old_path.endswith(".py"):
         old_source = _git("show", f"{old_ref}:{old_path}")
