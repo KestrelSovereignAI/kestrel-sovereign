@@ -1425,6 +1425,18 @@ async def test_a_completion_row_is_never_reported_as_work_that_may_not_have_happ
     assert result.data["refused"] == 1 and result.data["outcomes"] == 0
     assert "may never have happened" in result.confirmation
 
+    # An outcome row that records the work did NOT happen (live: 6 such rows)
+    # is not a completion: no ✓, and the warning fires.
+    await store.log_decision(
+        feature_name="talon_feature", tool_name="talon_file_and_claim.outcome",
+        action="tool_outcome", decision="filing_failed",
+        args_summary='{"reason_code": "UNKNOWN_FAILURE", "filed": false, "issue_number": 1481}',
+    )
+    result = await feature.security_audit_search(query="1481")
+    assert result.data["outcomes"] == 0 and result.data["refused"] == 1
+    assert "✓" not in result.confirmation
+    assert "may never have happened" in result.confirmation
+
 
 @pytest.mark.asyncio
 async def test_an_unparseable_row_without_a_sensitive_key_is_still_shown(tmp_path):
@@ -1503,3 +1515,29 @@ async def test_marking_a_dispatch_entry_flushes_it_without_a_search(tmp_path):
     boot_two = PermissionStore(str(db_path))
     await boot_two.initialize()
     assert "flushed_by_itself" in await boot_two.sync_dispatch_entries()
+
+
+@pytest.mark.asyncio
+async def test_the_tool_masks_a_legacy_row_on_the_way_out(tmp_path):
+    """The read-path re-mask is the guarantee; this drives it through the TOOL.
+    `test_a_legacy_unmasked_secret_is_masked_on_the_way_out` calls
+    remask_summary directly, so replacing the tool's call with the identity
+    function left every test green."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "legacy.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="WalletAgent", tool_name="send_payment",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary='{"api_key": "sk-live-LEGACY-LEAK", "memo": "orphaned"}',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="orphaned")
+
+    assert result.data["count"] == 1
+    assert "sk-live-LEGACY-LEAK" not in result.confirmation
+    assert "sk-live-LEGACY-LEAK" not in str(result.data)
+    assert "***MASKED***" in result.confirmation

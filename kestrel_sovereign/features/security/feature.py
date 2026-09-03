@@ -23,14 +23,6 @@ from kestrel_sovereign.features.security.permissions import (
 )
 
 
-#: Above this many matches, ``security_audit_search`` returns the COUNT and no
-#: arguments. The tool's whole justification for surfacing ``args_summary`` —
-#: which ``security_audit`` deliberately withholds — is that the caller already
-#: described what it wanted. A query matching most of the log is not a
-#: description, and answering it with a page of arguments would rebuild the
-#: unbounded disclosure by another route. This is a disclosure bound, not a
-#: page-size preference, which is why ``limit`` is clamped to it rather than
-#: being allowed to exceed it.
 #: Decisions that mean "this call was permitted to execute". Deliberately an
 #: allowlist: see the inversion note in ``security_audit_search``. Anything not
 #: here — a refusal, a block, an outcome row, or a value added after this was
@@ -43,6 +35,25 @@ _AUTHORIZED_DECISIONS = frozenset({
     "user_approved",
 })
 
+#: Outcome-row decisions (``action='tool_outcome'``) that mean "the work was
+#: DONE". The same allowlist discipline as above, for the same reason: an
+#: outcome row can just as well record that the work did NOT happen
+#: (``filing_failed`` is live in the log), and keying the completion bucket on
+#: the action alone reported such a row with a ✓ and suppressed the "may never
+#: have happened" warning. Anything not here falls through to "not authorized".
+_COMPLETED_OUTCOME_DECISIONS = frozenset({
+    "filed_and_dispatched",
+    "github_write_ok",
+})
+
+#: Above this many matches, ``security_audit_search`` returns the COUNT and no
+#: arguments. The tool's whole justification for surfacing ``args_summary`` —
+#: which ``security_audit`` deliberately withholds — is that the caller already
+#: described what it wanted. A query matching most of the log is not a
+#: description, and answering it with a page of arguments would rebuild the
+#: unbounded disclosure by another route. This is a disclosure bound, not a
+#: page-size preference; ``limit`` above it is honoured for the count and
+#: refused for the arguments (see the "No clamp on limit" note in the tool).
 MAX_DISCLOSING_MATCHES = 25
 
 
@@ -1291,7 +1302,7 @@ class SecurityFeature(Feature):
         bounded_outcomes = sum(
             1 for e in matches
             if e.get("action") == "tool_outcome"
-            and e["decision"] not in _AUTHORIZED_DECISIONS
+            and e["decision"] in _COMPLETED_OUTCOME_DECISIONS
         )
         matches = matches[:limit_val]
         omitted = bounded_total - len(matches)
@@ -1388,7 +1399,10 @@ class SecurityFeature(Feature):
             authorized = entry["decision"] in _AUTHORIZED_DECISIONS
             if authorized:
                 marker = "→"
-            elif entry.get("action") == "tool_outcome":
+            elif (
+                entry.get("action") == "tool_outcome"
+                and entry["decision"] in _COMPLETED_OUTCOME_DECISIONS
+            ):
                 marker = "✓"
             else:
                 marker = "✗"
