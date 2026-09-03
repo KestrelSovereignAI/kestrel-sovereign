@@ -197,6 +197,15 @@ def changed_line_map(
                 _seed_rename(renamed_from, renamed_to, diff_spec[0], old_map, new_map)
             renamed_from = None
             continue
+        if not in_hunk and line.startswith("copy to "):
+            # diff.renames=copies: the same zero-hunk extended-header shape as
+            # a pure rename, for a file that is a byte copy of a committed
+            # one. The source stays in place, so only the NEW side is wholly
+            # changed; the old-side seeding of a rename must not run.
+            copied_to = _decode_git_path(line[len("copy to "):])
+            if copied_to:
+                _seed_new_file(copied_to, new_map)
+            continue
         if not in_hunk and line.startswith("--- "):
             old_path = _patch_path(line)
             continue
@@ -269,13 +278,20 @@ def _seed_rename(
     if old_path.endswith(".py"):
         old_source = _git("show", f"{old_ref}:{old_path}")
         old_map[old_path] |= set(range(1, len(old_source.splitlines()) + 1))
-    if new_path.endswith(".py"):
-        try:
-            count = len((PROJECT_ROOT / new_path).read_text(encoding="utf-8").splitlines())
-        except (OSError, ValueError):
-            _UNANALYSED.add(new_path)
-            return
-        new_map[new_path] |= set(range(1, count + 1))
+    _seed_new_file(new_path, new_map)
+
+
+def _seed_new_file(new_path: str, new_map: dict[str, set[int]]) -> None:
+    """Every line of a working-tree file is changed (rename target, copy
+    target, untracked file); one it cannot read is NOT ANALYSED."""
+    if not new_path.endswith(".py"):
+        return
+    try:
+        count = len((PROJECT_ROOT / new_path).read_text(encoding="utf-8").splitlines())
+    except (OSError, ValueError):
+        _UNANALYSED.add(new_path)
+        return
+    new_map[new_path] |= set(range(1, count + 1))
 
 
 def _patch_path(raw: str) -> str | None:

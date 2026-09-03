@@ -1364,13 +1364,17 @@ def test_an_unrelated_edit_elsewhere_does_not_defeat_the_method_scope(repo: Path
     (repo / "mod.py").write_text(
         "class Queue:\n    def dispatch(self, x):\n        return x\n"
     )
-    (repo / "other.py").write_text("def dispatch(y):\n    return y\n")
-    (repo / "user.py").write_text("from other import dispatch\n")
+    # z.py is in old_sources (a line of it changed) but NOT in the paths
+    # whose change touches `dispatch`'s span: the difference set that
+    # separates "ask THIS symbol's files" from "ask every touched file". It
+    # is unparseable after the edit, so nothing but the old side can answer.
+    (repo / "z.py").write_text("def dispatch(y):\n    return y\nX = 1\n")
+    (repo / "user.py").write_text("from z import dispatch\n")
     _commit(repo)
     (repo / "mod.py").write_text(
         "class Queue:\n    def dispatch(self, x):\n        return x + 1\n"
     )
-    (repo / "other.py").write_text("def dispatch(y):\n    return y + 1\n")  # also touched
+    (repo / "z.py").write_text("def dispatch(y):\n    return y\ndef broken(\n")
 
     listed = {
         (o.path, o.line)
@@ -1500,3 +1504,63 @@ def test_diff_path_prefixes_are_pinned_against_git_config(repo: Path, config) ->
     finding = _named(_findings(repo), "tool_execution")
     assert [o.path for o in finding.unchanged] == ["sib.py"]
     assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 17: the copy header; three guards whose tests did not discriminate.
+# --------------------------------------------------------------------------
+
+def test_a_copied_file_is_analysed_under_diff_renames_copies(repo: Path) -> None:
+    """``copy from``/``copy to`` is the same zero-hunk header shape as a pure
+    rename; unhandled, the copied file was absent from both maps and the gate
+    exited 0 on an edit the default config reports. Only the NEW side is
+    seeded: a copy leaves its source in place."""
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')  # byte copy of HEAD a.py
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 9\n')
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert new_map.get("b.py") == {1, 2}, new_map
+    assert "b.py" not in old_map
+    finding = _named(_findings(repo), "gamma_marker")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 1)]
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unparseable_changed_file_no_scan_reaches_is_still_surfaced(repo: Path) -> None:
+    """collect's own parse guard, isolated: the sibling test's file is also a
+    grep candidate for its literal, so _tree_for's guard answered for it and
+    deleting collect's guard left every test green."""
+    (repo / "mod.py").write_text("X = 1\n")
+    _commit(repo)
+    (repo / "mod.py").write_text("def broken(\n")
+
+    assert _unparseable(repo) == ["mod.py"]
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_multiline_attribute_is_touched_on_the_line_its_name_is_on(repo: Path) -> None:
+    """``t\n.status`` spans two lines; the site is the name's line, and a
+    diff that edits only that line must count it as touched, not print it
+    under ``unchanged:``."""
+    (repo / "thing.py").write_text(
+        "class Thing:\n    @property\n    def status(self):\n        return 1\n"
+    )
+    (repo / "a.py").write_text(
+        "from thing import Thing\n\n\ndef f(t: Thing):\n    return (\n        t\n        .status\n    )\n"
+    )
+    (repo / "b.py").write_text("from thing import Thing\n\n\ndef g(t: Thing):\n    return t.status\n")
+    _commit(repo)
+    (repo / "thing.py").write_text(
+        "class Thing:\n    @property\n    def status(self):\n        return 2\n"
+    )
+    (repo / "a.py").write_text(
+        "from thing import Thing\n\n\ndef f(t: Thing):\n    return (\n        t\n        .status  # touched\n    )\n"
+    )
+
+    finding = _named(_findings(repo), "status")
+    assert ("a.py", 7) in {(o.path, o.line) for o in finding.changed}, finding
+    assert [(o.path, o.line) for o in finding.unchanged] == [("b.py", 5)]
