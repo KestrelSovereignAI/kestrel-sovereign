@@ -22,6 +22,7 @@ tests pin that boundary in both directions: matches come back with their
 arguments, and a row the query does not describe stays invisible.
 """
 
+import asyncio
 import pytest
 
 from kestrel_sovereign.features.security.permissions import PermissionStore
@@ -1379,3 +1380,126 @@ async def test_the_authorization_split_counts_rows_the_limit_hides(tmp_path):
     assert "none of the" not in result.confirmation, (
         "one authorized call exists; saying none did is the false conclusion"
     )
+
+
+# --------------------------------------------------------------------------
+# Review round 9 (opus gate, codex credits exhausted). Four findings, each with
+# the test that was missing.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_completion_row_is_never_reported_as_work_that_may_not_have_happened(tmp_path):
+    """`_AUTHORIZED_DECISIONS` lists permission decisions, so an outcome row —
+    action='tool_outcome', decision='filed_and_dispatched' — is not in it, and
+    the split folded it into "refused". A query matching only the outcome row
+    (an issue number, a job id) then said the work "may never have happened"
+    about the strongest completion evidence in the table."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "outcomes.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="talon_feature", tool_name="talon_file_and_claim.outcome",
+        action="tool_outcome", decision="filed_and_dispatched",
+        args_summary='{"reason_code": "OK", "filed": true, "issue_number": 1479}',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="1479")
+
+    assert result.data["count"] == 1
+    assert result.data["outcomes"] == 1
+    assert result.data["refused"] == 0
+    assert "may never have happened" not in result.confirmation
+    assert "1 completion(s) recorded" in result.confirmation
+    assert "✓" in result.confirmation
+
+    # A genuine refusal still reads as one.
+    await store.log_decision(
+        feature_name="talon_feature", tool_name="talon_file_and_claim",
+        action="tool_execution", decision="blocked",
+        args_summary='{"issue_number": 1480}',
+    )
+    result = await feature.security_audit_search(query="1480")
+    assert result.data["refused"] == 1 and result.data["outcomes"] == 0
+    assert "may never have happened" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_row_without_a_sensitive_key_is_still_shown(tmp_path):
+    """`summarize_args` truncates at 500 chars mid-structure, so every long
+    issue body — the filings that motivated this tool — was unparseable and
+    `remask_summary` withheld all of them. One rule at both projections now:
+    shown unless a sensitive name sits in key position, exactly what the
+    searchable projection already did."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    truncated = '{"title": "orphans the worker", "body": "' + "x" * 40  # cut mid-value
+    assert remask_summary(truncated) == truncated
+    leaking = '{"memo": "orphaned worker", "api_key": "sk-live-CUT'
+    assert "sk-live-CUT" not in remask_summary(leaking)
+    assert "not shown" in remask_summary(leaking)
+
+    store = PermissionStore(str(tmp_path / "truncated.db"))
+    await store.initialize()
+    await _log_filing(store, truncated)
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="orphans the worker")
+    assert result.data["count"] == 1
+    assert "orphans the worker" in result.confirmation
+    assert "not shown" not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_a_name_marked_during_a_flush_is_not_dropped_by_it(tmp_path, monkeypatch):
+    """`sync_dispatch_entries` snapshotted the dirty set for the write and then
+    cleared the WHOLE set after commit. A name marked while the executemany or
+    commit awaited was never written and no longer dirty — absent from the
+    durable table, so after a restart its envelope rows read as prior actions."""
+    import aiosqlite
+
+    store = PermissionStore(str(tmp_path / "race.db"))
+    await store.initialize()
+    store._dispatch_entries_dirty.add("feat_a")
+
+    real_executemany = aiosqlite.Connection.executemany
+
+    async def late_mark_then_write(self, *args, **kwargs):
+        # A concurrent mark_dispatch_entry whose own flush has not run yet.
+        store._dispatch_entries_dirty.add("feat_late")
+        return await real_executemany(self, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "executemany", late_mark_then_write)
+    await store.sync_dispatch_entries()
+    monkeypatch.undo()
+
+    assert "feat_late" in store._dispatch_entries_dirty, (
+        "the flush must discard only what it wrote"
+    )
+    durable = await store.sync_dispatch_entries()
+    assert {"feat_a", "feat_late"} <= durable
+
+    boot_two = PermissionStore(str(tmp_path / "race.db"))
+    await boot_two.initialize()
+    assert {"feat_a", "feat_late"} <= await boot_two.sync_dispatch_entries()
+
+
+@pytest.mark.asyncio
+async def test_marking_a_dispatch_entry_flushes_it_without_a_search(tmp_path):
+    """The docstring promised durability would not wait for the first search;
+    deleting the whole create_task block left every test green because each
+    one called sync_dispatch_entries() itself."""
+    db_path = tmp_path / "autoflush.db"
+    store = PermissionStore(str(db_path))
+    await store.initialize()
+
+    store.mark_dispatch_entry("flushed_by_itself")
+    assert store._dispatch_flush_tasks, "the mark must schedule its own flush"
+    await asyncio.gather(*store._dispatch_flush_tasks)
+
+    boot_two = PermissionStore(str(db_path))
+    await boot_two.initialize()
+    assert "flushed_by_itself" in await boot_two.sync_dispatch_entries()

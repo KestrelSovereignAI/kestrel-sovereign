@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.features.security.args_summary import (
+    SENSITIVE_JSON_KEY,
     SENSITIVE_KEY_SUBSTRINGS,
     mask_sensitive,
 )
@@ -128,14 +129,9 @@ def _flatten_json(value):
 #: A row too truncated to parse cannot be masked field-by-field. If it names a
 #: sensitive key at all, it is dropped from the searchable projection entirely
 #: rather than matched raw — losing a match is the safe failure.
-#: A sensitive name in KEY POSITION — `"...key...":` — rather than anywhere in
-#: the text. The value side is data and may legitimately contain these words.
-_SENSITIVE_JSON_KEY = re.compile(
-    r'"[^"]*(?:%s)[^"]*"\s*:' % "|".join(
-        re.escape(s) for s in SENSITIVE_KEY_SUBSTRINGS
-    ),
-    re.IGNORECASE,
-)
+#: One rule at both projections: the displayed one (args_summary.remask_summary)
+#: uses the same pattern, so they cannot disagree about what is safe.
+_SENSITIVE_JSON_KEY = SENSITIVE_JSON_KEY
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 _JSON_ESCAPES = {
@@ -483,6 +479,9 @@ class PermissionStore:
         # Marked this boot but not yet persisted — flushed on the next read so
         # registration stays synchronous and cheap.
         self._dispatch_entries_dirty: set = set()
+        # Flush tasks are held here so a running flush is never garbage
+        # collected mid-await (asyncio keeps only weak references).
+        self._dispatch_flush_tasks: set = set()
         # Global Auto has two tiers backing one effective state:
         #   - _global_auto_session: in-memory, cleared on session reset.
         #   - _global_auto_always:  persisted in security_global_settings,
@@ -1027,9 +1026,11 @@ class PermissionStore:
             # registration stays synchronous; the read path still syncs, so a
             # lost task degrades to the old behaviour rather than an error.
             try:
-                asyncio.get_running_loop().create_task(
+                task = asyncio.get_running_loop().create_task(
                     self.sync_dispatch_entries()
                 )
+                self._dispatch_flush_tasks.add(task)
+                task.add_done_callback(self._dispatch_flush_tasks.discard)
             except RuntimeError:
                 # No loop (sync construction in a test): the read path flushes.
                 pass
@@ -1048,14 +1049,20 @@ class PermissionStore:
         from what is loaded now would stop covering them.
         """
         async with aiosqlite.connect(self.db_path) as db:
-            if self._dispatch_entries_dirty:
+            # Snapshot, then discard only what was written: a name marked
+            # while the executemany/commit awaits were in flight is still
+            # dirty and goes out with the next flush. Clearing the whole set
+            # dropped it, and a feature removed before the next boot would then
+            # have its envelope rows read as prior actions.
+            pending = sorted(self._dispatch_entries_dirty)
+            if pending:
                 await db.executemany(
                     "INSERT OR IGNORE INTO security_dispatch_entries "
                     "(tool_name) VALUES (?)",
-                    [(name,) for name in sorted(self._dispatch_entries_dirty)],
+                    [(name,) for name in pending],
                 )
                 await db.commit()
-                self._dispatch_entries_dirty.clear()
+                self._dispatch_entries_dirty.difference_update(pending)
             cursor = await db.execute(
                 "SELECT tool_name FROM security_dispatch_entries"
             )
@@ -1371,7 +1378,9 @@ class PermissionStore:
             # The fold has to happen inside the query: SQLite cannot express
             # it, so Python is registered as a scalar function on this
             # connection. Deterministic, so SQLite may cache per-value.
-            await db.create_function("py_fold", 1, fold_stored_summary)
+            await db.create_function(
+                "py_fold", 1, fold_stored_summary, deterministic=True
+            )
             # id DESC for the same reason get_audit_log uses it: legacy rows
             # carry a space-separated timestamp that sorts incorrectly against
             # the ISO ones (F092), and id ordering is format-agnostic.

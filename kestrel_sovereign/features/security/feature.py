@@ -1282,6 +1282,17 @@ class SecurityFeature(Feature):
         bounded_authorized = sum(
             1 for e in matches if e["decision"] in _AUTHORIZED_DECISIONS
         )
+        # A `<tool>.outcome` row (action='tool_outcome') is a COMPLETION
+        # record, the strongest evidence in the table that the work happened.
+        # It is not a permission decision, so it is not in the allowlist —
+        # and folding it into "refused" made a query that matched only the
+        # outcome row (an issue number, a job id) report "may never have
+        # happened" about work whose completion is right there.
+        bounded_outcomes = sum(
+            1 for e in matches
+            if e.get("action") == "tool_outcome"
+            and e["decision"] not in _AUTHORIZED_DECISIONS
+        )
         matches = matches[:limit_val]
         omitted = bounded_total - len(matches)
 
@@ -1351,26 +1362,36 @@ class SecurityFeature(Feature):
         # three of them (#3107 review round 7). Inverted, an unrecognised
         # decision is reported as not-an-authorization, which is the safe read.
         allowed = bounded_authorized
-        refused = bounded_total - allowed
+        outcomes = bounded_outcomes
+        refused = bounded_total - allowed - outcomes
         headline = f"{bounded_total} prior attempt(s) matched ({scope_text})"
         if omitted:
             headline += f" (showing {len(matches)}, {omitted} older not shown)"
-        if refused and allowed:
-            headline += (
-                f" — {allowed} authorized, {refused} NOT authorized "
-                "(refused, blocked, or an outcome rather than a decision)"
-            )
-        elif refused:
+        parts = []
+        if allowed:
+            parts.append(f"{allowed} authorized to run")
+        if outcomes:
+            parts.append(f"{outcomes} completion(s) recorded")
+        if refused:
+            parts.append(f"{refused} NOT authorized (refused or blocked)")
+        if refused and not allowed and not outcomes:
             headline += (
                 f" — none of the {refused} was an authorization to run, "
                 "so this work may never have happened"
             )
-        else:
+        elif allowed and not outcomes and not refused:
             headline += " — authorized to run, which is not proof it succeeded"
+        else:
+            headline += " — " + ", ".join(parts)
         lines = [headline + ". Read `decision` per row:\n"]
         for entry in matches:
             authorized = entry["decision"] in _AUTHORIZED_DECISIONS
-            marker = "→" if authorized else "✗"
+            if authorized:
+                marker = "→"
+            elif entry.get("action") == "tool_outcome":
+                marker = "✓"
+            else:
+                marker = "✗"
             lines.append(
                 f"  {marker} {entry['timestamp']}  "
                 f"{entry['feature']}.{entry['tool']} [{entry['decision']}]"
@@ -1383,6 +1404,9 @@ class SecurityFeature(Feature):
             data={
                 "count": bounded_total,
                 "shown": len(matches),
+                "authorized": allowed,
+                "outcomes": outcomes,
+                "refused": refused,
                 "omitted": omitted,
                 "too_broad": False,
                 "query": needle,
