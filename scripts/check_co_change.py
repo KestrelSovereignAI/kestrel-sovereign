@@ -273,6 +273,12 @@ def _candidate_files(pattern: str, *, fixed: bool) -> set[str]:
 
 
 _TREES: dict[tuple[str, str], ast.AST | None] = {}
+#: Working-tree CANDIDATE files that could not be read or parsed. A changed
+#: file in that state is already reported as NOT ANALYSED by ``collect``; an
+#: untouched sibling in that state was silently dropped instead — its
+#: occurrences vanished and the gate printed "every site was touched", the
+#: same false clean bill of health at the other end of the same invariant.
+_UNANALYSED: set[str] = set()
 
 
 def _tree_for(path: str, ref: str = "") -> ast.AST | None:
@@ -286,7 +292,11 @@ def _tree_for(path: str, ref: str = "") -> ast.AST | None:
                 source = (PROJECT_ROOT / path).read_text(encoding="utf-8")
             except (OSError, ValueError):
                 source = ""
-        _TREES[key] = _parse(source, path) if source else None
+                _UNANALYSED.add(path)
+        tree = _parse(source, path) if source else None
+        if not ref and source and tree is None:
+            _UNANALYSED.add(path)
+        _TREES[key] = tree
     return _TREES[key]
 
 
@@ -679,6 +689,7 @@ def collect(
     """
     _TREES.clear()
     _INDEXES.clear()
+    _UNANALYSED.clear()
     symbols: dict[str, tuple[str, set[str]]] = {}
     literals: set[str] = set()
 
@@ -900,6 +911,13 @@ def collect(
 
     if unsearchable:
         structural.extend((f'"{value!r}"', 0) for value in sorted(unsearchable))
+    # Candidates the AST pass could not open or parse are NOT ANALYSED too:
+    # the same footer and the same --strict refusal as a changed file in that
+    # state, because the consequence is the same — a site that was never
+    # checked reads as touched.
+    for path in sorted(_UNANALYSED):
+        if path not in unparseable:
+            unparseable.append(path)
     return findings, structural, unparseable
 
 
