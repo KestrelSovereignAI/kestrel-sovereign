@@ -173,10 +173,20 @@ def changed_line_map(
     # not a header; reading it as one re-keys the old-side map to a bogus
     # path and voids every old-side line that follows.
     in_hunk = False
+    renamed_from: str | None = None
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             in_hunk = False
-            old_path = new_path = None
+            old_path = new_path = renamed_from = None
+            continue
+        if not in_hunk and line.startswith("rename from "):
+            renamed_from = _decode_git_path(line[len("rename from "):])
+            continue
+        if not in_hunk and line.startswith("rename to "):
+            renamed_to = _decode_git_path(line[len("rename to "):])
+            if renamed_from and renamed_to:
+                _seed_rename(renamed_from, renamed_to, diff_spec[0], old_map, new_map)
+            renamed_from = None
             continue
         if not in_hunk and line.startswith("--- "):
             old_path = _patch_path(line)
@@ -229,8 +239,38 @@ def _paths(output: str) -> set[str]:
     return {part for part in output.split("\0") if part}
 
 
+def _seed_rename(
+    old_path: str,
+    new_path: str,
+    old_ref: str,
+    old_map: dict[str, set[int]],
+    new_map: dict[str, set[int]],
+) -> None:
+    """A renamed file is wholly changed on both sides.
+
+    A pure ``git mv`` emits no ``---``/``+++`` and no hunks, so both maps came
+    back empty and ``--strict`` exited 0 over a change that strands every
+    importer of the old module path — the fifth door of "not checked must not
+    render as clean". Past ``diff.renameLimit`` git falls back to delete+add
+    and the same edit IS analysed; this makes the two shapes agree. Every old
+    line is treated as removed (its definitions and literals left that path)
+    and every new line as added, the untracked-file treatment applied to both
+    ends. A partial rename's hunks land on the same keys, a subset of this.
+    """
+    if old_path.endswith(".py"):
+        old_source = _git("show", f"{old_ref}:{old_path}")
+        old_map[old_path] |= set(range(1, len(old_source.splitlines()) + 1))
+    if new_path.endswith(".py"):
+        try:
+            count = len((PROJECT_ROOT / new_path).read_text(encoding="utf-8").splitlines())
+        except (OSError, ValueError):
+            _UNANALYSED.add(new_path)
+            return
+        new_map[new_path] |= set(range(1, count + 1))
+
+
 def _patch_path(raw: str) -> str | None:
-    """Decode a path out of a ``git diff`` header line.
+    """Decode a path out of a ``git diff`` ``---``/``+++`` header line.
 
     Git appends a tab separator when a path contains spaces, and QUOTES the
     whole path (C-style, with escapes) when it contains tabs or non-ASCII. A
@@ -239,6 +279,14 @@ def _patch_path(raw: str) -> str | None:
     silently skipped — a clean report for a file that was never looked at.
     """
     body = raw.split(" ", 1)[1] if " " in raw else raw
+    body = _decode_git_path(body)
+    if body is None or body == "/dev/null":
+        return None
+    return body[2:] if body[:2] in ("a/", "b/") else body
+
+
+def _decode_git_path(body: str) -> str | None:
+    """Undo git's path quoting; ``rename from/to`` lines carry no ``a/`` prefix."""
     if body.startswith('"'):
         # C-quoted, and git quotes the WHOLE `a/path`, not just the name. The
         # escapes are OCTAL bytes of the UTF-8 encoding (`caf\303\251.py`), so
@@ -254,9 +302,7 @@ def _patch_path(raw: str) -> str | None:
             body = decoded
     else:
         body = body.split("\t", 1)[0]
-    if body == "/dev/null":
-        return None
-    return body[2:] if body[:2] in ("a/", "b/") else body
+    return body
 
 
 def _parse(source: str, filename: str) -> ast.AST | None:
@@ -580,15 +626,15 @@ def module_importers(defining_paths: set[str]) -> set[str]:
     for module in modules:
         # The boundary must NOT exclude a preceding dot: `import pkg.cli as c`
         # is exactly the shape being looked for, and excluding `.` discarded
-        # the file before the dotted-name check below could ever see it.
+        # the file before the index could ever see it. The index records the
+        # last dotted segment of every import alongside the full name, so a
+        # bare-stem membership test is the whole check.
         pattern = _word_pattern(module)
         for path in _candidate_files(pattern, fixed=False):
             index = index_for(path)
             if index is None:
                 continue
-            if module in index.imported_modules or any(
-                mod.endswith(f".{module}") for mod in index.imported_modules
-            ):
+            if module in index.imported_modules:
                 found.add(path)
     return found
 
@@ -1003,7 +1049,7 @@ def _structural_footer(structural: list[tuple[str, int]]) -> str:
 
 def _unparseable_footer(unparseable: list[str]) -> str:
     return (
-        "  NOT ANALYSED — these changed files could not be parsed, so nothing "
+        "  NOT ANALYSED — these files could not be read or parsed, so nothing "
         "about them was checked: " + ", ".join(sorted(unparseable))
     )
 

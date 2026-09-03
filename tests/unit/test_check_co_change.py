@@ -1400,3 +1400,77 @@ def test_a_method_body_edit_does_not_pull_in_unrelated_module_level_importers(re
 
     listed = {(o.path, o.line) for f in _findings(repo) if f.name == "dispatch" for o in f.unchanged}
     assert ("user.py", 1) not in listed
+
+
+# --------------------------------------------------------------------------
+# Round 15: a pure rename is a change; the read-failure guard and the
+# literal-side double-count guard each get the test their twins already had.
+# --------------------------------------------------------------------------
+
+def test_a_pure_rename_is_analysed_not_invisible(repo: Path) -> None:
+    """``git mv`` emits no ``---``/``+++`` and no hunks, so both maps were
+    empty and ``--strict`` exited 0 while every importer of the old module
+    path was stranded. Past ``diff.renameLimit`` git falls back to delete+add
+    and the same edit WAS analysed — the gate contradicted itself."""
+    (repo / "mod.py").write_text("def shared(x):\n    return x\n")
+    (repo / "user.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(1)\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert old_map.get("mod.py") == {1, 2}
+    assert new_map.get("newmod.py") == {1, 2}
+    finding = _named(_findings(repo), "shared")
+    assert any(o.path == "user.py" for o in finding.unchanged), finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_renamed_file_that_cannot_be_read_is_not_analysed(repo: Path) -> None:
+    # A PURE rename (identical bytes, so no hunks): only the rename seeding
+    # ever looks at the new path, and it must record what it could not read
+    # under that path — collect's own guard sees the old path alone.
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # latin-1
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "moved.py")
+
+    assert "moved.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unreadable_sibling_is_reported_not_silently_dropped(repo: Path) -> None:
+    """The read-failure twin of the parse-failure test above: deleting the
+    ``_UNANALYSED.add`` in ``_tree_for``'s ``(OSError, ValueError)`` branch
+    printed "every site was touched" for a sibling that was never read."""
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    (repo / "sib.py").write_bytes(b'# caf\xe9\nB = "tool_execution"\n')  # latin-1, not UTF-8
+    _commit(repo)
+    (repo / "a.py").write_text('A = "subagent_dispatch"\n')
+
+    assert "sib.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_surviving_literal_on_an_edited_line_is_not_counted_twice(repo: Path) -> None:
+    """The literal-side twin of ``test_a_shifted_call_is_not_counted_twice``:
+    a literal that survives on a line the diff changed for another reason is
+    one touched site, not one per side."""
+    (repo / "mod.py").write_text(
+        'def foo(a, b):\n    return b\n\n\nX = foo("tool_execution", 1)\n'
+    )
+    (repo / "b.py").write_text('from mod import foo\n\nY = foo("tool_execution", 9)\n')
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        'def foo(a, b):\n    return b\n\n\nX = foo("tool_execution", 2)\n'
+    )
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 1, f"one site counted per side: {finding.changed}"
+    assert "modified 1 of 2 occurrences" in checker.render([finding])
+
+
+def test_the_not_analysed_footer_names_what_it_lists() -> None:
+    # The list carries untouched siblings and unreadable files too, not only
+    # changed files that failed to parse; the footer must not say otherwise.
+    footer = checker.render([], unparseable=["sib.py"])
+    assert "could not be read or parsed" in footer
+    assert "changed files" not in footer
