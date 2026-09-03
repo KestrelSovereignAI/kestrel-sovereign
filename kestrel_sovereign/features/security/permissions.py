@@ -20,9 +20,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.features.security.args_summary import (
-    mask_sensitive_regions,
     mask_sensitive,
     remask_summary,
+    repair_unparseable_summary,
 )
 
 #: The audit-search tool's own name. Its rows are excluded from every search
@@ -78,18 +78,19 @@ def fold_stored_summary(text):
     try:
         parsed = json.loads(text)
     except (ValueError, TypeError):
-        # Truncated past parsing. An unparseable row cannot be masked
-        # field-by-field, so it must not be searchable field-by-field either —
-        # but the test for "names a sensitive key" has to look at KEY
-        # POSITIONS. Scanning the whole serialized text meant a benign value
-        # like "orphaned keyboard worker" contained "key" and silently left the
-        # corpus, which defeats the long summaries this fallback exists for.
-        # Mask the sensitive VALUES (through the end of each value — string,
-        # container or scalar — so no tail of a secret survives a truncation)
-        # and fold the rest: the
-        # oracle is closed at the value, and the row's other fields stay in
-        # the corpus the caller believes it searched (#3107 round 13).
-        return _decode_escapes(mask_sensitive_regions(text)).casefold()
+        # Truncated past parsing. Repair the cut JSON and mask it structurally
+        # — the same masker and the same walk the parseable branch below
+        # applies — rather than scan the raw text: a scanner has to know every
+        # value shape (a container, an escaped nested string, a quoted key in
+        # prose) and rounds 13–16 each found one it did not. A row whose JSON
+        # cannot be repaired cannot be masked, so it is not searchable; a
+        # prose-only row has no key position and folds as it is (#3107).
+        repaired = repair_unparseable_summary(text)
+        if repaired is None:
+            return ""
+        prefix, masked = repaired
+        folded = prefix if masked is None else prefix + " " + _flatten_json(masked)
+        return folded.casefold().encode("utf-8", "replace").decode("utf-8")
 
     if isinstance(parsed, (dict, list)):
         # MASK BEFORE FOLDING. Masking only on the way out closes the display
@@ -136,11 +137,6 @@ def _flatten_json(value):
 
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
-_JSON_ESCAPES = {
-    '"': '"', "\\": "\\", "/": "/",
-    "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
-}
-_STANDARD_ESCAPE = re.compile(r'\\(["\\/bfnrt])')
 _SURROGATE_PAIR = re.compile(
     r"\\u(d[89ab][0-9a-fA-F]{2})\\u(d[c-f][0-9a-fA-F]{2})", re.IGNORECASE
 )
@@ -154,8 +150,8 @@ def _decode_unicode_escapes(text):
     escapes too turned ``\\b`` in a grep the agent just ran into a backspace,
     and the search for that exact command reported a false absence, with a
     message telling the caller absence is weak evidence (#3107 round 10).
-    ``_decode_escapes`` keeps the standard escapes for the stored-unparseable
-    path, where they are load-bearing.
+    The stored side of a TRUNCATED row is now repaired and parsed too, so the
+    same decoding applies to both sides of every comparison.
     """
     def _one(match):
         code = int(match.group(1), 16)
@@ -173,41 +169,6 @@ def _decode_unicode_escapes(text):
     )
     return _UNICODE_ESCAPE.sub(_one, paired)
 
-
-def _decode_escapes(text):
-    """Decode ``\\uXXXX`` escapes in text that is not valid JSON.
-
-    Surrogate pairs are joined so an emoji stored as two escapes reads as one
-    character; a lone surrogate is left as written rather than raising, because
-    a truncated summary can end mid-pair and a search must not fail on it.
-    """
-    def _one(match):
-        code = int(match.group(1), 16)
-        if 0xD800 <= code <= 0xDFFF:
-            # Leave it escaped. A truncated summary can end between an emoji's
-            # two halves, and a lone surrogate handed back to SQLite raises
-            # inside the scalar function — which fails the ENTIRE query, not
-            # just this row, so one cut emoji would break every search
-            # (#3107 review round 5). Pairs are rejoined below.
-            return match.group(0)
-        return chr(code)
-
-    decoded = _UNICODE_ESCAPE.sub(_one, text)
-
-    # Rejoin surviving well-formed pairs so an intact emoji reads as one
-    # character rather than two escapes.
-    def _pair(match):
-        high, low = int(match.group(1), 16), int(match.group(2), 16)
-        return chr(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
-
-    decoded = _SURROGATE_PAIR.sub(_pair, decoded)
-
-    # ...and the STANDARD escapes json.dumps introduces. Decoding only
-    # \uXXXX left a fragment containing a quote, newline or backslash stored
-    # escaped while the natural query carries the decoded character, so the
-    # search reported a false absence — and the result text promised that only
-    # detail past the truncation point was invisible.
-    return _STANDARD_ESCAPE.sub(lambda m: _JSON_ESCAPES[m.group(1)], decoded)
 
 logger = logging.getLogger(__name__)
 

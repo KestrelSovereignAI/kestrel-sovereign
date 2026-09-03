@@ -18,10 +18,11 @@ from typing import Any, Optional
 #: Substrings (matched case-insensitively) that mark a key as sensitive.
 #: A sensitive name in KEY POSITION — `"...key...":` — rather than anywhere in
 #: the text. The value side is data and may legitimately contain these words.
-#: :func:`mask_sensitive_regions` is the one masker both the searchable
-#: projection (permissions.fold_stored_summary) and the displayed one
-#: (remask_summary) apply to an unparseable row, so the two cannot disagree
-#: about what is masked.
+#: :func:`mask_sensitive` is the one masker every row gets — parseable rows
+#: directly, truncated rows after :func:`repair_unparseable_summary` closes
+#: what the cut left open — in both the searchable projection
+#: (permissions.fold_stored_summary) and the displayed one (remask_summary),
+#: so the two cannot disagree about what is masked.
 SENSITIVE_KEY_SUBSTRINGS = (
     "password",
     "secret",
@@ -34,93 +35,125 @@ SENSITIVE_KEY_SUBSTRINGS = (
     "social_security",
 )
 
-#: A sensitive key in key position, with the ``:`` and whitespace that
-#: precede its value, in serialized-but-unparseable JSON.
-_SENSITIVE_JSON_KEY_PREFIX = re.compile(
-    r'"[^"]*(?:%s)[^"]*"\s*:\s*' % "|".join(
-        re.escape(sub) for sub in SENSITIVE_KEY_SUBSTRINGS
-    ),
-    re.IGNORECASE,
-)
-
-#: A bare JSON scalar never contains whitespace; stopping at it confines the
-#: mask to one token when the text after a key-shaped match is prose rather
-#: than JSON (a truncated row whose string VALUE quotes ``"api_key":``).
-_BARE_SCALAR = re.compile(r"[^\s,}\]]*")
+#: What ``summarize_args`` appends when it cuts a row; stripped before repair.
+_TRUNCATION_MARK = "..."
+#: Trailing characters repair may drop to reach a parseable cut point: a cut
+#: inside a ``\\uXXXX`` escape needs up to six, a bare literal (``tru``) four.
+_MAX_REPAIR_TRIM = 8
 
 
-def _value_end(text: str, start: int) -> int:
-    """Index just past the JSON value beginning at ``start``, or ``len(text)``
-    when the value is cut off — a string, a balanced ``{}``/``[]`` container
-    (strings inside it respected), or a bare scalar up to the next separator.
+def _close_open_structures(text: str) -> Optional[str]:
+    """Append what a cut left open so ``text`` parses, or None.
+
+    Tracks strings (with escapes) and container nesting in one pass. An
+    unterminated VALUE string is closed; an unterminated KEY string is
+    dropped — there is no value to mask or show (a complete key the cut
+    separated from its value reaches this same branch once the caller trims
+    its closing quote). A trailing ``,`` is dropped and a trailing ``:`` gets
+    ``null``; then every open container is closed in reverse. None when the
+    text is not JSON-shaped or its brackets do not nest.
     """
-    if start >= len(text):
-        return start
-    first = text[start]
-    if first == '"':
-        i = start + 1
-        while i < len(text):
-            if text[i] == "\\":
-                i += 2
-                continue
-            if text[i] == '"':
-                return i + 1
-            i += 1
-        return len(text)
-    if first in "{[":
-        depth = 0
-        in_string = False
-        i = start
-        while i < len(text):
-            ch = text[i]
-            if in_string:
-                if ch == "\\":
-                    i += 1
-                elif ch == '"':
-                    in_string = False
+    if text[:1] not in "{[":
+        return None
+    closers: list[str] = []
+    in_string = False
+    escape = False
+    string_start = -1
+    string_is_key = False
+    previous = ""
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
             elif ch == '"':
-                in_string = True
-            elif ch in "{[":
-                depth += 1
-            elif ch in "}]":
-                depth -= 1
-                if depth == 0:
-                    return i + 1
-            i += 1
-        return len(text)
-    return _BARE_SCALAR.match(text, start).end()
+                in_string = False
+                previous = '"'
+            continue
+        if ch.isspace():
+            continue
+        if ch == '"':
+            in_string = True
+            string_start = i
+            string_is_key = bool(closers) and closers[-1] == "}" and previous in "{,"
+            continue
+        if ch in "{[":
+            closers.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not closers or closers[-1] != ch:
+                return None
+            closers.pop()
+        previous = ch
+    if in_string:
+        if string_is_key:
+            text = text[:string_start]
+        else:
+            if escape:
+                text = text[:-1]
+            text += '"'
+    tail = text.rstrip()
+    if tail.endswith(","):
+        tail = tail[:-1]
+    elif tail.endswith(":"):
+        tail += " null"
+    return tail + "".join(reversed(closers))
 
 
-def mask_sensitive_regions(text):
-    """Mask the value of every sensitive key in JSON text that will not parse.
+def complete_truncated_json(text: Any) -> Any:
+    """Parse JSON text that a truncation cut, or return None.
 
-    A row truncated mid-structure cannot be masked field-by-field. Dropping
-    the whole row whenever a sensitive key appeared silently shrank the corpus
-    the caller believes it searched — a filing that carried a (write-time
-    masked) ``token`` beside a long body left the read-back entirely, and the
-    no-match text then blamed truncation for a phrase INSIDE the cut. Only
-    the sensitive VALUE is the oracle risk; the rest of the row is data the
-    caller is entitled to match. The value is replaced through the end of
-    whatever JSON value follows the key — a string, a whole ``{}``/``[]``
-    container (masked wholesale, as :func:`mask_sensitive` masks a nested
-    secret dict), or a bare scalar — and a value the truncation cut off runs
-    to the end of the text, so no tail of a secret survives. A regex that
-    only knew strings stopped at a container's first comma and let the rest
-    of it through both projections (round 13 review).
+    Tries the text as it is, then with its open string and containers
+    closed, dropping up to ``_MAX_REPAIR_TRIM`` trailing characters so a cut
+    that landed inside an escape sequence, a number or a bare literal still
+    reaches a parseable point. Only a dict or list counts: the shape is what
+    :func:`mask_sensitive` walks.
     """
-    out = []
-    pos = 0
-    while True:
-        match = _SENSITIVE_JSON_KEY_PREFIX.search(text, pos)
-        if match is None:
-            break
-        out.append(text[pos:match.end()])
-        out.append('"***MASKED***"')
-        # Resume past the whole value: a sensitive key nested inside a masked
-        # container is covered by the mask, not matched again.
-        pos = _value_end(text, match.end())
-    out.append(text[pos:])
-    return "".join(out)
+    if not isinstance(text, str):
+        return None
+    body = text.rstrip()
+    if body.endswith(_TRUNCATION_MARK):
+        body = body[: -len(_TRUNCATION_MARK)]
+    for trim in range(_MAX_REPAIR_TRIM + 1):
+        candidate = body[: len(body) - trim] if trim else body
+        if not candidate:
+            return None
+        closed = _close_open_structures(candidate)
+        if closed is None:
+            return None
+        try:
+            parsed = json.loads(closed)
+        except ValueError:
+            continue
+        return parsed if isinstance(parsed, (dict, list)) else None
+    return None
+
+
+def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
+    """Split a stored summary that will not parse into its prose prefix and
+    the JSON it embeds, repaired and MASKED.
+
+    ``summarize_args`` output is JSON cut mid-structure; ``tool_audit`` writes
+    ``"<reason> | args=<json>"``. Either way the JSON is repaired by closing
+    what the cut left open and masked STRUCTURALLY by :func:`mask_sensitive`
+    — the one masker every parseable row already gets — so there is a single
+    masking rule and no text scanner to get a value shape wrong (rounds
+    13–16 each found one: a container, an escaped string, prose).
+
+    Returns ``(text, None)`` for prose that embeds no JSON at all (nothing
+    with a key position, so nothing to mask), ``(prefix, masked)`` when the
+    JSON repaired, and None when JSON was found but cannot be repaired — that
+    row cannot be masked, so it must not be shown or searched.
+    """
+    starts = sorted({m.start() for m in re.finditer(r"[{\[]", text)})[:8]
+    if not starts:
+        return text, None
+    for start in starts:
+        parsed = complete_truncated_json(text[start:])
+        if parsed is not None:
+            return text[:start], mask_sensitive(parsed)
+    return None
+
 
 #: Placeholder written in place of a sensitive value.
 MASK = "***MASKED***"
@@ -132,19 +165,24 @@ def mask_sensitive(data: Any) -> Any:
     Dicts and lists are walked recursively; a key matching any
     :data:`SENSITIVE_KEY_SUBSTRINGS` substring has its value replaced with
     :data:`MASK` regardless of the value's type (so a nested secret dict is
-    masked wholesale rather than descended into). A string value that is
-    itself JSON-shaped — it starts with ``{`` or ``[`` — is run through
-    :func:`mask_sensitive_regions`: a JSON-encoded payload carried as a
-    string (``{"payload": "{\\"api_key\\": ...}"}``) has no dict key for
-    this walk to see, and the unparseable branch masked exactly that shape
-    while this one showed it (round 14 review). Every other string is
-    prose and passes through untouched: this runs on the WRITE path for
-    every tool call, and the region mask's JSON-scoped value rules applied
-    to an issue body that merely quotes ``"api_key":`` ate the rest of the
-    body from the audit row, permanently (round 15 review).
+    masked wholesale rather than descended into). A string value that IS
+    JSON — a JSON-encoded payload carried as a string
+    (``{"payload": "{\\"api_key\\": ...}"}``) has no dict key for this walk
+    to see — is parsed (repaired first if a cut left it open), masked the
+    same way and re-serialized, and only when masking changed something.
+    Every other string is prose and passes through byte-for-byte: this runs
+    on the WRITE path for every tool call, and a text scanner applied to an
+    issue body that merely quoted ``"api_key":`` — or that began with a
+    markdown ``[link]`` — ate the rest of the body from the audit row,
+    permanently (rounds 15 and 16). Whether a string is JSON is decided by
+    parsing it, never by its first character.
     """
     if isinstance(data, str):
-        return mask_sensitive_regions(data) if data.lstrip()[:1] in ("{", "[") else data
+        nested = complete_truncated_json(data.lstrip())
+        if nested is None:
+            return data
+        masked = mask_sensitive(nested)
+        return data if masked == nested else json.dumps(masked, default=str)
     if isinstance(data, dict):
         result: dict = {}
         for key, value in data.items():
@@ -179,10 +217,11 @@ def remask_summary(summary: Optional[str]) -> Optional[str]:
 
     Cheap for the common case: a row already masked re-masks to itself.
 
-    A summary too truncated to parse cannot be re-masked field-by-field. Its
-    sensitive VALUES are masked in place by :func:`mask_sensitive_regions` —
-    the same helper the searchable projection applies (``fold_stored_summary``),
-    so display and match are the same text — and the rest of the row is shown.
+    A summary too truncated to parse is repaired — the cut's open string and
+    containers closed — and masked field-by-field like any other row, by
+    :func:`repair_unparseable_summary`, the same helper the searchable
+    projection applies (``fold_stored_summary``), so display and match are
+    the same text; the rest of the row is shown.
     ``summarize_args`` truncates at 500 chars mid-structure, so on the live
     corpus ~30% of rows with arguments are unparseable, the long-issue-body
     filings that motivated this tool among them; withholding all of them
@@ -195,9 +234,16 @@ def remask_summary(summary: Optional[str]) -> Optional[str]:
     try:
         parsed = json.loads(summary)
     except (ValueError, TypeError):
-        # Same rule as the searchable projection: mask the sensitive VALUES
-        # and keep the rest, rather than withholding the whole row.
-        return mask_sensitive_regions(summary)
+        # Same rule as the searchable projection: repair the cut JSON, mask
+        # it structurally, keep the rest. A row whose JSON cannot be repaired
+        # cannot be masked, and is withheld rather than shown raw.
+        repaired = repair_unparseable_summary(summary)
+        if repaired is None:
+            return "(summary truncated past repair; not shown)"
+        prefix, masked = repaired
+        if masked is None:
+            return summary
+        return prefix + json.dumps(masked, default=str)
     if not isinstance(parsed, (dict, list)):
         return summary
     try:

@@ -339,7 +339,11 @@ async def test_days_window_does_not_drop_legacy_timestamps(tmp_path):
     # its date alone and the bug hides. Put it one hour INSIDE the window,
     # which is the same calendar date as the cutoff.
     cutoff = datetime.now(timezone.utc) - timedelta(days=1)
-    legacy_stamp = (cutoff + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    legacy_stamp = (cutoff + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+    # The construction above must land on the cutoff's own date or the test
+    # stops exercising the bug (one hour ahead crossed midnight for one hour
+    # in every 24 and passed against the reverted predicate). Say so loudly.
+    assert legacy_stamp[:10] == cutoff.strftime("%Y-%m-%d"), legacy_stamp
     raw = sqlite3.connect(db_path)
     raw.execute(
         "INSERT INTO security_audit_log "
@@ -1297,12 +1301,12 @@ async def test_an_ordinary_query_containing_key_still_searches(store):
             "everything"
         )
 
-    # Scoping the key-detection regex to KEY POSITIONS already saves the plain
-    # cases above, which is why re-conflating the two functions survived a
-    # first mutation pass. The split is still load-bearing, and this is where:
-    # a query that itself looks like a JSON key position folds away under the
-    # stored-summary rule and becomes "%%".
-    hostile = 'what did I do with "api_key": rotation'
+    # Scoping masking to KEY POSITIONS already saves the plain cases above,
+    # which is why re-conflating the two functions survived a first mutation
+    # pass. The split is still load-bearing, and this is where: a query that
+    # is itself JSON with a sensitive key folds away under the stored-summary
+    # rule (which masks that value) and becomes "%%".
+    hostile = '{"api_key": "rotation"}'
     from kestrel_sovereign.features.security.permissions import (
         fold_stored_summary,
     )
@@ -1458,7 +1462,8 @@ async def test_an_unparseable_row_without_a_sensitive_key_is_still_shown(tmp_pat
     from kestrel_sovereign.features.security.feature import SecurityFeature
 
     truncated = '{"title": "orphans the worker", "body": "' + "x" * 40  # cut mid-value
-    assert remask_summary(truncated) == truncated
+    # Repaired (the cut string and object closed), nothing masked, nothing lost.
+    assert remask_summary(truncated) == truncated + '"}'
     leaking = '{"memo": "orphaned worker", "api_key": "sk-live-CUT'
     shown = remask_summary(leaking)
     assert "sk-live-CUT" not in shown
@@ -1743,26 +1748,33 @@ async def test_days_window_excludes_an_iso_row_older_than_the_window(tmp_path):
 # balanced close (or to the cut), in both projections.
 # --------------------------------------------------------------------------
 
-def test_mask_sensitive_regions_masks_a_container_value_wholesale():
-    from kestrel_sovereign.features.security.args_summary import mask_sensitive_regions
+def test_a_truncated_row_masks_every_value_shape_and_keeps_the_rest():
+    """One structural masker for truncated rows too: the cut is repaired,
+    parsed and masked by key position. A text scanner had to know every
+    value shape and missed one per round (container, escaped string, prose)."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
 
-    # A dict value: the regex that only knew strings stopped at the first
-    # comma and let `"b": "sk-live-BBB-LEAK"` through.
-    cut = '{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BBB-LEAK"}, "body": "## Deta'
-    masked = mask_sensitive_regions(cut)
-    assert masked == '{"memo": "orphaned worker", "secrets": "***MASKED***", "body": "## Deta'
-    # A list value, with a nested object and a string holding a brace.
-    cut = '{"api_keys": ["sk-1", {"k": "sk-2}"}], "memo": "x"'
-    assert mask_sensitive_regions(cut) == '{"api_keys": "***MASKED***", "memo": "x"'
-    # A container the truncation cut open runs to the end of the text.
-    cut = '{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BB'
-    assert mask_sensitive_regions(cut) == '{"memo": "orphaned worker", "secrets": "***MASKED***"'
-    # The shapes round 13 already handled still hold: a string, an unterminated
-    # string, a bare scalar, an escaped quote inside the secret.
-    assert mask_sensitive_regions('{"token": "abc", "n": 1') == '{"token": "***MASKED***", "n": 1'
-    assert mask_sensitive_regions('{"token": "ab') == '{"token": "***MASKED***"'
-    assert mask_sensitive_regions('{"token": 12345, "n": 1') == '{"token": "***MASKED***", "n": 1'
-    assert mask_sensitive_regions('{"token": "a\\"b", "n": 1') == '{"token": "***MASKED***", "n": 1'
+    cases = [
+        # a dict value; the scanner stopped at its first comma
+        '{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BBB-LEAK"}, "body": "## Deta',
+        # a list value with a nested object and a brace inside a string
+        '{"api_keys": ["sk-1-LEAK", {"k": "sk-2-LEAK}"}], "memo": "orphaned worker"',
+        # a container the cut left open
+        '{"memo": "orphaned worker", "secrets": {"a": "AAA-LEAK", "b": "sk-live-BB-LEAK',
+        # a string, an unterminated string, a bare scalar, an escaped quote
+        '{"memo": "orphaned worker", "token": "abc-LEAK", "n": 1',
+        '{"memo": "orphaned worker", "token": "ab-LEAK',
+        '{"memo": "orphaned worker", "token": 12345, "n": 1',
+        '{"memo": "orphaned worker", "token": "a\\"b-LEAK", "n": 1',
+        # the round-16 P1: a nested JSON string whose value is escaped
+        '{"payload": "{\\"password\\": \\"correct horse battery staple-LEAK\\"}", "memo": "orphaned worker", "body": "deploy the widget',
+        '{"memo": "orphaned worker", "credit_card": "4111 1111 1111 1111", "body": "deploy the wi',
+    ]
+    for cut in cases:
+        shown = remask_summary(cut)
+        assert "LEAK" not in shown and "12345" not in shown and "1111" not in shown, (cut, shown)
+        assert "***MASKED***" in shown, (cut, shown)
+        assert "orphaned worker" in shown, (cut, shown)
 
 
 @pytest.mark.asyncio
@@ -1832,9 +1844,10 @@ def test_remask_summary_never_shrinks_a_row():
     row = _talon_outcome_row()
     shown = remask_summary(row)
     assert "unmistakable-tail-phrase" in shown and '"issue_number": 3107' in shown
-    # An unparseable long row keeps its tail too.
+    # An unparseable long row keeps its tail too (repair may drop up to eight
+    # characters AT the cut to reach a parseable point, never more).
     cut = row[:850]
-    assert remask_summary(cut).endswith(cut[-40:])
+    assert cut[-48:-8] in remask_summary(cut)
 
 
 @pytest.mark.asyncio
@@ -1962,16 +1975,127 @@ async def test_a_benign_body_that_quotes_a_key_is_still_searchable_end_to_end(tm
         assert phrase in result.data["matches"][0]["args_summary"]
 
 
-def test_a_truncated_row_quoting_a_key_in_prose_loses_one_token_at_most():
-    """The unparseable branch cannot tell a structural key from one quoted
-    inside a string value it was cut in the middle of. A bare scalar never
-    holds whitespace, so the mask stops at the first space instead of
-    eating the rest of the body."""
-    from kestrel_sovereign.features.security.args_summary import mask_sensitive_regions
+def test_a_truncated_row_quoting_a_key_in_prose_loses_nothing():
+    """The unparseable branch used to scan raw text and could not tell a
+    structural key from one quoted inside a string value. Repairing and
+    parsing the cut row masks by key position, so prose is never touched."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
 
     cut = '{"title": "t", "body": "The `\\"api_key\\":` handling is the red herring here. Killing a job orphans the worker'
-    masked = mask_sensitive_regions(cut)
-    assert "orphans the worker" in masked and "red herring" in masked
-    # ...while a real bare scalar after a structural key is still masked whole.
-    assert mask_sensitive_regions('{"token": 12345, "n": 1') == '{"token": "***MASKED***", "n": 1'
-    assert mask_sensitive_regions('{"token": 12345') == '{"token": "***MASKED***"'
+    shown = remask_summary(cut)
+    assert "red herring" in shown and "orphans the worker" in shown and "***MASKED***" not in shown
+    folded = fold_stored_summary(cut)
+    assert "red herring" in folded and "orphans the worker" in folded
+    # ...while a real bare scalar after a structural key is still masked.
+    assert "12345" not in remask_summary('{"token": 12345, "n": 1')
+    assert "12345" not in remask_summary('{"token": 12345')
+
+
+# --------------------------------------------------------------------------
+# Round 17: the text scanner is gone. A truncated row is REPAIRED (its open
+# string and containers closed), parsed, and masked by the one structural
+# masker every parseable row gets; a JSON-valued string is decided by parsing.
+# --------------------------------------------------------------------------
+
+def test_complete_truncated_json_closes_what_the_cut_left_open():
+    from kestrel_sovereign.features.security.args_summary import complete_truncated_json as c
+
+    assert c('{"a": 1, "b": {"c": [1, 2') == {"a": 1, "b": {"c": [1, 2]}}
+    assert c('{"a": "unterminated str') == {"a": "unterminated str"}
+    assert c('{"a": "x", "api_k') == {"a": "x"}                 # a key the cut split is dropped
+    assert c('{"a": "x", "api_key"') == {"a": "x"}              # a key with no value is dropped
+    assert c('{"a": "x", "api_key":') == {"a": "x", "api_key": None}
+    # ...and a cut or dangling key LONGER than the eight-character trim: only
+    # the key-position drop can repair these (trimming cannot reach the comma).
+    assert c('{"a": "x", "social_security_numb') == {"a": "x"}
+    assert c('{"a": "x", "social_security_number"') == {"a": "x"}
+    assert c('{"a": "x",') == {"a": "x"}
+    assert c('{"a": tr') == {"a": None}                          # a cut bare literal: value unknown
+    assert c('{"a": "caf\\u00') == {"a": "caf"}                # a cut inside an escape
+    assert c('{"a": "back\\') == {"a": "back"}                 # a cut right after a backslash
+    assert c('{"a": "x"}...') == {"a": "x"}                      # summarize_args' marker
+    assert c('{"a": "x", "b": "y') == {"a": "x", "b": "y"}
+    assert c('{"list": [{"k": "v"}, {"k') == {"list": [{"k": "v"}, {}]}   # the cut key is dropped
+    # not JSON: prose, a bare scalar, misnested brackets
+    assert c("orphaned keyboard worker") is None
+    assert c('"just a string"') is None
+    assert c('{"a": [1}') is None
+    assert c("") is None and c(None) is None
+
+
+def test_the_escaped_nested_secret_is_masked_and_not_searchable_end_to_end(tmp_path):
+    """Round 16's P1: a nested JSON string's value begins with an escaped
+    quote, which the scanner read as a bare scalar and masked only to the
+    first space — the tail reached the model and the hit/no-hit oracle."""
+    import asyncio
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = '{"payload": "{\\"password\\": \\"correct horse battery staple\\"}", "body": "deploy the widget BBB'
+    assert "horse" not in fold_stored_summary(row)
+    assert "deploy the widget" in fold_stored_summary(row)
+
+    async def scenario():
+        store = PermissionStore(str(tmp_path / "escaped.db"))
+        await store.initialize()
+        await store.log_decision(
+            feature_name="Legacy", tool_name="deploy_widget", action="tool_execution",
+            decision="auto_mode_allowed", args_summary=row,
+        )
+        feature = SecurityFeature.__new__(SecurityFeature)
+        feature.permission_store = store
+        shown = await feature.security_audit_search(query="deploy the widget")
+        assert shown.data["count"] == 1 and "horse" not in str(shown.data)
+        for probe in ("horse battery staple", "horse battery stapleX", "correct horse"):
+            assert (await feature.security_audit_search(query=probe)).data["count"] == 0, probe
+
+    asyncio.run(scenario())
+
+
+def test_a_markdown_body_starting_with_a_bracket_survives_the_write_path():
+    """Round 16's P2: deciding "is this JSON?" by first character made a body
+    that opened with a link or an [x] checkbox eat its own prose."""
+    from kestrel_sovereign.features.security.args_summary import mask_sensitive, summarize_args
+
+    body = (
+        "[Talon run 41](https://example/41)\n\n"
+        'The config block opens with `"api_key": {` and is never closed in the\n'
+        "snippet below. Killing the tracked job orphans the worker, and the\n"
+        "kill reports success while the work keeps running.\n"
+    )
+    assert mask_sensitive(body) == body
+    assert mask_sensitive("[x] rotate the api_key: done") == "[x] rotate the api_key: done"
+    stored = summarize_args({"repo": "r", "title": "orphaned worker", "body": body})
+    assert json.loads(stored)["body"] == body
+    # ...and a string that IS JSON is still masked, whatever it starts with.
+    assert "sk-NESTED" not in mask_sensitive(" \n" + json.dumps([{"api_key": "sk-NESTED"}]))
+    assert "sk-NESTED" not in mask_sensitive(json.dumps({"api_key": "sk-NESTED"})[:-3])  # cut
+
+
+def test_a_tool_audit_row_keeps_its_reason_and_masks_its_embedded_args():
+    """tool_audit writes '<reason> | args=<json>'. The prose prefix is kept,
+    the embedded JSON is repaired and masked; a prose-only row (no args) is
+    shown and folded as it is, having no key position at all."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = 'tool not in palette [wallet] | args={"memo": "orphaned worker", "api_key": "sk-live-LEAK", "body": "deplo'
+    shown = remask_summary(row)
+    assert shown.startswith("tool not in palette [wallet] | args=")
+    assert "sk-live-LEAK" not in shown and "orphaned worker" in shown and "***MASKED***" in shown
+    folded = fold_stored_summary(row)
+    assert "sk-live" not in folded and "orphaned worker" in folded and "not in palette" in folded
+
+    prose = "refused: tool not in palette"
+    assert remask_summary(prose) == prose
+    assert fold_stored_summary(prose) == prose
+
+
+def test_a_row_whose_json_cannot_be_repaired_is_withheld_not_shown_raw():
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    broken = '{"api_key": "sk-live-LEAK"] "memo": "orphaned worker"'   # misnested: no repair
+    assert remask_summary(broken) == "(summary truncated past repair; not shown)"
+    assert fold_stored_summary(broken) == ""
