@@ -1426,8 +1426,8 @@ def test_a_pure_rename_is_analysed_not_invisible(repo: Path) -> None:
     _run(repo, "mv", "mod.py", "newmod.py")
 
     new_map, old_map = checker.changed_line_map(["HEAD"])
-    assert old_map.get("mod.py") == {1, 2}
-    assert new_map.get("newmod.py") == {1, 2}
+    # No line is seeded for a rename: the change is the module path.
+    assert new_map == {} and old_map == {} and checker._RENAMES == {"mod.py": "newmod.py"}
     finding = _named(_findings(repo), "shared")
     assert any(o.path == "user.py" for o in finding.unchanged), finding
     assert checker.main(["--strict"]) == 1
@@ -1592,6 +1592,7 @@ def test_a_rename_with_edits_keeps_its_untouched_in_file_siblings(repo: Path) ->
 
     new_map, old_map = checker.changed_line_map(["HEAD"])
     assert new_map == {"newmod.py": {1}} and old_map == {"mod.py": {1}}, (new_map, old_map)
+    assert checker._RENAMES == {"mod.py": "newmod.py"}
     finding = _named(_findings(repo), "tool_execution")
     assert [(o.path, o.line) for o in finding.unchanged] == [("newmod.py", 2), ("newmod.py", 3)]
     assert checker.main(["--strict"]) == 1
@@ -1634,3 +1635,68 @@ def test_a_copy_with_edits_records_no_removals_from_its_source(repo: Path) -> No
     assert new_map.get("b.py") == {1} and new_map.get("a.py") == {4}, changed
     # Nothing removed "tool_execution" anywhere, so nothing is surfaced for it.
     assert [f.name for f in _findings(repo) if f.name == "tool_execution"] == []
+
+
+# --------------------------------------------------------------------------
+# Round 19: a rename is a module-path change. Its old path strands every
+# external reference, edits or not; sites that moved with the file are not
+# stranded; counts across the rename reconcile through it.
+# --------------------------------------------------------------------------
+
+def test_a_rename_with_edits_still_surfaces_every_stranded_importer(repo: Path) -> None:
+    """Gating the old-side treatment on 'no hunks' made `git mv` plus any edit
+    drop every stranded importer: user.py raised ImportError and --strict was
+    green, while git's own delete+add fallback surfaced both names."""
+    (repo / "mod.py").write_text(
+        "TIMEOUT = 30\n\n\ndef public_api(y):\n    return y\n\n\nclass Worker:\n    pass\n"
+    )
+    (repo / "user.py").write_text(
+        "from mod import public_api, Worker\n\n\ndef f():\n    return public_api(1), Worker()\n"
+    )
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        "TIMEOUT = 60\n\n\ndef public_api(y):\n    return y\n\n\nclass Worker:\n    pass\n"
+    )
+
+    findings = _findings(repo)
+    for name in ("public_api", "Worker"):
+        finding = _named(findings, name)
+        assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1), ("user.py", 5)}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_sites_that_moved_with_a_renamed_file_are_not_stranded(repo: Path) -> None:
+    """A pure rename questions references bound to the OLD path, not the
+    callers inside the file that moved with their definition."""
+    body = "def shared(x):\n    return x\n" + "".join(
+        f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(3)
+    )
+    (repo / "mod.py").write_text(body)
+    (repo / "user.py").write_text("from mod import shared\n\n\ndef f():\n    return shared(9)\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    finding = _named(_findings(repo), "shared")
+    assert {(o.path, o.line) for o in finding.unchanged} == {("user.py", 1), ("user.py", 5)}, finding
+    # ...and nothing else in the renamed file is surfaced for it.
+    assert not [o for o in finding.unchanged if o.path == "newmod.py"]
+
+
+def test_counts_across_a_rename_reconcile_through_it(repo: Path) -> None:
+    """The old-side reconciliation matched touched sites by PATH; a rename
+    puts the two sides on different paths, so every old site was appended a
+    second time: 'modified 2 of 4' for 3 callers with 1 edited."""
+    body = "def shared(x):\n    return x\n" + "".join(
+        f"\n\ndef c{i}():\n    return shared({i})\n" for i in range(3)
+    )
+    (repo / "mod.py").write_text(body)
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        body.replace("    return x\n", "    return x + 1\n", 1).replace("shared(1)", "shared(11)")
+    )
+
+    finding = _named(_findings(repo), "shared")
+    assert len(finding.changed) == 1 and len(finding.unchanged) == 2, finding
+    assert "modified 1 of 3 call sites" in checker.render([finding])

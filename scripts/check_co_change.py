@@ -172,6 +172,7 @@ def changed_line_map(
         "--src-prefix=a/", "--dst-prefix=b/", *diff_spec,
     )
     _UNANALYSED.clear()  # one run's record starts here, ends in collect()
+    _RENAMES.clear()
     new_map: dict[str, set[int]] = defaultdict(set)
     old_map: dict[str, set[int]] = defaultdict(set)
     new_path: str | None = None
@@ -183,30 +184,27 @@ def changed_line_map(
     # path and voids every old-side line that follows.
     in_hunk = False
     renamed_from: str | None = None
-    # A rename or copy target is wholly changed ONLY when its entry carries
-    # no hunks (a pure `git mv`, a byte copy). Git detects a rename that also
-    # carries edits (similarity >= 50%), and seeding every line of that
-    # target marked its untouched in-file siblings as touched — the gate's
-    # own motivating case answered backwards, with --strict green. So the
-    # seed is buffered here and applied when the entry ends, if and only if
-    # no hunk was seen; an entry with hunks is keyed by its headers and
-    # hunks exactly like a plain edit.
-    pending_seed: tuple[str, str | None, str] | None = None
+    # A rename is RECORDED, not seeded. Seeding the target's lines marked the
+    # untouched sites inside a renamed-and-edited file as touched (a false
+    # clean); seeding the source's lines double-counted them. What a rename
+    # actually changes is the module path: every reference bound to the old
+    # one is stranded, edits or not — ``collect`` raises exactly those from
+    # the old file's module-level definitions. The entry's hunks, if any,
+    # key the maps like a plain edit. A COPY target is a new file (its lines
+    # all new, like an untracked file) only when the entry has no hunks, so
+    # that seed is buffered and applied when the entry ends.
+    pending_copy: str | None = None
     is_copy = False
 
-    def flush_pending_seed() -> None:
-        nonlocal pending_seed
-        if pending_seed is not None and not in_hunk:
-            kind, seed_old, seed_new = pending_seed
-            if kind == "rename" and seed_old is not None:
-                _seed_rename(seed_old, seed_new, diff_spec[0], old_map, new_map)
-            else:
-                _seed_new_file(seed_new, new_map)
-        pending_seed = None
+    def flush_pending_copy() -> None:
+        nonlocal pending_copy
+        if pending_copy is not None and not in_hunk:
+            _seed_new_file(pending_copy, new_map)
+        pending_copy = None
 
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            flush_pending_seed()
+            flush_pending_copy()
             in_hunk = False
             is_copy = False
             old_path = new_path = renamed_from = None
@@ -217,19 +215,19 @@ def changed_line_map(
         if not in_hunk and line.startswith("rename to "):
             renamed_to = _decode_git_path(line[len("rename to "):])
             if renamed_from and renamed_to:
-                pending_seed = ("rename", renamed_from, renamed_to)
+                _RENAMES[renamed_from] = renamed_to
             renamed_from = None
             continue
         if not in_hunk and line.startswith("copy to "):
             # diff.renames=copies: the same extended-header shape as a
             # rename, for a file derived from a committed one that stays in
-            # place. Only the NEW side can be wholly changed, and the entry's
-            # `---` header names the SOURCE — a copy removes nothing from it,
-            # so that header must not key the old-side map.
+            # place. The entry's `---` header names the SOURCE — a copy
+            # removes nothing from it — so that header must not key the
+            # old-side map.
             copied_to = _decode_git_path(line[len("copy to "):])
             is_copy = True
             if copied_to:
-                pending_seed = ("copy", None, copied_to)
+                pending_copy = copied_to
             continue
         if not in_hunk and line.startswith("--- "):
             if not is_copy:
@@ -251,7 +249,7 @@ def changed_line_map(
             count = 1 if new_count is None else int(new_count)
             for offset in range(count):
                 new_map[new_path].add(int(new_start) + offset)
-    flush_pending_seed()
+    flush_pending_copy()
     if include_untracked:
         # `git diff` never mentions an untracked file, so a brand-new module —
         # every line of it new — was invisible and the gate reported clean on
@@ -284,35 +282,9 @@ def _paths(output: str) -> set[str]:
     return {part for part in output.split("\0") if part}
 
 
-def _seed_rename(
-    old_path: str,
-    new_path: str,
-    old_ref: str,
-    old_map: dict[str, set[int]],
-    new_map: dict[str, set[int]],
-) -> None:
-    """A PURELY renamed file is wholly changed on both sides.
-
-    A pure ``git mv`` emits no ``---``/``+++`` and no hunks, so both maps came
-    back empty and ``--strict`` exited 0 over a change that strands every
-    importer of the old module path — the fifth door of "not checked must not
-    render as clean". Past ``diff.renameLimit`` git falls back to delete+add
-    and the same edit IS analysed; this makes the two shapes agree. Every old
-    line is treated as removed (its definitions and literals left that path)
-    and every new line as added, the untracked-file treatment applied to both
-    ends. The caller applies this only to an entry with no hunks: a rename
-    that also carries edits is keyed by its hunks like a plain edit, so the
-    untouched sites inside the renamed file stay untouched.
-    """
-    if old_path.endswith(".py"):
-        old_source = _git("show", f"{old_ref}:{old_path}")
-        old_map[old_path] |= set(range(1, len(old_source.splitlines()) + 1))
-    _seed_new_file(new_path, new_map)
-
-
 def _seed_new_file(new_path: str, new_map: dict[str, set[int]]) -> None:
-    """Every line of a working-tree file is changed (rename target, copy
-    target, untracked file); one it cannot read is NOT ANALYSED."""
+    """Every line of a working-tree file is changed (a pure copy's target, an
+    untracked file); one it cannot read is NOT ANALYSED."""
     if not new_path.endswith(".py"):
         return
     try:
@@ -391,6 +363,10 @@ _TREES: dict[tuple[str, str], ast.AST | None] = {}
 #: occurrences vanished and the gate printed "every site was touched", the
 #: same false clean bill of health at the other end of the same invariant.
 _UNANALYSED: set[str] = set()
+#: ``old path -> new path`` for every file the diff renamed, recorded by
+#: ``changed_line_map`` and read by ``collect``: a rename strands every
+#: reference bound to the OLD path, whether or not the entry carried edits.
+_RENAMES: dict[str, str] = {}
 
 
 def _tree_for(path: str, ref: str = "") -> ast.AST | None:
@@ -867,6 +843,39 @@ def collect(
                     paths | {path},
                 )
 
+    # A renamed module strands every reference bound to its OLD path, edits
+    # or not. Its module-level definitions enter as symbols defined at the old
+    # path — so the import check sees the name is no longer importable there
+    # — and the sites that moved WITH the file, inside the new path, are not
+    # stranded and do not count (``rename_only``). A definition the entry's
+    # hunks also edited is an ordinary edited symbol and keeps its in-file
+    # sites; the old path is added to it for the import check alone.
+    rename_only: dict[str, str] = {}
+    for moved_from, moved_to in sorted(_RENAMES.items()):
+        if not moved_from.endswith(".py"):
+            continue
+        source = old_sources.get(moved_from)
+        if source is None:
+            source = _git("show", f"{old_ref}:{moved_from}")
+            if not source or _parse(source, moved_from) is None:
+                if moved_to not in unparseable:
+                    unparseable.append(moved_to)
+                continue
+            old_sources[moved_from] = source
+        old_tree = _parse(source, moved_from)
+        module_level = _build_index(old_tree).module_definitions
+        every_line = set(range(1, len(source.splitlines()) + 1))
+        for name, kind in modified_symbols(source, moved_from, every_line).items():
+            if name not in module_level:
+                continue
+            if name not in symbols:
+                rename_only[name] = moved_to
+            existing_kind, paths = symbols.get(name, (kind, set()))
+            symbols[name] = (
+                "method" if "method" in (existing_kind, kind) else kind,
+                paths | {moved_from},
+            )
+
     findings: list[Finding] = []
     structural: list[tuple[str, int]] = []
 
@@ -957,6 +966,10 @@ def collect(
             structural.append((name, len(sites)))
             continue
         touched, untouched = _split(sites, new_map)
+        if name in rename_only:
+            # References inside the renamed file moved with their definition;
+            # only those bound to the old module path are in question.
+            untouched = [o for o in untouched if o.path != rename_only[name]]
 
         # A call REMOVED by the diff is gone from the working tree, so the scan
         # above cannot see it and the report understates both counts — the same
@@ -984,8 +997,10 @@ def collect(
             # from an in-place edit by count, text, or coordinate (both trees
             # differ at both ends), so that shape understates the headline
             # "modified N of M" by one. The ``unchanged`` listing — what the
-            # reader acts on — is unaffected either way.
-            already = sum(1 for o in touched if o.path == path)
+            # reader acts on — is unaffected either way. A renamed file's
+            # touched sites live under its NEW path, so the old path is
+            # matched through the rename or every one is counted twice.
+            already = sum(1 for o in touched if o.path in (path, _RENAMES.get(path, path)))
             for start, end in old_changed[already:]:
                 touched.append(Occurrence(path, start, end))
 
@@ -1048,7 +1063,7 @@ def collect(
                 for start, end in literal_sites(_build_index(tree), value)
                 if any(line in old_map.get(path, ()) for line in range(start, end + 1))
             ]
-            already = sum(1 for o in touched if o.path == path)
+            already = sum(1 for o in touched if o.path in (path, _RENAMES.get(path, path)))
             for start, end in old_changed[already:]:
                 touched.append(Occurrence(path, start, end))
 
@@ -1194,7 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
     # the merge base against the working tree, so excluding them here recreated
     # exactly the mixed-revision false clean that change was made to fix.
     new_map, old_map = changed_line_map(diff_spec, include_untracked=True)
-    if not new_map and not old_map and not _UNANALYSED:
+    if not new_map and not old_map and not _UNANALYSED and not _RENAMES:
         print("co-change: no changed lines to analyse.")
         return 0
 
