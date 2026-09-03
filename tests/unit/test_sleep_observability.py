@@ -466,3 +466,31 @@ def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary() -
         ]
     finally:
         _restore_app(app, original)
+
+
+def test_the_report_names_its_first_terminal_failure_not_the_skip():
+    """A privacy skip followed by an export failure composes
+    ``consolidation_skipped; Export failed: ...``. The structured code is the
+    export failure — the skip is a deliberate no-op and is never recorded —
+    and the summary names it instead of the skip."""
+    from kestrel_sovereign.agent.sleep import SleepReport, _record_failure_code
+
+    report = SleepReport(success=False, error="consolidation_skipped")
+    _record_failure_code(report, "consolidation_skipped")
+    assert report.failure_code is None
+    _record_failure_code(report, "export_failed")
+    _record_failure_code(report, "consolidation_failed")  # later phases do not overwrite
+    assert report.failure_code == "export_failed"
+    _record_failure_code(report, "Export failed: [Errno 28] No space left")  # prose never lands
+    assert report.failure_code == "export_failed"
+    report.error = "consolidation_skipped; Export failed: [Errno 28] No space left"
+
+    assert "Sleep failed: export_failed" in str(report)
+    assert report.to_dict()["failure_code"] == "export_failed"
+
+
+def test_a_skip_only_cycle_still_reads_as_the_skip():
+    from kestrel_sovereign.agent.sleep import SleepReport
+
+    report = SleepReport(success=False, error="consolidation_skipped")
+    assert "Sleep failed: consolidation_skipped" in str(report)

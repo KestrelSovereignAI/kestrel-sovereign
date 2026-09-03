@@ -25,6 +25,7 @@ SchedulerFeature.
 from __future__ import annotations
 
 import json
+import re
 import logging
 from collections.abc import Mapping
 from typing import Any, Awaitable, Callable
@@ -220,8 +221,10 @@ def _require_successful_task_result(
             result.status,
             result.result_text,
         )
-        # Same bound as the tool door below: a token crosses, prose does not.
-        reason_code = _failure_reason_code({"reason_code": result.reason_code})
+        # A token crosses, prose does not. The producer of a failed outcome
+        # records its code from a closed vocabulary (agent.sleep), which is
+        # lowercase, so this door bounds by shape and length only.
+        reason_code = _bounded_token(result.reason_code)
         if reason_code:
             raise RuntimeError(
                 f"scheduled task {task_name} returned {result.status} ({reason_code})"
@@ -454,6 +457,22 @@ def build_cron_registrations(
 _REASON_CODE_MAX_LEN = 64
 
 
+_TOKEN = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _bounded_token(code: Any) -> str:
+    """A short token or ""; never prose, never a path, never a sentence."""
+    if not isinstance(code, str):
+        return ""
+    code = code.strip()
+    if not code or len(code) > _REASON_CODE_MAX_LEN:
+        return ""
+    return code if _TOKEN.fullmatch(code) else ""
+
+
+_CONSTANT_TOKEN = re.compile(r"[A-Z][A-Z0-9_]*")
+
+
 def _failure_reason_code(result: Any) -> str:
     """Return a tool's short ``reason_code``, or "" when it did not set one.
 
@@ -475,4 +494,9 @@ def _failure_reason_code(result: Any) -> str:
     code = code.strip()
     if not code or len(code) > _REASON_CODE_MAX_LEN:
         return ""
-    return code if code.replace("_", "").isalnum() else ""
+    # Constant-shaped (UPPER_SNAKE), the way every core and Talon code is
+    # spelled: a tool that interpolated an owner, a repo or a job id into a
+    # lowercase/mixed token would otherwise ride it into signal_log.error.
+    # (The sleep door's codes are lowercase and bounded by a closed
+    # vocabulary at the producer, so they do not pass through here.)
+    return code if _CONSTANT_TOKEN.fullmatch(code) else ""

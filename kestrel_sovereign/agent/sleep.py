@@ -87,6 +87,7 @@ _SLEEP_FAILURE_REASONS = frozenset(
     {
         "consolidation_failed",
         "consolidation_skipped",
+        "export_failed",
         "semantic_artifact_expiry_sweep_failed",
         "semantic_inference_revocation_failed",
         "semantic_maintenance_failed",
@@ -120,39 +121,41 @@ def _semantic_maintenance_reason(value: Any) -> str:
     return "unavailable"
 
 
-#: The one token in ``_SLEEP_FAILURE_REASONS`` that names a deliberate no-op
-#: rather than a failure. It is a cause only when nothing else went wrong.
-_SLEEP_NON_TERMINAL_REASON = "consolidation_skipped"
-
-
 def _sleep_failure_reason(value: Any) -> Optional[str]:
     """Return an established content-free sleep failure code, if available.
 
-    Existing sleep stages append a later failure to an earlier code with
-    "; ". The FIRST known token is not always the cause: a privacy skip
-    followed by an export failure reads ``consolidation_skipped; Export
-    failed: ...``, and naming the skip would hand the reader a cause the
-    code elsewhere defines as "not a failure" while the real one goes
-    unnamed. So a terminal code anywhere in the chain wins; the skip is
-    returned only when it is the whole story; interpolated prose yields
-    nothing.
+    Legacy fallback for a report that carries no ``failure_code`` (the field
+    is set at every failing phase; only the skip-only cycle leaves it None).
+    Reads the FIRST known token of the composed ``error`` string.
     """
     if not isinstance(value, str):
         return None
-    tokens = [candidate.strip() for candidate in value.split(";")]
-    for code in tokens:
-        if code in _SLEEP_FAILURE_REASONS and code != _SLEEP_NON_TERMINAL_REASON:
+    for candidate in value.split(";"):
+        code = candidate.strip()
+        if code in _SLEEP_FAILURE_REASONS:
             return code
-    if tokens == [_SLEEP_NON_TERMINAL_REASON]:
-        return _SLEEP_NON_TERMINAL_REASON
     return None
 
 
-#: The one extractor for "which known code does this sleep failure carry".
-#: The scheduler's sleep door uses it too, so a composed error such as
-#: ``semantic_artifact_expiry_sweep_failed; consolidation_skipped`` yields the
-#: code at both sites instead of prose that a token bound then drops.
-sleep_failure_reason = _sleep_failure_reason
+#: The skip is a deliberate no-op, not a failure: it is never recorded as
+#: the cycle's failure code, so a later real failure is the one named.
+_SLEEP_NON_TERMINAL_REASON = "consolidation_skipped"
+
+
+def _record_failure_code(report: "SleepReport", code: Any) -> None:
+    """Record the cycle's FIRST terminal failure code, structurally.
+
+    ``error`` stays the composed human string it always was ("; "-joined,
+    with interpolated exception text from the export phase). Consumers that
+    need a cause — the scheduler's failed-outcome door, the ``!sleep``
+    summary — read this field instead of guessing from that string: three
+    review rounds of string extraction each named the wrong phase. Only
+    codes from the closed vocabulary are recorded, so prose never lands here.
+    """
+    if code not in _SLEEP_FAILURE_REASONS or code == _SLEEP_NON_TERMINAL_REASON:
+        return
+    if report.failure_code is None:
+        report.failure_code = code
 
 
 def _semantic_maintenance_capability_summary(value: Any) -> Tuple[int, str]:
@@ -737,6 +740,8 @@ class SleepReport:
 
     # Error info
     error: Optional[str] = None
+    #: The first terminal failure's content-free code (see _record_failure_code).
+    failure_code: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -773,6 +778,7 @@ class SleepReport:
                 "package_hash": self.incorporation_package_hash,
             },
             "error": self.error,
+            "failure_code": self.failure_code,
         }
 
     def semantic_maintenance_summary(self) -> Optional[str]:
@@ -801,7 +807,7 @@ class SleepReport:
         """Human-readable sleep summary with safe maintenance observability."""
         maintenance_summary = self.semantic_maintenance_summary()
         if not self.success:
-            failure_reason = _sleep_failure_reason(self.error)
+            failure_reason = self.failure_code or _sleep_failure_reason(self.error)
             maintenance_status = _semantic_maintenance_status(
                 self.semantic_maintenance.get("status")
                 if isinstance(self.semantic_maintenance, Mapping)
@@ -916,6 +922,7 @@ class SleepMixin:
             except Exception:
                 logger.warning("Governed semantic artifact expiry sweep failed")
                 report.error = "semantic_artifact_expiry_sweep_failed"
+                _record_failure_code(report, "semantic_artifact_expiry_sweep_failed")
                 artifact_sweep_succeeded = False
 
         # Note: Privacy mode checks are handled by the storage layer.
@@ -969,12 +976,14 @@ class SleepMixin:
                         report.error += f"; {unavailability_reason}"
                     else:
                         report.error = unavailability_reason
+                    _record_failure_code(report, unavailability_reason)
             except MemoryConsolidationTimeoutError:
                 logger.error("Consolidation timed out", exc_info=True)
                 if report.error:
                     report.error += "; consolidation_failed"
                 else:
                     report.error = "consolidation_failed"
+                _record_failure_code(report, "consolidation_failed")
                 report.consolidation_ms = int((time.time() - start) * 1000)
                 report.reflection_ms = (
                     int((time.time() - reflection_start) * 1000)
@@ -991,6 +1000,7 @@ class SleepMixin:
                     report.error += "; consolidation_failed"
                 else:
                     report.error = "consolidation_failed"
+                _record_failure_code(report, "consolidation_failed")
                 # Continue to export anyway - partial sleep is better than none
             report.consolidation_ms = int((time.time() - start) * 1000)
 
@@ -1048,6 +1058,7 @@ class SleepMixin:
                     report.error += f"; Export failed: {e}"
                 else:
                     report.error = f"Export failed: {e}"
+                _record_failure_code(report, "export_failed")
             report.export_ms = int((time.time() - start) * 1000)
 
         # Success is an actual completed consolidation or export, never merely
@@ -1134,6 +1145,7 @@ class SleepMixin:
                     if report.error
                     else "semantic_inference_revocation_failed"
                 )
+                _record_failure_code(report, "semantic_inference_revocation_failed")
                 logger.warning("Semantic inference revocation failed")
                 return False
             report.semantic_inference = {
@@ -1179,6 +1191,7 @@ class SleepMixin:
                     if report.error
                     else "semantic_maintenance_failed"
                 )
+                _record_failure_code(report, "semantic_maintenance_failed")
                 logger.warning("Semantic maintenance failed")
                 return False
             report.semantic_maintenance = result.to_mapping()
@@ -1207,6 +1220,7 @@ class SleepMixin:
             if report.error
             else "semantic_storage_unavailable"
         )
+        _record_failure_code(report, "semantic_storage_unavailable")
         logger.warning("Semantic maintenance skipped: governed storage is unavailable")
         return False
 
@@ -1987,6 +2001,7 @@ class SleepMixin:
         report.export_ms = sleep_report.export_ms
         report.reflection_ms = sleep_report.reflection_ms
         report.error = sleep_report.error
+        report.failure_code = sleep_report.failure_code
 
         return report
 

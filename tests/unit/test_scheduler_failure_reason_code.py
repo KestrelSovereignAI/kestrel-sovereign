@@ -54,6 +54,8 @@ def test_absent_reason_code_yields_empty_so_the_message_is_unchanged():
     "line\nbreak",                  # multiline text
     "x" * 65,                       # longer than the bound
     "reason: something happened",   # punctuation-bearing prose
+    "claim_denied_acme_repo",       # an identifier wearing a token's shape
+    "Claim_Denied",                 # mixed case: not a constant
     "",
     "   ",
 ])
@@ -160,3 +162,17 @@ def test_a_failed_outcome_prose_reason_never_crosses_the_boundary():
     with pytest.raises(RuntimeError) as excinfo:
         _require_successful_task_result("sleep", outcome)
     assert str(excinfo.value) == "scheduled task sleep returned failed"
+
+
+def test_a_failed_outcome_carries_the_producers_lowercase_code():
+    # The sleep vocabulary is lowercase and closed at the producer; the
+    # outcome door bounds by shape and length only.
+    outcome = ScheduledTaskOutcome(
+        status="failed", result_text="{}",
+        reason_code="semantic_artifact_expiry_sweep_failed",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("sleep", outcome)
+    assert str(excinfo.value) == (
+        "scheduled task sleep returned failed (semantic_artifact_expiry_sweep_failed)"
+    )

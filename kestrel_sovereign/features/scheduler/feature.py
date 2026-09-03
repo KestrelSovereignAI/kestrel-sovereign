@@ -63,7 +63,6 @@ from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-from kestrel_sovereign.agent.sleep import sleep_failure_reason
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
@@ -1343,16 +1342,15 @@ class SchedulerFeature(Feature):
             and not consolidation_skipped
             and not maintenance_skipped
         ):
-            # ``SleepReport.error`` is COMPOSED: later phases append with
-            # "; " and the export phase interpolates exception text, so the
-            # raw field is rarely a single token. Extract the known code the
-            # way the report itself does; anything else yields "" and the
-            # message reads exactly as before.
+            # ``SleepReport.failure_code`` is the cycle's first terminal
+            # failure, recorded structurally by the phase that failed (a
+            # closed vocabulary). ``error`` is the composed human string and
+            # is never parsed here.
             return ScheduledTaskOutcome(
                 status="failed",
                 result_text=result_text,
                 pause_schedule=False,
-                reason_code=sleep_failure_reason(data.get("error")) or "",
+                reason_code=str(data.get("failure_code") or ""),
             )
         return result_text
 

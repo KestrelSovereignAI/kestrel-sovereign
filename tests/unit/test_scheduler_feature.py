@@ -3708,6 +3708,7 @@ async def test_handle_sleep_failed_report_carries_the_reports_error_token():
             return {
                 "success": False,
                 "error": "semantic_artifact_expiry_sweep_failed",
+                "failure_code": "semantic_artifact_expiry_sweep_failed",
             }
 
     agent = _make_mock_agent()
@@ -3722,23 +3723,23 @@ async def test_handle_sleep_failed_report_carries_the_reports_error_token():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error, expected", [
-    # The normal case: a later phase appended to an earlier code.
-    ("semantic_artifact_expiry_sweep_failed; consolidation_skipped",
-     "semantic_artifact_expiry_sweep_failed"),
-    # Interpolated exception text carries no known code: nothing crosses.
-    ("Export failed: disk full at /Volumes/private", ""),
-    # A benign skip followed by the real failure must not name the skip.
-    ("consolidation_skipped; Export failed: remote backup unavailable", ""),
-    # ...but a terminal code later in the chain is the cause.
-    ("consolidation_skipped; consolidation_failed", "consolidation_failed"),
+@pytest.mark.parametrize("failure_code, expected", [
+    ("export_failed", "export_failed"),
+    ("semantic_artifact_expiry_sweep_failed", "semantic_artifact_expiry_sweep_failed"),
+    (None, ""),
 ])
-async def test_handle_sleep_failed_report_extracts_the_known_code_from_a_composed_error(
-    error, expected
+async def test_handle_sleep_failed_report_forwards_the_reports_failure_code(
+    failure_code, expected
 ):
+    """The report records its first terminal failure structurally; the door
+    reads that field and never parses the composed ``error`` string."""
     class _Report:
         def to_dict(self):
-            return {"success": False, "error": error}
+            return {
+                "success": False,
+                "error": "consolidation_skipped; Export failed: remote backup unavailable",
+                "failure_code": failure_code,
+            }
 
     agent = _make_mock_agent()
     agent.sleep = AsyncMock(return_value=_Report())
