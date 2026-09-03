@@ -1280,6 +1280,35 @@ class SecurityFeature(Feature):
             # headroom past the bound and reports whether it existed. A
             # separate COUNT could pass while the page query, on its own
             # connection, saw more rows and returned their arguments anyway.
+            # A tool_name that names a row class the read-back EXCLUDES by design —
+            # a feature's dispatch entry (a request, never an action) or this tool's
+            # own rows — is a question the query cannot satisfy; the WHERE clause
+            # contradicts itself and the plain "no match" would blame truncation.
+            # Answer it instead of searching (#3107 review round 12).
+            if tool_name:
+                excluded_names = await self.permission_store.sync_dispatch_entries()
+                if tool_name in excluded_names or tool_name.startswith(SEARCH_TOOL_NAME):
+                    why = (
+                        "a dispatch envelope — it records what a task ASKED FOR, not "
+                        "what was done; search the inner tool it dispatches"
+                        if tool_name in excluded_names
+                        else "this tool's own rows, which a search must not return"
+                    )
+                    return ToolResult.ok(
+                        confirmation=(
+                            f"tool_name={tool_name!r} names {why}. Those rows are "
+                            "excluded from read-back by design, so this filter can never "
+                            "match; omit tool_name or name the inner tool."
+                        ),
+                        data={
+                            "count": 0,
+                            "shown": 0,
+                            "excluded_by_design": True,
+                            "query": needle,
+                            "tool_name": tool_name,
+                            "matches": [],
+                        },
+                    )
             matches, too_broad = await self.permission_store.search_audit_log(
                 needle,
                 tool_name=tool_name or None,

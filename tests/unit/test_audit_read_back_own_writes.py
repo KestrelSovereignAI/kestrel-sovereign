@@ -1612,3 +1612,47 @@ async def test_the_hook_door_keeps_the_shared_500_char_cap(tmp_path):
     assert rows and len(rows[0]["args_summary"] or "") > 200
     matches, _ = await store.search_audit_log("the phrase past the old cap")
     assert len(matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_tool_name_that_is_excluded_by_design_is_answered_not_searched(tmp_path):
+    """`tool_name=<dispatch entry>` contradicted the unconditional exclusion in
+    the WHERE clause, so the ordinary question "did I dispatch Talon about
+    this?" always got the plain no-match text that blames truncation."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import SEARCH_TOOL_NAME
+
+    store = PermissionStore(str(tmp_path / "excluded.db"))
+    await store.initialize()
+    store.mark_dispatch_entry("talon_feature")
+    await store.log_decision(
+        feature_name="TalonFeature", tool_name="talon_feature",
+        action="subagent_dispatch", decision="auto_mode_allowed",
+        args_summary='{"task": "look into whether the worker is orphaned"}',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="orphaned", tool_name="talon_feature")
+    assert result.data["excluded_by_design"] is True
+    assert "dispatch envelope" in result.confirmation
+    assert "No recorded tool call matched" not in result.confirmation
+
+    result = await feature.security_audit_search(query="orphaned", tool_name=SEARCH_TOOL_NAME)
+    assert result.data["excluded_by_design"] is True
+    assert "own rows" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_an_absurd_days_window_is_refused_not_an_overflow(tmp_path):
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "days.db"))
+    await store.initialize()
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    result = await feature.security_audit_search(query="anything", days=10**9)
+    assert result.status is ToolResultStatus.ERROR
+    assert "days must be <=" in (result.error or "")
