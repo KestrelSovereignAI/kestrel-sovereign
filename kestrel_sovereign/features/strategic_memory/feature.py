@@ -87,6 +87,20 @@ _DISPATCH_MODE_ALIASES = {
 # ``workflow_run``.  Both must be live before execute mode is admitted.
 _DEFAULT_DISPATCH_WORKFLOW = "fleet_coding_pipeline"
 _WORKFLOW_RUN_TOOL = "workflow_run"
+#: Every ``reason_code`` a failed ``signal_dispatch`` result can carry. The
+#: scheduler admits a code into the dispatch failure (and so into
+#: ``signal_log.error``) only by membership here — see
+#: ``Feature.tool_reason_codes`` (#3184).
+SIGNAL_DISPATCH_REASON_CODES = frozenset(
+    {
+        "INVALID_DISPATCH_MODE",
+        "DISPATCH_CAPABILITY_UNAVAILABLE",
+        "GOVERNED_DISPATCH_UNAVAILABLE",
+        "WORKFLOW_RUNNER_UNAVAILABLE",
+        "WORKFLOW_RUNNER_FAILED",
+        "WORKFLOW_RUN_REJECTED",
+    }
+)
 # Prefixes that the github-backed sub-modules (backlog_hygiene,
 # session_log) return when prerequisites (scan_repos config or
 # GITHUB_TOKEN) are missing. They look like report bodies but are
@@ -148,6 +162,8 @@ class StrategicMemoryFeature(Feature):
     tools for querying vision, milestones, stakeholders, decisions,
     blockers, and learned patterns.
     """
+
+    tool_reason_codes = {"signal_dispatch": SIGNAL_DISPATCH_REASON_CODES}
 
     STRATEGY_FILENAME = "STRATEGY.yaml"
 
@@ -1603,7 +1619,11 @@ class StrategicMemoryFeature(Feature):
         if mode not in ("execute", "suggest"):
             return ToolResult.failed(
                 f"Invalid mode '{mode}'. Must be one of: execute, suggest.",
-                data={"mode": mode, "dispatched": False},
+                data={
+                    "mode": mode,
+                    "dispatched": False,
+                    "reason_code": "INVALID_DISPATCH_MODE",
+                },
             )
 
         issue = await pick_top_issue(self._strategy_data_view())
