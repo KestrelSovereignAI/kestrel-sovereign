@@ -165,8 +165,8 @@ def test_a_failed_outcome_prose_reason_never_crosses_the_boundary():
 
 
 def test_a_failed_outcome_carries_the_producers_lowercase_code():
-    # The sleep vocabulary is lowercase and closed at the producer; the
-    # outcome door bounds by shape and length only.
+    # The code is in the producer's closed vocabulary, so the outcome door
+    # admits it (lowercase and all); shape alone would not have been enough.
     outcome = ScheduledTaskOutcome(
         status="failed", result_text="{}",
         reason_code="semantic_artifact_expiry_sweep_failed",

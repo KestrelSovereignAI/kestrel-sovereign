@@ -877,6 +877,50 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
     )
 
 
+@pytest.mark.asyncio
+async def test_real_sleep_privacy_skip_then_export_failure_names_the_export(
+    dispatcher_components,
+):
+    """The one call site the structured code depends on, driven through the
+    real SleepMixin: a privacy-blocked consolidation followed by an export
+    exception composes ``consolidation_skipped; Export failed: ...``. The
+    cause that reaches signal_log.error must be the export, not the skip —
+    deleting the export phase's _record_failure_code left 402 tests green."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    agent._consolidate_memories = AsyncMock(return_value={
+        "skipped": True,
+        "privacy_blocked": True,
+    })
+    agent._export_sovereignty = AsyncMock(
+        side_effect=RuntimeError("remote backup unavailable")
+    )
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, task_args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"sleep": feature._handle_sleep},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("sleep"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={"skip_reflection": True, "skip_export": False},
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.FAILED
+    assert (result.error or "").endswith(
+        "scheduled task sleep returned failed (export_failed)"
+    )
+    assert "remote backup unavailable" not in (result.error or "")
+
+
 @pytest.mark.parametrize(
     "case",
     ["privacy_skip", "export_failure", "explicit_noop"],

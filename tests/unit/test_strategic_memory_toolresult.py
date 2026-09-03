@@ -499,7 +499,7 @@ def test_strategic_memory_passes_toolresult_contract():
 
 @pytest.mark.asyncio
 async def test_signal_dispatch_invalid_mode_names_a_reason_code():
-    """The fifth failed return of the tool #3184 is about. The other four
+    """The sixth failed return of the tool #3184 is about. The other five
     carry a reason_code; a scheduled row whose args_json holds a bad mode
     failed with none, so its dispatch failure read as cause-free."""
     feat = _make_feature({}, agent=_dispatch_agent(registration=None))
