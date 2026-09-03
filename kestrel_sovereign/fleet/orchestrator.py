@@ -346,9 +346,11 @@ WORKFLOW_MUTATION_TOOLS = frozenset(
         # the positive allowlist before these names were listed. Measured
         # consequence: only the low-latency scheduler wakeup is lost. The
         # feature's in-process recovery worker resolves both lanes by direct
-        # call (reconcile_await_signal_waits / process_await_signal_source),
-        # never through the tool path, so an await_signal stage hosted on the
-        # orchestrator still completes — on the recovery cadence.
+        # call (reconcile_await_signal_waits, whose waiting lane drains
+        # deliveries through _drain_await_signal_wait and whose overdue lane
+        # calls resolve_await_signal_deadline directly), never through the
+        # tool path, so an await_signal stage hosted on the orchestrator
+        # still completes — on the recovery cadence.
         "workflow_await_signal_deadline",
         "workflow_await_signal_delivery",
     }
