@@ -519,9 +519,13 @@ def _declared_reason_code(raw: Any, *, task_name: str, declared: frozenset[str])
     instead of declaring on its own feature. ``_bounded_token`` still fences
     the value first, so a declared code that is prose cannot cross either.
 
-    A value the producer set but did not declare is dropped and logged by
-    task name only — never by value — so the producer learns to declare it
-    instead of losing the cause silently. An unset code is the normal case
+    A value the producer set but that cannot cross is dropped and logged by
+    task name only — never by value — and the message names the fence that
+    rejected it: a code the owner never declared, or one it declared in a
+    shape the token fence refuses (``tool_reason_codes`` is free-form, so a
+    hyphenated or over-long code is declared and still dropped). Telling
+    that author to "declare it" hands off a remediation already satisfied;
+    the cause would stay missing forever. An unset code is the normal case
     and says nothing.
     """
     if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -529,6 +533,16 @@ def _declared_reason_code(raw: Any, *, task_name: str, declared: frozenset[str])
     token = _bounded_token(raw)
     if token and token in declared:
         return token
+    if isinstance(raw, str) and raw.strip() in declared:
+        logger.warning(
+            "Scheduled task %s returned a declared reason_code that is not a "
+            "bounded token (letters, digits and underscore, at most %d "
+            "characters); dropped. Respell it in the owning feature's "
+            "tool_reason_codes and its producer.",
+            task_name,
+            _REASON_CODE_MAX_LEN,
+        )
+        return ""
     logger.warning(
         "Scheduled task %s returned a reason_code it has not declared; "
         "dropped. Declare it in the owning feature's tool_reason_codes so "

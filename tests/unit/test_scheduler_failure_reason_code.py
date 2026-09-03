@@ -107,10 +107,32 @@ def test_a_declared_code_is_admitted_whatever_its_spelling():
     assert _code({"data": {"reason_code": "ERR_2249_SKIPPED"}}, declared) == "ERR_2249_SKIPPED"
 
 
-def test_a_declared_code_that_is_prose_still_cannot_cross():
-    # Both fences hold: declaring prose does not unlock it.
+def test_a_declared_code_that_is_prose_still_cannot_cross(caplog):
+    # Both fences hold: declaring prose does not unlock it — and the log
+    # names the fence that refused it, not a declaration already made.
     declared = frozenset({"the sweep hit /Users/someone/private"})
-    assert _code({"data": {"reason_code": "the sweep hit /Users/someone/private"}}, declared) == ""
+    with caplog.at_level("WARNING"):
+        assert _code({"data": {"reason_code": "the sweep hit /Users/someone/private"}}, declared) == ""
+    assert "not a bounded token" in caplog.text
+    assert "has not declared" not in caplog.text
+    assert "/Users/someone" not in caplog.text
+
+
+@pytest.mark.parametrize("value", ["workflow-run-rejected", "workflow.run.rejected", "X" * 65])
+def test_a_declared_code_the_token_fence_refuses_is_named_as_such(value, caplog):
+    """tool_reason_codes is free-form, so an author can declare a hyphenated,
+    dotted or over-long code. It is dropped either way; telling them to
+    declare it hands off a remediation already satisfied, and the cause
+    stays missing forever."""
+    with caplog.at_level("WARNING"):
+        assert _code({"data": {"reason_code": value}}, frozenset({value})) == ""
+    assert "not a bounded token" in caplog.text and "64" in caplog.text
+    assert "has not declared" not in caplog.text
+    # The same value UNDECLARED gets the declare-it message.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert _code({"data": {"reason_code": value}}, frozenset()) == ""
+    assert "has not declared" in caplog.text
 
 
 def test_nothing_declared_means_nothing_crosses():
