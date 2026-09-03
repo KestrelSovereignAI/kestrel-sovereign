@@ -413,54 +413,38 @@ async def test_fetch_pr_state_issue_skips_checks(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# #3191 — one run per check name, and a combined verdict that can resolve.
+# #3191 — every run counts, and a combined verdict that can resolve.
 # --------------------------------------------------------------------------
 
-def test_summarize_checks_keeps_only_the_newest_run_per_name():
-    """A re-run CI lists the same name twice; the stale failure must not sit
-    beside the fresh success in the fingerprint."""
+def test_summarize_checks_keeps_both_concurrent_suites_and_the_failing_one_decides():
+    """Measured on this repo: CI fires on both ``push`` and ``pull_request``,
+    so a PR head carries two same-named check runs from two concurrent check
+    suites, and which suite has the higher id is a coin flip. Keeping one
+    run per name erased a failing (or still-running) gate; both must count."""
     runs = {"check_runs": [
-        {"name": "unit-tests", "status": "completed", "conclusion": "failure",
-         "started_at": "2026-09-01T10:00:00Z", "completed_at": "2026-09-01T10:05:00Z", "id": 1},
-        {"name": "unit-tests", "status": "completed", "conclusion": "success",
-         "started_at": "2026-09-01T11:00:00Z", "completed_at": "2026-09-01T11:05:00Z", "id": 2},
+        {"name": "integration-tests", "status": "completed", "conclusion": "failure",
+         "id": 99755309896, "check_suite": {"id": 1}},
+        {"name": "integration-tests", "status": "completed", "conclusion": "skipped",
+         "id": 99755314204, "check_suite": {"id": 2}},
     ]}
     summary = summarize_checks(runs, {"state": "pending", "statuses": []})
-    assert summary.count("check:unit-tests=") == 1
-    assert "check:unit-tests=completed/success" in summary
-    assert "failure" not in summary
+    assert "check:integration-tests=completed/failure" in summary
+    assert "check:integration-tests=completed/skipped" in summary
+    assert "combined=failure" in summary
 
-
-def test_summarize_checks_newest_run_is_the_highest_id_then_started_at():
-    # An in-progress re-run has no completed_at yet: it is still the newest.
-    runs = {"check_runs": [
-        {"name": "ci", "status": "completed", "conclusion": "failure",
-         "started_at": "2026-09-01T10:00:00Z", "completed_at": "2026-09-01T10:05:00Z", "id": 1},
-        {"name": "ci", "status": "in_progress", "conclusion": None,
-         "started_at": "2026-09-01T12:00:00Z", "completed_at": None, "id": 2},
+    running = {"check_runs": [
+        {"name": "unit-tests", "status": "in_progress", "conclusion": None,
+         "id": 1, "check_suite": {"id": 1}},
+        {"name": "unit-tests", "status": "completed", "conclusion": "cancelled",
+         "id": 2, "check_suite": {"id": 2}},
     ]}
-    summary = summarize_checks(runs, None)
-    assert "check:ci=in_progress/" in summary and "failure" not in summary
-    assert "combined=pending" in summary
-    # Ids decide even against a later-looking timestamp on the older run.
-    runs = {"check_runs": [
-        {"name": "ci", "status": "completed", "conclusion": "failure", "id": 7,
-         "completed_at": "2026-09-02T00:00:00Z"},
-        {"name": "ci", "status": "completed", "conclusion": "success", "id": 9,
-         "completed_at": "2026-09-01T00:00:00Z"},
-    ]}
-    assert "check:ci=completed/success" in summarize_checks(runs, None)
-    # No ids at all (fixtures): started_at breaks the tie.
-    runs = {"check_runs": [
-        {"name": "ci", "status": "completed", "conclusion": "failure", "started_at": "2026-09-01T10:00:00Z"},
-        {"name": "ci", "status": "completed", "conclusion": "success", "started_at": "2026-09-01T11:00:00Z"},
-    ]}
-    assert "check:ci=completed/success" in summarize_checks(runs, None)
+    assert "combined=pending" in summarize_checks(running, {"state": "pending", "statuses": []})
 
 
 def test_summarize_checks_combined_resolves_from_check_runs():
     """With no legacy status contexts, GitHub's combined status is ``pending``
-    forever; the verdict has to come from the runs that actually gate the PR."""
+    forever; the verdict has to come from the runs that actually gate the PR —
+    the same rollup the CI wait provider uses."""
     green = {"check_runs": [
         {"name": "build", "status": "completed", "conclusion": "success"},
         {"name": "lint", "status": "completed", "conclusion": "skipped"},

@@ -34,7 +34,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, List
 
 from kestrel_sdk.signals import (
     AttentionPolicy,
@@ -146,73 +146,99 @@ def compute_fingerprint(normalized: Dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-#: Check-run conclusions that mean the run did not pass. ``neutral`` and
-#: ``skipped`` are deliberate non-failures.
-_RUN_FAILED_CONCLUSIONS = frozenset({
-    "failure", "timed_out", "cancelled", "action_required",
-    "startup_failure", "stale",
-})
+# GitHub check-run conclusions that mean the check did NOT pass. ``success``,
+# ``neutral`` and ``skipped`` are treated as non-blocking passes: they mean
+# the check did not need to run. ``cancelled`` deliberately stays a failure —
+# it means the check was stopped before it could tell us anything, which is an
+# absence of evidence rather than a pass (#2939).
+_FAIL_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "cancelled", "action_required", "stale",
+     "startup_failure"}
+)
 
 
-def _newest_run_per_name(runs: Any) -> list:
-    """Keep one check run per name: the newest by id, then started_at, then completed_at.
+def _positive_count(value: Any) -> bool:
+    """Whether ``value`` is a GitHub ``total_count`` greater than zero.
 
-    A re-run creates a NEW check run with a higher id, so id is the primary
-    key; an in-progress re-run has no ``completed_at`` yet and must still beat
-    the completed run it supersedes. Timestamps only break ties (fixtures
-    without ids).
-
-    GitHub returns a check run per workflow RUN, so a re-run CI, or two
-    workflows producing same-named jobs, lists the same name several times
-    with different verdicts. Summarizing all of them put a stale failure
-    beside a fresh success in one fingerprint (#3191): ``combined`` could
-    never leave ``pending`` and every stale flip was a spurious wake.
+    Tolerates the field being absent, ``null``, or a string; anything that is
+    not a positive integer reads as "no statuses reported".
     """
-    newest: dict = {}
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _check_verdict(
+    check_runs: Any = None, combined_status: Any = None
+) -> str:
+    """Reduce raw check-runs + combined commit status to a coarse verdict.
+
+    Returns one of:
+      * ``"unknown"`` — the rollup was not read at all (neither payload was
+        fetched); an evidence gap, NOT a statement about the checks,
+      * ``"none"``    — read successfully and empty: no check runs and no
+        statuses exist for this commit (no CI ran),
+      * ``"pending"`` — at least one check/status is not yet terminal,
+      * ``"failure"`` — everything terminal and at least one failed,
+      * ``"success"`` — everything terminal and all passed.
+
+    A check run counts as terminal on ``status == "completed"`` whatever its
+    conclusion, so ``skipped``/``neutral`` never hold the rollup open.
+    """
+    runs_read = isinstance(check_runs, (dict, list))
+    runs: List[dict] = []
+    if isinstance(check_runs, dict):
+        raw_runs = check_runs.get("check_runs", []) or []
+    elif isinstance(check_runs, list):
+        raw_runs = check_runs
+    else:
+        raw_runs = []
+    for r in raw_runs:
+        if isinstance(r, dict):
+            runs.append(r)
+
+    status_read = isinstance(combined_status, dict)
+    combined_state = ""
+    statuses: List[dict] = []
+    if isinstance(combined_status, dict):
+        for s in combined_status.get("statuses", []) or []:
+            if isinstance(s, dict):
+                statuses.append(s)
+        # GitHub reports the combined ``state`` as "pending" for a commit that
+        # carries ZERO legacy statuses — the shape of every Actions-only repo,
+        # where CI reports through check runs instead. Reading that as "a
+        # check is still running" pins the verdict at pending forever (#2939),
+        # so the combined state is evidence only when a status backs it.
+        if statuses or _positive_count(combined_status.get("total_count")):
+            combined_state = str(combined_status.get("state", "") or "").lower()
+
+    if not runs_read and not status_read:
+        return "unknown"
+    if not runs and not statuses and not combined_state:
+        return "none"
+
+    # Not terminal yet if any check run is still queued/in_progress, or the
+    # combined/legacy status is still pending.
     for r in runs:
-        if not isinstance(r, dict):
-            continue
-        name = str(r.get("name", "") or "")
-        raw_id = r.get("id")
-        key = (
-            raw_id if isinstance(raw_id, int) else 0,
-            str(r.get("started_at", "") or ""),
-            str(r.get("completed_at", "") or ""),
-        )
-        current = newest.get(name)
-        if current is None or key > current[0]:
-            newest[name] = (key, r)
-    return [r for _, r in newest.values()]
+        if str(r.get("status", "") or "").lower() != "completed":
+            return "pending"
+    if combined_state == "pending":
+        return "pending"
+    for s in statuses:
+        if str(s.get("state", "") or "").lower() == "pending":
+            return "pending"
 
+    # Everything terminal — any failure makes the verdict a failure.
+    for r in runs:
+        if str(r.get("conclusion", "") or "").lower() in _FAIL_CONCLUSIONS:
+            return "failure"
+    if combined_state in ("failure", "error"):
+        return "failure"
+    for s in statuses:
+        if str(s.get("state", "") or "").lower() in ("failure", "error"):
+            return "failure"
 
-def _combined_state(legacy_state: str, has_legacy_statuses: bool, runs: list) -> str:
-    """Derive one verdict from the legacy commit status and the deduped runs.
-
-    ``/commits/{sha}/status`` answers only for the legacy statuses API; with
-    no legacy contexts it says ``pending`` forever, which is not a verdict
-    about the check runs that actually gate the PR. So its state counts only
-    when it has statuses to speak for, and the check runs contribute their
-    own: pending while any is unfinished, failure if any newest run failed,
-    success otherwise. The worst verdict wins.
-    """
-    verdicts = []
-    if has_legacy_statuses and legacy_state:
-        verdicts.append(legacy_state)
-    if runs:
-        if any(str(r.get("status", "") or "") != "completed" for r in runs):
-            verdicts.append("pending")
-        elif any(
-            str(r.get("conclusion", "") or "") in _RUN_FAILED_CONCLUSIONS
-            for r in runs
-        ):
-            verdicts.append("failure")
-        else:
-            verdicts.append("success")
-    if not verdicts:
-        return legacy_state
-    for worst in ("failure", "error", "pending"):
-        if worst in verdicts:
-            return worst
     return "success"
 
 
@@ -230,25 +256,25 @@ def summarize_checks(
       - ``combined_status`` is the JSON from ``/commits/{sha}/status``
         (``{"state", "statuses": [{"context", "state"}, ...]}``).
 
-    The summary captures each check's ``status``/``conclusion`` — one entry
-    per check NAME, the newest run — and each legacy status context's
-    ``state``, plus a ``combined`` verdict derived from both (see
-    :func:`_combined_state`), so a CI transition — queued → in_progress →
-    completed/success|failure — changes the string (and therefore the
-    fingerprint) while a superseded run does not. It is order-independent
-    (parts are sorted) so the same set of checks always summarizes
-    identically. Returns ``""`` when there are no checks or statuses at all,
-    which is indistinguishable from "no checks key in payload".
+    The summary captures each check run's ``status``/``conclusion`` — EVERY
+    run, one entry each: ``/commits/{sha}/check-runs`` defaults to
+    ``filter=latest``, so re-run attempts are already collapsed upstream, and
+    the same-named duplicates that do arrive are two concurrent check suites
+    (this repo's CI fires on both ``push`` and ``pull_request``), each a real
+    gate that must count (#3191) — plus each legacy status context's
+    ``state``, plus a ``combined`` verdict from :func:`_check_verdict`, the
+    one rollup the CI wait provider also uses, so a CI transition — queued →
+    in_progress → completed/success|failure — changes the string (and
+    therefore the fingerprint). It is order-independent (parts are sorted)
+    so the same set of checks always summarizes identically. Returns ``""``
+    when there are no checks or statuses at all, which is indistinguishable
+    from "no checks key in payload".
     """
     parts = []
 
-    legacy_state = ""
-    has_legacy_statuses = False
     if isinstance(combined_status, dict):
-        legacy_state = str(combined_status.get("state", "") or "")
         for s in combined_status.get("statuses", []) or []:
             if isinstance(s, dict):
-                has_legacy_statuses = True
                 ctx = str(s.get("context", "") or "")
                 st = str(s.get("state", "") or "")
                 parts.append(f"status:{ctx}={st}")
@@ -260,14 +286,17 @@ def summarize_checks(
         runs = check_runs
     else:
         runs = []
-    runs = _newest_run_per_name(runs)
     for r in runs:
-        name = str(r.get("name", "") or "")
-        status = str(r.get("status", "") or "")
-        conclusion = str(r.get("conclusion", "") or "")
-        parts.append(f"check:{name}={status}/{conclusion}")
+        if isinstance(r, dict):
+            name = str(r.get("name", "") or "")
+            status = str(r.get("status", "") or "")
+            conclusion = str(r.get("conclusion", "") or "")
+            parts.append(f"check:{name}={status}/{conclusion}")
 
-    combined_state = _combined_state(legacy_state, has_legacy_statuses, runs)
+    # "unknown" (nothing fetched) and "none" (fetched, empty) both mean there
+    # is no verdict to fingerprint; the caller treats "" as "no checks".
+    verdict = _check_verdict(check_runs, combined_status)
+    combined_state = verdict if verdict in ("pending", "failure", "success") else ""
     if not parts and not combined_state:
         return ""
 

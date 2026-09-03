@@ -63,23 +63,17 @@ import re
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, WaitStatus
+from kestrel_sovereign.signals.sources.github_pr_watch import (
+    _FAIL_CONCLUSIONS,
+    _check_verdict,
+    _positive_count,
+)
 
 logger = logging.getLogger(__name__)
 
 # A CI handle is a PR reference: ``owner/repo#123``. The owner/repo half may
 # contain the usual GitHub name characters; the number is the PR/issue id.
 _CI_HANDLE_RE = re.compile(r"^(?P<repo>[^\s#]+/[^\s#]+)#(?P<number>\d+)$")
-
-# GitHub check-run conclusions that mean the check did NOT pass. ``success``,
-# ``neutral`` and ``skipped`` are treated as non-blocking passes: they mean
-# the check did not need to run. ``cancelled`` deliberately stays a failure —
-# it means the check was stopped before it could tell us anything, which is an
-# absence of evidence rather than a pass (#2939).
-_FAIL_CONCLUSIONS = frozenset(
-    {"failure", "timed_out", "cancelled", "action_required", "stale",
-     "startup_failure"}
-)
-
 
 def parse_ci_handle(handle: str) -> Tuple[str, int]:
     """Split a ``owner/repo#123`` CI handle into ``(repo, number)``.
@@ -94,91 +88,6 @@ def parse_ci_handle(handle: str) -> Tuple[str, int]:
             f"ci wait handle must be 'owner/repo#<number>', got {handle!r}"
         )
     return m.group("repo"), int(m.group("number"))
-
-
-def _positive_count(value: Any) -> bool:
-    """Whether ``value`` is a GitHub ``total_count`` greater than zero.
-
-    Tolerates the field being absent, ``null``, or a string; anything that is
-    not a positive integer reads as "no statuses reported".
-    """
-    try:
-        return int(value) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _check_verdict(
-    check_runs: Any = None, combined_status: Any = None
-) -> str:
-    """Reduce raw check-runs + combined commit status to a coarse verdict.
-
-    Returns one of:
-      * ``"unknown"`` — the rollup was not read at all (neither payload was
-        fetched); an evidence gap, NOT a statement about the checks,
-      * ``"none"``    — read successfully and empty: no check runs and no
-        statuses exist for this commit (no CI ran),
-      * ``"pending"`` — at least one check/status is not yet terminal,
-      * ``"failure"`` — everything terminal and at least one failed,
-      * ``"success"`` — everything terminal and all passed.
-
-    A check run counts as terminal on ``status == "completed"`` whatever its
-    conclusion, so ``skipped``/``neutral`` never hold the rollup open.
-    """
-    runs_read = isinstance(check_runs, (dict, list))
-    runs: List[dict] = []
-    if isinstance(check_runs, dict):
-        raw_runs = check_runs.get("check_runs", []) or []
-    elif isinstance(check_runs, list):
-        raw_runs = check_runs
-    else:
-        raw_runs = []
-    for r in raw_runs:
-        if isinstance(r, dict):
-            runs.append(r)
-
-    status_read = isinstance(combined_status, dict)
-    combined_state = ""
-    statuses: List[dict] = []
-    if isinstance(combined_status, dict):
-        for s in combined_status.get("statuses", []) or []:
-            if isinstance(s, dict):
-                statuses.append(s)
-        # GitHub reports the combined ``state`` as "pending" for a commit that
-        # carries ZERO legacy statuses — the shape of every Actions-only repo,
-        # where CI reports through check runs instead. Reading that as "a
-        # check is still running" pins the verdict at pending forever (#2939),
-        # so the combined state is evidence only when a status backs it.
-        if statuses or _positive_count(combined_status.get("total_count")):
-            combined_state = str(combined_status.get("state", "") or "").lower()
-
-    if not runs_read and not status_read:
-        return "unknown"
-    if not runs and not statuses and not combined_state:
-        return "none"
-
-    # Not terminal yet if any check run is still queued/in_progress, or the
-    # combined/legacy status is still pending.
-    for r in runs:
-        if str(r.get("status", "") or "").lower() != "completed":
-            return "pending"
-    if combined_state == "pending":
-        return "pending"
-    for s in statuses:
-        if str(s.get("state", "") or "").lower() == "pending":
-            return "pending"
-
-    # Everything terminal — any failure makes the verdict a failure.
-    for r in runs:
-        if str(r.get("conclusion", "") or "").lower() in _FAIL_CONCLUSIONS:
-            return "failure"
-    if combined_state in ("failure", "error"):
-        return "failure"
-    for s in statuses:
-        if str(s.get("state", "") or "").lower() in ("failure", "error"):
-            return "failure"
-
-    return "success"
 
 
 def _mergeability(pr_raw: Dict[str, Any]) -> Tuple[Optional[bool], str]:
