@@ -469,9 +469,10 @@ def test_summarize_checks_combined_still_honours_a_real_legacy_status():
     assert "status:ci/legacy=failure" in summary
 
 
-def test_check_verdict_treats_unreturned_runs_as_pending():
-    """GitHub pages the rollup; a total_count above what came back means
-    gates this call never saw, and an unread gate is not a success."""
+def test_check_verdict_treats_unreturned_runs_as_pending_but_never_hides_a_failure():
+    """A total_count above what came back means gates this verdict never saw.
+    An unread gate can only hide MORE failures, so it lowers success to
+    pending and leaves an observed failure alone."""
     from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
 
     page = {"total_count": 45, "check_runs": [
@@ -480,3 +481,38 @@ def test_check_verdict_treats_unreturned_runs_as_pending():
     assert _check_verdict(page, {"state": "pending", "statuses": []}) == "pending"
     page["total_count"] = 30
     assert _check_verdict(page, {"state": "pending", "statuses": []}) == "success"
+    page["total_count"] = 45
+    page["check_runs"][7]["conclusion"] = "failure"
+    assert _check_verdict(page, {"state": "pending", "statuses": []}) == "failure"
+
+
+@pytest.mark.asyncio
+async def test_fetch_pr_state_follows_check_run_pages(monkeypatch):
+    """The unread-page verdict must be a condition the fetch can clear: page
+    two is read, not merely detected."""
+    import kestrel_sovereign.signals.sources.github_pr_watch as watch
+
+    calls = []
+    page_one = [{"name": f"job-{i}", "status": "completed", "conclusion": "success"} for i in range(30)]
+    page_two = [{"name": f"job-{i}", "status": "completed", "conclusion": "failure" if i == 44 else "success"} for i in range(30, 45)]
+
+    async def fake_get(url, *, token, timeout, ref):
+        calls.append(url)
+        if url.endswith("/pulls/7"):
+            return {"state": "open", "merged": False, "head": {"sha": "deadbeef"}}
+        if "/check-runs" in url and "page=2" in url:
+            return {"total_count": 45, "check_runs": page_two}
+        if "/check-runs" in url:
+            return {"total_count": 45, "check_runs": page_one}
+        if url.endswith("/status"):
+            return {"state": "pending", "statuses": []}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(watch, "_github_get", fake_get)
+    raw = await watch.fetch_pr_state("org/repo", 7, kind="pr", token="t", timeout=5)
+
+    assert any("per_page=100&page=2" in u for u in calls)
+    summary = raw["checks_status"]
+    assert summary.count("check:") == 45
+    assert "check:job-44=completed/failure" in summary
+    assert "combined=failure" in summary
