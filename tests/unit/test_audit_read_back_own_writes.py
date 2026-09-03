@@ -1914,3 +1914,64 @@ async def test_a_json_encoded_payload_string_is_masked_in_every_branch(tmp_path)
     shown = await feature.security_audit_search(query="orphans the worker")
     assert shown.data["count"] == 1 and "sk-NESTED" not in str(shown.data)
     assert (await feature.security_audit_search(query="sk-NEST")).data["count"] == 0
+
+
+# --------------------------------------------------------------------------
+# Round 16: the region mask is for JSON, not prose — the write path must not
+# destroy a body that merely quotes a sensitive-looking key.
+# --------------------------------------------------------------------------
+
+_BODY_QUOTING_A_KEY = (
+    "## The defect\n\nThe `\"api_key\":` handling is the red herring here.\n"
+    "Killing a tracked job kills the wrapper and orphans the worker.\n"
+    "The job registry stores the wrapper PID; the wrapper does not exec.\n"
+)
+
+
+def test_a_benign_body_that_quotes_a_key_survives_the_write_path_intact():
+    from kestrel_sovereign.features.security.args_summary import mask_sensitive, summarize_args
+
+    assert mask_sensitive(_BODY_QUOTING_A_KEY) == _BODY_QUOTING_A_KEY
+    stored = summarize_args({"title": "t", "body": _BODY_QUOTING_A_KEY})
+    assert json.loads(stored)["body"] == _BODY_QUOTING_A_KEY
+    # A JSON-shaped string is still region-masked.
+    assert "sk-NESTED" not in mask_sensitive(json.dumps({"api_key": "sk-NESTED"}))
+    assert "sk-NESTED" not in mask_sensitive("  [" + json.dumps({"api_key": "sk-NESTED"}) + "]")
+
+
+@pytest.mark.asyncio
+async def test_a_benign_body_that_quotes_a_key_is_still_searchable_end_to_end(tmp_path):
+    """Reproduced through the real hook path's summarizer: three of four body
+    lines were gone from the audit row permanently, and the phrases the
+    read-back exists to find matched nothing."""
+    from kestrel_sovereign.features.security.args_summary import summarize_args
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "prose.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="GitHub", tool_name="create_github_issue",
+        action="tool_execution", decision="auto_mode_allowed",
+        args_summary=summarize_args({"title": "orphaned worker", "body": _BODY_QUOTING_A_KEY}),
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    for phrase in ("orphans the worker", "wrapper does not exec", "red herring"):
+        result = await feature.security_audit_search(query=phrase)
+        assert result.data["count"] == 1, phrase
+        assert phrase in result.data["matches"][0]["args_summary"]
+
+
+def test_a_truncated_row_quoting_a_key_in_prose_loses_one_token_at_most():
+    """The unparseable branch cannot tell a structural key from one quoted
+    inside a string value it was cut in the middle of. A bare scalar never
+    holds whitespace, so the mask stops at the first space instead of
+    eating the rest of the body."""
+    from kestrel_sovereign.features.security.args_summary import mask_sensitive_regions
+
+    cut = '{"title": "t", "body": "The `\\"api_key\\":` handling is the red herring here. Killing a job orphans the worker'
+    masked = mask_sensitive_regions(cut)
+    assert "orphans the worker" in masked and "red herring" in masked
+    # ...while a real bare scalar after a structural key is still masked whole.
+    assert mask_sensitive_regions('{"token": 12345, "n": 1') == '{"token": "***MASKED***", "n": 1'
+    assert mask_sensitive_regions('{"token": 12345') == '{"token": "***MASKED***"'

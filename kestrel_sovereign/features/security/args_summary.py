@@ -43,7 +43,10 @@ _SENSITIVE_JSON_KEY_PREFIX = re.compile(
     re.IGNORECASE,
 )
 
-_BARE_SCALAR = re.compile(r"[^,}\]]*")
+#: A bare JSON scalar never contains whitespace; stopping at it confines the
+#: mask to one token when the text after a key-shaped match is prose rather
+#: than JSON (a truncated row whose string VALUE quotes ``"api_key":``).
+_BARE_SCALAR = re.compile(r"[^\s,}\]]*")
 
 
 def _value_end(text: str, start: int) -> int:
@@ -129,15 +132,19 @@ def mask_sensitive(data: Any) -> Any:
     Dicts and lists are walked recursively; a key matching any
     :data:`SENSITIVE_KEY_SUBSTRINGS` substring has its value replaced with
     :data:`MASK` regardless of the value's type (so a nested secret dict is
-    masked wholesale rather than descended into). A string value is run
-    through :func:`mask_sensitive_regions`: a JSON-encoded payload carried
-    as a string (``{"payload": "{\\"api_key\\": ...}"}``) has no dict key
-    for this walk to see, and the unparseable branch masked exactly that
-    shape while this one showed it (round 14 review). Other scalars pass
-    through unchanged.
+    masked wholesale rather than descended into). A string value that is
+    itself JSON-shaped — it starts with ``{`` or ``[`` — is run through
+    :func:`mask_sensitive_regions`: a JSON-encoded payload carried as a
+    string (``{"payload": "{\\"api_key\\": ...}"}``) has no dict key for
+    this walk to see, and the unparseable branch masked exactly that shape
+    while this one showed it (round 14 review). Every other string is
+    prose and passes through untouched: this runs on the WRITE path for
+    every tool call, and the region mask's JSON-scoped value rules applied
+    to an issue body that merely quotes ``"api_key":`` ate the rest of the
+    body from the audit row, permanently (round 15 review).
     """
     if isinstance(data, str):
-        return mask_sensitive_regions(data)
+        return mask_sensitive_regions(data) if data.lstrip()[:1] in ("{", "[") else data
     if isinstance(data, dict):
         result: dict = {}
         for key, value in data.items():
