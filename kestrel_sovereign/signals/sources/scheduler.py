@@ -43,7 +43,6 @@ from kestrel_sdk.signals import (
     Trust,
 )
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-from kestrel_sovereign.agent.sleep import SLEEP_FAILURE_REASONS
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 logger = logging.getLogger(__name__)
@@ -232,10 +231,12 @@ def _require_successful_task_result(
             result.status,
             result.result_text,
         )
-        # Bounded by MEMBERSHIP in the producers' closed vocabularies, not by
-        # shape: an identifier wearing a token's shape is dropped here the
-        # same way the tool door drops it.
-        reason_code = _outcome_reason_code(result.reason_code)
+        # The same door as a tool result's: a code crosses only if the feature
+        # owning this task declared it (SchedulerFeature declares the sleep
+        # vocabulary for its own built-in). Never by shape.
+        reason_code = _declared_reason_code(
+            result.reason_code, task_name=task_name, declared=declared_reason_codes
+        )
         if reason_code:
             raise RuntimeError(
                 f"scheduled task {task_name} returned {result.status} ({reason_code})"
@@ -506,34 +507,41 @@ def _bounded_token(code: Any) -> str:
     return code if _TOKEN.fullmatch(code) else ""
 
 
-#: Every code a failed ScheduledTaskOutcome may name. The sleep vocabulary is
-#: the producer's own (lowercase); SLEEP_FAILED is the raised-cycle code the
-#: scheduler feature sets itself.
-_OUTCOME_REASON_CODES = frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS
+def _declared_reason_code(raw: Any, *, task_name: str, declared: frozenset[str]) -> str:
+    """The one rule both failure doors apply to a ``reason_code``.
 
+    A code crosses into the raised message — text that leaves the
+    redaction/cap boundary for ``signal_log.error`` — only by MEMBERSHIP in
+    the vocabulary the feature owning the task declared
+    (``Feature.tool_reason_codes``), never by shape. A shape rule cannot tell
+    a constant from an identifier spelled like one (``CLAIM_DENIED_<REPO>``),
+    and a hardcoded set in this module meant a new producer had to edit core
+    instead of declaring on its own feature. ``_bounded_token`` still fences
+    the value first, so a declared code that is prose cannot cross either.
 
-def _outcome_reason_code(code: Any) -> str:
-    token = _bounded_token(code)
-    return token if token in _OUTCOME_REASON_CODES else ""
+    A value the producer set but did not declare is dropped and logged by
+    task name only — never by value — so the producer learns to declare it
+    instead of losing the cause silently. An unset code is the normal case
+    and says nothing.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return ""
+    token = _bounded_token(raw)
+    if token and token in declared:
+        return token
+    logger.warning(
+        "Scheduled task %s returned a reason_code it has not declared; "
+        "dropped. Declare it in the owning feature's tool_reason_codes so "
+        "the cause can reach signal_log.error.",
+        task_name,
+    )
+    return ""
 
 
 def _failure_reason_code(
     result: Any, *, task_name: str, declared: frozenset[str]
 ) -> str:
-    """Return a tool's ``reason_code`` if its owner declared it, else "".
-
-    Bounded by MEMBERSHIP in the owning feature's declared vocabulary
-    (``Feature.tool_reason_codes``) — the rule the outcome door already
-    applies to the sleep vocabulary — never by shape. A shape rule cannot
-    tell a constant from an identifier spelled like one
-    (``CLAIM_DENIED_<REPO>``), and this text leaves the redaction/cap
-    boundary for ``signal_log.error``. ``_bounded_token`` still fences the
-    value first, so a declared code that is prose cannot cross either.
-
-    An undeclared value is dropped and logged by tool name only — never by
-    value — so the producer learns to declare it instead of losing the cause
-    silently.
-    """
+    """A tool result's ``reason_code`` through :func:`_declared_reason_code`."""
     data = None
     if isinstance(result, ToolResult):
         data = result.data
@@ -541,16 +549,6 @@ def _failure_reason_code(
         data = result.get("data") if isinstance(result.get("data"), dict) else result
     if not isinstance(data, dict):
         return ""
-    raw = data.get("reason_code")
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return ""
-    token = _bounded_token(raw)
-    if token and token in declared:
-        return token
-    logger.warning(
-        "Scheduled tool %s returned a reason_code it has not declared; "
-        "dropped. Declare it in the owning feature's tool_reason_codes so "
-        "the cause can reach signal_log.error.",
-        task_name,
+    return _declared_reason_code(
+        data.get("reason_code"), task_name=task_name, declared=declared
     )
-    return ""

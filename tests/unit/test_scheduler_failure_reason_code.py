@@ -23,6 +23,11 @@ import pytest
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.agent.sleep import SLEEP_FAILURE_REASONS
+from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+
+#: What the scheduler feature declares for its own sleep built-in.
+SLEEP_DECLARED = SchedulerFeature.tool_reason_codes["sleep"]
 
 from kestrel_sovereign.signals.sources.scheduler import _failure_reason_code
 
@@ -199,14 +204,14 @@ def test_a_failed_outcome_names_its_reason_code():
         reason_code="SLEEP_FAILED",
     )
     with pytest.raises(RuntimeError) as excinfo:
-        _require_successful_task_result("sleep", outcome, declared_reason_codes=frozenset())
+        _require_successful_task_result("sleep", outcome, declared_reason_codes=SLEEP_DECLARED)
     assert str(excinfo.value) == "scheduled task sleep returned failed (SLEEP_FAILED)"
 
 
 def test_a_failed_outcome_without_a_code_reads_exactly_as_before():
     outcome = ScheduledTaskOutcome(status="failed", result_text="{}")
     with pytest.raises(RuntimeError) as excinfo:
-        _require_successful_task_result("sleep", outcome, declared_reason_codes=frozenset())
+        _require_successful_task_result("sleep", outcome, declared_reason_codes=SLEEP_DECLARED)
     assert str(excinfo.value) == "scheduled task sleep returned failed"
 
 
@@ -217,7 +222,7 @@ def test_a_failed_outcome_prose_reason_never_crosses_the_boundary():
         reason_code="the semantic sweep hit: /Users/someone/private",
     )
     with pytest.raises(RuntimeError) as excinfo:
-        _require_successful_task_result("sleep", outcome, declared_reason_codes=frozenset())
+        _require_successful_task_result("sleep", outcome, declared_reason_codes=SLEEP_DECLARED)
     assert str(excinfo.value) == "scheduled task sleep returned failed"
 
 
@@ -229,21 +234,37 @@ def test_a_failed_outcome_carries_the_producers_lowercase_code():
         reason_code="semantic_artifact_expiry_sweep_failed",
     )
     with pytest.raises(RuntimeError) as excinfo:
-        _require_successful_task_result("sleep", outcome, declared_reason_codes=frozenset())
+        _require_successful_task_result("sleep", outcome, declared_reason_codes=SLEEP_DECLARED)
     assert str(excinfo.value) == (
         "scheduled task sleep returned failed (semantic_artifact_expiry_sweep_failed)"
     )
 
 
-def test_the_outcome_door_bounds_by_vocabulary_not_shape():
+def test_the_outcome_door_bounds_by_declaration_not_shape(caplog):
     # An identifier wearing a token's shape is dropped at this door exactly
-    # as the tool door drops it: one invariant, one answer.
+    # as the tool door drops it: one rule, two doors — and the drop is
+    # logged by task name so the producer learns to declare it.
     outcome = ScheduledTaskOutcome(
-        status="failed", result_text="{}", reason_code="claim_denied_acme_repo",
+        status="failed", result_text="{}", reason_code="CLAIM_DENIED_ACME_REPO",
     )
-    with pytest.raises(RuntimeError) as excinfo:
-        _require_successful_task_result("sleep", outcome, declared_reason_codes=frozenset())
+    with caplog.at_level("WARNING"), pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("sleep", outcome, declared_reason_codes=SLEEP_DECLARED)
     assert str(excinfo.value) == "scheduled task sleep returned failed"
+    assert "sleep" in caplog.text and "has not declared" in caplog.text
+    assert "ACME" not in caplog.text
+
+
+def test_the_outcome_door_honours_a_features_own_declaration():
+    # The reviewer's scenario: a feature's built-in returns a failed outcome
+    # with a code it declared — the same declaration mechanism the tool door
+    # uses, not a hardcoded set in the core signals module.
+    outcome = ScheduledTaskOutcome(status="failed", result_text="{}", reason_code="T_BUSY")
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("T", outcome, declared_reason_codes=frozenset({"T_BUSY"}))
+    assert str(excinfo.value) == "scheduled task T returned failed (T_BUSY)"
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("T", outcome, declared_reason_codes=frozenset())
+    assert str(excinfo.value) == "scheduled task T returned failed"
 
 
 # --------------------------------------------------------------------------
@@ -386,3 +407,36 @@ def test_strategic_memory_declares_every_code_signal_dispatch_returns():
     assert sm.StrategicMemoryFeature.tool_reason_codes["signal_dispatch"] == (
         SIGNAL_DISPATCH_REASON_CODES
     )
+
+
+@pytest.mark.asyncio
+async def test_a_builtin_outcome_is_bounded_by_the_same_lookup():
+    async def builtin(payload):
+        return ScheduledTaskOutcome(status="failed", result_text="{}", reason_code="SLEEP_FAILED")
+
+    async def lookup(task_name, payload):
+        raise AssertionError("builtins bypass tool lookup")
+
+    for declared, expected in (
+        (frozenset(), "scheduled task sleep returned failed"),
+        (SLEEP_DECLARED, "scheduled task sleep returned failed (SLEEP_FAILED)"),
+    ):
+        reg = _registration(
+            build_cron_registrations(
+                tool_lookup=lookup,
+                reason_codes_lookup=lambda task_name, d=declared: d,
+                builtin_handlers={"sleep": builtin},
+            ),
+            "sleep",
+        )
+        with pytest.raises(RuntimeError) as excinfo:
+            await reg.handler({})
+        assert str(excinfo.value) == expected
+
+
+def test_the_scheduler_feature_declares_the_sleep_vocabulary_it_produces():
+    # Every code _handle_sleep can set: the raised-cycle code and the report's
+    # own failure vocabulary. Declared by the owner, resolved by name.
+    assert SLEEP_DECLARED == frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS
+    feature = SchedulerFeature(_Agent({}))
+    assert feature._declared_reason_codes("sleep") == SLEEP_DECLARED

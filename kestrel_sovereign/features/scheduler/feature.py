@@ -64,6 +64,7 @@ from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.agent.sleep import SLEEP_FAILURE_REASONS
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
@@ -125,6 +126,16 @@ class SchedulerFeature(Feature):
     Standalone polling is armed only from ``on_agent_ready``; a shared
     PostgreSQL host owns one fleet runner instead.
     """
+
+    #: The reason codes this feature's own built-in tasks may return in a
+    #: failed ScheduledTaskOutcome: the sleep cycle's closed vocabulary plus
+    #: SLEEP_FAILED, the raised-cycle code ``_handle_sleep`` sets itself. The
+    #: signal boundary admits a code by membership here (see
+    #: ``Feature.tool_reason_codes``), so the vocabulary lives with its owner,
+    #: not in the core signals module.
+    tool_reason_codes = {
+        "sleep": frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS,
+    }
 
     @property
     def tool_description(self) -> str:

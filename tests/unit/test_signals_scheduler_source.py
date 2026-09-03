@@ -514,7 +514,7 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
     agent.sleep = sleep
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
-    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -844,7 +844,7 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
     async def unused_lookup(name, args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -906,7 +906,7 @@ async def test_real_sleep_privacy_skip_then_export_failure_names_the_export(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -968,7 +968,7 @@ async def test_real_sleep_nonterminal_reports_remain_successful_cron_dispatches(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):
@@ -1021,7 +1021,7 @@ async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
     async def unused_lookup(name, task_args):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
-    for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
+    for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
         tool_lookup=unused_lookup,
         builtin_handlers={"sleep": feature._handle_sleep},
     ):

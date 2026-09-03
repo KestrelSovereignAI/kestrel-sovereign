@@ -83,9 +83,10 @@ _SEMANTIC_MAINTENANCE_REASONS = frozenset(
         "wall_time",
     }
 )
-#: The closed vocabulary of sleep failure codes. Public because the scheduler's
-#: failed-outcome door bounds a ScheduledTaskOutcome.reason_code by membership
-#: in the producers' vocabularies, not by shape.
+#: The closed vocabulary of sleep failure codes. Public because the scheduler
+#: feature declares it (``SchedulerFeature.tool_reason_codes["sleep"]``) as
+#: the codes its sleep built-in may return; the signal boundary admits a
+#: ScheduledTaskOutcome.reason_code by membership there, not by shape.
 _SLEEP_FAILURE_REASONS = frozenset(
     {
         "consolidation_failed",
