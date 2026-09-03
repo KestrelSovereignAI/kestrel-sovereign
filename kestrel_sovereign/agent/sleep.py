@@ -120,16 +120,31 @@ def _semantic_maintenance_reason(value: Any) -> str:
     return "unavailable"
 
 
+#: The one token in ``_SLEEP_FAILURE_REASONS`` that names a deliberate no-op
+#: rather than a failure. It is a cause only when nothing else went wrong.
+_SLEEP_NON_TERMINAL_REASON = "consolidation_skipped"
+
+
 def _sleep_failure_reason(value: Any) -> Optional[str]:
-    """Return an established content-free sleep failure code, if available."""
+    """Return an established content-free sleep failure code, if available.
+
+    Existing sleep stages append a later failure to an earlier code with
+    "; ". The FIRST known token is not always the cause: a privacy skip
+    followed by an export failure reads ``consolidation_skipped; Export
+    failed: ...``, and naming the skip would hand the reader a cause the
+    code elsewhere defines as "not a failure" while the real one goes
+    unnamed. So a terminal code anywhere in the chain wins; the skip is
+    returned only when it is the whole story; interpolated prose yields
+    nothing.
+    """
     if not isinstance(value, str):
         return None
-    # Existing sleep stages may append a later failure to an earlier safe code.
-    # Preserve the useful known code without echoing the appended exception.
-    for candidate in value.split(";"):
-        code = candidate.strip()
-        if code in _SLEEP_FAILURE_REASONS:
+    tokens = [candidate.strip() for candidate in value.split(";")]
+    for code in tokens:
+        if code in _SLEEP_FAILURE_REASONS and code != _SLEEP_NON_TERMINAL_REASON:
             return code
+    if tokens == [_SLEEP_NON_TERMINAL_REASON]:
+        return _SLEEP_NON_TERMINAL_REASON
     return None
 
 

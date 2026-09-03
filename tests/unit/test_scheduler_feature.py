@@ -3728,6 +3728,10 @@ async def test_handle_sleep_failed_report_carries_the_reports_error_token():
      "semantic_artifact_expiry_sweep_failed"),
     # Interpolated exception text carries no known code: nothing crosses.
     ("Export failed: disk full at /Volumes/private", ""),
+    # A benign skip followed by the real failure must not name the skip.
+    ("consolidation_skipped; Export failed: remote backup unavailable", ""),
+    # ...but a terminal code later in the chain is the cause.
+    ("consolidation_skipped; consolidation_failed", "consolidation_failed"),
 ])
 async def test_handle_sleep_failed_report_extracts_the_known_code_from_a_composed_error(
     error, expected
