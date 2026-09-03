@@ -87,7 +87,7 @@ _SEMANTIC_MAINTENANCE_REASONS = frozenset(
 #: feature declares it (``SchedulerFeature.tool_reason_codes["sleep"]``) as
 #: the codes its sleep built-in may return; the signal boundary admits a
 #: ScheduledTaskOutcome.reason_code by membership there, not by shape.
-_SLEEP_FAILURE_REASONS = frozenset(
+SLEEP_FAILURE_REASONS = frozenset(
     {
         "consolidation_failed",
         "consolidation_skipped",
@@ -99,7 +99,6 @@ _SLEEP_FAILURE_REASONS = frozenset(
         "semantic_storage_unavailable",
     }
 )
-SLEEP_FAILURE_REASONS = _SLEEP_FAILURE_REASONS
 
 
 def _bounded_summary_number(value: Any) -> str:
@@ -138,7 +137,7 @@ def _sleep_failure_reason(value: Any) -> Optional[str]:
         return None
     for candidate in value.split(";"):
         code = candidate.strip()
-        if code in _SLEEP_FAILURE_REASONS:
+        if code in SLEEP_FAILURE_REASONS:
             return code
     return None
 
@@ -158,7 +157,7 @@ def _record_failure_code(report: "SleepReport", code: Any) -> None:
     review rounds of string extraction each named the wrong phase. Only
     codes from the closed vocabulary are recorded, so prose never lands here.
     """
-    if code not in _SLEEP_FAILURE_REASONS or code == _SLEEP_NON_TERMINAL_REASON:
+    if code not in SLEEP_FAILURE_REASONS or code == _SLEEP_NON_TERMINAL_REASON:
         return
     if report.failure_code is None:
         report.failure_code = code
@@ -846,7 +845,7 @@ class SleepReport:
                 if isinstance(self.semantic_maintenance, Mapping)
                 else None
             )
-            if reason in _SLEEP_FAILURE_REASONS:
+            if isinstance(reason, str) and reason in SLEEP_FAILURE_REASONS:
                 return reason
             return (
                 "semantic_maintenance_failed"
@@ -2035,30 +2034,18 @@ class SleepMixin:
                     report.incorporation_attempted = True
                     report.incorporation_success = False
 
-        # 2. Run full sleep with permanent storage
+        # 2. Run full sleep with permanent storage. The inner report IS the
+        # cryostasis report: it carries every field a consumer resolves the
+        # verdict from (``error``, ``failure_code``, the maintenance maps —
+        # see ``failure_reason()``), so it is returned with the incorporation
+        # result set on it rather than copied field by field. A copy dropped
+        # ``failure_code`` once and the maintenance maps once, each time
+        # leaving a failed cryostasis with no cause.
         sleep_report = await self.sleep(tier="filecoin")
-
-        # Merge sleep report into cryostasis report
-        report.success = sleep_report.success
-        report.cid = sleep_report.cid
-        report.episodes_created = sleep_report.episodes_created
-        report.patterns_found = sleep_report.patterns_found
-        report.messages_archived = sleep_report.messages_archived
-        report.total_messages = sleep_report.total_messages
-        report.shards_exported = sleep_report.shards_exported
-        report.total_size_bytes = sleep_report.total_size_bytes
-        report.storage_tier = sleep_report.storage_tier
-        report.pre_reflection = sleep_report.pre_reflection
-        report.post_reflection = sleep_report.post_reflection
-        report.insights_generated = sleep_report.insights_generated
-        report.hook_results = sleep_report.hook_results
-        report.consolidation_ms = sleep_report.consolidation_ms
-        report.export_ms = sleep_report.export_ms
-        report.reflection_ms = sleep_report.reflection_ms
-        report.error = sleep_report.error
-        report.failure_code = sleep_report.failure_code
-
-        return report
+        sleep_report.incorporation_attempted = report.incorporation_attempted
+        sleep_report.incorporation_success = report.incorporation_success
+        sleep_report.incorporation_package_hash = report.incorporation_package_hash
+        return sleep_report
 
     async def quick_nap(self) -> Optional[str]:
         """

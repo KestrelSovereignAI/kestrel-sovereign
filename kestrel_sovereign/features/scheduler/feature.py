@@ -1400,7 +1400,9 @@ class SchedulerFeature(Feature):
             # ``SleepReport.failure_reason()`` is the one resolution of "why
             # did this cycle fail" (the phase's recorded code, else the
             # maintenance unit's status); ``to_dict`` carries it. ``error``
-            # is the composed human string and is never parsed here.
+            # is the composed human string; the only thing read from it here
+            # is the exact skip token above, which ``_record_failure_code``
+            # deliberately never records.
             return ScheduledTaskOutcome(
                 status="failed",
                 result_text=result_text,

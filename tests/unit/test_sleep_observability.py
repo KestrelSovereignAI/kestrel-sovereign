@@ -542,3 +542,47 @@ def test_a_partial_maintenance_unit_yields_a_reason_and_keeps_its_wording():
         semantic_maintenance={"status": "partial", "reason": "semantic_storage_unavailable"},
     )
     assert known.failure_reason() == "semantic_storage_unavailable"
+
+
+class _NoLegalFeatureSleepAgent(_CommandSleepAgent):
+    def get_feature(self, name):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inner",
+    [
+        # Tier 3: the one failing path that sets neither error nor failure_code —
+        # a partial maintenance unit reports through its own status map.
+        SleepReport(success=False, semantic_maintenance={"status": "partial", "reason": "x"}),
+        # Tier 1: the phase's recorded code.
+        SleepReport(
+            success=False,
+            error="consolidation_skipped; Export failed: remote backup unavailable",
+            failure_code="export_failed",
+        ),
+    ],
+    ids=["maintenance_partial", "export_failed"],
+)
+async def test_cryostasis_resolves_the_same_failure_reason_as_the_inner_cycle(inner):
+    """The cryostasis report used to be a field-by-field copy of the inner
+    report; it dropped ``failure_code`` once and the maintenance maps once,
+    each time turning a caused failure into ``Sleep failed: unavailable``."""
+    # Snapshot the inner verdict BEFORE the call: the double hands back the
+    # same object, so reading it afterwards would agree with any mutation.
+    expected_reason = inner.failure_reason()
+    expected_dict = inner.to_dict()
+    expected_text = str(inner)
+    assert expected_reason is not None
+
+    agent = _NoLegalFeatureSleepAgent(inner)
+    report = await agent.cryostasis_sleep(incorporation_params={"entity_name": "x"})
+
+    assert report.failure_reason() == expected_reason
+    assert report.to_dict()["failure_reason"] == expected_dict["failure_reason"]
+    assert str(report) == expected_text
+    assert agent.sleep_calls == [{"tier": "filecoin"}]
+    # The incorporation verdict still rides on the returned report.
+    assert report.incorporation_attempted is True
+    assert report.incorporation_success is False
