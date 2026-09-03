@@ -94,6 +94,7 @@ _SLEEP_FAILURE_REASONS = frozenset(
         "semantic_artifact_expiry_sweep_failed",
         "semantic_inference_revocation_failed",
         "semantic_maintenance_failed",
+        "semantic_maintenance_partial",
         "semantic_storage_unavailable",
     }
 )
@@ -834,8 +835,23 @@ class SleepReport:
         resolved = self.failure_code or _sleep_failure_reason(self.error)
         if resolved is not None:
             return resolved
-        if self._maintenance_status() == "failed":
-            return "semantic_maintenance_failed"
+        status = self._maintenance_status()
+        if status in ("failed", "partial"):
+            # A bounded maintenance unit fails the cycle from its own status
+            # map, never through ``error``; its ``reason`` is the cause when it
+            # is a known code, else the status itself is the cause.
+            reason = (
+                self.semantic_maintenance.get("reason")
+                if isinstance(self.semantic_maintenance, Mapping)
+                else None
+            )
+            if reason in _SLEEP_FAILURE_REASONS:
+                return reason
+            return (
+                "semantic_maintenance_failed"
+                if status == "failed"
+                else "semantic_maintenance_partial"
+            )
         return None
 
     def __str__(self) -> str:
@@ -844,13 +860,14 @@ class SleepReport:
         if not self.success:
             failure_reason = self.failure_reason()
             maintenance_status = self._maintenance_status()
-            if failure_reason is not None:
-                lines = [f"Sleep failed: {failure_reason}"]
-            elif maintenance_status == "partial":
+            phase_failed = self.failure_code or _sleep_failure_reason(self.error)
+            if maintenance_status == "partial" and phase_failed is None:
                 # A bounded maintenance unit can be intentionally incomplete.
-                # Its report often has no separate legacy ``error`` field, so
-                # do not degrade this operator-visible state to ``None``.
+                # Same resolution as every other consumer (failure_reason());
+                # the operator wording stays "incomplete", not "failed".
                 lines = ["Sleep incomplete: semantic maintenance is partial."]
+            elif failure_reason is not None:
+                lines = [f"Sleep failed: {failure_reason}"]
             else:
                 lines = ["Sleep failed: unavailable"]
             if maintenance_summary:
@@ -1157,6 +1174,14 @@ class SleepMixin:
                     "reason": "semantic_storage_unavailable",
                 }
                 report.semantic_maintenance = dict(report.semantic_inference)
+                # Same condition as the maintenance-side storage gap below,
+                # same code: the sibling recorded it and this exit did not.
+                report.error = (
+                    f"{report.error}; semantic_storage_unavailable"
+                    if report.error
+                    else "semantic_storage_unavailable"
+                )
+                _record_failure_code(report, "semantic_storage_unavailable")
                 logger.warning(
                     "Semantic inference revocation skipped: governed storage is unavailable"
                 )

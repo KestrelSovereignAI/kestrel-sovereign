@@ -504,11 +504,41 @@ def test_a_failed_maintenance_unit_still_yields_a_reason():
     both the summary and the scheduler door read."""
     from kestrel_sovereign.agent.sleep import SleepReport
 
+    # A known reason on the status map is the cause itself...
     report = SleepReport(
         success=False,
         semantic_maintenance={"status": "failed", "reason": "semantic_storage_unavailable"},
     )
+    assert report.failure_reason() == "semantic_storage_unavailable"
+    assert report.to_dict()["failure_reason"] == "semantic_storage_unavailable"
+    assert "Sleep failed: semantic_storage_unavailable" in str(report)
+    # ...and an unknown one resolves to the status.
+    report = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "failed", "reason": "something the code never named"},
+    )
     assert report.failure_reason() == "semantic_maintenance_failed"
-    assert report.to_dict()["failure_reason"] == "semantic_maintenance_failed"
     assert "Sleep failed: semantic_maintenance_failed" in str(report)
     assert SleepReport(success=True).failure_reason() is None
+
+
+def test_a_partial_maintenance_unit_yields_a_reason_and_keeps_its_wording():
+    """`partial` fails the cycle exactly like `failed` (any status outside
+    complete/no_op), but tier 3 only knew `failed`: the scheduler door got
+    no cause while the summary said "incomplete". One resolution now; the
+    operator wording stays."""
+    from kestrel_sovereign.agent.sleep import SleepReport
+
+    report = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "partial", "reason": "semantic_maintenance_lease_lost"},
+    )
+    assert report.failure_reason() == "semantic_maintenance_partial"
+    assert report.to_dict()["failure_reason"] == "semantic_maintenance_partial"
+    assert "Sleep incomplete: semantic maintenance is partial." in str(report)
+
+    known = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "partial", "reason": "semantic_storage_unavailable"},
+    )
+    assert known.failure_reason() == "semantic_storage_unavailable"
