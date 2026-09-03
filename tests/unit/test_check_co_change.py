@@ -88,7 +88,7 @@ def test_candidate_prefilter_finds_the_file_under_real_git_grep(repo: Path) -> N
     )
     _commit(repo)
 
-    pattern = r"(^|[^[:alnum:]_])helper([^[:alnum:]_]|$)"
+    pattern = checker._word_pattern("helper")
     result = subprocess.run(
         ["git", "grep", "-l", "-E", "--", pattern, "*.py"],
         cwd=repo, capture_output=True, text=True, check=False,
@@ -1293,3 +1293,51 @@ def test_an_unparseable_sibling_is_reported_not_silently_dropped(repo: Path) -> 
 
     assert "sib.py" in _unparseable(repo)
     assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 12: bytes the gate cannot read are NOT ANALYSED, never clean; method
+# edits do not drag unrelated importers in.
+# --------------------------------------------------------------------------
+
+def test_a_changed_file_that_cannot_be_decoded_is_not_analysed(repo: Path) -> None:
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # latin-1, not UTF-8
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\nC = 1\n')
+
+    assert "mod.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_untracked_file_that_cannot_be_decoded_is_not_analysed(repo: Path) -> None:
+    (repo / "a.py").write_text('A = "tool_execution"\n')
+    _commit(repo)
+    (repo / "new.py").write_bytes(b'# caf\xe9\nB = "tool_execution"\n')  # untracked, latin-1
+
+    assert "new.py" in _unparseable(repo)
+
+
+def test_a_removed_line_in_a_non_utf8_file_does_not_crash_the_gate(repo: Path) -> None:
+    """`git show` of a latin-1 blob used to raise UnicodeDecodeError inside
+    subprocess.run, where nothing could catch it."""
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\nB = 2\n')
+    _commit(repo)
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # a REMOVED line
+
+    _findings(repo)  # must not raise
+
+
+def test_a_method_body_edit_does_not_pull_in_unrelated_module_level_importers(repo: Path) -> None:
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x\n"
+    )
+    (repo / "other.py").write_text("def dispatch(y):\n    return y\n")
+    (repo / "user.py").write_text("from other import dispatch\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x + 1\n"
+    )
+
+    listed = {(o.path, o.line) for f in _findings(repo) if f.name == "dispatch" for o in f.unchanged}
+    assert ("user.py", 1) not in listed

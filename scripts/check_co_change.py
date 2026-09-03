@@ -131,6 +131,10 @@ def _git(*args: str) -> str:
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
+        # A non-UTF-8 blob (or diff text) must not crash the whole gate from
+        # inside subprocess.run, where nothing here can catch it; the bytes
+        # survive as surrogates and the file lands in NOT ANALYSED instead.
+        errors="surrogateescape",
         check=False,
     )
     if result.returncode not in (0, 1):
@@ -154,6 +158,7 @@ def changed_line_map(
     behind under the old name.
     """
     diff = _git("diff", "-U0", "--no-color", "--no-ext-diff", *diff_spec)
+    _UNANALYSED.clear()  # one run's record starts here, ends in collect()
     new_map: dict[str, set[int]] = defaultdict(set)
     old_map: dict[str, set[int]] = defaultdict(set)
     new_path: str | None = None
@@ -196,6 +201,9 @@ def changed_line_map(
             try:
                 count = len((PROJECT_ROOT / path).read_text(encoding="utf-8").splitlines())
             except (OSError, ValueError):
+                # Same invariant as _tree_for: a file that cannot be read was
+                # not checked, and "not checked" must not render as "clean".
+                _UNANALYSED.add(path)
                 continue
             new_map[path] = set(range(1, count + 1))
 
@@ -689,7 +697,8 @@ def collect(
     """
     _TREES.clear()
     _INDEXES.clear()
-    _UNANALYSED.clear()
+    # _UNANALYSED is NOT cleared here: changed_line_map, which runs first,
+    # already records untracked files it could not read into it.
     symbols: dict[str, tuple[str, set[str]]] = {}
     literals: set[str] = set()
 
@@ -701,6 +710,7 @@ def collect(
         try:
             source = (PROJECT_ROOT / path).read_text(encoding="utf-8")
         except (OSError, ValueError):
+            unparseable.append(path)
             continue
         # A changed file that will not parse yields no symbols and no literals,
         # which renders as "every site was touched". On a local iteration gate a
@@ -784,6 +794,17 @@ def collect(
             (index := index_for(path)) is not None and name in index.module_definitions
             for path in defining_paths
         )
+        # Directional: `from m import name` bindings are at risk only when the
+        # name WAS importable at module level and is not any more (deleted or
+        # demoted). A method never was, so a method-body edit must not pull
+        # every unrelated module-level `run`/`close`/`dispatch` importer in the
+        # tree into its unchanged-site list — the exact noise this gate's
+        # docstring warns makes people suppress it.
+        module_level_before = any(
+            (old_tree := _parse(source, path)) is not None
+            and name in _build_index(old_tree).module_definitions
+            for path, source in old_sources.items()
+        )
         defined_before = any(
             (tree := _parse(source, path)) is not None
             and defines(_build_index(tree), name)
@@ -807,7 +828,7 @@ def collect(
                     name,
                     kind=kind,
                     local_names=local_names,
-                    include_imports=not module_level_now,
+                    include_imports=module_level_before and not module_level_now,
                 )
             )
 
@@ -831,7 +852,7 @@ def collect(
                     name,
                     kind=kind,
                     local_names=local_names,
-                    include_imports=not module_level_now,
+                    include_imports=module_level_before and not module_level_now,
                 )
                 if any(line in old_map.get(path, ()) for line in range(start, end + 1))
             ]
