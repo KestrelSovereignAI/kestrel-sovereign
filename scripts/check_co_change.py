@@ -298,6 +298,9 @@ def _tree_for(path: str, ref: str = "") -> ast.AST | None:
         else:
             try:
                 source = (PROJECT_ROOT / path).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                # The diff deleted it: nothing to analyse, nothing withheld.
+                source = ""
             except (OSError, ValueError):
                 source = ""
                 _UNANALYSED.add(path)
@@ -734,6 +737,14 @@ def collect(
         if not path.endswith(".py"):
             continue
         source = _git("show", f"{old_ref}:{path}")
+        # surrogateescape keeps a non-UTF-8 blob's bytes, and ast.parse then
+        # raises (a ValueError) — the same "could not be analysed" the new
+        # side reports. Dropping it here rendered the old side's sites as
+        # touched, the false clean this footer exists to prevent.
+        if source and _parse(source, path) is None:
+            if path not in unparseable:
+                unparseable.append(path)
+            continue
         if source:
             old_sources[path] = source
             literals |= literals_on(source, path, lines)
@@ -794,16 +805,27 @@ def collect(
             (index := index_for(path)) is not None and name in index.module_definitions
             for path in defining_paths
         )
-        # Directional: `from m import name` bindings are at risk only when the
-        # name WAS importable at module level and is not any more (deleted or
-        # demoted). A method never was, so a method-body edit must not pull
-        # every unrelated module-level `run`/`close`/`dispatch` importer in the
-        # tree into its unchanged-site list — the exact noise this gate's
+        # Directional, and PER FILE: `from m import name` bindings are at
+        # risk only where the name WAS importable at module level in THAT
+        # file and is not any more (deleted or demoted). Symbols are merged by
+        # bare name, so a method `Queue.dispatch` in mod.py shares its entry
+        # with a module-level `dispatch` in other.py; asking "was it
+        # module-level before, anywhere?" let the untouched other.py answer
+        # for the method and pulled every `from other import dispatch` into
+        # the method edit's unchanged-site list — the exact noise this gate's
         # docstring warns makes people suppress it.
-        module_level_before = any(
-            (old_tree := _parse(source, path)) is not None
-            and name in _build_index(old_tree).module_definitions
-            for path, source in old_sources.items()
+        def _module_level_at(path: str, source: str) -> bool:
+            old_tree = _parse(source, path)
+            return old_tree is not None and name in _build_index(old_tree).module_definitions
+
+        imports_at_risk = any(
+            _module_level_at(path, old_sources[path])
+            and (
+                (index := index_for(path)) is None
+                or name not in index.module_definitions
+            )
+            for path in defining_paths
+            if path in old_sources
         )
         defined_before = any(
             (tree := _parse(source, path)) is not None
@@ -828,7 +850,7 @@ def collect(
                     name,
                     kind=kind,
                     local_names=local_names,
-                    include_imports=module_level_before and not module_level_now,
+                    include_imports=imports_at_risk,
                 )
             )
 
@@ -852,7 +874,7 @@ def collect(
                     name,
                     kind=kind,
                     local_names=local_names,
-                    include_imports=module_level_before and not module_level_now,
+                    include_imports=imports_at_risk,
                 )
                 if any(line in old_map.get(path, ()) for line in range(start, end + 1))
             ]

@@ -1328,6 +1328,47 @@ def test_a_removed_line_in_a_non_utf8_file_does_not_crash_the_gate(repo: Path) -
     _findings(repo)  # must not raise
 
 
+def test_an_old_side_blob_that_will_not_parse_is_not_analysed(repo: Path) -> None:
+    """surrogateescape keeps the bytes; ast.parse then raises. Dropping the old
+    side silently rendered its sites as touched and --strict passed."""
+    (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # latin-1 in HEAD
+    (repo / "sib.py").write_text('B = "tool_execution"\n')
+    _commit(repo)
+    (repo / "mod.py").write_text('# cafe\nA = "subagent_dispatch"\n')  # repaired + renamed
+
+    assert "mod.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_unrelated_edit_elsewhere_does_not_defeat_the_method_scope(repo: Path) -> None:
+    """`module_level_before` must ask about THIS symbol's files: an unrelated
+    module-level `dispatch` in another touched file answered for the method."""
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x\n"
+    )
+    (repo / "other.py").write_text("def dispatch(y):\n    return y\n")
+    (repo / "user.py").write_text("from other import dispatch\n")
+    _commit(repo)
+    (repo / "mod.py").write_text(
+        "class Queue:\n    def dispatch(self, x):\n        return x + 1\n"
+    )
+    (repo / "other.py").write_text("def dispatch(y):\n    return y + 1\n")  # also touched
+
+    listed = {
+        (o.path, o.line)
+        for f in _findings(repo) if f.name == "dispatch" for o in f.unchanged
+    }
+    assert ("user.py", 1) not in listed
+
+
+def test_a_deleted_file_is_not_reported_as_unreadable(repo: Path) -> None:
+    (repo / "gone.py").write_text("def gone():\n    return 1\n")
+    _commit(repo)
+    _run(repo, "rm", "-q", "gone.py")
+
+    assert "gone.py" not in _unparseable(repo)
+
+
 def test_a_method_body_edit_does_not_pull_in_unrelated_module_level_importers(repo: Path) -> None:
     (repo / "mod.py").write_text(
         "class Queue:\n    def dispatch(self, x):\n        return x\n"
