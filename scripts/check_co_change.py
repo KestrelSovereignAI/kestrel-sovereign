@@ -801,10 +801,6 @@ def collect(
         # ALL, not ANY: symbols are merged by bare name, so a surviving
         # `shared` in m2.py was suppressing the import check for a deleted
         # `shared` in m1.py, and `from m1 import shared` went unreported.
-        module_level_now = all(
-            (index := index_for(path)) is not None and name in index.module_definitions
-            for path in defining_paths
-        )
         # Directional, and PER FILE: `from m import name` bindings are at
         # risk only where the name WAS importable at module level in THAT
         # file and is not any more (deleted or demoted). Symbols are merged by
