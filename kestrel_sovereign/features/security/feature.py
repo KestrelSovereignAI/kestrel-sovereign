@@ -46,15 +46,20 @@ _COMPLETED_OUTCOME_DECISIONS = frozenset({
     "github_write_ok",
 })
 
-#: Above this many matches, ``security_audit_search`` returns the COUNT and no
-#: arguments. The tool's whole justification for surfacing ``args_summary`` —
-#: which ``security_audit`` deliberately withholds — is that the caller already
-#: described what it wanted. A query matching most of the log is not a
-#: description, and answering it with a page of arguments would rebuild the
-#: unbounded disclosure by another route. This is a disclosure bound, not a
-#: page-size preference; ``limit`` above it is honoured for the count and
-#: refused for the arguments (see the "No clamp on limit" note in the tool).
+#: Above this many matches, ``security_audit_search`` tells the caller the
+#: bound was exceeded and returns no arguments — and not the count either,
+#: which is itself a small disclosure. The tool's whole justification for
+#: surfacing ``args_summary`` — which ``security_audit`` deliberately
+#: withholds — is that the caller already described what it wanted. A query
+#: matching most of the log is not a description, and answering it with a
+#: page of arguments would rebuild the unbounded disclosure by another
+#: route. This is a disclosure bound, not a page-size preference; ``limit``
+#: is never consulted for it (see the "No clamp on limit" note in the tool).
 MAX_DISCLOSING_MATCHES = 25
+
+#: A century. ``timedelta`` overflows far below any integer a caller might
+#: type; anything larger than this is a mistake, not a window.
+MAX_SEARCH_DAYS = 36500
 
 
 # Per-feature default permission levels for fresh agents (#406).
@@ -1192,10 +1197,11 @@ class SecurityFeature(Feature):
         **That footing only holds while the query is a description.** A query
         broad enough to match most of the log is not one, and answering it with
         a page of arguments would rebuild the unbounded disclosure by another
-        route. So the match is counted first: past
-        ``MAX_DISCLOSING_MATCHES`` the count comes back and the arguments do
-        not. Narrowing is the caller's move, and nothing leaves the database
-        in the meantime.
+        route. So the match is bounded first: past
+        ``MAX_DISCLOSING_MATCHES`` the caller is told the bound was exceeded
+        — not the count, which is itself a small disclosure — and no
+        arguments come back. Narrowing is the caller's move, and nothing
+        leaves the database in the meantime.
 
         **A match is an AUTHORIZATION, not a completion.** The security hook
         logs at ``PRE_TOOL_USE``, so a row says the call was allowed to run —
@@ -1253,6 +1259,12 @@ class SecurityFeature(Feature):
                 return ToolResult.failed(f"days must be an integer, got {days!r}")
             if days_val < 1:
                 return ToolResult.failed("days must be >= 1")
+            if days_val > MAX_SEARCH_DAYS:
+                # timedelta overflows well below sys.maxsize; a bound here is
+                # a refusal the caller can read, not an OverflowError.
+                return ToolResult.failed(
+                    f"days must be <= {MAX_SEARCH_DAYS}; omit days to search the whole log"
+                )
         else:
             days_val = None
 
