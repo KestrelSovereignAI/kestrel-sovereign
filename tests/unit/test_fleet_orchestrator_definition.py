@@ -142,7 +142,8 @@ def test_allowlist_denies_write_edit_and_mutation_tools():
         "workflow_cancel",
         "workflow_force_abort",
         "workflow_define",
-        # #3195 — scheduler one-shot targets; denied even where the
+        # #3195 — the scheduler's one-shot deadline target and the periodic
+        # delivery-reconciliation adapter; denied even where the
         # WorkflowsFeature package is absent, so CI enforces it.
         "workflow_await_signal_deadline",
         "workflow_await_signal_delivery",
