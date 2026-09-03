@@ -3709,6 +3709,7 @@ async def test_handle_sleep_failed_report_carries_the_reports_error_token():
                 "success": False,
                 "error": "semantic_artifact_expiry_sweep_failed",
                 "failure_code": "semantic_artifact_expiry_sweep_failed",
+                "failure_reason": "semantic_artifact_expiry_sweep_failed",
             }
 
     agent = _make_mock_agent()
@@ -3723,22 +3724,23 @@ async def test_handle_sleep_failed_report_carries_the_reports_error_token():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_code, expected", [
+@pytest.mark.parametrize("failure_reason, expected", [
     ("export_failed", "export_failed"),
-    ("semantic_artifact_expiry_sweep_failed", "semantic_artifact_expiry_sweep_failed"),
+    ("semantic_maintenance_failed", "semantic_maintenance_failed"),
     (None, ""),
 ])
-async def test_handle_sleep_failed_report_forwards_the_reports_failure_code(
-    failure_code, expected
+async def test_handle_sleep_failed_report_forwards_the_reports_failure_reason(
+    failure_reason, expected
 ):
-    """The report records its first terminal failure structurally; the door
-    reads that field and never parses the composed ``error`` string."""
+    """The report resolves its own cause (failure_reason, carried by
+    to_dict); the door reads that and never parses the composed ``error``."""
     class _Report:
         def to_dict(self):
             return {
                 "success": False,
                 "error": "consolidation_skipped; Export failed: remote backup unavailable",
-                "failure_code": failure_code,
+                "failure_code": None,
+                "failure_reason": failure_reason,
             }
 
     agent = _make_mock_agent()

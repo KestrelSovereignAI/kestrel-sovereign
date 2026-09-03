@@ -176,3 +176,14 @@ def test_a_failed_outcome_carries_the_producers_lowercase_code():
     assert str(excinfo.value) == (
         "scheduled task sleep returned failed (semantic_artifact_expiry_sweep_failed)"
     )
+
+
+def test_the_outcome_door_bounds_by_vocabulary_not_shape():
+    # An identifier wearing a token's shape is dropped at this door exactly
+    # as the tool door drops it: one invariant, one answer.
+    outcome = ScheduledTaskOutcome(
+        status="failed", result_text="{}", reason_code="claim_denied_acme_repo",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        _require_successful_task_result("sleep", outcome)
+    assert str(excinfo.value) == "scheduled task sleep returned failed"

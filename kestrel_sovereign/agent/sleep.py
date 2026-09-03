@@ -83,6 +83,9 @@ _SEMANTIC_MAINTENANCE_REASONS = frozenset(
         "wall_time",
     }
 )
+#: The closed vocabulary of sleep failure codes. Public because the scheduler's
+#: failed-outcome door bounds a ScheduledTaskOutcome.reason_code by membership
+#: in the producers' vocabularies, not by shape.
 _SLEEP_FAILURE_REASONS = frozenset(
     {
         "consolidation_failed",
@@ -94,6 +97,7 @@ _SLEEP_FAILURE_REASONS = frozenset(
         "semantic_storage_unavailable",
     }
 )
+SLEEP_FAILURE_REASONS = _SLEEP_FAILURE_REASONS
 
 
 def _bounded_summary_number(value: Any) -> str:
@@ -740,7 +744,10 @@ class SleepReport:
 
     # Error info
     error: Optional[str] = None
-    #: The first terminal failure's content-free code (see _record_failure_code).
+    #: The first terminal failure's content-free code, recorded by the phase
+    #: that failed (see _record_failure_code). Not every failing path records
+    #: one — semantic maintenance reports through ``semantic_maintenance`` —
+    #: so consumers read :meth:`failure_reason`, the one resolution.
     failure_code: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -779,6 +786,7 @@ class SleepReport:
             },
             "error": self.error,
             "failure_code": self.failure_code,
+            "failure_reason": self.failure_reason(),
         }
 
     def semantic_maintenance_summary(self) -> Optional[str]:
@@ -803,16 +811,39 @@ class SleepReport:
         """
         return _semantic_maintenance_diagnostics(self.semantic_maintenance)
 
+    def _maintenance_status(self) -> Optional[str]:
+        return _semantic_maintenance_status(
+            self.semantic_maintenance.get("status")
+            if isinstance(self.semantic_maintenance, Mapping)
+            else None
+        )
+
+    def failure_reason(self) -> Optional[str]:
+        """The cycle's content-free failure code, or None if it succeeded.
+
+        One resolution for every consumer — the ``!sleep`` summary and the
+        scheduler's failed-outcome door read this, never the composed
+        ``error`` string. Tiers: the code the failing phase recorded; else the
+        first known token of the legacy ``error`` (the skip-only cycle); else
+        a failed semantic-maintenance unit, which reports through its own
+        status map rather than ``error`` and would otherwise be the one
+        failure with no cause at all.
+        """
+        if self.success:
+            return None
+        resolved = self.failure_code or _sleep_failure_reason(self.error)
+        if resolved is not None:
+            return resolved
+        if self._maintenance_status() == "failed":
+            return "semantic_maintenance_failed"
+        return None
+
     def __str__(self) -> str:
         """Human-readable sleep summary with safe maintenance observability."""
         maintenance_summary = self.semantic_maintenance_summary()
         if not self.success:
-            failure_reason = self.failure_code or _sleep_failure_reason(self.error)
-            maintenance_status = _semantic_maintenance_status(
-                self.semantic_maintenance.get("status")
-                if isinstance(self.semantic_maintenance, Mapping)
-                else None
-            )
+            failure_reason = self.failure_reason()
+            maintenance_status = self._maintenance_status()
             if failure_reason is not None:
                 lines = [f"Sleep failed: {failure_reason}"]
             elif maintenance_status == "partial":
@@ -820,8 +851,6 @@ class SleepReport:
                 # Its report often has no separate legacy ``error`` field, so
                 # do not degrade this operator-visible state to ``None``.
                 lines = ["Sleep incomplete: semantic maintenance is partial."]
-            elif maintenance_status == "failed":
-                lines = ["Sleep failed: semantic_maintenance_failed"]
             else:
                 lines = ["Sleep failed: unavailable"]
             if maintenance_summary:

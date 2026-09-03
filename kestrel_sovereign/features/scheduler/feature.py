@@ -1342,15 +1342,15 @@ class SchedulerFeature(Feature):
             and not consolidation_skipped
             and not maintenance_skipped
         ):
-            # ``SleepReport.failure_code`` is the cycle's first terminal
-            # failure, recorded structurally by the phase that failed (a
-            # closed vocabulary). ``error`` is the composed human string and
-            # is never parsed here.
+            # ``SleepReport.failure_reason()`` is the one resolution of "why
+            # did this cycle fail" (the phase's recorded code, else the
+            # maintenance unit's status); ``to_dict`` carries it. ``error``
+            # is the composed human string and is never parsed here.
             return ScheduledTaskOutcome(
                 status="failed",
                 result_text=result_text,
                 pause_schedule=False,
-                reason_code=str(data.get("failure_code") or ""),
+                reason_code=str(data.get("failure_reason") or ""),
             )
         return result_text
 

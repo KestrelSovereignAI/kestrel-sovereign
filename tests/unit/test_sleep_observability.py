@@ -481,8 +481,9 @@ def test_the_report_names_its_first_terminal_failure_not_the_skip():
     _record_failure_code(report, "export_failed")
     _record_failure_code(report, "consolidation_failed")  # later phases do not overwrite
     assert report.failure_code == "export_failed"
-    _record_failure_code(report, "Export failed: [Errno 28] No space left")  # prose never lands
-    assert report.failure_code == "export_failed"
+    fresh = SleepReport(success=False, error="Export failed: [Errno 28] No space left")
+    _record_failure_code(fresh, "Export failed: [Errno 28] No space left")  # prose never lands
+    assert fresh.failure_code is None
     report.error = "consolidation_skipped; Export failed: [Errno 28] No space left"
 
     assert "Sleep failed: export_failed" in str(report)
@@ -494,3 +495,20 @@ def test_a_skip_only_cycle_still_reads_as_the_skip():
 
     report = SleepReport(success=False, error="consolidation_skipped")
     assert "Sleep failed: consolidation_skipped" in str(report)
+
+
+def test_a_failed_maintenance_unit_still_yields_a_reason():
+    """Semantic maintenance reports through its own status map, not ``error``,
+    and records no failure_code — the one failing path that reached the
+    scheduler with no cause at all. failure_reason() is the single resolution
+    both the summary and the scheduler door read."""
+    from kestrel_sovereign.agent.sleep import SleepReport
+
+    report = SleepReport(
+        success=False,
+        semantic_maintenance={"status": "failed", "reason": "semantic_storage_unavailable"},
+    )
+    assert report.failure_reason() == "semantic_maintenance_failed"
+    assert report.to_dict()["failure_reason"] == "semantic_maintenance_failed"
+    assert "Sleep failed: semantic_maintenance_failed" in str(report)
+    assert SleepReport(success=True).failure_reason() is None

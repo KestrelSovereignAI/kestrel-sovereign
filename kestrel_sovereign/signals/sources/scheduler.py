@@ -43,6 +43,7 @@ from kestrel_sdk.signals import (
     Trust,
 )
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.agent.sleep import SLEEP_FAILURE_REASONS
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 logger = logging.getLogger(__name__)
@@ -221,10 +222,10 @@ def _require_successful_task_result(
             result.status,
             result.result_text,
         )
-        # A token crosses, prose does not. The producer of a failed outcome
-        # records its code from a closed vocabulary (agent.sleep), which is
-        # lowercase, so this door bounds by shape and length only.
-        reason_code = _bounded_token(result.reason_code)
+        # Bounded by MEMBERSHIP in the producers' closed vocabularies, not by
+        # shape: an identifier wearing a token's shape is dropped here the
+        # same way the tool door drops it.
+        reason_code = _outcome_reason_code(result.reason_code)
         if reason_code:
             raise RuntimeError(
                 f"scheduled task {task_name} returned {result.status} ({reason_code})"
@@ -470,6 +471,17 @@ def _bounded_token(code: Any) -> str:
     return code if _TOKEN.fullmatch(code) else ""
 
 
+#: Every code a failed ScheduledTaskOutcome may name. The sleep vocabulary is
+#: the producer's own (lowercase); SLEEP_FAILED is the raised-cycle code the
+#: scheduler feature sets itself.
+_OUTCOME_REASON_CODES = frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS
+
+
+def _outcome_reason_code(code: Any) -> str:
+    token = _bounded_token(code)
+    return token if token in _OUTCOME_REASON_CODES else ""
+
+
 _CONSTANT_TOKEN = re.compile(r"[A-Z][A-Z0-9_]*")
 
 
@@ -488,15 +500,10 @@ def _failure_reason_code(result: Any) -> str:
         data = result.get("data") if isinstance(result.get("data"), dict) else result
     if not isinstance(data, dict):
         return ""
-    code = data.get("reason_code")
-    if not isinstance(code, str):
-        return ""
-    code = code.strip()
-    if not code or len(code) > _REASON_CODE_MAX_LEN:
-        return ""
+    token = _bounded_token(data.get("reason_code"))
     # Constant-shaped (UPPER_SNAKE), the way every core and Talon code is
     # spelled: a tool that interpolated an owner, a repo or a job id into a
     # lowercase/mixed token would otherwise ride it into signal_log.error.
-    # (The sleep door's codes are lowercase and bounded by a closed
-    # vocabulary at the producer, so they do not pass through here.)
-    return code if _CONSTANT_TOKEN.fullmatch(code) else ""
+    # The outcome door bounds by vocabulary membership instead (see
+    # _outcome_reason_code); both share _bounded_token.
+    return token if _CONSTANT_TOKEN.fullmatch(token) else ""

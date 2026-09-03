@@ -21,9 +21,9 @@ class ScheduledTaskOutcome:
     pause_schedule: bool = False
     # A short controlled token naming WHY a failed outcome failed (for example
     # ``SLEEP_FAILED``). Unlike ``result_text`` it may cross into the
-    # exception the signal boundary raises, because it is a token the handler
-    # chose, never free-form prose; the raise site bounds it the same way it
-    # bounds a tool's ``reason_code`` and drops anything that is not a token.
+    # exception the signal boundary raises, because it is a code from a
+    # producer's closed vocabulary, never free-form prose; the raise site
+    # bounds it by MEMBERSHIP in those vocabularies and drops anything else.
     reason_code: str = ""
 
     def __post_init__(self) -> None:
