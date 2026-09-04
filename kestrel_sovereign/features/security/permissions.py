@@ -45,11 +45,16 @@ def fold_query(text):
     """Canonicalise a QUERY for matching: decode escapes, casefold. No masking.
 
     Split from :func:`fold_stored_summary` because the two answer different
-    questions and sharing one function was a defect (#3107 review round 8). The
-    stored summary is redacted before it becomes searchable; a query must not
-    be, or an ordinary search for ``monkey``, ``password reset`` or ``API key
-    rotation`` folds to the empty string, becomes the LIKE pattern ``%%``, and
-    matches every row in the table.
+    questions and sharing one function was a defect (#3107 review round 8):
+    the stored side is parsed, masked and flattened (a JSON-shaped row folds
+    to its keys and values, decoded), while a query is the literal text a
+    human typed. A query containing a literal ``\\u00e9`` must match the
+    stored row's decoded ``é``, and a JSON-shaped query must match its own
+    literal text rather than being flattened into ``repo o/r``. The
+    round-8 shape (the stored rule emptying a query such as ``password
+    reset`` into the LIKE pattern ``%%``) went with the text scanner in
+    round 17; these two are the divergences that remain, and both are
+    pinned.
     """
     if not text:
         return text
@@ -110,10 +115,7 @@ def _fold_text(text: str) -> str:
         # prose) and rounds 13–16 each found one it did not. A row whose JSON
         # cannot be repaired cannot be masked, so it is not searchable; a
         # prose-only row has no key position and folds as it is (#3107).
-        repaired = repair_unparseable_summary(text)
-        if repaired is None:
-            return ""
-        prefix, masked, _altered = repaired
+        prefix, masked, _altered = repair_unparseable_summary(text)
         folded = prefix if masked is None else prefix + " " + _flatten_json(masked)
         return folded.casefold().encode("utf-8", "replace").decode("utf-8")
 

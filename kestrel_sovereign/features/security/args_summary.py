@@ -151,7 +151,7 @@ def repair_json_text(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> tuple[An
     return None, False
 
 
-def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any, bool]]:
+def repair_unparseable_summary(text: str) -> tuple[str, Any, bool]:
     """Split a stored summary that will not parse into its prose prefix and
     the JSON it embeds, repaired and MASKED.
 
@@ -163,10 +163,13 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any, bool]]:
     13–16 each found one: a container, an escaped string, prose).
 
     Returns ``(text, None, False)`` for prose that embeds no JSON at all
-    (nothing with a key position, so nothing to mask), ``(prefix, masked,
-    altered)`` when the JSON parsed — ``altered`` says whether it had to be
-    reconstructed — and None when JSON was found but cannot be repaired: that
-    row cannot be masked, so it must not be shown or searched.
+    (nothing with a key position, so nothing to mask) and ``(prefix, masked,
+    altered)`` when JSON parsed — ``altered`` says whether it had to be
+    reconstructed. Structure the repair could not parse and that carries a
+    value is never handed back: it is replaced by the ``(prefix withheld …)``
+    placeholder, in front of a repaired region or as the whole row, so the
+    row stays shown and searchable minus exactly that text. Nothing returns
+    None (round 31 review: the old withhold-the-row branch was dead).
     """
     starts = sorted({m.start() for m in re.finditer(r"[{\[]", text)})[:8]
     if not starts:
@@ -334,10 +337,7 @@ def _remask_text(summary: str) -> str:
         # cut left open and rendered a cut field as null, and a reader must
         # not take that reconstruction for the record as written (round 23
         # review).
-        repaired = repair_unparseable_summary(summary)
-        if repaired is None:
-            return "(summary truncated past repair; not shown)"
-        prefix, masked, altered = repaired
+        prefix, masked, altered = repair_unparseable_summary(summary)
         if masked is None:
             return prefix  # the text as written, or the withheld placeholder
         shown = prefix + json.dumps(masked, default=str)

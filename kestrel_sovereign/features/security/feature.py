@@ -64,6 +64,22 @@ _PERMISSION_DECISION_ACTIONS = frozenset({
     ACTION_TOOL_RESOLUTION,
 })
 
+def _search_result_shape(needle, tool_name, days, limit):
+    """The key set every ``security_audit_search`` result carries, so a caller
+    reading ``data["too_broad"]`` (the tool's headline behaviour) never hits a
+    KeyError on one of the four return paths (round 31 review)."""
+    return {
+        "count": 0,
+        "shown": 0,
+        "too_broad": False,
+        "query": needle,
+        "tool_name": tool_name or "",
+        "days": days,
+        "limit_requested": limit,
+        "matches": [],
+    }
+
+
 #: Above this many matches, ``security_audit_search`` tells the caller the
 #: bound was exceeded and returns no arguments — and not the count either,
 #: which is itself a small disclosure. The tool's whole justification for
@@ -506,6 +522,19 @@ class SecurityFeature(Feature):
                 own_dispatch = getattr(feature, "tool_name", None)
                 if own_dispatch and not isinstance(own_dispatch, property):
                     self.permission_store.mark_dispatch_entry(own_dispatch)
+                # The read-back tool is registered explicitly, ALLOW: with no
+                # row it fell through to ASK, which is DENY on the scheduler
+                # session and wait-forever elsewhere — the unattended path
+                # #3107 was filed for got no answer, and the refusal row it
+                # wrote named this tool, which the search excludes, so the
+                # refusal was invisible to itself (round 31 review). ALLOW is
+                # deliberate: the disclosure is masked on both read paths and
+                # bounded by MAX_DISCLOSING_MATCHES, and the tool is read-only.
+                await self.permission_store.register_tool(
+                    feature_name="SecurityFeature",
+                    tool_name=SEARCH_TOOL_NAME,
+                    default_level=PermissionLevel.ALLOW,
+                )
                 continue
             await self.register_feature_tools(
                 feature_name,
@@ -1321,12 +1350,10 @@ class SecurityFeature(Feature):
                             "match; omit tool_name or name the inner tool."
                         ),
                         data={
-                            "count": 0,
-                            "shown": 0,
+                            **_search_result_shape(
+                                needle, tool_name, days_val, limit_val
+                            ),
                             "excluded_by_design": True,
-                            "query": needle,
-                            "tool_name": tool_name,
-                            "matches": [],
                         },
                     )
             matches, too_broad = await self.permission_store.search_audit_log(
@@ -1393,13 +1420,10 @@ class SecurityFeature(Feature):
                     "returned from the log."
                 ),
                 data={
+                    **_search_result_shape(needle, tool_name, days_val, limit_val),
                     "count": None,
                     "too_broad": True,
                     "max_disclosing_matches": MAX_DISCLOSING_MATCHES,
-                    "query": needle,
-                    "tool_name": tool_name or "",
-                    "days": days_val,
-                    "matches": [],
                 },
             )
 
@@ -1419,15 +1443,7 @@ class SecurityFeature(Feature):
                     "detail past its own row's cut cannot match. Absence here "
                     "is weak evidence, not proof you never did it."
                 ),
-                data={
-                    "count": 0,
-                    "too_broad": False,
-                    "query": needle,
-                    "tool_name": tool_name or "",
-                    "days": days_val,
-                    "limit_requested": limit_val,
-                    "matches": [],
-                },
+                data=_search_result_shape(needle, tool_name, days_val, limit_val),
             )
 
         # Rows arrive re-masked from the store's own read path

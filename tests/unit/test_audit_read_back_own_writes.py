@@ -2730,3 +2730,85 @@ async def test_an_undated_row_stays_in_the_corpus_under_a_days_window(tmp_path):
     # The undated rows stay; the dated row outside the window is excluded
     # (the positive control that the window still does its job).
     assert len(rows) == 2 and all(not r["timestamp"] for r in rows), rows
+
+
+# --------------------------------------------------------------------------
+# Round 32: the withhold-the-row branch is gone; the query/stored split is
+# pinned; the tool is registered; every result carries one key set.
+# --------------------------------------------------------------------------
+
+def test_the_query_fold_and_the_stored_fold_diverge_where_it_matters():
+    """Substituting fold_stored_summary for fold_query at the needle site left
+    every test green; the round-8 rationale went with the scanner. These are
+    the divergences that remain."""
+    from kestrel_sovereign.features.security.permissions import fold_query, fold_stored_summary
+
+    # A literal escape in the QUERY must match the stored row's decoded form.
+    assert fold_query("caf\\u00e9") == "café"
+    assert fold_stored_summary(json.dumps({"city": "café"})) == "city café"
+    # A JSON-shaped query is matched literally, not flattened to its values.
+    assert fold_query('{"repo": "o/r"}') == '{"repo": "o/r"}'
+    assert fold_stored_summary('{"repo": "o/r"}') == "repo o/r"
+
+
+@pytest.mark.asyncio
+async def test_the_needle_is_folded_as_a_query_not_as_a_stored_row(tmp_path):
+    """The same two divergences driven through search_audit_log, so folding
+    the needle with the stored rule at the bind site fails here."""
+    store = PermissionStore(str(tmp_path / "needle-fold.db"))
+    await store.initialize()
+    await store.log_decision(feature_name="GitHub", tool_name="create_github_issue", action="tool_execution",
+                             decision="auto_mode_allowed", args_summary=json.dumps({"city": "café"}))
+    await store.log_decision(feature_name="GitHub", tool_name="create_github_issue", action="tool_execution",
+                             decision="auto_mode_allowed", args_summary=json.dumps({"note": '{"repo": "o/r"}'}))
+    # A literal escape in the query matches the stored row's decoded form.
+    rows, _ = await store.search_audit_log("caf\\u00e9")
+    assert len(rows) == 1 and "city" in rows[0]["args_summary"], rows
+    # A JSON-shaped query matches its own literal text inside a stored value,
+    # not the flattened `repo o/r`.
+    rows, _ = await store.search_audit_log('{"repo": "o/r"}')
+    assert len(rows) == 1 and "note" in rows[0]["args_summary"], rows
+
+
+@pytest.mark.asyncio
+async def test_the_search_tool_is_registered_allow_so_an_unattended_agent_gets_an_answer(tmp_path):
+    """No permission row was ever written for the read-back tool, so
+    get_permission fell through to ASK: DENY on the scheduler session,
+    wait-forever elsewhere — no answer on the unattended path #3107 was
+    filed for, and the refusal row named a tool the search excludes."""
+    from types import SimpleNamespace
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import SEARCH_TOOL_NAME, PermissionLevel
+
+    store = PermissionStore(str(tmp_path / "registered.db"))
+    await store.initialize()
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    feature.agent = SimpleNamespace(features={"SecurityFeature": feature})
+    await feature._register_all_tools()
+    level = await store.get_permission("SecurityFeature", SEARCH_TOOL_NAME)
+    assert level is PermissionLevel.ALLOW, level
+
+
+@pytest.mark.asyncio
+async def test_every_search_result_carries_the_same_key_set(tmp_path):
+    from kestrel_sovereign.features.security import feature as feature_mod
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "shapes.db"))
+    await store.initialize()
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    common = {"count", "shown", "too_broad", "query", "tool_name", "days", "limit_requested", "matches"}
+    empty = await feature.security_audit_search(query="nothing here")
+    assert common <= set(empty.data), empty.data
+    for _ in range(feature_mod.MAX_DISCLOSING_MATCHES + 1):
+        await store.log_decision(feature_name="GitHub", tool_name="create_github_issue", action="tool_execution",
+                                 decision="auto_mode_allowed", args_summary='{"title": "orphans the worker"}')
+    broad = await feature.security_audit_search(query="orphans the worker")
+    assert broad.data["too_broad"] is True and common <= set(broad.data), broad.data
+    matched = await feature.security_audit_search(query="orphans the worker", days=1, limit=2, tool_name="create_github_issue")
+    assert common <= set(matched.data), matched.data
+    store.mark_dispatch_entry("some_feature")
+    excluded = await feature.security_audit_search(query="x", tool_name="some_feature")
+    assert excluded.data.get("excluded_by_design") is True and common <= set(excluded.data), excluded.data
