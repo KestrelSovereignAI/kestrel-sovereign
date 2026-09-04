@@ -3986,13 +3986,17 @@ class KestrelAgent(
         status_message = self.privacy_agent.set_mode(mode)
 
         # Context clauses are immutable between deliberate transitions. A
-        # privacy change can make a feature's cached user-authored context
-        # ineligible even though no feature tool runs, so republish while the
-        # privacy-transition lock is still held. Renderer failure must never
-        # preserve pre-transition bytes: suppress every optional feature clause
-        # without executing feature code and continue in the safer mode.
+        # privacy change can make asynchronously persisted feature state newly
+        # readable or make cached user-authored context ineligible even though
+        # no feature tool runs. Await feature preparation after the new policy
+        # is installed, then republish atomically while the privacy-transition
+        # lock is still held. Preparation/renderer failure must never preserve
+        # pre-transition bytes: suppress every optional feature clause without
+        # executing feature code and continue in the safer mode.
         try:
-            self.refresh_all_feature_context_clauses(fail_closed=True)
+            await self.prepare_and_refresh_all_feature_context_clauses(
+                fail_closed=True
+            )
         except (Exception, asyncio.CancelledError) as suppression_exc:
             logging.critical(
                 "Feature context suppression during privacy transition "
@@ -4596,7 +4600,11 @@ class KestrelAgent(
             return False
 
     def refresh_all_feature_context_clauses(self, *, fail_closed: bool = False):
-        """Republish clauses after a host-owned configuration transition."""
+        """Republish clauses whose feature-owned state is already prepared.
+
+        Host-owned transitions that can require asynchronous state loading use
+        :meth:`prepare_and_refresh_all_feature_context_clauses` instead.
+        """
 
         runtime = getattr(self, "feature_contribution_runtime", None)
         if runtime is None:
@@ -4606,14 +4614,41 @@ class KestrelAgent(
         except Exception as exc:
             if not fail_closed:
                 raise
-            # Do not log the exception or its chained renderer cause: an
-            # out-of-tree renderer may have included private bytes in either.
-            logging.error(
-                "Feature context refresh failed during a host transition; "
-                "suppressing contributed context (%s)",
-                type(exc).__name__,
-            )
-            return runtime.suppress_all_context_clauses()
+            return self._suppress_failed_feature_context_refresh(runtime, exc)
+
+    async def prepare_and_refresh_all_feature_context_clauses(
+        self,
+        *,
+        fail_closed: bool = False,
+    ):
+        """Prepare async feature state, then atomically republish all clauses."""
+
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is None:
+            return ()
+        try:
+            return await runtime.prepare_and_refresh_all_context_clauses()
+        except asyncio.CancelledError as exc:
+            if fail_closed:
+                self._suppress_failed_feature_context_refresh(runtime, exc)
+            raise
+        except Exception as exc:
+            if not fail_closed:
+                raise
+            return self._suppress_failed_feature_context_refresh(runtime, exc)
+
+    @staticmethod
+    def _suppress_failed_feature_context_refresh(runtime, exc):
+        """Replace all feature clauses with empty bodies after refresh failure."""
+
+        # Do not log the exception or its chained feature-code cause: an
+        # out-of-tree hook or renderer may have included private bytes there.
+        logging.error(
+            "Feature context refresh failed during a host transition; "
+            "suppressing contributed context (%s)",
+            type(exc).__name__,
+        )
+        return runtime.suppress_all_context_clauses()
 
     def _record_contribution_rejections(self, transition) -> None:
         """Log and RETAIN the features refused activation.

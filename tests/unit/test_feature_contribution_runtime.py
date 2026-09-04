@@ -39,6 +39,7 @@ def _agent(tmp_path: Path) -> KestrelAgent:
     agent = KestrelAgent(
         did="did:test:sdk-contributions",
         storage_path=str(tmp_path / "agent.db"),
+        llm_service=SimpleNamespace(),
     )
     agent.task_manager = None
     agent.signal_registry = SourceRegistry()
@@ -162,6 +163,258 @@ async def test_privacy_transition_republishes_all_active_context_clauses(tmp_pat
 
     assert runtime.active_context_clauses()[0].body == "privacy-safe replacement"
     assert feature.context_renderer_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_awaits_context_preparation_before_rendering(
+    tmp_path,
+):
+    """The new privacy policy is visible while async feature state reloads."""
+
+    class PreparingFixture(SDKFixtureFeature):
+        contribution_prefix = "async-context-prepare"
+
+        def __init__(self, agent):
+            super().__init__(agent)
+            self.prepare_started = asyncio.Event()
+            self.allow_prepare = asyncio.Event()
+
+        async def prepare_context_clause_refresh(self):
+            self.prepare_started.set()
+            await self.allow_prepare.wait()
+            self.context_text = "rehydrated after privacy resume"
+
+    agent = _agent(tmp_path)
+    feature = PreparingFixture(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    original = runtime.active_context_clauses()
+    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
+    agent.privacy_agent = SimpleNamespace(
+        set_mode=lambda _mode: "Privacy mode changed.",
+        privacy_config=None,
+    )
+    agent._privacy_mode = PrivacyMode.NORMAL
+    agent.features = {}
+    agent.llm_service = None
+
+    transition = asyncio.create_task(
+        agent._apply_privacy_mode_locked(PrivacyMode.NORMAL)
+    )
+    await feature.prepare_started.wait()
+
+    assert not transition.done()
+    assert runtime.active_context_clauses() == original
+
+    feature.allow_prepare.set()
+    result = await transition
+
+    assert result.applied is True
+    assert runtime.active_context_clauses()[0].body == (
+        "rehydrated after privacy resume"
+    )
+    assert feature.context_renderer_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_context_preparation_failure_is_sanitized_before_registry_mutation(
+    tmp_path,
+):
+    """Out-of-tree async failures cannot leak text or partially republish."""
+
+    secret = "api-key=context-prepare-must-stay-private"
+
+    class FailingPrepareFixture(SDKFixtureFeature):
+        contribution_prefix = "failing-context-prepare"
+
+        async def prepare_context_clause_refresh(self):
+            self.context_text = "must never be committed"
+            raise RuntimeError(secret)
+
+    agent = _agent(tmp_path)
+    feature = FailingPrepareFixture(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    original = runtime.active_context_clauses()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        await runtime.prepare_and_refresh_all_context_clauses()
+
+    error = exc_info.value
+    assert error.getter == "prepare_context_clause_refresh"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert runtime.active_context_clauses() == original
+    assert feature.context_renderer_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_context_preparation_cancellation_is_sanitized_and_fail_closed(
+    tmp_path, caplog
+):
+    """A feature cannot forge cancellation text or preserve stale prompt bytes."""
+
+    secret = "token=context-prepare-cancel-must-stay-private"
+
+    class CancellingPrepareFixture(SDKFixtureFeature):
+        contribution_prefix = "cancel-context-prepare"
+
+        async def prepare_context_clause_refresh(self):
+            raise asyncio.CancelledError(secret)
+
+    agent = _agent(tmp_path)
+    feature = CancellingPrepareFixture(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
+    agent.privacy_agent = SimpleNamespace(
+        set_mode=lambda _mode: "Privacy mode changed.",
+        privacy_config=None,
+    )
+    agent._privacy_mode = PrivacyMode.NORMAL
+    agent.features = {}
+    agent.llm_service = None
+
+    result = await agent._apply_privacy_mode_locked(PrivacyMode.NORMAL)
+
+    assert result.applied is True
+    assert runtime.active_context_clauses()[0].body == ""
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_legacy_feature_without_context_preparation_hook_is_supported(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    feature.prepare_context_clause_refresh = None
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    feature.context_text = "legacy feature rerendered"
+
+    refreshed = await runtime.prepare_and_refresh_all_context_clauses()
+
+    assert refreshed[0].body == "legacy feature rerendered"
+
+
+@pytest.mark.asyncio
+async def test_feature_without_context_clauses_is_not_prepared(tmp_path):
+    class NoContextFixture(SDKFixtureFeature):
+        contribution_prefix = "no-context-prepare"
+
+        def get_context_clause_registrations(self):
+            self.contribution_calls["context"] += 1
+            return ()
+
+        async def prepare_context_clause_refresh(self):
+            raise AssertionError("non-contributor preparation must not run")
+
+    agent = _agent(tmp_path)
+    feature = NoContextFixture(agent)
+    await agent._register_feature(feature)
+
+    assert (
+        await agent.feature_contribution_runtime.prepare_and_refresh_all_context_clauses()
+        == ()
+    )
+
+
+@pytest.mark.asyncio
+async def test_external_context_preparation_cancellation_propagates_sanitized(
+    tmp_path,
+):
+    """Task cancellation preserves cancellation semantics and prompt atomicity."""
+
+    secret = "caller-cancellation-detail-must-not-survive"
+
+    class BlockingPrepareFixture(SDKFixtureFeature):
+        contribution_prefix = "blocking-context-prepare"
+
+        def __init__(self, agent):
+            super().__init__(agent)
+            self.prepare_started = asyncio.Event()
+            self.never = asyncio.Event()
+
+        async def prepare_context_clause_refresh(self):
+            self.prepare_started.set()
+            await self.never.wait()
+
+    agent = _agent(tmp_path)
+    feature = BlockingPrepareFixture(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    original = runtime.active_context_clauses()
+    refresh = asyncio.create_task(
+        runtime.prepare_and_refresh_all_context_clauses()
+    )
+    await feature.prepare_started.wait()
+
+    refresh.cancel(secret)
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await refresh
+
+    assert secret not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert runtime.active_context_clauses() == original
+    assert feature.context_renderer_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_cancellation_suppresses_context_and_latches_safe_mode(
+    tmp_path, caplog
+):
+    secret = "privacy-transition-cancel-detail-must-not-survive"
+
+    class BlockingPrepareFixture(SDKFixtureFeature):
+        contribution_prefix = "cancelled-privacy-context-prepare"
+
+        def __init__(self, agent):
+            super().__init__(agent)
+            self.prepare_started = asyncio.Event()
+            self.never = asyncio.Event()
+
+        async def prepare_context_clause_refresh(self):
+            self.prepare_started.set()
+            await self.never.wait()
+
+    agent = _agent(tmp_path)
+    feature = BlockingPrepareFixture(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
+    agent.privacy_agent = SimpleNamespace(
+        set_mode=lambda _mode: "Privacy mode changed.",
+        privacy_config=None,
+    )
+    agent._privacy_mode = PrivacyMode.NORMAL
+    agent.features = {}
+    agent.llm_service = None
+    transition = asyncio.create_task(
+        agent._apply_privacy_mode_locked(PrivacyMode.NORMAL)
+    )
+    await feature.prepare_started.wait()
+
+    transition.cancel(secret)
+    with pytest.raises(
+        RuntimeError,
+        match="feature context could not be suppressed during privacy transition",
+    ) as exc_info:
+        await transition
+
+    assert runtime.active_context_clauses()[0].body == ""
+    assert agent._safe_mode is True
+    visible = "".join(
+        traceback.format_exception(
+            type(exc_info.value),
+            exc_info.value,
+            exc_info.value.__traceback__,
+        )
+    )
+    assert secret not in visible
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio
