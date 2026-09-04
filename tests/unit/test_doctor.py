@@ -2642,6 +2642,69 @@ def test_postgres_doctor_rejects_custody_roles_changed_during_snapshot(
     assert any("custody" in item.lower() for item in report.fail), report.fail
 
 
+def test_postgres_doctor_rejects_cluster_targets_changed_during_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """Endpoint failover cannot leave stale identities on fresh custody rows."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.hold.state import (
+        HoldDatabaseSnapshot,
+        PostgresHoldCustodySnapshot,
+    )
+
+    identity_reads = iter(
+        (
+            "primary-cluster",
+            "evidence-cluster",
+            "shared-cluster",
+            "shared-cluster",
+        )
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda *_args, **_kwargs: next(identity_reads),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda _dsn, *, cluster_identity, **_kwargs: (
+            PostgresHoldCustodySnapshot(cluster_identity=cluster_identity),
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_primary_state",
+        lambda *_args, **_kwargs: HoldDatabaseSnapshot(existing_tables=frozenset()),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_protocol_rows",
+        lambda *_args, **_kwargs: [],
+    )
+    report = DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any("cluster" in item.lower() for item in report.fail), report.fail
+
+
 @pytest.mark.asyncio
 async def test_sqlite_doctor_rejects_missing_hold_history_anchor(
     tmp_path,
