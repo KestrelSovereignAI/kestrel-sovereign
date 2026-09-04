@@ -2229,3 +2229,85 @@ async def test_a_cut_nested_payload_inside_a_parseable_row_is_masked_in_both_pro
     assert shown.data["count"] == 1 and "NESTEDCUT" not in str(shown.data)
     for probe in ("sk-live-N", "sk-live-NESTEDCUT"):
         assert (await feature.security_audit_search(query=probe)).data["count"] == 0, probe
+
+
+# --------------------------------------------------------------------------
+# Round 22: one bucket per row; NULL columns stay in the corpus; a top-level
+# JSON-string row is masked like any other.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_outcome_row_carrying_an_authorization_value_is_counted_once(tmp_path):
+    """The buckets were not disjoint: an outcome row whose decision was an
+    authorization value counted as authorized AND unclassified, and refused,
+    derived by subtraction, came out -1 — "-1 NOT authorized" about a row
+    the same line called authorized."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "once.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="Foreign", tool_name="t.outcome", action="tool_outcome",
+        decision="allowed", args_summary='{"note": "orphaned worker"}',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="orphaned worker")
+    d = result.data
+    assert (d["authorized"], d["outcomes"], d["unclassified_outcomes"], d["refused"]) == (0, 0, 1, 0)
+    assert d["authorized"] + d["outcomes"] + d["unclassified_outcomes"] + d["refused"] == d["count"]
+    assert "-1" not in result.confirmation and "?" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_rows_with_a_null_action_or_tool_name_are_still_searchable(tmp_path):
+    """`NULL <> x`, `NULL NOT LIKE x` and `NULL NOT IN (...)` are all NULL, so
+    the exclusion predicates silently dropped a foreign writer's row and the
+    caller was told absence was weak evidence — for a row that was there."""
+    import sqlite3
+
+    db_path = tmp_path / "nulls.db"
+    store = PermissionStore(str(db_path))
+    await store.initialize()
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO security_audit_log (feature_name, tool_name, action, decision, args_summary)"
+        " VALUES (?,?,?,?,?)", ("Foreign", "create_github_issue", None, "auto_mode_allowed", '{"title": "orphans the worker"}'),
+    )
+    raw.execute(
+        "INSERT INTO security_audit_log (feature_name, tool_name, action, decision, args_summary)"
+        " VALUES (?,?,?,?,?)", ("Foreign", None, "tool_execution", "auto_mode_allowed", '{"title": "orphans the worker too"}'),
+    )
+    raw.commit(); raw.close()
+
+    rows, _ = await store.search_audit_log("orphans the worker")
+    assert len(rows) == 2, rows
+    rows, _ = await store.search_audit_log("orphans the worker too")
+    assert len(rows) == 1 and rows[0]["tool"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_top_level_json_string_row_is_masked_in_both_projections(tmp_path):
+    """Both read paths short-circuited on a non-dict parse, so a row that IS a
+    JSON-encoded payload (the same bytes the walker masks one level down)
+    was shown raw and searchable raw."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = json.dumps(json.dumps({"api_key": "sk-live-TOPLEVEL", "memo": "orphans the worker"}))
+    assert "TOPLEVEL" not in remask_summary(row) and "***MASKED***" in remask_summary(row)
+    assert "toplevel" not in fold_stored_summary(row) and "orphans the worker" in fold_stored_summary(row)
+    assert remask_summary(json.dumps("just prose")) == json.dumps("just prose")
+
+    store = PermissionStore(str(tmp_path / "toplevel.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="Foreign", tool_name="t", action="tool_execution",
+        decision="auto_mode_allowed", args_summary=row,
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    shown = await feature.security_audit_search(query="orphans the worker")
+    assert shown.data["count"] == 1 and "TOPLEVEL" not in str(shown.data)
+    assert (await feature.security_audit_search(query="sk-live-TOP")).data["count"] == 0

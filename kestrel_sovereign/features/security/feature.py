@@ -1336,28 +1336,29 @@ class SecurityFeature(Feature):
         # The default limit of 20 sits inside the 25-row bound, so this is
         # reachable without the caller doing anything unusual.
         bounded_total = len(matches)
-        bounded_authorized = sum(
-            1 for e in matches if e["decision"] in _AUTHORIZED_DECISIONS
-        )
-        # A `<tool>.outcome` row (action='tool_outcome') is a COMPLETION
-        # record, the strongest evidence in the table that the work happened.
-        # It is not a permission decision, so it is not in the allowlist —
-        # and folding it into "refused" made a query that matched only the
-        # outcome row (an issue number, a job id) report "may never have
-        # happened" about work whose completion is right there.
-        bounded_outcomes = sum(
-            1 for e in matches
-            if e.get("action") == "tool_outcome"
-            and e["decision"] in _COMPLETED_OUTCOME_DECISIONS
-        )
-        # An outcome row with a decision this tool does not classify: not a
-        # completion (no ✓), not a refusal (a completion record must never be
-        # described as work that may not have happened) — a record to read.
-        bounded_unclassified = sum(
-            1 for e in matches
-            if e.get("action") == "tool_outcome"
-            and e["decision"] not in _COMPLETED_OUTCOME_DECISIONS
-        )
+        # Each row lands in exactly ONE bucket. A `<tool>.outcome` row
+        # (action='tool_outcome') is a COMPLETION record, the strongest
+        # evidence in the table that the work happened; it is not a
+        # permission decision, so its decision value is read against the
+        # completion allowlist and never against the authorization one —
+        # an outcome row carrying an authorization value counted in both and
+        # left "refused" at -1 (round 21 review). An outcome row with a
+        # decision this tool does not classify is neither a completion (no
+        # ✓) nor a refusal (a completion record must never be described as
+        # work that may not have happened): a record to read. Every other
+        # row is an authorization or a refusal. Refused is counted, never
+        # derived by subtraction.
+        bounded_authorized = bounded_outcomes = bounded_unclassified = bounded_refused = 0
+        for e in matches:
+            if e.get("action") == "tool_outcome":
+                if e["decision"] in _COMPLETED_OUTCOME_DECISIONS:
+                    bounded_outcomes += 1
+                else:
+                    bounded_unclassified += 1
+            elif e["decision"] in _AUTHORIZED_DECISIONS:
+                bounded_authorized += 1
+            else:
+                bounded_refused += 1
         matches = matches[:limit_val]
         omitted = bounded_total - len(matches)
 
@@ -1429,7 +1430,7 @@ class SecurityFeature(Feature):
         allowed = bounded_authorized
         outcomes = bounded_outcomes
         unclassified = bounded_unclassified
-        refused = bounded_total - allowed - outcomes - unclassified
+        refused = bounded_refused
         headline = f"{bounded_total} prior attempt(s) matched ({scope_text})"
         if omitted:
             headline += f" (showing {len(matches)}, {omitted} older not shown)"
@@ -1456,11 +1457,11 @@ class SecurityFeature(Feature):
             headline += " — " + ", ".join(parts)
         lines = [headline + ". Read `decision` per row:\n"]
         for entry in matches:
-            authorized = entry["decision"] in _AUTHORIZED_DECISIONS
-            if authorized:
-                marker = "→"
-            elif entry.get("action") == "tool_outcome":
+            # The same one-bucket rule as the counts above.
+            if entry.get("action") == "tool_outcome":
                 marker = "✓" if entry["decision"] in _COMPLETED_OUTCOME_DECISIONS else "?"
+            elif entry["decision"] in _AUTHORIZED_DECISIONS:
+                marker = "→"
             else:
                 marker = "✗"
             lines.append(

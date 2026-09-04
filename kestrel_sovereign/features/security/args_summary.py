@@ -275,6 +275,11 @@ def remask_summary(summary: Optional[str]) -> Optional[str]:
         if masked is None:
             return summary
         return prefix + json.dumps(masked, default=str)
+    if isinstance(parsed, str):
+        # The whole row is a JSON string — the payload the walker masks one
+        # level down, carried at the top (round 21 review).
+        masked = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
+        return summary if masked == parsed else json.dumps(masked)
     if not isinstance(parsed, (dict, list)):
         return summary
     try:

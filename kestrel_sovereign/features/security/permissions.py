@@ -127,6 +127,10 @@ def fold_stored_summary(text):
         # the one place the value crosses back into SQLite.
         return _flatten_json(parsed).casefold().encode("utf-8", "replace").decode("utf-8")
     if isinstance(parsed, str):
+        # A row that is itself a JSON string may carry a JSON-encoded payload
+        # one level up from where the walker sees it (round 21 review); the
+        # same masker, the same read-path slack.
+        parsed = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
         return parsed.casefold().encode("utf-8", "replace").decode("utf-8")
     return str(parsed).casefold()
 
@@ -1277,7 +1281,12 @@ class PermissionStore:
             # generally is the honest rule rather than a special case: what a
             # task ASKED for is not evidence of what was DONE, and the inner
             # tool rows are what record that.
-            "action <> ?",
+            # COALESCE on every exclusion: the schema declares action and
+            # tool_name without NOT NULL, and under three-valued logic
+            # `NULL <> x`, `NULL NOT LIKE x` and `NULL NOT IN (...)` are all
+            # NULL — the row silently leaves the corpus the caller believes it
+            # searched (round 21 review). A NULL is "not the excluded value".
+            "COALESCE(action, '') <> ?",
             # A search must never return its own act of searching. The security
             # hook writes its PRE_TOOL_USE row — carrying this very query inside
             # ``args_summary`` — BEFORE the tool body runs, so without this the
@@ -1290,7 +1299,7 @@ class PermissionStore:
             # underscores in the tool name, and without declaring the escape
             # character SQLite reads "\\_" as backslash-then-wildcard and the
             # exclusion silently matches nothing.
-            "tool_name NOT LIKE ? ESCAPE '\\'",
+            "COALESCE(tool_name, '') NOT LIKE ? ESCAPE '\\'",
         ]
         folded = _like(fold_query(needle))
         params: List[Any] = [
@@ -1311,7 +1320,7 @@ class PermissionStore:
         dispatch_names = sorted(self._dispatch_entries)
         if dispatch_names:
             placeholders = ", ".join("?" for _ in dispatch_names)
-            clauses.append(f"tool_name NOT IN ({placeholders})")
+            clauses.append(f"COALESCE(tool_name, '') NOT IN ({placeholders})")
             params.extend(dispatch_names)
 
         if tool_name:
