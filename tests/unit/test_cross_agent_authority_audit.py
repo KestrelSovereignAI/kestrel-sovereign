@@ -81,6 +81,10 @@ PROVENANCE_TRANSFORM_CALLS = {
     "sum",
     "tuple",
 }
+PROVENANCE_ACCESSOR_SUFFIXES = (
+    "causation_chain",
+    "get_current_chain",
+)
 HTTP_SEGMENTS = {
     # Every request-routed agent endpoint is addressable through the host's
     # /api/agents/{name}/... alias in multi-agent mode.  Inventory the complete
@@ -534,6 +538,63 @@ def _discovered_scheduler_surfaces() -> set[str]:
     }
 
 
+def _resolved_source_factory_call_names(
+    tree: ast.Module,
+    factory: ast.FunctionDef | ast.AsyncFunctionDef,
+    parameter_name: str,
+    constants: dict[str, str],
+    relative: str,
+) -> set[str]:
+    """Resolve every call's source-name argument or fail that call closed."""
+
+    positional_parameters = [
+        *factory.args.posonlyargs,
+        *factory.args.args,
+    ]
+    positional_names = [parameter.arg for parameter in positional_parameters]
+    positional_index = (
+        positional_names.index(parameter_name)
+        if parameter_name in positional_names
+        else None
+    )
+    matched = False
+    names: set[str] = set()
+    for call in ast.walk(tree):
+        if not (
+            isinstance(call, ast.Call)
+            and _call_name(call) == factory.name
+        ):
+            continue
+        matched = True
+        argument: ast.expr | None = None
+        if positional_index is not None and positional_index < len(call.args):
+            argument = call.args[positional_index]
+        else:
+            keyword = next(
+                (item for item in call.keywords if item.arg == parameter_name),
+                None,
+            )
+            if keyword is not None:
+                argument = keyword.value
+        if argument is None:
+            raise AssertionError(
+                f"Source factory {factory.name} call omits {parameter_name!r} "
+                f"in {relative}: {ast.unparse(call)}"
+            )
+        resolved = _resolved_string(argument, constants)
+        if resolved is None:
+            raise AssertionError(
+                f"Unresolved source name passed to {factory.name} in "
+                f"{relative}: {ast.unparse(argument)}"
+            )
+        names.add(resolved)
+    if not matched:
+        raise AssertionError(
+            f"SourceRegistration factory {factory.name} has no call in {relative}"
+        )
+    return names
+
+
 def _discovered_core_signal_source_surfaces() -> set[str]:
     """Inventory every core ``SourceRegistration`` plus cron handlers.
 
@@ -605,31 +666,15 @@ def _discovered_core_signal_source_surfaces() -> set[str]:
                     ]
                     parameter_names = [parameter.arg for parameter in parameters]
                     if name_expression.id in parameter_names:
-                        parameter_index = parameter_names.index(name_expression.id)
-                        for call in ast.walk(tree):
-                            if not (
-                                isinstance(call, ast.Call)
-                                and _call_name(call) == enclosing.name
-                            ):
-                                continue
-                            argument: ast.expr | None = None
-                            if parameter_index < len(call.args):
-                                argument = call.args[parameter_index]
-                            else:
-                                keyword = next(
-                                    (
-                                        item
-                                        for item in call.keywords
-                                        if item.arg == name_expression.id
-                                    ),
-                                    None,
-                                )
-                                if keyword is not None:
-                                    argument = keyword.value
-                            if argument is not None:
-                                resolved = _resolved_string(argument, constants)
-                                if resolved is not None:
-                                    names.add(resolved)
+                        names.update(
+                            _resolved_source_factory_call_names(
+                                tree,
+                                enclosing,
+                                name_expression.id,
+                                constants,
+                                relative,
+                            )
+                        )
             if not names:
                 raise AssertionError(
                     "Unresolved SourceRegistration name expression in "
@@ -637,6 +682,124 @@ def _discovered_core_signal_source_surfaces() -> set[str]:
                 )
             surfaces.update(f"{relative}::{name}" for name in names)
     return surfaces
+
+
+def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
+    """Return scopes that can publish values into ``_direct_tools``."""
+
+    writers: set[str] = set()
+
+    class DirectToolWriterVisitor(ast.NodeVisitor):
+        PUBLISH_METHODS = {"__setitem__", "setdefault", "update"}
+
+        def __init__(self) -> None:
+            self.scope: list[str] = []
+            self.aliases: list[set[str]] = []
+
+        def _visit_definition(
+            self,
+            node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> None:
+            self.scope.append(node.name)
+            self.aliases.append(set())
+            self.generic_visit(node)
+            self.aliases.pop()
+            self.scope.pop()
+
+        def _is_registry(self, node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Attribute)
+                and node.attr == "_direct_tools"
+            ) or (
+                isinstance(node, ast.Name)
+                and bool(self.aliases)
+                and node.id in self.aliases[-1]
+            )
+
+        def _record(self) -> None:
+            if not self.scope:
+                return
+            qualified = ".".join(self.scope)
+            if self.scope[-1] == "register_dynamic_tools":
+                qualified = self.scope[-1]
+            writers.add(f"{relative}::{qualified}")
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            self._visit_definition(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self._visit_definition(node)
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            self._visit_definition(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+            if self.aliases and self._is_registry(node.value):
+                self.aliases[-1].update(
+                    target.id
+                    for target in node.targets
+                    if isinstance(target, ast.Name)
+                )
+            if any(
+                isinstance(target, ast.Subscript)
+                and self._is_registry(target.value)
+                for target in node.targets
+            ):
+                self._record()
+            if any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "_direct_tools"
+                for target in node.targets
+            ) and not (
+                isinstance(node.value, ast.Dict)
+                and not node.value.keys
+            ):
+                self._record()
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+            if (
+                node.value is not None
+                and self.aliases
+                and self._is_registry(node.value)
+            ):
+                if isinstance(node.target, ast.Name):
+                    self.aliases[-1].add(node.target.id)
+            if (
+                isinstance(node.target, ast.Subscript)
+                and self._is_registry(node.target.value)
+            ):
+                self._record()
+            if (
+                node.value is not None
+                and isinstance(node.target, ast.Attribute)
+                and node.target.attr == "_direct_tools"
+                and not (
+                    isinstance(node.value, ast.Dict)
+                    and not node.value.keys
+                )
+            ):
+                self._record()
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:  # noqa: N802
+            if self._is_registry(node.target):
+                self._record()
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in self.PUBLISH_METHODS
+                and self._is_registry(node.func.value)
+            ):
+                self._record()
+            self.generic_visit(node)
+
+    DirectToolWriterVisitor().visit(tree)
+    return writers
 
 
 def _discovered_runtime_generated_tool_surfaces() -> set[str]:
@@ -735,50 +898,13 @@ def _discovered_runtime_generated_tool_surfaces() -> set[str]:
     # Discover writers structurally so a new one cannot bypass this inventory
     # by using a special-purpose tool name or execution path.
     direct_writers: set[str] = set()
-
-    class DirectToolWriterVisitor(ast.NodeVisitor):
-        def __init__(self, relative: str) -> None:
-            self.relative = relative
-            self.scope: list[str] = []
-
-        def _visit_definition(
-            self,
-            node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
-        ) -> None:
-            self.scope.append(node.name)
-            self.generic_visit(node)
-            self.scope.pop()
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
-            self._visit_definition(node)
-
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
-            self._visit_definition(node)
-
-        def visit_AsyncFunctionDef(  # noqa: N802
-            self, node: ast.AsyncFunctionDef
-        ) -> None:
-            self._visit_definition(node)
-
-        def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
-            writes_registry = any(
-                isinstance(target, ast.Subscript)
-                and isinstance(target.value, ast.Attribute)
-                and target.value.attr == "_direct_tools"
-                for target in node.targets
-            )
-            if writes_registry and self.scope:
-                qualified = ".".join(self.scope)
-                # Preserve the pre-existing generic boundary ID while using a
-                # qualified ID for any special writer discovered elsewhere.
-                if self.scope[-1] == "register_dynamic_tools":
-                    qualified = self.scope[-1]
-                direct_writers.add(f"{self.relative}::{qualified}")
-            self.generic_visit(node)
-
     for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        DirectToolWriterVisitor(path.relative_to(REPO_ROOT).as_posix()).visit(tree)
+        direct_writers.update(
+            _direct_tool_writer_surfaces(
+                tree, path.relative_to(REPO_ROOT).as_posix()
+            )
+        )
     surfaces.update(direct_writers)
 
     receipt_writer = (
@@ -1148,6 +1274,38 @@ def _route_declarations(
                 return
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 registration = node.func.attr.casefold()
+                if registration == "include_router":
+                    receiver = _route_receiver_name(node)
+                    prefix_keyword = next(
+                        (
+                            item
+                            for item in node.keywords
+                            if item.arg == "prefix"
+                        ),
+                        None,
+                    )
+                    include_prefix = ""
+                    if prefix_keyword is not None:
+                        resolved_prefix = _resolved_string(
+                            prefix_keyword.value, active_strings
+                        )
+                        if resolved_prefix is None:
+                            raise AssertionError(
+                                "Unresolved include_router prefix expression: "
+                                f"{ast.unparse(prefix_keyword.value)}"
+                            )
+                        include_prefix = resolved_prefix
+                    # Checked-in APIRouter composition changes every child
+                    # path. Until those child declarations are expanded here,
+                    # fail closed rather than leave the old paths green. The
+                    # app's existing prefix-free publication calls remain
+                    # covered by their source decorators and the separate
+                    # dynamic-router boundary inventory.
+                    if receiver != "app" or include_prefix:
+                        raise AssertionError(
+                            "include_router prefix composition requires exact "
+                            f"HTTP inventory support: {ast.unparse(node)}"
+                        )
                 if registration in {
                     "add_api_route",
                     "add_api_websocket_route",
@@ -1526,6 +1684,36 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
     ), "The classified high-level Feature tool must remain wired into registration"
 
 
+def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
+    tree = ast.parse(
+        "class Publisher:\n"
+        "    def direct(self, tool):\n"
+        "        self._direct_tools.update({'x': tool})\n\n"
+        "    def default(self, tool):\n"
+        "        self._direct_tools.setdefault('x', tool)\n\n"
+        "    def alias(self, tool):\n"
+        "        registry = self._direct_tools\n"
+        "        registry['x'] = tool\n\n"
+        "    def union(self, tools):\n"
+        "        registry = self._direct_tools\n"
+        "        registry |= tools\n\n"
+        "    def replace(self, tools):\n"
+        "        self._direct_tools = tools\n\n"
+        "    def initialize(self):\n"
+        "        self._direct_tools = {}\n\n"
+        "    def remove(self):\n"
+        "        self._direct_tools.pop('x', None)\n"
+    )
+
+    assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.alias",
+        "example.py::Publisher.default",
+        "example.py::Publisher.direct",
+        "example.py::Publisher.replace",
+        "example.py::Publisher.union",
+    }
+
+
 def test_every_core_signal_source_and_builtin_handler_is_classified() -> None:
     discovered = _discovered_core_signal_source_surfaces()
     assert discovered == _documented_surfaces(
@@ -1569,6 +1757,31 @@ def test_signal_source_inventory_scans_beyond_scheduler_module() -> None:
         "kestrel_sovereign/signals/sources/workflow_rescue.py::"
         "fleet_stalled_sweep",
     } <= non_scheduler_sources
+
+
+def test_each_source_factory_call_must_resolve_its_own_name() -> None:
+    tree = ast.parse(
+        "STATIC_NAME = 'static.source'\n"
+        "def make_source(name):\n"
+        "    return SourceRegistration(name=name)\n\n"
+        "make_source(STATIC_NAME)\n"
+        "make_source(runtime_name)\n"
+    )
+    factory = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "make_source"
+    )
+
+    with pytest.raises(AssertionError, match="runtime_name"):
+        _resolved_source_factory_call_names(
+            tree,
+            factory,
+            "name",
+            _module_string_constants(tree),
+            "example.py",
+        )
 
 
 def test_every_dynamic_router_publication_boundary_is_classified() -> None:
@@ -1986,6 +2199,27 @@ def test_programmatic_route_registrations_and_mounts_are_inventoried() -> None:
         (("PATCH",), "/host/mutate"),
         (("MOUNT",), "<dynamic:mount_path>"),
     ]
+
+
+def test_router_composition_cannot_leave_uncomposed_paths_green() -> None:
+    nested_router = ast.parse(
+        'child = APIRouter(prefix="/child")\n'
+        '@child.get("/status")\n'
+        "def status():\n    pass\n"
+        'parent = APIRouter(prefix="/parent")\n'
+        'parent.include_router(child, prefix="/nested")\n'
+    )
+    app_prefix = ast.parse(
+        'child = APIRouter(prefix="/child")\n'
+        '@child.get("/status")\n'
+        "def status():\n    pass\n"
+        'app.include_router(child, prefix="/v2")\n'
+    )
+
+    with pytest.raises(AssertionError, match="prefix composition"):
+        _route_declarations(nested_router, {}, {})
+    with pytest.raises(AssertionError, match="prefix composition"):
+        _route_declarations(app_prefix, {}, {})
 
 
 def test_fastapi_generated_routes_follow_constructor_configuration() -> None:
@@ -2448,6 +2682,18 @@ def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> boo
     )
 
 
+def _is_provenance_accessor_call(node: ast.AST) -> bool:
+    """Whether an expression actually invokes a canonical chain accessor."""
+
+    return any(
+        isinstance(child, ast.Call)
+        and _call_name(child).casefold().strip("_").endswith(
+            PROVENANCE_ACCESSOR_SUFFIXES
+        )
+        for child in ast.walk(node)
+    )
+
+
 def _has_provenance_value(
     node: ast.AST,
     aliases: set[str] | None = None,
@@ -2455,15 +2701,21 @@ def _has_provenance_value(
 ) -> bool:
     """Whether an expression reads provenance directly or via a local helper."""
 
-    return _has_provenance_token(node, aliases) or any(
-        isinstance(child, ast.Call)
-        and _call_name(child).casefold() in (provenance_return_helpers or set())
-        for child in ast.walk(node)
+    return (
+        _has_provenance_token(node, aliases)
+        or _is_provenance_accessor_call(node)
+        or any(
+            isinstance(child, ast.Call)
+            and _call_name(child).casefold()
+            in (provenance_return_helpers or set())
+            for child in ast.walk(node)
+        )
     )
 
 
 def _cross_agent_control_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
+    control_helpers: set[str] | None = None,
 ) -> set[str]:
     """Resolve local names that reference cross-agent control callables."""
 
@@ -2502,7 +2754,7 @@ def _cross_agent_control_aliases(
             if target_name:
                 assignments.append((target_name, source))
 
-    aliases: set[str] = set()
+    aliases: set[str] = set(control_helpers or ())
     changed = True
     while changed:
         changed = False
@@ -2522,14 +2774,31 @@ def _is_cross_agent_control_call(
     """Whether ``node`` invokes a known control or a local alias of one."""
 
     call_name = _call_name(node).casefold()
-    return _is_cross_agent_control_name(call_name) or call_name in (
-        control_aliases or set()
+    # ``_call_name`` covers ordinary names and attributes.  For a mapping or
+    # sequence-selected callable, inspect only the selector, not its receiver:
+    # ``handlers["terminate_child"]`` is a control sink, while a neutral call
+    # on ``task_manager`` must not become one merely because the receiver name
+    # contains the broad inventory term ``task``.
+    callable_tokens = (
+        _identifier_tokens(node.func.slice)
+        if isinstance(node.func, ast.Subscript)
+        else set()
+    )
+    return (
+        _is_cross_agent_control_name(call_name)
+        or call_name in (control_aliases or set())
+        or any(
+            _is_cross_agent_control_name(token)
+            or token in (control_aliases or set())
+            for token in callable_tokens
+        )
     )
 
 
 def _provenance_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     provenance_return_helpers: set[str] | None = None,
+    control_helpers: set[str] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Resolve provenance aliases and provenance-selected control arguments."""
 
@@ -2571,6 +2840,8 @@ def _provenance_aliases(
             return _has_provenance_token(value, aliases) or calls_known_helper
         if isinstance(value, ast.Call):
             call_name = _call_name(value).casefold()
+            if _is_provenance_accessor_call(value):
+                return True
             if call_name in (provenance_return_helpers or set()):
                 return True
             if call_name.startswith(("can_", "has_", "is_", "may_")) or (
@@ -2615,7 +2886,7 @@ def _provenance_aliases(
 
     aliases: set[str] = set()
     scope_nodes = _walk_lexical_scope(function)
-    control_aliases = _cross_agent_control_aliases(function)
+    control_aliases = _cross_agent_control_aliases(function, control_helpers)
     control_argument_names = {
         token
         for node in scope_nodes
@@ -2869,8 +3140,83 @@ def _provenance_aliases(
     return aliases, provenance_selected_targets
 
 
+def _local_control_helpers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    """Find local helpers that eventually invoke a control sink."""
+
+    helper_names: set[str] = set()
+
+    def is_summary_sink(call: ast.Call, known_helpers: set[str]) -> bool:
+        call_name = _call_name(call).casefold()
+        if call_name in known_helpers:
+            return True
+        selector_tokens = (
+            _identifier_tokens(call.func.slice)
+            if isinstance(call.func, ast.Subscript)
+            else set()
+        )
+        sink_tokens = {call_name, *selector_tokens}
+        control_actions = (
+            "cancel",
+            "create",
+            "delegate",
+            "deploy",
+            "hold",
+            "interrupt",
+            "invoke",
+            "kill",
+            "list",
+            "offboard",
+            "read",
+            "restart",
+            "send",
+            "shutdown",
+            "spawn",
+            "stop",
+            "subscribe",
+            "teardown",
+            "terminate",
+            "withdraw",
+        )
+        agent_subjects = (
+            "a2a",
+            "agent",
+            "child",
+            "descendant",
+            "fleet",
+            "host",
+            "peer",
+        )
+        return any(
+            token in {"kill_process", "shutdown"}
+            or (
+                any(action in token for action in control_actions)
+                and any(subject in token for subject in agent_subjects)
+            )
+            for token in sink_tokens
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        for function in functions:
+            function_name = function.name.casefold()
+            if function_name in helper_names:
+                continue
+            if any(
+                isinstance(node, ast.Call)
+                and is_summary_sink(node, helper_names)
+                for node in _walk_lexical_scope(function)
+            ):
+                helper_names.add(function_name)
+                changed = True
+    return helper_names
+
+
 def _local_provenance_return_helpers(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    control_helpers: set[str] | None = None,
 ) -> set[str]:
     """Find local helpers whose return value is provenance-derived.
 
@@ -2888,7 +3234,7 @@ def _local_provenance_return_helpers(
             if function.name.casefold() in helper_names:
                 continue
             aliases, _selected_targets = _provenance_aliases(
-                function, helper_names
+                function, helper_names, control_helpers
             )
             returns_provenance = False
             for node in _walk_lexical_scope(function):
@@ -2905,7 +3251,8 @@ def _local_provenance_return_helpers(
                         for child in ast.walk(value)
                     )
                     returns_provenance = (
-                        call_name in helper_names
+                        _is_provenance_accessor_call(value)
+                        or call_name in helper_names
                         or call_name in PROVENANCE_TRANSFORM_CALLS
                         and (
                             _has_provenance_token(value, aliases)
@@ -3088,12 +3435,17 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-    provenance_return_helpers = _local_provenance_return_helpers(functions)
+    control_helpers = _local_control_helpers(functions)
+    provenance_return_helpers = _local_provenance_return_helpers(
+        functions, control_helpers
+    )
     for function in functions:
         function_name = function.name.casefold()
-        control_aliases = _cross_agent_control_aliases(function)
+        control_aliases = _cross_agent_control_aliases(function, control_helpers)
         provenance_aliases, provenance_selected_targets = (
-            _provenance_aliases(function, provenance_return_helpers)
+            _provenance_aliases(
+                function, provenance_return_helpers, control_helpers
+            )
         )
         lines.update(
             _guard_clause_provenance_lines(
@@ -3124,15 +3476,48 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                     for argument in arguments
                 ):
                     lines.add(node.lineno)
-                if _is_cross_agent_control_call(node, control_aliases) and any(
-                    bool(
-                        _identifier_tokens(argument).intersection(
-                            provenance_selected_targets
+                if _is_cross_agent_control_call(node, control_aliases):
+                    direct_control_inputs = [*node.args]
+                    direct_control_inputs.extend(
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg is None
+                        or any(
+                            term in keyword.arg.casefold().split("_")
+                            for term in (
+                                "target",
+                                "agent",
+                                "peer",
+                                "child",
+                                "name",
+                                "id",
+                            )
                         )
                     )
-                    for argument in arguments
-                ):
-                    lines.add(node.lineno)
+                    if (
+                        _has_provenance_value(
+                            node.func,
+                            provenance_aliases,
+                            provenance_return_helpers,
+                        )
+                        or any(
+                            _has_provenance_value(
+                                argument,
+                                provenance_aliases,
+                                provenance_return_helpers,
+                            )
+                            for argument in direct_control_inputs
+                        )
+                        or any(
+                            bool(
+                                _identifier_tokens(argument).intersection(
+                                    provenance_selected_targets
+                                )
+                            )
+                            for argument in arguments
+                        )
+                    ):
+                        lines.add(node.lineno)
             assignment_targets: list[ast.AST] = []
             assignment_value: ast.AST | None = None
             if isinstance(node, ast.Assign):
@@ -3785,6 +4170,63 @@ def test_provenance_scanner_follows_local_helper_return_values() -> None:
     assert _authority_provenance_lines(wrapped_helper) == {9}
     assert _authority_provenance_lines(direct_helper_guard) == {5}
     assert _authority_provenance_lines(propagation_only_helper) == set()
+
+
+def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers() -> None:
+    direct_target = ast.parse(
+        "def dispatch(request):\n"
+        "    terminate_child(request.causation_chain[-1].agent_id)\n"
+    )
+    canonical_accessors = ast.parse(
+        "def dispatch(self, target):\n"
+        "    if self._get_current_chain():\n"
+        "        target.shutdown()\n\n"
+        "def adapter(self, target):\n"
+        "    chain = self._provide_causation_chain()\n"
+        "    if chain:\n"
+        "        target.shutdown()\n"
+    )
+    neutral_control_helpers = ast.parse(
+        "def apply(manager, target):\n"
+        "    manager.kill_process(target)\n\n"
+        "def wrapped(manager, target):\n"
+        "    apply(manager, target)\n\n"
+        "def dispatch(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        wrapped(manager, target)\n"
+    )
+    mapped_callback = ast.parse(
+        "def dispatch(request, handlers, target):\n"
+        "    if request.orchestrator:\n"
+        "        handlers['terminate_child'](target)\n"
+    )
+
+    assert _authority_provenance_lines(direct_target) == {2}
+    assert _authority_provenance_lines(canonical_accessors) == {2, 7}
+    assert _authority_provenance_lines(neutral_control_helpers) == {8}
+    assert _authority_provenance_lines(mapped_callback) == {2}
+
+
+def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -> None:
+    accessor_reference = ast.parse(
+        "def dispatch(self):\n"
+        "    provider = getattr(self.agent, '_provide_causation_chain', None)\n"
+        "    if callable(provider):\n"
+        "        self.send_a2a_task()\n"
+    )
+    local_task_plumbing = ast.parse(
+        "def schedule(work):\n"
+        "    asyncio.create_task(work())\n\n"
+        "def record_failure():\n"
+        "    schedule(write_log)\n\n"
+        "def run(request):\n"
+        "    reason = request.causation_chain[-1]\n"
+        "    if reason:\n"
+        "        record_failure()\n"
+    )
+
+    assert _authority_provenance_lines(accessor_reference) == set()
+    assert _authority_provenance_lines(local_task_plumbing) == set()
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
