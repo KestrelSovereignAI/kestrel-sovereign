@@ -831,6 +831,91 @@ async def test_update_delegation_enforces_exact_operation_profile_repo_and_ref(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["grant", "request"])
+async def test_update_repository_embedded_nul_returns_failed_tool_result(
+    tmp_path,
+    surface,
+):
+    """Malformed filesystem input is a validation error, not a tool crash."""
+
+    feat, backend = await _make_feature(tmp_path)
+    if surface == "grant":
+        result = await feat.grant_restart_delegation(
+            subject_agent_did=feat.agent.did,
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path="bad\0checkout",
+        )
+        stored = await backend.fetchval(
+            "SELECT COUNT(*) FROM restart_authority_delegations"
+        )
+    else:
+        result = await feat.request_restart(
+            reason="reject malformed repository",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path="bad\0checkout",
+        )
+        stored = len(await list_requests(backend))
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "repo_path" in result.error
+    assert stored == 0
+
+
+@pytest.mark.asyncio
+async def test_delegated_update_rejects_repository_retarget_before_mutation(
+    tmp_path,
+):
+    """A signed canonical path cannot be replaced by a symlink before use."""
+
+    feat, backend = await _make_feature(tmp_path)
+    authorized = tmp_path / "authorized"
+    attacker = tmp_path / "attacker"
+    authorized.mkdir()
+    attacker.mkdir()
+    _git_checkout(authorized)
+    _git_checkout(attacker)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(authorized),
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="bound repository must remain bound",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path=str(authorized),
+            delegation_id=delegation_id,
+        )
+
+    shutil.rmtree(authorized)
+    authorized.symlink_to(attacker, target_is_directory=True)
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("retargeted repository reached update runner")
+    )
+    with patch.object(
+        RestartCoordinatorFeature,
+        "_spawn_restart_subprocess",
+    ) as restart:
+        result = await feat.restart_coordinator()
+
+    row = await get_request(backend, requested.data["request"]["id"])
+    assert row.status == "rejected"
+    assert "repo_path" in row.status_reason
+    assert result.data["executed"] == []
+    feat._run_update.assert_not_awaited()
+    restart.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_expired_or_forged_delegation_fails_closed_before_filing(
     tmp_path,
 ):

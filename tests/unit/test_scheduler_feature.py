@@ -534,6 +534,40 @@ class TestRetiredCronCleanup:
             await f.post_all_features_loaded(agent)
 
     @pytest.mark.asyncio
+    async def test_post_load_accepts_concurrent_authority_schedule_removal(self):
+        """A peer replica deleting the same legacy row is successful cleanup."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        legacy = {
+            "task_name": "request_restart",
+            "id": "legacy-concurrent-removal",
+            "enabled": True,
+        }
+        f.schedule_list = AsyncMock(side_effect=[
+            ToolResult.ok(confirmation="listed", data={"tasks": [legacy]}),
+            ToolResult.ok(confirmation="listed", data={"tasks": []}),
+        ])
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.failed(
+                error="Task legacy-concurrent-removal not found"
+            )
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+
+        f.schedule_remove.assert_awaited_once_with("legacy-concurrent-removal")
+        assert f.schedule_list.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_post_load_removes_retired_builtin_schedules(self):
         """Persisted rows for removed core sources must be deleted on upgrade."""
         from kestrel_sdk.tools.result import ToolResult

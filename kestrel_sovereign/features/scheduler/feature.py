@@ -445,6 +445,38 @@ class SchedulerFeature(Feature):
                 task_id = task["id"]
                 removal = await self.schedule_remove(task_id)
                 if removal.status is not ToolResultStatus.OK:
+                    # A peer replica may have listed and removed the same
+                    # unsafe legacy row between our snapshot and delete.  That
+                    # is the desired terminal state, not a boot failure.  Only
+                    # accept it after a fresh authoritative list proves this
+                    # exact tenant-owned row is already absent; storage/list
+                    # failures and rows that remain visible still fail closed.
+                    refreshed = await self.schedule_list()
+                    refreshed_data = (
+                        refreshed.data if isinstance(refreshed.data, dict) else None
+                    )
+                    refreshed_tasks = (
+                        refreshed_data.get("tasks")
+                        if refreshed_data is not None
+                        else None
+                    )
+                    already_absent = (
+                        refreshed.status is ToolResultStatus.OK
+                        and isinstance(refreshed_tasks, list)
+                        and not any(
+                            current.get("id") == task_id
+                            for current in refreshed_tasks
+                            if isinstance(current, dict)
+                        )
+                    )
+                    if already_absent:
+                        logger.warning(
+                            "Authority-bound schedule '%s' (id=%s) was "
+                            "removed concurrently by another scheduler replica",
+                            task["task_name"],
+                            str(task_id)[:8],
+                        )
+                        continue
                     raise RuntimeError(
                         "Failed to remove authority-bound schedule "
                         f"'{task['task_name']}' (id={task_id}): "

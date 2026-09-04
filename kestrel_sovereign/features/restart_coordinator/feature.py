@@ -122,6 +122,18 @@ MAX_RESTART_DISPATCH_ATTEMPTS = 3
 # administrative role.
 MAX_RESTART_DELEGATION_SECONDS = 86_400
 
+
+def _canonical_update_repo_path(path: str) -> Optional[str]:
+    """Resolve one repository path without leaking malformed input failures."""
+
+    try:
+        return str(Path(path).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        # ``ValueError`` covers embedded NULs; ``RuntimeError`` covers path
+        # resolution failures such as symlink loops on supported platforms.
+        return None
+
+
 # An ``executing`` row stamped with THIS boot older than this never had its
 # restart happen — the process it was going to kill is still running it. The
 # in-dispatch check catches the common case; this is the backstop for a row
@@ -590,13 +602,13 @@ class RestartCoordinatorFeature(Feature):
                     "update_then_restart delegation requires an explicit repo_path",
                     data={"created": False},
                 )
-            try:
-                update_repo_path = str(Path(repo_path).expanduser().resolve())
-            except OSError:
+            canonical_repo_path = _canonical_update_repo_path(repo_path)
+            if canonical_repo_path is None:
                 return ToolResult.failed(
                     "update_then_restart delegation repo_path is invalid",
                     data={"created": False},
                 )
+            update_repo_path = canonical_repo_path
             if not repo_is_git_checkout(update_repo_path):
                 return ToolResult.failed(
                     "update_then_restart delegation repo_path must be a local "
@@ -857,12 +869,12 @@ class RestartCoordinatorFeature(Feature):
                 )
 
         if operation == "update_then_restart":
-            try:
-                canonical_repo_path = str(
-                    Path(update_repo_path).expanduser().resolve()
+            canonical_repo_path = _canonical_update_repo_path(update_repo_path)
+            if canonical_repo_path is None:
+                return ToolResult.failed(
+                    "update_then_restart repo_path is invalid",
+                    data={"created": False},
                 )
-            except OSError:
-                canonical_repo_path = ""
             # A delegated path is signed in canonical form; refusing aliases
             # prevents a symlink retarget from widening the signed repository.
             if delegation_id and canonical_repo_path != update_repo_path:
@@ -2461,8 +2473,12 @@ class RestartCoordinatorFeature(Feature):
                 "reason": f"rejected: unknown update profile "
                           f"{req.update_profile!r}",
             }
-        if not is_valid_target_ref(req.update_target_ref) or \
-                not repo_is_git_checkout(req.update_repo_path):
+        canonical_repo_path = _canonical_update_repo_path(req.update_repo_path)
+        if (
+            not is_valid_target_ref(req.update_target_ref)
+            or canonical_repo_path != req.update_repo_path
+            or not repo_is_git_checkout(canonical_repo_path or "")
+        ):
             await update_status(
                 self._db, req.id,
                 status="rejected",
