@@ -154,6 +154,23 @@ CLI_SURFACE_ID = re.compile(
 )
 
 
+@lru_cache(maxsize=None)
+def _source_text(source_path: Path) -> str:
+    """Read checked-in source once for all inventory contracts."""
+
+    return source_path.read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=None)
+def _parsed_module(source_path: Path) -> ast.Module:
+    """Parse a checked-in module once for all inventory contracts."""
+
+    return ast.parse(
+        _source_text(source_path),
+        filename=str(source_path),
+    )
+
+
 def _resolved_string(
     node: ast.expr,
     constants: dict[str, str] | None = None,
@@ -298,11 +315,34 @@ def _module_strings_at_definition(
 def _cached_local_string_constants(source_path: Path) -> dict[str, str]:
     """Read one imported module's local constants without crawling its imports."""
 
-    tree = ast.parse(
-        source_path.read_text(encoding="utf-8"),
-        filename=str(source_path),
-    )
-    return _module_string_constants(tree)
+    return _module_string_constants(_parsed_module(source_path))
+
+
+def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
+    """Resolve direct import aliases for the SDK's ``tool`` decorator."""
+
+    aliases = {"tool"}
+    assignments: list[tuple[str, str]] = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            for imported in node.names:
+                if imported.name == "tool":
+                    aliases.add(imported.asname or imported.name)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Name)
+        ):
+            assignments.append((node.targets[0].id, node.value.id))
+    changed = True
+    while changed:
+        changed = False
+        for target, source in assignments:
+            if source in aliases and target not in aliases:
+                aliases.add(target)
+                changed = True
+    return aliases
 
 
 def test_module_string_constants_follow_source_order_on_reassignment() -> None:
@@ -328,6 +368,7 @@ def _public_tool_name(
     decorator: ast.expr,
     fallback: str,
     constants: dict[str, str] | None = None,
+    decorator_aliases: set[str] | None = None,
 ) -> str | None:
     call = decorator if isinstance(decorator, ast.Call) else None
     function = call.func if call is not None else decorator
@@ -338,10 +379,15 @@ def _public_tool_name(
         if isinstance(function, ast.Attribute)
         else ""
     )
-    if decorator_name != "tool":
+    if decorator_name not in (decorator_aliases or {"tool"}):
         return None
     if call is None:
         return fallback
+    if any(keyword.arg is None for keyword in call.keywords):
+        raise AssertionError(
+            "Unresolved @tool keyword unpacking: "
+            f"{ast.unparse(call)}"
+        )
     if call.args:
         name = _resolved_string(call.args[0], constants)
         if name is None:
@@ -410,14 +456,18 @@ def _discovered_tool_surfaces() -> set[str]:
     surfaces: set[str] = set()
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
     for path in feature_root.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = _parsed_module(path)
+        decorator_aliases = _tool_decorator_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             string_constants = _module_strings_at_definition(tree, node, path)
             for decorator in node.decorator_list:
                 public_name = _public_tool_name(
-                    decorator, node.name, string_constants
+                    decorator,
+                    node.name,
+                    string_constants,
+                    decorator_aliases,
                 )
                 if public_name is None:
                     continue
@@ -1052,7 +1102,7 @@ def _discovered_dynamic_router_surfaces() -> set[str]:
             self.generic_visit(node)
 
     for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = _parsed_module(path)
         IncludeRouterVisitor(path.relative_to(REPO_ROOT).as_posix()).visit(tree)
     return surfaces
 
@@ -1306,6 +1356,25 @@ def _route_declarations(
                             "include_router prefix composition requires exact "
                             f"HTTP inventory support: {ast.unparse(node)}"
                         )
+                    router_expression = (
+                        node.args[0]
+                        if node.args
+                        else next(
+                            (
+                                item.value
+                                for item in node.keywords
+                                if item.arg == "router"
+                            ),
+                            None,
+                        )
+                    )
+                    if module_scope and not isinstance(
+                        router_expression, (ast.Name, ast.Attribute)
+                    ):
+                        raise AssertionError(
+                            "Unresolved module-level include_router publication: "
+                            f"{ast.unparse(node)}"
+                        )
                 if registration in {
                     "add_api_route",
                     "add_api_websocket_route",
@@ -1434,6 +1503,12 @@ def _route_methods(
     if method not in {"add_api_route", "add_route", "api_route", "route"}:
         return ()
 
+    if any(keyword.arg is None for keyword in decorator.keywords):
+        raise AssertionError(
+            "Unresolved route method keyword unpacking: "
+            f"{ast.unparse(decorator)}"
+        )
+
     def normalized(values: tuple[str, ...]) -> tuple[str, ...]:
         methods = tuple(value.upper() for value in values)
         if (
@@ -1523,7 +1598,7 @@ def _discovered_http_surfaces() -> set[str]:
         | {REPO_ROOT / "kestrel_sovereign/server.py"}
     )
     for path in paths:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = _parsed_module(path)
         string_constants = _module_string_constants(tree, path)
         method_constants = _module_string_collections(tree, path)
         for methods, route in _route_declarations(
@@ -1573,7 +1648,7 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
         | {REPO_ROOT / "kestrel_sovereign/server.py"}
     )
     for path in paths:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = _parsed_module(path)
         string_constants = _module_string_constants(tree, path)
         method_constants = _module_string_collections(tree, path)
         for methods, canonical_route in _route_declarations(
@@ -2221,6 +2296,12 @@ def test_router_composition_cannot_leave_uncomposed_paths_green() -> None:
     with pytest.raises(AssertionError, match="prefix composition"):
         _route_declarations(app_prefix, {}, {})
 
+    dynamic_module_publication = ast.parse(
+        "app.include_router(load_plugin_router())\n"
+    )
+    with pytest.raises(AssertionError, match="module-level include_router"):
+        _route_declarations(dynamic_module_publication, {}, {})
+
 
 def test_fastapi_generated_routes_follow_constructor_configuration() -> None:
     defaults = ast.parse("app = FastAPI()\n")
@@ -2341,6 +2422,103 @@ def test_unresolved_decorator_declarations_fail_closed() -> None:
         _router_prefix(prefix_tree)
     with pytest.raises(AssertionError, match="Unsupported api_route methods"):
         _route_methods(methods_decorator)
+
+
+def test_tool_import_aliases_and_route_keyword_unpacking_fail_closed() -> None:
+    tree = ast.parse(
+        "from kestrel_sdk import tool as expose\n"
+        '@expose(name="terminate_child")\n'
+        "def implementation():\n    pass\n"
+    )
+    function = tree.body[1]
+    assert isinstance(function, ast.FunctionDef)
+    assert _public_tool_name(
+        function.decorator_list[0],
+        function.name,
+        {},
+        _tool_decorator_aliases(tree),
+    ) == "terminate_child"
+
+    route = ast.parse(
+        'OPTIONS = {"methods": ["DELETE"]}\n'
+        '@router.api_route("/api/agents/{name}", **OPTIONS)\n'
+        "def terminate():\n    pass\n"
+    ).body[1]
+    assert isinstance(route, ast.FunctionDef)
+    with pytest.raises(AssertionError, match="keyword unpacking"):
+        _route_methods(route.decorator_list[0])
+
+    unpacked_tool = ast.parse(
+        "@tool(**OPTIONS)\n"
+        "def neutral():\n    pass\n"
+    ).body[0]
+    assert isinstance(unpacked_tool, ast.FunctionDef)
+    with pytest.raises(AssertionError, match="@tool keyword unpacking"):
+        _public_tool_name(
+            unpacked_tool.decorator_list[0], unpacked_tool.name
+        )
+
+
+def test_repository_scans_reuse_parsed_trees_and_analysis_summaries() -> None:
+    source_path = REPO_ROOT / "kestrel_sovereign/server.py"
+    assert _parsed_module(source_path) is _parsed_module(source_path)
+    assert _cached_authority_provenance_lines(
+        source_path
+    ) is _cached_authority_provenance_lines(source_path)
+
+    function = ast.parse(
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        target.shutdown()\n"
+    ).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    assert _walk_lexical_scope(function) is _walk_lexical_scope(function)
+    assert _identifier_tokens(function) is _identifier_tokens(function)
+
+
+def test_provenance_return_summaries_skip_authority_body_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = ast.parse(
+        "def derive(request):\n"
+        "    chain = request.causation_chain\n"
+        "    return bool(chain)\n"
+    )
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def forbidden_scan(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("return summaries invoked authority-body analysis")
+
+    monkeypatch.setitem(
+        globals(),
+        "_contains_cross_agent_control_call",
+        forbidden_scan,
+    )
+    assert _local_provenance_return_helpers(functions) == {"derive"}
+
+
+def test_repository_scan_prefilters_modules_without_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = REPO_ROOT / "kestrel_sovereign/__init__.py"
+    source = _source_text(source_path).casefold()
+    assert not any(
+        marker in source
+        for marker in ("causation", "orchestrator", "current_chain")
+    )
+    _cached_authority_provenance_lines.cache_clear()
+
+    def forbidden_analysis(_tree: ast.AST) -> set[int]:
+        raise AssertionError("marker-free module reached authority analysis")
+
+    monkeypatch.setitem(
+        globals(), "_authority_provenance_lines", forbidden_analysis
+    )
+    assert _cached_authority_provenance_lines(source_path) == frozenset()
 
 
 def test_audit_records_remediated_authority_paths_as_enforced() -> None:
@@ -2556,7 +2734,8 @@ def test_shared_ipfs_pin_read_is_recorded_as_3226() -> None:
     assert "recursive pins" in row
 
 
-def _identifier_tokens(node: ast.AST) -> set[str]:
+@lru_cache(maxsize=None)
+def _identifier_tokens(node: ast.AST) -> frozenset[str]:
     tokens: set[str] = set()
     for child in ast.walk(node):
         if isinstance(child, ast.Name):
@@ -2568,12 +2747,13 @@ def _identifier_tokens(node: ast.AST) -> set[str]:
             tokens.add(ast.unparse(child).casefold())
         elif isinstance(child, ast.Constant) and isinstance(child.value, str):
             tokens.add(child.value.casefold())
-    return tokens
+    return frozenset(tokens)
 
 
+@lru_cache(maxsize=None)
 def _walk_lexical_scope(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> list[ast.AST]:
+) -> tuple[ast.AST, ...]:
     """Walk one function body without borrowing nested-scope semantics."""
 
     nodes: list[ast.AST] = []
@@ -2600,7 +2780,7 @@ def _walk_lexical_scope(
     visitor = ScopeVisitor()
     for statement in function.body:
         visitor.visit(statement)
-    return nodes
+    return tuple(nodes)
 
 
 def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
@@ -2638,7 +2818,7 @@ def _child_statement_blocks(statement: ast.stmt) -> list[list[ast.stmt]]:
 
 
 def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
-    tokens = _identifier_tokens(node)
+    tokens = set(_identifier_tokens(node))
     # The bare string ``"ORCHESTRATOR"`` is also a provider role label in
     # prompts and logs. Treat it as metadata only when it is used as a lookup
     # key; names/attributes called ``orchestrator`` remain provenance-bearing.
@@ -2734,14 +2914,35 @@ def _cross_agent_control_aliases(
             value = node.value
         if value is None:
             continue
-        source = (
-            value.id.casefold()
-            if isinstance(value, ast.Name)
-            else value.attr.casefold()
-            if isinstance(value, ast.Attribute)
-            else ""
-        )
-        if not source:
+        if isinstance(value, ast.Name):
+            sources = {value.id.casefold()}
+        elif isinstance(value, ast.Attribute):
+            sources = {value.attr.casefold()}
+        elif isinstance(value, ast.Subscript):
+            receiver = value.value
+            sources = (
+                {receiver.id.casefold()}
+                if isinstance(receiver, ast.Name)
+                else {receiver.attr.casefold()}
+                if isinstance(receiver, ast.Attribute)
+                else set()
+            )
+        elif isinstance(value, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+            elements = (
+                [*value.keys, *value.values]
+                if isinstance(value, ast.Dict)
+                else list(value.elts)
+            )
+            sources = {
+                element.id.casefold()
+                if isinstance(element, ast.Name)
+                else element.attr.casefold()
+                for element in elements
+                if isinstance(element, (ast.Name, ast.Attribute))
+            }
+        else:
+            sources = set()
+        if not sources:
             continue
         for target in targets:
             target_name = (
@@ -2752,7 +2953,7 @@ def _cross_agent_control_aliases(
                 else ""
             )
             if target_name:
-                assignments.append((target_name, source))
+                assignments.extend((target_name, source) for source in sources)
 
     aliases: set[str] = set(control_helpers or ())
     changed = True
@@ -2795,10 +2996,67 @@ def _is_cross_agent_control_call(
     )
 
 
+def _is_unambiguous_control_sink(
+    call: ast.Call,
+    known_helpers: set[str] | None = None,
+) -> bool:
+    """Recognize lifecycle calls without broad terms such as local ``task``."""
+
+    call_name = _call_name(call).casefold()
+    if call_name in (known_helpers or set()):
+        return True
+    selector_tokens = (
+        _identifier_tokens(call.func.slice)
+        if isinstance(call.func, ast.Subscript)
+        else frozenset()
+    )
+    control_actions = (
+        "cancel",
+        "create",
+        "delegate",
+        "deploy",
+        "hold",
+        "interrupt",
+        "invoke",
+        "kill",
+        "list",
+        "offboard",
+        "read",
+        "restart",
+        "send",
+        "shutdown",
+        "spawn",
+        "stop",
+        "subscribe",
+        "teardown",
+        "terminate",
+        "withdraw",
+    )
+    agent_subjects = (
+        "a2a",
+        "agent",
+        "child",
+        "descendant",
+        "fleet",
+        "host",
+        "peer",
+    )
+    return any(
+        token in {"kill_process", "shutdown"}
+        or (
+            any(action in token for action in control_actions)
+            and any(subject in token for subject in agent_subjects)
+        )
+        for token in {call_name, *selector_tokens}
+    )
+
+
 def _provenance_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     provenance_return_helpers: set[str] | None = None,
     control_helpers: set[str] | None = None,
+    *,
+    authority_analysis: bool = True,
 ) -> tuple[set[str], set[str]]:
     """Resolve provenance aliases and provenance-selected control arguments."""
 
@@ -2886,18 +3144,41 @@ def _provenance_aliases(
 
     aliases: set[str] = set()
     scope_nodes = _walk_lexical_scope(function)
-    control_aliases = _cross_agent_control_aliases(function, control_helpers)
-    control_argument_names = {
-        token
-        for node in scope_nodes
-        if isinstance(node, ast.Call)
-        and _is_cross_agent_control_call(node, control_aliases)
-        for argument in [
-            *node.args,
-            *(keyword.value for keyword in node.keywords),
-        ]
-        for token in _identifier_tokens(argument)
-    }
+    control_aliases = (
+        _cross_agent_control_aliases(function, control_helpers)
+        if authority_analysis
+        else set()
+    )
+    control_argument_names = (
+        {
+            token
+            for node in scope_nodes
+            if isinstance(node, ast.Call)
+            and _is_cross_agent_control_call(node, control_aliases)
+            for argument in [
+                *node.args,
+                *(keyword.value for keyword in node.keywords),
+            ]
+            for token in _identifier_tokens(argument)
+        }
+        if authority_analysis
+        else set()
+    )
+    selector_control_argument_names = (
+        {
+            token
+            for node in scope_nodes
+            if isinstance(node, ast.Call)
+            and _is_unambiguous_control_sink(node, control_helpers)
+            for argument in [
+                *node.args,
+                *(keyword.value for keyword in node.keywords),
+            ]
+            for token in _identifier_tokens(argument)
+        }
+        if authority_analysis
+        else set()
+    )
     assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
     for node in scope_nodes:
         targets: list[ast.AST] = []
@@ -2946,6 +3227,8 @@ def _provenance_aliases(
     )
     authority_decision_names: set[str] = set(authority_target_names)
     for node in scope_nodes:
+        if not authority_analysis:
+            break
         guarded: list[ast.AST] = []
         decision_expression: ast.AST | None = None
         if isinstance(node, (ast.If, ast.While)):
@@ -3003,17 +3286,21 @@ def _provenance_aliases(
     # authority decisions before walking assignment dependencies backwards.
     def collect_guard_decisions(
         statements: list[ast.stmt],
-        enclosing_continuation: list[ast.stmt] | None = None,
+        enclosing_continuation_controls: bool = False,
     ) -> None:
-        enclosing_continuation = enclosing_continuation or []
+        suffix_controls = [False] * (len(statements) + 1)
+        for index in range(len(statements) - 1, -1, -1):
+            suffix_controls[index] = suffix_controls[index + 1] or (
+                _contains_cross_agent_control_call(
+                    statements[index], control_aliases
+                )
+            )
         for index, statement in enumerate(statements):
-            continuation = [
-                *statements[index + 1 :],
-                *enclosing_continuation,
-            ]
-            if continuation and _contains_cross_agent_control_call(
-                continuation, control_aliases
-            ):
+            controls_continuation = (
+                suffix_controls[index + 1]
+                or enclosing_continuation_controls
+            )
+            if controls_continuation:
                 if isinstance(statement, ast.Assert):
                     authority_decision_names.update(
                         _identifier_tokens(statement.test)
@@ -3025,17 +3312,18 @@ def _provenance_aliases(
                     authority_decision_names.update(
                         _identifier_tokens(statement.test)
                     )
-            child_continuation = (
-                []
+            child_continuation_controls = (
+                False
                 if isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
-                else continuation
+                else controls_continuation
             )
             for block in _child_statement_blocks(statement):
-                collect_guard_decisions(block, child_continuation)
+                collect_guard_decisions(block, child_continuation_controls)
 
-    collect_guard_decisions(function.body)
+    if authority_analysis:
+        collect_guard_decisions(function.body)
 
-    changed = True
+    changed = authority_analysis
     while changed:
         changed = False
         for names, value, _node in assignments:
@@ -3104,7 +3392,11 @@ def _provenance_aliases(
     provenance_selected_targets: set[str] = set()
     while changed:
         changed = False
-        selected_decisions = provenance_selected_decisions(function.body)
+        selected_decisions = (
+            provenance_selected_decisions(function.body)
+            if authority_analysis
+            else set()
+        )
         provenance_selected_targets.update(
             selected_decisions.intersection(authority_target_names)
         )
@@ -3117,8 +3409,25 @@ def _provenance_aliases(
                 _is_permission_name(name) for name in names
             )
             target_names = names.intersection(authority_target_names)
-            target_derived = bool(target_names) and is_provenance_derived(
-                value, aliases
+            unwrapped_value = value
+            while isinstance(unwrapped_value, (ast.Await, ast.Expr)):
+                unwrapped_value = unwrapped_value.value
+            selector_target_names = names.intersection(
+                selector_control_argument_names
+            )
+            target_derived = bool(target_names) and (
+                is_provenance_derived(value, aliases)
+                or bool(selector_target_names)
+                and isinstance(unwrapped_value, ast.Call)
+                and any(
+                    _has_provenance_value(
+                        argument, aliases, provenance_return_helpers
+                    )
+                    for argument in [
+                        *unwrapped_value.args,
+                        *(keyword.value for keyword in unwrapped_value.keywords),
+                    ]
+                )
             )
             guard_decision_names = names.intersection(
                 authority_decision_names - authority_target_names
@@ -3147,56 +3456,6 @@ def _local_control_helpers(
 
     helper_names: set[str] = set()
 
-    def is_summary_sink(call: ast.Call, known_helpers: set[str]) -> bool:
-        call_name = _call_name(call).casefold()
-        if call_name in known_helpers:
-            return True
-        selector_tokens = (
-            _identifier_tokens(call.func.slice)
-            if isinstance(call.func, ast.Subscript)
-            else set()
-        )
-        sink_tokens = {call_name, *selector_tokens}
-        control_actions = (
-            "cancel",
-            "create",
-            "delegate",
-            "deploy",
-            "hold",
-            "interrupt",
-            "invoke",
-            "kill",
-            "list",
-            "offboard",
-            "read",
-            "restart",
-            "send",
-            "shutdown",
-            "spawn",
-            "stop",
-            "subscribe",
-            "teardown",
-            "terminate",
-            "withdraw",
-        )
-        agent_subjects = (
-            "a2a",
-            "agent",
-            "child",
-            "descendant",
-            "fleet",
-            "host",
-            "peer",
-        )
-        return any(
-            token in {"kill_process", "shutdown"}
-            or (
-                any(action in token for action in control_actions)
-                and any(subject in token for subject in agent_subjects)
-            )
-            for token in sink_tokens
-        )
-
     changed = True
     while changed:
         changed = False
@@ -3206,7 +3465,7 @@ def _local_control_helpers(
                 continue
             if any(
                 isinstance(node, ast.Call)
-                and is_summary_sink(node, helper_names)
+                and _is_unambiguous_control_sink(node, helper_names)
                 for node in _walk_lexical_scope(function)
             ):
                 helper_names.add(function_name)
@@ -3234,7 +3493,10 @@ def _local_provenance_return_helpers(
             if function.name.casefold() in helper_names:
                 continue
             aliases, _selected_targets = _provenance_aliases(
-                function, helper_names, control_helpers
+                function,
+                helper_names,
+                control_helpers,
+                authority_analysis=False,
             )
             returns_provenance = False
             for node in _walk_lexical_scope(function):
@@ -3292,7 +3554,18 @@ def _contains_cross_agent_control_call(
     scopes whose calls are not executed merely because the outer branch ran.
     """
 
-    roots = nodes if isinstance(nodes, list) else [nodes]
+    roots = tuple(nodes) if isinstance(nodes, list) else (nodes,)
+    return _cached_contains_cross_agent_control_call(
+        roots, frozenset(control_aliases or ())
+    )
+
+
+@lru_cache(maxsize=None)
+def _cached_contains_cross_agent_control_call(
+    roots: tuple[ast.AST, ...],
+    control_aliases: frozenset[str],
+) -> bool:
+    """Cache repeated control-body queries made by fixed-point summaries."""
 
     def is_control_reference(node: ast.AST) -> bool:
         if _is_cross_agent_control_reference(node):
@@ -3304,7 +3577,7 @@ def _contains_cross_agent_control_call(
             if isinstance(node, ast.Attribute)
             else ""
         )
-        return bool(reference_name and reference_name in (control_aliases or set()))
+        return bool(reference_name and reference_name in control_aliases)
 
     class ControlCallVisitor(ast.NodeVisitor):
         found = False
@@ -3379,18 +3652,19 @@ def _guard_clause_provenance_lines(
 
     def scan_block(
         statements: list[ast.stmt],
-        enclosing_continuation: list[ast.stmt] | None = None,
+        enclosing_continuation_controls: bool = False,
     ) -> None:
-        enclosing_continuation = enclosing_continuation or []
-        for index, statement in enumerate(statements):
-            continuation = [
-                *statements[index + 1 :],
-                *enclosing_continuation,
-            ]
-            controls_continuation = bool(continuation) and (
+        suffix_controls = [False] * (len(statements) + 1)
+        for index in range(len(statements) - 1, -1, -1):
+            suffix_controls[index] = suffix_controls[index + 1] or (
                 _contains_cross_agent_control_call(
-                    continuation, control_aliases
+                    statements[index], control_aliases
                 )
+            )
+        for index, statement in enumerate(statements):
+            controls_continuation = (
+                suffix_controls[index + 1]
+                or enclosing_continuation_controls
             )
             if controls_continuation and isinstance(statement, ast.Assert):
                 if _has_provenance_value(
@@ -3416,13 +3690,13 @@ def _guard_clause_provenance_lines(
             # continuation into loop bodies. Other compound statements retain
             # the enclosing continuation: a return/raise nested under ``with``
             # or ``try`` still gates the later control call.
-            child_continuation = (
-                []
+            child_continuation_controls = (
+                False
                 if isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
-                else continuation
+                else controls_continuation
             )
             for block in _child_statement_blocks(statement):
-                scan_block(block, child_continuation)
+                scan_block(block, child_continuation_controls)
 
     scan_block(function.body)
     return lines
@@ -3670,6 +3944,19 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             ):
                 lines.add(node.lineno)
     return lines
+
+
+@lru_cache(maxsize=None)
+def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
+    """Reuse one module's parsed tree and complete authority summary."""
+
+    source = _source_text(source_path).casefold()
+    if not any(
+        marker in source
+        for marker in ("causation", "orchestrator", "current_chain")
+    ):
+        return frozenset()
+    return frozenset(_authority_provenance_lines(_parsed_module(source_path)))
 
 
 def test_direct_provenance_authority_patterns_are_detected() -> None:
@@ -4200,11 +4487,24 @@ def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers(
         "    if request.orchestrator:\n"
         "        handlers['terminate_child'](target)\n"
     )
+    helper_selected_target = ast.parse(
+        "def dispatch(request):\n"
+        "    target = choose(request.causation_chain)\n"
+        "    terminate_child(target)\n"
+    )
+    container_selected_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = [noop, terminate_child]\n"
+        "    callback = callbacks[bool(request.causation_chain)]\n"
+        "    callback(target)\n"
+    )
 
     assert _authority_provenance_lines(direct_target) == {2}
     assert _authority_provenance_lines(canonical_accessors) == {2, 7}
     assert _authority_provenance_lines(neutral_control_helpers) == {8}
     assert _authority_provenance_lines(mapped_callback) == {2}
+    assert _authority_provenance_lines(helper_selected_target) == {3}
+    assert _authority_provenance_lines(container_selected_callback) == {4}
 
 
 def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -> None:
@@ -4234,8 +4534,7 @@ def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None
 
     violations: list[str] = []
     for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for line in _authority_provenance_lines(tree):
+        for line in _cached_authority_provenance_lines(path):
             violations.append(f"{path.relative_to(REPO_ROOT)}:{line}")
 
     assert not violations, (
