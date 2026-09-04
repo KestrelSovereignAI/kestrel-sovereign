@@ -183,7 +183,7 @@ async def test_recipient_mutation_authority_postgres():
 
 
 @pytest.mark.asyncio
-async def test_postgres_v3_fence_remains_strong_during_v2_rollout():
+async def test_postgres_v4_fence_is_installed_and_enforced():
     if not POSTGRES_URL:  # pragma: no cover - environment gate
         pytest.skip(
             "TEST_POSTGRES_URL / KESTREL_DATABASE_URL / DATABASE_URL required"
@@ -192,15 +192,13 @@ async def test_postgres_v3_fence_remains_strong_during_v2_rollout():
 
     backend = PostgresBackend(POSTGRES_URL)
     await backend.connect()
-    terminal_id = f"mixed-version-terminal-{uuid4().hex}"
-    authorityless_id = f"mixed-version-authorityless-{uuid4().hex}"
+    terminal_id = f"authority-fence-terminal-{uuid4().hex}"
+    authorityless_id = f"authority-fence-authorityless-{uuid4().hex}"
     try:
         store = TaskStore(backend)
         await store.initialize()
 
-        # This is the compatibility marker an already-deployed v2 worker probes
-        # before deciding whether to replace its shared trigger function.
-        v2_ready = await backend.fetch_one("""
+        fence_ready = await backend.fetch_one("""
             SELECT
                 EXISTS (
                     SELECT 1
@@ -209,7 +207,7 @@ async def test_postgres_v3_fence_remains_strong_during_v2_rollout():
                       ON namespace.oid = procedure.pronamespace
                     WHERE namespace.nspname = current_schema()
                       AND procedure.proname =
-                          'a2a_tasks_enforce_authority_fence'
+                          'a2a_tasks_enforce_authority_fence_v4'
                       AND pg_get_function_identity_arguments(procedure.oid) = ''
                 )
                 AND EXISTS (
@@ -221,11 +219,11 @@ async def test_postgres_v3_fence_remains_strong_during_v2_rollout():
                       ON namespace.oid = relation.relnamespace
                     WHERE namespace.nspname = current_schema()
                       AND relation.relname = 'a2a_tasks'
-                      AND trigger.tgname = 'a2a_tasks_authority_fence_v2'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v4'
                       AND NOT trigger.tgisinternal
                 )
         """)
-        assert v2_ready and v2_ready[0] is True
+        assert fence_ready and fence_ready[0] is True
 
         await backend.execute(
             """
