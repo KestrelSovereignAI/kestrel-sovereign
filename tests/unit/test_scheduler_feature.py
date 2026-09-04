@@ -461,6 +461,16 @@ class TestRetiredCronCleanup:
                     "enabled": False,
                 },
                 {
+                    "task_name": "grant_restart_delegation",
+                    "id": "legacy-grant-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "revoke_restart_delegation",
+                    "id": "legacy-revoke-paused",
+                    "enabled": False,
+                },
+                {
                     "task_name": "backup_snapshot",
                     "id": "keep-default",
                     "enabled": True,
@@ -484,6 +494,8 @@ class TestRetiredCronCleanup:
             "legacy-paused",
             "legacy-ack-live",
             "legacy-ack-paused",
+            "legacy-grant-live",
+            "legacy-revoke-paused",
         }
         readded = {
             call.kwargs.get("task_name")
@@ -491,6 +503,8 @@ class TestRetiredCronCleanup:
         }
         assert "request_restart" not in readded
         assert "acknowledge_restart_escalation" not in readded
+        assert "grant_restart_delegation" not in readded
+        assert "revoke_restart_delegation" not in readded
 
     @pytest.mark.asyncio
     async def test_post_load_fails_closed_when_authority_schedule_removal_fails(self):
@@ -1209,7 +1223,12 @@ class TestScheduleAdd:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "tool_name",
-        ["request_restart", "acknowledge_restart_escalation"],
+        [
+            "request_restart",
+            "acknowledge_restart_escalation",
+            "grant_restart_delegation",
+            "revoke_restart_delegation",
+        ],
     )
     async def test_add_rejects_authority_bound_restart_tool(self, feature, tool_name):
         """An unattended scheduler tick cannot supply sovereign authority."""

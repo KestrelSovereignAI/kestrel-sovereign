@@ -529,6 +529,11 @@ async def resolve_restart_delegation(
         return None, reason
     if expected_signature is not None and delegation.signature != expected_signature:
         return None, "restart delegation no longer matches the request binding"
+    # Read the database clock before the revocation witness.  The revocation
+    # lookup is the final awaited decision in this resolver, so a revocation
+    # that commits while clock/expiry state is being read is observed before
+    # delegated host authority is returned to the mutation boundary.
+    now = await database_clock(db)
     revoked = await db.fetchone(
         "SELECT revoked_at, revoked_by, revocation_evidence, "
         "revocation_signature FROM "
@@ -548,7 +553,6 @@ async def resolve_restart_delegation(
                 f"{receipt_reason}"
             )
         return None, "restart delegation was revoked"
-    now = await database_clock(db)
     issued_at = datetime.fromisoformat(delegation.issued_at)
     expires_at = datetime.fromisoformat(delegation.expires_at)
     if now < issued_at:

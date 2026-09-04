@@ -34,6 +34,7 @@ from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
 )
 from kestrel_sovereign.features.restart_coordinator.authority import (
+    issue_restart_delegation_revocation,
     verify_restart_authority,
 )
 from kestrel_sovereign.features.restart_coordinator.event_store import (
@@ -53,6 +54,7 @@ from kestrel_sovereign.features.restart_coordinator.store import (
     list_requests,
     mark_deferral_started,
     record_update_log,
+    resolve_restart_delegation,
     update_status,
     verify_restart_authority_at_use,
 )
@@ -766,6 +768,23 @@ async def test_restart_delegation_cannot_cross_agent_boundary(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_grant_rejects_subject_outside_agent_local_authority_store(tmp_path):
+    """Default SQLite grants must be usable from the database that stores them."""
+
+    owner, backend = await _make_feature(tmp_path, did="did:test:owner")
+
+    granted = await owner.grant_restart_delegation(
+        subject_agent_did="did:test:other-agent",
+    )
+
+    assert granted.status is ToolResultStatus.ERROR
+    assert "this agent" in granted.error
+    assert await backend.fetchval(
+        "SELECT COUNT(*) FROM restart_authority_delegations"
+    ) == 0
+
+
+@pytest.mark.asyncio
 async def test_update_delegation_enforces_exact_operation_profile_repo_and_ref(
     tmp_path,
 ):
@@ -880,6 +899,55 @@ async def test_revocation_is_durable_signed_and_blocks_new_requests(tmp_path):
     assert denied.status is ToolResultStatus.ERROR
     assert "revoked" in denied.error
     assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_delegation_revoked_during_clock_read_blocks_final_use(tmp_path):
+    """A revocation committed during resolution must precede host mutation."""
+
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    revoked_at = datetime.now(timezone.utc).isoformat()
+    evidence, signature = issue_restart_delegation_revocation(
+        delegation_id=delegation_id,
+        revoked_at=revoked_at,
+    )
+
+    async def commit_revocation_during_clock_read(db):
+        await db.execute(
+            "INSERT INTO restart_authority_delegation_revocations "
+            "(delegation_id, revoked_at, revoked_by, revocation_evidence, "
+            "revocation_signature) VALUES (?, ?, ?, ?, ?)",
+            (
+                delegation_id,
+                revoked_at,
+                "test-sovereign",
+                evidence,
+                signature,
+            ),
+        )
+        return datetime.now(timezone.utc)
+
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.store.database_clock",
+        side_effect=commit_revocation_during_clock_read,
+    ):
+        delegation, reason = await resolve_restart_delegation(
+            backend,
+            delegation_id,
+            subject_agent_did=feat.agent.did,
+            operation="restart_only",
+            update_repo_path="",
+            update_target_ref="",
+            update_profile="",
+            update_allow_migrations=False,
+        )
+
+    assert delegation is None
+    assert reason == "restart delegation was revoked"
 
 
 @pytest.mark.asyncio

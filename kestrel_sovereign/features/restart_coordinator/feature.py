@@ -541,6 +541,13 @@ class RestartCoordinatorFeature(Feature):
                 "subject_agent_did must be an explicit DID",
                 data={"created": False},
             )
+        local_agent_did = str(getattr(self.agent, "did", "") or "")
+        if subject_agent_did != local_agent_did:
+            return ToolResult.failed(
+                "subject_agent_did must identify this agent; restart "
+                "delegations are stored in the subject agent's authority store",
+                data={"created": False},
+            )
         if operation not in KNOWN_OPERATIONS:
             return ToolResult.failed(
                 f"operation must be one of {sorted(KNOWN_OPERATIONS)}; "

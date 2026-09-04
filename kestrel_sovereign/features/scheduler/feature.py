@@ -102,7 +102,12 @@ _RETIRED_BUILTIN_CRON_TASKS = frozenset({
 # coordinators remain valid built-in cron sources; only the authority-bearing
 # request surface is excluded here.
 _AUTHORITY_BOUND_TASKS = frozenset(
-    {"request_restart", "acknowledge_restart_escalation"}
+    {
+        "request_restart",
+        "acknowledge_restart_escalation",
+        "grant_restart_delegation",
+        "revoke_restart_delegation",
+    }
 )
 
 # Stable namespace used to distinguish core-owned schedule rows from user rows.
