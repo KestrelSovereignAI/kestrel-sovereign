@@ -11,14 +11,89 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from kestrel_sovereign.security.tool_audit import ACTION_TOOL_RESOLUTION, ACTION_TOOL_VALIDATION
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.security.permissions import (
+    SEARCH_TOOL_NAME,
+    SUBAGENT_DISPATCH_ACTION,
     PermissionLevel,
     PermissionStore,
     assert_sdk_permission_level_parity,
     compose_restrictive_permission,
 )
+
+
+#: Decisions that mean "this call was permitted to execute". Deliberately an
+#: allowlist: see the inversion note in ``security_audit_search``. Anything not
+#: here — a refusal, a block, an outcome row, or a value added after this was
+#: written — is reported as not-an-authorization.
+_AUTHORIZED_DECISIONS = frozenset({
+    "allowed",
+    "auto_allowed",
+    "auto_approved",
+    "auto_mode_allowed",
+    "user_approved",
+})
+
+#: Outcome-row decisions (``action='tool_outcome'``) that mean "the work was
+#: DONE". The same allowlist discipline as above, for the same reason: an
+#: outcome row can just as well record that the work did NOT happen
+#: (``filing_failed`` is live in the log), and keying the completion bucket on
+#: the action alone reported such a row with a ✓. An outcome row whose
+#: decision is not here is neither a completion nor a refusal: it is reported
+#: as an outcome record this tool does not classify, to be read — never as
+#: "this work may never have happened", which a completion record with a
+#: value this list has not learned (``issue_created``) turned into the exact
+#: false absence the tool exists to prevent (round 19 review).
+_COMPLETED_OUTCOME_DECISIONS = frozenset({
+    "filed_and_dispatched",
+    "github_write_ok",
+})
+
+#: The actions that record a PERMISSION decision about running a tool — the
+#: only rows whose ``decision`` means authorized or refused. Every other
+#: action in the table (``ephemeral_session_close``, ``mode_change``,
+#: ``permission_change``, ``auto_mode_config`` …) is a record to read, not a
+#: verdict: forcing it into the authorize/refuse split reported a completed
+#: purge as work that may never have happened (round 27 review).
+_PERMISSION_DECISION_ACTIONS = frozenset({
+    "tool_execution",
+    SUBAGENT_DISPATCH_ACTION,
+    ACTION_TOOL_VALIDATION,
+    ACTION_TOOL_RESOLUTION,
+})
+
+def _search_result_shape(needle, tool_name, days, limit):
+    """The key set every ``security_audit_search`` result carries, so a caller
+    reading ``data["too_broad"]`` (the tool's headline behaviour) never hits a
+    KeyError on one of the four return paths (round 31 review)."""
+    return {
+        "count": 0,
+        "shown": 0,
+        "too_broad": False,
+        "query": needle,
+        "tool_name": tool_name or "",
+        "days": days,
+        "limit_requested": limit,
+        "matches": [],
+    }
+
+
+#: Above this many matches, ``security_audit_search`` tells the caller the
+#: bound was exceeded and returns no arguments — and not the count either,
+#: which is itself a small disclosure. The tool's whole justification for
+#: surfacing ``args_summary`` — which ``security_audit`` deliberately
+#: withholds — is that the caller already described what it wanted. A query
+#: matching most of the log is not a description, and answering it with a
+#: page of arguments would rebuild the unbounded disclosure by another
+#: route. This is a disclosure bound, not a page-size preference; ``limit``
+#: is never consulted for it (see the "No clamp on limit" note in the tool).
+MAX_DISCLOSING_MATCHES = 25
+
+#: A century. ``timedelta`` overflows far below any integer a caller might
+#: type; anything larger than this is a mistake, not a window.
+MAX_SEARCH_DAYS = 36500
 
 
 # Per-feature default permission levels for fresh agents (#406).
@@ -437,6 +512,29 @@ class SecurityFeature(Feature):
 
         for feature_name, feature in self.agent.features.items():
             if feature_name == "SecurityFeature":
+                # Its tool rows are skipped (it owns the permission tree), but
+                # its DISPATCH ENTRY must still be known: `security_feature` is
+                # the envelope that reaches `security_audit_search`, and a
+                # search that does not exclude it reports its own wrapper as
+                # prior work — permanently, since the row is written on every
+                # invocation (#3107 review round 5). The skip below is about
+                # permissions; this fact is not.
+                own_dispatch = getattr(feature, "tool_name", None)
+                if own_dispatch and not isinstance(own_dispatch, property):
+                    self.permission_store.mark_dispatch_entry(own_dispatch)
+                # The read-back tool is registered explicitly, ALLOW: with no
+                # row it fell through to ASK, which is DENY on the scheduler
+                # session and wait-forever elsewhere — the unattended path
+                # #3107 was filed for got no answer, and the refusal row it
+                # wrote named this tool, which the search excludes, so the
+                # refusal was invisible to itself (round 31 review). ALLOW is
+                # deliberate: the disclosure is masked on both read paths and
+                # bounded by MAX_DISCLOSING_MATCHES, and the tool is read-only.
+                await self.permission_store.register_tool(
+                    feature_name="SecurityFeature",
+                    tool_name=SEARCH_TOOL_NAME,
+                    default_level=PermissionLevel.ALLOW,
+                )
                 continue
             await self.register_feature_tools(
                 feature_name,
@@ -586,6 +684,10 @@ class SecurityFeature(Feature):
         # feature-wide DENY or ALWAYS_ASK rail.
         subagent_tool_name = getattr(feature, "tool_name", None)
         if subagent_tool_name and not isinstance(subagent_tool_name, property):
+            # Tell the store this name is a DISPATCH entry, not a tool. It is
+            # the only place that distinction is known, and a read-back over
+            # the audit log needs it to tell a request from an action (#3107).
+            self.permission_store.mark_dispatch_entry(subagent_tool_name)
             await self.permission_store.register_tool(
                 feature_name=feature_name,
                 tool_name=subagent_tool_name,
@@ -1101,6 +1203,325 @@ class SecurityFeature(Feature):
                 "count": len(logs),
                 "limit_requested": limit_val,
                 "entries": safe_entries,
+            },
+        )
+
+    @tool(
+        name=SEARCH_TOOL_NAME,
+        description=(
+            "Search your own recorded tool calls for ones matching a "
+            "description — 'have I already filed/commented/run this?'"
+        ),
+        category=ToolCategory.SYSTEM,
+        # Deliberately NO command_prefix. `AgentTool.parse_command_args` binds
+        # positionally and gives a non-final string parameter exactly one
+        # whitespace token, so `!security-audit-search orphans the worker`
+        # would bind query='orphans', tool_name='the', days='worker' and fail
+        # validation — and quoting does not help, because that parser splits on
+        # whitespace too (#3118). A free-form query cannot survive that
+        # surface. Advertising a command that always fails is worse than
+        # having none; this stays programmatic until #3118 lands.
+    )
+    async def security_audit_search(
+        self,
+        query: str,
+        tool_name: Optional[str] = None,
+        days: Optional[int] = None,
+        limit: int = 20,
+    ) -> ToolResult:
+        """Find prior tool calls of your own that match ``query`` (#3107).
+
+        ``security_audit`` lists what happened recently and deliberately omits
+        the recorded arguments, because dumping every row's arguments into the
+        context is disclosure nobody asked for. That filter also removed the
+        only field that can answer "have I already done this?", so a later turn
+        rediscovered work it had already done and filed the same issue twice.
+
+        This asks the other question. The caller must already describe what it
+        is looking for, so what comes back is a match to a description the
+        caller supplied — not whatever happens to be recent.
+
+        **That footing only holds while the query is a description.** A query
+        broad enough to match most of the log is not one, and answering it with
+        a page of arguments would rebuild the unbounded disclosure by another
+        route. So the match is bounded first: past
+        ``MAX_DISCLOSING_MATCHES`` the caller is told the bound was exceeded
+        — not the count, which is itself a small disclosure — and no
+        arguments come back. Narrowing is the caller's move, and nothing
+        leaves the database in the meantime.
+
+        **A match is an AUTHORIZATION, not a completion.** The security hook
+        logs at ``PRE_TOOL_USE``, so a row says the call was allowed to run —
+        not that its body succeeded. Denied and timed-out attempts are rows
+        too. Read ``decision``; a match is evidence you TRIED, and where a
+        paired ``<tool>.outcome`` row exists that is what carries the result.
+
+        What the disclosure ceiling actually is: ``args_summary`` was masked
+        and truncated by ``summarize_args`` when it was written, and both of
+        the store's read paths — this one and ``GET /api/security/audit`` —
+        re-mask it on the way out, so a row an older or foreign writer stored
+        raw is masked wherever it is read. Nothing here widens what was
+        persisted. The masking is a key-name heuristic, so it is a good
+        filter and not a guarantee.
+
+        The truncation is 500 characters, but was **200** on the
+        ``SecurityHook`` path until that override was removed — so rows written
+        before then are cut shorter, and a search cannot see past whatever cut
+        its own row got. That is why an empty result says so rather than
+        reading as proof.
+
+        Args:
+            query: What to look for — a repo, an issue number, a title
+                   fragment, a command. Matched case-insensitively against the
+                   recorded arguments and the tool name.
+            tool_name: Restrict to one tool, e.g. "create_github_issue".
+            days: Only consider the last N days.
+            limit: Maximum matches to return, newest first. It cannot widen
+                   disclosure — the bound is the total-match gate, not this.
+        """
+        needle = (query or "").strip()
+        if not needle:
+            return ToolResult.failed(
+                "query must be a non-empty description of what to look for; "
+                "use security_audit for an unfiltered recent listing"
+            )
+
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+        # No clamp on ``limit``, deliberately. Mutation testing showed one had
+        # no observable effect, and it was right: the disclosure bound is the
+        # TOTAL-match gate below, and ``search_audit_log`` only runs when the
+        # total is already within ``MAX_DISCLOSING_MATCHES``. A caller raising
+        # ``limit`` therefore cannot widen what is disclosed — it can only ask
+        # for a page at least as large as a set that is already bounded. A
+        # clamp here would have read as the thing enforcing the bound while
+        # enforcing nothing, which is worse than its absence.
+
+        if days is not None:
+            try:
+                days_val: Optional[int] = int(days)
+            except (TypeError, ValueError):
+                return ToolResult.failed(f"days must be an integer, got {days!r}")
+            if days_val < 1:
+                return ToolResult.failed("days must be >= 1")
+            if days_val > MAX_SEARCH_DAYS:
+                # timedelta overflows well below sys.maxsize; a bound here is
+                # a refusal the caller can read, not an OverflowError.
+                return ToolResult.failed(
+                    f"days must be <= {MAX_SEARCH_DAYS}; omit days to search the whole log"
+                )
+        else:
+            days_val = None
+
+        scope = [f"query={needle!r}"]
+        if tool_name:
+            scope.append(f"tool={tool_name}")
+        if days_val is not None:
+            scope.append(f"days={days_val}")
+        scope_text = ", ".join(scope)
+
+        try:
+            # One statement, one snapshot: the store fetches a single row of
+            # headroom past the bound and reports whether it existed. A
+            # separate COUNT could pass while the page query, on its own
+            # connection, saw more rows and returned their arguments anyway.
+            # A tool_name that names a row class the read-back EXCLUDES by design —
+            # a feature's dispatch entry (a request, never an action) or this tool's
+            # own rows — is a question the query cannot satisfy; the WHERE clause
+            # contradicts itself and the plain "no match" would blame truncation.
+            # Answer it instead of searching (#3107 review round 12).
+            if tool_name:
+                excluded_names = await self.permission_store.sync_dispatch_entries()
+                if tool_name in excluded_names or tool_name.startswith(SEARCH_TOOL_NAME):
+                    why = (
+                        "a dispatch envelope — it records what a task ASKED FOR, not "
+                        "what was done; search the inner tool it dispatches"
+                        if tool_name in excluded_names
+                        else "this tool's own rows, which a search must not return"
+                    )
+                    return ToolResult.ok(
+                        confirmation=(
+                            f"tool_name={tool_name!r} names {why}. Those rows are "
+                            "excluded from read-back by design, so this filter can never "
+                            "match; omit tool_name or name the inner tool."
+                        ),
+                        data={
+                            **_search_result_shape(
+                                needle, tool_name, days_val, limit_val
+                            ),
+                            "excluded_by_design": True,
+                        },
+                    )
+            matches, too_broad = await self.permission_store.search_audit_log(
+                needle,
+                tool_name=tool_name or None,
+                days=days_val,
+                limit=MAX_DISCLOSING_MATCHES,
+            )
+        except Exception as e:
+            logger.error(f"security_audit_search failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        # The gate must see the full bound, so the QUERY always asks for
+        # MAX_DISCLOSING_MATCHES; the caller's smaller limit is applied after.
+        # Asking the store for `limit` directly would let limit=1 report
+        # "not too broad" for a query matching four hundred rows.
+        #
+        # Count the AUTHORIZATION SPLIT before slicing, and say how many were
+        # omitted. Slicing first meant 20 recent denials plus one older
+        # authorized call reported "none authorized" — the false conclusion
+        # that triggers exactly the duplicate work this tool exists to prevent.
+        # The default limit of 20 sits inside the 25-row bound, so this is
+        # reachable without the caller doing anything unusual.
+        bounded_total = len(matches)
+        # Each row lands in exactly ONE bucket. A `<tool>.outcome` row
+        # (action='tool_outcome') is a COMPLETION record, the strongest
+        # evidence in the table that the work happened; it is not a
+        # permission decision, so its decision value is read against the
+        # completion allowlist and never against the authorization one —
+        # an outcome row carrying an authorization value counted in both and
+        # left "refused" at -1 (round 21 review). An outcome row with a
+        # decision this tool does not classify is neither a completion (no
+        # ✓) nor a refusal (a completion record must never be described as
+        # work that may not have happened): a record to read. Every other
+        # row is an authorization or a refusal. Refused is counted, never
+        # derived by subtraction.
+        bounded_authorized = bounded_outcomes = bounded_unclassified = bounded_refused = 0
+        for e in matches:
+            if e.get("action") == "tool_outcome":
+                if e["decision"] in _COMPLETED_OUTCOME_DECISIONS:
+                    bounded_outcomes += 1
+                else:
+                    bounded_unclassified += 1
+            elif e.get("action") not in _PERMISSION_DECISION_ACTIONS:
+                bounded_unclassified += 1
+            elif e["decision"] in _AUTHORIZED_DECISIONS:
+                bounded_authorized += 1
+            else:
+                bounded_refused += 1
+        matches = matches[:limit_val]
+        omitted = bounded_total - len(matches)
+
+        if too_broad:
+            # Deliberately no arguments: a query this broad is not a
+            # description of one prior action, and returning a page of it would
+            # be the unbounded dump wearing a query parameter.
+            return ToolResult.ok(
+                confirmation=(
+                    f"More than {MAX_DISCLOSING_MATCHES} recorded calls "
+                    f"matched ({scope_text}) — too broad to answer with "
+                    "arguments.\n"
+                    "Narrow it: add a distinctive phrase from the thing "
+                    "itself, a tool_name, or a days window. Nothing was "
+                    "returned from the log."
+                ),
+                data={
+                    **_search_result_shape(needle, tool_name, days_val, limit_val),
+                    "count": None,
+                    "too_broad": True,
+                    "max_disclosing_matches": MAX_DISCLOSING_MATCHES,
+                },
+            )
+
+        if not matches:
+            # An empty result is NOT proof the thing was never done. Say so:
+            # this searches recorded arguments, masked and truncated by their
+            # WRITER, so a match past that cut is invisible here. The read
+            # path adds no cut of its own.
+            return ToolResult.ok(
+                confirmation=(
+                    f"No recorded tool call matched ({scope_text}).\n"
+                    "This searches the masked argument summary, which is "
+                    "truncated when written — core writers cap it at 500 "
+                    "characters (200 for rows written before that was "
+                    "unified), other writers set their own cap — so an older "
+                    "row is cut shorter than a new one. A distinguishing "
+                    "detail past its own row's cut cannot match. Absence here "
+                    "is weak evidence, not proof you never did it."
+                ),
+                data=_search_result_shape(needle, tool_name, days_val, limit_val),
+            )
+
+        # Rows arrive re-masked from the store's own read path
+        # (PermissionStore.search_audit_log): the stored value is only as safe
+        # as the writer that produced it, and provenance is unknowable for
+        # rows this tool did not write. One door, in the store, so every
+        # caller of that read path gets the same text this tool shows.
+
+        # An ALLOWLIST, not a refusal list. Listing the refusals means a
+        # decision value added later — or one already in the table that this
+        # list never knew about — silently reads as "authorized", which is the
+        # direction that suppresses a retry of work that never ran. This agent's
+        # own log carries fifteen distinct decision values including `blocked`,
+        # `filing_failed` and a `refused-*` family; a refusal list had missed
+        # three of them (#3107 review round 7). Inverted, an unrecognised
+        # decision is reported as not-an-authorization, which is the safe read.
+        allowed = bounded_authorized
+        outcomes = bounded_outcomes
+        unclassified = bounded_unclassified
+        refused = bounded_refused
+        headline = f"{bounded_total} prior attempt(s) matched ({scope_text})"
+        if omitted:
+            headline += f" (showing {len(matches)}, {omitted} older not shown)"
+        parts = []
+        if allowed:
+            parts.append(f"{allowed} authorized to run")
+        if outcomes:
+            parts.append(f"{outcomes} completion(s) recorded")
+        if unclassified:
+            parts.append(
+                f"{unclassified} record(s) this tool does not classify as an "
+                "authorization, a refusal or a completion — read them"
+            )
+        if refused:
+            parts.append(f"{refused} NOT authorized (refused or blocked)")
+        if refused and not allowed and not outcomes and not unclassified:
+            headline += (
+                f" — none of the {refused} was an authorization to run, "
+                "so this work may never have happened"
+            )
+        elif allowed and not outcomes and not refused and not unclassified:
+            headline += " — authorized to run, which is not proof it succeeded"
+        else:
+            headline += " — " + ", ".join(parts)
+        lines = [headline + ". Read `decision` per row:\n"]
+        for entry in matches:
+            # The same one-bucket rule as the counts above.
+            if entry.get("action") == "tool_outcome":
+                marker = "✓" if entry["decision"] in _COMPLETED_OUTCOME_DECISIONS else "?"
+            elif entry.get("action") not in _PERMISSION_DECISION_ACTIONS:
+                marker = "?"
+            elif entry["decision"] in _AUTHORIZED_DECISIONS:
+                marker = "→"
+            else:
+                marker = "✗"
+            lines.append(
+                f"  {marker} {entry['timestamp']}  "
+                f"{entry['feature']}.{entry['tool']} [{entry['decision']}]"
+            )
+            if entry["args_summary"]:
+                lines.append(f"     {entry['args_summary']}")
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "count": bounded_total,
+                "shown": len(matches),
+                "authorized": allowed,
+                "outcomes": outcomes,
+                "unclassified_outcomes": unclassified,
+                "refused": refused,
+                "omitted": omitted,
+                "too_broad": False,
+                "query": needle,
+                "tool_name": tool_name or "",
+                "days": days_val,
+                "limit_requested": limit_val,
+                "matches": matches,
             },
         )
 
