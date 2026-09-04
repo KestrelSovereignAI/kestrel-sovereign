@@ -264,14 +264,7 @@ def changed_line_map(
         # every line of it new — was invisible and the gate reported clean on
         # it. Treat an untracked Python file as wholly changed.
         for path in untracked_python_files():
-            try:
-                count = len((PROJECT_ROOT / path).read_text(encoding="utf-8").splitlines())
-            except (OSError, ValueError):
-                # Same invariant as _tree_for: a file that cannot be read was
-                # not checked, and "not checked" must not render as "clean".
-                _UNANALYSED.add(path)
-                continue
-            new_map[path] = set(range(1, count + 1))
+            _seed_new_file(path, new_map)
 
     return dict(new_map), dict(old_map)
 
@@ -956,7 +949,12 @@ def collect(
     for name, (kind, defining_paths) in sorted(symbols.items()):
         # Follow re-export bridges: a caller may only ever mention the alias.
         local_names = alias_closure(name, old_sources=old_sources)
-        scope = scope_for(name, kind, defining_paths)
+        # A module name is repo-wide whatever kind the symbol table holds:
+        # a colliding `def _helpers()` elsewhere would otherwise scope the
+        # renamed `_helpers.py` to the OTHER file's importers and intersect
+        # the module's real consumers away (round 15 review, the scope twin
+        # of round 23's import-check fix).
+        scope = None if name in module_names else scope_for(name, kind, defining_paths)
         if scope is not None:
             # The closure can discover a name the scope has never heard of. A
             # private helper re-exported as `h` is reached by a module that
@@ -1146,7 +1144,12 @@ def collect(
         if len(touched) + len(untouched) > MAX_TOTAL_SITES:
             structural.append((f'"{value}"', len(touched) + len(untouched)))
             continue
-        if touched and untouched:
+        # `if untouched:` alone, as for symbols: `literals` holds only values
+        # on a changed line, so an empty `touched` means the detector could
+        # not FIND the changed occurrence (a pure addition spelled by implicit
+        # concatenation, below the widened-run threshold) — a gap worth
+        # printing as "modified 0 of N", never a silent clean.
+        if untouched:
             findings.append(Finding("literal", value, touched, untouched))
 
     # Candidates the AST pass could not open or parse are NOT ANALYSED too:

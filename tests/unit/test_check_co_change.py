@@ -1933,3 +1933,49 @@ def test_a_pure_copy_is_seeded_when_a_later_entry_follows_it(repo: Path) -> None
     assert new_map.get("b.py") == {1, 2}, new_map
     finding = _named(_findings(repo), "gamma_marker")
     assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 1)]
+
+
+# --------------------------------------------------------------------------
+# Round 24: a module name is repo-wide whatever the symbol table holds; a
+# literal the detector could not find is a report, not a silent clean.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("change", ["rename", "delete"])
+def test_a_private_module_colliding_with_a_private_function_keeps_repo_wide_scope(
+    repo: Path, change: str
+) -> None:
+    """`scope_for` read the colliding symbol's kind and paths: a module-level
+    `def _helpers()` edited elsewhere scoped the renamed `_helpers.py` to the
+    OTHER file's importers, and `import pkg._helpers` was intersected away."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "_helpers.py").write_text("TIMEOUT = 30\n")
+    (repo / "consumer.py").write_text("import pkg._helpers\n\n\ndef f():\n    return pkg._helpers.TIMEOUT\n")
+    (repo / "other.py").write_text("def _helpers():\n    return 1\n")
+    _commit(repo)
+    if change == "rename":
+        _run(repo, "mv", "pkg/_helpers.py", "pkg/_util.py")
+    else:
+        _run(repo, "rm", "-q", "pkg/_helpers.py")
+    (repo / "other.py").write_text("def _helpers():\n    return 2\n")
+
+    finding = _named(_findings(repo), "_helpers")
+    assert {("consumer.py", 1), ("consumer.py", 5)} <= {(o.path, o.line) for o in finding.unchanged}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_literal_the_detector_cannot_find_is_reported_not_dropped(repo: Path) -> None:
+    """A pure addition spelled by implicit concatenation, below the widened-run
+    threshold, is in neither the candidate files nor the old side, so
+    `touched` is empty; `touched and untouched` then dropped the finding and
+    two untouched siblings read clean."""
+    (repo / "a.py").write_text("A = 1\n")
+    (repo / "b.py").write_text('Z = "auto_allow"\n')
+    (repo / "c.py").write_text('W = "auto_allow"\n')
+    _commit(repo)
+    (repo / "a.py").write_text('A = 1\nX = "auto_" "allow"\n')
+
+    finding = _named(_findings(repo), "auto_allow")
+    assert finding.changed == [] and {o.path for o in finding.unchanged} == {"b.py", "c.py"}, finding
+    assert "modified 0 of 2 occurrences" in checker.render([finding])
+    assert checker.main(["--strict"]) == 1
