@@ -16,19 +16,26 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from kestrel_sovereign.storage.database_clock import database_clock
 
 from .authority import (
+    RestartDelegation,
     RestartAuthorityError,
+    issue_restart_delegation,
+    issue_restart_delegation_revocation,
     issue_restart_authority,
+    restart_authority_delegation_binding,
     restart_authority_evidence_generation,
     restart_authority_generation,
+    restart_delegation_allows,
     reseal_restart_safety_state,
     rotate_restart_authority_generation,
     verify_restart_authority,
+    verify_restart_delegation,
+    verify_restart_delegation_revocation,
 )
 
 
@@ -422,11 +429,40 @@ async def ensure_restart_requests_table(db) -> None:
         )
         """
     )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            subject_agent_did TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            authority_evidence TEXT NOT NULL,
+            authority_signature TEXT NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_restart_delegations_subject
+        ON restart_authority_delegations(subject_agent_did, expires_at)
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_delegation_revocations (
+            delegation_id TEXT PRIMARY KEY,
+            revoked_at TEXT NOT NULL,
+            revoked_by TEXT NOT NULL,
+            revocation_evidence TEXT NOT NULL,
+            revocation_signature TEXT NOT NULL
+        )
+        """
+    )
     # This table was introduced after signed request rows. A verifiable legacy
     # row is safe to adopt once: its signature authenticates the generation.
     # Invalid rows stay unissued and therefore fail closed at execution.
     for request in await list_requests(db):
-        verified, _ = verify_restart_authority(request)
+        verified, _ = await verify_restart_authority_at_use(db, request)
         if not verified:
             continue
         try:
@@ -449,6 +485,251 @@ async def ensure_restart_requests_table(db) -> None:
             )
 
 
+async def _load_restart_delegation(
+    db, delegation_id: str,
+) -> tuple[RestartDelegation | None, str]:
+    rows = await db.fetchall(
+        "SELECT delegation_id, subject_agent_did, issued_at, expires_at, "
+        "authority_evidence, authority_signature "
+        "FROM restart_authority_delegations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    if not rows:
+        return None, "restart delegation is absent"
+    row = rows[0]
+    parsed, reason = verify_restart_delegation(row[4], row[5])
+    if parsed is None:
+        return None, reason
+    if (
+        parsed.delegation_id != str(row[0])
+        or parsed.subject_agent_did != str(row[1])
+        or parsed.issued_at != str(row[2])
+        or parsed.expires_at != str(row[3])
+    ):
+        return None, "restart delegation index fields do not match signed evidence"
+    return parsed, reason
+
+
+async def resolve_restart_delegation(
+    db,
+    delegation_id: str,
+    *,
+    subject_agent_did: str,
+    operation: str,
+    update_repo_path: str,
+    update_target_ref: str,
+    update_profile: str,
+    update_allow_migrations: bool,
+    expected_signature: str | None = None,
+) -> tuple[RestartDelegation | None, str]:
+    """Resolve one live delegation and enforce its exact mutation bounds."""
+
+    delegation, reason = await _load_restart_delegation(db, delegation_id)
+    if delegation is None:
+        return None, reason
+    if expected_signature is not None and delegation.signature != expected_signature:
+        return None, "restart delegation no longer matches the request binding"
+    revoked = await db.fetchone(
+        "SELECT revoked_at, revoked_by, revocation_evidence, "
+        "revocation_signature FROM "
+        "restart_authority_delegation_revocations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    if revoked is not None:
+        receipt, receipt_reason = verify_restart_delegation_revocation(
+            revoked[2], revoked[3], delegation_id=delegation_id
+        )
+        if receipt is None or (
+            receipt["revoked_at"] != str(revoked[0])
+            or receipt["revoked_by"] != str(revoked[1])
+        ):
+            return None, (
+                "restart delegation has an invalid revocation receipt: "
+                f"{receipt_reason}"
+            )
+        return None, "restart delegation was revoked"
+    now = await database_clock(db)
+    issued_at = datetime.fromisoformat(delegation.issued_at)
+    expires_at = datetime.fromisoformat(delegation.expires_at)
+    if now < issued_at:
+        return None, "restart delegation is not yet valid"
+    if now >= expires_at:
+        return None, "restart delegation has expired"
+    allowed, reason = restart_delegation_allows(
+        delegation,
+        subject_agent_did=subject_agent_did,
+        operation=operation,
+        update_repo_path=update_repo_path,
+        update_target_ref=update_target_ref,
+        update_profile=update_profile,
+        update_allow_migrations=update_allow_migrations,
+    )
+    return (delegation, reason) if allowed else (None, reason)
+
+
+async def verify_restart_authority_at_use(
+    db, request: RestartRequest,
+) -> tuple[bool, str]:
+    """Verify a request seal plus live delegation/revocation state."""
+
+    verified, reason = verify_restart_authority(request)
+    if not verified:
+        return False, reason
+    try:
+        binding = restart_authority_delegation_binding(request)
+    except RestartAuthorityError as error:
+        return False, str(error)
+    if binding is None:
+        return True, reason
+    delegation, reason = await resolve_restart_delegation(
+        db,
+        binding[0],
+        subject_agent_did=request.requested_by_agent,
+        operation=request.operation,
+        update_repo_path=request.update_repo_path,
+        update_target_ref=request.update_target_ref,
+        update_profile=request.update_profile,
+        update_allow_migrations=request.update_allow_migrations,
+        expected_signature=binding[1],
+    )
+    return delegation is not None, reason
+
+
+async def insert_restart_delegation(
+    db,
+    *,
+    subject_agent_did: str,
+    operation: str,
+    update_repo_path: str,
+    update_target_ref: str,
+    update_profile: str,
+    update_allow_migrations: bool,
+    expires_in_seconds: int,
+) -> RestartDelegation:
+    """Issue and durably record one sovereign-signed delegation."""
+
+    issued_at = await database_clock(db)
+    expires_at = issued_at + timedelta(seconds=expires_in_seconds)
+    evidence, signature = issue_restart_delegation(
+        subject_agent_did=subject_agent_did,
+        operation=operation,
+        update_repo_path=update_repo_path,
+        update_target_ref=update_target_ref,
+        update_profile=update_profile,
+        update_allow_migrations=update_allow_migrations,
+        issued_at=issued_at.isoformat(),
+        expires_at=expires_at.isoformat(),
+    )
+    delegation, reason = verify_restart_delegation(evidence, signature)
+    if delegation is None:
+        raise RestartAuthorityError(reason)
+    await db.execute(
+        "INSERT INTO restart_authority_delegations "
+        "(delegation_id, subject_agent_did, issued_at, expires_at, "
+        "authority_evidence, authority_signature) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            delegation.delegation_id,
+            delegation.subject_agent_did,
+            delegation.issued_at,
+            delegation.expires_at,
+            delegation.evidence,
+            delegation.signature,
+        ),
+    )
+    return delegation
+
+
+async def revoke_restart_delegation(
+    db, delegation_id: str,
+) -> tuple[bool, dict[str, str] | None]:
+    """Append an idempotent, signed sovereign revocation receipt."""
+
+    delegation, _ = await _load_restart_delegation(db, delegation_id)
+    if delegation is None:
+        return False, None
+    revoked_at = (await database_clock(db)).isoformat()
+    evidence, signature = issue_restart_delegation_revocation(
+        delegation_id=delegation_id,
+        revoked_at=revoked_at,
+    )
+    document, reason = verify_restart_delegation_revocation(
+        evidence, signature, delegation_id=delegation_id
+    )
+    if document is None:
+        raise RestartAuthorityError(reason)
+    await db.execute(
+        "INSERT INTO restart_authority_delegation_revocations "
+        "(delegation_id, revoked_at, revoked_by, revocation_evidence, "
+        "revocation_signature) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(delegation_id) DO NOTHING",
+        (
+            delegation_id,
+            document["revoked_at"],
+            document["revoked_by"],
+            evidence,
+            signature,
+        ),
+    )
+    row = await db.fetchone(
+        "SELECT revoked_at, revoked_by FROM "
+        "restart_authority_delegation_revocations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    if row is None:
+        return False, None
+    return True, {"revoked_at": str(row[0]), "revoked_by": str(row[1])}
+
+
+async def list_restart_delegations(
+    db, *, subject_agent_did: str,
+) -> List[dict[str, Any]]:
+    """Return public delegation state only for its exact subject."""
+
+    rows = await db.fetchall(
+        "SELECT delegation_id FROM restart_authority_delegations "
+        "WHERE subject_agent_did = ? ORDER BY issued_at DESC",
+        (subject_agent_did,),
+    )
+    now = await database_clock(db)
+    results: List[dict[str, Any]] = []
+    for row in rows:
+        delegation, reason = await _load_restart_delegation(db, str(row[0]))
+        if delegation is None:
+            results.append({
+                "delegation_id": str(row[0]),
+                "active": False,
+                "status_reason": reason,
+            })
+            continue
+        revoked = await db.fetchone(
+            "SELECT revoked_at, revoked_by, revocation_evidence, "
+            "revocation_signature FROM "
+            "restart_authority_delegation_revocations WHERE delegation_id = ?",
+            (delegation.delegation_id,),
+        )
+        valid_revocation = None
+        if revoked is not None:
+            valid_revocation, _ = verify_restart_delegation_revocation(
+                revoked[2], revoked[3], delegation_id=delegation.delegation_id
+            )
+        public = delegation.to_public_dict()
+        public.update({
+            "active": revoked is None and now < datetime.fromisoformat(
+                delegation.expires_at
+            ),
+            "revoked_at": (
+                valid_revocation["revoked_at"]
+                if valid_revocation is not None else ""
+            ),
+            "revoked_by": (
+                valid_revocation["revoked_by"]
+                if valid_revocation is not None else ""
+            ),
+        })
+        results.append(public)
+    return results
+
+
 async def insert_request(
     db,
     *,
@@ -464,28 +745,44 @@ async def insert_request(
     update_allow_migrations: bool = False,
     requester_request_id: str = "",
     origin_session_id: str = "",
+    delegation_id: str = "",
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
     requested_at = (await database_clock(db)).isoformat()
-    authority_evidence, authority_signature = issue_restart_authority(
-        request_id=req_id,
-        requested_by_agent=requested_by_agent,
-        reason=reason,
-        urgency=urgency,
-        policy=policy,
-        desired_window=desired_window,
-        operation=operation,
-        update_repo_path=update_repo_path,
-        update_target_ref=update_target_ref,
-        update_profile=update_profile,
-        update_allow_migrations=update_allow_migrations,
-        requester_request_id=requester_request_id,
-        origin_session_id=origin_session_id,
-        requested_at=requested_at,
-    )
-    generation = restart_authority_evidence_generation(authority_evidence)
     async with db.transaction(immediate=True):
+        delegation = None
+        if delegation_id:
+            delegation, reason = await resolve_restart_delegation(
+                db,
+                delegation_id,
+                subject_agent_did=requested_by_agent,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=update_profile,
+                update_allow_migrations=update_allow_migrations,
+            )
+            if delegation is None:
+                raise RestartAuthorityError(reason)
+        authority_evidence, authority_signature = issue_restart_authority(
+            request_id=req_id,
+            requested_by_agent=requested_by_agent,
+            reason=reason,
+            urgency=urgency,
+            policy=policy,
+            desired_window=desired_window,
+            operation=operation,
+            update_repo_path=update_repo_path,
+            update_target_ref=update_target_ref,
+            update_profile=update_profile,
+            update_allow_migrations=update_allow_migrations,
+            requester_request_id=requester_request_id,
+            origin_session_id=origin_session_id,
+            requested_at=requested_at,
+            delegation=delegation,
+        )
+        generation = restart_authority_evidence_generation(authority_evidence)
         await db.execute(
             """
             INSERT INTO restart_requests (
@@ -692,7 +989,7 @@ async def mark_deferral_started(
     current = await get_request(db, request_id)
     if current is None:
         return None
-    verified, _ = verify_restart_authority(current)
+    verified, _ = await verify_restart_authority_at_use(db, current)
     if not verified:
         return None
     if current.first_blocked_at:
@@ -731,7 +1028,7 @@ async def clear_deferral_started(
     current = await get_request(db, request_id)
     if current is None:
         return None
-    verified, _ = verify_restart_authority(current)
+    verified, _ = await verify_restart_authority_at_use(db, current)
     if not verified:
         return None
     try:
@@ -786,7 +1083,7 @@ async def acknowledge_escalation(
     current_evidence = current.authority_evidence or ""
     current_signature = current.authority_signature or ""
     if current_evidence or current_signature:
-        verified, _ = verify_restart_authority(current)
+        verified, _ = await verify_restart_authority_at_use(db, current)
         if not verified:
             return False
         authority_evidence = current_evidence
@@ -863,7 +1160,7 @@ async def acknowledge_escalation(
         and refreshed.escalation_acknowledged
         and refreshed.authority_evidence == authority_evidence
         and refreshed.authority_signature == authority_signature
-        and verify_restart_authority(refreshed)[0]
+        and (await verify_restart_authority_at_use(db, refreshed))[0]
     )
 
 
@@ -1022,7 +1319,7 @@ async def claim_request_for_execution(
             or fresh.authority_signature != request.authority_signature
         ):
             return "lost_race"
-        verified, _ = verify_restart_authority(fresh)
+        verified, _ = await verify_restart_authority_at_use(db, fresh)
         if not verified:
             return "invalid"
         if restart_authority_generation(fresh) != generation:
@@ -1133,7 +1430,9 @@ async def update_status(
     async with db.transaction(immediate=True):
         if retry_transition:
             current = await get_request(db, request_id)
-            if current is None or not verify_restart_authority(current)[0]:
+            if current is None or not (
+                await verify_restart_authority_at_use(db, current)
+            )[0]:
                 return False
             if (
                 expected_current_status is not None

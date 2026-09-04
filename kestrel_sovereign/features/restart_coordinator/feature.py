@@ -1,7 +1,7 @@
 """RestartCoordinatorFeature — durable, host-mediated restart requests.
 
-Four agent-facing @tool entry points (request / list / cancel / escalation
-acknowledgement) plus an ACTION-mode
+Seven agent-facing @tool entry points (request / list / cancel / escalation
+acknowledgement plus grant / list / revoke delegation) and an ACTION-mode
 ``restart_coordinator`` cron entry that scans the durable table and
 spawns a detached subprocess to actually restart Kestrel once safety
 checks pass. After restart, ``initialize`` sweeps any in-flight
@@ -44,7 +44,6 @@ from kestrel_sovereign.storage.db.interface import TransactionError
 from .authority import (
     RestartAuthorityError,
     require_restart_request_authority,
-    verify_restart_authority,
 )
 from .event_store import (
     ensure_restart_status_events_table,
@@ -66,13 +65,18 @@ from .store import (
     get_request,
     get_request_for_agent,
     insert_request,
+    insert_restart_delegation,
     list_requests,
+    list_restart_delegations,
     list_requests_needing_wake,
     mark_deferral_started,
     mark_wake_delivered,
     mark_wake_dispatched,
     record_update_log,
+    resolve_restart_delegation,
+    revoke_restart_delegation as revoke_restart_delegation_record,
     update_status,
+    verify_restart_authority_at_use,
 )
 from .update_profiles import (
     KNOWN_UPDATE_PROFILES,
@@ -112,6 +116,11 @@ _DISPATCH_POLL_SECONDS = 0.5
 # stops retrying and rejects it. A permanently broken ``kestrel restart`` would
 # otherwise spawn a doomed subprocess every cron tick indefinitely.
 MAX_RESTART_DISPATCH_ATTEMPTS = 3
+
+# Delegated whole-host authority is deliberately short lived. The sovereign
+# can reissue it, but an agent cannot turn one approval into an indefinite
+# administrative role.
+MAX_RESTART_DELEGATION_SECONDS = 86_400
 
 # An ``executing`` row stamped with THIS boot older than this never had its
 # restart happen — the process it was going to kill is still running it. The
@@ -498,12 +507,207 @@ class RestartCoordinatorFeature(Feature):
             return []
 
     @tool(
+        name="grant_restart_delegation",
+        description=(
+            "Sovereign-only: grant one agent a short-lived, revocable, signed "
+            "whole-host restart delegation. The subject DID and exact "
+            "operation are mandatory. update_then_restart additionally binds "
+            "one explicit repository, target ref, update profile, and "
+            "migration choice. A delegation is not an admin role and grants "
+            "nothing outside these bounds. Returns its delegation_id."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!restart grant-delegation",
+    )
+    async def grant_restart_delegation(
+        self,
+        subject_agent_did: str,
+        operation: str = "restart_only",
+        expires_in_seconds: int = 3600,
+        update_profile: str = "",
+        target_ref: str = "",
+        repo_path: str = "",
+        allow_migrations: bool = False,
+    ) -> ToolResult:
+        try:
+            require_restart_request_authority()
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error), data={"created": False, "authority": "required"}
+            )
+        subject_agent_did = (subject_agent_did or "").strip()
+        if not subject_agent_did or not subject_agent_did.startswith("did:"):
+            return ToolResult.failed(
+                "subject_agent_did must be an explicit DID",
+                data={"created": False},
+            )
+        if operation not in KNOWN_OPERATIONS:
+            return ToolResult.failed(
+                f"operation must be one of {sorted(KNOWN_OPERATIONS)}; "
+                f"got {operation!r}",
+                data={"created": False},
+            )
+        if (
+            not isinstance(expires_in_seconds, int)
+            or isinstance(expires_in_seconds, bool)
+            or not 1 <= expires_in_seconds <= MAX_RESTART_DELEGATION_SECONDS
+        ):
+            return ToolResult.failed(
+                "expires_in_seconds must be an integer between 1 and "
+                f"{MAX_RESTART_DELEGATION_SECONDS}",
+                data={"created": False},
+            )
+        update_repo_path = ""
+        update_target_ref = ""
+        if operation == "restart_only":
+            if any((update_profile, target_ref, repo_path, allow_migrations)):
+                return ToolResult.failed(
+                    "restart_only delegation cannot carry update bounds",
+                    data={"created": False},
+                )
+        else:
+            if update_profile not in KNOWN_UPDATE_PROFILES:
+                return ToolResult.failed(
+                    "update_then_restart delegation requires a known "
+                    f"update_profile; got {update_profile!r}",
+                    data={"created": False},
+                )
+            update_target_ref = (target_ref or "").strip()
+            if not is_valid_target_ref(update_target_ref):
+                return ToolResult.failed(
+                    "update_then_restart delegation requires a valid target_ref",
+                    data={"created": False},
+                )
+            if not (repo_path or "").strip():
+                return ToolResult.failed(
+                    "update_then_restart delegation requires an explicit repo_path",
+                    data={"created": False},
+                )
+            try:
+                update_repo_path = str(Path(repo_path).expanduser().resolve())
+            except OSError:
+                return ToolResult.failed(
+                    "update_then_restart delegation repo_path is invalid",
+                    data={"created": False},
+                )
+            if not repo_is_git_checkout(update_repo_path):
+                return ToolResult.failed(
+                    "update_then_restart delegation repo_path must be a local "
+                    "git checkout",
+                    data={"created": False},
+                )
+            profile = get_update_profile(update_profile)
+            if allow_migrations and (
+                profile is None or not profile.supports_migrations
+            ):
+                return ToolResult.failed(
+                    f"update profile {update_profile!r} does not allow migrations",
+                    data={"created": False},
+                )
+        if self._db is None:
+            return ToolResult.failed(
+                "Restart coordinator storage unavailable",
+                data={"created": False},
+            )
+        try:
+            delegation = await insert_restart_delegation(
+                self._db,
+                subject_agent_did=subject_agent_did,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=(
+                    update_profile if operation == "update_then_restart" else ""
+                ),
+                update_allow_migrations=bool(allow_migrations),
+                expires_in_seconds=expires_in_seconds,
+            )
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error), data={"created": False, "authority": "required"}
+            )
+        return ToolResult.ok(
+            confirmation=(
+                "Granted scoped restart delegation "
+                f"{delegation.delegation_id} to {subject_agent_did}"
+            ),
+            data={"created": True, "delegation": delegation.to_public_dict()},
+        )
+
+    @tool(
+        name="list_restart_delegations",
+        description=(
+            "List this agent's own restart delegations and whether each is "
+            "active, expired, or revoked. Signed authority bytes are never returned."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!restart list-delegations",
+    )
+    async def list_restart_delegations(self) -> ToolResult:
+        if self._db is None:
+            return ToolResult.failed("Restart coordinator storage unavailable")
+        subject = getattr(self.agent, "did", "") or ""
+        delegations = await list_restart_delegations(
+            self._db, subject_agent_did=str(subject)
+        )
+        return ToolResult.ok(
+            confirmation=f"Found {len(delegations)} restart delegation(s)",
+            data={"count": len(delegations), "delegations": delegations},
+        )
+
+    @tool(
+        name="revoke_restart_delegation",
+        description=(
+            "Sovereign-only: durably revoke a signed restart delegation by id. "
+            "Revocation is idempotent and is rechecked before update and restart use."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!restart revoke-delegation",
+    )
+    async def revoke_restart_delegation(self, delegation_id: str) -> ToolResult:
+        try:
+            require_restart_request_authority()
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error), data={"revoked": False, "authority": "required"}
+            )
+        if self._db is None:
+            return ToolResult.failed(
+                "Restart coordinator storage unavailable",
+                data={"revoked": False},
+            )
+        normalized = (delegation_id or "").strip()
+        try:
+            revoked, receipt = await revoke_restart_delegation_record(
+                self._db, normalized
+            )
+        except RestartAuthorityError as error:
+            return ToolResult.failed(
+                str(error),
+                data={"revoked": False, "authority": "required"},
+            )
+        if not revoked:
+            return ToolResult.failed(
+                "Restart delegation not found",
+                data={"revoked": False, "delegation_id": normalized},
+            )
+        return ToolResult.ok(
+            confirmation=f"Revoked restart delegation {normalized}",
+            data={
+                "revoked": True,
+                "delegation_id": normalized,
+                **(receipt or {}),
+            },
+        )
+
+    @tool(
         name="request_restart",
         description=(
-            "File a sovereign-authorized durable whole-host restart request. "
-            "This tool succeeds only inside a turn authenticated by the "
-            "sovereign API key; agent identity, peer status, causation, and "
-            "generic ASK/AUTO approval do not confer this authority. The exact "
+            "File an authorized durable whole-host restart request. This tool "
+            "requires either the endpoint-authenticated sovereign API key or "
+            "an explicit delegation_id for this agent and these exact mutation "
+            "bounds. Agent identity, peer status, causation, and generic "
+            "ASK/AUTO approval do not confer authority. The exact "
             "operation/update bounds are sealed durably and re-verified by "
             "the host coordinator. "
             "The host coordinator "
@@ -549,6 +753,7 @@ class RestartCoordinatorFeature(Feature):
         target_ref: str = "",
         repo_path: str = "",
         allow_migrations: bool = False,
+        delegation_id: str = "",
     ) -> ToolResult:
         if not reason or not reason.strip():
             return ToolResult.failed(
@@ -576,16 +781,24 @@ class RestartCoordinatorFeature(Feature):
                 data={"created": False},
             )
 
-        # Authority is checked before update-mode path discovery or checkout
-        # inspection. A caller who cannot request a whole-host mutation must
-        # not be able to use its validation errors as a filesystem oracle.
-        try:
-            require_restart_request_authority()
-        except RestartAuthorityError as error:
+        if self._db is None:
             return ToolResult.failed(
-                str(error),
-                data={"created": False, "authority": "required"},
+                "Restart coordinator storage unavailable",
+                data={"created": False},
             )
+        agent_id = str(getattr(self.agent, "did", "") or "")
+        delegation_id = (delegation_id or "").strip()
+        if not delegation_id:
+            # Authority is checked before update-mode path discovery or checkout
+            # inspection. A caller who cannot request a whole-host mutation must
+            # not be able to use its validation errors as a filesystem oracle.
+            try:
+                require_restart_request_authority()
+            except RestartAuthorityError as error:
+                return ToolResult.failed(
+                    str(error),
+                    data={"created": False, "authority": "required"},
+                )
 
         # Validate and normalise the update-mode parameters up front so an
         # unsafe/unknown profile never reaches the durable table.
@@ -608,8 +821,49 @@ class RestartCoordinatorFeature(Feature):
                     data={"created": False},
                 )
             update_repo_path = (repo_path or "").strip()
-            if not update_repo_path:
+            if not update_repo_path and not delegation_id:
                 update_repo_path = default_sovereign_repo_path()
+            if delegation_id and not update_repo_path:
+                return ToolResult.failed(
+                    "delegated update_then_restart requires the explicit "
+                    "repo_path bound by its delegation",
+                    data={"created": False, "authority": "required"},
+                )
+
+        if delegation_id:
+            delegation, authority_reason = await resolve_restart_delegation(
+                self._db,
+                delegation_id,
+                subject_agent_did=agent_id,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=(
+                    update_profile if operation == "update_then_restart" else ""
+                ),
+                update_allow_migrations=bool(allow_migrations),
+            )
+            if delegation is None:
+                return ToolResult.failed(
+                    authority_reason,
+                    data={"created": False, "authority": "required"},
+                )
+
+        if operation == "update_then_restart":
+            try:
+                canonical_repo_path = str(
+                    Path(update_repo_path).expanduser().resolve()
+                )
+            except OSError:
+                canonical_repo_path = ""
+            # A delegated path is signed in canonical form; refusing aliases
+            # prevents a symlink retarget from widening the signed repository.
+            if delegation_id and canonical_repo_path != update_repo_path:
+                return ToolResult.failed(
+                    "delegated repo_path no longer resolves to its signed bound",
+                    data={"created": False, "authority": "required"},
+                )
+            update_repo_path = canonical_repo_path
             if not repo_is_git_checkout(update_repo_path):
                 return ToolResult.failed(
                     "update_then_restart requires repo_path to be a local "
@@ -618,13 +872,6 @@ class RestartCoordinatorFeature(Feature):
                     data={"created": False},
                 )
 
-        if self._db is None:
-            return ToolResult.failed(
-                "Restart coordinator storage unavailable",
-                data={"created": False},
-            )
-
-        agent_id = getattr(self.agent, "did", "") or ""
         # Record the in-flight chat/agent turn that filed this request so
         # the coordinator can ignore the requester's own active-request
         # marker when judging idleness — that marker should not block the
@@ -658,6 +905,7 @@ class RestartCoordinatorFeature(Feature):
                 update_allow_migrations=bool(allow_migrations),
                 requester_request_id=str(requester_request_id),
                 origin_session_id=origin_session_id,
+                delegation_id=delegation_id,
             )
         except RestartAuthorityError as error:
             return ToolResult.failed(
@@ -1342,7 +1590,7 @@ class RestartCoordinatorFeature(Feature):
         if fresh is None or fresh.status != expected_current_status:
             return True
 
-        verified, reason = verify_restart_authority(fresh)
+        verified, reason = await verify_restart_authority_at_use(self._db, fresh)
         if verified:
             if fresh.authority_signature == req.authority_signature:
                 return False
@@ -1410,7 +1658,9 @@ class RestartCoordinatorFeature(Feature):
         if current is None or current.status != active_status:
             return None
 
-        verified, authority_reason = verify_restart_authority(current)
+        verified, authority_reason = await verify_restart_authority_at_use(
+            self._db, current
+        )
         if verified:
             moved = await update_status(
                 self._db,
@@ -1437,7 +1687,9 @@ class RestartCoordinatorFeature(Feature):
             current = await get_request(self._db, request_id)
             if current is None or current.status != active_status:
                 return None
-            verified, authority_reason = verify_restart_authority(current)
+            verified, authority_reason = await verify_restart_authority_at_use(
+                self._db, current
+            )
 
         terminal_reason = (
             f"{reason}; authority revoked during {authority_context}: "
@@ -1660,7 +1912,7 @@ class RestartCoordinatorFeature(Feature):
             else:
                 refreshed = await get_request(self._db, req.id)
                 verified = (
-                    verify_restart_authority(refreshed)[0]
+                    (await verify_restart_authority_at_use(self._db, refreshed))[0]
                     if refreshed is not None
                     else False
                 )

@@ -54,6 +54,7 @@ from kestrel_sovereign.features.restart_coordinator.store import (
     mark_deferral_started,
     record_update_log,
     update_status,
+    verify_restart_authority_at_use,
 )
 from kestrel_sovereign.features.restart_coordinator.update_profiles import (
     get_update_profile,
@@ -684,6 +685,367 @@ async def test_request_restart_rejects_server_generated_temporary_key(
     assert "temporary sovereign key" in result.error
     assert "stable KESTREL_API_KEY" in result.error
     assert await list_requests(backend) == []
+
+
+# ---------------------------------------------------------------------------
+# Narrow sovereign-signed restart delegations (#3148)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sovereign_grants_did_bound_delegation_for_autonomous_restart(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path, did="did:test:delegate")
+
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did="did:test:delegate",
+        operation="restart_only",
+        expires_in_seconds=600,
+    )
+    assert granted.status is ToolResultStatus.OK
+    delegation = granted.data["delegation"]
+    assert delegation["subject_agent_did"] == "did:test:delegate"
+    assert delegation["operation"] == "restart_only"
+    assert "authority_signature" not in delegation
+
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="delegated unattended recovery",
+            delegation_id=delegation["delegation_id"],
+        )
+
+    assert requested.status is ToolResultStatus.OK
+    row = await get_request(backend, requested.data["request"]["id"])
+    assert await verify_restart_authority_at_use(backend, row) == (
+        True,
+        "restart request is within delegated bounds",
+    )
+    listed = await feat.list_restart_delegations()
+    assert listed.data["delegations"][0]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_nonsovereign_cannot_grant_or_revoke_restart_delegation(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    with caller_context_scope(CallerContext.authenticated("auto-mode")):
+        denied_grant = await feat.grant_restart_delegation(
+            subject_agent_did=feat.agent.did,
+        )
+        denied_revoke = await feat.revoke_restart_delegation(delegation_id)
+
+    assert denied_grant.status is ToolResultStatus.ERROR
+    assert denied_revoke.status is ToolResultStatus.ERROR
+    listed = await feat.list_restart_delegations()
+    assert listed.data["delegations"][0]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_restart_delegation_cannot_cross_agent_boundary(tmp_path):
+    owner, backend = await _make_feature(tmp_path, did="did:test:owner")
+    peer = RestartCoordinatorFeature(_make_agent(backend, did="did:test:peer"))
+    await peer.initialize()
+    granted = await owner.grant_restart_delegation(
+        subject_agent_did="did:test:owner",
+    )
+
+    with caller_context_scope(None):
+        result = await peer.request_restart(
+            reason="peer tries owner mandate",
+            delegation_id=granted.data["delegation"]["delegation_id"],
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "subject" in result.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_update_delegation_enforces_exact_operation_profile_repo_and_ref(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    repo = _git_checkout(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=repo,
+        expires_in_seconds=600,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    with caller_context_scope(None):
+        wrong_operation = await feat.request_restart(
+            reason="widen to restart",
+            delegation_id=delegation_id,
+        )
+        wrong_ref = await feat.request_restart(
+            reason="widen ref",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="release",
+            repo_path=repo,
+            delegation_id=delegation_id,
+        )
+        exact = await feat.request_restart(
+            reason="exact delegated update",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path=repo,
+            delegation_id=delegation_id,
+        )
+
+    assert wrong_operation.status is ToolResultStatus.ERROR
+    assert wrong_ref.status is ToolResultStatus.ERROR
+    assert "delegated operation bounds" in wrong_operation.error
+    assert "delegated operation bounds" in wrong_ref.error
+    assert exact.status is ToolResultStatus.OK
+    assert len(await list_requests(backend)) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_or_forged_delegation_fails_closed_before_filing(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        expires_in_seconds=1,
+    )
+    delegation = granted.data["delegation"]
+    delegation_id = delegation["delegation_id"]
+    after_expiry = datetime.fromisoformat(delegation["expires_at"]) + timedelta(
+        seconds=1
+    )
+
+    with (
+        caller_context_scope(None),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.store.database_clock",
+            AsyncMock(return_value=after_expiry),
+        ),
+    ):
+        expired = await feat.request_restart(
+            reason="expired", delegation_id=delegation_id,
+        )
+    assert expired.status is ToolResultStatus.ERROR
+    assert "expired" in expired.error
+
+    await backend.execute(
+        "UPDATE restart_authority_delegations SET authority_signature = ? "
+        "WHERE delegation_id = ?",
+        ("0" * 64, delegation_id),
+    )
+    with caller_context_scope(None):
+        forged = await feat.request_restart(
+            reason="forged", delegation_id=delegation_id,
+        )
+    assert forged.status is ToolResultStatus.ERROR
+    assert "signature verification failed" in forged.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_revocation_is_durable_signed_and_blocks_new_requests(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    revoked = await feat.revoke_restart_delegation(delegation_id)
+    assert revoked.status is ToolResultStatus.OK
+    assert revoked.data["revoked_by"] == "test-sovereign"
+    receipt = await backend.fetchone(
+        "SELECT revoked_by, revocation_evidence, revocation_signature FROM "
+        "restart_authority_delegation_revocations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    assert receipt[0] == "test-sovereign"
+    assert json.loads(receipt[1])["delegation_id"] == delegation_id
+    assert len(receipt[2]) == 64
+
+    with caller_context_scope(None):
+        denied = await feat.request_restart(
+            reason="revoked", delegation_id=delegation_id,
+        )
+    assert denied.status is ToolResultStatus.ERROR
+    assert "revoked" in denied.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_durable_revocation_fails_closed(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    await feat.revoke_restart_delegation(delegation_id)
+    await backend.execute(
+        "UPDATE restart_authority_delegation_revocations "
+        "SET revocation_signature = ? WHERE delegation_id = ?",
+        ("0" * 64, delegation_id),
+    )
+
+    with caller_context_scope(None):
+        denied = await feat.request_restart(
+            reason="tampered revocation", delegation_id=delegation_id,
+        )
+
+    assert denied.status is ToolResultStatus.ERROR
+    assert "invalid revocation receipt" in denied.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_delegation_survives_database_reconnect(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    raw = SQLiteBackend(str(tmp_path / "restart.db"))
+    await raw.connect()
+    restarted_db = _track_test_database(AsyncDatabase(raw))
+    await ensure_restart_requests_table(restarted_db)
+    restarted = RestartCoordinatorFeature(
+        _make_agent(restarted_db, did=feat.agent.did)
+    )
+    await restarted.initialize()
+
+    with caller_context_scope(None):
+        requested = await restarted.request_restart(
+            reason="durable delegated recovery", delegation_id=delegation_id,
+        )
+
+    assert requested.status is ToolResultStatus.OK
+    row = await get_request(restarted_db, requested.data["request"]["id"])
+    assert (await verify_restart_authority_at_use(restarted_db, row))[0] is True
+
+
+@pytest.mark.asyncio
+async def test_executor_rechecks_delegation_revocation_after_request_filing(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="revoke before executor",
+            delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    await feat.revoke_restart_delegation(delegation_id)
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "delegation was revoked" in row.status_reason
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rechecks_delegation_at_final_restart_boundary(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="revoke at boundary",
+            delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def revoke_after_execution_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "executing":
+            with caller_context_scope(CallerContext.sovereign(
+                identity="test-sovereign",
+                credential="restart-authority-test-key",
+            )):
+                revoked = await feat.revoke_restart_delegation(delegation_id)
+            assert revoked.status is ToolResultStatus.OK
+
+    feat._emit_status_event = revoke_after_execution_transition
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "delegation was revoked" in row.status_reason
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_executor_rechecks_delegation_at_update_mutation_boundary(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    repo = _git_checkout(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=repo,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="revoke before update mutation",
+            operation="update_then_restart",
+            update_profile="sovereign_local_uv_sync",
+            target_ref="main",
+            repo_path=repo,
+            delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    original_emit = feat._emit_status_event
+
+    async def revoke_after_updating_transition(req, *, state, **kwargs):
+        await original_emit(req, state=state, **kwargs)
+        if state == "updating":
+            with caller_context_scope(CallerContext.sovereign(
+                identity="test-sovereign",
+                credential="restart-authority-test-key",
+            )):
+                revoked = await feat.revoke_restart_delegation(delegation_id)
+            assert revoked.status is ToolResultStatus.OK
+
+    feat._emit_status_event = revoke_after_updating_transition
+    with (
+        patch.object(RestartCoordinatorFeature, "_run_update") as run_update,
+        patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn,
+    ):
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "delegation was revoked" in row.status_reason
+    run_update.assert_not_called()
+    spawn.assert_not_called()
 
 
 @pytest.mark.asyncio
