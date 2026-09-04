@@ -2169,14 +2169,27 @@ async def test_a_blob_args_summary_row_does_not_kill_every_search(tmp_path):
         decision="auto_mode_allowed", args_summary='{"title": "orphans the worker"}',
     )
     raw = sqlite3.connect(db_path)
+    # Same tool name as the real row, so a tool-name match pulls the BLOB row
+    # into the result set and it reaches the display re-mask too — the fold
+    # guard alone left get_audit_log and every tool-name search raising
+    # (round 22 review).
     raw.execute(
         "INSERT INTO security_audit_log (feature_name, tool_name, action, decision, args_summary)"
-        " VALUES (?,?,?,?,?)", ("Foreign", "t", "tool_execution", "auto_mode_allowed", b"\x00orphans the worker"),
+        " VALUES (?,?,?,?,?)", ("Foreign", "create_github_issue", "tool_execution", "auto_mode_allowed", b"\x00orphans the worker"),
+    )
+    raw.execute(
+        "INSERT INTO security_audit_log (feature_name, tool_name, action, decision, args_summary)"
+        " VALUES (?,?,?,?,?)", ("Foreign", "create_github_issue", "tool_execution", "auto_mode_allowed", 3),
     )
     raw.commit(); raw.close()
 
     matches, _ = await store.search_audit_log("orphans the worker")
-    assert [m["tool"] for m in matches] == ["create_github_issue"]
+    assert [m["args_summary"] for m in matches] == ['{"title": "orphans the worker"}']
+    matches, _ = await store.search_audit_log("create_github_issue")
+    assert len(matches) == 3 and all("orphans" not in (m["args_summary"] or "") or m["args_summary"].startswith("{") for m in matches)
+    assert {m["args_summary"] for m in matches} >= {"(summary not text; not shown)"}
+    recent = await store.get_audit_log(10)
+    assert len(recent) == 3 and all(isinstance(r["args_summary"], str) for r in recent)
 
 
 def test_the_write_path_keeps_prose_after_a_json_prefix_and_never_trims():
@@ -2311,3 +2324,57 @@ async def test_a_top_level_json_string_row_is_masked_in_both_projections(tmp_pat
     shown = await feature.security_audit_search(query="orphans the worker")
     assert shown.data["count"] == 1 and "TOPLEVEL" not in str(shown.data)
     assert (await feature.security_audit_search(query="sk-live-TOP")).data["count"] == 0
+
+
+# --------------------------------------------------------------------------
+# Round 23: escapes inside a nested payload are decoded for matching; the
+# headline never drops the unclassified clause.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_nested_payloads_unicode_escapes_are_searchable(tmp_path):
+    """json.loads decodes the OUTER row; a string value that is itself a
+    serialized JSON document still carries literal \\u2014, and fold_query
+    decodes the query side — neither spelling matched, a false absence in
+    the tool that exists to prevent one."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    nested = json.dumps({"title": "Killing a tracked job — orphans the worker", "city": "Échec"})
+    row = json.dumps({"repo": "K/kt", "payload": nested})
+    assert "\\u2014" in row  # the escape survives the outer dump
+    folded = fold_stored_summary(row)
+    assert "job — orphans" in folded and "échec" in folded
+
+    store = PermissionStore(str(tmp_path / "nested-escapes.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="GitHub", tool_name="create_github_issue", action="tool_execution",
+        decision="auto_mode_allowed", args_summary=row,
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    for phrase in ("Killing a tracked job — orphans", "Échec"):
+        assert (await feature.security_audit_search(query=phrase)).data["count"] == 1, phrase
+
+
+@pytest.mark.asyncio
+async def test_the_headline_keeps_the_unclassified_clause_beside_an_authorization(tmp_path):
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "headline.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="talon_feature", tool_name="talon_file_and_claim", action="tool_execution",
+        decision="auto_mode_allowed", args_summary='{"issue": "orphan worker alpha"}',
+    )
+    await store.log_decision(
+        feature_name="talon_feature", tool_name="talon_file_and_claim.outcome", action="tool_outcome",
+        decision="issue_created", args_summary='{"issue": "orphan worker alpha", "issue_number": 7}',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="orphan worker alpha")
+    assert result.data["authorized"] == 1 and result.data["unclassified_outcomes"] == 1
+    assert "does not classify" in result.confirmation and "read them" in result.confirmation
+    assert "which is not proof it succeeded" not in result.confirmation

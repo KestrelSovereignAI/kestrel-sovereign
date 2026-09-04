@@ -148,7 +148,14 @@ def _flatten_json(value):
             for item in node:
                 walk(item)
         else:
-            parts.append(node if isinstance(node, str) else str(node))
+            # A string value that is itself a JSON document serialized by the
+            # caller (an args_json, an HTTP payload) still carries literal
+            # ``\\u2014``/``\\u00c9`` after the OUTER row is decoded, while
+            # fold_query decodes the query side — neither spelling matched
+            # (round 22 review). Decode the leaf so both sides are the same
+            # kind of thing; only ``\\uXXXX``, so the round-10 ``\\b`` bug
+            # stays closed.
+            parts.append(_decode_unicode_escapes(node) if isinstance(node, str) else str(node))
 
     walk(value)
     return " ".join(parts)

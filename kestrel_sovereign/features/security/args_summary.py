@@ -260,6 +260,13 @@ def remask_summary(summary: Optional[str]) -> Optional[str]:
     cannot appear without its key, and a repaired row is masked by key
     position exactly as a parseable one is — field by field, one masker.
     """
+    if not isinstance(summary, str):
+        # The column has TEXT affinity but stores bytes as bytes (and an int
+        # as an int): the fold path already refuses these, and this door —
+        # on BOTH store read paths, the operator endpoint included — handed
+        # them to a string regex and raised for every caller until the row
+        # aged out (round 22 review). One rule at both doors.
+        return None if summary is None else "(summary not text; not shown)"
     if not summary:
         return summary
     try:

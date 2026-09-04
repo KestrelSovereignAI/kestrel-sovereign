@@ -1451,7 +1451,7 @@ class SecurityFeature(Feature):
                 f" — none of the {refused} was an authorization to run, "
                 "so this work may never have happened"
             )
-        elif allowed and not outcomes and not refused:
+        elif allowed and not outcomes and not refused and not unclassified:
             headline += " — authorized to run, which is not proof it succeeded"
         else:
             headline += " — " + ", ".join(parts)
