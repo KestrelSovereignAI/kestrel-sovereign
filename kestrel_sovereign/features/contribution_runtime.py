@@ -105,6 +105,7 @@ class FeatureContributionCollectionError(FeatureContributionRuntimeError):
         "get_feature_permission_defaults": "permission-default collection",
         "get_setup_step_registrations": "setup-step collection",
         "get_context_clause_registrations": "context-clause collection",
+        "prepare_context_clause_refresh": "context-clause preparation",
         "render_context_clauses": "context-clause rendering",
         "validate_feature_contributions": "contribution validation",
         "validate_contribution_owner_uniqueness": "contribution validation",
@@ -1224,16 +1225,50 @@ class FeatureContributionRuntime:
     def refresh_all_context_clauses(
         self,
     ) -> tuple[ResolvedContextClause, ...]:
-        """Atomically republish every active clause after a host transition.
+        """Atomically republish already-prepared active clause state.
 
-        Privacy and other host-owned configuration can change what an
-        out-of-tree renderer is allowed to disclose without invoking a feature
-        tool. Resolve every renderer before touching the registry, then replace
-        the complete agent-owned set in one validated mutation so prompts never
-        observe a mixture of pre- and post-transition bytes.
+        Use :meth:`prepare_and_refresh_all_context_clauses` when a host-owned
+        transition may require asynchronous feature preparation. This
+        synchronous path is for callers that already updated feature-owned
+        state. It still resolves every renderer before touching the registry,
+        then replaces the complete agent-owned set in one validated mutation.
         """
 
         active_items = tuple(self._active.items())
+        replacements = tuple(
+            (
+                key,
+                active,
+                self._resolve_context_clauses(active.prepared),
+            )
+            for key, active in active_items
+        )
+        return self._commit_all_context_clause_replacements(replacements)
+
+    async def prepare_and_refresh_all_context_clauses(
+        self,
+    ) -> tuple[ResolvedContextClause, ...]:
+        """Await feature preparation, then atomically republish every clause.
+
+        A host-owned transition may make asynchronously persisted feature
+        state readable only after the new policy is installed. Await each
+        active feature's optional SDK preparation hook before invoking any
+        synchronous renderer. The registry remains untouched until every hook
+        and renderer succeeds and the complete replacement batch can commit.
+        """
+
+        active_items = tuple(self._active.items())
+        for _key, active in active_items:
+            if active.context_clauses:
+                await self._prepare_context_clause_refresh(active.prepared)
+
+        if len(self._active) != len(active_items) or any(
+            self._active.get(key) is not active for key, active in active_items
+        ):
+            raise FeatureContributionRuntimeError(
+                "active feature contributions changed during context-clause preparation"
+            )
+
         replacements = tuple(
             (
                 key,
@@ -1290,6 +1325,47 @@ class FeatureContributionRuntime:
             )
             offset = end
         return committed
+
+    @staticmethod
+    async def _prepare_context_clause_refresh(
+        prepared: PreparedFeatureContributions,
+    ) -> None:
+        sanitized_error: FeatureContributionCollectionError | None = None
+        externally_cancelled = False
+        try:
+            prepare = getattr(
+                prepared.feature,
+                "prepare_context_clause_refresh",
+                None,
+            )
+            if prepare is None:
+                return
+            await prepare()
+            return
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                externally_cancelled = True
+            else:
+                sanitized_error = FeatureContributionCollectionError(
+                    prepared.feature,
+                    "prepare_context_clause_refresh",
+                )
+        except Exception:
+            # Preparation is arbitrary out-of-tree code and may carry private
+            # feature state in its error or cancellation text. As with context
+            # renderers, discard the untrusted exception object completely.
+            sanitized_error = FeatureContributionCollectionError(
+                prepared.feature,
+                "prepare_context_clause_refresh",
+            )
+        if externally_cancelled:
+            # Preserve real task cancellation without retaining its optional
+            # message as an exception cause/context across host logging.
+            raise asyncio.CancelledError()
+        # Raising outside the handler prevents the untrusted exception from
+        # surviving on __context__, even when traceback formatting is enabled.
+        raise sanitized_error
 
     @staticmethod
     def _resolve_context_clauses(

@@ -308,15 +308,18 @@ traffic with `KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE` and
 positive integers. These are independent host budgets: scheduler effect gates
 use the scheduler host's own storage pool, not the agents' advisory pool.
 
-#### SDK 0.37 release cascade
+#### SDK 0.37–0.38 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.37.1,<0.38`; the
+Core requires `kestrel-sovereign-sdk[tracing]>=0.37.1,<0.39`; the
 `observability` extra carries the same SDK line with `metrics`. This is a
 runtime contract for durable isolated execution, provider-neutral private
 inference leases (including bounded owner-scoped idle renewal), and private
 host ingress, plus feature-owned operator and context-clause contribution
-contracts. It is not a preference that a downstream package may relax. The
-Core-owned release-cascade contract is:
+contracts. SDK 0.38.1 adds the optional awaited preparation hook that Core
+invokes before synchronously rendering a context-clause batch; Core continues
+to resolve that hook defensively for features built against 0.37.1. It is not
+a preference that a downstream package may relax. The Core-owned
+release-cascade contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
