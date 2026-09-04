@@ -172,9 +172,30 @@ class TestModels:
             argv=["ls", "-la", "/tmp"],
             purpose="test",
         )
-        assert command.argv == ["ls", "-la", "/tmp"]
+        assert command.argv == ("ls", "-la", "/tmp")
         assert not hasattr(command, "language")
         assert not hasattr(command, "content")
+
+    def test_compute_command_cannot_be_emptied_after_it_is_checked(self):
+        """The construction check is only worth something if the value
+        cannot change behind it.
+
+        A list would stay the caller's. Emptying it after construction
+        would leave Docker with no command, and `docker run IMAGE` with
+        no command runs the image's default CMD — a shell.
+        """
+        caller_list = ["ls", "-la"]
+        command = ComputeCommand(
+            id="c", name="n", argv=caller_list, purpose="test"
+        )
+
+        caller_list.clear()
+        assert command.argv == ("ls", "-la")
+
+        with pytest.raises((AttributeError, TypeError)):
+            command.argv = []  # type: ignore[misc]
+        with pytest.raises(AttributeError):
+            command.argv.clear()  # type: ignore[attr-defined]
 
     def test_compute_command_refuses_an_empty_vector(self):
         """``docker run IMAGE`` with no command runs the image's own

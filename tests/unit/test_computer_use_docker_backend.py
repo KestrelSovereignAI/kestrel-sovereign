@@ -79,7 +79,7 @@ async def test_exec_hands_the_vector_to_the_argv_mode_unchanged() -> None:
 
     assert executor.scripts == []
     assert len(executor.commands) == 1
-    assert executor.commands[0].argv == argv
+    assert executor.commands[0].argv == tuple(argv)
     assert result.argv == argv
     assert result.returncode == 0
     assert (result.stdout, result.stderr) == ("out", "err")

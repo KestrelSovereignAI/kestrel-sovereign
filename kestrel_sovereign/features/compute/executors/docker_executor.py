@@ -68,12 +68,17 @@ class DockerExecutor(BaseExecutor):
         self,
         docker_path: Optional[str] = None,
         images: Optional[Dict[str, str]] = None,
-        command_image: Optional[str] = None,
         default_memory_limit: str = "256m",
         default_cpu_quota: int = 50000,  # 50% of one CPU
         default_pids_limit: int = 50,
         max_output_bytes: int = 1024 * 1024,  # 1MB
         current_agent_data_path: Optional[str | Path] = None,
+        # Appended rather than grouped with `images`, which is where it
+        # belongs by meaning: `DockerExecutor` is a package-level export
+        # that already accepted these positions, and inserting a
+        # parameter mid-list silently remaps every caller that passed
+        # one positionally.
+        command_image: Optional[str] = None,
     ):
         """
         Initialize the Docker executor.
@@ -233,7 +238,11 @@ class DockerExecutor(BaseExecutor):
             script_cwd=container_cwd,
         )
 
-        script_name = "script.py" if script.language == "python" else "script.sh"
+        if script.language == "python":
+            interpreter, script_name = "python", "script.py"
+        else:
+            interpreter, script_name = "sh", "script.sh"
+        script_argument = f"/scripts/{script_name}"
         script_path = Path(context.workdir) / script_name
         script_path.write_text(safe_content)
         script_path.chmod(0o755)
@@ -255,13 +264,10 @@ class DockerExecutor(BaseExecutor):
                 # directory.
                 f"{staging_dir}:{_CONTAINER_TRASH_DIR}:rw",
             ],
+            program=interpreter,
         )
-        if script.language == "python":
-            runtime_command = ["python", "/scripts/script.py"]
-        else:
-            runtime_command = ["sh", "/scripts/script.sh"]
-        cmd.extend(runtime_command)
-        log_safe_cmd.extend(runtime_command)
+        cmd.append(script_argument)
+        log_safe_cmd.append(script_argument)
 
         logger.info("Executing script %s... in Docker container", script.id[:8])
         logger.debug("Container command: %s", " ".join(log_safe_cmd))
@@ -307,6 +313,7 @@ class DockerExecutor(BaseExecutor):
         mounts: Optional[List[Dict[str, str]]],
         environment: Dict[str, str],
         binds: List[str],
+        program: str,
     ) -> tuple[List[str], List[str]]:
         """Build ``docker run`` up to and including the image.
 
@@ -319,10 +326,28 @@ class DockerExecutor(BaseExecutor):
         that environment values are redacted, so a debug log of the
         container command cannot leak a secret the caller passed in.
 
-        Everything the caller appends after the returned command lands
-        *after the image*, which is where ``docker run`` stops reading
-        flags — so no element of a command vector can be read as an
-        option to Docker itself.
+        ``program`` is what will run, and it is pinned with
+        ``--entrypoint`` rather than left to position. Words after the
+        image are not the process argv: Docker appends them to whatever
+        ``ENTRYPOINT`` the image declares, so an image with one runs its
+        own program with the caller's first word demoted to an argument.
+        Measured on an image built with
+        ``ENTRYPOINT ["/bin/echo", "ENTRYPOINT-RAN"]``: a vector of
+        ``["printf", "HACKED"]`` printed ``ENTRYPOINT-RAN printf
+        HACKED`` — ``echo`` ran while the policy had vetted ``printf``.
+        That is #3187 again, one layer down, and it is why the program
+        is named to Docker instead of positioned after the image.
+
+        ``--entrypoint`` also clears the image's default ``CMD``
+        (measured, not read: ``docker run --entrypoint printf alpine``
+        runs ``printf`` with no arguments, where the same run without
+        the override starts the image's shell). So a caller appending
+        nothing gets its own program with no arguments, never the
+        image's idea of what to do.
+
+        It is a required parameter for the same reason: the two modes
+        share this builder, and a mode that forgot to pin its program
+        would silently inherit the image's.
         """
         cmd = [
             docker_path,
@@ -361,6 +386,7 @@ class DockerExecutor(BaseExecutor):
                 cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
 
         cmd.extend(["-w", container_cwd])
+        cmd.extend(["--entrypoint", program])
         log_safe_cmd = list(cmd)
         for key, value in environment.items():
             cmd.extend(["-e", f"{key}={value}"])
@@ -377,12 +403,12 @@ class DockerExecutor(BaseExecutor):
     ) -> ExecutionRecord:
         """Execute an argv vector in a container. No script, no shell.
 
-        ``docker run`` hands everything after the image straight to
-        ``execve`` in the container, so ``command.argv[0]`` is the
-        program and every later element is an argument to it. That is
-        the whole difference from :meth:`execute`: a script's first word
-        is read by a shell's grammar first, which is how a vetted
-        ``eval`` ran an unvetted ``printf`` (#3187).
+        ``command.argv[0]`` is the program and every later element is an
+        argument to it — pinned with ``--entrypoint`` rather than left
+        to position, for the reason :meth:`_container_invocation`
+        records. That is the whole difference from :meth:`execute`: a
+        script's first word is read by a shell's grammar first, which is
+        how a vetted ``eval`` ran an unvetted ``printf`` (#3187).
 
         No trash mount is created. The rewriter that redirects deletions
         into it only rewrites script text, and there is no script text
@@ -451,9 +477,10 @@ class DockerExecutor(BaseExecutor):
             mounts=None,
             environment=command.environment,
             binds=[],
+            program=command.argv[0],
         )
-        cmd.extend(command.argv)
-        log_safe_cmd.extend(command.argv)
+        cmd.extend(command.argv[1:])
+        log_safe_cmd.extend(command.argv[1:])
 
         logger.info("Executing command %s... in Docker container", command.id[:8])
         # Quoted, unlike the script path's log line: here the reader is

@@ -132,6 +132,86 @@ async def test_a_shell_the_caller_names_still_runs(backends):
     assert (on_host.returncode, on_host.stdout) == (0, "named")
 
 
+@pytest.fixture(scope="module")
+def entrypoint_image() -> str:
+    """An image that would run its own program given half a chance."""
+    tag = "kestrel-test-3187-entrypoint:latest"
+    build = subprocess.run(
+        ["docker", "build", "-q", "-t", tag, "-"],
+        input='FROM alpine:3.19\nENTRYPOINT ["/bin/echo", "ENTRYPOINT-RAN"]\n',
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert build.returncode == 0, build.stderr
+    yield tag
+    subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, timeout=60)
+
+
+@pytest.mark.asyncio
+async def test_the_image_cannot_interpose_its_own_program(entrypoint_image):
+    """codex round 1 P1 — position after the image is not enough.
+
+    Words after the image are not the container's argv: Docker appends
+    them to the image's ``ENTRYPOINT``. Measured before the fix, this
+    exact image turned ``["printf", "HACKED"]`` into
+    ``ENTRYPOINT-RAN printf HACKED`` — ``echo`` ran, ``printf`` became
+    an argument, and the policy had vetted ``printf``. #3187 one layer
+    down.
+
+    Naming the program with ``--entrypoint`` is what makes ``argv[0]``
+    the process regardless of what the image wanted to run.
+    """
+    from kestrel_sovereign.features.compute.executors.docker_executor import (
+        DockerExecutor,
+    )
+    from kestrel_sovereign.features.compute.models import ComputeCommand
+
+    executor = DockerExecutor(command_image=entrypoint_image)
+    record = await executor.execute_command(
+        ComputeCommand(
+            id="entrypoint-interposition",
+            name="entrypoint interposition",
+            argv=["printf", "VECTOR-RAN"],
+            purpose="prove the image cannot interpose its own program",
+            timeout_seconds=60,
+        )
+    )
+
+    assert "ENTRYPOINT-RAN" not in record.stdout, record.stdout
+    assert record.stdout == "VECTOR-RAN", record.stdout
+    assert record.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_an_image_default_command_cannot_run_in_place_of_the_vector(
+    entrypoint_image,
+):
+    """And the image's own ``CMD`` cannot stand in either.
+
+    ``--entrypoint`` clears it, so the container runs the caller's
+    program with the caller's arguments and nothing else.
+    """
+    from kestrel_sovereign.features.compute.executors.docker_executor import (
+        DockerExecutor,
+    )
+    from kestrel_sovereign.features.compute.models import ComputeCommand
+
+    executor = DockerExecutor(command_image=entrypoint_image)
+    record = await executor.execute_command(
+        ComputeCommand(
+            id="single-word-vector",
+            name="single word vector",
+            argv=["true"],
+            purpose="a vector with no arguments must not inherit a CMD",
+            timeout_seconds=60,
+        )
+    )
+
+    assert record.stdout == "", record.stdout
+    assert record.exit_code == 0
+
+
 @pytest.mark.asyncio
 async def test_a_vector_element_is_never_read_as_a_docker_option(backends):
     """``docker run`` stops reading options at the image name.

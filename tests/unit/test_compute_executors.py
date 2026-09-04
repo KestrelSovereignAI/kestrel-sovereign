@@ -1244,9 +1244,13 @@ async def test_docker_command_mode_execs_the_vector_and_writes_no_script(
     The vector here is chosen so that any re-reading would show: under
     the previous implementation these words were quoted into a bash
     script, and ``eval`` ran ``printf`` with only ``eval`` vetted.
-    ``docker run`` stops reading options at the image, so the assertion
-    that the vector is the *tail* of the command, immediately after the
-    image, is the assertion that nothing can reinterpret it.
+
+    ``argv[0]`` is named to Docker with ``--entrypoint`` rather than
+    positioned after the image. Position is not enough: words after the
+    image are appended to whatever ``ENTRYPOINT`` the image declares,
+    so on an entrypoint-bearing image the first word is demoted to an
+    argument and the image's own program runs (codex round 1 P1,
+    reproduced live — see the parity test for the measurement).
     """
     argv = ["eval", "printf HACKED", ";", "--privileged", "$(id)"]
     captured, contents = await _capture_container_argv(
@@ -1255,12 +1259,15 @@ async def test_docker_command_mode_execs_the_vector_and_writes_no_script(
         run=lambda executor: executor.execute_command(_command(argv=argv)),
     )
 
-    assert captured[-len(argv):] == argv
-    assert captured[-len(argv) - 1] == docker_executor_module.DEFAULT_COMMAND_IMAGE
+    entrypoint_at = captured.index("--entrypoint")
+    image_at = captured.index(docker_executor_module.DEFAULT_COMMAND_IMAGE)
+    assert captured[entrypoint_at + 1] == argv[0]
+    assert entrypoint_at < image_at, "--entrypoint is an option, not an argument"
+    assert captured[image_at + 1 :] == argv[1:]
 
     # Nothing interprets it: no interpreter is named, and no script
     # file exists to be interpreted.
-    flags = captured[: -len(argv)]
+    flags = captured[:image_at]
     assert "sh" not in flags and "bash" not in flags and "python" not in flags
     assert contents == [[]], f"the executor wrote a file: {contents}"
 

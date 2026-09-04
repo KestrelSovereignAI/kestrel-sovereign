@@ -8,7 +8,7 @@ and execution tracking.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 
 class ScriptState(Enum):
@@ -184,7 +184,7 @@ class ComputeScript:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class ComputeCommand:
     """An argv vector to execute directly — not a script.
 
@@ -205,7 +205,7 @@ class ComputeCommand:
 
     id: str  # UUID
     name: str  # Human-readable name
-    argv: List[str]  # argv[0] is the program; the rest are its arguments
+    argv: Tuple[str, ...]  # argv[0] is the program; the rest its arguments
     purpose: str  # Why the agent created this
 
     timeout_seconds: int = 300
@@ -220,6 +220,15 @@ class ComputeCommand:
         # execution images is a shell. Refuse it at construction, where
         # the caller is, rather than discovering it as a container that
         # started something nobody asked for.
+        #
+        # Validating once is only worth anything if the value cannot
+        # change afterwards, which is why this type is frozen and argv
+        # is copied into a tuple. A list would stay the caller's: the
+        # caller clears it, or assigns a new one, and the check that
+        # already passed is describing a vector that no longer exists
+        # (codex round 1 P2). The environment is left a plain dict
+        # because it has no equivalent cliff — a changed value is a
+        # different value, while an emptied argv is a different program.
         if not self.argv:
             raise ValueError("ComputeCommand requires a non-empty argv")
         for index, element in enumerate(self.argv):
@@ -230,6 +239,7 @@ class ComputeCommand:
                 )
         if not self.argv[0]:
             raise ValueError("ComputeCommand argv[0] must name a program")
+        object.__setattr__(self, "argv", tuple(self.argv))
 
 
 @dataclass

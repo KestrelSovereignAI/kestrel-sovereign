@@ -10,13 +10,18 @@ flags (``--read-only``, ``--network=none``, ``--security-opt=no-new-privileges``
 memory and pid limits) and we don't want a second container runtime path
 that could drift from those guarantees.
 
-The command is an argv vector all the way down: ``docker run`` hands
-everything after the image to ``execve`` inside the container. This
-backend used to quote the vector into a bash script and run that
-instead, which meant the words were read a second time, by a shell,
-after the policy had vetted them — so ``eval 'printf HACKED'`` ran
-``printf`` having shown the policy only ``eval``, which is not a
-program at all (#3187). A method named ``exec(argv)`` now execs argv.
+The command is an argv vector all the way down. This backend used to
+quote the vector into a bash script and run that instead, which meant
+the words were read a second time, by a shell, after the policy had
+vetted them — so ``eval 'printf HACKED'`` ran ``printf`` having shown
+the policy only ``eval``, which is not a program at all (#3187). A
+method named ``exec(argv)`` now execs argv.
+
+Position after the image is not what makes that true; the executor
+names ``argv[0]`` to Docker with ``--entrypoint``. Words placed after
+an image are appended to whatever ``ENTRYPOINT`` it declares, so on an
+image that has one they are arguments to the image's program rather
+than a program of their own — the same defect one layer down.
 """
 
 from __future__ import annotations
