@@ -299,25 +299,27 @@ def _start_inprocess_mode(
         if not cfg.autostart
     }
 
-    # A fleet host cannot mint a sovereign credential at runtime: every
+    # An API-key fleet cannot mint a sovereign credential at runtime: every
     # managed child can reach the same loopback bootstrap route as a browser.
-    # Setup normally provisions this value in the project .env. Legacy homes
-    # must be repaired explicitly instead of starting with an undiscoverable
-    # ephemeral key that neither CLI nor console can use.
+    # Setup normally provisions this value in the project .env. OAuth-required
+    # fleets already have a complete operator-authentication lane and do not
+    # need a parallel API key.
     env = pm._load_env()
     from kestrel_sovereign.auth import normalize_api_key
 
     host_api_key = normalize_api_key(env.get("KESTREL_API_KEY")) or ""
-    if not host_api_key.strip():
+    oauth_required = env.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not host_api_key.strip() and not oauth_required:
         print(
             "❌ Multi-agent host requires a stable KESTREL_API_KEY in the "
             "project .env. Run `kestrel setup keys` and retry."
         )
         return 1
-    browser_url = (
-        f"http://localhost:{multi_agent.host.port}/"
-        f"#key={quote(host_api_key, safe='')}"
-    )
+    browser_url = f"http://localhost:{multi_agent.host.port}/"
+    if host_api_key:
+        browser_url += f"#key={quote(host_api_key, safe='')}"
 
     print("\U0001F985 Kestrel MultiAgent starting (in-process)...")
     # The fragment is never sent in an HTTP request or access log. app.js

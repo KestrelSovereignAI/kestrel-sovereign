@@ -30,6 +30,7 @@ from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV,
     A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
     A2A_PEER_IDENTITY_ROOTS_ENV,
+    A2A_PEER_STABLE_AGENT_ID_FIELD,
     install_process_a2a_did_resolver,
 )
 from kestrel_sovereign.config import (
@@ -663,7 +664,11 @@ class TestStartAgent:
 
         env = mock_popen.call_args.kwargs["env"]
         assert json.loads(env[A2A_PEER_IDENTITY_DOCUMENTS_ENV]) == [
-            documents[name] for name in configs
+            {
+                **documents[name],
+                A2A_PEER_STABLE_AGENT_ID_FIELD: documents[name]["id"],
+            }
+            for name in configs
         ]
         assert A2A_PEER_IDENTITY_ROOTS_ENV not in env
         assert [call.args[0] for call in attest.call_args_list] == [

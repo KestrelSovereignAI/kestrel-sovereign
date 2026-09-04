@@ -35,6 +35,7 @@ from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV,
     A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
     A2A_PEER_IDENTITY_ROOTS_ENV,
+    A2A_PEER_STABLE_AGENT_ID_FIELD,
     launcher_attested_a2a_verification_document,
     stage_process_a2a_did_registry,
 )
@@ -975,7 +976,12 @@ class ProcessManager:
                     f"agent '{peer_name}' ({type(exc).__name__})"
                 ) from exc
             if document is not None:
-                identity_documents.append(document)
+                identity_documents.append(
+                    {
+                        **document,
+                        A2A_PEER_STABLE_AGENT_ID_FIELD: expected_did,
+                    }
+                )
         for inherited_registry_key in (
             A2A_PEER_IDENTITY_ROOTS_ENV,
             A2A_PEER_IDENTITY_DOCUMENTS_ENV,

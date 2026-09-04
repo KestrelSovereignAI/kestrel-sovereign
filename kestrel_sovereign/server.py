@@ -525,7 +525,7 @@ def _constitution_safe_mode_records(agent, manager) -> list[dict]:
     return records
 
 
-def _oauth_required() -> bool:
+def _oauth_required(environ: Mapping[str, str] | None = None) -> bool:
     """Return whether OAuth is the required auth mode.
 
     Set KESTREL_REQUIRE_OAUTH=true in Cloud Run deploy scripts to force
@@ -534,7 +534,8 @@ def _oauth_required() -> bool:
 
     This is the single source of truth for auth mode.
     """
-    return os.environ.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
+    source = os.environ if environ is None else environ
+    return source.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
         "1", "true", "yes", "on"
     }
 
@@ -545,14 +546,17 @@ def _bootstrap_key_enabled() -> bool:
 
 
 def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
-    """Return the provisioned fleet credential or refuse an unsafe boot.
+    """Return the fleet credential required by the configured auth lane.
 
     A runtime-generated key cannot be handed to local clients safely once
     managed peers share the host's loopback namespace. Fleet launchers and the
-    server therefore meet on the project-provisioned key; localhost bootstrap
-    remains a standalone-only compatibility lane.
+    server therefore meet on the project-provisioned key in API-key mode;
+    OAuth-required hosts need no parallel sovereign API-key credential.
+    Localhost bootstrap remains a standalone-only compatibility lane.
     """
     api_key = normalize_api_key(environ.get("KESTREL_API_KEY")) or ""
+    if _oauth_required(environ):
+        return api_key
     if not api_key.strip():
         raise RuntimeError(
             "Multi-agent hosts require a stable KESTREL_API_KEY provisioned "

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from kestrel_sovereign.features.peers.directory import (
     PeerDirectoryError,
@@ -49,9 +49,16 @@ def mark_a2a_inbound_scoped_policy(
 class RecipientA2ASenderAuthorizer:
     """Authorize verified sender DIDs under one recipient's live peer scope."""
 
-    def __init__(self, manager: Any, *, recipient: Any):
+    def __init__(
+        self,
+        manager: Any,
+        *,
+        recipient: Any,
+        sender_id_resolver: Optional[Callable[[str], Optional[str]]] = None,
+    ):
         self._manager = manager
         self._recipient = recipient
+        self._sender_id_resolver = sender_id_resolver
         recipient_declares_scope = (
             getattr(recipient, "peer_directory_router", None) is not None
             or getattr(recipient, "peer_requester", None) is not None
@@ -218,6 +225,19 @@ class RecipientA2ASenderAuthorizer:
 
     def _sender_directory_id(self, signing_did: str) -> Optional[str]:
         """Map a loaded signing DID to its stable id; retain external DIDs."""
+        if self._sender_id_resolver is not None:
+            try:
+                sender_id = self._sender_id_resolver(signing_did)
+            except Exception:  # noqa: BLE001 - launcher registry boundary
+                logger.warning(
+                    "Inbound A2A signing-DID mapping failed for %s",
+                    signing_did,
+                    exc_info=True,
+                )
+                return None
+            if isinstance(sender_id, str) and sender_id:
+                return sender_id
+            return None
         matches = []
         for agent in self._agents():
             identity = getattr(agent, "identity", None)
@@ -254,11 +274,13 @@ def install_a2a_inbound_sender_authorizer(
     manager: Any,
     *,
     recipient: Any,
+    sender_id_resolver: Optional[Callable[[str], Optional[str]]] = None,
 ) -> RecipientA2ASenderAuthorizer:
     """Install the explicit inbound authorization seam on one recipient."""
     authorizer = RecipientA2ASenderAuthorizer(
         manager,
         recipient=recipient,
+        sender_id_resolver=sender_id_resolver,
     )
     recipient.a2a_inbound_sender_authorizer = authorizer
     logger.info(

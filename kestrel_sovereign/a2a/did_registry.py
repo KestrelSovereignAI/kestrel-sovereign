@@ -34,6 +34,7 @@ A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV = (
 A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV = (
     "KESTREL_A2A_PEER_IDENTITY_DOCUMENTS_SHA256"
 )
+A2A_PEER_STABLE_AGENT_ID_FIELD = "kestrelAgentId"
 _MAX_PROCESS_REGISTRY_BYTES = 128 * 1024
 _MAX_WINDOWS_ENV_VALUE_CHARS = 32_766
 _MAX_LINUX_ENV_ENTRY_BYTES = 128 * 1024
@@ -230,10 +231,18 @@ def _validated_verification_document(
         raise ProcessA2ADidResolverConfigurationError(
             "A2A peer identity registry contains invalid verification methods"
         )
-    return {
+    normalized = {
         "id": did,
         "verificationMethod": [dict(method) for method in verification_methods],
     }
+    stable_agent_id = material.get(A2A_PEER_STABLE_AGENT_ID_FIELD)
+    if stable_agent_id is not None:
+        if not isinstance(stable_agent_id, str) or not stable_agent_id:
+            raise ProcessA2ADidResolverConfigurationError(
+                "A2A peer identity registry contains an invalid stable agent id"
+            )
+        normalized[A2A_PEER_STABLE_AGENT_ID_FIELD] = stable_agent_id
+    return normalized
 
 
 def launcher_attested_a2a_verification_document(
@@ -313,6 +322,7 @@ class ProcessA2ADidResolver:
     ) -> None:
         self._federated_fallback = federated_fallback
         verified: dict[str, Mapping[str, Any]] = {}
+        stable_agent_ids: dict[str, str] = {}
         for material in documents:
             document = _validated_verification_document(material)
             did = str(document["id"])
@@ -320,8 +330,15 @@ class ProcessA2ADidResolver:
                 raise ProcessA2ADidResolverConfigurationError(
                     "A2A peer identity registry contains a duplicate signing DID"
                 )
-            verified[did] = deepcopy(document)
+            stable_agent_id = document.get(A2A_PEER_STABLE_AGENT_ID_FIELD)
+            if isinstance(stable_agent_id, str):
+                stable_agent_ids[did] = stable_agent_id
+            verified[did] = {
+                "id": did,
+                "verificationMethod": deepcopy(document["verificationMethod"]),
+            }
         self._documents = verified
+        self._stable_agent_ids = stable_agent_ids
 
     def resolve(self, did: str) -> Optional[Mapping[str, Any]]:
         if not isinstance(did, str) or not did:
@@ -331,6 +348,20 @@ class ProcessA2ADidResolver:
             return deepcopy(document)
         if self._federated_fallback:
             return HostA2ADidResolver._resolve_federated(did)
+        return None
+
+    def directory_agent_id(self, signing_did: str) -> Optional[str]:
+        """Map an attested signing DID to its launcher's durable agent id."""
+
+        if not isinstance(signing_did, str) or not signing_did:
+            return None
+        stable_agent_id = self._stable_agent_ids.get(signing_did)
+        if stable_agent_id is not None:
+            return stable_agent_id
+        # Federated identities have no local launcher binding; after signature
+        # verification their DID remains the identity a scoped provider sees.
+        if self._federated_fallback and signing_did.startswith("did:web:"):
+            return signing_did
         return None
 
 
@@ -398,6 +429,7 @@ def install_process_a2a_did_resolver(
         federated_fallback=federated,
     )
     agent.a2a_did_resolver = resolver.resolve
+    agent._a2a_process_did_resolver = resolver
     if registry_file is not None and environ is os.environ:
         # Feature initialization is intentionally repeatable. Once the
         # one-shot file has been authenticated and consumed, remove its stale
@@ -563,6 +595,7 @@ __all__ = [
     "A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV",
     "A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV",
     "A2A_PEER_IDENTITY_ROOTS_ENV",
+    "A2A_PEER_STABLE_AGENT_ID_FIELD",
     "HostA2ADidResolver",
     "ProcessA2ADidResolver",
     "ProcessA2ADidResolverConfigurationError",

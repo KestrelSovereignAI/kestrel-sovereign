@@ -282,7 +282,27 @@ class PeersFeature(Feature):
             install_process_a2a_did_resolver,
         )
 
-        install_process_a2a_did_resolver(self.agent)
+        process_resolver = install_process_a2a_did_resolver(self.agent)
+        if process_resolver is None:
+            process_resolver = getattr(
+                self.agent,
+                "_a2a_process_did_resolver",
+                None,
+            )
+        from kestrel_sovereign.a2a.transport_auth import (
+            is_a2a_transport_only_process,
+        )
+
+        managed_subprocess = is_a2a_transport_only_process()
+        if managed_subprocess:
+            from kestrel_sovereign.a2a.inbound_authorization import (
+                mark_a2a_inbound_scoped_policy,
+            )
+
+            # This launch marker is authoritative even if registry or host
+            # wiring is absent. A broken managed child must deny A2A rather
+            # than silently regain standalone unsigned compatibility.
+            mark_a2a_inbound_scoped_policy(self.agent, required=True)
         self._own_name = self._get_own_name()
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and
@@ -304,6 +324,27 @@ class PeersFeature(Feature):
                 )
         elif self._host_url:
             self._install_local_host_router()
+
+        if managed_subprocess:
+            from kestrel_sovereign.a2a.inbound_authorization import (
+                install_a2a_inbound_sender_authorizer,
+            )
+
+            # The endpoint reads its immutable policy from the agent, while
+            # the subprocess compatibility router normally belongs to this
+            # feature. Publish the exact pair only for a launcher-marked child.
+            self.agent.peer_directory_router = self._peer_router
+            self.agent.peer_requester = self._peer_requester
+            sender_id_resolver = (
+                process_resolver.directory_agent_id
+                if process_resolver is not None
+                else lambda _signing_did: None
+            )
+            install_a2a_inbound_sender_authorizer(
+                None,
+                recipient=self.agent,
+                sender_id_resolver=sender_id_resolver,
+            )
 
         # #1576: every outbound A2A dispatch writes a sender-side audit
         # row. The receiver-side ``a2a_tasks`` row tells us what the

@@ -177,6 +177,17 @@ def test_multi_agent_server_rejects_missing_out_of_band_host_key(monkeypatch):
         server._require_multi_agent_host_api_key(os.environ)
 
 
+def test_oauth_only_multi_agent_server_does_not_require_api_key(monkeypatch):
+    """Required OAuth is a complete sovereign host-authentication lane."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    assert server._require_multi_agent_host_api_key(os.environ) == ""
+
+
 @pytest.mark.asyncio
 async def test_multi_agent_lifespan_checks_host_key_before_starting_resources(
     monkeypatch,

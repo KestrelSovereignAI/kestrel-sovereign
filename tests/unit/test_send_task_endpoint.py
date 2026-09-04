@@ -1523,3 +1523,20 @@ def test_require_signed_rejects_unsigned_403(app_with_send, monkeypatch):
 
     assert resp.status_code == 403
     agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_transport_only_process_rejects_unsigned_without_feature_policy(
+    app_with_send,
+    monkeypatch,
+):
+    """A missing or failed Peers feature cannot reopen unsigned A2A."""
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_ONLY", "true")
+    agent = _stub_agent()
+    agent.a2a_did_resolver = None
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=_body())
+
+    assert resp.status_code == 403
+    agent.task_manager.create_task.assert_not_awaited()

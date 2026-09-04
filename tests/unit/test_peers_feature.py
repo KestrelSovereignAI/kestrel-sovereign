@@ -1,11 +1,22 @@
 """Direct contracts for the Peers feature."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.a2a.did_registry import (
+    A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+    A2A_PEER_STABLE_AGENT_ID_FIELD,
+)
+from kestrel_sovereign.a2a.inbound_authorization import (
+    has_a2a_inbound_scoped_policy,
+)
+from kestrel_sovereign.endpoints.agent import (
+    _a2a_inbound_requires_verified_sender,
+)
 from kestrel_sovereign.features.peers.feature import (
     MAX_OUTBOUND_ARTIFACT_BYTES,
     PeersFeature,
@@ -17,6 +28,66 @@ def test_discover_host_url_from_env(monkeypatch):
     monkeypatch.setenv("KESTREL_HOST_URL", "http://localhost:9999/")
 
     assert _discover_host_url() == "http://localhost:9999"
+
+
+@pytest.mark.asyncio
+async def test_managed_subprocess_installs_scoped_inbound_policy(monkeypatch):
+    """A fleet child transport key is admission, never sender authority."""
+
+    monkeypatch.setenv("KESTREL_HOST_URL", "http://localhost:9999")
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_ONLY", "true")
+    signing_did = "did:web:example.test:claw"
+    monkeypatch.setenv(
+        A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+        json.dumps(
+            [
+                {
+                    "id": signing_did,
+                    "verificationMethod": [
+                        {
+                            "id": f"{signing_did}#key-1",
+                            "controller": signing_did,
+                            "publicKeyMultibase": "zTest",
+                        }
+                    ],
+                    A2A_PEER_STABLE_AGENT_ID_FIELD: "did:test:claw",
+                }
+            ]
+        ),
+    )
+    agent = SimpleNamespace(
+        _agent_name="ivy",
+        did="did:test:ivy",
+        peer_directory_router=None,
+        peer_requester=None,
+    )
+    feature = PeersFeature(agent)
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.ensure_a2a_transport_key",
+        return_value="peer-transport-key",
+    ), patch(
+        "kestrel_sovereign.features.storage_access.resolve_feature_database",
+        return_value=None,
+    ):
+        await feature.initialize()
+
+    authorizer = getattr(agent, "a2a_inbound_sender_authorizer", None)
+    assert has_a2a_inbound_scoped_policy(agent) is True
+    assert authorizer is not None
+    assert authorizer.requires_verified_sender is True
+    assert _a2a_inbound_requires_verified_sender(agent, authorizer) is True
+
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = _mock_directory_response()
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        assert await authorizer.authorize(signing_did) is True
+        assert await authorizer.authorize("did:web:example.test:outsider") is False
 
 
 @pytest.mark.asyncio

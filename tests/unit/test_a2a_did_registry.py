@@ -15,6 +15,7 @@ from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV,
     A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
     A2A_PEER_IDENTITY_ROOTS_ENV,
+    A2A_PEER_STABLE_AGENT_ID_FIELD,
     HostA2ADidResolver,
     ProcessA2ADidResolver,
     ProcessA2ADidResolverConfigurationError,
@@ -275,6 +276,24 @@ def test_process_registry_resolves_launcher_attested_successor_material():
     assert document["verificationMethod"] == (
         sender.identity.new_verification_methods
     )
+
+
+def test_process_registry_maps_signing_did_to_attested_stable_agent_id():
+    sender, _ = _hybrid_agent(DID_A)
+    stable_agent_id = "did:pkh:eip155:1:0xstable"
+    attested = {
+        "id": DID_A,
+        "verificationMethod": sender.identity.new_verification_methods,
+        A2A_PEER_STABLE_AGENT_ID_FIELD: stable_agent_id,
+    }
+
+    resolver = ProcessA2ADidResolver((attested,))
+
+    assert resolver.directory_agent_id(DID_A) == stable_agent_id
+    assert resolver.directory_agent_id("did:web:example.test:unknown") is None
+    # The internal launcher binding is not part of the DID document passed to
+    # the cryptographic envelope verifier.
+    assert A2A_PEER_STABLE_AGENT_ID_FIELD not in resolver.resolve(DID_A)
 
 
 def test_process_registry_file_handoff_is_authenticated_and_one_shot(

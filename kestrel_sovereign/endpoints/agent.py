@@ -2510,8 +2510,14 @@ def _a2a_inbound_requires_verified_sender(agent, authorizer) -> bool:
     from kestrel_sovereign.a2a.inbound_authorization import (
         has_a2a_inbound_scoped_policy,
     )
+    from kestrel_sovereign.a2a.transport_auth import (
+        is_a2a_transport_only_process,
+    )
 
-    if has_a2a_inbound_scoped_policy(agent):
+    if (
+        is_a2a_transport_only_process()
+        or has_a2a_inbound_scoped_policy(agent)
+    ):
         return True
     if authorizer is not None:
         try:
