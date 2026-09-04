@@ -5316,6 +5316,17 @@ class KestrelAgent(
                 with self.committed_feature_transition_cognition():
                     await ready_hook(self)
             except (Exception, asyncio.CancelledError) as exc:
+                # A hook may await a child task that was cancelled on its own;
+                # ready hooks remain best-effort in that case.  Cancellation of
+                # this transition task itself is different: swallowing it would
+                # let the enable endpoint report success after its caller left.
+                transition_task = asyncio.current_task()
+                if (
+                    isinstance(exc, asyncio.CancelledError)
+                    and transition_task is not None
+                    and transition_task.cancelling()
+                ):
+                    raise
                 logging.warning(
                     "on_agent_ready failed for %s during re-enable: %s",
                     getattr(feature, "name", type(feature).__name__),

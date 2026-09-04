@@ -758,6 +758,60 @@ async def test_reenable_on_agent_ready_failure_is_non_fatal(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reenable_ready_hook_owner_cancellation_propagates(tmp_path):
+    """Cancelling the transition itself must not look like a hook-owned failure."""
+
+    agent = _agent(tmp_path)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            started.set()
+            await release.wait()
+
+    feature = BlockingReadyFeature(agent)
+    await _boot_feature(agent, feature)
+    await agent._unregister_feature_runtime(feature, unload=False)
+
+    transition = asyncio.create_task(agent._activate_feature_runtime(feature))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    transition.cancel("runtime enable caller cancelled")
+    try:
+        with pytest.raises(asyncio.CancelledError, match="runtime enable caller cancelled"):
+            await transition
+    finally:
+        release.set()
+
+    # Ready runs only after commit, so cancellation propagates without rolling
+    # back the already-live generation.
+    assert feature.enabled is True
+    assert all(_live_registrations(agent, feature).values())
+
+
+@pytest.mark.asyncio
+async def test_reenable_ready_hook_child_cancellation_is_non_fatal(tmp_path):
+    """A hook-owned cancelled child remains a best-effort ready-hook failure."""
+
+    agent = _agent(tmp_path)
+
+    class ChildCancelledReadyFeature(_FullFeature):
+        async def on_agent_ready(self, ready_agent):
+            child = asyncio.create_task(asyncio.sleep(0))
+            child.cancel("ready child cancelled")
+            await child
+
+    feature = ChildCancelledReadyFeature(agent)
+    await _boot_feature(agent, feature)
+    await agent._unregister_feature_runtime(feature, unload=False)
+
+    await agent._activate_feature_runtime(feature)
+
+    assert feature.enabled is True
+    assert all(_live_registrations(agent, feature).values())
+
+
+@pytest.mark.asyncio
 async def test_boot_ready_hook_waits_until_host_context_is_published(tmp_path):
     """A readiness hook may await cognition without circular startup waiting."""
 
