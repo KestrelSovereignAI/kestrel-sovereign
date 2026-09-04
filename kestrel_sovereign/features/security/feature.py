@@ -1209,10 +1209,12 @@ class SecurityFeature(Feature):
         paired ``<tool>.outcome`` row exists that is what carries the result.
 
         What the disclosure ceiling actually is: ``args_summary`` was masked
-        and truncated by ``summarize_args`` when it was written, and
-        ``GET /api/security/audit`` already returns that same value verbatim.
-        Nothing here widens what was persisted. The masking is a key-name
-        heuristic, so it is a good filter and not a guarantee.
+        and truncated by ``summarize_args`` when it was written, and both of
+        the store's read paths — this one and ``GET /api/security/audit`` —
+        re-mask it on the way out, so a row an older or foreign writer stored
+        raw is masked wherever it is read. Nothing here widens what was
+        persisted. The masking is a key-name heuristic, so it is a good
+        filter and not a guarantee.
 
         The truncation is 500 characters, but was **200** on the
         ``SecurityHook`` path until that override was removed — so rows written

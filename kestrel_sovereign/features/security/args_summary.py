@@ -37,6 +37,8 @@ SENSITIVE_KEY_SUBSTRINGS = (
 
 #: What ``summarize_args`` appends when it cuts a row; stripped before repair.
 _TRUNCATION_MARK = "..."
+#: A JSON key position (``"...":``) — the one shape that can carry a secret.
+_KEY_POSITION = re.compile(r'"\s*:')
 #: Trailing characters repair may drop to reach a parseable cut point: a cut
 #: inside a ``\\uXXXX`` escape needs up to six, a bare literal (``tru``) four.
 _MAX_REPAIR_TRIM = 8
@@ -149,9 +151,16 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
     if not starts:
         return text, None
     for start in starts:
+        prefix = text[:start]
+        if _KEY_POSITION.search(prefix):
+            # Text before this candidate carries a key position — an earlier
+            # JSON region that did not repair, or JSON-shaped prose. It would
+            # be handed back RAW as the prefix, shown and searchable; the row
+            # is withheld instead (round 17 review).
+            return None
         parsed = complete_truncated_json(text[start:])
         if parsed is not None:
-            return text[:start], mask_sensitive(parsed)
+            return prefix, mask_sensitive(parsed)
     return None
 
 
@@ -226,8 +235,8 @@ def remask_summary(summary: Optional[str]) -> Optional[str]:
     corpus ~30% of rows with arguments are unparseable, the long-issue-body
     filings that motivated this tool among them; withholding all of them
     degraded the read-back to what ``security_audit`` already gave. A value
-    cannot appear without its key, so masking from each sensitive key through
-    the end of its value is exactly as strong as field-by-field masking.
+    cannot appear without its key, and a repaired row is masked by key
+    position exactly as a parseable one is — field by field, one masker.
     """
     if not summary:
         return summary

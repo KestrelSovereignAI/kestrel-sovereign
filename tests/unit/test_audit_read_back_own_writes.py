@@ -1100,12 +1100,12 @@ async def test_a_legacy_unmasked_secret_is_masked_on_the_way_out(store):
     assert "sk-live-LEGACY-LEAK" not in shown
     assert "***MASKED***" in shown and "orphaned" in shown
 
-    # The operator's existing surface, get_audit_log (/api/security/audit),
-    # is untouched: it returns what is stored, as it always has.
+    # The store's OTHER read path over the same column, get_audit_log
+    # (/api/security/audit), masks too: "one door in the store" is only true
+    # if both doors do (round 17 review).
     recent = await store.get_audit_log(limit=5)
-    assert any("sk-live-LEGACY-LEAK" in (r.get("args_summary") or "") for r in recent), (
-        "get_audit_log's behaviour must not change under this ticket"
-    )
+    assert recent and all("sk-live-LEGACY-LEAK" not in (r.get("args_summary") or "") for r in recent)
+    assert any("***MASKED***" in (r.get("args_summary") or "") for r in recent)
 
 
 @pytest.mark.asyncio
@@ -2099,3 +2099,35 @@ def test_a_row_whose_json_cannot_be_repaired_is_withheld_not_shown_raw():
     broken = '{"api_key": "sk-live-LEAK"] "memo": "orphaned worker"'   # misnested: no repair
     assert remask_summary(broken) == "(summary truncated past repair; not shown)"
     assert fold_stored_summary(broken) == ""
+
+
+# --------------------------------------------------------------------------
+# Round 18: the prefix before a repairable region is never handed back raw;
+# both store read paths mask.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_unrepairable_region_before_a_repairable_one_is_withheld(tmp_path):
+    """The repair loop scanned up to eight bracket positions and returned the
+    text before the first one that repaired RAW — including an earlier JSON
+    region that did not repair: shown verbatim, and walked out by hit/no-hit."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = '{"api_key": "sk-live-LEAK"] trailing {"b": 1}'
+    assert remask_summary(row) == "(summary truncated past repair; not shown)"
+    assert fold_stored_summary(row) == ""
+
+    store = PermissionStore(str(tmp_path / "two-regions.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="Legacy", tool_name="t", action="tool_execution",
+        decision="auto_mode_allowed", args_summary=row,
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    for probe in ("sk-live-L", "sk-live-LEAK", "trailing"):
+        assert (await feature.security_audit_search(query=probe)).data["count"] == 0, probe
+    # A prose prefix with no key position still keeps its embedded JSON.
+    assert "***MASKED***" in remask_summary('refused [wallet] | args={"api_key": "sk-LEAK", "m": "x"')

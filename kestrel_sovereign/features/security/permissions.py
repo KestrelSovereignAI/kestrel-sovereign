@@ -67,11 +67,14 @@ def fold_stored_summary(text):
 
     A truncated summary is not valid JSON — ``summarize_args`` cuts at 500
     characters mid-structure — and those are exactly the long issue bodies the
-    motivating case searches. Falling back to the raw text there would leave
-    every escape undecoded and reintroduce the bug one row-shape over, so the
-    fallback unescapes ``\\uXXXX`` directly instead. Returning nothing for an
-    unparseable row is not an option either: it would silently shrink the
-    corpus the caller believes it searched.
+    motivating case searches. Folding the raw text there would leave every
+    escape undecoded and reintroduce the bug one row-shape over, so the
+    fallback repairs the cut JSON and parses it, which decodes the escapes
+    inside it the same way the parseable branch does; a prose-only row (no
+    JSON at all) is folded as written. Returning nothing for every unparseable
+    row is not an option either: it would silently shrink the corpus the
+    caller believes it searched — only a row whose JSON cannot be repaired is
+    withheld, because it cannot be masked.
     """
     if not text:
         return text
@@ -1192,7 +1195,10 @@ class PermissionStore:
                 "action": row["action"],
                 "decision": row["decision"],
                 "user_choice": row["user_choice"],
-                "args_summary": row["args_summary"],
+                # Re-masked here too: this is the store's OTHER read path over
+                # the same column (/api/security/audit), and "one door in the
+                # store" is only true if both doors mask (round 17 review).
+                "args_summary": remask_summary(row["args_summary"]),
                 "timestamp": row["created_at"],
             }
             for row in rows
@@ -1242,8 +1248,10 @@ class PermissionStore:
         #
         # So neither side is compared raw. ``py_fold`` (registered on the
         # connection) decodes the JSON escaping and casefolds, and both the
-        # column and the needle go through it. Measured at 187 ms for a full
-        # scan of 86,000 rows — this table has no index for LIKE anyway.
+        # column and the needle go through it. Measured 2026-09-03 at about
+        # 0.7 s for a full scan of 86,000 rows with an eighth of them
+        # truncated (repair costs more than a parse), and under 2 s if every
+        # row is — this table has no index for LIKE anyway.
         clauses = [
             (
                 "(py_fold(args_summary) LIKE ? ESCAPE '\\' "
@@ -1406,6 +1414,7 @@ class PermissionStore:
                 # disagreeing with itself about its own rows, and the next
                 # caller (an endpoint, another feature) would have leaked a
                 # legacy row the tool had been hiding (round 14 review).
+                # get_audit_log applies the same re-mask.
                 "args_summary": remask_summary(row["args_summary"]),
                 "timestamp": row["created_at"],
             }
