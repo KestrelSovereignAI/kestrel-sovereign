@@ -75,6 +75,8 @@ HTTP_SEGMENTS = {
     "bridge",
     "host",
     "auth",
+    # Process-wide credentials/configuration rather than an agent principal.
+    "github",
 }
 HTTP_EXACT_ROUTES = {
     "/health",
@@ -85,6 +87,10 @@ HTTP_EXACT_ROUTES = {
     "/api/agent/invoke",
     "/api/agent/stream",
     "/api/auth/key",
+    "/api/keys/platform",
+    "/api/keys/user",
+    "/api/keys/user/verify",
+    "/api/keys/user/{provider}",
     "/v1/chat/completions",
 }
 INDIRECT_DISPATCH_CALLS = {
@@ -605,6 +611,8 @@ def _route_methods(
     if not isinstance(decorator.func, ast.Attribute):
         return ()
     method = decorator.func.attr.lower()
+    if method in {"websocket", "websocket_route"}:
+        return ("WEBSOCKET",)
     if method in {
         "get",
         "post",
@@ -931,6 +939,13 @@ def test_app_level_host_authority_routes_are_discovered() -> None:
         "kestrel_sovereign/server.py::GET /health/detailed",
         "kestrel_sovereign/server.py::GET /phoenix",
         "kestrel_sovereign/server.py::GET /phoenix/{path:path}",
+        "kestrel_sovereign/endpoints/github.py::GET /api/github/repos",
+        "kestrel_sovereign/endpoints/github.py::GET /api/github/{path:path}",
+        "kestrel_sovereign/endpoints/models.py::GET /api/keys/platform",
+        "kestrel_sovereign/endpoints/models.py::GET /api/keys/user",
+        "kestrel_sovereign/endpoints/models.py::POST /api/keys/user",
+        "kestrel_sovereign/endpoints/models.py::POST /api/keys/user/verify",
+        "kestrel_sovereign/endpoints/models.py::DELETE /api/keys/user/{provider}",
     ):
         assert surface in discovered
 
@@ -959,6 +974,71 @@ def test_bootstrap_api_key_authority_matches_host_lifecycle_gate() -> None:
     assert "satisfies the current #3149 host-lifecycle gate" in row
     assert "create or withdraw hosted agents" in row
     assert "distinct from the constitutional sovereign signing key" in row
+
+
+def test_host_github_and_non_agent_key_principals_are_recorded() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+
+    github_matrix = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Use the host GitHub credential ")
+    )
+    assert "process-wide GitHub token" in github_matrix
+    assert "do not bind `get_agent`" in github_matrix
+
+    key_matrix = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Manage authenticated-user or platform service keys ")
+    )
+    assert "request.state.user_id" in key_matrix
+    assert "selected agent supplies only PostgreSQL connectivity" in key_matrix
+
+    for route in ("/api/github/repos", "/api/github/{path:path}"):
+        canonical = next(
+            line
+            for line in audit.splitlines()
+            if f"endpoints/github.py::GET {route}`" in line
+        )
+        assert "process-wide GitHub credential" in canonical
+
+        alias = next(
+            line
+            for line in audit.splitlines()
+            if "endpoints/github.py::GET "
+            f"/api/agents/{{selected_agent_name}}{route}`" in line
+        )
+        assert "H —" in alias
+        assert "selected-agent prefix" in alias
+
+    for method, route in (
+        ("DELETE", "/api/keys/user/{provider}"),
+        ("GET", "/api/keys/user"),
+        ("POST", "/api/keys/user"),
+        ("POST", "/api/keys/user/verify"),
+    ):
+        canonical = next(
+            line
+            for line in audit.splitlines()
+            if f"endpoints/models.py::{method} {route}`" in line
+        )
+        assert "request.state.user_id" in canonical
+
+        alias = next(
+            line
+            for line in audit.splitlines()
+            if "endpoints/models.py::"
+            f"{method} /api/agents/{{selected_agent_name}}{route}`" in line
+        )
+        assert "U —" in alias
+
+    platform = next(
+        line
+        for line in audit.splitlines()
+        if "endpoints/models.py::GET /api/keys/platform`" in line
+    )
+    assert "platform-global" in platform
 
 
 def test_canonical_host_authentication_routes_are_discovered() -> None:
@@ -1012,6 +1092,20 @@ def test_api_route_declarations_resolve_module_method_constants() -> None:
         "GET",
         "POST",
     )
+
+
+def test_websocket_declarations_are_inventoried_as_agent_addressable() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        '@router.websocket("/agents/{agent_name}/control")\n'
+        "async def control():\n    pass\n\n"
+        '@router.websocket_route("/agents/{agent_name}/events")\n'
+        "async def events():\n    pass\n"
+    )
+    assert _route_declarations(tree, {}, {}) == [
+        (("WEBSOCKET",), "/api/agents/{agent_name}/control"),
+        (("WEBSOCKET",), "/api/agents/{agent_name}/events"),
+    ]
 
 
 def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
@@ -1249,6 +1343,9 @@ def _identifier_tokens(node: ast.AST) -> set[str]:
             tokens.add(child.id.casefold())
         elif isinstance(child, ast.Attribute):
             tokens.add(child.attr.casefold())
+            tokens.add(ast.unparse(child).casefold())
+        elif isinstance(child, ast.Subscript):
+            tokens.add(ast.unparse(child).casefold())
         elif isinstance(child, ast.Constant) and isinstance(child.value, str):
             tokens.add(child.value.casefold())
     return tokens
@@ -1355,6 +1452,11 @@ def _provenance_aliases(
                 for element in target.elts
                 for name in target_names(element)
             }
+        if isinstance(target, (ast.Attribute, ast.Subscript)):
+            # Use the full access path rather than tainting broad bases such as
+            # ``self`` or ``state``. The same normalized path is emitted by
+            # ``_identifier_tokens`` when a later condition reads it.
+            return {ast.unparse(target).casefold()}
         return set()
 
     aliases: set[str] = set()
@@ -1669,6 +1771,16 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "    if request.causation_chain:\n"
         "        metadata['causation_chain'] = request.causation_chain\n"
     )
+    stateful_aliases = ast.parse(
+        "def dispatch(request, state):\n"
+        "    self.lineage = request.causation_chain\n"
+        "    if self.lineage:\n"
+        "        terminate_child(request.target)\n\n"
+        "def adapter(request, state):\n"
+        "    state['lineage'] = request.causation_chain\n"
+        "    if state['lineage']:\n"
+        "        cancel_task(request.target)\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
@@ -1691,6 +1803,7 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(unrelated_attribute_assignment) == set()
     assert _authority_provenance_lines(neutral_guarded_control) == {2, 6, 9}
     assert _authority_provenance_lines(propagation_only_guard) == set()
+    assert _authority_provenance_lines(stateful_aliases) == {3, 8}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:

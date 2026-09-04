@@ -66,6 +66,8 @@ narrow, revocable, signed delegation.
 | Bootstrap host API credential | `GET /api/auth/key` | The host-wide API authentication boundary | Public-localhost provisioning exception that yields runtime sovereign authority | The endpoint is disabled unless bootstrap policy enables it, restricts callers to loopback/Docker gateway/explicit allowed hosts, and is rate-limited. It returns the host API key. Runtime authentication maps that key to `CallerRole.SOVEREIGN`, so it satisfies the current #3149 host-lifecycle gate and can create or withdraw hosted agents. The API key remains distinct from the constitutional sovereign signing key; bootstrap policy is nevertheless a path to host administration. This classification is reconciled with `docs/audit/AUTH_SURFACE_MATRIX.md`. |
 | Authenticate a host user / inspect credentials | `/auth/login`, `/auth/callback`, `/auth/logout`, `/auth/token`, `/auth/me`, `/auth/verify` | The host-wide OAuth session or JWT authentication boundary | Outside agent hierarchy; configured human authentication | Login, callback, logout, and token are self-authenticating entrypoints; token issuance is allowlist/password checked and rate-limited. `me` and `verify` first require central host authentication and apply their endpoint semantics. A synthesized `/api/agents/{name}/auth/*` prefix is host-authenticated by the outer middleware and does not make these host credential handlers target-agent-local or confer relation authority. This classification is reconciled with `docs/audit/AUTH_SURFACE_MATRIX.md`. |
 | Read host UI state / issue browser tokens | `GET /api/host/ui/contributions`; `GET /api/host/csrf`; `POST /api/host/phoenix/session` | Shared host UI manifest, CSRF token, or Phoenix embed session | Host-authenticated external operation | Central API-key/JWT/session middleware protects these app-level routes. The CSRF token is a double-submit value rather than standalone authority; the Phoenix route mints a short-lived path-scoped cookie only after host authentication and backend reachability. |
+| Use the host GitHub credential | `GET /api/github/repos`; `GET /api/github/{path:path}` | Repositories visible to the process-wide GitHub token and host configuration | Outside agent hierarchy; host-authenticated external operation | Global authentication protects both routes. The handlers do not bind `get_agent`; repository allowlisting constrains the process-wide token. A synthesized selected-agent prefix therefore remains host-scoped and grants no agent relation authority. |
+| Manage authenticated-user or platform service keys | `/api/keys/user*`; `GET /api/keys/platform` | The authenticated user's BYOK namespace, or the platform-global key catalog | Outside agent hierarchy; authenticated-user or host policy | User-key handlers key storage on the request-context `request.state.user_id` principal; the selected agent supplies only PostgreSQL connectivity. Missing platform/user context makes the routes unavailable. The platform catalog is host-global, so neither family becomes agent-local when reached through a selected-agent prefix. |
 | Read host/fleet health or process metrics | `GET /health`; `GET /health/detailed`; `GET /metrics` | Public aggregate readiness, authenticated per-agent fleet diagnostics, or public process-wide Prometheus telemetry | Outside agent hierarchy; deployment/operator observation policy | `/health` intentionally exposes only aggregate readiness and `/metrics` is an explicitly public scraper surface. Global authentication protects `/health/detailed`, whose multi-agent response names agents and their checks. None of these observations creates control authority. |
 | Use the Phoenix trace proxy | All registered methods on `/phoenix` and `/phoenix/{path:path}` | The shared host Phoenix trace store | Outside agent hierarchy; host-authenticated external operation | Global authentication accepts a host session/API key or the short-lived path-scoped embed cookie. The route proxies fleet-scoped trace data but does not grant one agent authority over another. Symbolic `api_route(methods=...)` declarations are expanded by the contract scanner. |
 | Read observability summaries/metrics | `GET /api/observability/summary`; `GET /api/observability/metrics/{metric_name}` | The routed agent's events only | Self | A per-agent SQLite store happens to isolate the data, but shared PostgreSQL queries omit the trusted agent predicate and the metrics route accepts an arbitrary optional `agent_name`. Defect: [#3215](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3215). |
@@ -415,12 +417,14 @@ outside core and must define their own operator policy.
 
 ## Machine-checked HTTP inventory
 
-This inventory includes canonical routes and the live #871 `/agent/*`
+This inventory includes canonical HTTP routes and the live #871 `/agent/*`
 compatibility spellings synthesized from every `/api/agent/*` declaration.
 The compatibility middleware rewrites those deprecated entry doors before
 downstream authentication and FastAPI dispatch, so they carry the same
 authority classification as the canonical handler and cannot be omitted merely
-because no second decorator declares them.
+because no second decorator declares them. In-tree `websocket` and
+`websocket_route` declarations are represented as `WEBSOCKET`; the exact-set
+contract therefore also fails on a new live WebSocket until it is classified.
 
 | Surface ID | Classification |
 |---|---|
@@ -486,7 +490,14 @@ because no second decorator declares them.
 | `kestrel_sovereign/endpoints/features.py::GET /api/features/{name}/skills` | Request-routed agent skill discovery; not a cross-agent grant. |
 | `kestrel_sovereign/endpoints/files.py::GET /api/agent/channels/{channel_type}/link-qr.png` | Host-authenticated channel-link QR read from the request-routed agent. |
 | `kestrel_sovereign/endpoints/files.py::GET /agent/channels/{channel_type}/link-qr.png` | Deprecated compatibility channel-link QR read from the request-routed agent. |
+| `kestrel_sovereign/endpoints/github.py::GET /api/github/repos` | Host-authenticated access through the process-wide GitHub credential and repository allowlist; no agent principal is bound. |
+| `kestrel_sovereign/endpoints/github.py::GET /api/github/{path:path}` | Host-authenticated, repository-scoped proxy through the process-wide GitHub credential; no agent principal is bound. |
 | `kestrel_sovereign/endpoints/metrics.py::GET /metrics` | Explicitly public, process-wide Prometheus telemetry; observation grants no control authority. |
+| `kestrel_sovereign/endpoints/models.py::DELETE /api/keys/user/{provider}` | Authenticated-user-scoped BYOK mutation keyed by `request.state.user_id`; the routed agent supplies PostgreSQL connectivity only. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/keys/platform` | Host-authenticated read of the platform-global key catalog; the routed agent supplies PostgreSQL connectivity only. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/keys/user` | Authenticated-user-scoped BYOK read keyed by `request.state.user_id`; the routed agent supplies PostgreSQL connectivity only. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/keys/user` | Authenticated-user-scoped BYOK mutation keyed by `request.state.user_id`; the routed agent supplies PostgreSQL connectivity only. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/keys/user/verify` | Authenticated-user-scoped passphrase verification keyed by `request.state.user_id`; the routed agent supplies PostgreSQL connectivity only. |
 | `kestrel_sovereign/endpoints/models.py::POST /v1/chat/completions` | Host-authenticated external invocation of the request-routed agent; message/user fields are not hierarchy authority. |
 | `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{agent_name}` | Sovereign/delegated host lifecycle; #3149. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents` | Authenticated read-only host discovery. |
@@ -527,7 +538,7 @@ because no second decorator declares them.
 The host routing middleware accepts
 `/api/agents/{selected_agent_name}/{remaining_path}` and rewrites the remainder before
 FastAPI dispatch. The table therefore spells the synthesized alias for every
-decorated core HTTP route, including handlers that do not consume `Request`
+decorated core HTTP or WebSocket route, including handlers that do not consume `Request`
 and routes whose canonical spelling contains no agent-shaped word. The
 canonical root is excluded because the router regex requires a non-empty
 remainder. Authentication sees the
@@ -540,7 +551,8 @@ Classification codes: **A** = sovereign/operator-authenticated,
 target-agent-local read or mutation, with routing selecting the target but
 granting no hierarchy authority;
 **H** = host/fleet handler whose explicit operator policy ignores agent
-selection as authority; **W** = configured webhook ingress policy, whose auth
+selection as authority; **U** = authenticated-user namespace whose
+`request.state.user_id` principal ignores agent selection; **W** = configured webhook ingress policy, whose auth
 and rate limits apply only when configured (explicit open/unlimited modes are
 not described as enforced); **D-n** =
 known focused defect n.
@@ -610,15 +622,15 @@ known focused defect n.
 | `kestrel_sovereign/endpoints/files.py::GET /api/agents/{selected_agent_name}/api/agent/channels/{channel_type}/link-qr.png` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/files.py::GET /api/agents/{selected_agent_name}/api/files/{content_hash}` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/files.py::HEAD /api/agents/{selected_agent_name}/api/files/{content_hash}` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/github.py::GET /api/agents/{selected_agent_name}/api/github/repos` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/github.py::GET /api/agents/{selected_agent_name}/api/github/{path:path}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/github.py::GET /api/agents/{selected_agent_name}/api/github/repos` | H — process-wide GitHub credential/configuration; the selected-agent prefix grants no target-local authority. |
+| `kestrel_sovereign/endpoints/github.py::GET /api/agents/{selected_agent_name}/api/github/{path:path}` | H — process-wide GitHub credential/configuration; the selected-agent prefix grants no target-local authority. |
 | `kestrel_sovereign/endpoints/memories.py::DELETE /api/agents/{selected_agent_name}/api/memories/{node_id}` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/memories.py::GET /api/agents/{selected_agent_name}/api/identity-chain` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/memories.py::GET /api/agents/{selected_agent_name}/api/memories` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/memories.py::GET /api/agents/{selected_agent_name}/api/memories/{node_id}` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/metrics.py::GET /api/agents/{selected_agent_name}/metrics` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{selected_agent_name}/api/agents/{agent_name}` | H — host/fleet discovery or lifecycle; #3149 policy enforces mutations. |
-| `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{selected_agent_name}/api/keys/user/{provider}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{selected_agent_name}/api/keys/user/{provider}` | U — authenticated-user BYOK principal from `request.state.user_id`; agent selection only supplies PostgreSQL connectivity. |
 | `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{selected_agent_name}/api/keys/{provider}` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/agents` | H — host/fleet discovery or lifecycle; #3149 policy enforces mutations. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/constitution` | A — target-local policy remains enforcement. |
@@ -629,8 +641,8 @@ known focused defect n.
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/ipfs/status` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/available-sources` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/platform` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/user` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/platform` | H — platform-global key catalog; agent selection only supplies PostgreSQL connectivity. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/user` | U — authenticated-user BYOK principal from `request.state.user_id`; agent selection only supplies PostgreSQL connectivity. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/{provider}/usage` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/model/current` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/models` | A — target-local policy remains enforcement. |
@@ -646,8 +658,8 @@ known focused defect n.
 | `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/identity/avatar` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/identity/avatar/generate` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys/user` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys/user/verify` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys/user` | U — authenticated-user BYOK principal from `request.state.user_id`; agent selection only supplies PostgreSQL connectivity. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys/user/verify` | U — authenticated-user BYOK principal from `request.state.user_id`; agent selection only supplies PostgreSQL connectivity. |
 | `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/model/set` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/v1/chat/completions` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/models.py::PUT /api/agents/{selected_agent_name}/api/embedding/route-model` | A — target-local policy remains enforcement. |
