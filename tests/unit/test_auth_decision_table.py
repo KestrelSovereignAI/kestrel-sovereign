@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.middleware.sessions import SessionMiddleware
 
+from kestrel_sovereign.auth import normalize_api_key
 from kestrel_sovereign.server import auth_middleware
 
 
@@ -104,6 +105,36 @@ def test_bootstrap_key_is_localhost_only_when_enabled():
         assert denied_response.status_code == 403
     finally:
         _restore_app(app, original)
+
+
+def test_quoted_empty_api_key_cannot_authenticate_an_empty_bearer():
+    """Docker's literal quote characters must not turn empty into a key."""
+
+    app = FastAPI()
+    app.middleware("http")(auth_middleware)
+
+    @app.get("/protected")
+    async def protected(request: Request):
+        return {"role": request.state.caller.role.value}
+
+    with patch.dict(
+        "os.environ",
+        {"KESTREL_API_KEY": '""', "KESTREL_REQUIRE_OAUTH": "false"},
+    ):
+        with TestClient(app) as client:
+            response = client.get(
+                "/protected",
+                headers={"Authorization": "Bearer "},
+            )
+        generated_key = os.environ["KESTREL_API_KEY"]
+
+    assert response.status_code == 401
+    assert generated_key not in ("", '""')
+
+
+def test_normalize_api_key_treats_quoted_empty_as_absent():
+    assert normalize_api_key('""') is None
+    assert normalize_api_key("''") is None
 
 
 def test_managed_peer_process_cannot_bootstrap_or_use_sovereign_key():

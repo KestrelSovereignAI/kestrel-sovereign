@@ -12,8 +12,11 @@ def normalize_api_key(value: Optional[str]) -> Optional[str]:
         return None
     # Docker ``--env-file`` retains matching surrounding quotes literally.
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-        return value[1:-1]
-    return value
+        value = value[1:-1]
+    # Callers use ``None`` as the canonical "no credential" state. Returning
+    # an empty string here would let a literal Docker env-file value of ``""``
+    # compare equal to an empty bearer token after normalization.
+    return value or None
 
 
 def required_oauth_is_configured(environ: Mapping[str, str]) -> bool:

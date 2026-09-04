@@ -574,14 +574,14 @@ def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
 
 def get_api_key():
     """Get or generate the API key."""
-    api_key = os.environ.get("KESTREL_API_KEY")
+    api_key = normalize_api_key(os.environ.get("KESTREL_API_KEY"))
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
-    return normalize_api_key(api_key)
+    return api_key
 
 
 async def verify_api_key(
