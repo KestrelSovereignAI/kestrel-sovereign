@@ -106,7 +106,9 @@ boundary, and the registration/execution boundaries for non-feature dynamic
 tools such as MCP tools. Cross-agent capability is a property of the
 implementation and deployment, not a public-name convention: exact inventory
 of the complete registered set prevents a shared-host mutation from hiding
-behind an innocuous name. False positives remain explicitly classified. The
+behind an innocuous name. Direct writes to the runtime tool registry are also
+discovered, including the ephemeral constitution-receipt tool. False positives
+remain explicitly classified. The
 inventory therefore also includes generic `execute_skill`, `execute_named_tool`, and
 `_create_schedule` dispatchers; those meta-tools can reach an
 authority-bearing target even when their own names contain no relation or
@@ -120,6 +122,8 @@ method inventory and target-specific authority.
 | `kestrel_sovereign/agent/orchestrator_engine.py::_dispatch_direct_tool` | Generic governed execution boundary for runtime-registered direct tools. PRE/POST_TOOL_USE and ordinary tool permission checks still apply, but the owning non-feature provider must inventory and enforce target-specific relation authority. |
 | `kestrel_sovereign/agent/orchestrator_engine.py::execute_named_tool` | Generic transport-neutral dispatcher that can resolve runtime-registered direct tools as well as feature tools. Dispatch supplies governance hooks, not relation authority; the selected tool retains its target-specific gate. |
 | `kestrel_sovereign/agent/tool_registry.py::register_dynamic_tools` | Generic publication boundary for arbitrary runtime tool names, including MCP providers. The registry defaults unknown tools to ASK but cannot infer target authority; provider-owned controls require their own exact inventory and enforcement. |
+| `kestrel_sovereign/kestrel_agent.py::KestrelAgent._handle_constitution_receipt_tool` | Execution boundary for the ephemeral constitution-receipt canary. It records exact system-prompt receipt for one local cognition turn and grants no agent relation authority. |
+| `kestrel_sovereign/kestrel_agent.py::KestrelAgent.register_constitution_receipt_tool` | Direct publication boundary for the ephemeral constitution-receipt canary. The dispatcher owns its expected value and lifetime; publication grants no peer, parent, or host authority. |
 | `kestrel_sovereign/features/base.py::Feature.get_tools.DynamicTool.execute` | Generic runtime wrapper for the separately inventoried core `@tool` methods; it introduces no target authority and the wrapped method retains its target-specific gate. |
 | `kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool` | Generic high-level dispatcher registered once per visible feature, including `deploy_feature` and `restart_coordinator_feature`. PRE_SUBAGENT_CALL/PRE_TOOL_USE are operational consent gates, not relation authority; the selected downstream method retains its target-specific authority requirement and known defects #3223/#3148. |
 | `kestrel_sovereign/features/isolated_runtime.py::IsolatedFeatureTool.execute` | Generic forwarding boundary for runtime-advertised out-of-tree tools. Core preserves ordinary tool governance but cannot infer relation authority from child metadata; the owning feature must inventory and enforce every target-specific authority boundary. |

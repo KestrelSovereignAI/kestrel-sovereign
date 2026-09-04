@@ -110,7 +110,8 @@ INDIRECT_DISPATCH_CALLS = {
 }
 SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/"
-    r"(?:server\.py::[^`]+|(?:agent|features|host_features|endpoints|signals)/[^`]+))`\s*\|"
+    r"(?:(?:server|kestrel_agent)\.py::[^`]+|"
+    r"(?:agent|features|host_features|endpoints|signals)/[^`]+))`\s*\|"
 )
 COMMAND_SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/command_handler\.py::![^`]+)`\s*\|"
@@ -165,20 +166,19 @@ def _imported_module_path(node: ast.ImportFrom, source_path: Path) -> Path | Non
     return package_file if package_file.is_file() else None
 
 
-def _module_string_constants(
+def _module_constant_bindings(
     tree: ast.Module,
     source_path: Path | None = None,
-) -> dict[str, str]:
-    """Resolve static strings in module execution order, including imports.
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    """Replay scalar-string and string-collection bindings together.
 
-    Replaying assignments once in source order both matches Python's runtime
-    semantics and prevents two assignments to the same name from oscillating
-    forever in a fixed-point loop.  An unresolved reassignment invalidates an
-    earlier value so later route discovery fails closed rather than using a
-    stale string.
+    Collections capture their element values when their assignment executes.
+    Resolving them against a separately computed final scalar map would rewrite
+    that history when an element name is rebound later.
     """
 
-    constants: dict[str, str] = {}
+    strings: dict[str, str] = {}
+    collections: dict[str, tuple[str, ...]] = {}
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and source_path is not None:
             imported_path = _imported_module_path(node, source_path)
@@ -187,7 +187,7 @@ def _module_string_constants(
             imported_constants = _cached_local_string_constants(imported_path)
             for alias in node.names:
                 if alias.name in imported_constants:
-                    constants[alias.asname or alias.name] = imported_constants[
+                    strings[alias.asname or alias.name] = imported_constants[
                         alias.name
                     ]
             continue
@@ -199,15 +199,66 @@ def _module_string_constants(
             value = node.value
         else:
             continue
-        resolved = _resolved_string(value, constants) if value is not None else None
+        resolved_string = (
+            _resolved_string(value, strings) if value is not None else None
+        )
+        resolved_collection: tuple[str, ...] | None = None
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            elements = tuple(
+                _resolved_string(element, strings) for element in value.elts
+            )
+            if all(element is not None for element in elements):
+                resolved_collection = tuple(
+                    element for element in elements if element is not None
+                )
         for target in targets:
             if not isinstance(target, ast.Name):
                 continue
-            if resolved is None:
-                constants.pop(target.id, None)
+            if resolved_string is None:
+                strings.pop(target.id, None)
             else:
-                constants[target.id] = resolved
-    return constants
+                strings[target.id] = resolved_string
+            if resolved_collection is None:
+                collections.pop(target.id, None)
+            else:
+                collections[target.id] = resolved_collection
+    return strings, collections
+
+
+def _module_string_constants(
+    tree: ast.Module,
+    source_path: Path | None = None,
+) -> dict[str, str]:
+    """Resolve static strings in module execution order, including imports."""
+
+    return _module_constant_bindings(tree, source_path)[0]
+
+
+def _module_strings_at_definition(
+    tree: ast.Module,
+    definition: ast.FunctionDef | ast.AsyncFunctionDef,
+    source_path: Path | None = None,
+) -> dict[str, str]:
+    """Resolve globals as they existed when a decorator executed.
+
+    Top-level functions and methods of a top-level class are decorated while
+    that containing module statement executes. A nested function instead runs
+    only when its outer function is called, after module initialization, so it
+    retains the final module bindings used by the prior scanner.
+    """
+
+    for index, statement in enumerate(tree.body):
+        executes_during_statement = statement is definition or (
+            isinstance(statement, ast.ClassDef)
+            and definition in statement.body
+        )
+        if executes_during_statement:
+            preceding = ast.Module(
+                body=tree.body[:index],
+                type_ignores=[],
+            )
+            return _module_string_constants(preceding, source_path)
+    return _module_string_constants(tree, source_path)
 
 
 @lru_cache(maxsize=None)
@@ -327,10 +378,10 @@ def _discovered_tool_surfaces() -> set[str]:
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
     for path in feature_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        string_constants = _module_string_constants(tree, path)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+            string_constants = _module_strings_at_definition(tree, node, path)
             for decorator in node.decorator_list:
                 public_name = _public_tool_name(
                     decorator, node.name, string_constants
@@ -538,6 +589,77 @@ def _discovered_runtime_generated_tool_surfaces() -> set[str]:
             )
         relative = path.relative_to(REPO_ROOT).as_posix()
         surfaces.update(f"{relative}::{name}" for name in discovered_names)
+
+    # Most runtime tools enter through ``register_dynamic_tools``, but any
+    # direct write to ``_direct_tools`` is an equally real publication door.
+    # Discover writers structurally so a new one cannot bypass this inventory
+    # by using a special-purpose tool name or execution path.
+    direct_writers: set[str] = set()
+
+    class DirectToolWriterVisitor(ast.NodeVisitor):
+        def __init__(self, relative: str) -> None:
+            self.relative = relative
+            self.scope: list[str] = []
+
+        def _visit_definition(
+            self,
+            node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> None:
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            self._visit_definition(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self._visit_definition(node)
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            self._visit_definition(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+            writes_registry = any(
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Attribute)
+                and target.value.attr == "_direct_tools"
+                for target in node.targets
+            )
+            if writes_registry and self.scope:
+                qualified = ".".join(self.scope)
+                # Preserve the pre-existing generic boundary ID while using a
+                # qualified ID for any special writer discovered elsewhere.
+                if self.scope[-1] == "register_dynamic_tools":
+                    qualified = self.scope[-1]
+                direct_writers.add(f"{self.relative}::{qualified}")
+            self.generic_visit(node)
+
+    for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        DirectToolWriterVisitor(path.relative_to(REPO_ROOT).as_posix()).visit(tree)
+    surfaces.update(direct_writers)
+
+    receipt_writer = (
+        "kestrel_sovereign/kestrel_agent.py::"
+        "KestrelAgent.register_constitution_receipt_tool"
+    )
+    if receipt_writer in direct_writers:
+        agent_path = REPO_ROOT / "kestrel_sovereign/kestrel_agent.py"
+        agent_tree = ast.parse(
+            agent_path.read_text(encoding="utf-8"), filename=str(agent_path)
+        )
+        if not any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_handle_constitution_receipt_tool"
+            for node in ast.walk(agent_tree)
+        ):
+            raise AssertionError("Missing constitution-receipt execution handler")
+        surfaces.add(
+            "kestrel_sovereign/kestrel_agent.py::"
+            "KestrelAgent._handle_constitution_receipt_tool"
+        )
     return surfaces
 
 
@@ -925,7 +1047,7 @@ def _route_declarations(
                     preceding, source_path
                 )
                 active_methods = _module_string_collections(
-                    preceding, active_strings
+                    preceding, source_path
                 )
                 declarations.extend(
                     _fastapi_generated_route_declarations(
@@ -977,36 +1099,11 @@ def _route_path(
 
 def _module_string_collections(
     tree: ast.Module,
-    string_constants: dict[str, str] | None = None,
+    source_path: Path | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Resolve safe module constants used by ``methods=`` declarations."""
 
-    collections: dict[str, tuple[str, ...]] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            value: ast.expr | None = node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        names = [target.id for target in targets if isinstance(target, ast.Name)]
-        if not isinstance(value, (ast.List, ast.Tuple, ast.Set)):
-            for name in names:
-                collections.pop(name, None)
-            continue
-        resolved_values = [
-            _resolved_string(element, string_constants) for element in value.elts
-        ]
-        if any(value is None for value in resolved_values):
-            for name in names:
-                collections.pop(name, None)
-            continue
-        values = tuple(value for value in resolved_values if value is not None)
-        for name in names:
-            collections[name] = values
-    return collections
+    return _module_constant_bindings(tree, source_path)[1]
 
 
 def _route_methods(
@@ -1130,7 +1227,7 @@ def _discovered_http_surfaces() -> set[str]:
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         string_constants = _module_string_constants(tree, path)
-        method_constants = _module_string_collections(tree, string_constants)
+        method_constants = _module_string_collections(tree, path)
         for methods, route in _route_declarations(
             tree, string_constants, method_constants, path
         ):
@@ -1180,7 +1277,7 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         string_constants = _module_string_constants(tree, path)
-        method_constants = _module_string_collections(tree, string_constants)
+        method_constants = _module_string_collections(tree, path)
         for methods, canonical_route in _route_declarations(
             tree, string_constants, method_constants, path
         ):
@@ -1264,6 +1361,10 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
         "_dispatch_direct_tool",
         "kestrel_sovereign/agent/orchestrator_engine.py::execute_named_tool",
         "kestrel_sovereign/agent/tool_registry.py::register_dynamic_tools",
+        "kestrel_sovereign/kestrel_agent.py::"
+        "KestrelAgent._handle_constitution_receipt_tool",
+        "kestrel_sovereign/kestrel_agent.py::"
+        "KestrelAgent.register_constitution_receipt_tool",
         "kestrel_sovereign/features/base.py::"
         "Feature.get_tools.DynamicTool.execute",
         "kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool",
@@ -1621,6 +1722,25 @@ def test_api_route_declarations_resolve_module_method_constants() -> None:
         _route_methods(reassigned_decorator, method_constants)
 
 
+def test_method_collections_capture_scalar_values_in_source_order() -> None:
+    tree = ast.parse(
+        'METHOD = "POST"\n'
+        "METHODS = [METHOD]\n"
+        'METHOD = "GET"\n'
+        "router = APIRouter()\n"
+        '@router.api_route("/api/agents/{agent}/control", methods=METHODS)\n'
+        "def control():\n    pass\n"
+    )
+    strings = _module_string_constants(tree)
+    methods = _module_string_collections(tree)
+
+    assert strings["METHOD"] == "GET"
+    assert methods["METHODS"] == ("POST",)
+    assert _route_declarations(tree, strings, methods) == [
+        (("POST",), "/api/agents/{agent}/control")
+    ]
+
+
 def test_route_declarations_resolve_constants_at_decorator_execution() -> None:
     tree = ast.parse(
         'ROUTE = "/api/agents/{agent}/terminate"\n'
@@ -1632,7 +1752,7 @@ def test_route_declarations_resolve_constants_at_decorator_execution() -> None:
         'METHODS = ["GET"]\n'
     )
     final_strings = _module_string_constants(tree)
-    final_methods = _module_string_collections(tree, final_strings)
+    final_methods = _module_string_collections(tree)
 
     assert final_strings["ROUTE"] == "/benign"
     assert final_methods["METHODS"] == ("GET",)
@@ -1742,6 +1862,23 @@ def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
     assert _public_tool_name(tool_decorator, "tool_impl", constants) == (
         "neutral-control"
     )
+
+
+def test_tool_names_resolve_constants_at_decorator_execution() -> None:
+    tree = ast.parse(
+        'NAME = "terminate_child"\n'
+        "@tool(NAME)\n"
+        "def implementation():\n    pass\n"
+        'NAME = "benign"\n'
+    )
+    function = tree.body[1]
+    assert isinstance(function, ast.FunctionDef)
+    constants = _module_strings_at_definition(tree, function)
+
+    assert _module_string_constants(tree)["NAME"] == "benign"
+    assert _public_tool_name(
+        function.decorator_list[0], function.name, constants
+    ) == "terminate_child"
 
 
 def test_route_prefix_is_bound_to_receiver_and_lexical_scope() -> None:
@@ -2094,6 +2231,59 @@ def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> boo
     )
 
 
+def _cross_agent_control_aliases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    """Resolve local names that reference cross-agent control callables."""
+
+    assignments: list[tuple[str, str]] = []
+    for node in _walk_lexical_scope(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        source = (
+            value.id.casefold()
+            if isinstance(value, ast.Name)
+            else value.attr.casefold()
+            if isinstance(value, ast.Attribute)
+            else ""
+        )
+        if not source:
+            continue
+        for target in targets:
+            target_name = (
+                target.id.casefold()
+                if isinstance(target, ast.Name)
+                else target.attr.casefold()
+                if isinstance(target, ast.Attribute)
+                else ""
+            )
+            if target_name:
+                assignments.append((target_name, source))
+
+    aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for target, source in assignments:
+            if (
+                _is_cross_agent_control_name(source) or source in aliases
+            ) and target not in aliases:
+                aliases.add(target)
+                changed = True
+    return aliases
+
+
 def _provenance_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> set[str]:
@@ -2193,6 +2383,7 @@ def _provenance_aliases(
 
     aliases: set[str] = set()
     scope_nodes = _walk_lexical_scope(function)
+    control_aliases = _cross_agent_control_aliases(function)
     assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
     for node in scope_nodes:
         targets: list[ast.AST] = []
@@ -2241,7 +2432,9 @@ def _provenance_aliases(
             for case in node.cases:
                 if (
                     case.guard is not None
-                    and _contains_cross_agent_control_call(case.body)
+                    and _contains_cross_agent_control_call(
+                        case.body, control_aliases
+                    )
                 ):
                     authority_decision_names.update(
                         _identifier_tokens(case.guard)
@@ -2266,7 +2459,7 @@ def _provenance_aliases(
         if (
             guarded
             and decision_expression is not None
-            and _contains_cross_agent_control_call(guarded)
+            and _contains_cross_agent_control_call(guarded, control_aliases)
         ):
             authority_decision_names.update(
                 _identifier_tokens(decision_expression)
@@ -2278,7 +2471,9 @@ def _provenance_aliases(
     def collect_guard_decisions(statements: list[ast.stmt]) -> None:
         for index, statement in enumerate(statements):
             continuation = statements[index + 1 :]
-            if continuation and _contains_cross_agent_control_call(continuation):
+            if continuation and _contains_cross_agent_control_call(
+                continuation, control_aliases
+            ):
                 if isinstance(statement, ast.Assert):
                     authority_decision_names.update(
                         _identifier_tokens(statement.test)
@@ -2386,7 +2581,10 @@ def _provenance_aliases(
     return aliases
 
 
-def _contains_cross_agent_control_call(nodes: ast.AST | list[ast.AST]) -> bool:
+def _contains_cross_agent_control_call(
+    nodes: ast.AST | list[ast.AST],
+    control_aliases: set[str] | None = None,
+) -> bool:
     """Return whether a guarded expression/body invokes an agent control.
 
     Authority checks are often wrapped by generic adapters named ``execute``
@@ -2398,11 +2596,44 @@ def _contains_cross_agent_control_call(nodes: ast.AST | list[ast.AST]) -> bool:
 
     roots = nodes if isinstance(nodes, list) else [nodes]
 
+    def is_control_reference(node: ast.AST) -> bool:
+        if _is_cross_agent_control_reference(node):
+            return True
+        reference_name = (
+            node.id.casefold()
+            if isinstance(node, ast.Name)
+            else node.attr.casefold()
+            if isinstance(node, ast.Attribute)
+            else ""
+        )
+        return bool(reference_name and reference_name in (control_aliases or set()))
+
     class ControlCallVisitor(ast.NodeVisitor):
         found = False
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast API
-            if _is_cross_agent_control_name(_call_name(node)):
+            call_name = _call_name(node).casefold()
+            if _is_cross_agent_control_name(call_name) or call_name in (
+                control_aliases or set()
+            ):
+                self.found = True
+                return
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+            if is_control_reference(node.value):
+                self.found = True
+                return
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+            if node.value is not None and is_control_reference(node.value):
+                self.found = True
+                return
+            self.generic_visit(node)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802
+            if is_control_reference(node.value):
                 self.found = True
                 return
             self.generic_visit(node)
@@ -2444,6 +2675,7 @@ def _is_cross_agent_control_reference(node: ast.AST) -> bool:
 def _guard_clause_provenance_lines(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     provenance_aliases: set[str],
+    control_aliases: set[str],
 ) -> set[int]:
     """Find provenance conditions that gate a later control by exiting early."""
 
@@ -2453,7 +2685,9 @@ def _guard_clause_provenance_lines(
         for index, statement in enumerate(statements):
             continuation = statements[index + 1 :]
             controls_continuation = bool(continuation) and (
-                _contains_cross_agent_control_call(continuation)
+                _contains_cross_agent_control_call(
+                    continuation, control_aliases
+                )
             )
             if controls_continuation and isinstance(statement, ast.Assert):
                 if _has_provenance_token(statement.test, provenance_aliases):
@@ -2484,9 +2718,12 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     ]
     for function in functions:
         function_name = function.name.casefold()
+        control_aliases = _cross_agent_control_aliases(function)
         provenance_aliases = _provenance_aliases(function)
         lines.update(
-            _guard_clause_provenance_lines(function, provenance_aliases)
+            _guard_clause_provenance_lines(
+                function, provenance_aliases, control_aliases
+            )
         )
         function_is_permission_boundary = (
             _is_permission_name(function_name)
@@ -2547,7 +2784,8 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 if _has_provenance_token(node.subject, provenance_aliases) and (
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
-                        [statement for case in node.cases for statement in case.body]
+                        [statement for case in node.cases for statement in case.body],
+                        control_aliases,
                     )
                 ):
                     lines.add(node.lineno)
@@ -2559,7 +2797,9 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                         )
                         and (
                             function_is_permission_boundary
-                            or _contains_cross_agent_control_call(case.body)
+                            or _contains_cross_agent_control_call(
+                                case.body, control_aliases
+                            )
                         )
                     ):
                         lines.add(case.guard.lineno)
@@ -2568,7 +2808,7 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 if _has_provenance_token(node.iter, provenance_aliases) and (
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
-                        [*node.body, *node.orelse]
+                        [*node.body, *node.orelse], control_aliases
                     )
                 ):
                     lines.add(node.lineno)
@@ -2576,7 +2816,9 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             if isinstance(node, ast.BoolOp):
                 if (
                     _has_provenance_token(node, provenance_aliases)
-                    and _contains_cross_agent_control_call(node.values)
+                    and _contains_cross_agent_control_call(
+                        node.values, control_aliases
+                    )
                 ):
                     lines.add(node.lineno)
                 continue
@@ -2594,7 +2836,9 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                         _has_provenance_token(condition, provenance_aliases)
                         for condition in conditions
                     )
-                    and _contains_cross_agent_control_call(node)
+                    and _contains_cross_agent_control_call(
+                        node, control_aliases
+                    )
                 ):
                     lines.add(node.lineno)
                 continue
@@ -2617,7 +2861,9 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             if has_provenance and (
                 has_permission
                 or function_is_permission_boundary
-                or _contains_cross_agent_control_call(guarded_nodes)
+                or _contains_cross_agent_control_call(
+                    guarded_nodes, control_aliases
+                )
                 or selects_control
             ):
                 lines.add(node.lineno)
@@ -2984,6 +3230,23 @@ def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
 
     assert _authority_provenance_lines(propagation_only_nested_helper) == set()
     assert _authority_provenance_lines(nested_authority) == {3}
+
+
+def test_provenance_scanner_follows_control_callback_aliases() -> None:
+    callbacks = ast.parse(
+        "def prebound(request, target):\n"
+        "    callback = terminate_child\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n\n"
+        "def branch_assigned(request, target):\n"
+        "    if request.orchestrator:\n"
+        "        callback = stop_peer\n"
+        "    else:\n"
+        "        callback = noop\n"
+        "    callback(target)\n"
+    )
+
+    assert _authority_provenance_lines(callbacks) == {3, 7}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
