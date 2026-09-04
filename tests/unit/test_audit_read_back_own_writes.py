@@ -2309,9 +2309,12 @@ async def test_a_top_level_json_string_row_is_masked_in_both_projections(tmp_pat
     from kestrel_sovereign.features.security.feature import SecurityFeature
     from kestrel_sovereign.features.security.permissions import fold_stored_summary
 
-    row = json.dumps(json.dumps({"api_key": "sk-live-TOPLEVEL", "memo": "orphans the worker"}))
+    row = json.dumps(json.dumps({"api_key": "sk-live-TOPLEVEL", "memo": "orphans the worker — Échec"}))
     assert "TOPLEVEL" not in remask_summary(row) and "***MASKED***" in remask_summary(row)
-    assert "toplevel" not in fold_stored_summary(row) and "orphans the worker" in fold_stored_summary(row)
+    folded = fold_stored_summary(row)
+    assert "toplevel" not in folded and "orphans the worker" in folded
+    # Its escapes are decoded for matching, as a nested payload's are.
+    assert "— échec" in folded, folded
     assert remask_summary(json.dumps("just prose")) == json.dumps("just prose")
 
     store = PermissionStore(str(tmp_path / "toplevel.db"))
@@ -2324,6 +2327,7 @@ async def test_a_top_level_json_string_row_is_masked_in_both_projections(tmp_pat
     feature.permission_store = store
     shown = await feature.security_audit_search(query="orphans the worker")
     assert shown.data["count"] == 1 and "TOPLEVEL" not in str(shown.data)
+    assert (await feature.security_audit_search(query="worker — Échec")).data["count"] == 1
     assert (await feature.security_audit_search(query="sk-live-TOP")).data["count"] == 0
 
 
@@ -2521,3 +2525,29 @@ def test_a_reconstructed_nested_payload_is_marked_in_the_display():
     two = json.dumps({"a": '{"body": "the quick brown fo', "b": json.dumps({"k": "v"})})
     shown = remask_summary(two)
     assert shown.endswith("...") and json.loads(shown[:-3])["a"] == '{"body": "the quick brown fo'
+
+
+@pytest.mark.asyncio
+async def test_a_non_positive_or_non_integer_limit_or_days_is_refused_not_a_false_absence(tmp_path):
+    """limit is applied before the empty check: limit=0 turned a real match
+    into 'No recorded tool call matched … absence is weak evidence', and
+    days=0 (cutoff = now) did the same. The `< 1` guards prevent it and had
+    no test; a mutation deleting either killed nothing."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "limits.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="GitHub", tool_name="create_github_issue", action="tool_execution",
+        decision="auto_mode_allowed", args_summary='{"title": "orphans the worker"}',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+
+    for kwargs in ({"limit": 0}, {"limit": -3}, {"limit": "x"}, {"days": 0}, {"days": "x"}):
+        result = await feature.security_audit_search(query="orphans the worker", **kwargs)
+        assert result.status is ToolResultStatus.ERROR, (kwargs, result)
+        assert "No recorded tool call matched" not in (result.error or "") + (result.confirmation or "")
+    ok = await feature.security_audit_search(query="orphans the worker", limit=1, days=1)
+    assert ok.data["count"] == 1

@@ -141,7 +141,11 @@ def _fold_text(text: str) -> str:
         # one level up from where the walker sees it (round 21 review); the
         # same masker, the same read-path slack.
         parsed = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
-        return parsed.casefold().encode("utf-8", "replace").decode("utf-8")
+        # Decode its escapes as the leaf walk does (round 22): a row that is
+        # itself a JSON string keeps ``\\u2014``/``\\u00e9`` past the outer
+        # decode, and the query side is decoded — neither spelling matched
+        # (round 26 review).
+        return _decode_unicode_escapes(parsed).casefold().encode("utf-8", "replace").decode("utf-8")
     return str(parsed).casefold()
 
 
