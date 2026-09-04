@@ -871,19 +871,23 @@ def _route_methods(
             methods = (*methods, "HEAD")
         return methods
 
+    positional_methods: ast.expr | None = None
     if method == "add_route" and len(decorator.args) >= 3:
         positional_methods = decorator.args[2]
+    elif method == "route" and len(decorator.args) >= 2:
+        positional_methods = decorator.args[1]
+    if positional_methods is not None:
         if isinstance(positional_methods, ast.Name):
             values = (constants or {}).get(positional_methods.id)
             if values is None:
                 raise AssertionError(
-                    "Unresolved add_route positional methods expression: "
+                    f"Unresolved {method} positional methods expression: "
                     f"{ast.unparse(positional_methods)}"
                 )
             return normalized(values)
         if not isinstance(positional_methods, (ast.List, ast.Tuple, ast.Set)):
             raise AssertionError(
-                "Unsupported add_route positional methods expression: "
+                f"Unsupported {method} positional methods expression: "
                 f"{ast.unparse(positional_methods)}"
             )
         resolved = tuple(
@@ -891,7 +895,7 @@ def _route_methods(
         )
         if any(value is None for value in resolved):
             raise AssertionError(
-                "Unresolved add_route positional method expression: "
+                f"Unresolved {method} positional method expression: "
                 f"{ast.unparse(positional_methods)}"
             )
         return normalized(tuple(value for value in resolved if value is not None))
@@ -1410,6 +1414,28 @@ def test_api_route_declarations_resolve_module_method_constants() -> None:
     )
 
 
+def test_route_decorator_resolves_positional_methods_and_fails_closed() -> None:
+    tree = ast.parse(
+        '_MUTATIONS = ["POST", "DELETE"]\n'
+        '@router.route("/agents/{agent}/terminate", _MUTATIONS)\n'
+        "def terminate():\n    pass\n"
+    )
+    decorator = tree.body[1].decorator_list[0]
+    assert isinstance(decorator, ast.Call)
+    assert _route_methods(decorator, _module_string_collections(tree)) == (
+        "POST",
+        "DELETE",
+    )
+
+    unresolved = ast.parse(
+        '@router.route("/agents/{agent}/terminate", methods_for_target())\n'
+        "def terminate():\n    pass\n"
+    ).body[0].decorator_list[0]
+    assert isinstance(unresolved, ast.Call)
+    with pytest.raises(AssertionError, match="Unsupported route positional methods"):
+        _route_methods(unresolved)
+
+
 def test_websocket_declarations_are_inventoried_as_agent_addressable() -> None:
     tree = ast.parse(
         'router = APIRouter(prefix="/api")\n'
@@ -1854,8 +1880,9 @@ def _provenance_aliases(
         return set()
 
     aliases: set[str] = set()
+    scope_nodes = _walk_lexical_scope(function)
     assignments: list[tuple[set[str], ast.AST]] = []
-    for node in _walk_lexical_scope(function):
+    for node in scope_nodes:
         targets: list[ast.AST] = []
         value: ast.AST | None = None
         if isinstance(node, ast.Assign):
@@ -1876,6 +1903,70 @@ def _provenance_aliases(
         if names:
             assignments.append((names, value))
 
+    # An arbitrary helper may compute an authority decision without advertising
+    # that fact in its name. Mark assignment targets that later guard a control,
+    # then walk local assignment dependencies backwards. Merely passing
+    # causation metadata to a helper remains propagation unless its result
+    # reaches such a control gate.
+    authority_decision_names: set[str] = set()
+    for node in scope_nodes:
+        guarded: list[ast.AST] = []
+        decision_expression: ast.AST | None = None
+        if isinstance(node, (ast.If, ast.While)):
+            guarded = [*node.body, *node.orelse]
+            decision_expression = node.test
+        elif isinstance(node, ast.IfExp):
+            guarded = [node.body, node.orelse]
+            decision_expression = node.test
+        elif isinstance(node, ast.BoolOp):
+            guarded = list(node.values)
+            decision_expression = node
+        elif isinstance(node, ast.Match):
+            guarded = [
+                statement for case in node.cases for statement in case.body
+            ]
+            decision_expression = node.subject
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            guarded = [*node.body, *node.orelse]
+            decision_expression = node.iter
+        elif isinstance(
+            node,
+            (ast.DictComp, ast.GeneratorExp, ast.ListComp, ast.SetComp),
+        ):
+            conditions = [
+                condition
+                for generator in node.generators
+                for condition in generator.ifs
+            ]
+            guarded = [node]
+            if conditions:
+                decision_expression = ast.BoolOp(
+                    op=ast.And(), values=conditions
+                )
+        if (
+            guarded
+            and decision_expression is not None
+            and _contains_cross_agent_control_call(guarded)
+        ):
+            authority_decision_names.update(
+                _identifier_tokens(decision_expression)
+            )
+
+    assignment_names = {
+        name for names, _value in assignments for name in names
+    }
+    changed = True
+    while changed:
+        changed = False
+        for names, value in assignments:
+            if not names.intersection(authority_decision_names):
+                continue
+            dependencies = _identifier_tokens(value).intersection(assignment_names)
+            new_dependencies = dependencies - authority_decision_names
+            if new_dependencies:
+                authority_decision_names.update(new_dependencies)
+                changed = True
+
     changed = True
     while changed:
         changed = False
@@ -1884,7 +1975,10 @@ def _provenance_aliases(
                 _is_permission_name(name) for name in names
             )
             derived = is_provenance_derived(value, aliases) or (
-                permission_shaped_target
+                (
+                    permission_shaped_target
+                    or bool(names.intersection(authority_decision_names))
+                )
                 and _has_provenance_token(value, aliases)
             )
             if derived and not names.issubset(aliases):
@@ -2028,6 +2122,31 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                     or _contains_cross_agent_control_call(
                         [*node.body, *node.orelse]
                     )
+                ):
+                    lines.add(node.lineno)
+                continue
+            if isinstance(node, ast.BoolOp):
+                if (
+                    _has_provenance_token(node, provenance_aliases)
+                    and _contains_cross_agent_control_call(node.values)
+                ):
+                    lines.add(node.lineno)
+                continue
+            if isinstance(
+                node,
+                (ast.DictComp, ast.GeneratorExp, ast.ListComp, ast.SetComp),
+            ):
+                conditions = [
+                    condition
+                    for generator in node.generators
+                    for condition in generator.ifs
+                ]
+                if (
+                    any(
+                        _has_provenance_token(condition, provenance_aliases)
+                        for condition in conditions
+                    )
+                    and _contains_cross_agent_control_call(node)
                 ):
                     lines.add(node.lineno)
                 continue
@@ -2273,8 +2392,15 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     )
     neutral_predicate = ast.parse(
         "def dispatch(request, target):\n"
-        "    allowed = compare_lineage(request.causation_chain, target)\n"
-        "    if allowed:\n"
+        "    decision = compare_lineage(request.causation_chain, target)\n"
+        "    if decision:\n"
+        "        terminate_child(target)\n"
+    )
+    chained_neutral_predicate = ast.parse(
+        "def dispatch(request, target):\n"
+        "    decision = compare_lineage(request.causation_chain, target)\n"
+        "    normalized = bool(decision)\n"
+        "    if normalized:\n"
         "        terminate_child(target)\n"
     )
     selected_callback = ast.parse(
@@ -2284,11 +2410,54 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
         "    )\n"
         "    callback(target)\n"
     )
+    short_circuit_controls = ast.parse(
+        "def dispatch(request, target):\n"
+        "    request.causation_chain and terminate_child(target)\n\n"
+        "def adapter(request, target):\n"
+        "    return request.orchestrator or stop_peer(target)\n"
+    )
+    comprehension_control = ast.parse(
+        "def dispatch(request, targets):\n"
+        "    return [\n"
+        "        terminate_child(target)\n"
+        "        for target in targets\n"
+        "        if request.causation_chain\n"
+        "    ]\n"
+    )
+    propagation_only_helper = ast.parse(
+        "def dispatch(request, metadata):\n"
+        "    result = emit_event(causation=request.causation_chain)\n"
+        "    if result:\n"
+        "        metadata['emitted'] = result\n"
+    )
+    neutral_control_forms = ast.parse(
+        "def match_dispatch(request, target):\n"
+        "    decision = compare_lineage(request.causation_chain, target)\n"
+        "    match decision:\n"
+        "        case True:\n"
+        "            terminate_child(target)\n\n"
+        "def loop_dispatch(request):\n"
+        "    targets = select_targets(request.orchestrator)\n"
+        "    for target in targets:\n"
+        "        stop_peer(target)\n\n"
+        "def comprehension_dispatch(request, targets):\n"
+        "    decision = compare_lineage(request.causation_chain)\n"
+        "    return [\n"
+        "        terminate_child(target)\n"
+        "        for target in targets\n"
+        "        if decision\n"
+        "    ]\n"
+    )
 
     assert _authority_provenance_lines(authority_vocabulary) == {2, 6}
     assert _authority_provenance_lines(boolean_reducers) == {6, 11}
-    assert _authority_provenance_lines(neutral_predicate) == {2, 3}
+    assert _authority_provenance_lines(neutral_predicate) == {3}
+    assert _authority_provenance_lines(chained_neutral_predicate) == {4}
     assert _authority_provenance_lines(selected_callback) == {3}
+    assert _authority_provenance_lines(short_circuit_controls) == {2, 5}
+    assert _authority_provenance_lines(comprehension_control) == {2}
+    assert _authority_provenance_lines(propagation_only_helper) == set()
+    assert _authority_provenance_lines(neutral_control_forms) == {3, 9, 14}
 
 
 def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
