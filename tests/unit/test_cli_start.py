@@ -41,7 +41,7 @@ def test_host_start_output_uses_configured_host_port(tmp_path, capsys):
         PidStatus.ABSENT, None, None, None, "no PID file"
     )
     process_manager.is_port_in_use.return_value = False
-    process_manager._load_env.return_value = {}
+    process_manager._load_env.return_value = {"KESTREL_API_KEY": "host-test-key"}
     process_manager.wait_for_health.return_value = True
 
     result = _start_inprocess_mode(tmp_path, config, process_manager)
@@ -55,6 +55,21 @@ def test_host_start_output_uses_configured_host_port(tmp_path, capsys):
     assert f"URL:      http://localhost:{DEFAULT_HOST_PORT}" in output
     assert f"Starting server on :{DEFAULT_HOST_PORT}" in output
     assert f"MultiAgent ready: http://localhost:{DEFAULT_HOST_PORT}" in output
+    assert f"http://localhost:{DEFAULT_HOST_PORT}/#key=host-test-key" in output
+
+
+def test_host_start_rejects_missing_out_of_band_api_key(tmp_path, capsys):
+    config = _quickstart_config(tmp_path)
+    process_manager = MagicMock(spec=ProcessManager)
+    process_manager._load_env.return_value = {}
+
+    result = _start_inprocess_mode(tmp_path, config, process_manager)
+
+    assert result == 1
+    process_manager._spawn_detached.assert_not_called()
+    output = capsys.readouterr().out
+    assert "KESTREL_API_KEY" in output
+    assert "multi-agent host" in output.lower()
 
 
 def test_named_start_output_uses_assigned_agent_port(tmp_path, capsys):

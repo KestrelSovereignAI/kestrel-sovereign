@@ -786,6 +786,7 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
 
     manager = _Manager()
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    monkeypatch.setenv("KESTREL_API_KEY", "shutdown-host-test-key")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
     monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)

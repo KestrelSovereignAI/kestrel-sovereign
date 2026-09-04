@@ -17,6 +17,7 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import quote
 
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.process_manager import (
@@ -298,8 +299,30 @@ def _start_inprocess_mode(
         if not cfg.autostart
     }
 
+    # A fleet host cannot mint a sovereign credential at runtime: every
+    # managed child can reach the same loopback bootstrap route as a browser.
+    # Setup normally provisions this value in the project .env. Legacy homes
+    # must be repaired explicitly instead of starting with an undiscoverable
+    # ephemeral key that neither CLI nor console can use.
+    env = pm._load_env()
+    from kestrel_sovereign.auth import normalize_api_key
+
+    host_api_key = normalize_api_key(env.get("KESTREL_API_KEY")) or ""
+    if not host_api_key.strip():
+        print(
+            "❌ Multi-agent host requires a stable KESTREL_API_KEY in the "
+            "project .env. Run `kestrel setup --steps keys` and retry."
+        )
+        return 1
+    browser_url = (
+        f"http://localhost:{multi_agent.host.port}/"
+        f"#key={quote(host_api_key, safe='')}"
+    )
+
     print("\U0001F985 Kestrel MultiAgent starting (in-process)...")
-    print(f"   URL:      http://localhost:{multi_agent.host.port}")
+    # The fragment is never sent in an HTTP request or access log. app.js
+    # consumes it into sessionStorage and strips it from the address bar.
+    print(f"   URL:      {browser_url}")
 
     if autostart or manual:
         print("   Agents:")
@@ -333,7 +356,6 @@ def _start_inprocess_mode(
         print("   Run: kestrel terminate   (add --force if it doesn't die)")
         return 1
 
-    env = pm._load_env()
     env["PORT"] = str(multi_agent.host.port)
     env["KESTREL_MULTI_AGENT"] = "true"
     env["KESTREL_SERVE_UI"] = "true"
@@ -377,7 +399,7 @@ def _start_inprocess_mode(
         print(f"   Check log: {log_file}")
         return 1
 
-    print(f"\n\U0001F985 MultiAgent ready: http://localhost:{multi_agent.host.port}")
+    print(f"\n\U0001F985 MultiAgent ready: {browser_url}")
     return 0
 
 

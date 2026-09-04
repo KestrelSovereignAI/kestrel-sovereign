@@ -367,6 +367,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         return manager
 
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    monkeypatch.setenv("KESTREL_API_KEY", "scheduler-host-test-key")
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")

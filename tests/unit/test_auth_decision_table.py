@@ -166,6 +166,39 @@ def test_multi_agent_host_never_bootstraps_sovereign_key_to_local_peer(host_stat
         _restore_app(app, original)
 
 
+def test_multi_agent_server_rejects_missing_out_of_band_host_key(monkeypatch):
+    """A fleet must never fall back to a peer-recoverable ephemeral key."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="KESTREL_API_KEY"):
+        server._require_multi_agent_host_api_key(os.environ)
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_lifespan_checks_host_key_before_starting_resources(
+    monkeypatch,
+):
+    """The direct-uvicorn path must invoke the same fleet credential guard."""
+    from kestrel_sovereign import server
+
+    class GuardReached(RuntimeError):
+        pass
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setattr(
+        server,
+        "_require_multi_agent_host_api_key",
+        lambda _environ: (_ for _ in ()).throw(GuardReached("guard reached")),
+    )
+
+    with pytest.raises(GuardReached, match="guard reached"):
+        async with server._lifespan_startup(FastAPI()):
+            pass
+
+
 def test_auth_me_rejects_api_key_without_session():
     app, original = _prepare_app()
     try:

@@ -330,11 +330,13 @@ export function createKestrelStandaloneAuthProvider({
     fetchFn,
     sessionStorage,
     location,
+    history,
     logger,
 } = {}) {
     const fetchImpl = getRequiredDependency('fetch', fetchFn);
     const sessionStore = getRequiredDependency('sessionStorage', sessionStorage);
     const locationRef = getRequiredDependency('location', location);
+    const historyRef = history || null;
     const log = getRequiredDependency('console', logger);
 
     let apiKey = null;
@@ -365,10 +367,22 @@ export function createKestrelStandaloneAuthProvider({
     return {
         async ensureAuthenticated() {
             const params = new URLSearchParams(locationRef.search || '');
-            if (params.get('key')) {
-                apiKey = params.get('key');
+            const fragmentParams = new URLSearchParams(
+                String(locationRef.hash || '').replace(/^#/, ''),
+            );
+            const fragmentKey = fragmentParams.get('key');
+            const suppliedKey = fragmentKey || params.get('key');
+            if (suppliedKey) {
+                apiKey = suppliedKey;
                 sessionStore.setItem('kestrel_api_key', apiKey);
-                log.log('API key set from URL parameter');
+                if (fragmentKey && typeof historyRef?.replaceState === 'function') {
+                    // The fragment never crosses the HTTP boundary. Remove it
+                    // after capture so the credential also leaves the visible
+                    // address bar/browser-history entry immediately.
+                    const cleanUrl = `${locationRef.pathname || '/'}${locationRef.search || ''}`;
+                    historyRef.replaceState(historyRef.state ?? null, '', cleanUrl);
+                }
+                log.log('API key set from browser handoff');
                 return;
             }
 
@@ -553,6 +567,7 @@ export function createApiClient({
     fetchFn = globalThis.fetch,
     sessionStorage = globalThis.sessionStorage,
     location = globalThis.location,
+    history = globalThis.history,
     logger = globalThis.console,
     AbortControllerCtor = globalThis.AbortController,
     TextDecoderCtor = globalThis.TextDecoder,
@@ -571,6 +586,7 @@ export function createApiClient({
         fetchFn: fetchImpl,
         sessionStorage: sessionStore,
         location: locationRef,
+        history,
         logger: log,
     });
 

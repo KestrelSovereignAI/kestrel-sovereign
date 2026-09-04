@@ -106,6 +106,39 @@ function createClient({ fetchFn, sessionInitial = {}, authProvider = null } = {}
     return { client, logger, location, sessionStorage };
 }
 
+test('init accepts a host key from the URL fragment without bootstrap disclosure', async () => {
+    const fetchFn = createFetchQueue();
+    const logger = createLogger();
+    const location = {
+        href: '/#key=host-secret',
+        pathname: '/',
+        search: '',
+        hash: '#key=host-secret',
+    };
+    const history = {
+        state: null,
+        calls: [],
+        replaceState(...args) {
+            this.calls.push(args);
+        },
+    };
+    const sessionStorage = createStorage();
+    const client = createApiClient({
+        fetchFn,
+        sessionStorage,
+        location,
+        history,
+        logger,
+    });
+
+    await client.init();
+
+    assert.equal(client.getApiKey(), 'host-secret');
+    assert.equal(sessionStorage.getItem('kestrel_api_key'), 'host-secret');
+    assert.equal(fetchFn.calls.length, 0);
+    assert.deepEqual(history.calls, [[null, '', '/']]);
+});
+
 test('init caches bootstrap API key when bootstrap succeeds', async () => {
     const fetchFn = createFetchQueue(jsonResponse(200, { key: 'k-secret' }));
     const { client, sessionStorage, location } = createClient({ fetchFn });

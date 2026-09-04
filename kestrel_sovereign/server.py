@@ -544,6 +544,23 @@ def _bootstrap_key_enabled() -> bool:
     return not _oauth_required() and not is_a2a_transport_only_process()
 
 
+def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
+    """Return the provisioned fleet credential or refuse an unsafe boot.
+
+    A runtime-generated key cannot be handed to local clients safely once
+    managed peers share the host's loopback namespace. Fleet launchers and the
+    server therefore meet on the project-provisioned key; localhost bootstrap
+    remains a standalone-only compatibility lane.
+    """
+    api_key = normalize_api_key(environ.get("KESTREL_API_KEY")) or ""
+    if not api_key.strip():
+        raise RuntimeError(
+            "Multi-agent hosts require a stable KESTREL_API_KEY provisioned "
+            "out of band; run `kestrel setup --steps keys` before startup"
+        )
+    return api_key
+
+
 def get_api_key():
     """Get or generate the API key."""
     api_key = os.environ.get("KESTREL_API_KEY")
@@ -2309,6 +2326,17 @@ async def _lifespan_startup(app: FastAPI):
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
 
+    # Establish the authentication boundary before launching any host-owned
+    # resources. Direct uvicorn starts must obey the same fail-closed rule as
+    # `kestrel start`; otherwise get_api_key() would mint an undiscoverable key
+    # after the peer-visible bootstrap endpoint has already been disabled.
+    multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in (
+        "1", "true", "yes"
+    )
+    multi_agent_path = resolve_multi_agent_path(os.environ)
+    if multi_agent_env or multi_agent_path.exists():
+        _require_multi_agent_host_api_key(os.environ)
+
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
     # in-process agents initialize and when subprocess agents inherit the env
@@ -2418,10 +2446,6 @@ async def _lifespan_startup(app: FastAPI):
         )
         app.state.phoenix = None
         app.state.phoenix_disabled_reason = reason
-
-    # Detect multi-agent mode
-    multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
-    multi_agent_path = resolve_multi_agent_path(os.environ)
 
     if multi_agent_env or multi_agent_path.exists():
         # --- Multi-agent mode ---

@@ -1081,7 +1081,7 @@ class TestCmdStart:
             PidStatus.ABSENT, None, None, None, "no PID file"
         )
         pm.is_port_in_use.return_value = False
-        pm._load_env.return_value = {}
+        pm._load_env.return_value = {"KESTREL_API_KEY": "host-test-key"}
         pm.wait_for_health.return_value = False
 
         rc = _start_inprocess_mode(
@@ -1146,7 +1146,7 @@ class TestCmdStart:
             PidStatus.ABSENT, None, None, None, "no PID file"
         )
         pm.is_port_in_use.return_value = False
-        pm._load_env.return_value = {}
+        pm._load_env.return_value = {"KESTREL_API_KEY": "host-test-key"}
         pm.wait_for_health.return_value = False
         detail = [
             "/health is responding (HTTP 503); /health/detailed "
@@ -1770,11 +1770,50 @@ class TestDetectRunningAgentServer:
             raise AssertionError(f"unexpected probe: {url}")
 
         with patch("httpx.get", side_effect=fake_get):
-            result = detect("claw", agent_cfg, multi_agent)
+            result = detect(
+                "claw",
+                agent_cfg,
+                multi_agent,
+                operator_api_key="host-key",
+            )
 
         assert result == (
             f"http://localhost:{multi_agent.host.port}/api/agents/claw",
             "host-key",
+        )
+
+    def test_detects_multi_agent_with_locally_provisioned_key(self, multi_agent_env):
+        """The operator CLI must not depend on the peer-visible bootstrap route."""
+        import httpx
+
+        detect, agent_cfg, multi_agent = self._make_cfg(multi_agent_env)
+
+        def fake_get(url, timeout=None, **kwargs):
+            if url.endswith(f":{agent_cfg.port}/health"):
+                raise httpx.ConnectError("no standalone")
+            response = MagicMock()
+            if url.endswith(f":{multi_agent.host.port}/health"):
+                response.status_code = 200
+                return response
+            if url.endswith("/api/auth/key"):
+                raise AssertionError("fleet host bootstrap must not be queried")
+            if url.endswith("/api/agents/claw/health"):
+                assert kwargs["headers"] == {"X-API-Key": "local-host-key"}
+                response.status_code = 200
+                return response
+            raise AssertionError(f"unexpected probe: {url}")
+
+        with patch("httpx.get", side_effect=fake_get):
+            result = detect(
+                "claw",
+                agent_cfg,
+                multi_agent,
+                operator_api_key="local-host-key",
+            )
+
+        assert result == (
+            f"http://localhost:{multi_agent.host.port}/api/agents/claw",
+            "local-host-key",
         )
 
     def test_host_running_but_agent_not_routed_returns_none(self, multi_agent_env):
