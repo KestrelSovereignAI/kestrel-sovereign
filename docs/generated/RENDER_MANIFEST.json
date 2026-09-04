@@ -228,7 +228,9 @@
       "existing_code_refs": [
         "kestrel_sovereign/command_handler.py",
         "kestrel_sovereign/endpoints/agent.py",
+        "kestrel_sovereign/endpoints/features.py",
         "kestrel_sovereign/endpoints/models.py",
+        "kestrel_sovereign/endpoints/observability.py",
         "kestrel_sovereign/endpoints/rasa_shim.py",
         "kestrel_sovereign/endpoints/restart_events.py",
         "kestrel_sovereign/endpoints/spawn.py",
@@ -239,6 +241,7 @@
         "kestrel_sovereign/features/spawn/feature.py",
         "kestrel_sovereign/features/tasks/feature.py",
         "kestrel_sovereign/features/todo/feature.py",
+        "kestrel_sovereign/features/web_search/feature.py",
         "kestrel_sovereign/features/webhooks/receiver.py"
       ],
       "findings": [],

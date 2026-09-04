@@ -38,6 +38,13 @@ HTTP_SEGMENTS = {
     "peers",
     "children",
     "webhooks",
+    # Feature package lifecycle mutates the host's shared interpreter, while
+    # observability can read a shared PostgreSQL event table.  Neither class
+    # needs an agent-shaped word in the remainder of its route to cross an
+    # authority boundary, so inventory the complete namespaces and classify
+    # their self-only/read-only false positives explicitly in the audit.
+    "features",
+    "observability",
 }
 HTTP_EXACT_ROUTES = {"/api/agent/invoke"}
 SURFACE_ID = re.compile(
@@ -247,6 +254,21 @@ def test_feature_contributed_nested_webhook_router_is_discovered() -> None:
     ) in _discovered_http_surfaces()
 
 
+def test_host_feature_and_shared_observability_routes_are_discovered() -> None:
+    discovered = _discovered_http_surfaces()
+    for surface in (
+        "kestrel_sovereign/endpoints/features.py::"
+        "POST /api/features/{name}/install",
+        "kestrel_sovereign/endpoints/features.py::"
+        "POST /api/features/{name}/remove",
+        "kestrel_sovereign/endpoints/observability.py::"
+        "GET /api/observability/summary",
+        "kestrel_sovereign/endpoints/observability.py::"
+        "GET /api/observability/metrics/{metric_name}",
+    ):
+        assert surface in discovered
+
+
 def test_api_route_declarations_expand_every_registered_method() -> None:
     decorator = ast.parse(
         '@router.api_route("/api/tasks", methods=["POST", "PUT"])\n'
@@ -273,6 +295,35 @@ def test_a2a_cancellation_delegates_to_issue_3134() -> None:
     assert "Defect:" not in row
 
 
+def test_unverified_spawn_authority_is_recorded_as_a_defect() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    for action in (
+        "Create child",
+        "List/read child work",
+        "Delegate work to child",
+        "Terminate/offboard child",
+    ):
+        row = next(
+            line for line in audit.splitlines() if line.startswith(f"| {action} |")
+        )
+        assert "[#3142]" in row
+        assert "Defect" in row
+
+
+def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    expected = {
+        "Read observability summaries/metrics": "[#3215]",
+        "Install/remove feature package": "[#3214]",
+    }
+    for action, issue in expected.items():
+        row = next(
+            line for line in audit.splitlines() if line.startswith(f"| {action} |")
+        )
+        assert issue in row
+        assert "Defect:" in row
+
+
 def _identifier_tokens(node: ast.AST) -> set[str]:
     tokens: set[str] = set()
     for child in ast.walk(node):
@@ -293,9 +344,21 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
     for function in functions:
-        function_is_permission_boundary = any(
-            term in function.name.casefold()
-            for term in ("authoriz", "permission")
+        function_name = function.name.casefold()
+        function_is_permission_boundary = (
+            any(
+                term in function_name
+                for term in (
+                    "authoriz",
+                    "permission",
+                    "allowed",
+                    "permitted",
+                    "forbid",
+                    "denied",
+                    "has_access",
+                )
+            )
+            or function_name.startswith(("can_", "may_"))
         )
         for node in ast.walk(function):
             if isinstance(node, ast.Return):
@@ -359,9 +422,16 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "def is_authorized(request):\n"
         "    return bool(request.causation_chain)\n"
     )
+    ordinary_helpers = ast.parse(
+        "def can_control(request):\n"
+        "    return bool(request.causation_chain)\n\n"
+        "def is_allowed(request):\n"
+        "    return bool(request.orchestrator)\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
+    assert _authority_provenance_lines(ordinary_helpers) == {2, 5}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:

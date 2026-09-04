@@ -26,13 +26,15 @@ work happened. Authority is permission to control another agent. A causation
 frame, trace parent, scheduler source, display label, peer status, co-hosting,
 or guessed identifier never grants authority.
 
-The authoritative parent-to-child relation is a verified, parent-signed spawn
-mandate receipt bound to the final child DID. The manager's `spawned_by` graph
-edge and `_parent_children` map are indexes/caches; neither is authority without
-receipt verification. Work to restore that evidence after restart is tracked in
-[#3133](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3133),
-and the durable descendant query is
-[#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142).
+The design requires a verified, parent-signed spawn mandate receipt bound to the
+final child DID. The live implementation has not reached that model: `_do_spawn`
+signs while `child_did` is unset, mutates that signed field after creation, and
+does not re-sign or verify at the later control boundaries. Its `spawned_by`
+graph edge, `_parent_children` map, and `_child_mandates` map currently act as
+unverified authority inputs. Restart rehydration is tracked in
+[#3133](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3133);
+final-DID signature verification and authoritative descendant lookup are tracked
+in [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142).
 
 A universally available capability is the absence of a required relation, not
 a third relationship axis. Peer communication and bounded cooperative Stop may
@@ -58,14 +60,17 @@ narrow, revocable, signed delegation.
 | Synchronous peer message | `ask_agent` | One directory-resolved peer | Universal policy (communication) | The router resolves in trusted `PeerRequester.authorization_scope` and must reauthorize `invoke`. The request creates causation, not control authority. |
 | Asynchronous peer message/question/task | `send_a2a_message`, `send_a2a_question`, `send_a2a_task`; `POST /api/agent/tasks/send` | One directory-resolved recipient | Universal policy (communication) | Outbound routing reauthorizes the stable peer identity; inbound hosted delivery requires a verified sender/scoped authorizer. Signed-envelope verification authenticates the sender but does not create hierarchy. |
 | External webhook ingress | `POST /webhooks/{webhook_name}`; Rasa `POST /webhooks/rest/webhook` | The request-bound agent or uniquely configured receiver | Universal policy (bounded ingress) | The route binds the target from trusted request state/receiver registration and the configured receiver authenticates and rate-limits the payload. Rasa uses its sovereign-configured shared secret and the host-bound agent; payload sender fields create no agent authority. |
+| Read observability summaries/metrics | `GET /api/observability/summary`; `GET /api/observability/metrics/{metric_name}` | The routed agent's events only | Self | A per-agent SQLite store happens to isolate the data, but shared PostgreSQL queries omit the trusted agent predicate and the metrics route accepts an arbitrary optional `agent_name`. Defect: [#3215](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3215). |
+| Inspect/configure routed feature state | Feature catalog/detail/config/skills routes; feature enable/disable/config mutation | The request-routed agent | Self or sovereign/delegated operator policy | `get_agent(request)` binds the target runtime. These namespace matches are classified explicitly so they cannot conceal a future cross-agent implementation; they currently do not grant one agent authority over another. |
+| Install/remove feature package | `POST /api/features/{name}/install`; `POST /api/features/{name}/remove` | Shared host interpreter and all loaded users of the package | Sovereign/delegated | The handlers currently require only an authenticated routed agent despite their sovereign-only docstrings. Defect: [#3214](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3214). |
 | Read outbound peer result/audit | `get_peer_task_result`, `list_outbound_a2a_tasks` | A task created by the caller | Self (creator) | Outbound records retain creator/recipient binding. Shared-store reads and HTTP/SSE still need durable principal predicates: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | Read task inbox/status/result | `check_task_status`, `list_my_tasks`, `get_task_result`; task GET/list/SSE endpoints | Recipient inbox or creator-owned result | Self (recipient or creator, according to operation) | Current task-ID/full-table reads are not consistently principal-scoped on shared PostgreSQL. Defect: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | Respond/fail/complete or attach artifact | `respond_to_a2a_task`, `attach_artifact_to_a2a_task` | An incoming A2A task | Self (recipient) | Enforced by [#3144](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3144): each mutation binds the trusted caller DID and includes the recipient in the durable atomic predicate. |
 | Cancel A2A task | `cancel_task`; `POST /api/agent/tasks/{task_id:path}/cancel` | A non-terminal task | Self (creator or recipient) | Enforced by [#3134](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3134): durable creator/recipient authorization and an atomic cancellation predicate are shared by the tool and signed peer route. Causation/sender display metadata is not consulted. |
-| Create child | `spawn_agent` | A new child | Spawn mandate | The parent constructs/signs the mandate; the host binds and re-signs it to the final child DID. A created child does not grant the child reciprocal authority. |
-| List/read child work | `list_children`, `get_child_result`; `GET /api/spawn/children` | The caller's children | Spawn mandate or self-owned feature state | Child enumeration must derive from verified receipts ([#3133](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3133), [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142)); results are held by the calling feature instance. |
-| Delegate work to child | `delegate_task` | A direct child | Spawn mandate | The caller DID must be the verified mandate parent at dispatch time. `_parent_children` is only a lookup cache. |
-| Terminate/offboard child | `terminate_child` | A direct child/descendant runtime tree | Spawn mandate | Signed parent authority is required in addition to lifecycle/custody/refund gates. `ALWAYS_ASK` tightens consent but is not the authority proof. |
+| Create child | `spawn_agent` | A new child | Spawn mandate | The live path signs before the final child DID is known and then mutates `child_did`, invalidating the signature. Defect: [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). A created child does not grant reciprocal authority. |
+| List/read child work | `list_children`, `get_child_result`; `GET /api/spawn/children` | The caller's children | Spawn mandate or self-owned feature state | Results are held by the calling feature instance, but child enumeration currently trusts process-local graph/cache projections without verifying a final-DID receipt. Defects: [#3133](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3133), [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). |
+| Delegate work to child | `delegate_task` | A direct child | Spawn mandate | The live boundary checks only `manager.get_children()` / `_parent_children`; `verify_mandate()` has no production caller. Defect: [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). |
+| Terminate/offboard child | `terminate_child` | A direct child/descendant runtime tree | Spawn mandate | The live boundary checks the same unverified cache relation. Signed authority must be added alongside lifecycle/custody/refund gates; `ALWAYS_ASK` is consent, not proof. Defect: [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). |
 | Cooperative Stop | Stop authority service and future peer signal rail; current `POST /api/agent/stop` is local only | Turn, agent, subtree, host, or fleet | Universal policy for Stop; spawn mandate/sovereign for Hold | Typed Stop work is tracked by [#3139](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3139) and [#3141](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3141). Peer Stop must inherit signal cycle detection and load-bearing rate limits; repeated Stop must not become Hold through the back door. |
 | File/execute whole-host restart or update | `request_restart`, `restart_coordinator` | Every co-hosted agent and possibly their code checkout | Sovereign/delegated | The current feature admits an ordinary agent tool call; generic ASK can be auto-promoted. Defect: [#3148](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3148). |
 | Read/cancel/ack restart request | `list_restart_requests`, `list_restart_status_events`, `cancel_restart_request`, `acknowledge_restart_escalation`; restart status endpoint | A durable restart request/event | Self for requester detail/mutation; explicitly public host-coordination fields may be universal read-only | Enforced by [#3146](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3146): list/event reads bind the requesting agent, and cancel/ack mutations include `requested_by_agent` in the durable predicate. |
@@ -105,11 +110,11 @@ cross-agent door cannot silently appear merely because it omits `agent`.
 | `kestrel_sovereign/features/restart_coordinator/feature.py::list_restart_status_events` | Requester/explicit host-coordination read; #3146. |
 | `kestrel_sovereign/features/restart_coordinator/feature.py::request_restart` | Sovereign or narrow signed delegation; #3148. |
 | `kestrel_sovereign/features/restart_coordinator/feature.py::restart_coordinator` | Sovereign executor/registered cron action; #3148. |
-| `kestrel_sovereign/features/spawn/feature.py::delegate_task` | Verified parent-to-child mandate. |
-| `kestrel_sovereign/features/spawn/feature.py::get_child_result` | Self-owned result state, addressed within verified child set. |
-| `kestrel_sovereign/features/spawn/feature.py::list_children` | Verified parent-to-child mandate query. |
-| `kestrel_sovereign/features/spawn/feature.py::spawn_agent` | Creates a signed parent-to-child mandate. |
-| `kestrel_sovereign/features/spawn/feature.py::terminate_child` | Verified parent-to-child mandate plus lifecycle gates. |
+| `kestrel_sovereign/features/spawn/feature.py::delegate_task` | Unverified process-local child map; defect #3142. |
+| `kestrel_sovereign/features/spawn/feature.py::get_child_result` | Self-owned result state keyed by the caller's prior delegated task. |
+| `kestrel_sovereign/features/spawn/feature.py::list_children` | Unverified process-local child map; defects #3133/#3142. |
+| `kestrel_sovereign/features/spawn/feature.py::spawn_agent` | Signature is invalidated when the final child DID is assigned; defect #3142. |
+| `kestrel_sovereign/features/spawn/feature.py::terminate_child` | Unverified process-local child map plus lifecycle gates; defect #3142. |
 | `kestrel_sovereign/features/tasks/feature.py::attach_artifact_to_a2a_task` | Recipient-owned mutation; #3144. |
 | `kestrel_sovereign/features/tasks/feature.py::cancel_task` | Creator/recipient-owned mutation; #3134. |
 | `kestrel_sovereign/features/tasks/feature.py::check_task_status` | Principal-scoped read; #3145. |
@@ -141,12 +146,25 @@ a host-control door behind the feature-tool inventory.
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/{task_id:path}/cancel` | Creator/recipient-owned mutation; the signed peer envelope authenticates the actor, live recipient scope is rechecked, and the durable transition uses the atomic #3134 authority predicate. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/stop` | Current routed-agent/self Stop; peer Stop must use the typed authority rail. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/send` | Scoped, authenticated A2A delivery. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/features` | Request-routed agent feature catalog; not a cross-agent grant. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/features/installed` | Request-routed agent feature inventory; not a cross-agent grant. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/features/{name}` | Request-routed agent feature detail; not a cross-agent grant. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/features/{name}/install` | Shared-host package mutation lacks sovereign/delegated enforcement; defect #3214. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/features/{name}/enable` | Request-routed agent runtime mutation; not a cross-agent grant. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/features/{name}/disable` | Request-routed agent runtime mutation; not a cross-agent grant. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/features/{name}/remove` | Shared-host package mutation lacks sovereign/delegated enforcement; defect #3214. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/features/{name}/config` | Request-routed agent config read; secrets remain write-only. |
+| `kestrel_sovereign/endpoints/features.py::PATCH /api/features/{name}/config` | Request-routed agent config mutation; not a cross-agent grant. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/features/{name}/skills` | Request-routed agent skill discovery; not a cross-agent grant. |
 | `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{agent_name}` | Sovereign/delegated host lifecycle; #3149. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/agents` | Authenticated read-only host discovery. |
 | `kestrel_sovereign/endpoints/models.py::POST /api/agents` | Sovereign/delegated host lifecycle; #3149. |
+| `kestrel_sovereign/endpoints/observability.py::GET /api/observability/summary` | Shared PostgreSQL read lacks a trusted agent predicate; defect #3215. |
+| `kestrel_sovereign/endpoints/observability.py::GET /api/observability/metrics/{metric_name}` | Shared PostgreSQL read accepts an untrusted optional agent filter; defect #3215. |
 | `kestrel_sovereign/endpoints/restart_events.py::GET /api/restart/status-events` | Requester/explicit host-coordination read; #3146. |
 | `kestrel_sovereign/endpoints/rasa_shim.py::POST /webhooks/rest/webhook` | Sovereign-configured, authenticated ingress to the host-bound agent; payload sender is not authority. |
-| `kestrel_sovereign/endpoints/spawn.py::GET /api/spawn/children` | Read-only child status projected from verified relationships. |
+| `kestrel_sovereign/endpoints/spawn.py::GET /api/spawn/children` | Read-only child status projected from unverified process-local relationships; defects #3133/#3142. |
+| `kestrel_sovereign/features/web_search/feature.py::GET /api/features/web_search/test` | Request-routed agent connectivity test; not a cross-agent grant. |
 | `kestrel_sovereign/features/webhooks/receiver.py::POST /webhooks/{webhook_name}` | Bounded ingress to the request-scoped or uniquely configured receiver; webhook auth does not create agent hierarchy. |
 
 ## Review rule
