@@ -445,15 +445,37 @@ class CompositeContextClauseRegistry:
     def validate_reserved_audit_names(
         self, names: Iterable[str]
     ) -> tuple[str, ...]:
-        """Ensure bootstrap audit names do not shadow any union member."""
+        """Ensure bootstrap audit names do not shadow host or union members."""
 
         values = tuple(names)
         if len(set(values)) != len(values):
             raise FeatureContributionRuntimeError(
                 "duplicate bootstrap audit name"
             )
+        host_conflict = next(
+            (name for name in values if name in HOST_OWNED_AUDIT_NAMES),
+            None,
+        )
+        if host_conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"bootstrap name {host_conflict!r} is a reserved host "
+                "audit name"
+            )
+        derived_audit_names = tuple(
+            audit_name
+            for filename in values
+            if (audit_name := legacy_bootstrap_audit_name(filename)) is not None
+        )
+        prospective_audit_names = (*values, *derived_audit_names)
         resident_names = {clause.name for clause in self.snapshot()}
-        conflict = next((name for name in values if name in resident_names), None)
+        conflict = next(
+            (
+                name
+                for name in prospective_audit_names
+                if name in resident_names
+            ),
+            None,
+        )
         if conflict is not None:
             raise FeatureContributionRuntimeError(
                 f"context-clause name is already registered: {conflict!r}"

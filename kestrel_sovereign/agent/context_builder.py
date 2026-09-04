@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
 from .system_prompt_assembler import (
+    HOST_OWNED_AUDIT_NAMES,
     LEGACY_MANDATORY_SYSTEM_SUBSECTIONS,
     legacy_bootstrap_audit_name,
 )
@@ -216,9 +217,6 @@ class ContextBuilder:
     ) -> None:
         """Preflight bootstrap names against host and feature audit owners."""
 
-        from kestrel_sovereign.agent.system_prompt_assembler import (
-            SYNTHETIC_HOST_AUDIT_NAMES,
-        )
         from kestrel_sovereign.features.contribution_runtime import (
             FeatureContributionRuntimeError,
         )
@@ -227,7 +225,7 @@ class ContextBuilder:
             self._bootstrap_loader.file_order if names is None else names
         )
         conflict = next(
-            (name for name in values if name in SYNTHETIC_HOST_AUDIT_NAMES),
+            (name for name in values if name in HOST_OWNED_AUDIT_NAMES),
             None,
         )
         if conflict is not None:

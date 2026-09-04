@@ -18,6 +18,7 @@ from kestrel_sovereign.agent.context_stages import EPHEMERAL_NOTICE
 from kestrel_sovereign.agent.system_prompt_assembler import assemble_system_prompt
 from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
 from kestrel_sovereign.features.contribution_runtime import (
+    CompositeContextClauseRegistry,
     ContextClauseRegistry,
     FeatureContributionRuntimeError,
     ResolvedContextClause,
@@ -245,6 +246,36 @@ def test_bootstrap_add_rejects_active_context_name_without_mutation():
         match="already registered",
     ):
         builder._bootstrap_loader.add_file("POLICY.yaml")
+
+    assert builder._bootstrap_loader.file_order == before
+
+
+def test_bootstrap_add_rejects_composite_legacy_alias_without_mutation():
+    host = ContextClauseRegistry()
+    agent = ContextClauseRegistry()
+    agent.register_batch((_clause("bootstrap_notes", 10, "feature notes"),))
+    composite = CompositeContextClauseRegistry(host, agent)
+    builder = ContextBuilder(MagicMock(), context_clause_registry=composite)
+    before = builder._bootstrap_loader.file_order
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="already registered",
+    ):
+        builder._bootstrap_loader.add_file("NOTES.md")
+
+    assert builder._bootstrap_loader.file_order == before
+
+
+def test_bootstrap_add_rejects_legacy_host_audit_name_without_registry():
+    builder = ContextBuilder(MagicMock(), context_clause_registry=None)
+    before = builder._bootstrap_loader.file_order
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        builder._bootstrap_loader.add_file("constitution")
 
     assert builder._bootstrap_loader.file_order == before
 
