@@ -6399,6 +6399,13 @@ class IsolatedFeatureTool(AgentTool):
 class ProxyFeature(Feature):
     """Feature contract adapter backed by an SDK isolated-feature client."""
 
+    # Runtime re-enable holds the agent's conversation boundary. Persist the
+    # operator-declared config while this proxy is still terminal so initialize
+    # launches the child with that config and opens ingress only afterward.
+    # Applying it after initialize can drain a callback which is itself queued
+    # on the conversation boundary, inverting those two locks.
+    _apply_host_config_before_initialize = True
+
     def __init__(
         self,
         agent: Any,
@@ -9489,6 +9496,27 @@ class ProxyFeature(Feature):
             else _idle_wake_failed
         )
         async with self._reload_lock:
+            if _ingress_fenced:
+                # The endpoint validates its lease before entering this helper,
+                # but reload/recovery owns the same lifecycle lock and may have
+                # replaced the client and reopened the gate while this setter
+                # was queued. Re-prove the exact client/gate generation only
+                # after acquiring the lock that excludes those owners. From
+                # here until transition settlement, no reload can invalidate
+                # that proof underneath the inherited closed-ingress boundary.
+                inherited = _active_config_ingress_fence.get()
+                if (
+                    not isinstance(inherited, _ConfigIngressFenceLease)
+                    or not inherited.transition_started
+                    or not self._config_ingress_lease_is_current(
+                        inherited,
+                        require_current_client=True,
+                        require_current_task=True,
+                    )
+                ):
+                    raise IsolatedRuntimePreparationError(
+                        "Isolated feature changed during config ingress transition."
+                    )
             if self._terminal_lifecycle_latched:
                 return await self._persist_terminal_config(
                     cfg,

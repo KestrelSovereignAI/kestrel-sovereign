@@ -303,6 +303,91 @@ class TestGetFeatureDetail:
 
 class TestEnableFeature:
     @pytest.mark.asyncio
+    async def test_isolated_reenable_settles_declared_config_before_opening_ingress(
+        self,
+    ):
+        """Re-enable cannot drain a callback queued on its conversation lock."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class IsolatedOrderingFeature(SDKFixtureFeature):
+            contribution_prefix = "isolated-enable-config-order"
+            config_schema = {"type": "object", "additionalProperties": True}
+            _apply_host_config_before_initialize = True
+
+            def __init__(self, agent):
+                super().__init__(agent)
+                self.config = {"mode": "old"}
+                self.ingress_open = False
+                self.ingress_started = asyncio.Event()
+                self.ingress_finished = asyncio.Event()
+                self.drain_waited_on_conversation = asyncio.Event()
+                self.rescue_deadlock = asyncio.Event()
+                self.ingress_task = None
+                self.call_order = []
+
+            async def initialize(self):
+                self.call_order.append("initialize")
+                self.ingress_open = True
+
+                async def inbound_callback():
+                    self.ingress_started.set()
+                    async with self.agent.feature_config_transition():
+                        self.ingress_finished.set()
+
+                self.ingress_task = asyncio.create_task(inbound_callback())
+                await self.ingress_started.wait()
+                # Let the callback queue on the transition's CONVERSATION lock
+                # before initialize returns to the activation sequence.
+                await asyncio.sleep(0)
+
+            async def get_config(self):
+                return dict(self.config)
+
+            async def set_config(self, config):
+                self.call_order.append("set_config")
+                if self.ingress_open and not self.ingress_finished.is_set():
+                    # A real proxy drains its admitted callback here. The bounded
+                    # rescue makes the pre-fix lock cycle observable without
+                    # leaving a permanently hung pytest task.
+                    self.drain_waited_on_conversation.set()
+                    await self.rescue_deadlock.wait()
+                self.config = dict(config)
+
+        agent = _lifecycle_agent()
+        feature = IsolatedOrderingFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        agent._declared_feature_config = lambda _name: {"mode": "declared"}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async def bounded_rescue():
+            await asyncio.sleep(0.05)
+            feature.rescue_deadlock.set()
+
+        rescue = asyncio.create_task(bounded_rescue())
+        try:
+            response = await asyncio.wait_for(
+                features_endpoint.enable_feature(request, feature.name),
+                timeout=1,
+            )
+            assert response["status"] == "enabled"
+            assert feature.call_order == ["set_config", "initialize"]
+            assert not feature.drain_waited_on_conversation.is_set()
+            await asyncio.wait_for(feature.ingress_task, timeout=1)
+            assert feature.ingress_finished.is_set()
+        finally:
+            feature.rescue_deadlock.set()
+            await rescue
+            if feature.ingress_task is not None and not feature.ingress_task.done():
+                feature.ingress_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await feature.ingress_task
+
+    @pytest.mark.asyncio
     async def test_enable_and_config_use_ingress_before_conversation_lock(self):
         """A config PATCH cannot deadlock a concurrent runtime re-enable."""
 

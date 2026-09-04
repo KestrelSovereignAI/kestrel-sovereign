@@ -5170,6 +5170,9 @@ class KestrelAgent(
         performed, on the SAME feature instance, so a soft-disabled feature is
         restored end to end:
 
+        * operator-declared config before ``initialize()`` for isolated
+          runtimes, so their child opens ingress only after it has the declared
+          generation;
         * ``initialize()`` — re-registers the feature's owned **signal sources**;
         * contributed permission defaults through SecurityFeature, before any
           callable surface is exposed;
@@ -5203,11 +5206,30 @@ class KestrelAgent(
                 (feature,)
             ).only()
         try:
+            # An isolated re-enable starts from a terminal proxy with no live
+            # ingress. Persist its declared config first so initialize forwards
+            # that exact generation to the child and opens the traffic gate only
+            # after settlement. If we initialized first, a child callback could
+            # enter the gate, queue on the CONVERSATION boundary held by this
+            # activation, and then be drained by the post-initialize setter: a
+            # lock cycle. In-process features retain their established ordering
+            # because initialize may intentionally reset volatile config.
+            config_precedes_initialize = (
+                inspect.getattr_static(
+                    feature,
+                    "_apply_host_config_before_initialize",
+                    False,
+                )
+                is True
+            )
+            if config_precedes_initialize:
+                await self._apply_host_feature_config(feature)
             await feature.initialize()
-            # initialize() can reset config a feature does not persist (a
-            # volatile-privacy host key, for example), so a disable/enable
-            # cycle would otherwise lose the declared value until restart.
-            await self._apply_host_feature_config(feature)
+            if not config_precedes_initialize:
+                # initialize() can reset config a feature does not persist (a
+                # volatile-privacy host key, for example), so a disable/enable
+                # cycle would otherwise lose the declared value until restart.
+                await self._apply_host_feature_config(feature)
             self._ensure_feature_contribution_runtime().activate(
                 prepared_contributions
             )

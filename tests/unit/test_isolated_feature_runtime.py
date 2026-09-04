@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import errno
 import gc
 import json
@@ -81,6 +82,12 @@ from kestrel_sovereign.waits import WaitRegistry
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
+
+
+def test_proxy_declares_config_before_runtime_initialize():
+    """The host activation path must recognize the isolated ingress contract."""
+
+    assert ProxyFeature._apply_host_config_before_initialize is True
 
 
 @pytest.fixture(autouse=True)
@@ -11959,6 +11966,96 @@ async def test_endpoint_ingress_fence_is_reused_by_real_proxy_config_transition(
         assert feature._traffic_gate.closed is False
         assert feature._host_config == next_config
     finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reload_cannot_invalidate_fence_after_setter_validation(
+    monkeypatch, tmp_path
+):
+    """A reload queued first cannot reopen ingress under a validated lease."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+    reload_has_lock = asyncio.Event()
+    release_reload = asyncio.Event()
+    setter_validated = asyncio.Event()
+    clients = []
+
+    class RacingReloadClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.prepare_gate_states = []
+            clients.append(self)
+
+        async def prepare_config_transition(self, config):
+            self.prepare_gate_states.append(feature._traffic_gate.closed)
+            return ConfigTransitionResult.applied()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RacingReloadClient)
+    reload_task = None
+    setter_task = None
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        first_client = feature._client
+        original_close = feature._close_traffic_gate
+        original_setter = feature._set_config_under_ingress_boundary
+
+        async def pause_reload_after_lock():
+            reload_has_lock.set()
+            await release_reload.wait()
+            await original_close()
+
+        async def observe_validated_setter(*args, **kwargs):
+            # set_config reaches this helper only after accepting the inherited
+            # lease. It then queues on the reload lock held above.
+            setter_validated.set()
+            return await original_setter(*args, **kwargs)
+
+        monkeypatch.setattr(feature, "_close_traffic_gate", pause_reload_after_lock)
+        monkeypatch.setattr(
+            feature,
+            "_set_config_under_ingress_boundary",
+            observe_validated_setter,
+        )
+
+        async with feature.config_transition_ingress_fence() as ingress_lease:
+            reload_task = asyncio.create_task(feature.reload())
+            await asyncio.wait_for(reload_has_lock.wait(), timeout=1)
+
+            async def authorized_setter():
+                assert feature.claim_config_transition_ingress_fence(ingress_lease)
+                return await feature.set_config(next_config)
+
+            setter_task = asyncio.create_task(authorized_setter())
+            await asyncio.wait_for(setter_validated.wait(), timeout=1)
+
+            release_reload.set()
+            await asyncio.wait_for(reload_task, timeout=1)
+            assert feature._client is not first_client
+
+            with pytest.raises(
+                IsolatedRuntimePreparationError,
+                match="changed during config ingress transition",
+            ):
+                await asyncio.wait_for(setter_task, timeout=1)
+
+            assert clients[-1].prepare_gate_states == []
+            assert feature._host_config == old_config
+    finally:
+        release_reload.set()
+        for task in (reload_task, setter_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         await feature.shutdown()
 
 
