@@ -1826,3 +1826,63 @@ def test_a_package_rename_surfaces_the_package_name_not_init(repo: Path) -> None
     assert "pkg" in names and "__init__" not in names, names
     assert checker._module_name("pkg/__init__.py") == "pkg"
     assert checker._module_name("a/b/mod.py") == "mod"
+
+
+# --------------------------------------------------------------------------
+# Round 22: an empty file's deletion has no header; `from pkg.mod import X`
+# is a module binding; the deleted-package name rule gets its test.
+# --------------------------------------------------------------------------
+
+def test_deleting_a_package_with_an_empty_init_surfaces_the_package(repo: Path) -> None:
+    """Git emits no ---/+++ and no hunk for an empty file's deletion, only
+    `deleted file mode`, so `_DELETED` read off the header never saw it: a
+    package removal reported only the sibling module while `import pkg`
+    raised ModuleNotFoundError — and its rename twin reported both."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "other.py").write_text("X = 1\n")
+    (repo / "user.py").write_text("import pkg\nfrom pkg import other\n\n\ndef f():\n    return pkg, other\n")
+    _commit(repo)
+    _run(repo, "rm", "-rq", "pkg")
+
+    names = {f.name for f in _findings(repo)}
+    assert {"pkg", "other"} <= names and "__init__" not in names, names
+    finding = _named(_findings(repo), "pkg")
+    assert ("user.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+    # A deletion that is the ONLY change is still a change.
+    assert checker.main(["--strict"]) == 1
+
+
+def test_from_dotted_module_import_is_a_binding_of_the_module(repo: Path) -> None:
+    """`from pkg.mod import TIMEOUT` is bound to mod's path exactly as
+    `import pkg.mod` is; a constants-only module has no definition name to
+    carry the binding, and both its rename and its deletion read clean."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "pkg" / "mod.py").write_text("TIMEOUT = 30\n")
+    (repo / "user.py").write_text("from pkg.mod import TIMEOUT\n")
+    _commit(repo)
+    _run(repo, "mv", "pkg/mod.py", "pkg/mod2.py")
+    finding = _named(_findings(repo), "mod")
+    assert ("user.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+
+    _run(repo, "checkout", "-q", "--", ".")
+    _run(repo, "reset", "-q", "--hard", "HEAD")
+    _run(repo, "rm", "-q", "pkg/mod.py")
+    finding = _named(_findings(repo), "mod")
+    assert ("user.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+
+
+def test_deleting_only_an_empty_module_is_still_a_change(repo: Path) -> None:
+    """With no hunk and no header, both line maps are empty; the early exit
+    'no changed lines to analyse' read that as clean while `import pkg` was
+    broken. The deletion set is a change in its own right."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "user.py").write_text("import pkg\n")
+    _commit(repo)
+    _run(repo, "rm", "-rq", "pkg")
+
+    new_map, old_map = checker.changed_line_map(["HEAD"])
+    assert new_map == {} and old_map == {} and checker._DELETED == {"pkg/__init__.py"}
+    assert checker.main(["--strict"]) == 1

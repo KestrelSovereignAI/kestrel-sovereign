@@ -237,8 +237,6 @@ def changed_line_map(
             continue
         if not in_hunk and line.startswith("+++ "):
             new_path = _patch_path(line)
-            if new_path is None and old_path is not None:
-                _DELETED.add(old_path)  # `+++ /dev/null`: the file is gone
             continue
         match = _HUNK.match(line)
         if not match:
@@ -254,6 +252,13 @@ def changed_line_map(
             for offset in range(count):
                 new_map[new_path].add(int(new_start) + offset)
     flush_pending_copy()
+    # Deletions are asked for by name, not read off a `+++ /dev/null` header:
+    # an EMPTY file's deletion (most `__init__.py`) emits no `---`/`+++` and
+    # no hunk at all, only `deleted file mode`, so a package removal was
+    # invisible while its rename twin was reported.
+    _DELETED.update(
+        _paths(_git("diff", "--diff-filter=D", "--name-only", "-z", *diff_spec))
+    )
     if include_untracked:
         # `git diff` never mentions an untracked file, so a brand-new module —
         # every line of it new — was invisible and the gate reported clean on
@@ -494,6 +499,14 @@ def _build_index(tree: ast.AST) -> FileIndex:
             if node.module:
                 index.imported_modules.add(node.module)
                 index.imported_modules.add(node.module.rsplit(".", 1)[-1])
+                # ``from pkg.mod import X`` is bound to mod's PATH exactly as
+                # ``import pkg.mod`` is — a constants-only module has no
+                # definition name to carry the binding, so the module's own
+                # name must (round 13 review, the ImportFrom twin of the
+                # Import branch below).
+                index.import_bindings.setdefault(
+                    node.module.rsplit(".", 1)[-1], []
+                ).append((node.lineno, node.lineno))
         elif isinstance(node, ast.Import):
             for entry in node.names:
                 index.imported_modules.add(entry.name)
@@ -1259,7 +1272,7 @@ def main(argv: list[str] | None = None) -> int:
     # the merge base against the working tree, so excluding them here recreated
     # exactly the mixed-revision false clean that change was made to fix.
     new_map, old_map = changed_line_map(diff_spec, include_untracked=True)
-    if not new_map and not old_map and not _UNANALYSED and not _RENAMES:
+    if not new_map and not old_map and not _UNANALYSED and not _RENAMES and not _DELETED:
         print("co-change: no changed lines to analyse.")
         return 0
 
