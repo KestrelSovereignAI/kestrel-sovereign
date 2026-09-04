@@ -2275,6 +2275,190 @@ def test_postgres_doctor_rejects_swapped_persisted_custody_roles(
     assert not any("custody roles verified" in message for message in report.ok)
 
 
+def test_postgres_doctor_rejects_primary_receipt_history_rollback(
+    tmp_path,
+    monkeypatch,
+):
+    """Doctor must predict the same external-anchor refusal as server boot."""
+
+    from uuid import UUID
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold.state import (
+        HoldStore,
+        _HOLD_SCHEMA_TABLES,
+        _INITIALIZATION_WITNESS_PAYLOAD,
+        _POSTGRES_EVIDENCE_BINDING_KEY,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_PRIMARY_BINDING_KEY,
+        _POSTGRES_ROLLBACK_DOMAIN_KEY,
+        _POSTGRES_ROLLBACK_DOMAIN_PREFIX,
+        _POSTGRES_WITNESS_AGENT_ID,
+        _POSTGRES_WITNESS_KEY,
+        postgres_hold_custody_binding_payload,
+    )
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    primary_dsn = "postgresql://durable.example/kestrel"
+    primary_domain = _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(
+        UUID("11111111-1111-4111-8111-111111111111")
+    )
+    evidence_domain = _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(
+        UUID("22222222-2222-4222-8222-222222222222")
+    )
+    binding = postgres_hold_custody_binding_payload(
+        UUID("33333333-3333-4333-8333-333333333333"),
+        primary_domain,
+        evidence_domain,
+    )
+    first_receipt = (
+        "receipt-one",
+        "operation-one",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "first hold",
+        "did:operator:sovereign",
+        "2026-09-04T12:00:00+00:00",
+        "",
+        "",
+        "receipt-one",
+    )
+    second_receipt = (
+        "receipt-two",
+        "operation-two",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "replacement hold",
+        "did:operator:sovereign",
+        "2026-09-04T12:01:00+00:00",
+        "",
+        "receipt-one",
+        "receipt-two",
+    )
+    newer_anchor = HoldStore._history_anchor_payload_from_rows(
+        (first_receipt, second_receipt)
+    ).decode("ascii")
+
+    def _rolled_back_primary(dsn, sql, params=(), **kwargs):
+        if sql == doctor._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [("agent_metadata",)]
+        if sql == doctor._POSTGRES_HOLD_CUSTODY_SQL:
+            if dsn == primary_dsn:
+                return [
+                    (_POSTGRES_ROLLBACK_DOMAIN_KEY, primary_domain),
+                    (_POSTGRES_PRIMARY_BINDING_KEY, binding),
+                ]
+            return [
+                (_POSTGRES_ROLLBACK_DOMAIN_KEY, evidence_domain),
+                (_POSTGRES_EVIDENCE_BINDING_KEY, binding),
+            ]
+        if "information_schema.tables" in sql and "hold_latches" in sql:
+            return [(table,) for table in sorted(_HOLD_SCHEMA_TABLES)]
+        if sql.lstrip().startswith("SELECT receipt_id, operation_id"):
+            # The primary was restored to the first receipt while independent
+            # evidence still binds the deployment to the two-receipt history.
+            return [first_receipt]
+        if sql == doctor._POSTGRES_HOLD_PROTOCOL_SQL:
+            return [
+                (
+                    _POSTGRES_WITNESS_KEY,
+                    _INITIALIZATION_WITNESS_PAYLOAD.decode("ascii"),
+                ),
+                (_POSTGRES_HISTORY_ANCHOR_KEY, newer_anchor),
+            ]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _rolled_back_primary,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready, f"ok={report.ok} fail={report.fail}"
+    assert any("history anchor" in message for message in report.fail), report.fail
+    assert not any("custody roles verified" in message for message in report.ok)
+
+
+def test_postgres_doctor_rejects_protocol_changed_during_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """A Hold publication racing Doctor cannot become a stitched clean read."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.hold.state import (
+        HoldStore,
+        PostgresHoldCustodySnapshot,
+        _HOLD_SCHEMA_TABLES,
+        _INITIALIZATION_WITNESS_PAYLOAD,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_WITNESS_KEY,
+    )
+
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda _dsn, *, cluster_identity, **_kwargs: (
+            PostgresHoldCustodySnapshot(cluster_identity=cluster_identity),
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_primary_state",
+        lambda *_args, **_kwargs: (set(_HOLD_SCHEMA_TABLES), []),
+    )
+    empty_anchor = HoldStore._history_anchor_payload_from_rows(()).decode("ascii")
+    protocol_reads = iter(
+        (
+            [],
+            [
+                (
+                    _POSTGRES_WITNESS_KEY,
+                    _INITIALIZATION_WITNESS_PAYLOAD.decode("ascii"),
+                ),
+                (_POSTGRES_HISTORY_ANCHOR_KEY, empty_anchor),
+            ],
+        )
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_protocol_rows",
+        lambda *_args, **_kwargs: next(protocol_reads),
+    )
+    report = DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any("changed during the diagnostic snapshot" in item for item in report.fail)
+
+
 def test_postgres_doctor_rejects_same_hold_evidence_url_without_probing(
     tmp_path,
     monkeypatch,
@@ -2541,7 +2725,12 @@ def test_a_postgres_host_whose_anchor_names_no_agent_is_skipped_not_guessed(
     report = diagnose(tmp_path)
 
     assert any("names no agent" in m for m in report.warn), report.warn
-    assert not fake.executed, "doctor queried PostgreSQL without a tenant"
+    tenant_reads = [
+        sql
+        for sql, _params in fake.executed
+        if "FROM graph_nodes" in sql or "FROM graph_edges" in sql
+    ]
+    assert not tenant_reads, "doctor queried PostgreSQL governance without a tenant"
 
 
 def test_sqlite_hosts_never_reach_for_postgres(tmp_path, monkeypatch):
