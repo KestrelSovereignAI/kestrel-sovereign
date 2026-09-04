@@ -908,11 +908,19 @@ async def test_malformed_durable_revocation_fails_closed(tmp_path):
 
 @pytest.mark.asyncio
 async def test_delegation_survives_database_reconnect(tmp_path):
-    feat, _ = await _make_feature(tmp_path)
+    feat, backend = await _make_feature(tmp_path)
     granted = await feat.grant_restart_delegation(
         subject_agent_did=feat.agent.did,
     )
     delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="durable delegated recovery", delegation_id=delegation_id,
+        )
+    request_id = requested.data["request"]["id"]
+    assert (await verify_restart_authority_at_use(
+        backend, await get_request(backend, request_id)
+    ))[0] is True
 
     raw = SQLiteBackend(str(tmp_path / "restart.db"))
     await raw.connect()
@@ -923,14 +931,14 @@ async def test_delegation_survives_database_reconnect(tmp_path):
     )
     await restarted.initialize()
 
-    with caller_context_scope(None):
-        requested = await restarted.request_restart(
-            reason="durable delegated recovery", delegation_id=delegation_id,
-        )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await restarted.restart_coordinator()
 
-    assert requested.status is ToolResultStatus.OK
-    row = await get_request(restarted_db, requested.data["request"]["id"])
-    assert (await verify_restart_authority_at_use(restarted_db, row))[0] is True
+    assert spawn.call_count == 1
+    assert result.data["executed"][0]["request_id"] == request_id
+    assert (await get_request(restarted_db, request_id)).status == "executing"
 
 
 @pytest.mark.asyncio
