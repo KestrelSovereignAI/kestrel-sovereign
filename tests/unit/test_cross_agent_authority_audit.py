@@ -31,6 +31,10 @@ CONTROL_NAME_TERMS = (
     "fleet",
 )
 HTTP_SEGMENTS = {
+    # Every request-routed agent endpoint is addressable through the host's
+    # /api/agents/{name}/... alias in multi-agent mode.  Inventory the complete
+    # singular namespace rather than guessing which suffixes invoke or control.
+    "agent",
     "agents",
     "tasks",
     "stop",
@@ -53,6 +57,11 @@ HTTP_SEGMENTS = {
     "host",
 }
 HTTP_EXACT_ROUTES = {
+    "/health",
+    "/health/detailed",
+    "/metrics",
+    "/phoenix",
+    "/phoenix/{path:path}",
     "/api/agent/invoke",
     "/api/agent/stream",
     "/api/auth/key",
@@ -64,6 +73,9 @@ SURFACE_ID = re.compile(
 )
 COMMAND_SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/command_handler\.py::![^`]+)`\s*\|"
+)
+CLI_SURFACE_ID = re.compile(
+    r"\|\s*`(kestrel_sovereign/cli\.py::kestrel [^`]+)`\s*\|"
 )
 
 
@@ -129,6 +141,41 @@ def _discovered_builtin_command_surfaces() -> set[str]:
     return surfaces
 
 
+def _discovered_core_cli_surfaces() -> set[str]:
+    """Return every command dispatched by the canonical core CLI.
+
+    The complete dispatch dictionary is intentionally inventoried, including
+    commands that turn out to be self-only or unrelated.  Filtering by names
+    such as ``agent`` or ``restart`` would miss authority-bearing verbs such as
+    ``ask``, ``create``, and ``update`` and would recreate the blind spot this
+    contract exists to close.  Feature entry-point commands are outside core
+    and do not appear in this dictionary.
+    """
+
+    cli_path = REPO_ROOT / "kestrel_sovereign/cli.py"
+    tree = ast.parse(cli_path.read_text(encoding="utf-8"), filename=str(cli_path))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "commands"
+            for target in node.targets
+        ):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            continue
+        command_names = {
+            str(key.value)
+            for key in node.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        return {
+            f"kestrel_sovereign/cli.py::kestrel {command}"
+            for command in command_names
+        }
+    raise AssertionError("Could not find the core CLI command dispatch dictionary")
+
+
 def _router_prefix(tree: ast.Module) -> str:
     # Feature routers are commonly built inside ``get_router`` factories, so
     # the APIRouter assignment is not necessarily at module scope.
@@ -145,26 +192,64 @@ def _router_prefix(tree: ast.Module) -> str:
     return ""
 
 
-def _route_methods(decorator: ast.Call) -> tuple[str, ...]:
+def _module_string_collections(tree: ast.Module) -> dict[str, tuple[str, ...]]:
+    """Resolve safe module constants used by ``methods=`` declarations."""
+
+    collections: dict[str, tuple[str, ...]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(
+            node.value, (ast.List, ast.Tuple, ast.Set)
+        ):
+            continue
+        values = tuple(
+            str(element.value)
+            for element in node.value.elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        )
+        if len(values) != len(node.value.elts):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                collections[target.id] = values
+    return collections
+
+
+def _route_methods(
+    decorator: ast.Call,
+    constants: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[str, ...]:
     if not isinstance(decorator.func, ast.Attribute):
         return ()
     method = decorator.func.attr.lower()
-    if method in {"get", "post", "put", "patch", "delete"}:
+    if method in {
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+        "trace",
+    }:
         return (method.upper(),)
     if method != "api_route":
         return ()
     for keyword in decorator.keywords:
-        if keyword.arg != "methods" or not isinstance(
-            keyword.value, (ast.List, ast.Tuple, ast.Set)
-        ):
+        if keyword.arg != "methods":
             continue
-        methods = []
-        for element in keyword.value.elts:
-            if isinstance(element, ast.Constant) and isinstance(
-                element.value, str
-            ):
-                methods.append(element.value.upper())
-        return tuple(methods)
+        if isinstance(keyword.value, ast.Name):
+            return tuple(
+                value.upper()
+                for value in (constants or {}).get(keyword.value.id, ())
+            )
+        if isinstance(keyword.value, (ast.List, ast.Tuple, ast.Set)):
+            methods = []
+            for element in keyword.value.elts:
+                if isinstance(element, ast.Constant) and isinstance(
+                    element.value, str
+                ):
+                    methods.append(element.value.upper())
+            return tuple(methods)
     return ()
 
 
@@ -181,6 +266,7 @@ def _discovered_http_surfaces() -> set[str]:
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         prefix = _router_prefix(tree)
+        method_constants = _module_string_collections(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -189,7 +275,7 @@ def _discovered_http_surfaces() -> set[str]:
                     decorator.func, ast.Attribute
                 ):
                     continue
-                methods = _route_methods(decorator)
+                methods = _route_methods(decorator, method_constants)
                 if not methods:
                     continue
                 if not decorator.args or not isinstance(decorator.args[0], ast.Constant):
@@ -223,6 +309,14 @@ def _documented_command_surfaces(section: str) -> set[str]:
     return set(COMMAND_SURFACE_ID.findall(body))
 
 
+def _documented_cli_surfaces(section: str) -> set[str]:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    start = audit.index(section)
+    next_section = audit.find("\n## ", start + len(section))
+    body = audit[start:] if next_section < 0 else audit[start:next_section]
+    return set(CLI_SURFACE_ID.findall(body))
+
+
 def test_every_cross_agent_named_tool_is_classified() -> None:
     assert _discovered_tool_surfaces() == _documented_surfaces(
         "## Machine-checked tool inventory"
@@ -254,6 +348,18 @@ def test_builtin_agent_creation_command_is_discovered() -> None:
         "kestrel_sovereign/command_handler.py::!create-agent"
         in _discovered_builtin_command_surfaces()
     )
+
+
+def test_every_core_cli_command_is_classified() -> None:
+    assert _discovered_core_cli_surfaces() == _documented_cli_surfaces(
+        "## Machine-checked core CLI inventory"
+    )
+
+
+def test_core_cli_agent_and_fleet_controls_are_discovered() -> None:
+    discovered = _discovered_core_cli_surfaces()
+    for command in ("ask", "create", "terminate", "restart", "update"):
+        assert f"kestrel_sovereign/cli.py::kestrel {command}" in discovered
 
 
 def test_every_cross_agent_http_route_is_classified() -> None:
@@ -303,6 +409,9 @@ def test_app_level_host_authority_routes_are_discovered() -> None:
         "kestrel_sovereign/server.py::GET /api/host/ui/contributions",
         "kestrel_sovereign/server.py::GET /api/host/csrf",
         "kestrel_sovereign/server.py::POST /api/host/phoenix/session",
+        "kestrel_sovereign/server.py::GET /health/detailed",
+        "kestrel_sovereign/server.py::GET /phoenix",
+        "kestrel_sovereign/server.py::GET /phoenix/{path:path}",
     ):
         assert surface in discovered
 
@@ -321,6 +430,20 @@ def test_api_route_declarations_expand_every_registered_method() -> None:
     ).body[0].decorator_list[0]
     assert isinstance(decorator, ast.Call)
     assert _route_methods(decorator) == ("POST", "PUT")
+
+
+def test_api_route_declarations_resolve_module_method_constants() -> None:
+    tree = ast.parse(
+        '_METHODS = ["GET", "POST"]\n'
+        '@router.api_route("/phoenix", methods=_METHODS)\n'
+        "def route():\n    pass\n"
+    )
+    decorator = tree.body[1].decorator_list[0]
+    assert isinstance(decorator, ast.Call)
+    assert _route_methods(decorator, _module_string_collections(tree)) == (
+        "GET",
+        "POST",
+    )
 
 
 def test_audit_records_remediated_authority_paths_as_enforced() -> None:
