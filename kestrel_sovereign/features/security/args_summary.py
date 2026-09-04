@@ -131,7 +131,10 @@ def complete_truncated_json(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> A
             return None
         try:
             parsed = json.loads(closed)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError is a RuntimeError, not a ValueError: a deeply
+            # nested value escaped every guard, denied the call on the write
+            # path and poisoned the query on the read path (round 23 review).
             continue
         return parsed if isinstance(parsed, (dict, list)) else None
     return None
@@ -200,15 +203,23 @@ def mask_sensitive(data: Any, *, repair_slack: int = 0) -> Any:
             return data
         try:
             nested, end = _JSON_PREFIX.raw_decode(stripped)
-        except ValueError:
+        except (ValueError, RecursionError):
             nested = complete_truncated_json(stripped, max_trim=repair_slack) if repair_slack else None
             end = len(stripped)
         if not isinstance(nested, (dict, list)):
             return data
-        masked = mask_sensitive(nested, repair_slack=repair_slack)
-        if masked == nested:
-            return data
-        return data[: len(data) - len(stripped)] + json.dumps(masked, default=str) + stripped[end:]
+        try:
+            masked = mask_sensitive(nested, repair_slack=repair_slack)
+            if masked == nested:
+                return data
+            replaced = json.dumps(masked, default=str)
+        except RecursionError:
+            # The decoder accepts a payload nested deeper than this walk (or
+            # the encoder) can follow. It cannot be masked, so it is not
+            # shown; raising here denied the tool call on the write path
+            # and poisoned the query on the read path (round 23 review).
+            return "(payload nested past the limit; not shown)"
+        return data[: len(data) - len(stripped)] + replaced + stripped[end:]
     if isinstance(data, dict):
         result: dict = {}
         for key, value in data.items():
@@ -270,18 +281,31 @@ def remask_summary(summary: Optional[str]) -> Optional[str]:
     if not summary:
         return summary
     try:
+        return _remask_text(summary)
+    except RecursionError:
+        # A row nested past the interpreter's limit cannot be walked, so it
+        # cannot be masked; withheld, never shown raw or raised.
+        return "(summary could not be re-masked; not shown)"
+
+
+def _remask_text(summary: str) -> str:
+    try:
         parsed = json.loads(summary)
     except (ValueError, TypeError):
         # Same rule as the searchable projection: repair the cut JSON, mask
         # it structurally, keep the rest. A row whose JSON cannot be repaired
-        # cannot be masked, and is withheld rather than shown raw.
+        # cannot be masked, and is withheld rather than shown raw. A repaired
+        # row is shown WITH the truncation marker: the repair closed what the
+        # cut left open and rendered a cut field as null, and a reader must
+        # not take that reconstruction for the record as written (round 23
+        # review).
         repaired = repair_unparseable_summary(summary)
         if repaired is None:
             return "(summary truncated past repair; not shown)"
         prefix, masked = repaired
         if masked is None:
             return summary
-        return prefix + json.dumps(masked, default=str)
+        return prefix + json.dumps(masked, default=str) + _TRUNCATION_MARK
     if isinstance(parsed, str):
         # The whole row is a JSON string — the payload the walker masks one
         # level down, carried at the top (round 21 review).
@@ -310,7 +334,10 @@ def summarize_args(args: Optional[dict], max_length: int = 500) -> Optional[str]
     try:
         masked = mask_sensitive(args)
         summary = json.dumps(masked, default=str)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
+        # RecursionError included: a body nested past the interpreter's
+        # limit raised through the hook, which failed closed — the call was
+        # wrongly DENIED and no audit row was written (round 23 review).
         return "(args could not be summarized)"
     if len(summary) > max_length:
         return summary[: max_length - 3] + "..."

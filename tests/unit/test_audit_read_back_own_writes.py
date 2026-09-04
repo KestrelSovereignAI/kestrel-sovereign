@@ -1469,8 +1469,9 @@ async def test_an_unparseable_row_without_a_sensitive_key_is_still_shown(tmp_pat
     from kestrel_sovereign.features.security.feature import SecurityFeature
 
     truncated = '{"title": "orphans the worker", "body": "' + "x" * 40  # cut mid-value
-    # Repaired (the cut string and object closed), nothing masked, nothing lost.
-    assert remask_summary(truncated) == truncated + '"}'
+    # Repaired (the cut string and object closed), nothing masked, nothing
+    # lost — and marked as reconstructed.
+    assert remask_summary(truncated) == truncated + '"}...'
     leaking = '{"memo": "orphaned worker", "api_key": "sk-live-CUT'
     shown = remask_summary(leaking)
     assert "sk-live-CUT" not in shown
@@ -2018,7 +2019,7 @@ def test_complete_truncated_json_closes_what_the_cut_left_open():
     assert c('{"a": "x", "social_security_numb') == {"a": "x"}
     assert c('{"a": "x", "social_security_number"') == {"a": "x"}
     assert c('{"a": "x",') == {"a": "x"}
-    assert c('{"a": tr') == {"a": None}                          # a cut bare literal: value unknown
+    assert c('{"a": tr') == {"a": None}   # a cut bare literal: a null PLACEHOLDER (shown with the marker)
     assert c('{"a": "caf\\u00') == {"a": "caf"}                # a cut inside an escape
     assert c('{"a": "back\\') == {"a": "back"}                 # a cut right after a backslash
     assert c('{"a": "x"}...') == {"a": "x"}                      # summarize_args' marker
@@ -2378,3 +2379,61 @@ async def test_the_headline_keeps_the_unclassified_clause_beside_an_authorizatio
     assert result.data["authorized"] == 1 and result.data["unclassified_outcomes"] == 1
     assert "does not classify" in result.confirmation and "read them" in result.confirmation
     assert "which is not proof it succeeded" not in result.confirmation
+
+
+# --------------------------------------------------------------------------
+# Round 24: a value nested past the interpreter's limit is refused at every
+# door, never raised; a reconstructed row is visibly reconstructed.
+# --------------------------------------------------------------------------
+
+def test_a_deeply_nested_value_never_raises_at_any_door():
+    """RecursionError is a RuntimeError: it escaped every ValueError guard. On
+    the write path the hook failed closed and the call was wrongly DENIED
+    with no audit row; on the read path the registered scalar raised and
+    every search failed."""
+    from kestrel_sovereign.features.security.args_summary import mask_sensitive, remask_summary, summarize_args
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    deep = "[" * 1000 + "]" * 1000
+    stored = summarize_args({"repo": "o/r", "title": "orphans the worker", "body": deep})
+    assert json.loads(stored)["title"] == "orphans the worker"
+    # The decoder accepts 1000 levels; the walk cannot follow them, so the
+    # payload is withheld rather than raised or left raw.
+    assert json.loads(stored)["body"] == "(payload nested past the limit; not shown)"
+    assert isinstance(summarize_args({"body": "[" * 100000}), str)
+    # A REAL structure (not a string) nested past the limit: the string branch
+    # cannot absorb it, so summarize_args' own guard is the door.
+    deep_obj: list = []
+    cur = deep_obj
+    for _ in range(1000):
+        nxt: list = []
+        cur.append(nxt)
+        cur = nxt
+    assert summarize_args({"body": deep_obj}) == "(args could not be summarized)"
+    # A row that is itself one structure nested past the limit parses (the C
+    # decoder follows it) and overflows the walk: withheld, not raised.
+    assert remask_summary(deep) == "(summary could not be re-masked; not shown)"
+    assert fold_stored_summary(deep) == ""
+    # A parseable row whose string VALUE is nested past the limit still masks
+    # its other fields.
+    row = json.dumps({"api_key": "sk-live-LEAK", "body": "[" * 5000})
+    assert "sk-live-LEAK" not in remask_summary(row) and "***MASKED***" in remask_summary(row)
+    assert "sk-live" not in fold_stored_summary(row)
+    assert "sk-live-LEAK" not in mask_sensitive(row)
+
+
+def test_a_repaired_row_is_shown_with_the_truncation_marker():
+    """The repair closed what the cut left open and rendered a cut field as
+    null; without a marker both read paths handed the reader a well-formed
+    record and `"draft": null` read as a fact about the prior call."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+
+    for cut in ('{"repo": "o/r", "title": "orphans the worker", "issue_number":', '{"ok": tru', '{"a": 1, "n": 1.2e'):
+        shown = remask_summary(cut)
+        assert shown.endswith("..."), shown
+        assert json.loads(shown[:-3]), shown
+    assert remask_summary('{"repo": "o/r", "title": "orphans the worker", "issue_number":') == '{"repo": "o/r", "title": "orphans the worker", "issue_number": null}...'
+    # A row that parses as written carries no marker.
+    assert remask_summary('{"repo": "o/r"}') == '{"repo": "o/r"}'
+    # tool_audit's prose prefix keeps its place before the repaired JSON.
+    assert remask_summary('refused [wallet] | args={"api_key": "sk-LEAK", "m": "x"').endswith('"m": "x"}...')

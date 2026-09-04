@@ -87,6 +87,16 @@ def fold_stored_summary(text):
     if not text:
         return text
     try:
+        return _fold_text(text)
+    except RecursionError:
+        # A row nested past the interpreter's limit cannot be walked or
+        # masked; inside the registered scalar function a raise fails the
+        # WHOLE query, so it matches nothing instead (round 23 review).
+        return ""
+
+
+def _fold_text(text: str) -> str:
+    try:
         parsed = json.loads(text)
     except (ValueError, TypeError):
         # Truncated past parsing. Repair the cut JSON and mask it structurally
