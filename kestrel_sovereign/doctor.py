@@ -795,9 +795,33 @@ def _check_postgres_hold_readiness(
             raise RuntimeError(
                 "Hold protocol evidence changed during the diagnostic snapshot"
             )
+        final_primary_identity = _read_postgres_cluster_identity(
+            primary_dsn,
+            label="primary",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        final_evidence_identity = _read_postgres_cluster_identity(
+            evidence_dsn,
+            label="evidence",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        if final_primary_identity is None or final_evidence_identity is None:
+            return
+        if (final_primary_identity, final_evidence_identity) != (
+            primary_identity,
+            evidence_identity,
+        ):
+            raise RuntimeError(
+                "PostgreSQL Hold cluster identity changed during the diagnostic "
+                "snapshot"
+            )
         primary_after = _read_postgres_hold_custody_snapshot(
             primary_dsn,
-            cluster_identity=primary_identity,
+            cluster_identity=final_primary_identity,
             label="primary",
             env=env,
             project_dir=project_dir,
@@ -805,7 +829,7 @@ def _check_postgres_hold_readiness(
         )
         evidence_custody_after = _read_postgres_hold_custody_snapshot(
             evidence_dsn,
-            cluster_identity=evidence_identity,
+            cluster_identity=final_evidence_identity,
             label="evidence",
             env=env,
             project_dir=project_dir,
