@@ -72,6 +72,7 @@ INDIRECT_DISPATCH_CALLS = {
     # no agent-shaped word.  These are execution boundaries, not authority:
     # the selected downstream tool must still enforce its own policy.
     "execute_skill",
+    "execute_named_tool",
     "_create_schedule",
 }
 SURFACE_ID = re.compile(
@@ -126,11 +127,13 @@ def _is_indirect_tool_dispatcher(
 ) -> bool:
     """Detect public tools that can select another tool at runtime.
 
-    ``run_workflow`` delegates directly through ``TaskManager.execute_skill``.
-    Scheduler creation tools delegate indirectly through ``_create_schedule``;
-    the persisted name is later resolved to any loaded feature tool.  Detect
-    the wiring rather than freezing only today's public names, so renaming one
-    of these entry doors cannot make it disappear from the authority audit.
+    ``run_workflow`` delegates directly through ``TaskManager.execute_skill``;
+    ``signal_dispatch`` selects the contributed workflow runner through
+    ``execute_named_tool``. Scheduler creation tools delegate indirectly
+    through ``_create_schedule``; the persisted name is later resolved to any
+    loaded feature tool. Detect the wiring rather than freezing only today's
+    public names, so renaming one of these entry doors cannot make it disappear
+    from the authority audit.
     """
 
     return any(
@@ -419,6 +422,7 @@ def test_generic_indirect_dispatch_tools_are_classified() -> None:
     discovered = _discovered_tool_surfaces()
     for surface in (
         "kestrel_sovereign/features/tasks/feature.py::run_workflow",
+        "kestrel_sovereign/features/strategic_memory/feature.py::signal_dispatch",
         "kestrel_sovereign/features/scheduler/feature.py::schedule_add",
         "kestrel_sovereign/features/scheduler/feature.py::schedule_add_deadline",
     ):
@@ -434,10 +438,16 @@ def test_indirect_dispatch_discovery_follows_execution_wiring() -> None:
         "async def later(self):\n"
         "    return await self._create_schedule(task_name='anything')\n"
     ).body[0]
+    named = ast.parse(
+        "async def dispatch(self):\n"
+        "    return await self.execute_named_tool('workflow_run', {})\n"
+    ).body[0]
     assert isinstance(direct, ast.AsyncFunctionDef)
     assert isinstance(scheduled, ast.AsyncFunctionDef)
+    assert isinstance(named, ast.AsyncFunctionDef)
     assert _is_indirect_tool_dispatcher(direct)
     assert _is_indirect_tool_dispatcher(scheduled)
+    assert _is_indirect_tool_dispatcher(named)
 
 
 def test_relation_free_control_names_are_still_discovered() -> None:
@@ -670,6 +680,19 @@ def test_webhook_ambiguity_and_open_unlimited_mode_are_recorded() -> None:
     assert "allow_unauthenticated" in row
 
 
+def test_routed_rasa_target_mismatch_is_recorded() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    row = next(
+        line
+        for line in audit.splitlines()
+        if "endpoints/rasa_shim.py::POST "
+        "/api/agents/{selected_agent_name}/webhooks/rest/webhook" in line
+    )
+    assert "D-3220" in row
+    assert "host-default agent" in row
+    assert "target binding" in row
+
+
 def _identifier_tokens(node: ast.AST) -> set[str]:
     tokens: set[str] = set()
     for child in ast.walk(node):
@@ -684,13 +707,15 @@ def _identifier_tokens(node: ast.AST) -> set[str]:
 
 def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
     tokens = _identifier_tokens(node)
-    provenance_tokens = {
-        "causation",
-        "causation_chain",
-        "orchestrator",
-        "kestrel.orchestrator",
-    }
-    return bool(tokens.intersection(provenance_tokens | (aliases or set())))
+    provenance_tokens = {"orchestrator", "kestrel.orchestrator"}
+    return any(
+        token in provenance_tokens
+        or token == "causation"
+        or token.startswith("causation_")
+        or token == "causationframe"
+        or token in (aliases or set())
+        for token in tokens
+    )
 
 
 def _provenance_aliases(
@@ -698,7 +723,7 @@ def _provenance_aliases(
 ) -> set[str]:
     """Resolve simple local aliases of provenance metadata to a fixed point."""
 
-    def is_value_preserving_alias(value: ast.AST, aliases: set[str]) -> bool:
+    def is_provenance_derived(value: ast.AST, aliases: set[str]) -> bool:
         # Awaiting a helper that merely *receives* causation metadata does not
         # make its result provenance (for example ``fired = await
         # emit(..., causation_chain=chain)``).  Follow only direct accessors and
@@ -712,6 +737,11 @@ def _provenance_aliases(
             "get",
             "getattr",
         }:
+            return _has_provenance_token(value, aliases)
+        # Boolean normalization does not erase the authority input. Common
+        # forms such as ``allowed = chain is not None`` and ``has_chain = not
+        # not chain`` remain provenance-derived when used by a later gate.
+        if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp, ast.IfExp)):
             return _has_provenance_token(value, aliases)
         return False
 
@@ -744,7 +774,7 @@ def _provenance_aliases(
     while changed:
         changed = False
         for names, value in assignments:
-            if is_value_preserving_alias(value, aliases) and not names.issubset(
+            if is_provenance_derived(value, aliases) and not names.issubset(
                 aliases
             ):
                 aliases.update(names)
@@ -779,6 +809,18 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             or _is_cross_agent_control_name(function_name)
         )
         for node in ast.walk(function):
+            if isinstance(node, ast.Call):
+                function_tokens = _identifier_tokens(node.func)
+                is_permission_call = any(
+                    "authoriz" in token or "permission" in token
+                    for token in function_tokens
+                )
+                arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+                if is_permission_call and any(
+                    _has_provenance_token(argument, provenance_aliases)
+                    for argument in arguments
+                ):
+                    lines.add(node.lineno)
             if isinstance(node, ast.Return):
                 if (
                     function_is_permission_boundary
@@ -801,24 +843,6 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 has_permission or function_is_permission_boundary
             ):
                 lines.add(node.lineno)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        function_tokens = _identifier_tokens(node.func)
-        is_permission_call = any(
-            "authoriz" in token or "permission" in token
-            for token in function_tokens
-        )
-        argument_tokens = set().union(
-            *(_identifier_tokens(argument) for argument in node.args),
-            *(_identifier_tokens(keyword.value) for keyword in node.keywords),
-        )
-        has_provenance_argument = any(
-            "causation" in token or "orchestrator" in token
-            for token in argument_tokens
-        )
-        if is_permission_call and has_provenance_argument:
-            lines.add(node.lineno)
     return lines
 
 
@@ -854,11 +878,30 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "    if chain:\n"
         "        return True\n"
     )
+    canonical_frame = ast.parse(
+        "def authorize_child(request):\n"
+        "    if request.causation_frame:\n"
+        "        return True\n"
+    )
+    compared_alias = ast.parse(
+        "def authorize_child(request):\n"
+        "    allowed = request.causation_chain is not None\n"
+        "    if allowed:\n"
+        "        return True\n"
+    )
+    permission_call_alias = ast.parse(
+        "def check(request):\n"
+        "    chain = request.causation_chain\n"
+        "    return authorize(chain)\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
     assert _authority_provenance_lines(ordinary_helpers) == {2, 5}
     assert _authority_provenance_lines(control_handlers) == {2, 7, 11}
+    assert _authority_provenance_lines(canonical_frame) == {2}
+    assert _authority_provenance_lines(compared_alias) == {3}
+    assert _authority_provenance_lines(permission_call_alias) == {3}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:

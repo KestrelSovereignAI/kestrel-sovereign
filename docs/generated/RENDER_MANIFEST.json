@@ -254,6 +254,7 @@
         "kestrel_sovereign/features/restart_coordinator/feature.py",
         "kestrel_sovereign/features/scheduler/feature.py",
         "kestrel_sovereign/features/spawn/feature.py",
+        "kestrel_sovereign/features/strategic_memory/feature.py",
         "kestrel_sovereign/features/tasks/feature.py",
         "kestrel_sovereign/features/todo/feature.py",
         "kestrel_sovereign/features/web_search/feature.py",
