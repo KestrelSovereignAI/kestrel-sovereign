@@ -325,14 +325,37 @@ or control words.
 ## Machine-checked built-in command inventory
 
 Built-in commands do not carry feature `@tool` decorators. The contract test
-therefore discovers command names containing the same cross-agent terms
-directly from `BUILTIN_COMMAND_SPECS`, so a command-handler mutation cannot add
-a host-control door behind the feature-tool inventory.
+therefore discovers every entry directly from `BUILTIN_COMMAND_SPECS`, including
+apparently local commands. A neutrally named host-control door cannot hide
+behind either the feature-tool inventory or a command-name heuristic.
 
 | Surface ID | Classification |
 |---|---|
+| `kestrel_sovereign/command_handler.py::!status` | Caller runtime status read; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!help` | Static command-catalog read; no agent target. |
+| `kestrel_sovereign/command_handler.py::!reload-context` | Caller bootstrap/context reload; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!heartbeat` | Caller heartbeat trigger; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!verify-constitution` | Caller constitutional-integrity read; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!reanchor-constitution` | Sovereign-gated mutation of the caller's constitutional anchor; no peer grant. |
+| `kestrel_sovereign/command_handler.py::!safe-mode` | Sovereign-gated transition of the caller's safe-mode state; no peer grant. |
+| `kestrel_sovereign/command_handler.py::!privacy` | Caller privacy-mode state/session control; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!set-privacy-mode` | Caller privacy-mode transition; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!confirm-privacy-mode` | Caller confirmation of its pending privacy-mode transition; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!get-privacy-mode` | Caller privacy-mode read; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!privacy-status` | Caller privacy-state read; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!privacy-save` | Caller isolated-session save; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!privacy-discard` | Caller isolated-session discard; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!backup` | Caller backup creation; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!promote-backup` | Caller isolated-session promotion and backup; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!sleep` | Caller memory consolidation and sovereignty export; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!consolidate` | Caller memory consolidation; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!compact` | Caller session-context compaction; no co-hosted-agent target. |
 | `kestrel_sovereign/command_handler.py::!create-agent` | Sovereign/delegated host identity provisioning; #3149. |
+| `kestrel_sovereign/command_handler.py::!anchor` | Caller memory-state anchor; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!set-app-context` | Caller active-session app context; no co-hosted-agent target. |
+| `kestrel_sovereign/command_handler.py::!legacy-echo` | Caller legacy app-context echo path; no co-hosted-agent target. |
 | `kestrel_sovereign/command_handler.py::!tasks` | Unscoped shared-store task listing; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
+| `kestrel_sovereign/command_handler.py::!continue` | Resumes only the caller's stopped request; not peer Stop or mandate-only Hold. |
 
 ## Machine-checked core CLI inventory
 

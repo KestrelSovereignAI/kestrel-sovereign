@@ -33,6 +33,7 @@ CONTROL_NAME_TERMS = (
 PERMISSION_NAME_TERMS = (
     "authoriz",
     "authority",
+    "mandate",
     "permission",
     "allowed",
     "permitted",
@@ -99,7 +100,43 @@ CLI_SURFACE_ID = re.compile(
 )
 
 
-def _public_tool_name(decorator: ast.expr, fallback: str) -> str | None:
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Resolve literal module strings used in decorator declarations."""
+
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                constants[target.id] = value.value
+    return constants
+
+
+def _resolved_string(
+    node: ast.expr,
+    constants: dict[str, str] | None = None,
+) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return (constants or {}).get(node.id)
+    return None
+
+
+def _public_tool_name(
+    decorator: ast.expr,
+    fallback: str,
+    constants: dict[str, str] | None = None,
+) -> str | None:
     call = decorator if isinstance(decorator, ast.Call) else None
     function = call.func if call is not None else decorator
     decorator_name = (
@@ -113,11 +150,13 @@ def _public_tool_name(decorator: ast.expr, fallback: str) -> str | None:
         return None
     if call is None:
         return fallback
-    if call.args and isinstance(call.args[0], ast.Constant):
-        return str(call.args[0].value)
+    if call.args and (name := _resolved_string(call.args[0], constants)) is not None:
+        return name
     for keyword in call.keywords:
-        if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
-            return str(keyword.value.value)
+        if keyword.arg == "name" and (
+            name := _resolved_string(keyword.value, constants)
+        ) is not None:
+            return name
     return fallback
 
 
@@ -171,11 +210,14 @@ def _discovered_tool_surfaces() -> set[str]:
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
     for path in feature_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        string_constants = _module_string_constants(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for decorator in node.decorator_list:
-                public_name = _public_tool_name(decorator, node.name)
+                public_name = _public_tool_name(
+                    decorator, node.name, string_constants
+                )
                 if public_name is None:
                     continue
                 relative = path.relative_to(REPO_ROOT).as_posix()
@@ -184,10 +226,10 @@ def _discovered_tool_surfaces() -> set[str]:
 
 
 def _discovered_builtin_command_surfaces() -> set[str]:
-    """Return built-ins whose public names indicate cross-agent reach.
+    """Return every built-in command, including apparently local commands.
 
     Built-in commands bypass feature ``@tool`` discovery.  They therefore need
-    their own inventory source or a host-control door such as ``!create-agent``
+    an exact, unfiltered inventory or a neutrally named authority-bearing door
     can remain invisible while the feature-tool completeness gate stays green.
     """
 
@@ -196,8 +238,7 @@ def _discovered_builtin_command_surfaces() -> set[str]:
         command = spec.get("cmd")
         if not isinstance(command, str):
             continue
-        if _is_cross_agent_control_name(command):
-            surfaces.add(f"kestrel_sovereign/command_handler.py::{command}")
+        surfaces.add(f"kestrel_sovereign/command_handler.py::{command}")
     return surfaces
 
 
@@ -236,20 +277,44 @@ def _discovered_core_cli_surfaces() -> set[str]:
     raise AssertionError("Could not find the core CLI command dispatch dictionary")
 
 
-def _router_prefix(tree: ast.Module) -> str:
+def _router_prefix(
+    tree: ast.Module,
+    constants: dict[str, str] | None = None,
+) -> str:
     # Feature routers are commonly built inside ``get_router`` factories, so
     # the APIRouter assignment is not necessarily at module scope.
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
-        if not any(isinstance(target, ast.Name) and target.id == "router" for target in node.targets):
+        if not any(
+            isinstance(target, ast.Name) and target.id == "router"
+            for target in node.targets
+        ):
             continue
         if not isinstance(node.value, ast.Call):
             continue
         for keyword in node.value.keywords:
-            if keyword.arg == "prefix" and isinstance(keyword.value, ast.Constant):
-                return str(keyword.value.value)
+            if keyword.arg == "prefix" and (
+                prefix := _resolved_string(keyword.value, constants)
+            ) is not None:
+                return prefix
     return ""
+
+
+def _route_path(
+    decorator: ast.Call,
+    constants: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve positional or keyword FastAPI route paths."""
+
+    if decorator.args and (
+        route := _resolved_string(decorator.args[0], constants)
+    ) is not None:
+        return route
+    for keyword in decorator.keywords:
+        if keyword.arg == "path":
+            return _resolved_string(keyword.value, constants)
+    return None
 
 
 def _module_string_collections(tree: ast.Module) -> dict[str, tuple[str, ...]]:
@@ -325,7 +390,8 @@ def _discovered_http_surfaces() -> set[str]:
     )
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        prefix = _router_prefix(tree)
+        string_constants = _module_string_constants(tree)
+        prefix = _router_prefix(tree, string_constants)
         method_constants = _module_string_collections(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -338,9 +404,10 @@ def _discovered_http_surfaces() -> set[str]:
                 methods = _route_methods(decorator, method_constants)
                 if not methods:
                     continue
-                if not decorator.args or not isinstance(decorator.args[0], ast.Constant):
+                route_path = _route_path(decorator, string_constants)
+                if route_path is None:
                     continue
-                route = prefix + str(decorator.args[0].value)
+                route = prefix + route_path
                 segments = {part for part in route.casefold().split("/") if part}
                 if (
                     route.casefold() not in HTTP_EXACT_ROUTES
@@ -381,7 +448,8 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
     )
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        prefix = _router_prefix(tree)
+        string_constants = _module_string_constants(tree)
+        prefix = _router_prefix(tree, string_constants)
         method_constants = _module_string_collections(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -392,11 +460,10 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
                 methods = _route_methods(decorator, method_constants)
                 if not methods:
                     continue
-                if not decorator.args or not isinstance(
-                    decorator.args[0], ast.Constant
-                ):
+                route_path = _route_path(decorator, string_constants)
+                if route_path is None:
                     continue
-                canonical_route = prefix + str(decorator.args[0].value)
+                canonical_route = prefix + route_path
                 # The host regex requires a non-empty remaining path, so the
                 # canonical root has no multi-agent alias.
                 if canonical_route == "/":
@@ -454,12 +521,14 @@ def test_generic_indirect_dispatch_tools_are_classified() -> None:
             (REPO_ROOT / relative).read_text(encoding="utf-8"),
             filename=relative,
         )
+        string_constants = _module_string_constants(tree)
         tool_nodes = [
             node
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and any(
-                _public_tool_name(decorator, node.name) == public_name
+                _public_tool_name(decorator, node.name, string_constants)
+                == public_name
                 for decorator in node.decorator_list
             )
         ]
@@ -481,7 +550,7 @@ def test_relation_free_control_names_are_still_discovered() -> None:
         assert _is_cross_agent_control_name(name)
 
 
-def test_every_cross_agent_named_builtin_command_is_classified() -> None:
+def test_every_builtin_command_is_classified() -> None:
     assert _discovered_builtin_command_surfaces() == _documented_command_surfaces(
         "## Machine-checked built-in command inventory"
     )
@@ -610,6 +679,28 @@ def test_api_route_declarations_resolve_module_method_constants() -> None:
     assert _route_methods(decorator, _module_string_collections(tree)) == (
         "GET",
         "POST",
+    )
+
+
+def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
+    tree = ast.parse(
+        '_ROUTE = "/api/agent/constant"\n'
+        '_PREFIX = "/api"\n'
+        '_TOOL_NAME = "neutral-control"\n'
+        "router = APIRouter(prefix=_PREFIX)\n"
+        "@router.post(path=_ROUTE)\n"
+        "def route():\n    pass\n\n"
+        "@tool(name=_TOOL_NAME)\n"
+        "def tool_impl():\n    pass\n"
+    )
+    constants = _module_string_constants(tree)
+    route_decorator = tree.body[4].decorator_list[0]
+    tool_decorator = tree.body[5].decorator_list[0]
+    assert isinstance(route_decorator, ast.Call)
+    assert _router_prefix(tree, constants) == "/api"
+    assert _route_path(route_decorator, constants) == "/api/agent/constant"
+    assert _public_tool_name(tool_decorator, "tool_impl", constants) == (
+        "neutral-control"
     )
 
 
@@ -791,6 +882,17 @@ def _provenance_aliases(
             return _has_provenance_token(value, aliases)
         return False
 
+    def target_names(target: ast.AST) -> set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id.casefold()}
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return {
+                name
+                for element in target.elts
+                for name in target_names(element)
+            }
+        return set()
+
     aliases: set[str] = set()
     assignments: list[tuple[set[str], ast.AST]] = []
     for node in ast.walk(function):
@@ -807,12 +909,7 @@ def _provenance_aliases(
             value = node.value
         if value is None:
             continue
-        names = {
-            child.id.casefold()
-            for target in targets
-            for child in ast.walk(target)
-            if isinstance(child, ast.Name)
-        }
+        names = {name for target in targets for name in target_names(target)}
         if names:
             assignments.append((names, value))
 
@@ -855,11 +952,47 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                     for argument in arguments
                 ):
                     lines.add(node.lineno)
+            assignment_targets: list[ast.AST] = []
+            assignment_value: ast.AST | None = None
+            if isinstance(node, ast.Assign):
+                assignment_targets = list(node.targets)
+                assignment_value = node.value
+            elif isinstance(node, ast.AnnAssign):
+                assignment_targets = [node.target]
+                assignment_value = node.value
+            elif isinstance(node, ast.NamedExpr):
+                assignment_targets = [node.target]
+                assignment_value = node.value
+            if assignment_value is not None:
+                target_tokens = {
+                    token
+                    for target in assignment_targets
+                    for token in _identifier_tokens(target)
+                }
+                if (
+                    any(_is_permission_name(token) for token in target_tokens)
+                    and _has_provenance_token(
+                        assignment_value, provenance_aliases
+                    )
+                ):
+                    lines.add(node.lineno)
             if isinstance(node, ast.Return):
                 if (
-                    function_is_permission_boundary
-                    and node.value is not None
+                    node.value is not None
                     and _has_provenance_token(node.value, provenance_aliases)
+                    and (
+                        function_is_permission_boundary
+                        or any(
+                            _is_permission_name(token)
+                            for token in _identifier_tokens(node.value)
+                        )
+                    )
+                ):
+                    lines.add(node.lineno)
+                continue
+            if isinstance(node, ast.Match):
+                if function_is_permission_boundary and _has_provenance_token(
+                    node.subject, provenance_aliases
                 ):
                     lines.add(node.lineno)
                 continue
@@ -944,18 +1077,54 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         '    key = "causation_chain"\n'
         "    return bool(request.metadata.get(key))\n"
     )
+    mandate_verifier = ast.parse(
+        "def verify_mandate(request):\n"
+        "    return bool(request.causation_chain)\n"
+    )
+    helper_return = ast.parse(
+        "def check(request):\n"
+        "    allowed = bool(request.causation_chain)\n"
+        "    return allowed\n"
+    )
+    permission_assignment = ast.parse(
+        "def check(request):\n"
+        "    request.state.authorized = bool(request.causation_chain)\n"
+    )
+    permission_mapping = ast.parse(
+        "def check(request):\n"
+        '    return {"authorized": bool(request.causation_chain)}\n'
+    )
+    permission_match = ast.parse(
+        "def authorize(request):\n"
+        "    match request.causation_chain:\n"
+        "        case []:\n"
+        "            return False\n"
+        "        case _:\n"
+        "            return True\n"
+    )
+    unrelated_attribute_assignment = ast.parse(
+        "def authorize_cache(request):\n"
+        "    request.state.snapshot = request.causation_chain\n"
+        "    return request\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
     assert _authority_provenance_lines(ordinary_helpers) == {2, 5}
     assert _authority_provenance_lines(control_handlers) == {2, 7, 11}
     assert _authority_provenance_lines(canonical_frame) == {2}
-    assert _authority_provenance_lines(compared_alias) == {3}
+    assert _authority_provenance_lines(compared_alias) == {2, 3}
     assert _authority_provenance_lines(permission_call_alias) == {3}
     assert _authority_provenance_lines(authority_helper) == {2}
     assert _authority_provenance_lines(access_helper) == {2}
     assert _authority_provenance_lines(require_call) == {3}
     assert _authority_provenance_lines(dynamic_metadata_key) == {3}
+    assert _authority_provenance_lines(mandate_verifier) == {2}
+    assert _authority_provenance_lines(helper_return) == {2, 3}
+    assert _authority_provenance_lines(permission_assignment) == {2}
+    assert _authority_provenance_lines(permission_mapping) == {2}
+    assert _authority_provenance_lines(permission_match) == {2}
+    assert _authority_provenance_lines(unrelated_attribute_assignment) == set()
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
