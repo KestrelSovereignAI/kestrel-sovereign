@@ -1776,3 +1776,53 @@ def test_a_copied_file_that_cannot_be_read_is_not_analysed(repo: Path) -> None:
     assert "b.py" not in new_map and "b.py" in checker._UNANALYSED
     assert "b.py" in _unparseable(repo)
     assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 21: a deleted module strands the same references a renamed one does;
+# an empty module is a module; one rule turns a path into an import name.
+# --------------------------------------------------------------------------
+
+def test_a_deleted_module_surfaces_its_stranded_importers(repo: Path) -> None:
+    """`git rm mod.py` reported clean while `git mv mod.py newmod.py` reported
+    three stranded sites for the same importers — and git's own delete+add
+    fallback past diff.renameLimit IS the deletion shape."""
+    (repo / "mod.py").write_text("TIMEOUT = 30\n\n\ndef helper():\n    return 1\n")
+    (repo / "user.py").write_text("import mod\n\n\ndef f():\n    return mod.TIMEOUT, mod.helper()\n")
+    (repo / "bare.py").write_text("import mod\n")
+    _commit(repo)
+    _run(repo, "rm", "-q", "mod.py")
+
+    finding = _named(_findings(repo), "mod")
+    assert {(o.path, o.line) for o in finding.unchanged} >= {("user.py", 1), ("user.py", 5), ("bare.py", 1)}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_an_empty_module_renamed_is_analysed_not_withheld(repo: Path) -> None:
+    """An empty blob parses; conflating it with an unparseable one put a
+    package rename's `__init__.py` in NOT ANALYSED and withheld the answerable
+    sites. `__init__.py` is usually empty, so this was every package rename."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    (repo / "user.py").write_text("import pkg\n\n\ndef f():\n    return pkg\n")
+    _commit(repo)
+    _run(repo, "mv", "pkg", "pkg2")
+
+    assert _unparseable(repo) == []
+    finding = _named(_findings(repo), "pkg")
+    assert {(o.path, o.line) for o in finding.unchanged} >= {("user.py", 1), ("user.py", 5)}, finding
+
+
+def test_a_package_rename_surfaces_the_package_name_not_init(repo: Path) -> None:
+    """The `__init__.py` -> package rule lived twice; the rename copy had no
+    test, so registering `__init__` instead of `pkg` left the suite green."""
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("VERSION = 1\n")
+    (repo / "user.py").write_text("import pkg\n\n\ndef f():\n    return pkg.VERSION\n")
+    _commit(repo)
+    _run(repo, "mv", "pkg", "pkg2")
+
+    names = {f.name for f in _findings(repo)}
+    assert "pkg" in names and "__init__" not in names, names
+    assert checker._module_name("pkg/__init__.py") == "pkg"
+    assert checker._module_name("a/b/mod.py") == "mod"

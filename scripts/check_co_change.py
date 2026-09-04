@@ -173,6 +173,7 @@ def changed_line_map(
     )
     _UNANALYSED.clear()  # one run's record starts here, ends in collect()
     _RENAMES.clear()
+    _DELETED.clear()
     new_map: dict[str, set[int]] = defaultdict(set)
     old_map: dict[str, set[int]] = defaultdict(set)
     new_path: str | None = None
@@ -236,6 +237,8 @@ def changed_line_map(
             continue
         if not in_hunk and line.startswith("+++ "):
             new_path = _patch_path(line)
+            if new_path is None and old_path is not None:
+                _DELETED.add(old_path)  # `+++ /dev/null`: the file is gone
             continue
         match = _HUNK.match(line)
         if not match:
@@ -368,6 +371,19 @@ _UNANALYSED: set[str] = set()
 #: ``changed_line_map`` and read by ``collect``: a rename strands every
 #: reference bound to the OLD path, whether or not the entry carried edits.
 _RENAMES: dict[str, str] = {}
+#: Every file the diff deleted. A deletion strands exactly the references a
+#: rename does — ``import mod``, ``mod.attr`` — with no target file whose
+#: sites moved along; git's delete+add fallback past ``diff.renameLimit`` is
+#: this shape, so the two must agree.
+_DELETED: set[str] = set()
+
+
+def _module_name(path: str) -> str:
+    """The importable name of a ``.py`` path: its stem, or for
+    ``pkg/__init__.py`` the package directory — the one rule for every site
+    that turns a path into the name an ``import`` binds."""
+    candidate = Path(path)
+    return candidate.parent.name if candidate.stem == "__init__" else candidate.stem
 
 
 def _tree_for(path: str, ref: str = "") -> ast.AST | None:
@@ -655,10 +671,9 @@ def module_importers(defining_paths: set[str]) -> set[str]:
     """
     modules: set[str] = set()
     for path in defining_paths:
-        candidate = Path(path)
         # `pkg/__init__.py` IS the package: its importable name is the parent
         # directory, and searching for `__init__` finds nothing real.
-        modules.add(candidate.parent.name if candidate.stem == "__init__" else candidate.stem)
+        modules.add(_module_name(path))
 
     found: set[str] = set()
     for module in modules:
@@ -865,7 +880,11 @@ def collect(
         source = old_sources.get(moved_from)
         if source is None:
             source = _git("show", f"{old_ref}:{moved_from}")
-            if not source or _parse(source, moved_from) is None:
+            # An EMPTY blob parses (an empty module, most ``__init__.py``);
+            # only a blob that will not parse is NOT ANALYSED. Conflating the
+            # two withheld every package rename's stranded importers under a
+            # footer naming a file that read fine.
+            if _parse(source, moved_from) is None:
                 if moved_to not in unparseable:
                     unparseable.append(moved_to)
                 continue
@@ -889,12 +908,21 @@ def collect(
         # ``mod.TIMEOUT`` are bound to the path, not to any definition in it,
         # and a constants-only or side-effect module has no definition at
         # all. A package's ``__init__`` is reached by the package name.
-        stem = moved_from[:-3].rsplit("/", 1)[-1]
-        if stem == "__init__" and "/" in moved_from:
-            stem = moved_from[:-3].rsplit("/", 2)[-2]
+        stem = _module_name(moved_from)
         if stem and stem not in symbols:
             rename_only[stem] = moved_to
             symbols[stem] = ("module", {moved_from})
+
+    # A DELETED module strands the same path-bound references, with no target
+    # whose sites moved along, so nothing is excluded. Its definitions already
+    # entered through the old-side loop (every line of a deleted file is a
+    # removed line); only the module's own name is new here.
+    for gone in sorted(_DELETED):
+        if not gone.endswith(".py"):
+            continue
+        stem = _module_name(gone)
+        if stem and stem not in symbols:
+            symbols[stem] = ("module", {gone})
 
     findings: list[Finding] = []
     structural: list[tuple[str, int]] = []
